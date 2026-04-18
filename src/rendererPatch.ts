@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV43) { return 'already patched'; }
-  window.__ijFindPatchedV43 = true;
+  if (window.__ijFindPatchedV45) { return 'already patched'; }
+  window.__ijFindPatchedV45 = true;
 
   function send(payload) {
     try { globalThis.irSearchEvent(JSON.stringify(payload)); } catch (e) {}
@@ -194,6 +194,15 @@ export function getRendererPatchScript(): string {
   };
 
   window.__ijFindTestCreateWidget = function () {
+    // Fast path: if a previous run already captured the real class + services,
+    // don't recreate anything — we'd just burn a boot-time stub slot. Renderer
+    // globals survive extension-host restarts, so this hits on warm reloads.
+    try {
+      var existing = window.__ijFindMonaco;
+      if (existing && existing.ctor && existing.inst && existing.modelSvc) {
+        return 'monaco-already-captured ctor=' + (existing.ctor.name || '?');
+      }
+    } catch (e) {}
     var caps = window.__ijFindCaptures;
     if (!caps || !caps.services || caps.services.length === 0) {
       return 'no-services-captured';
@@ -303,19 +312,20 @@ export function getRendererPatchScript(): string {
       }
     } catch (e) {}
 
-    // 5. Create a visible host and try each candidate.
+    // 5. Create an off-screen host (invisible) and try each candidate. The
+    //    host only needs to live long enough for createInstance + setModel +
+    //    layout — we dispose it ~1s later. No visible test box.
     var host = document.createElement('div');
     host.className = 'ij-find-test-widget-host';
     host.style.cssText = [
       'position: fixed',
-      'top: 80px',
-      'left: 40px',
+      'top: -99999px',
+      'left: -99999px',
       'width: 640px',
       'height: 360px',
-      'background: var(--vscode-editor-background, #1e1e1e)',
-      'border: 2px solid #ff5d00',
-      'z-index: 2147483600',
-      'box-shadow: 0 10px 40px rgba(0,0,0,0.5)',
+      'visibility: hidden',
+      'pointer-events: none',
+      'z-index: -1',
     ].join(';') + ';';
     document.body.appendChild(host);
 
@@ -443,9 +453,9 @@ export function getRendererPatchScript(): string {
       try { createdEditor.dispose(); } catch (e) {}
       try { document.body.removeChild(host); } catch (e) {}
       send({ type: 'log', msg: 'test widget disposed' });
-    }, 10000);
+    }, 1000);
 
-    return report.join(' | ') + ' | host visible for 10s at (40,80) 640x360';
+    return report.join(' | ') + ' | off-screen host, disposes in 1s';
   };
 
   function el(tag, opts) {
@@ -526,15 +536,21 @@ export function getRendererPatchScript(): string {
     '  padding: 8px 10px 6px; flex: 0 0 auto;',
     '  border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-widget-border));',
     '}',
-    '.ij-find-search-row { display: flex; gap: 6px; align-items: center; }',
+    '.ij-find-search-row { display: flex; gap: 6px; align-items: flex-start; }',
     '.ij-find-query {',
     '  flex: 1; padding: 5px 8px;',
     '  font-family: var(--vscode-editor-font-family, monospace);',
     '  font-size: 13px;',
+    '  line-height: 1.4;',
     '  background: var(--vscode-input-background, #3c3c3c);',
     '  color: var(--vscode-input-foreground, #cccccc);',
     '  border: 1px solid var(--vscode-input-border, transparent);',
     '  border-radius: 2px; outline: none;',
+    '  resize: none;',
+    '  overflow-y: auto; overflow-x: hidden;',
+    '  min-height: 26px; max-height: 160px;',
+    '  white-space: pre-wrap;',
+    '  box-sizing: border-box;',
     '}',
     '.ij-find-query:focus { border-color: var(--vscode-focusBorder, #007acc); }',
     '.ij-find-opts { display: flex; gap: 2px; }',
@@ -770,10 +786,22 @@ export function getRendererPatchScript(): string {
   var $close = el('button', { className: 'ij-find-close', title: 'Close (Esc)', text: '\\u00D7' });
   var $header = el('div', { className: 'ij-find-header', children: [$title, $summary, $close] });
 
-  var $q = el('input', {
+  var $q = el('textarea', {
     className: 'ij-find-query',
-    attrs: { type: 'text', placeholder: 'Search in project...', spellcheck: 'false', autocomplete: 'off' },
+    attrs: {
+      placeholder: 'Search in project... (Shift+Enter for newline)',
+      spellcheck: 'false',
+      autocomplete: 'off',
+      rows: '1',
+      wrap: 'soft',
+    },
   });
+  // Auto-grow: adjust textarea height to fit content, bounded by max-height.
+  function autosizeQuery() {
+    $q.style.height = 'auto';
+    var h = Math.min(160, Math.max(26, $q.scrollHeight));
+    $q.style.height = h + 'px';
+  }
   var $optCase = el('button', { className: 'ij-find-opt', title: 'Match Case (Alt+C)', text: 'Aa', attrs: { 'data-opt': 'caseSensitive', 'aria-pressed': 'false' } });
   var $optWord = el('button', { className: 'ij-find-opt', title: 'Whole Word (Alt+W)', text: 'W', attrs: { 'data-opt': 'wholeWord', 'aria-pressed': 'false' } });
   var $optRegex = el('button', { className: 'ij-find-opt', title: 'Regex (Alt+R)', text: '.*', attrs: { 'data-opt': 'useRegex', 'aria-pressed': 'false' } });
@@ -1031,16 +1059,18 @@ export function getRendererPatchScript(): string {
     selectMatch(next);
   }
 
-  $q.addEventListener('input', scheduleSearch);
+  $q.addEventListener('input', function () { autosizeQuery(); scheduleSearch(); });
   $q.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      // Shift+Enter: insert literal newline (textarea default) → enables
+      // ripgrep multi-line search. Plain Enter: navigate or trigger search.
       if (state.debounce) { clearTimeout(state.debounce); }
       e.preventDefault();
       if (state.flat.length > 0 && state.activeIndex < 0) { selectMatch(0); }
       else if (state.flat.length > 0) { openActive(); }
       else { triggerSearch(); }
-    } else if (e.key === 'ArrowDown') { e.preventDefault(); moveActive(1); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); moveActive(-1); }
+    } else if (e.key === 'ArrowDown' && !e.shiftKey) { e.preventDefault(); moveActive(1); }
+    else if (e.key === 'ArrowUp' && !e.shiftKey) { e.preventDefault(); moveActive(-1); }
     else if (e.key === 'PageDown') { e.preventDefault(); moveActive(10); }
     else if (e.key === 'PageUp') { e.preventDefault(); moveActive(-10); }
     else if (e.key === 'Escape') { e.preventDefault(); window.__ijFindHide(); }
@@ -2463,9 +2493,18 @@ export function getRendererPatchScript(): string {
         document.body.appendChild(panel);
         document.body.appendChild($hoverTooltip);
       }
+      // Paint the overlay BEFORE firing the search — otherwise the browser
+      // processes our JS (send to extension → runRgSearch → network roundtrip)
+      // inside the same microtask and the panel appears only after the first
+      // results:start message lands. rAF guarantees one paint first.
       if (typeof initialQuery === 'string' && initialQuery && initialQuery !== $q.value) {
         $q.value = initialQuery;
-        triggerSearch();
+        autosizeQuery();
+        setStatus('Searching\u2026', true);
+        render();
+        requestAnimationFrame(function () {
+          requestAnimationFrame(triggerSearch);
+        });
       }
       setTimeout(function () { try { $q.focus(); $q.select(); } catch (e) {} }, 0);
       return 'show ok';

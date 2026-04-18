@@ -1,6 +1,13 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
 import * as zlib from 'zlib';
+import { promisify } from 'util';
+import { parseRegex } from './codesearch/regexAst';
+import { analyze } from './codesearch/regexInfo';
+import { PostingSource, TrigramQuery, evalQuery, qAnd, qTri } from './codesearch/trigramQuery';
+
+const gzipAsync = promisify(zlib.gzip);
+const gunzipAsync = promisify(zlib.gunzip);
 
 // ──────────────────────────────────────────────────────────────────────────
 // Trigram inverted index for workspace-wide text search.
@@ -18,13 +25,11 @@ import * as zlib from 'zlib';
 // regex queries fall back to a full scan.
 // ──────────────────────────────────────────────────────────────────────────
 
-// Index-sizing knobs. Files with absurd unique-trigram counts are almost
-// always minified / generated / data, and popular trigrams that appear in a
-// large fraction of the workspace are useless as filters — both are dropped
-// to keep the index small and fast.
-const MAX_UNIQUE_TRIGRAMS_PER_FILE = 30_000;
-const FREQUENT_TRIGRAM_FILE_RATIO = 0.30;  // drop trigrams in >30% of files
-const FREQUENT_TRIGRAM_MIN_ABSOLUTE = 10_000;  // or >10k files, whichever is lower
+// NOTE: previously we dropped files with >30K unique trigrams and pruned
+// trigrams that appeared in >30% of files. Both caused false negatives — a
+// pruned trigram forced the query planner to over-filter ("file doesn't
+// have this tri → exclude") even when the trigram was deliberately unindexed.
+// Cox's codesearch tolerates fat indexes; we keep everything.
 
 const BINARY_EXT = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp',
@@ -70,11 +75,21 @@ export class TrigramIndex {
   private async doInit(): Promise<void> {
     try { await vscode.workspace.fs.createDirectory(this.storageDir); } catch {}
     await this.load();
-    await this.reconcileWorkspace();
+    // Mark ready AS SOON AS the disk image is loaded — search can use the
+    // ~accurate cached index immediately. Reconcile (mtime-based delta
+    // refresh) continues in the background; new/changed files may miss
+    // matches for a few seconds until it completes, which is fine.
+    if (this.fileMeta.size > 0) {
+      this.ready = true;
+      this.log.appendLine(`TrigramIndex usable from disk (${this.fileMeta.size} files) — reconcile in bg`);
+    }
     this.startWatcher();
+    await this.reconcileWorkspace();
     this.ready = true;
-    if (this.dirty) { void this.save(); }
-    this.log.appendLine(`TrigramIndex ready: ${this.fileMeta.size} files, ${this.tris.size} trigrams`);
+    // reconcileWorkspace already called scheduleSave(5_000) if anything
+    // changed; letting that run once is enough. Redundant immediate save
+    // was doubling 100MB gzip work after every cold start.
+    this.log.appendLine(`TrigramIndex fully ready: ${this.fileMeta.size} files, ${this.tris.size} trigrams`);
   }
 
   private indexFileName(): string {
@@ -88,7 +103,8 @@ export class TrigramIndex {
     const fileUri = vscode.Uri.joinPath(this.storageDir, this.indexFileName());
     try {
       const bytes = await vscode.workspace.fs.readFile(fileUri);
-      const json = zlib.gunzipSync(Buffer.from(bytes)).toString('utf-8');
+      const decompressed = await gunzipAsync(Buffer.from(bytes));
+      const json = decompressed.toString('utf-8');
       const data = JSON.parse(json) as Serialized;
       if (!data || data.version !== 1) { return; }
       this.nextId = data.nextId || 1;
@@ -107,7 +123,6 @@ export class TrigramIndex {
 
   private async save(): Promise<void> {
     const fileUri = vscode.Uri.joinPath(this.storageDir, this.indexFileName());
-    this.pruneFrequentTrigrams();
     const trigramPairs: Array<[string, number[]]> = new Array(this.tris.size);
     let i = 0;
     for (const [tri, ids] of this.tris) {
@@ -125,7 +140,10 @@ export class TrigramIndex {
     };
     try {
       const json = JSON.stringify(data);
-      const compressed = zlib.gzipSync(Buffer.from(json), { level: 6 });
+      // gzip at a low level (1) trades ~15% size for ~3x speed; index is
+      // temporary disk state, not something to minimize bytes at the cost
+      // of blocking the extension host.
+      const compressed = await gzipAsync(Buffer.from(json), { level: 1 });
       await vscode.workspace.fs.writeFile(fileUri, compressed);
       this.dirty = false;
       this.log.appendLine(
@@ -134,27 +152,6 @@ export class TrigramIndex {
       );
     } catch (err) {
       this.log.appendLine(`TrigramIndex save failed: ${err instanceof Error ? err.message : err}`);
-    }
-  }
-
-  private pruneFrequentTrigrams(): void {
-    const fileCount = this.fileMeta.size;
-    if (fileCount === 0) { return; }
-    const threshold = Math.min(
-      Math.ceil(fileCount * FREQUENT_TRIGRAM_FILE_RATIO),
-      FREQUENT_TRIGRAM_MIN_ABSOLUTE,
-    );
-    let dropped = 0;
-    for (const [tri, ids] of Array.from(this.tris)) {
-      if (ids.size > threshold) {
-        this.tris.delete(tri);
-        dropped++;
-      }
-    }
-    if (dropped > 0) {
-      this.log.appendLine(
-        `TrigramIndex pruned ${dropped} frequent trigrams (posting > ${threshold} files)`,
-      );
     }
   }
 
@@ -171,6 +168,41 @@ export class TrigramIndex {
     if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = undefined; }
     if (this.watcher) { this.watcher.dispose(); this.watcher = undefined; }
     if (this.dirty) { void this.save(); }
+  }
+
+  /** Wipe the in-memory index + disk cache and rebuild from scratch.
+   *  Used by the "Rebuild Search Index" command when the user suspects
+   *  the index is out of sync with the workspace. */
+  async rebuild(): Promise<void> {
+    // Cancel any pending save so it can't clobber the fresh build.
+    if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = undefined; }
+    // Block reads during rebuild — callers get null candidates and fall
+    // back to full rg scans until we're done.
+    this.ready = false;
+    this.tris.clear();
+    this.fileMeta.clear();
+    this.uriToId.clear();
+    this.nextId = 1;
+    this.dirty = false;
+    // Remove the on-disk image. If this fails (permissions / not present)
+    // it's fine — the next save will overwrite it anyway.
+    try {
+      const fileUri = vscode.Uri.joinPath(this.storageDir, this.indexFileName());
+      await vscode.workspace.fs.delete(fileUri, { useTrash: false });
+      this.log.appendLine(`TrigramIndex: deleted ${fileUri.fsPath}`);
+    } catch (err) {
+      this.log.appendLine(
+        `TrigramIndex: could not delete on-disk index (${err instanceof Error ? err.message : err}); continuing.`,
+      );
+    }
+    this.log.appendLine('TrigramIndex: rebuilding from scratch...');
+    await this.reconcileWorkspace();
+    this.ready = true;
+    this.log.appendLine(
+      `TrigramIndex rebuilt: ${this.fileMeta.size} files, ${this.tris.size} trigrams`,
+    );
+    // Force an immediate save so the recovery is persisted; no 5s delay.
+    await this.save();
   }
 
   private getExcludePattern(): string | undefined {
@@ -191,10 +223,14 @@ export class TrigramIndex {
         removed++;
       }
     }
-    // Determine files to (re)index by mtime.
+    // Determine files to (re)index by mtime. Yield to the event loop
+    // every YIELD_EVERY stats so other extensions get CPU during cold
+    // start (100K stat() calls back-to-back would otherwise starve them).
+    const YIELD_EVERY = 500;
     const toIndex: vscode.Uri[] = [];
     const statLimit = 32;
     let statIdx = 0;
+    let statsSince = 0;
     const statWorkers: Promise<void>[] = [];
     for (let w = 0; w < statLimit; w++) {
       statWorkers.push((async () => {
@@ -206,18 +242,28 @@ export class TrigramIndex {
             const stat = await vscode.workspace.fs.stat(uri);
             if (stat.type === vscode.FileType.Directory) { continue; }
             const id = this.uriToId.get(uri.toString());
-            if (id === undefined) { toIndex.push(uri); continue; }
-            const meta = this.fileMeta.get(id);
-            if (!meta || meta.mtime !== stat.mtime) { toIndex.push(uri); }
+            if (id === undefined) { toIndex.push(uri); }
+            else {
+              const meta = this.fileMeta.get(id);
+              if (!meta || meta.mtime !== stat.mtime) { toIndex.push(uri); }
+            }
           } catch {}
+          if (++statsSince >= YIELD_EVERY) {
+            statsSince = 0;
+            await new Promise<void>((r) => setImmediate(r));
+          }
         }
       })());
     }
     await Promise.all(statWorkers);
     this.log.appendLine(`TrigramIndex reconcile: total=${files.length} reindex=${toIndex.length} removed=${removed}`);
-    // Index with limited concurrency so we don't thrash the FS.
+    // Index with limited concurrency so we don't thrash the FS, and yield
+    // periodically. Each indexFile is CPU-heavy (decode + trigram extract),
+    // so yielding matters more here than during stat.
     const indexLimit = 8;
+    const INDEX_YIELD_EVERY = 100;
     let indexIdx = 0;
+    let indexedSince = 0;
     const indexWorkers: Promise<void>[] = [];
     for (let w = 0; w < indexLimit; w++) {
       indexWorkers.push((async () => {
@@ -225,6 +271,10 @@ export class TrigramIndex {
           const i = indexIdx++;
           if (i >= toIndex.length) { return; }
           try { await this.indexFile(toIndex[i]); } catch {}
+          if (++indexedSince >= INDEX_YIELD_EVERY) {
+            indexedSince = 0;
+            await new Promise<void>((r) => setImmediate(r));
+          }
         }
       })());
     }
@@ -294,12 +344,6 @@ export class TrigramIndex {
       }
     }
     const uniq = extractTrigramsLower(text);
-    if (uniq.size > MAX_UNIQUE_TRIGRAMS_PER_FILE) {
-      // Skip minified / generated / data files; they balloon the index
-      // without helping searches that users actually run.
-      this.removeByUri(uriStr);
-      return;
-    }
     this.fileMeta.set(id, { uri: uriStr, mtime: stat.mtime, size: stat.size });
     for (const tri of uniq) {
       let set = this.tris.get(tri);
@@ -309,38 +353,84 @@ export class TrigramIndex {
   }
 
   // Public: get candidate URIs for a query. Returns null when the index
-  // cannot help (short query / not ready / regex) and the caller should
-  // fall back to a full scan.
-  candidatesFor(query: string, opts: { useRegex: boolean }): Set<string> | null {
+  // cannot usefully constrain (index not ready, planner has no info) — the
+  // caller should fall back to a full scan in that case.
+  //
+  // For regex / multi-line queries we route through Cox's codesearch
+  // planner: parse regex → RegexInfo → TrigramQuery → posting intersection.
+  // For plain substring queries we take the fast AND-of-all-trigrams path.
+  candidatesFor(query: string, opts: { useRegex: boolean; caseSensitive?: boolean; wholeWord?: boolean }): Set<string> | null {
     if (!this.ready) { return null; }
-    if (opts.useRegex) { return null; }
-    if (query.length < 3) { return null; }
-    const qtris = extractTrigramsLower(query);
-    if (qtris.size === 0) { return null; }
-    let pool: Set<number> | null = null;
-    for (const t of qtris) {
-      const ids = this.tris.get(t);
-      if (!ids || ids.size === 0) { return new Set<string>(); }
-      if (pool === null) {
-        pool = new Set(ids);
-      } else {
-        const smaller = ids.size < pool.size ? ids : pool;
-        const bigger = ids.size < pool.size ? pool : ids;
-        const next = new Set<number>();
-        for (const id of smaller) { if (bigger.has(id)) { next.add(id); } }
-        pool = next;
-      }
-      if (pool.size === 0) { return new Set<string>(); }
+    if (query.length === 0) { return null; }
+
+    // Non-regex, single-line, non-whole-word: fast path, AND the query's
+    // trigrams directly without building an AST.
+    if (!opts.useRegex && !opts.wholeWord && !query.includes('\n')) {
+      if (query.length < 3) { return null; }
+      const qtris = extractTrigramsLower(query);
+      if (qtris.size === 0) { return null; }
+      return this.intersectTrigrams(qtris);
     }
+
+    // General path: build a regex-like AST from the query and let Cox's
+    // analyzer decide what trigrams are required.
+    let patternSrc: string;
+    if (opts.useRegex) {
+      patternSrc = query;
+    } else {
+      patternSrc = escapeRegexSource(query);
+      if (opts.wholeWord) { patternSrc = '\\b' + patternSrc + '\\b'; }
+    }
+    const ast = parseRegex(patternSrc, {
+      caseInsensitive: !opts.caseSensitive,
+      dotAll: false,
+      multiline: false,
+    });
+    const info = analyze(ast);
+    const tq: TrigramQuery = info.match;
+    const source: PostingSource = {
+      get: (tri: string) => this.tris.get(tri) ?? null,
+      allFiles: () => {
+        const all = new Set<number>();
+        for (const id of this.fileMeta.keys()) { all.add(id); }
+        return all;
+      },
+    };
+    const ids = evalQuery(tq, source);
+    if (ids === null) { return null; }
     const out = new Set<string>();
-    if (pool) {
-      for (const id of pool) {
-        const meta = this.fileMeta.get(id);
-        if (meta) { out.add(meta.uri); }
-      }
+    for (const id of ids) {
+      const meta = this.fileMeta.get(id);
+      if (meta) { out.add(meta.uri); }
     }
     return out;
   }
+
+  private intersectTrigrams(qtris: Set<string>): Set<string> {
+    const qList: TrigramQuery[] = [];
+    for (const t of qtris) { qList.push(qTri(t)); }
+    const tq = qAnd(qList);
+    const source: PostingSource = {
+      get: (tri: string) => this.tris.get(tri) ?? null,
+      allFiles: () => {
+        const all = new Set<number>();
+        for (const id of this.fileMeta.keys()) { all.add(id); }
+        return all;
+      },
+    };
+    const ids = evalQuery(tq, source);
+    if (ids === null) { return new Set(); }
+    const out = new Set<string>();
+    for (const id of ids) {
+      const meta = this.fileMeta.get(id);
+      if (meta) { out.add(meta.uri); }
+    }
+    return out;
+  }
+}
+
+function escapeRegexSource(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function getExt(fsPath: string): string {

@@ -3,6 +3,7 @@ import * as http from 'http';
 import { execSync } from 'child_process';
 import WebSocket from 'ws';
 import { runSearch, SearchOptions, FileMatch, MatchRange } from './search';
+import { findRipgrepPath, runRgSearch } from './rgSearch';
 import { getRendererPatchScript } from './rendererPatch';
 import { TrigramIndex } from './trigramIndex';
 
@@ -69,16 +70,30 @@ export class OverlayPanel {
   /** Kick CDP + patch install off the critical path of the first command. */
   async prewarm(): Promise<void> {
     try {
+      const rgPath = findRipgrepPath();
+      this.log.appendLine(`ripgrep: ${rgPath || '(not found — will fall back to JS scan)'}`);
       await this.ensureInjected();
       this.log.appendLine('Prewarm complete (CDP attached, patch installed).');
-      // Give the capture patches a chance to see real editor creation:
-      // open + close a throwaway monaco-backed UI (Settings editor uses
-      // monaco internally). Do this only if the user hasn't already been
-      // using editors. Wait briefly so the patch is fully registered.
-      setTimeout(() => { void this.triggerCaptureDiagnostic(); }, 1500);
+      // Do NOT run capture diagnostic here. Opening/closing a file at
+      // activation time is user-visible and competes for CPU with other
+      // extensions starting up. Capture runs lazily on the first show().
     } catch (err) {
       this.log.appendLine(`Prewarm failed: ${err instanceof Error ? err.message : err}`);
     }
+  }
+
+  private captureTriggered = false;
+  /** Fire the capture diagnostic exactly once per extension-host session,
+   * and only if Monaco globals aren't already populated. Runs in the
+   * background — the overlay UI renders without waiting for it. */
+  private scheduleLazyCapture(): void {
+    if (this.captureTriggered) { return; }
+    this.captureTriggered = true;
+    setTimeout(() => {
+      void this.triggerCaptureDiagnostic().catch((err) => {
+        this.log.appendLine(`Lazy capture failed: ${err instanceof Error ? err.message : err}`);
+      });
+    }, 500);
   }
 
   private async listWorkbenchWindowIds(): Promise<number[]> {
@@ -110,6 +125,32 @@ export class OverlayPanel {
     const windowIds = await this.listWorkbenchWindowIds();
     this.log.appendLine(`Workbench windows: [${windowIds.join(', ')}]`);
     if (windowIds.length === 0) { return; }
+
+    // Renderer globals persist across extension-host restarts. If a previous
+    // session already captured the real CodeEditorWidget class + services,
+    // there's nothing to redo — skip force-open + TEST widget entirely.
+    const monacoPeek = `(function(){
+      try {
+        var m = window.__ijFindMonaco;
+        if (!m) return 'none';
+        return 'ctor=' + (!!(m.ctor)) + ' inst=' + (!!(m.inst)) + ' modelSvc=' + (!!(m.modelSvc));
+      } catch(e){ return 'peek-err:' + (e && e.message); }
+    })()`;
+    let alreadyReadyWin: number | null = null;
+    for (const id of windowIds) {
+      try {
+        const v = await this.evalInWindow(id, monacoPeek);
+        this.log.appendLine(`Monaco globals win=${id}: ${v}`);
+        if (/ctor=true inst=true modelSvc=true/.test(v)) {
+          alreadyReadyWin = id;
+          break;
+        }
+      } catch {}
+    }
+    if (alreadyReadyWin !== null) {
+      this.log.appendLine(`Monaco globals already present in win=${alreadyReadyWin} — skipping capture diagnostic.`);
+      return;
+    }
 
     const peek = `(function(){
       try {
@@ -231,6 +272,28 @@ export class OverlayPanel {
     await this.ensureInjected();
   }
 
+  async rebuildIndex(): Promise<void> {
+    // Cancel any in-flight search — it was probably using the stale index.
+    this.cancelActive();
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: 'IntelliJ Styled Search: rebuilding index',
+        cancellable: false,
+      },
+      async (progress) => {
+        progress.report({ message: 'clearing...' });
+        try {
+          await this.trigramIndex.rebuild();
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.log.appendLine(`Rebuild failed: ${msg}`);
+          throw err;
+        }
+      },
+    );
+  }
+
   async show(initialQuery: string): Promise<void> {
     // Coalesce a burst of command invocations (user mashing a shortcut)
     // into one effective show; we just remember the last query.
@@ -251,51 +314,67 @@ export class OverlayPanel {
   private async doShow(initialQuery: string): Promise<void> {
     try {
       await this.ensureInjected();
-      const focusedId = await this.getFocusedWindowId();
-      if (focusedId === null) {
+      // Single-roundtrip fast path: in one CDP message we locate the focused
+      // workbench window, send __ijFindShow into it (awaited), and fire-and-
+      // forget __ijFindHide into every other window. Prior version did three
+      // serial roundtrips and cost ~200–400 ms of visible lag on cold start.
+      const showExpr = `(function(){ try { return window.__ijFindShow ? window.__ijFindShow(${JSON.stringify(initialQuery)}) : 'no-show-fn'; } catch (e) { return 'show-throw:' + (e && e.message); } })()`;
+      const hideExpr = `try { window.__ijFindHide && window.__ijFindHide(); } catch (e) {}`;
+      const script = `
+        (async function () {
+          var BW = require('electron').BrowserWindow;
+          var focused = BW.getFocusedWindow();
+          if (!focused) {
+            var ws = BW.getAllWindows();
+            for (var i = 0; i < ws.length; i++) {
+              try {
+                var url = (ws[i].webContents && ws[i].webContents.getURL && ws[i].webContents.getURL()) || '';
+                if (/workbench\\.(?:esm\\.)?html/.test(url)) { focused = ws[i]; break; }
+              } catch (e) {}
+            }
+          }
+          if (!focused) { return { fid: 0, result: 'no-focus' }; }
+          var fid = focused.id;
+          var showR;
+          try {
+            var r = await focused.webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(showExpr)}, returnByValue: true });
+            if (r && r.exceptionDetails) {
+              showR = 'exc:' + ((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text || '').split('\\n')[0].slice(0, 150);
+            } else {
+              showR = (r && r.result && r.result.value) || 'ok';
+            }
+          } catch (e) { showR = 'show-err:' + (e && e.message); }
+          var wins = BW.getAllWindows();
+          for (var j = 0; j < wins.length; j++) {
+            if (wins[j].id === fid) { continue; }
+            try { wins[j].webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(hideExpr)} }); } catch (e) {}
+          }
+          return { fid: fid, result: String(showR) };
+        })()
+      `.trim();
+      const resp = await this.send('Runtime.evaluate', {
+        expression: script,
+        awaitPromise: true,
+        returnByValue: true,
+        includeCommandLineAPI: true,
+      });
+      const v = resp?.result?.value as { fid: number; result: string } | undefined;
+      if (!v || !v.fid) {
         this.log.appendLine('show() aborted: no focused VSCode window');
         return;
       }
-      this.activeWindowId = focusedId;
-      await this.evalInAllWindowsExcept(
-        focusedId,
-        `try { window.__ijFindHide && window.__ijFindHide(); } catch (e) {}`,
-      );
-      const showExpr = `(function(){ try { return window.__ijFindShow ? window.__ijFindShow(${JSON.stringify(initialQuery)}) : 'no-show-fn'; } catch (e) { return 'show-throw:' + (e && e.message); } })()`;
-      const result = await this.evalInWindow(focusedId, showExpr);
-      this.log.appendLine(`Show(win=${focusedId}): ${result}`);
+      this.activeWindowId = v.fid;
+      this.log.appendLine(`Show(win=${v.fid}): ${v.result}`);
+      // After the overlay is visible, kick off monaco capture in the
+      // background. Results + DOM-fallback preview keep working meanwhile;
+      // the first preview click that lands after capture completes will
+      // upgrade to a real monaco widget.
+      this.scheduleLazyCapture();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log.appendLine(`show() failed: ${err instanceof Error ? err.stack : msg}`);
       vscode.window.showErrorMessage(`IntelliJ Styled Search: ${msg}`);
     }
-  }
-
-  private async getFocusedWindowId(): Promise<number | null> {
-    const script = `
-      (function () {
-        var BW = require('electron').BrowserWindow;
-        var w = BW.getFocusedWindow();
-        if (!w) {
-          // Fall back to the last-focused patchable (workbench) window.
-          var ws = BW.getAllWindows();
-          for (var i = 0; i < ws.length; i++) {
-            try {
-              var url = (ws[i].webContents && ws[i].webContents.getURL && ws[i].webContents.getURL()) || '';
-              if (/workbench\\./.test(url)) { w = ws[i]; break; }
-            } catch (e) {}
-          }
-        }
-        return w ? w.id : 0;
-      })()
-    `.trim();
-    const resp = await this.send('Runtime.evaluate', {
-      expression: script,
-      returnByValue: true,
-      includeCommandLineAPI: true,
-    });
-    const id = resp?.result?.value;
-    return typeof id === 'number' && id > 0 ? id : null;
   }
 
   private async evalInWindow(winId: number, expr: string): Promise<string> {
@@ -322,27 +401,6 @@ export class OverlayPanel {
     });
     const value = resp?.result?.value;
     return typeof value === 'string' ? value : String(value ?? '');
-  }
-
-  private async evalInAllWindowsExcept(exceptId: number, expr: string): Promise<void> {
-    const script = `
-      (async function () {
-        var BW = require('electron').BrowserWindow;
-        var wins = BW.getAllWindows();
-        for (var i = 0; i < wins.length; i++) {
-          if (wins[i].id === ${exceptId}) { continue; }
-          try {
-            await wins[i].webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(expr)} });
-          } catch (e) {}
-        }
-      })()
-    `.trim();
-    await this.send('Runtime.evaluate', {
-      expression: script,
-      awaitPromise: true,
-      returnByValue: true,
-      includeCommandLineAPI: true,
-    });
   }
 
   private async evalInAllWindowsCollect(expr: string): Promise<string> {
@@ -727,18 +785,49 @@ export class OverlayPanel {
     const cts = new vscode.CancellationTokenSource();
     this.activeSearch = cts;
     await this.postToRenderer({ type: 'results:start' });
-    // Ask the trigram index which files could possibly contain the query;
-    // null means "index can't help — scan everything".
-    const candidates = this.trigramIndex.candidatesFor(options.query, { useRegex: options.useRegex });
-    if (candidates) {
-      this.log.appendLine(`TrigramIndex candidates: ${candidates.size} / indexSize=${this.trigramIndex.size}`);
-    }
+    const progress = {
+      onFile: (m: FileMatch) => { if (!cts.token.isCancellationRequested) { void this.postToRenderer({ type: 'results:file', match: m }); } },
+      onDone: (s: { totalFiles: number; totalMatches: number; truncated: boolean }) => {
+        if (!cts.token.isCancellationRequested) { void this.postToRenderer({ type: 'results:done', ...s }); }
+      },
+      onError: (e: Error) => { void this.postToRenderer({ type: 'results:error', message: e.message }); },
+    };
     try {
-      await runSearch(options, cts.token, {
-        onFile: (m) => { if (!cts.token.isCancellationRequested) { void this.postToRenderer({ type: 'results:file', match: m }); } },
-        onDone: (s) => { if (!cts.token.isCancellationRequested) { void this.postToRenderer({ type: 'results:done', ...s }); } },
-        onError: (e) => { void this.postToRenderer({ type: 'results:error', message: e.message }); },
-      }, candidates);
+      // Cox's codesearch planner narrows rg's file set. If the index
+      // returns null, the planner couldn't constrain — rg walks the whole
+      // workspace. If the index returns an empty set, the regex can't
+      // match anything.
+      const candidates = this.trigramIndex.candidatesFor(options.query, {
+        useRegex: options.useRegex,
+        caseSensitive: options.caseSensitive,
+        wholeWord: options.wholeWord,
+      });
+      if (candidates) {
+        this.log.appendLine(
+          `TrigramIndex candidates: ${candidates.size} / indexSize=${this.trigramIndex.size}`,
+        );
+      }
+      // Primary engine: the same ripgrep that VSCode's built-in "Find in
+      // Files" uses. Byte-for-byte result parity + multi-thread speed.
+      // Falls back to the JS+trigram path only if rg isn't locatable.
+      const rgPath = findRipgrepPath();
+      if (rgPath) {
+        let paths: string[] | null = null;
+        if (candidates) {
+          if (candidates.size === 0) {
+            progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
+            return;
+          }
+          paths = [];
+          for (const u of candidates) {
+            try { paths.push(vscode.Uri.parse(u).fsPath); } catch {}
+          }
+        }
+        await runRgSearch(options, cts.token, progress, paths);
+      } else {
+        this.log.appendLine('rg not found — falling back to JS scan.');
+        await runSearch(options, cts.token, progress, candidates);
+      }
     } finally {
       if (this.activeSearch === cts) {
         this.activeSearch.dispose();
@@ -752,26 +841,6 @@ export class OverlayPanel {
     const payload = JSON.stringify(msg);
     const js = `try { window.__ijFindOnMessage && window.__ijFindOnMessage(${payload}); } catch (e) {}`;
     await this.evalInWindow(this.activeWindowId, js);
-  }
-
-  private async evalInAllWindows(expr: string) {
-    const script = `
-      (async function () {
-        var BW = require('electron').BrowserWindow;
-        var wins = BW.getAllWindows();
-        for (var i = 0; i < wins.length; i++) {
-          try {
-            await wins[i].webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(expr)} });
-          } catch (e) {}
-        }
-      })()
-    `.trim();
-    await this.send('Runtime.evaluate', {
-      expression: script,
-      awaitPromise: true,
-      returnByValue: true,
-      includeCommandLineAPI: true,
-    });
   }
 
   private async openFile(uriStr: string, line: number, column: number, preview: boolean) {

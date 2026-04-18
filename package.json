@@ -38,6 +38,11 @@
         "command": "intellijStyledSearch.reinject",
         "title": "Reinject Renderer Patch (Recovery)",
         "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.rebuildIndex",
+        "title": "Rebuild Search Index",
+        "category": "IntelliJ Search"
       }
     ],
     "keybindings": [

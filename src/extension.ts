@@ -22,6 +22,16 @@ export function activate(context: vscode.ExtensionContext) {
       await overlay.forceReinject();
       vscode.window.showInformationMessage('IntelliJ Styled Search: re-injected.');
     }),
+    vscode.commands.registerCommand('intellijStyledSearch.rebuildIndex', async () => {
+      overlay.logCommand('rebuildIndex');
+      try {
+        await overlay.rebuildIndex();
+        vscode.window.showInformationMessage('IntelliJ Styled Search: index rebuilt.');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(`Index rebuild failed: ${msg}`);
+      }
+    }),
   );
 }
 

@@ -95,28 +95,31 @@ export async function runSearch(
   const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
   const maxResults = cfg.get<number>('maxResults', 2000);
 
-  const excludePattern = excludeGlobs.length > 0 ? `{${excludeGlobs.join(',')}}` : undefined;
-
   let files: vscode.Uri[];
-  try {
-    files = await vscode.workspace.findFiles('**/*', excludePattern, 100_000, token);
-  } catch (err) {
-    progress.onError(err as Error);
-    return;
-  }
-
-  if (token.isCancellationRequested) { return; }
-
-  // When a trigram-index lookup narrowed the search to a candidate set, drop
-  // every file that isn't in it. This is how we turn O(workspace) scans into
-  // O(hits) for typical queries.
+  // Fast path: trigram index already told us exactly which files could
+  // contain the query. Skip the full findFiles('**/*', 100K) sweep and
+  // just materialize the candidate set. This is the single biggest search
+  // latency win for warm workspaces — findFiles on a 100K-file workspace
+  // is multi-hundred-ms on its own.
   if (candidateUris) {
     if (candidateUris.size === 0) {
       progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
       return;
     }
-    files = files.filter((u) => candidateUris.has(u.toString()));
+    files = new Array(candidateUris.size);
+    let ci = 0;
+    for (const u of candidateUris) { files[ci++] = vscode.Uri.parse(u); }
+  } else {
+    const excludePattern = excludeGlobs.length > 0 ? `{${excludeGlobs.join(',')}}` : undefined;
+    try {
+      files = await vscode.workspace.findFiles('**/*', excludePattern, 100_000, token);
+    } catch (err) {
+      progress.onError(err as Error);
+      return;
+    }
   }
+
+  if (token.isCancellationRequested) { return; }
 
   // Reorder so results stream back in relevance order:
   //   1. files the user has open in tabs right now
@@ -128,7 +131,10 @@ export async function runSearch(
   let filesWithMatches = 0;
   let truncated = false;
 
-  const concurrency = 8;
+  // Raised from 8 → 24. Candidate sets from the trigram index are usually
+  // a few thousand files; FS latency dominates and macOS / Linux handle
+  // this concurrency level without thrashing.
+  const concurrency = 24;
   let idx = 0;
 
   const workers: Promise<void>[] = [];
