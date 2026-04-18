@@ -14,6 +14,11 @@ export function activate(context: vscode.ExtensionContext) {
       overlay.logCommand('searchSelection');
       void overlay.show(getQueryFromActiveEditor());
     }),
+    vscode.commands.registerCommand('intellijStyledSearch.reinject', async () => {
+      overlay.logCommand('reinject');
+      await overlay.forceReinject();
+      vscode.window.showInformationMessage('IntelliJ Styled Search: re-injected.');
+    }),
   );
 }
 

@@ -33,6 +33,11 @@
         "command": "intellijStyledSearch.searchSelection",
         "title": "Find Selection in Project",
         "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.reinject",
+        "title": "Reinject Renderer Patch (Recovery)",
+        "category": "IntelliJ Search"
       }
     ],
     "keybindings": [

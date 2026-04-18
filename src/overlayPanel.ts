@@ -62,6 +62,16 @@ export class OverlayPanel {
     this.log.appendLine(`[${new Date().toISOString()}] Command invoked: ${name}`);
   }
 
+  async forceReinject(): Promise<void> {
+    this.log.appendLine('Forcing reinject...');
+    if (this.ws) {
+      try { this.ws.close(); } catch {}
+      this.ws = undefined;
+    }
+    this.injectPromise = undefined;
+    await this.ensureInjected();
+  }
+
   async show(initialQuery: string): Promise<void> {
     try {
       await this.ensureInjected();
@@ -267,16 +277,26 @@ export class OverlayPanel {
           try {
             var url = '';
             try { url = (w.webContents && w.webContents.getURL && w.webContents.getURL()) || ''; } catch (eu) {}
-            // Only patch the main workbench windows. Skip webviews, DevTools,
-            // issue reporter, process explorer, etc. — those often enforce
-            // a stricter Trusted Types policy and break innerHTML anyway.
+            // Only patch the main workbench windows.
             if (!/workbench\\.(?:esm\\.)?html(?:\\?|#|$)/.test(url)) {
               results.push('skip:' + w.id + ':url=' + url.split('?')[0].split('/').pop());
               continue;
             }
-            try { w.webContents.debugger.detach(); } catch (e2) {}
-            w.webContents.debugger.attach('1.3');
-            await w.webContents.debugger.sendCommand('Runtime.enable');
+            // ── Cooperative debugger attachment ──
+            // Other extensions (e.g. intellisense-recursion) use the SAME
+            // webContents.debugger to install their own bindings/listeners
+            // (irGoToType for cmd+click navigation, etc.). If we detach +
+            // reattach, we evict their session and break their plugin.
+            // Only attach if the debugger isn't already attached, and add our
+            // binding/listener on top of whatever's there. Both bindings can
+            // coexist on a single CDP session.
+            var alreadyAttached = false;
+            try { alreadyAttached = w.webContents.debugger.isAttached(); } catch (eIs) {}
+            if (!alreadyAttached) {
+              try { w.webContents.debugger.attach('1.3'); }
+              catch (eAtt) { results.push('attach-fail:' + w.id + ':' + eAtt.message); continue; }
+            }
+            try { await w.webContents.debugger.sendCommand('Runtime.enable'); } catch (eRe) {}
             var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(patchExpr)}, returnByValue: true });
             if (r && r.exceptionDetails) {
               var ed = r.exceptionDetails;
