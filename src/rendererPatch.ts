@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV20) { return 'already patched'; }
-  window.__ijFindPatchedV20 = true;
+  if (window.__ijFindPatchedV29) { return 'already patched'; }
+  window.__ijFindPatchedV29 = true;
 
   function send(payload) {
     try { globalThis.irSearchEvent(JSON.stringify(payload)); } catch (e) {}
@@ -203,6 +203,17 @@ export function getRendererPatchScript(): string {
     '  font-size: 12px; line-height: 18px;',
     '  padding: 4px 0;',
     '}',
+    // When a stolen monaco editor is mounted in this body, keep our own
+    // padding / typography rules from bleeding into it. Nothing is forced
+    // on the .monaco-editor child — we size it via inline style in JS.
+    '.ij-find-preview-body.ij-find-stolen {',
+    '  padding: 0;',
+    '  overflow: hidden;',
+    '  font-family: unset;',
+    '  font-size: unset;',
+    '  line-height: unset;',
+    '  color: unset;',
+    '}',
     '.ij-find-preview-line {',
     '  display: flex; gap: 8px; padding: 0 10px; white-space: pre;',
     '  color: var(--vscode-editor-foreground, #d4d4d4);',
@@ -235,19 +246,6 @@ export function getRendererPatchScript(): string {
     '  border-radius: 3px; margin-left: auto;',
     '}',
     '.ij-find-edit-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)); }',
-    // Placeholder shown in the original editor group while we hold its editor.
-    '.ij-find-editor-placeholder {',
-    '  width: 100%; height: 100%;',
-    '  background: var(--vscode-editor-background, #1e1e1e);',
-    '  display: flex; align-items: center; justify-content: center;',
-    '  color: var(--vscode-descriptionForeground, #9d9d9d);',
-    '  font-size: 11px;',
-    '  font-family: var(--vscode-font-family, system-ui);',
-    '}',
-    '.ij-find-editor-placeholder::after {',
-    '  content: "(viewing in search preview)";',
-    '  opacity: 0.6;',
-    '}',
     '.ij-find-edit-textarea {',
     '  width: 100%; height: 100%;',
     '  border: 0; outline: none; resize: none;',
@@ -367,6 +365,15 @@ export function getRendererPatchScript(): string {
   var $hoverTooltip = el('div', { className: 'ij-find-hover-tooltip' });
   document.body.appendChild($hoverTooltip);
 
+  // When the preview pane is resized (panel corner drag or splitter), relayout
+  // any stolen Monaco editor so it re-fits the available area.
+  try {
+    var previewResizeObserver = new ResizeObserver(function () {
+      if (state && state.stolenEditor) { layoutStolenEditor(); }
+    });
+    previewResizeObserver.observe($previewBody);
+  } catch (e) {}
+
   var state = {
     options: { caseSensitive: false, wholeWord: false, useRegex: false },
     files: [],
@@ -390,11 +397,13 @@ export function getRendererPatchScript(): string {
     // DOM-move ("stolen editor") state: we physically relocate a real VSCode
     // editor instance into our preview pane. All editor features (LSP hover,
     // intellisense, undo, everything) come for free.
-    stolenEditor: null,        // the .editor-instance / .monaco-editor root we moved
+    stolenEditor: null,        // the .monaco-editor we moved
     stolenEditorOrigParent: null,
     stolenEditorOrigNextSibling: null,
-    stolenEditorPlaceholder: null,
     stolenEditorUri: '',
+    stolenEditorWidget: null,  // cached widget reference for .layout() calls
+    stolenGroup: null,         // .editor-group-container to hide
+    stolenGroupOrigDisplay: '',
   };
 
   function setStatus(text, spinning) {
@@ -709,6 +718,11 @@ export function getRendererPatchScript(): string {
   var monacoState = { tried: false, api: null, source: '' };
 
   function findMonacoSync() {
+    // First check our private bundle's global (set by monaco-entry.mjs) — we
+    // use a non-conflicting name so we don't clobber anything VSCode itself
+    // might reference as \`monaco\`.
+    try { if (globalThis.__ijFindMonacoApi && globalThis.__ijFindMonacoApi.editor && typeof globalThis.__ijFindMonacoApi.editor.create === 'function') { return { api: globalThis.__ijFindMonacoApi, source: 'bundled (__ijFindMonacoApi)' }; } } catch (e) {}
+    // Then fall back to any monaco VSCode may have exposed natively.
     try { if (typeof monaco !== 'undefined' && monaco && monaco.editor && typeof monaco.editor.create === 'function') { return { api: monaco, source: 'global monaco' }; } } catch (e) {}
     try { if (window.monaco && window.monaco.editor && typeof window.monaco.editor.create === 'function') { return { api: window.monaco, source: 'window.monaco' }; } } catch (e) {}
     try { if (self.monaco && self.monaco.editor && typeof self.monaco.editor.create === 'function') { return { api: self.monaco, source: 'self.monaco' }; } } catch (e) {}
@@ -1117,17 +1131,14 @@ export function getRendererPatchScript(): string {
     state.previewUri = msg.uri;
     state.previewLanguageId = msg.languageId || '';
     $preview.classList.remove('ij-find-modified');
-    ensureMonaco(function (api) {
-      if (api) {
-        try { renderPreviewMonaco(api, msg); return; }
-        catch (e) { send({ type: 'log', msg: 'renderPreviewMonaco threw: ' + (e && e.message) }); }
-      }
-      // Try DOM-move of a real VSCode editor first (gives the user full LSP
-      // features inside our preview pane), fall back to static DOM rendering.
-      attemptStealVscodeEditor(msg, function (stolen) {
-        if (stolen) { state.previewMode = 'stolen'; return; }
-        renderPreviewDOM(msg);
-      });
+    // Primary: steal the real VSCode editor's DOM — full LSP, intellisense,
+    // cmd+click, undo, etc. come for free because it IS the real editor.
+    // Fallback to DOM rendering if the editor isn't in the workbench DOM yet.
+    // (The bundled standalone monaco is kept available for emergencies but
+    // not used by default — it pollutes global CSS / themes.)
+    attemptStealVscodeEditor(msg, function (stolen) {
+      if (stolen) { state.previewMode = 'stolen'; return; }
+      renderPreviewDOM(msg);
     });
   }
 
@@ -1152,8 +1163,6 @@ export function getRendererPatchScript(): string {
   function findVscodeEditorDom(uri) {
     var filename = filenameFromUri(uri);
     if (!filename) { return null; }
-    // Look at editor-group tabs; the one whose label matches our filename
-    // and is in an .editor-group-container points at the editor we want.
     var labels = document.querySelectorAll('.editor-group-container .tab .monaco-icon-label .label-name, .editor-group-container .tab .tab-label');
     for (var i = 0; i < labels.length; i++) {
       var label = labels[i];
@@ -1161,62 +1170,165 @@ export function getRendererPatchScript(): string {
       if (txt === filename || txt.split('/').pop() === filename) {
         var group = label.closest('.editor-group-container');
         if (!group) { continue; }
-        // The editor body lives in .editor-container .monaco-editor (or .editor-instance).
-        var body = group.querySelector('.editor-container');
-        if (body) { return body; }
+        // Steal the .monaco-editor directly — the smallest movable unit.
         var monacoEl = group.querySelector('.monaco-editor');
-        if (monacoEl) { return monacoEl.parentElement || monacoEl; }
+        if (monacoEl) { return monacoEl; }
       }
     }
-    // Fallback: last-added .monaco-editor that's inside an .editor-group-container.
+    // Fallback: last .monaco-editor that's inside an .editor-group-container.
     var all = document.querySelectorAll('.editor-group-container .monaco-editor');
-    if (all.length > 0) { return all[all.length - 1].parentElement || all[all.length - 1]; }
+    if (all.length > 0) { return all[all.length - 1]; }
     return null;
+  }
+
+  // Duck-typing: a code editor widget has \`layout\`, \`getModel\`,
+  // \`getDomNode\` function members. Walk every property (own + enumerable +
+  // Symbol) on a given element looking for one.
+  function findMonacoWidgetOn(el, label) {
+    if (!el) { return null; }
+    var seen = {};
+    var keys = [];
+    try { var own = Object.getOwnPropertyNames(el); for (var i = 0; i < own.length; i++) { keys.push(own[i]); seen[own[i]] = 1; } } catch (e) {}
+    for (var k in el) { if (!seen[k]) { keys.push(k); seen[k] = 1; } }
+    for (var j = 0; j < keys.length; j++) {
+      var val;
+      try { val = el[keys[j]]; } catch (e) { continue; }
+      if (!val || typeof val !== 'object') { continue; }
+      if (typeof val.layout === 'function' &&
+          typeof val.getModel === 'function' &&
+          typeof val.getDomNode === 'function') {
+        send({ type: 'log', msg: 'widget found on ' + label + ' via "' + keys[j] + '"' });
+        return val;
+      }
+      try {
+        if (val.editor && typeof val.editor.layout === 'function' && typeof val.editor.getModel === 'function') {
+          send({ type: 'log', msg: 'widget found on ' + label + ' via "' + keys[j] + '.editor"' });
+          return val.editor;
+        }
+        if (val._editor && typeof val._editor.layout === 'function' && typeof val._editor.getModel === 'function') {
+          send({ type: 'log', msg: 'widget found on ' + label + ' via "' + keys[j] + '._editor"' });
+          return val._editor;
+        }
+      } catch (e) {}
+    }
+    try {
+      var syms = Object.getOwnPropertySymbols(el);
+      for (var s = 0; s < syms.length; s++) {
+        var sv;
+        try { sv = el[syms[s]]; } catch (e) { continue; }
+        if (!sv || typeof sv !== 'object') { continue; }
+        if (typeof sv.layout === 'function' && typeof sv.getModel === 'function' && typeof sv.getDomNode === 'function') {
+          send({ type: 'log', msg: 'widget found on ' + label + ' via Symbol ' + syms[s].toString() });
+          return sv;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // Search \`.monaco-editor\`, each of its ancestors up to .editor-group-container,
+  // and its own key descendants for the widget instance.
+  function findMonacoWidget(startEl) {
+    if (!startEl) { return null; }
+    var candidates = [
+      { el: startEl, label: '.monaco-editor' },
+    ];
+    var el = startEl.parentElement;
+    for (var i = 0; i < 6 && el; i++, el = el.parentElement) {
+      var cls = (el.className || '').toString().trim().split(/\\s+/)[0] || el.tagName;
+      candidates.push({ el: el, label: 'ancestor[' + i + ']=' + cls });
+      if (el.classList && el.classList.contains('editor-group-container')) { break; }
+    }
+    // Likely internal descendants that could host the widget reference.
+    var innerSelectors = ['.overflow-guard', '.monaco-scrollable-element', '.margin', '.lines-content'];
+    for (var n = 0; n < innerSelectors.length; n++) {
+      var inner = startEl.querySelector(innerSelectors[n]);
+      if (inner) { candidates.push({ el: inner, label: 'descendant=' + innerSelectors[n] }); }
+    }
+    for (var c = 0; c < candidates.length; c++) {
+      var w = findMonacoWidgetOn(candidates[c].el, candidates[c].label);
+      if (w) { return w; }
+    }
+    send({ type: 'log', msg: 'widget NOT found; checked ' + candidates.length + ' elements' });
+    return null;
+  }
+
+  // Minimal: set the .monaco-editor outer box to the preview pane's size.
+  // If we happen to find the widget handle we also call .layout() because
+  // that is the clean Monaco API — BUT we never touch monaco's own internal
+  // DOM (.overflow-guard, .view-lines, etc.). Those stay untouched so that
+  // the editor's rendering / restoration are never corrupted.
+  function layoutStolenEditor() {
+    if (!state.stolenEditor) { return; }
+    var rect = $previewBody.getBoundingClientRect();
+    var w = Math.max(100, Math.floor(rect.width));
+    var h = Math.max(40, Math.floor(rect.height));
+    state.stolenEditor.style.width = w + 'px';
+    state.stolenEditor.style.height = h + 'px';
+    var widget = state.stolenEditorWidget;
+    if (!widget) {
+      widget = findMonacoWidget(state.stolenEditor);
+      state.stolenEditorWidget = widget;
+    }
+    if (widget && typeof widget.layout === 'function') {
+      try { widget.layout({ width: w, height: h }); } catch (e) {}
+    }
   }
 
   function restoreStolenEditor() {
     if (!state.stolenEditor || !state.stolenEditorOrigParent) { return; }
     try {
-      if (state.stolenEditorPlaceholder && state.stolenEditorPlaceholder.parentNode) {
-        state.stolenEditorPlaceholder.parentNode.replaceChild(state.stolenEditor, state.stolenEditorPlaceholder);
-      } else if (state.stolenEditorOrigNextSibling && state.stolenEditorOrigNextSibling.parentNode === state.stolenEditorOrigParent) {
+      state.stolenEditor.style.width = '';
+      state.stolenEditor.style.height = '';
+      state.stolenEditor.style.position = '';
+      if (state.stolenEditorOrigNextSibling && state.stolenEditorOrigNextSibling.parentNode === state.stolenEditorOrigParent) {
         state.stolenEditorOrigParent.insertBefore(state.stolenEditor, state.stolenEditorOrigNextSibling);
       } else {
         state.stolenEditorOrigParent.appendChild(state.stolenEditor);
       }
-      // Trigger relayout.
-      try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+      // Return the source group to its original visibility so any user
+      // tabs that happened to share that column reappear.
+      if (state.stolenGroup) {
+        state.stolenGroup.style.display = state.stolenGroupOrigDisplay || '';
+      }
     } catch (e) { send({ type: 'log', msg: 'restoreStolenEditor err: ' + (e && e.message) }); }
+    $previewBody.classList.remove('ij-find-stolen');
     state.stolenEditor = null;
     state.stolenEditorOrigParent = null;
     state.stolenEditorOrigNextSibling = null;
-    state.stolenEditorPlaceholder = null;
     state.stolenEditorUri = '';
+    state.stolenEditorWidget = null;
+    state.stolenGroup = null;
+    state.stolenGroupOrigDisplay = '';
   }
 
   function stealEditorIntoPreview(editorEl, uri) {
     if (!editorEl || !editorEl.parentNode) { return false; }
-    // If already showing this editor, nothing to do.
-    if (state.stolenEditor === editorEl && state.stolenEditorUri === uri) { return true; }
-    // Restore any previously-stolen editor first.
+    if (state.stolenEditor === editorEl && state.stolenEditorUri === uri) {
+      layoutStolenEditor();
+      return true;
+    }
     if (state.stolenEditor) { restoreStolenEditor(); }
     state.stolenEditor = editorEl;
+    state.stolenEditorWidget = null;
     state.stolenEditorOrigParent = editorEl.parentNode;
     state.stolenEditorOrigNextSibling = editorEl.nextSibling;
     state.stolenEditorUri = uri;
-    // Leave a placeholder so the original group keeps its layout slot.
-    var placeholder = document.createElement('div');
-    placeholder.className = 'ij-find-editor-placeholder';
-    placeholder.style.width = '100%'; placeholder.style.height = '100%';
-    state.stolenEditorPlaceholder = placeholder;
-    state.stolenEditorOrigParent.replaceChild(placeholder, editorEl);
-    // Put it into our preview pane, sized to fill.
+    // Hide the source .editor-group-container entirely so the user never
+    // sees a new column or tab appear — preview is invisible to VSCode's
+    // editor UI. The widget inside still lives (we're moving it, not
+    // disposing), so it keeps sharing VSCode's TextModel.
+    var group = editorEl.closest ? editorEl.closest('.editor-group-container') : null;
+    if (group) {
+      state.stolenGroup = group;
+      state.stolenGroupOrigDisplay = group.style.display;
+      group.style.display = 'none';
+    }
     clearChildren($previewBody);
-    editorEl.style.width = '100%';
-    editorEl.style.height = '100%';
+    $previewBody.classList.add('ij-find-stolen');
     editorEl.style.position = 'relative';
     $previewBody.appendChild(editorEl);
-    try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+    layoutStolenEditor();
     return true;
   }
 
@@ -1250,6 +1362,9 @@ export function getRendererPatchScript(): string {
       return state.monacoEditor;
     }
     clearChildren($previewBody);
+    // Neutralise inherited typography / padding / overflow so Monaco's own
+    // geometry is in charge of this container.
+    $previewBody.classList.add('ij-find-editor-mounted');
     var host = el('div', { className: 'ij-find-monaco-host' });
     $previewBody.appendChild(host);
     var hostRect = host.getBoundingClientRect();
@@ -1377,6 +1492,7 @@ export function getRendererPatchScript(): string {
     if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
       try { state.monacoHost.parentElement.removeChild(state.monacoHost); } catch (e) {}
     }
+    $previewBody.classList.remove('ij-find-editor-mounted');
     clearChildren($previewBody);
     var focusEl = null;
     var frag = document.createDocumentFragment();

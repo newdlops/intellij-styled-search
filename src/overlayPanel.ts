@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import * as http from 'http';
+import * as fs from 'fs';
+import * as path from 'path';
 import { execSync } from 'child_process';
 import WebSocket from 'ws';
 import { runSearch, SearchOptions, FileMatch, MatchRange } from './search';
@@ -41,6 +43,8 @@ export class OverlayPanel {
   private injectPromise: Promise<void> | undefined;
   private log: vscode.OutputChannel;
   private activeWindowId: number | undefined;
+  private monacoBundleSrc: string = '';
+  private monacoInjectedWindows = new Set<number>();
 
   static get(context: vscode.ExtensionContext): OverlayPanel {
     if (!OverlayPanel.instance) {
@@ -53,6 +57,15 @@ export class OverlayPanel {
     this.log = vscode.window.createOutputChannel('IntelliJ Styled Search');
     context.subscriptions.push(this.log);
     context.subscriptions.push({ dispose: () => this.dispose() });
+    // Load the bundled monaco source so we can inject it into the renderer
+    // once CDP is up. If it's missing we fall back to DOM rendering.
+    try {
+      const bundlePath = path.join(context.extensionPath, 'resources', 'monaco.bundle.js');
+      this.monacoBundleSrc = fs.readFileSync(bundlePath, 'utf-8');
+      this.log.appendLine(`Monaco bundle loaded: ${Math.round(this.monacoBundleSrc.length / 1024)} KB`);
+    } catch (err) {
+      this.log.appendLine(`Monaco bundle NOT found: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   logActivation() {
@@ -84,6 +97,11 @@ export class OverlayPanel {
         return;
       }
       this.activeWindowId = focusedId;
+      // Bundle injection kept as a last-resort tool (can be re-enabled), but
+      // not run by default — it brings its own CSS which leaks into VSCode's
+      // native monaco editors. The preview pane instead steals the real
+      // VSCode editor DOM (see renderPreview in rendererPatch.ts).
+      // await this.ensureMonacoInjectedInWindow(focusedId);
       // Auto-hide any lingering overlay in other windows so only one is ever open.
       await this.evalInAllWindowsExcept(
         focusedId,
@@ -96,6 +114,40 @@ export class OverlayPanel {
       const msg = err instanceof Error ? err.message : String(err);
       this.log.appendLine(`show() failed: ${err instanceof Error ? err.stack : msg}`);
       vscode.window.showErrorMessage(`IntelliJ Styled Search: ${msg}`);
+    }
+  }
+
+  private async ensureMonacoInjectedInWindow(winId: number): Promise<void> {
+    if (!this.monacoBundleSrc) { return; }
+    if (this.monacoInjectedWindows.has(winId)) { return; }
+    const sizeKB = Math.round(this.monacoBundleSrc.length / 1024);
+    this.log.appendLine(`Injecting monaco bundle into window ${winId} (${sizeKB} KB)...`);
+    const t0 = Date.now();
+    // Wrap so it's idempotent in the renderer; the bundle itself sets
+    // globalThis.monaco, we just need to run it once.
+    const guarded = `
+      (function () {
+        if (globalThis.__ijFindMonacoInjected) { return 'already'; }
+        globalThis.__ijFindMonacoInjected = true;
+        try {
+          ${this.monacoBundleSrc}
+          var api = globalThis.__ijFindMonacoApi;
+          return 'ok:' + (typeof api) + ':' + (api && typeof api.editor);
+        } catch (e) {
+          globalThis.__ijFindMonacoInjected = false;
+          return 'err:' + (e && e.message ? e.message : String(e)).slice(0, 300);
+        }
+      })()
+    `;
+    try {
+      const result = await this.evalInWindow(winId, guarded);
+      const elapsed = Date.now() - t0;
+      this.log.appendLine(`Monaco inject win=${winId} (${elapsed}ms): ${String(result).slice(0, 200)}`);
+      if (String(result).startsWith('ok') || result === 'already') {
+        this.monacoInjectedWindows.add(winId);
+      }
+    } catch (err) {
+      this.log.appendLine(`Monaco inject exception: ${err instanceof Error ? err.message : err}`);
     }
   }
 
@@ -391,6 +443,11 @@ export class OverlayPanel {
       const uri = vscode.Uri.parse(uriStr);
       const doc = await vscode.workspace.openTextDocument(uri);
       const pos = new vscode.Position(Math.max(0, line), Math.max(0, column));
+      // Open in Beside; the renderer immediately hides that editor-group
+      // container so the user never sees a new column/tab. We steal the
+      // monaco widget out of the hidden group. The widget shares VSCode's
+      // TextModel, so edits in our preview propagate to any tab the user
+      // already has open on the same file (and vice-versa).
       await vscode.window.showTextDocument(doc, {
         viewColumn: vscode.ViewColumn.Beside,
         preserveFocus,

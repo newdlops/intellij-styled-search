@@ -92,7 +92,8 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p ./",
+    "bundle:monaco": "node scripts/bundleMonaco.js",
+    "compile": "npm run bundle:monaco && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile"
   },
@@ -100,6 +101,8 @@
     "@types/node": "^18.0.0",
     "@types/vscode": "^1.75.0",
     "@types/ws": "^8.5.10",
+    "esbuild": "^0.21.0",
+    "monaco-editor": "^0.52.0",
     "typescript": "^5.0.0"
   },
   "dependencies": {
