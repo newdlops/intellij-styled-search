@@ -11,8 +11,11 @@ type RendererEvent =
   | { type: 'openFile'; uri: string; line: number; column: number }
   | { type: 'previewFile'; uri: string; line: number; column: number }
   | { type: 'requestPreview'; uri: string; line: number; ranges?: MatchRange[]; contextLines: number }
+  | { type: 'openInSideEditor'; uri: string; line: number; column: number }
+  | { type: 'pinInSideEditor'; uri: string; line: number; column: number }
   | { type: 'requestHover'; reqId: number; uri: string; line: number; column: number; x: number; y: number }
   | { type: 'runCommand'; command: string; args: unknown[] }
+  | { type: 'saveFile'; uri: string; content: string }
   | { type: 'log'; msg: string };
 
 type PreviewLine = { lineNumber: number; text: string };
@@ -374,9 +377,57 @@ export class OverlayPanel {
       case 'openFile': void this.openFile(evt.uri, evt.line, evt.column, false); break;
       case 'previewFile': void this.openFile(evt.uri, evt.line, evt.column, true); break;
       case 'requestPreview': void this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges); break;
+      case 'openInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, true, true); break;
+      case 'pinInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, false, false); break;
       case 'requestHover': void this.sendHover(evt.reqId, evt.uri, evt.line, evt.column, evt.x, evt.y); break;
       case 'runCommand': void this.runHoverCommand(evt.command, evt.args); break;
+      case 'saveFile': void this.saveFile(evt.uri, evt.content); break;
       case 'log': this.log.appendLine(`[renderer] ${evt.msg}`); break;
+    }
+  }
+
+  private async openInSideEditor(uriStr: string, line: number, column: number, preview: boolean, preserveFocus: boolean) {
+    try {
+      const uri = vscode.Uri.parse(uriStr);
+      const doc = await vscode.workspace.openTextDocument(uri);
+      const pos = new vscode.Position(Math.max(0, line), Math.max(0, column));
+      await vscode.window.showTextDocument(doc, {
+        viewColumn: vscode.ViewColumn.Beside,
+        preserveFocus,
+        preview,
+        selection: new vscode.Range(pos, pos),
+      });
+    } catch (err) {
+      this.log.appendLine(`openInSideEditor failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  private async saveFile(uriStr: string, content: string) {
+    try {
+      const uri = vscode.Uri.parse(uriStr);
+      // Use a WorkspaceEdit so VSCode's edit pipeline tracks the change (undo
+      // history, dirty state on any open editor, etc). Fall back to direct
+      // fs.writeFile if applyEdit fails.
+      const doc = await vscode.workspace.openTextDocument(uri);
+      const fullRange = new vscode.Range(
+        doc.positionAt(0),
+        doc.positionAt(doc.getText().length),
+      );
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(uri, fullRange, content);
+      const ok = await vscode.workspace.applyEdit(edit);
+      if (ok) {
+        const refreshed = await vscode.workspace.openTextDocument(uri);
+        await refreshed.save();
+      } else {
+        await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+      }
+      vscode.window.setStatusBarMessage(
+        `IJ Find: saved ${vscode.workspace.asRelativePath(uri)}`, 2000,
+      );
+    } catch (err) {
+      this.log.appendLine(`saveFile failed: ${err instanceof Error ? err.message : err}`);
+      vscode.window.showErrorMessage(`Save failed: ${err instanceof Error ? err.message : err}`);
     }
   }
 

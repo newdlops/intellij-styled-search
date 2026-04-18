@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV12) { return 'already patched'; }
-  window.__ijFindPatchedV12 = true;
+  if (window.__ijFindPatchedV20) { return 'already patched'; }
+  window.__ijFindPatchedV20 = true;
 
   function send(payload) {
     try { globalThis.irSearchEvent(JSON.stringify(payload)); } catch (e) {}
@@ -216,6 +216,48 @@ export function getRendererPatchScript(): string {
     '  user-select: none;',
     '}',
     '.ij-find-preview-text { flex: 1 1 auto; min-width: 0; }',
+    // Host element for the embedded Monaco editor. Monaco needs a sized box.
+    '.ij-find-monaco-host {',
+    '  flex: 1 1 auto; width: 100%; height: 100%; min-height: 0; overflow: hidden;',
+    '}',
+    '.ij-find-modified-dot {',
+    '  display: inline-block; width: 8px; height: 8px;',
+    '  margin-right: 6px; border-radius: 50%;',
+    '  background: var(--vscode-editorWarning-foreground, #cca700);',
+    '  vertical-align: middle;',
+    '  visibility: hidden;',
+    '}',
+    '.ij-find-modified .ij-find-modified-dot { visibility: visible; }',
+    '.ij-find-edit-btn {',
+    '  background: transparent; border: 1px solid var(--vscode-widget-border, #555);',
+    '  color: inherit; cursor: pointer;',
+    '  font-size: 11px; padding: 1px 8px;',
+    '  border-radius: 3px; margin-left: auto;',
+    '}',
+    '.ij-find-edit-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)); }',
+    // Placeholder shown in the original editor group while we hold its editor.
+    '.ij-find-editor-placeholder {',
+    '  width: 100%; height: 100%;',
+    '  background: var(--vscode-editor-background, #1e1e1e);',
+    '  display: flex; align-items: center; justify-content: center;',
+    '  color: var(--vscode-descriptionForeground, #9d9d9d);',
+    '  font-size: 11px;',
+    '  font-family: var(--vscode-font-family, system-ui);',
+    '}',
+    '.ij-find-editor-placeholder::after {',
+    '  content: "(viewing in search preview)";',
+    '  opacity: 0.6;',
+    '}',
+    '.ij-find-edit-textarea {',
+    '  width: 100%; height: 100%;',
+    '  border: 0; outline: none; resize: none;',
+    '  padding: 6px 10px;',
+    '  background: var(--vscode-editor-background, #1e1e1e);',
+    '  color: var(--vscode-editor-foreground, #d4d4d4);',
+    '  font-family: var(--vscode-editor-font-family, monospace);',
+    '  font-size: 12px; line-height: 18px;',
+    '  white-space: pre; tab-size: 4;',
+    '}',
 
     // Token classes for our fallback regex tokenizer.
     '.ij-tk-keyword { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); }',
@@ -308,7 +350,9 @@ export function getRendererPatchScript(): string {
   var $results = el('div', { className: 'ij-find-results', attrs: { tabindex: '0' } });
   var $splitter = el('div', { className: 'ij-find-splitter', title: 'Drag to resize' });
 
-  var $previewHeader = el('div', { className: 'ij-find-preview-header', text: '' });
+  var $modifiedDot = el('span', { className: 'ij-find-modified-dot', title: 'Unsaved changes' });
+  var $previewPath = el('span', { className: 'ij-find-preview-path', text: '' });
+  var $previewHeader = el('div', { className: 'ij-find-preview-header', children: [$modifiedDot, $previewPath] });
   var $previewBody = el('div', { className: 'ij-find-preview-body' });
   var $preview = el('div', { className: 'ij-find-preview', children: [$previewHeader, $previewBody] });
 
@@ -336,6 +380,21 @@ export function getRendererPatchScript(): string {
     hoverReqId: 0,
     hoverTimer: null,
     lastHoverKey: '',
+    monacoEditor: null,        // monaco.editor.IStandaloneCodeEditor
+    monacoHost: null,          // div hosting the editor
+    monacoChangeListener: null,
+    previewMode: '',           // 'monaco' | 'stolen' | 'dom'
+    lastPreviewMsg: null,
+    editing: false,
+    editTextarea: null,
+    // DOM-move ("stolen editor") state: we physically relocate a real VSCode
+    // editor instance into our preview pane. All editor features (LSP hover,
+    // intellisense, undo, everything) come for free.
+    stolenEditor: null,        // the .editor-instance / .monaco-editor root we moved
+    stolenEditorOrigParent: null,
+    stolenEditorOrigNextSibling: null,
+    stolenEditorPlaceholder: null,
+    stolenEditorUri: '',
   };
 
   function setStatus(text, spinning) {
@@ -382,8 +441,14 @@ export function getRendererPatchScript(): string {
   }
 
   function clearPreview() {
-    $previewHeader.textContent = '';
-    clearChildren($previewBody);
+    $previewPath.textContent = '';
+    $preview.classList.remove('ij-find-modified');
+    if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
+      // Keep editor in memory; just blank out its model contents.
+      try { state.monacoEditor.setValue(''); } catch (e) {}
+    } else {
+      clearChildren($previewBody);
+    }
     state.lastPreviewKey = '';
     state.previewUri = '';
     state.previewLanguageId = '';
@@ -445,10 +510,18 @@ export function getRendererPatchScript(): string {
     var fm = state.flat[flatIdx];
     var f = state.files[fm.fi];
     var m = f.matches[fm.mi];
+    var col = (m.ranges && m.ranges[0]) ? m.ranges[0].start : 0;
     var key = f.uri + '#' + m.line;
     if (key === state.lastPreviewKey) { return; }
     state.lastPreviewKey = key;
+    // Quick read-only context in our overlay's preview pane.
     send({ type: 'requestPreview', uri: f.uri, line: m.line, ranges: m.ranges, contextLines: 0 });
+    // Also open the file in a real VSCode editor in the column beside our
+    // overlay. preserveFocus keeps arrow-key navigation in the search input;
+    // preview tab so iterating matches reuses one editor tab. The user can
+    // immediately click into that editor and edit with full VSCode features
+    // (intellisense, hover, save, jump-to-def, etc.) — no Edit button needed.
+    send({ type: 'openInSideEditor', uri: f.uri, line: m.line, column: col });
   }
 
   function openActive() {
@@ -457,7 +530,8 @@ export function getRendererPatchScript(): string {
     var f = state.files[fm.fi];
     var m = f.matches[fm.mi];
     var col = (m.ranges && m.ranges[0]) ? m.ranges[0].start : 0;
-    send({ type: 'openFile', uri: f.uri, line: m.line, column: col });
+    // Pin as a regular tab and move focus into the editor for editing.
+    send({ type: 'pinInSideEditor', uri: f.uri, line: m.line, column: col });
   }
 
   function triggerSearch() {
@@ -615,64 +689,294 @@ export function getRendererPatchScript(): string {
     else if (e.altKey && (e.key === 'r' || e.key === 'R')) { e.preventDefault(); toggleOpt('useRegex', $optRegex); }
   });
 
-  // ── Monaco access (best effort) ──────────────────────────────────────
+  // ── Monaco access (aggressive multi-path probe) ─────────────────────
+  //
+  // VSCode's renderer loads monaco to render every open editor, but recent
+  // builds (ESM + bundled) hide it from \`globalThis.monaco\` / the AMD
+  // \`require\`. We try several paths:
+  //
+  //   1. Direct globals: \`monaco\`, \`window.monaco\`, \`self.monaco\`.
+  //   2. AMD loaders: \`window.require\`, \`globalThis.require\`,
+  //      \`AMDLoader.global.require\`, \`globalThis.webPackChunkFn\`, etc.
+  //   3. Node-integration \`require\` (if nodeIntegration=true in this window).
+  //   4. \`__webpack_require__\` — late ESM bundles sometimes expose it.
+  //   5. DOM walk: find an existing \`.monaco-editor\` in the workbench and
+  //      extract its widget/model/service references from attached props,
+  //      then reconstruct the monaco namespace from there.
+  //
+  // Each attempt logs what it tried so an unresolved environment can be
+  // diagnosed from the output channel.
   var monacoState = { tried: false, api: null, source: '' };
+
   function findMonacoSync() {
-    if (typeof monaco !== 'undefined' && monaco && monaco.editor && typeof monaco.editor.colorize === 'function') {
-      return { api: monaco, source: 'global monaco' };
+    try { if (typeof monaco !== 'undefined' && monaco && monaco.editor && typeof monaco.editor.create === 'function') { return { api: monaco, source: 'global monaco' }; } } catch (e) {}
+    try { if (window.monaco && window.monaco.editor && typeof window.monaco.editor.create === 'function') { return { api: window.monaco, source: 'window.monaco' }; } } catch (e) {}
+    try { if (self.monaco && self.monaco.editor && typeof self.monaco.editor.create === 'function') { return { api: self.monaco, source: 'self.monaco' }; } } catch (e) {}
+    try { if (globalThis.monaco && globalThis.monaco.editor && typeof globalThis.monaco.editor.create === 'function') { return { api: globalThis.monaco, source: 'globalThis.monaco' }; } } catch (e) {}
+    return null;
+  }
+
+  function collectLoaders() {
+    var loaders = [];
+    var candidates = [
+      { get: function () { return window.require; }, src: 'window.require' },
+      { get: function () { return globalThis.require; }, src: 'globalThis.require' },
+      { get: function () { return self.require; }, src: 'self.require' },
+      { get: function () { return globalThis.AMDLoader && globalThis.AMDLoader.global && globalThis.AMDLoader.global.require; }, src: 'AMDLoader.global.require' },
+      { get: function () { return globalThis._VSCODE_AMDLOADER && globalThis._VSCODE_AMDLOADER.require; }, src: '_VSCODE_AMDLOADER.require' },
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+      try {
+        var fn = candidates[i].get();
+        if (typeof fn === 'function') { loaders.push({ fn: fn, src: candidates[i].src }); }
+      } catch (e) {}
     }
-    if (window.monaco && window.monaco.editor && typeof window.monaco.editor.colorize === 'function') {
-      return { api: window.monaco, source: 'window.monaco' };
+    return loaders;
+  }
+
+  function tryMonacoViaDom() {
+    try {
+      var editors = document.querySelectorAll('.monaco-editor');
+      if (editors.length === 0) { return null; }
+      // VSCode / Monaco don't advertise a stable DOM hook, but some builds do
+      // attach the widget via a private key. Walk own props looking for the
+      // signature of a code editor widget (getModel + getDomNode).
+      for (var i = 0; i < editors.length; i++) {
+        var el = editors[i];
+        var keys;
+        try { keys = Object.keys(el); } catch (e) { keys = []; }
+        for (var p in el) { if (keys.indexOf(p) < 0) { keys.push(p); } }
+        for (var k = 0; k < keys.length; k++) {
+          var key = keys[k];
+          var value;
+          try { value = el[key]; } catch (e) { continue; }
+          if (!value || typeof value !== 'object') { continue; }
+          if (typeof value.getModel === 'function' && typeof value.getDomNode === 'function') {
+            send({ type: 'log', msg: 'DOM editor widget found on property "' + key + '"' });
+            return { widget: value, domEl: el };
+          }
+        }
+      }
+    } catch (e) {
+      send({ type: 'log', msg: 'DOM monaco probe error: ' + (e && e.message) });
     }
     return null;
   }
+
+  function buildApiFromWidget(widget) {
+    // Given a CodeEditorWidget instance, try to reach the editor factory / Uri
+    // class via the prototype chain or its model.
+    try {
+      var model = widget.getModel();
+      // model.uri likely an instance of monaco.Uri. Its prototype chain has
+      // static factory methods we can poke at.
+      if (model && model.uri) {
+        // The model knows its originating monaco namespace via internal
+        // references; but they are version-specific. Log what we can see so
+        // we can tailor the next attempt.
+        var modelProto = Object.getPrototypeOf(model);
+        var uriProto = Object.getPrototypeOf(model.uri);
+        send({ type: 'log', msg: 'widget.getModel() proto keys: ' + Object.getOwnPropertyNames(modelProto || {}).slice(0, 30).join(',') });
+        send({ type: 'log', msg: 'model.uri proto keys: ' + Object.getOwnPropertyNames(uriProto || {}).slice(0, 30).join(',') });
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function probeReport() {
+    var report = {};
+    try { report.location = String(location.href).slice(0, 200); } catch (e) { report.locationErr = String(e); }
+    try { report.baseURI = String(document.baseURI).slice(0, 200); } catch (e) {}
+    var globalKeys = [];
+    try { for (var k in globalThis) { globalKeys.push(k); } } catch (e) {}
+    report.totalGlobals = globalKeys.length;
+    report.monacoEditorDomCount = document.querySelectorAll('.monaco-editor').length;
+    var interesting = globalKeys.filter(function (k) { return /monaco|vs|editor|workbench|loader|amd|require|webpack|_VSCODE/i.test(k); });
+    report.interesting = interesting.slice(0, 40);
+    // Capture the shape of promising globals.
+    try {
+      if (typeof vscode !== 'undefined') {
+        report.vscodeKeys = Object.keys(vscode).slice(0, 30);
+        // Also prototype keys (contextBridge usually puts methods on proto).
+        try {
+          var proto = Object.getPrototypeOf(vscode);
+          if (proto) { report.vscodeProtoKeys = Object.getOwnPropertyNames(proto).slice(0, 30); }
+        } catch (e) {}
+      }
+    } catch (e) {}
+    try { report.vscodeFileRoot = String(globalThis._VSCODE_FILE_ROOT).slice(0, 200); } catch (e) {}
+    try {
+      if (typeof globalThis.MonacoPerformanceMarks !== 'undefined') {
+        var mpm = globalThis.MonacoPerformanceMarks;
+        if (Array.isArray(mpm)) { report.perfMarksCount = mpm.length; }
+        else if (typeof mpm === 'object' && mpm !== null) { report.perfMarksKeys = Object.keys(mpm).slice(0, 20); }
+      }
+    } catch (e) {}
+    report.typeof = {
+      monaco: typeof monaco,
+      require: typeof require,
+      process: typeof process,
+      module: typeof module,
+      __webpack_require__: typeof __webpack_require__,
+      __dirname: typeof __dirname,
+    };
+    // Dynamic import availability — check indirectly (can't reference \`import\`
+    // as an identifier in a script without triggering a SyntaxError).
+    try {
+      (0, eval)('import("about:blank").catch(function(){})');
+      report.dynamicImport = 'expression-parsed';
+    } catch (e) { report.dynamicImport = 'syntax-err:' + (e && e.message || '').slice(0, 80); }
+    // First few script sources to see actual module paths.
+    try {
+      var scripts = document.querySelectorAll('script');
+      var srcs = [];
+      for (var s = 0; s < scripts.length && srcs.length < 8; s++) {
+        var src = scripts[s].getAttribute('src') || scripts[s].getAttribute('data-src');
+        if (src) { srcs.push(src.slice(0, 150)); }
+      }
+      report.scripts = srcs;
+    } catch (e) {}
+    return JSON.stringify(report).slice(0, 2500);
+  }
+  window.__ijFindProbe = probeReport;
+
   function ensureMonaco(cb) {
     if (monacoState.tried) { cb(monacoState.api); return; }
+    // Path 1: direct global lookup.
     var sync = findMonacoSync();
     if (sync) {
       monacoState.api = sync.api; monacoState.source = sync.source; monacoState.tried = true;
       send({ type: 'log', msg: 'monaco found via ' + sync.source });
       cb(sync.api); return;
     }
-    var loaders = [];
-    try { if (typeof window.require === 'function') { loaders.push({ fn: window.require, src: 'window.require' }); } } catch (e) {}
-    try { if (typeof globalThis.require === 'function') { loaders.push({ fn: globalThis.require, src: 'globalThis.require' }); } } catch (e) {}
-    try {
-      if (globalThis.AMDLoader && globalThis.AMDLoader.global && typeof globalThis.AMDLoader.global.require === 'function') {
-        loaders.push({ fn: globalThis.AMDLoader.global.require, src: 'AMDLoader.global.require' });
-      }
-    } catch (e) {}
-    if (loaders.length === 0) {
-      monacoState.tried = true;
-      send({ type: 'log', msg: 'monaco probe: no loader (require/AMDLoader)' });
-      cb(null); return;
-    }
-    var idx = 0;
-    function tryNext() {
-      if (idx >= loaders.length) {
-        monacoState.tried = true;
-        send({ type: 'log', msg: 'monaco probe: all loaders failed' });
-        cb(null); return;
-      }
-      var entry = loaders[idx++];
-      try {
-        entry.fn(['vs/editor/editor.main'], function () {
-          var found = findMonacoSync();
-          if (found) {
-            monacoState.api = found.api; monacoState.source = entry.src + ' -> ' + found.source; monacoState.tried = true;
-            send({ type: 'log', msg: 'monaco loaded via ' + monacoState.source });
-            cb(found.api);
-          } else { tryNext(); }
-        }, function (err) {
-          send({ type: 'log', msg: 'loader ' + entry.src + ' failed: ' + (err && err.message ? err.message : String(err)).slice(0, 120) });
+    send({ type: 'log', msg: 'monaco probe report: ' + probeReport() });
+    // Path 2: AMD/loader require.
+    var loaders = collectLoaders();
+    send({ type: 'log', msg: 'monaco loaders tried: ' + loaders.map(function (l) { return l.src; }).join(', ') });
+    if (loaders.length > 0) {
+      var idx = 0;
+      var tryNext = function () {
+        if (idx >= loaders.length) { tryNodeRequire(); return; }
+        var entry = loaders[idx++];
+        try {
+          entry.fn(['vs/editor/editor.main'], function () {
+            var found = findMonacoSync();
+            if (found) {
+              monacoState.api = found.api; monacoState.source = entry.src + ' → ' + found.source; monacoState.tried = true;
+              send({ type: 'log', msg: 'monaco loaded via ' + monacoState.source });
+              cb(found.api);
+            } else { tryNext(); }
+          }, function (err) {
+            send({ type: 'log', msg: 'loader ' + entry.src + ' rejected: ' + String(err && err.message ? err.message : err).slice(0, 150) });
+            tryNext();
+          });
+        } catch (e) {
+          send({ type: 'log', msg: 'loader ' + entry.src + ' threw: ' + (e && e.message) });
           tryNext();
-        });
-      } catch (e) {
-        send({ type: 'log', msg: 'loader ' + entry.src + ' threw: ' + (e && e.message)});
-        tryNext();
-      }
+        }
+      };
+      tryNext();
+      return;
     }
-    tryNext();
+    tryDynamicImports();
+    function tryDynamicImports() {
+      // Path 2.5: dynamic ESM import. Recent VSCode builds (electron-browser
+      // sandbox + ESM) don't expose a loader, but the module files are still
+      // served over the \`vscode-file://\` scheme. Try several candidate URLs
+      // derived from document.baseURI and \`_VSCODE_FILE_ROOT\`.
+      var candidates = [];
+      try {
+        // Resolve up from out/vs/code/electron-browser/workbench/workbench.html
+        // to the \`out/\` directory (4 levels up), then to vs/editor/editor.main.
+        candidates.push(new URL('../../../../vs/editor/editor.main.js', document.baseURI).href);
+        candidates.push(new URL('../../../../vs/editor/editor.api.js', document.baseURI).href);
+        candidates.push(new URL('../../../../vs/editor/editor.main.mjs', document.baseURI).href);
+      } catch (e) {}
+      try {
+        var root = globalThis._VSCODE_FILE_ROOT;
+        if (typeof root === 'string' && root) {
+          // \`_VSCODE_FILE_ROOT\` is the app's \`out\` path. Build a \`vscode-file://\` URL.
+          var prefix = 'vscode-file://vscode-app';
+          candidates.push(prefix + root + '/vs/editor/editor.main.js');
+          candidates.push(prefix + root + '/vs/editor/editor.api.js');
+          candidates.push(prefix + root + '/vs/editor/editor.main.mjs');
+        }
+      } catch (e) {}
+      // Deduplicate
+      var seen = {}, uniq = [];
+      for (var ci = 0; ci < candidates.length; ci++) { if (!seen[candidates[ci]]) { seen[candidates[ci]] = 1; uniq.push(candidates[ci]); } }
+      send({ type: 'log', msg: 'dynamic import candidates: ' + JSON.stringify(uniq) });
+      if (uniq.length === 0) { tryNodeRequire(); return; }
+      var ci2 = 0;
+      function nextImport() {
+        if (ci2 >= uniq.length) { tryNodeRequire(); return; }
+        var url = uniq[ci2++];
+        try {
+          var p = (0, eval)('import(' + JSON.stringify(url) + ')');
+          Promise.resolve(p).then(function (mod) {
+            var keys = [];
+            try { keys = mod ? Object.keys(mod) : []; } catch (e) {}
+            send({ type: 'log', msg: 'import OK url=' + url + ' keys=' + keys.slice(0, 25).join(',') });
+            // Preferred: after import, global \`monaco\` should exist.
+            var sync = findMonacoSync();
+            if (sync) {
+              monacoState.api = sync.api; monacoState.source = 'dynamicImport(' + url + ') → ' + sync.source; monacoState.tried = true;
+              send({ type: 'log', msg: 'monaco loaded via ' + monacoState.source });
+              cb(sync.api);
+              return;
+            }
+            // Fallback: the module namespace might itself expose the API.
+            if (mod && mod.editor && typeof mod.editor.create === 'function') {
+              monacoState.api = mod; monacoState.source = 'dynamicImport(' + url + ') module namespace'; monacoState.tried = true;
+              send({ type: 'log', msg: 'monaco loaded from import namespace of ' + url });
+              cb(mod);
+              return;
+            }
+            nextImport();
+          }).catch(function (err) {
+            send({ type: 'log', msg: 'import rejected url=' + url + ' err=' + String(err && err.message || err).slice(0, 200) });
+            nextImport();
+          });
+        } catch (e) {
+          send({ type: 'log', msg: 'import threw url=' + url + ' err=' + (e && e.message) });
+          nextImport();
+        }
+      }
+      nextImport();
+    }
+    function tryNodeRequire() {
+      // Path 3: Node-integrated require (if nodeIntegration=true for the
+      // workbench window). Electron exposes \`require\` as a CJS wrapper-level
+      // function; some VSCode versions leave this enabled.
+      try {
+        if (typeof require === 'function') {
+          send({ type: 'log', msg: 'node require available, attempting require("vs/editor/editor.main")' });
+          try {
+            require('vs/editor/editor.main');
+            var found = findMonacoSync();
+            if (found) {
+              monacoState.api = found.api; monacoState.source = 'node require'; monacoState.tried = true;
+              send({ type: 'log', msg: 'monaco loaded via node require' });
+              cb(found.api);
+              return;
+            }
+          } catch (e) { send({ type: 'log', msg: 'node require("vs/editor/editor.main") threw: ' + (e && e.message).toString().slice(0, 200) }); }
+        }
+      } catch (e) {}
+      tryDom();
+    }
+    function tryDom() {
+      // Path 4: walk existing .monaco-editor DOM for widget/model handles.
+      var domHit = tryMonacoViaDom();
+      if (domHit) {
+        buildApiFromWidget(domHit.widget);
+        // Even without a full monaco namespace we can expose what we have.
+        monacoState.source = 'DOM widget';
+      }
+      monacoState.tried = true;
+      send({ type: 'log', msg: 'monaco probe: all loaders failed (final)' });
+      cb(null);
+    }
   }
 
   // ── Lightweight regex tokenizer fallback ─────────────────────────────
@@ -808,9 +1112,271 @@ export function getRendererPatchScript(): string {
   }
 
   function renderPreview(msg) {
-    $previewHeader.textContent = msg.relPath || msg.uri;
+    state.lastPreviewMsg = msg;
+    $previewPath.textContent = msg.relPath || msg.uri;
     state.previewUri = msg.uri;
     state.previewLanguageId = msg.languageId || '';
+    $preview.classList.remove('ij-find-modified');
+    ensureMonaco(function (api) {
+      if (api) {
+        try { renderPreviewMonaco(api, msg); return; }
+        catch (e) { send({ type: 'log', msg: 'renderPreviewMonaco threw: ' + (e && e.message) }); }
+      }
+      // Try DOM-move of a real VSCode editor first (gives the user full LSP
+      // features inside our preview pane), fall back to static DOM rendering.
+      attemptStealVscodeEditor(msg, function (stolen) {
+        if (stolen) { state.previewMode = 'stolen'; return; }
+        renderPreviewDOM(msg);
+      });
+    });
+  }
+
+  // ── Steal real VSCode editor DOM ─────────────────────────────────────
+  //
+  // When Monaco isn't directly accessible, we fall back to reparenting an
+  // actual editor that VSCode has already created for this file. The editor
+  // keeps all its wiring (language services, model, undo stack) because
+  // internal references are to the DOM element itself — we're only moving it
+  // to a different parent.
+  //
+  // On the next match selection we restore the previously stolen editor to
+  // its original place and steal the new one.
+
+  function filenameFromUri(uri) {
+    try {
+      var noQuery = String(uri).split('?')[0].split('#')[0];
+      return decodeURIComponent(noQuery.split('/').pop());
+    } catch (e) { return ''; }
+  }
+
+  function findVscodeEditorDom(uri) {
+    var filename = filenameFromUri(uri);
+    if (!filename) { return null; }
+    // Look at editor-group tabs; the one whose label matches our filename
+    // and is in an .editor-group-container points at the editor we want.
+    var labels = document.querySelectorAll('.editor-group-container .tab .monaco-icon-label .label-name, .editor-group-container .tab .tab-label');
+    for (var i = 0; i < labels.length; i++) {
+      var label = labels[i];
+      var txt = (label.textContent || '').trim();
+      if (txt === filename || txt.split('/').pop() === filename) {
+        var group = label.closest('.editor-group-container');
+        if (!group) { continue; }
+        // The editor body lives in .editor-container .monaco-editor (or .editor-instance).
+        var body = group.querySelector('.editor-container');
+        if (body) { return body; }
+        var monacoEl = group.querySelector('.monaco-editor');
+        if (monacoEl) { return monacoEl.parentElement || monacoEl; }
+      }
+    }
+    // Fallback: last-added .monaco-editor that's inside an .editor-group-container.
+    var all = document.querySelectorAll('.editor-group-container .monaco-editor');
+    if (all.length > 0) { return all[all.length - 1].parentElement || all[all.length - 1]; }
+    return null;
+  }
+
+  function restoreStolenEditor() {
+    if (!state.stolenEditor || !state.stolenEditorOrigParent) { return; }
+    try {
+      if (state.stolenEditorPlaceholder && state.stolenEditorPlaceholder.parentNode) {
+        state.stolenEditorPlaceholder.parentNode.replaceChild(state.stolenEditor, state.stolenEditorPlaceholder);
+      } else if (state.stolenEditorOrigNextSibling && state.stolenEditorOrigNextSibling.parentNode === state.stolenEditorOrigParent) {
+        state.stolenEditorOrigParent.insertBefore(state.stolenEditor, state.stolenEditorOrigNextSibling);
+      } else {
+        state.stolenEditorOrigParent.appendChild(state.stolenEditor);
+      }
+      // Trigger relayout.
+      try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+    } catch (e) { send({ type: 'log', msg: 'restoreStolenEditor err: ' + (e && e.message) }); }
+    state.stolenEditor = null;
+    state.stolenEditorOrigParent = null;
+    state.stolenEditorOrigNextSibling = null;
+    state.stolenEditorPlaceholder = null;
+    state.stolenEditorUri = '';
+  }
+
+  function stealEditorIntoPreview(editorEl, uri) {
+    if (!editorEl || !editorEl.parentNode) { return false; }
+    // If already showing this editor, nothing to do.
+    if (state.stolenEditor === editorEl && state.stolenEditorUri === uri) { return true; }
+    // Restore any previously-stolen editor first.
+    if (state.stolenEditor) { restoreStolenEditor(); }
+    state.stolenEditor = editorEl;
+    state.stolenEditorOrigParent = editorEl.parentNode;
+    state.stolenEditorOrigNextSibling = editorEl.nextSibling;
+    state.stolenEditorUri = uri;
+    // Leave a placeholder so the original group keeps its layout slot.
+    var placeholder = document.createElement('div');
+    placeholder.className = 'ij-find-editor-placeholder';
+    placeholder.style.width = '100%'; placeholder.style.height = '100%';
+    state.stolenEditorPlaceholder = placeholder;
+    state.stolenEditorOrigParent.replaceChild(placeholder, editorEl);
+    // Put it into our preview pane, sized to fill.
+    clearChildren($previewBody);
+    editorEl.style.width = '100%';
+    editorEl.style.height = '100%';
+    editorEl.style.position = 'relative';
+    $previewBody.appendChild(editorEl);
+    try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+    return true;
+  }
+
+  function attemptStealVscodeEditor(msg, cb) {
+    // The file has just been opened in a side editor by the extension.
+    // Poll up to ~800ms for its DOM to appear, then move it.
+    var attempts = 0;
+    function tick() {
+      var dom = findVscodeEditorDom(msg.uri);
+      if (dom) {
+        var ok = stealEditorIntoPreview(dom, msg.uri);
+        send({ type: 'log', msg: 'steal editor ' + (ok ? 'OK' : 'FAIL') + ' attempts=' + attempts + ' dom=' + (dom.tagName + '.' + (dom.className || '').slice(0, 40)) });
+        cb(ok);
+        return;
+      }
+      attempts++;
+      if (attempts > 40) {
+        send({ type: 'log', msg: 'steal editor: no DOM found after ' + attempts + ' attempts' });
+        cb(false);
+        return;
+      }
+      setTimeout(tick, 20);
+    }
+    tick();
+  }
+
+
+  function ensureMonacoEditor(api) {
+    if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
+      send({ type: 'log', msg: 'reusing existing monaco editor' });
+      return state.monacoEditor;
+    }
+    clearChildren($previewBody);
+    var host = el('div', { className: 'ij-find-monaco-host' });
+    $previewBody.appendChild(host);
+    var hostRect = host.getBoundingClientRect();
+    send({ type: 'log', msg: 'monaco host created rect=' + Math.round(hostRect.width) + 'x' + Math.round(hostRect.height) + ' parentRect=' + Math.round($previewBody.getBoundingClientRect().width) + 'x' + Math.round($previewBody.getBoundingClientRect().height) });
+    state.monacoHost = host;
+    var editor;
+    try {
+      editor = api.editor.create(host, {
+        automaticLayout: true,
+        readOnly: false,
+        minimap: { enabled: false },
+        scrollBeyondLastLine: false,
+        lineNumbers: 'on',
+        glyphMargin: false,
+        folding: true,
+        contextmenu: true,
+        fontSize: 12,
+        renderLineHighlight: 'all',
+        occurrencesHighlight: true,
+      });
+      send({ type: 'log', msg: 'monaco.editor.create OK editorType=' + typeof editor + ' hasGetModel=' + (editor && typeof editor.getModel === 'function') });
+    } catch (e) {
+      send({ type: 'log', msg: 'monaco.editor.create THREW: ' + (e && e.message) });
+      throw e;
+    }
+    state.monacoEditor = editor;
+    try {
+      editor.addCommand(api.KeyMod.CtrlCmd | api.KeyCode.KeyS, function () {
+        var ed = state.monacoEditor;
+        var model = ed && ed.getModel();
+        if (!model || !state.previewUri) {
+          send({ type: 'log', msg: 'save skipped: no model or uri' });
+          return;
+        }
+        var content = model.getValue();
+        send({ type: 'log', msg: 'Cmd+S pressed; saving uri=' + state.previewUri + ' bytes=' + content.length });
+        send({ type: 'saveFile', uri: state.previewUri, content: content });
+        $preview.classList.remove('ij-find-modified');
+      });
+      send({ type: 'log', msg: 'save command registered' });
+    } catch (e) {
+      send({ type: 'log', msg: 'addCommand THREW: ' + (e && e.message) });
+    }
+    return editor;
+  }
+
+  function renderPreviewMonaco(api, msg) {
+    state.previewMode = 'monaco';
+    var editor = ensureMonacoEditor(api);
+    var fullText = msg.lines.map(function (l) { return l.text; }).join('\\n');
+    var fileUri;
+    try { fileUri = api.Uri.parse(msg.uri); }
+    catch (e) { send({ type: 'log', msg: 'Uri.parse threw: ' + (e && e.message) + ' uri=' + msg.uri }); return; }
+    var model = null;
+    try { model = api.editor.getModel(fileUri); }
+    catch (e) { send({ type: 'log', msg: 'getModel threw: ' + (e && e.message) }); }
+    if (model) {
+      send({ type: 'log', msg: 'reused existing model lang=' + (model.getLanguageId ? model.getLanguageId() : '?') + ' lines=' + model.getLineCount() });
+    } else {
+      try {
+        model = api.editor.createModel(fullText, msg.languageId || 'plaintext', fileUri);
+        send({ type: 'log', msg: 'createModel OK lang=' + (msg.languageId || 'plaintext') });
+      }
+      catch (e) {
+        send({ type: 'log', msg: 'createModel(uri) threw: ' + (e && e.message) + ' — trying anonymous' });
+        try {
+          model = api.editor.createModel(fullText, msg.languageId || 'plaintext');
+          send({ type: 'log', msg: 'createModel anonymous OK' });
+        }
+        catch (e2) {
+          send({ type: 'log', msg: 'createModel anonymous THREW: ' + (e2 && e2.message) });
+          return;
+        }
+      }
+    }
+    if (msg.languageId && model.getLanguageId && model.getLanguageId() !== msg.languageId) {
+      try { api.editor.setModelLanguage(model, msg.languageId); } catch (e) {}
+    }
+    try {
+      editor.setModel(model);
+      send({ type: 'log', msg: 'editor.setModel OK; readOnly=' + (editor.getOption ? editor.getOption(api.editor.EditorOption ? api.editor.EditorOption.readOnly : 81) : '?') });
+    } catch (e) {
+      send({ type: 'log', msg: 'setModel threw: ' + (e && e.message) });
+      return;
+    }
+
+    if (state.monacoChangeListener) { try { state.monacoChangeListener.dispose(); } catch (e) {} }
+    state.monacoChangeListener = model.onDidChangeContent(function (ev) {
+      $preview.classList.add('ij-find-modified');
+    });
+    send({ type: 'log', msg: 'change listener attached' });
+
+    // Reveal focus line and place caret at first match.
+    var focusLine = msg.focusLine + 1; // monaco is 1-indexed
+    var col = (msg.ranges && msg.ranges[0]) ? msg.ranges[0].start + 1 : 1;
+    try {
+      editor.revealLineInCenter(focusLine, 0);
+      editor.setPosition({ lineNumber: focusLine, column: col });
+    } catch (e) {}
+    // Briefly highlight the search match using Monaco decorations.
+    try {
+      var ranges = (msg.ranges || []).map(function (r) {
+        return new api.Range(focusLine, r.start + 1, focusLine, r.end + 1);
+      });
+      if (state.monacoMatchDecos) { state.monacoMatchDecos = editor.deltaDecorations(state.monacoMatchDecos, []); }
+      if (ranges.length === 0) {
+        ranges = [new api.Range(focusLine, 1, focusLine, model.getLineMaxColumn(focusLine))];
+      }
+      state.monacoMatchDecos = editor.deltaDecorations([], ranges.map(function (range, idx) {
+        return {
+          range: range,
+          options: {
+            inlineClassName: idx === 0 && msg.ranges && msg.ranges.length > 0 ? 'findMatch currentFindMatch' : 'findMatch',
+            className: 'rangeHighlight',
+            isWholeLine: !(msg.ranges && msg.ranges.length > 0),
+          },
+        };
+      }));
+    } catch (e) {}
+  }
+
+  function renderPreviewDOM(msg) {
+    state.previewMode = 'dom';
+    // If we previously hosted Monaco, detach it.
+    if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
+      try { state.monacoHost.parentElement.removeChild(state.monacoHost); } catch (e) {}
+    }
     clearChildren($previewBody);
     var focusEl = null;
     var frag = document.createDocumentFragment();
@@ -823,7 +1389,6 @@ export function getRendererPatchScript(): string {
       });
       lineEl.appendChild(el('span', { className: 'ij-find-preview-lineno', text: String(line.lineNumber + 1) }));
       var textSpan = el('span', { className: 'ij-find-preview-text' });
-      // Initial pass: search-range highlight on focus, fallback regex tokenizer for the rest.
       if (isFocus && msg.ranges && msg.ranges.length > 0) {
         appendHighlightedInto(textSpan, line.text, msg.ranges);
       } else if (!fallbackHighlight(textSpan, line.text, state.previewLanguageId)) {
@@ -834,17 +1399,6 @@ export function getRendererPatchScript(): string {
       if (isFocus) { focusEl = lineEl; }
     }
     $previewBody.appendChild(frag);
-
-    // Async upgrade with monaco if we can reach it (replaces tokenization).
-    if (state.previewLanguageId) {
-      var lineEls = $previewBody.querySelectorAll('.ij-find-preview-line');
-      var fullText = msg.lines.map(function (l) { return l.text; }).join('\\n');
-      ensureMonaco(function (api) {
-        if (!api) { return; }
-        applyMonacoFullText(api, fullText, state.previewLanguageId, lineEls);
-      });
-    }
-
     if (focusEl) {
       setTimeout(function () { try { focusEl.scrollIntoView({ block: 'center' }); } catch (e) {} }, 0);
     }
@@ -1194,6 +1748,9 @@ export function getRendererPatchScript(): string {
 
   $previewBody.addEventListener('mousemove', function (e) {
     if (!state.previewUri) { return; }
+    // In Monaco mode, the embedded editor handles hover natively via VSCode
+    // language services — don't double-show a custom tooltip.
+    if (state.previewMode === 'monaco') { return; }
     cancelHoverHide();
     if (state.hoverTimer) { clearTimeout(state.hoverTimer); }
     state.hoverTimer = setTimeout(function () {
@@ -1255,6 +1812,8 @@ export function getRendererPatchScript(): string {
     panel.style.removeProperty('pointer-events');
     panel.style.removeProperty('z-index');
     panel.style.removeProperty('position');
+    // Return any stolen VSCode editor to its editor group.
+    if (state.stolenEditor) { restoreStolenEditor(); }
     hideHover();
     send({ type: 'cancel' });
   };
@@ -1262,13 +1821,35 @@ export function getRendererPatchScript(): string {
     try {
       var r = panel.getBoundingClientRect();
       var cs = getComputedStyle(panel);
+      // Deeper probe of possible Monaco access paths.
+      var globalKeys = [];
+      try {
+        for (var k in globalThis) {
+          if (/monaco|amd|loader|workbench|_VSCODE/i.test(k)) { globalKeys.push(k); }
+          if (globalKeys.length > 30) { break; }
+        }
+      } catch (e) {}
+      var domEditors = document.querySelectorAll('.monaco-editor');
+      var firstEditorProps = [];
+      if (domEditors.length > 0) {
+        for (var p in domEditors[0]) {
+          if (typeof domEditors[0][p] === 'object' && domEditors[0][p] !== null) {
+            if (/editor|widget|controller|context/i.test(p)) { firstEditorProps.push(p); }
+          }
+          if (firstEditorProps.length > 20) { break; }
+        }
+      }
       return 'inDom=' + document.body.contains(panel) +
         ' disp=' + cs.display +
         ' z=' + cs.zIndex +
         ' rect=' + Math.round(r.x) + ',' + Math.round(r.y) + ',' + Math.round(r.width) + 'x' + Math.round(r.height) +
         ' monacoGlobal=' + (typeof monaco !== 'undefined') +
         ' windowRequire=' + (typeof window.require) +
-        ' AMDLoader=' + (typeof globalThis.AMDLoader);
+        ' AMDLoader=' + (typeof globalThis.AMDLoader) +
+        ' MonacoEnv=' + (typeof globalThis.MonacoEnvironment) +
+        ' globalCandidates=[' + globalKeys.join(',') + ']' +
+        ' domEditors=' + domEditors.length +
+        ' firstEditorProps=[' + firstEditorProps.join(',') + ']';
     } catch (e) { return 'status-err: ' + (e && e.message); }
   };
   window.__ijFindOnMessage = function (msg) {
