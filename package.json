@@ -1,0 +1,103 @@
+{
+  "name": "intellij-styled-search",
+  "displayName": "IntelliJ Styled Search",
+  "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
+  "version": "0.1.0",
+  "publisher": "newdlops",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "search",
+    "find in path",
+    "intellij",
+    "peek",
+    "project search"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "intellijStyledSearch.searchInProject",
+        "title": "Find in Path (IntelliJ Style)",
+        "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.searchSelection",
+        "title": "Find Selection in Project",
+        "category": "IntelliJ Search"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "intellijStyledSearch.searchSelection",
+        "key": "ctrl+shift+alt+f",
+        "mac": "cmd+shift+alt+f",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "intellijStyledSearch.searchInProject",
+        "key": "ctrl+shift+alt+p",
+        "mac": "cmd+shift+alt+p"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "intellijStyledSearch.searchSelection",
+          "when": "editorHasSelection",
+          "group": "navigation@99"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "IntelliJ Styled Search",
+      "properties": {
+        "intellijStyledSearch.excludeGlobs": {
+          "type": "array",
+          "default": [
+            "**/node_modules/**",
+            "**/.git/**",
+            "**/out/**",
+            "**/dist/**",
+            "**/build/**",
+            "**/.next/**",
+            "**/coverage/**"
+          ],
+          "description": "Glob patterns to exclude from search."
+        },
+        "intellijStyledSearch.maxFileSize": {
+          "type": "number",
+          "default": 1048576,
+          "description": "Maximum file size (bytes) to include in search."
+        },
+        "intellijStyledSearch.maxResults": {
+          "type": "number",
+          "default": 2000,
+          "description": "Maximum number of match lines to return."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.75.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
