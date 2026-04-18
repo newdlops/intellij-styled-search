@@ -1,12 +1,452 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV29) { return 'already patched'; }
-  window.__ijFindPatchedV29 = true;
+  if (window.__ijFindPatchedV43) { return 'already patched'; }
+  window.__ijFindPatchedV43 = true;
 
   function send(payload) {
     try { globalThis.irSearchEvent(JSON.stringify(payload)); } catch (e) {}
   }
+
+  // ── Capture VSCode internals via prototype interception ─────────────
+  // Monkey-patch Map.set / WeakMap.set / Set.add briefly right after patch
+  // install. VSCode stores widgets and services in native Map/WeakMap
+  // containers internally; anything that gets .set() in and matches one of
+  // the duck-typed signatures is captured for later use. Patches are
+  // self-removing after 30s so the overhead disappears once we have what
+  // we need (or if capture turned up empty).
+  // Always restart capture on patch load — stale captures from a previous
+  // extension-host session (renderer persists across Dev Host reloads)
+  // reference disposed widgets and we want fresh services anyway.
+  try { if (window.__ijFindStopCapture) { window.__ijFindStopCapture(); } } catch (e) {}
+  window.__ijFindCaptures = {
+    widgets: [],       // { v, src, key }  — CodeEditorWidget-like
+    services: [],      // { v, src, key, kind } — DI / editor / model services
+    widgetCtors: [],   // unique widget constructors we saw
+    serviceMaps: [],   // Map instances that stored a service (likely ServiceCollection)
+  };
+  window.__ijFindCaptureInstalled = false;
+  if (!window.__ijFindCaptureInstalled) {
+    window.__ijFindCaptureInstalled = true;
+    var caps = window.__ijFindCaptures;
+    var capturing = true;
+    function stringifyKey(k) {
+      try {
+        if (k === null || k === undefined) { return String(k); }
+        if (typeof k === 'string') { return k.length > 60 ? k.slice(0, 60) + '…' : k; }
+        if (typeof k === 'number' || typeof k === 'boolean') { return String(k); }
+        return typeof k;
+      } catch (e) { return '?'; }
+    }
+    function sniff(v, src, k) {
+      if (!capturing) { return null; }
+      if (!v || typeof v !== 'object') { return null; }
+      try {
+        if (typeof v.layout === 'function' && typeof v.getModel === 'function' && typeof v.getDomNode === 'function') {
+          if (caps.widgets.length < 50) {
+            caps.widgets.push({ v: v, src: src, key: stringifyKey(k) });
+          }
+          var ctor = v.constructor;
+          if (ctor && caps.widgetCtors.indexOf(ctor) < 0 && caps.widgetCtors.length < 10) {
+            caps.widgetCtors.push(ctor);
+          }
+          return 'widget';
+        }
+      } catch (e) {}
+      try {
+        if (typeof v.createInstance === 'function' && typeof v.invokeFunction === 'function') {
+          if (caps.services.length < 40) {
+            caps.services.push({ v: v, src: src, key: stringifyKey(k), kind: 'IInstantiationService' });
+          }
+          return 'service';
+        }
+      } catch (e) {}
+      try {
+        if (typeof v.listCodeEditors === 'function' || typeof v.getActiveCodeEditor === 'function') {
+          if (caps.services.length < 40) {
+            caps.services.push({ v: v, src: src, key: stringifyKey(k), kind: 'ICodeEditorService' });
+          }
+          return 'service';
+        }
+      } catch (e) {}
+      try {
+        if (typeof v.createModel === 'function' && typeof v.getModel === 'function' && typeof v.getModels === 'function') {
+          if (caps.services.length < 40) {
+            caps.services.push({ v: v, src: src, key: stringifyKey(k), kind: 'IModelService' });
+          }
+          return 'service';
+        }
+      } catch (e) {}
+      return null;
+    }
+    var origMapSet = Map.prototype.set;
+    Map.prototype.set = function (k, v) {
+      try {
+        var kind = sniff(v, 'Map.set', k);
+        if (kind === 'service' && caps.serviceMaps.indexOf(this) < 0 && caps.serviceMaps.length < 6) {
+          caps.serviceMaps.push(this);
+        }
+      } catch (e) {}
+      return origMapSet.call(this, k, v);
+    };
+    var origWeakMapSet = WeakMap.prototype.set;
+    WeakMap.prototype.set = function (k, v) {
+      try { sniff(v, 'WeakMap.set', k); } catch (e) {}
+      return origWeakMapSet.call(this, k, v);
+    };
+    var origSetAdd = Set.prototype.add;
+    Set.prototype.add = function (v) {
+      try { sniff(v, 'Set.add', null); } catch (e) {}
+      return origSetAdd.call(this, v);
+    };
+    var origArrayPush = Array.prototype.push;
+    Array.prototype.push = function () {
+      try {
+        for (var i = 0; i < arguments.length; i++) {
+          sniff(arguments[i], 'Array.push', i);
+        }
+      } catch (e) {}
+      return origArrayPush.apply(this, arguments);
+    };
+    // Hook Reflect.construct so that whenever any \`new X(...)\` runs via
+    // VSCode's DI container, we get the actual class X. Duck-test its
+    // prototype — if it has layout/getModel/getDomNode there, it's the
+    // widget class (or a subclass). Record distinct constructors.
+    var origReflectConstruct = Reflect.construct;
+    Reflect.construct = function (target, args, newTarget) {
+      try {
+        if (capturing && target && target.prototype) {
+          var p = target.prototype;
+          if (typeof p.layout === 'function' &&
+              typeof p.getModel === 'function' &&
+              typeof p.getDomNode === 'function') {
+            if (caps.widgetCtors.indexOf(target) < 0 && caps.widgetCtors.length < 20) {
+              caps.widgetCtors.push(target);
+            }
+          }
+        }
+      } catch (e) {}
+      return origReflectConstruct.apply(Reflect, arguments);
+    };
+    window.__ijFindStopCapture = function () {
+      if (!capturing) { return 'already-stopped'; }
+      capturing = false;
+      try { Map.prototype.set = origMapSet; } catch (e) {}
+      try { WeakMap.prototype.set = origWeakMapSet; } catch (e) {}
+      try { Set.prototype.add = origSetAdd; } catch (e) {}
+      try { Array.prototype.push = origArrayPush; } catch (e) {}
+      try { Reflect.construct = origReflectConstruct; } catch (e) {}
+      // Summarise.
+      var uniqKinds = {};
+      for (var i = 0; i < caps.services.length; i++) { uniqKinds[caps.services[i].kind] = (uniqKinds[caps.services[i].kind] || 0) + 1; }
+      send({ type: 'log', msg: 'Capture done: widgets=' + caps.widgets.length + ' services=' + JSON.stringify(uniqKinds) + ' ctors=' + caps.widgetCtors.length });
+      for (var j = 0; j < caps.services.length && j < 8; j++) {
+        var s = caps.services[j];
+        send({ type: 'log', msg: 'svc[' + s.kind + '] via ' + s.src + ' key=' + s.key });
+      }
+      return 'stopped:w=' + caps.widgets.length + ':s=' + caps.services.length;
+    };
+    // No auto-stop — extension controls the lifecycle via CDP. Patches
+    // stay installed until __ijFindStopCapture is explicitly invoked.
+  }
+
+  // ── Standalone widget creation experiment (V36) ─────────────────────
+  // Uses the captured IInstantiationService + widget constructor to try
+  // creating a real monaco CodeEditorWidget rooted at a host div of our
+  // choosing — without opening any editor group or tab. Logs everything
+  // and briefly shows the widget for visual confirmation.
+  // ── Preview integration helpers ────────────────────────────────────
+  // Once __ijFindMonaco is populated (by the diagnostic's test widget
+  // succeeding), renderPreview can spin up a real CodeEditorWidget rooted
+  // in our overlay's preview pane. Services are borrowed from the widget
+  // that was already alive in VSCode — theme / font / extensions all come
+  // through automatically.
+  window.__ijFindCreatePreviewEditor = function (host) {
+    var m = window.__ijFindMonaco;
+    if (!m || !m.ctor || !m.inst) { return null; }
+    try {
+      var editor = m.inst.createInstance(m.ctor, host, {
+        automaticLayout: true,
+        readOnly: false,
+        minimap: { enabled: false },
+        scrollBeyondLastLine: false,
+        renderLineHighlight: 'all',
+      }, m.widgetOptions);
+      return editor;
+    } catch (e) {
+      send({ type: 'log', msg: 'createPreviewEditor err: ' + (e && e.message) });
+      return null;
+    }
+  };
+  window.__ijFindSetPreviewContent = function (editor, content, languageId) {
+    var m = window.__ijFindMonaco;
+    if (!m || !m.modelSvc || !editor) { return false; }
+    try {
+      var model = m.modelSvc.createModel(content || '', languageId || 'plaintext');
+      var old = editor.getModel && editor.getModel();
+      editor.setModel(model);
+      if (old && old.dispose && old !== model) { try { old.dispose(); } catch (e) {} }
+      return true;
+    } catch (e) {
+      send({ type: 'log', msg: 'setPreviewContent err: ' + (e && e.message) });
+      return false;
+    }
+  };
+
+  window.__ijFindTestCreateWidget = function () {
+    var caps = window.__ijFindCaptures;
+    if (!caps || !caps.services || caps.services.length === 0) {
+      return 'no-services-captured';
+    }
+    var report = [];
+
+    // Filter widgets to those whose getModel() actually returns a Model with
+    // a uri — those are REAL editor widgets, not DI stubs / no-op proxies.
+    var realWidgets = [];
+    for (var wi = 0; wi < caps.widgets.length; wi++) {
+      var cap = caps.widgets[wi];
+      var vv = cap.v;
+      try {
+        var m = vv.getModel && vv.getModel();
+        var uri = m && m.uri && (m.uri.toString ? m.uri.toString() : String(m.uri));
+        var tag = '';
+        try { var d = vv.getDomNode && vv.getDomNode(); if (d && d.tagName) { tag = d.tagName; } } catch (e) {}
+        if (uri && uri !== '?') {
+          realWidgets.push({ v: vv, src: cap.src, key: cap.key, uri: uri, tag: tag });
+        }
+      } catch (e) {}
+    }
+    report.push('captured widgets total=' + caps.widgets.length + ' real=' + realWidgets.length);
+    report.push('widgetCtors=' + caps.widgetCtors.length + ' serviceMaps=' + caps.serviceMaps.length);
+
+    // 1. Candidates: constructors captured, plus proto chain of any real widget.
+    var candidates = [];
+    for (var i = 0; i < caps.widgetCtors.length; i++) {
+      var c = caps.widgetCtors[i];
+      candidates.push({ ctor: c, src: 'captured[' + i + ']' });
+    }
+    var w0 = (realWidgets[0] && realWidgets[0].v) || (caps.widgets[0] && caps.widgets[0].v);
+    if (realWidgets.length > 0) {
+      report.push('real[0] uri=' + realWidgets[0].uri.slice(0, 100) + ' tag=' + realWidgets[0].tag);
+    }
+    if (w0) {
+      try {
+        var p = Object.getPrototypeOf(w0);
+        var depth = 0;
+        while (p && depth < 8) {
+          var keys = [];
+          try { keys = Object.getOwnPropertyNames(p); } catch (e) {}
+          var hasL = keys.indexOf('layout') >= 0;
+          var hasM = keys.indexOf('getModel') >= 0;
+          var hasD = keys.indexOf('getDomNode') >= 0;
+          var ctorName = '?';
+          try { ctorName = (p.constructor && p.constructor.name) || '?'; } catch (e) {}
+          report.push('proto[' + depth + '] ctor=' + ctorName + ' hasLGD=' + hasL + '/' + hasM + '/' + hasD + ' keys=' + keys.slice(0, 30).join(','));
+          if (hasL && hasM && hasD) {
+            try {
+              if (p.constructor && candidates.every(function (ce) { return ce.ctor !== p.constructor; })) {
+                candidates.push({ ctor: p.constructor, src: 'proto[' + depth + '].constructor' });
+              }
+            } catch (e) {}
+          }
+          p = Object.getPrototypeOf(p);
+          depth++;
+        }
+      } catch (e) { report.push('proto walk err: ' + e.message); }
+    }
+
+    // 2. Log real info from the captured widget so we know what we're looking at.
+    if (w0) {
+      try {
+        var model = w0.getModel && w0.getModel();
+        if (model) {
+          var uri = (model.uri && model.uri.toString) ? model.uri.toString() : '?';
+          var lang = (model.getLanguageId && model.getLanguageId()) || '?';
+          report.push('widget[0].model uri=' + uri.slice(0, 100) + ' lang=' + lang);
+        } else { report.push('widget[0].getModel()=null'); }
+      } catch (e) { report.push('getModel err: ' + e.message); }
+      try {
+        var dom = w0.getDomNode && w0.getDomNode();
+        if (dom) {
+          report.push('widget[0].dom tag=' + dom.tagName + ' class=' + (dom.className || '').slice(0, 80));
+        }
+      } catch (e) { report.push('getDomNode err: ' + e.message); }
+    }
+
+    // 3. Describe candidate ctors (kind, name, source preview).
+    for (var ci = 0; ci < candidates.length; ci++) {
+      var cc = candidates[ci];
+      var nm = '?';
+      try { nm = cc.ctor && cc.ctor.name || '?'; } catch (e) {}
+      var ss = '';
+      try { ss = String(cc.ctor).slice(0, 80).replace(/\\s+/g, ' '); } catch (e) {}
+      report.push('cand[' + ci + '] from=' + cc.src + ' name=' + nm + ' src=' + ss);
+    }
+
+    // 4. Find an IInstantiationService from widget[0] if possible (same
+    //    services tree as the widget — safest choice).
+    var inst = caps.services[0].v;
+    try {
+      if (w0) {
+        var keysW = Object.getOwnPropertyNames(w0);
+        for (var ki = 0; ki < keysW.length; ki++) {
+          var fv;
+          try { fv = w0[keysW[ki]]; } catch (e) { continue; }
+          if (fv && typeof fv === 'object' &&
+              typeof fv.createInstance === 'function' &&
+              typeof fv.invokeFunction === 'function') {
+            inst = fv;
+            report.push('using widget[0].' + keysW[ki] + ' as IInstantiationService');
+            break;
+          }
+        }
+      }
+    } catch (e) {}
+
+    // 5. Create a visible host and try each candidate.
+    var host = document.createElement('div');
+    host.className = 'ij-find-test-widget-host';
+    host.style.cssText = [
+      'position: fixed',
+      'top: 80px',
+      'left: 40px',
+      'width: 640px',
+      'height: 360px',
+      'background: var(--vscode-editor-background, #1e1e1e)',
+      'border: 2px solid #ff5d00',
+      'z-index: 2147483600',
+      'box-shadow: 0 10px 40px rgba(0,0,0,0.5)',
+    ].join(';') + ';';
+    document.body.appendChild(host);
+
+    var testOptions = {
+      value: 'const x = 42;',
+      language: 'javascript',
+      automaticLayout: true,
+      readOnly: false,
+      theme: 'vs-dark',
+    };
+    var widgetOptions = { isSimpleWidget: false, contributions: [] };
+
+    var createdEditor = null;
+    for (var cj = 0; cj < candidates.length && !createdEditor; cj++) {
+      var Ctor = candidates[cj].ctor;
+      var srcLabel = candidates[cj].src;
+      // Try: createInstance(Ctor, host, opts), createInstance(..., widgetOpts), new Ctor(host, opts), new Ctor(host, opts, widgetOpts)
+      var attempts = [
+        { fn: function (C) { return inst.createInstance(C, host, testOptions); }, label: 'createInstance(host,opts)' },
+        { fn: function (C) { return inst.createInstance(C, host, testOptions, widgetOptions); }, label: 'createInstance(host,opts,wo)' },
+        { fn: function (C) { return new C(host, testOptions); }, label: 'new(host,opts)' },
+        { fn: function (C) { return new C(host, testOptions, widgetOptions); }, label: 'new(host,opts,wo)' },
+      ];
+      for (var aa = 0; aa < attempts.length && !createdEditor; aa++) {
+        try {
+          var ed = attempts[aa].fn(Ctor);
+          if (ed && typeof ed === 'object') {
+            createdEditor = ed;
+            report.push('OK ' + srcLabel + ' ' + attempts[aa].label + ' → ' + (ed.constructor && ed.constructor.name));
+            break;
+          }
+        } catch (e) {
+          report.push('ERR ' + srcLabel + ' ' + attempts[aa].label + ' : ' + String(e && e.message || e).slice(0, 160));
+        }
+      }
+    }
+
+    if (!createdEditor) {
+      try { document.body.removeChild(host); } catch (e) {}
+      return report.join(' | ');
+    }
+
+    // ── Persist captured services so renderPreview can create real
+    // monaco widgets long after capture stops ─────────────────────────
+    var winnerCtor = null;
+    for (var cw = 0; cw < candidates.length; cw++) {
+      if (createdEditor && createdEditor.constructor === candidates[cw].ctor) {
+        winnerCtor = candidates[cw].ctor;
+        break;
+      }
+    }
+    if (!winnerCtor) { winnerCtor = candidates[0] && candidates[0].ctor; }
+    window.__ijFindMonaco = {
+      ctor: winnerCtor,
+      inst: inst,
+      modelSvc: null, // filled below
+      widgetOptions: widgetOptions,
+    };
+
+    // ── Post-create: force proper rendering ───────────────────────────
+    // Widget was constructed, but content likely isn't rendered because the
+    // implicit \`value\` option didn't seed a model in this context. Use the
+    // captured IModelService to create a real TextModel and assign it, then
+    // explicitly call layout() with the host's size.
+    var modelSvc = null;
+    for (var si = 0; si < caps.services.length; si++) {
+      if (caps.services[si].kind === 'IModelService') { modelSvc = caps.services[si].v; break; }
+    }
+    report.push('IModelService found=' + !!modelSvc);
+    window.__ijFindMonaco.modelSvc = modelSvc;
+
+    try {
+      var currentModel = createdEditor.getModel && createdEditor.getModel();
+      report.push('before model: ' + (currentModel ? 'has model uri=' + (currentModel.uri && currentModel.uri.toString && currentModel.uri.toString().slice(0, 80)) : 'null'));
+    } catch (e) { report.push('getModel check err: ' + e.message); }
+
+    if (modelSvc) {
+      try {
+        // Signature typically: createModel(value, languageSelection, resource?, isForSimpleWidget?)
+        // Try with just value + language id string first.
+        var newModel;
+        try {
+          newModel = modelSvc.createModel('const x = 42;\\nconst y = "hello";', 'javascript');
+          report.push('createModel(value,lang) → ' + (newModel && newModel.constructor && newModel.constructor.name));
+        } catch (e1) {
+          report.push('createModel(value,lang) ERR: ' + String(e1 && e1.message || e1).slice(0, 120));
+          try {
+            // Fallback: create without language selection
+            newModel = modelSvc.createModel('const x = 42;');
+            report.push('createModel(value) → ' + (newModel && newModel.constructor && newModel.constructor.name));
+          } catch (e2) {
+            report.push('createModel(value) ERR: ' + String(e2 && e2.message || e2).slice(0, 120));
+          }
+        }
+        if (newModel) {
+          try {
+            createdEditor.setModel(newModel);
+            report.push('setModel OK');
+          } catch (e) { report.push('setModel ERR: ' + String(e && e.message).slice(0, 120)); }
+        }
+      } catch (e) { report.push('modelSvc flow ERR: ' + e.message); }
+    }
+
+    try {
+      var rect = host.getBoundingClientRect();
+      createdEditor.layout({ width: Math.floor(rect.width), height: Math.floor(rect.height) });
+      report.push('layout(' + Math.floor(rect.width) + 'x' + Math.floor(rect.height) + ') called');
+    } catch (e) { report.push('layout ERR: ' + e.message); }
+
+    // Diagnostics about visible content.
+    try {
+      var mdom = createdEditor.getDomNode && createdEditor.getDomNode();
+      var viewLines = mdom && mdom.querySelectorAll && mdom.querySelectorAll('.view-line');
+      var innerLen = mdom && mdom.innerHTML ? mdom.innerHTML.length : 0;
+      report.push('post-render: viewLines=' + (viewLines ? viewLines.length : '?') + ' innerHTML.len=' + innerLen);
+      var m2 = createdEditor.getModel && createdEditor.getModel();
+      if (m2) {
+        report.push('post-render model uri=' + (m2.uri && m2.uri.toString && m2.uri.toString().slice(0, 80)) + ' lineCount=' + (m2.getLineCount && m2.getLineCount()));
+      }
+    } catch (e) { report.push('post-render check ERR: ' + e.message); }
+
+    window.__ijFindTestEditorRef = createdEditor;
+    window.__ijFindTestHostRef = host;
+    setTimeout(function () {
+      try { createdEditor.dispose(); } catch (e) {}
+      try { document.body.removeChild(host); } catch (e) {}
+      send({ type: 'log', msg: 'test widget disposed' });
+    }, 10000);
+
+    return report.join(' | ') + ' | host visible for 10s at (40,80) 640x360';
+  };
 
   function el(tag, opts) {
     var e = document.createElement(tag);
@@ -402,8 +842,11 @@ export function getRendererPatchScript(): string {
     stolenEditorOrigNextSibling: null,
     stolenEditorUri: '',
     stolenEditorWidget: null,  // cached widget reference for .layout() calls
-    stolenGroup: null,         // .editor-group-container to hide
-    stolenGroupOrigDisplay: '',
+    stolenEditorWidgetSearched: false,
+    stolenGroup: null,         // .editor-group-container we shrink to 0
+    stolenGroupOrigStyles: null,
+    previewMonacoEditor: null,
+    previewMonacoHost: null,
   };
 
   function setStatus(text, spinning) {
@@ -487,8 +930,17 @@ export function getRendererPatchScript(): string {
         var textEl = el('span', { className: 'ij-find-row-text' });
         appendHighlightedInto(textEl, m.preview, m.ranges);
 
-        var locText = f.relPath + ':' + (m.line + 1);
-        var locEl = el('span', { className: 'ij-find-row-loc', title: locText, text: locText });
+        // Row shows just the filename; the preview pane already renders the
+        // breadcrumb path, so repeating the full relPath here is redundant.
+        // Full path stays in the title attribute for on-hover disclosure.
+        var slashIdx = f.relPath.lastIndexOf('/');
+        var fileName = slashIdx >= 0 ? f.relPath.slice(slashIdx + 1) : f.relPath;
+        var locText = fileName + ':' + (m.line + 1);
+        var locEl = el('span', {
+          className: 'ij-find-row-loc',
+          title: f.relPath + ':' + (m.line + 1),
+          text: locText,
+        });
 
         frag.appendChild(el('div', {
           className: 'ij-find-row',
@@ -519,18 +971,12 @@ export function getRendererPatchScript(): string {
     var fm = state.flat[flatIdx];
     var f = state.files[fm.fi];
     var m = f.matches[fm.mi];
-    var col = (m.ranges && m.ranges[0]) ? m.ranges[0].start : 0;
     var key = f.uri + '#' + m.line;
     if (key === state.lastPreviewKey) { return; }
     state.lastPreviewKey = key;
-    // Quick read-only context in our overlay's preview pane.
+    // Only refresh the overlay's preview pane; do NOT touch VSCode's editor
+    // area at all. Arrow-key browsing leaves no trace.
     send({ type: 'requestPreview', uri: f.uri, line: m.line, ranges: m.ranges, contextLines: 0 });
-    // Also open the file in a real VSCode editor in the column beside our
-    // overlay. preserveFocus keeps arrow-key navigation in the search input;
-    // preview tab so iterating matches reuses one editor tab. The user can
-    // immediately click into that editor and edit with full VSCode features
-    // (intellisense, hover, save, jump-to-def, etc.) — no Edit button needed.
-    send({ type: 'openInSideEditor', uri: f.uri, line: m.line, column: col });
   }
 
   function openActive() {
@@ -539,7 +985,9 @@ export function getRendererPatchScript(): string {
     var f = state.files[fm.fi];
     var m = f.matches[fm.mi];
     var col = (m.ranges && m.ranges[0]) ? m.ranges[0].start : 0;
-    // Pin as a regular tab and move focus into the editor for editing.
+    // Double-click / Enter — the explicit "open and edit" action. Pins the
+    // file in Beside with focus so the user can edit with all real VSCode
+    // features (intellisense, hover, save, undo, extensions).
     send({ type: 'pinInSideEditor', uri: f.uri, line: m.line, column: col });
   }
 
@@ -1131,15 +1579,81 @@ export function getRendererPatchScript(): string {
     state.previewUri = msg.uri;
     state.previewLanguageId = msg.languageId || '';
     $preview.classList.remove('ij-find-modified');
-    // Primary: steal the real VSCode editor's DOM — full LSP, intellisense,
-    // cmd+click, undo, etc. come for free because it IS the real editor.
-    // Fallback to DOM rendering if the editor isn't in the workbench DOM yet.
-    // (The bundled standalone monaco is kept available for emergencies but
-    // not used by default — it pollutes global CSS / themes.)
-    attemptStealVscodeEditor(msg, function (stolen) {
-      if (stolen) { state.previewMode = 'stolen'; return; }
+    var m = window.__ijFindMonaco;
+    send({ type: 'log', msg: 'renderPreview uri=' + (msg.relPath || msg.uri).slice(0, 80) +
+      ' hasMonaco=' + (!!m) +
+      ' ctor=' + (!!(m && m.ctor)) +
+      ' inst=' + (!!(m && m.inst)) +
+      ' modelSvc=' + (!!(m && m.modelSvc)) });
+    if (m && m.ctor && m.inst) {
+      try { renderPreviewMonacoReal(msg); return; }
+      catch (e) { send({ type: 'log', msg: 'renderPreviewMonacoReal threw: ' + (e && e.message) }); }
+    }
+    send({ type: 'log', msg: 'renderPreview: DOM fallback' });
+    renderPreviewDOM(msg);
+  }
+
+  function renderPreviewMonacoReal(msg) {
+    var fullText = (msg.lines || []).map(function (l) { return l.text; }).join('\\n');
+    var lang = msg.languageId || 'plaintext';
+    send({ type: 'log', msg: 'monacoReal lines=' + (msg.lines ? msg.lines.length : 0) + ' lang=' + lang + ' reuse=' + !!(state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody) });
+    // Reuse existing widget if it's still mounted in our preview body.
+    if (state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody) {
+      var ok = window.__ijFindSetPreviewContent(state.previewMonacoEditor, fullText, lang);
+      send({ type: 'log', msg: 'monacoReal reuse setModel=' + ok });
+      if (ok) {
+        try { state.previewMonacoEditor.revealLineInCenter(msg.focusLine + 1); } catch (e) {}
+        try {
+          var rect = state.previewMonacoHost.getBoundingClientRect();
+          state.previewMonacoEditor.layout({ width: Math.floor(rect.width), height: Math.floor(rect.height) });
+        } catch (e) {}
+        state.previewMode = 'monaco';
+        return;
+      }
+    }
+    clearChildren($previewBody);
+    $previewBody.classList.add('ij-find-editor-mounted');
+    var host = document.createElement('div');
+    host.className = 'ij-find-monaco-preview-host';
+    host.style.cssText = 'width:100%;height:100%;overflow:hidden;';
+    $previewBody.appendChild(host);
+    var hostRect = host.getBoundingClientRect();
+    send({ type: 'log', msg: 'monacoReal host rect=' + Math.round(hostRect.width) + 'x' + Math.round(hostRect.height) });
+    var editor = window.__ijFindCreatePreviewEditor(host);
+    send({ type: 'log', msg: 'monacoReal createPreviewEditor → ' + (editor ? 'OK ' + (editor.constructor && editor.constructor.name) : 'null') });
+    if (!editor) {
+      try { $previewBody.removeChild(host); } catch (e) {}
+      $previewBody.classList.remove('ij-find-editor-mounted');
       renderPreviewDOM(msg);
-    });
+      return;
+    }
+    state.previewMonacoEditor = editor;
+    state.previewMonacoHost = host;
+    state.previewMode = 'monaco';
+    var setOk = window.__ijFindSetPreviewContent(editor, fullText, lang);
+    send({ type: 'log', msg: 'monacoReal setPreviewContent=' + setOk });
+    try {
+      var r2 = host.getBoundingClientRect();
+      editor.layout({ width: Math.floor(r2.width), height: Math.floor(r2.height) });
+    } catch (e) {}
+    try { editor.revealLineInCenter(msg.focusLine + 1); } catch (e) {}
+    // Post-render check
+    try {
+      var vl = editor.getDomNode && editor.getDomNode() && editor.getDomNode().querySelectorAll('.view-line');
+      send({ type: 'log', msg: 'monacoReal rendered viewLines=' + (vl ? vl.length : '?') });
+    } catch (e) {}
+  }
+
+  function disposePreviewMonacoEditor() {
+    if (state.previewMonacoEditor) {
+      try { state.previewMonacoEditor.dispose(); } catch (e) {}
+    }
+    if (state.previewMonacoHost && state.previewMonacoHost.parentElement) {
+      try { state.previewMonacoHost.parentElement.removeChild(state.previewMonacoHost); } catch (e) {}
+    }
+    state.previewMonacoEditor = null;
+    state.previewMonacoHost = null;
+    $previewBody.classList.remove('ij-find-editor-mounted');
   }
 
   // ── Steal real VSCode editor DOM ─────────────────────────────────────
@@ -1265,13 +1779,12 @@ export function getRendererPatchScript(): string {
     var h = Math.max(40, Math.floor(rect.height));
     state.stolenEditor.style.width = w + 'px';
     state.stolenEditor.style.height = h + 'px';
-    var widget = state.stolenEditorWidget;
-    if (!widget) {
-      widget = findMonacoWidget(state.stolenEditor);
-      state.stolenEditorWidget = widget;
+    if (!state.stolenEditorWidget && !state.stolenEditorWidgetSearched) {
+      state.stolenEditorWidget = findMonacoWidget(state.stolenEditor);
+      state.stolenEditorWidgetSearched = true;
     }
-    if (widget && typeof widget.layout === 'function') {
-      try { widget.layout({ width: w, height: h }); } catch (e) {}
+    if (state.stolenEditorWidget && typeof state.stolenEditorWidget.layout === 'function') {
+      try { state.stolenEditorWidget.layout({ width: w, height: h }); } catch (e) {}
     }
   }
 
@@ -1286,10 +1799,22 @@ export function getRendererPatchScript(): string {
       } else {
         state.stolenEditorOrigParent.appendChild(state.stolenEditor);
       }
-      // Return the source group to its original visibility so any user
-      // tabs that happened to share that column reappear.
-      if (state.stolenGroup) {
-        state.stolenGroup.style.display = state.stolenGroupOrigDisplay || '';
+      // Restore the source group's size so any tabs in that column reappear.
+      if (state.stolenGroup && state.stolenGroupOrigStyles) {
+        var g = state.stolenGroup;
+        var s = state.stolenGroupOrigStyles;
+        g.style.flex = s.groupFlex || '';
+        g.style.minWidth = s.groupMinWidth || '';
+        g.style.minHeight = s.groupMinHeight || '';
+        g.style.overflow = s.groupOverflow || '';
+        g.style.width = s.groupWidth || '';
+        g.style.height = s.groupHeight || '';
+        if (s.split) {
+          s.split.style.flex = s.splitFlex || '';
+          s.split.style.minWidth = s.splitMinWidth || '';
+          s.split.style.overflow = s.splitOverflow || '';
+          s.split.style.width = s.splitWidth || '';
+        }
       }
     } catch (e) { send({ type: 'log', msg: 'restoreStolenEditor err: ' + (e && e.message) }); }
     $previewBody.classList.remove('ij-find-stolen');
@@ -1298,8 +1823,9 @@ export function getRendererPatchScript(): string {
     state.stolenEditorOrigNextSibling = null;
     state.stolenEditorUri = '';
     state.stolenEditorWidget = null;
+    state.stolenEditorWidgetSearched = false;
     state.stolenGroup = null;
-    state.stolenGroupOrigDisplay = '';
+    state.stolenGroupOrigStyles = null;
   }
 
   function stealEditorIntoPreview(editorEl, uri) {
@@ -1311,18 +1837,43 @@ export function getRendererPatchScript(): string {
     if (state.stolenEditor) { restoreStolenEditor(); }
     state.stolenEditor = editorEl;
     state.stolenEditorWidget = null;
+    state.stolenEditorWidgetSearched = false;
     state.stolenEditorOrigParent = editorEl.parentNode;
     state.stolenEditorOrigNextSibling = editorEl.nextSibling;
     state.stolenEditorUri = uri;
-    // Hide the source .editor-group-container entirely so the user never
-    // sees a new column or tab appear — preview is invisible to VSCode's
-    // editor UI. The widget inside still lives (we're moving it, not
-    // disposing), so it keeps sharing VSCode's TextModel.
+    // Shrink the source .editor-group-container (and its split-view-view
+    // wrapper if any) to zero width without removing it from flex flow.
+    // VSCode's split-view layout stays consistent — no corrupted sibling
+    // styles on restore — and the group is visually invisible while we hold
+    // its monaco editor.
     var group = editorEl.closest ? editorEl.closest('.editor-group-container') : null;
     if (group) {
+      var split = group.closest ? group.closest('.split-view-view') : null;
       state.stolenGroup = group;
-      state.stolenGroupOrigDisplay = group.style.display;
-      group.style.display = 'none';
+      state.stolenGroupOrigStyles = {
+        groupFlex: group.style.flex,
+        groupMinWidth: group.style.minWidth,
+        groupMinHeight: group.style.minHeight,
+        groupOverflow: group.style.overflow,
+        groupWidth: group.style.width,
+        groupHeight: group.style.height,
+        splitFlex: split ? split.style.flex : undefined,
+        splitMinWidth: split ? split.style.minWidth : undefined,
+        splitOverflow: split ? split.style.overflow : undefined,
+        splitWidth: split ? split.style.width : undefined,
+        split: split,
+      };
+      group.style.flex = '0 0 0px';
+      group.style.minWidth = '0';
+      group.style.minHeight = '0';
+      group.style.width = '0';
+      group.style.overflow = 'hidden';
+      if (split) {
+        split.style.flex = '0 0 0px';
+        split.style.minWidth = '0';
+        split.style.overflow = 'hidden';
+        split.style.width = '0';
+      }
     }
     clearChildren($previewBody);
     $previewBody.classList.add('ij-find-stolen');
@@ -1930,6 +2481,8 @@ export function getRendererPatchScript(): string {
     panel.style.removeProperty('position');
     // Return any stolen VSCode editor to its editor group.
     if (state.stolenEditor) { restoreStolenEditor(); }
+    // Tear down preview monaco widget so its GPU/DOM resources are released.
+    disposePreviewMonacoEditor();
     hideHover();
     send({ type: 'cancel' });
   };

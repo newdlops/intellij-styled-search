@@ -4,6 +4,9 @@ import { OverlayPanel } from './overlayPanel';
 export function activate(context: vscode.ExtensionContext) {
   const overlay = OverlayPanel.get(context);
   overlay.logActivation();
+  // Warm CDP + patch install in the background so the first user command
+  // doesn't eat the SIGUSR1 / WebSocket / inject round-trip itself.
+  void overlay.prewarm();
 
   context.subscriptions.push(
     vscode.commands.registerCommand('intellijStyledSearch.searchInProject', () => {

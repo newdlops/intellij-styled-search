@@ -82,6 +82,7 @@ export async function runSearch(
   opts: SearchOptions,
   token: vscode.CancellationToken,
   progress: SearchProgress,
+  candidateUris?: Set<string> | null,
 ): Promise<void> {
   const regex = buildRegex(opts);
   if (!regex) {
@@ -105,6 +106,23 @@ export async function runSearch(
   }
 
   if (token.isCancellationRequested) { return; }
+
+  // When a trigram-index lookup narrowed the search to a candidate set, drop
+  // every file that isn't in it. This is how we turn O(workspace) scans into
+  // O(hits) for typical queries.
+  if (candidateUris) {
+    if (candidateUris.size === 0) {
+      progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
+      return;
+    }
+    files = files.filter((u) => candidateUris.has(u.toString()));
+  }
+
+  // Reorder so results stream back in relevance order:
+  //   1. files the user has open in tabs right now
+  //   2. other user source files, shallower paths first (project root prioritized)
+  //   3. library-looking paths (node_modules, vendor, venv, …) scanned last
+  files = prioritizeFiles(files);
 
   let totalMatches = 0;
   let filesWithMatches = 0;
@@ -168,6 +186,69 @@ function looksBinary(bytes: Uint8Array): boolean {
     if (bytes[i] === 0) { return true; }
   }
   return false;
+}
+
+// Priority groups for streaming order. Lower is searched first.
+//   0: currently open tabs (instant feedback on files the user is editing)
+//   1: user code (not in library-ish paths); sorted by path depth ascending
+//   2: library-ish paths (node_modules, vendor, venv, dist, site-packages, …)
+const LIBRARY_PATH_RE = /(?:^|\/)(?:node_modules|vendor|third_party|deps|bower_components|\.yarn|\.pnp|\.cache|venv|\.venv|env|\.env|site-packages|dist-info|egg-info|Pods|Carthage|target|out|build|dist|coverage|__pycache__)(?:\/|$)/i;
+
+function collectOpenTabUris(): Set<string> {
+  const set = new Set<string>();
+  try {
+    const groups = (vscode.window as any).tabGroups;
+    if (groups && Array.isArray(groups.all)) {
+      for (const group of groups.all) {
+        for (const tab of group.tabs || []) {
+          const input = tab.input;
+          if (input && typeof input === 'object' && 'uri' in input && input.uri) {
+            set.add(input.uri.toString());
+          }
+        }
+      }
+    }
+  } catch {}
+  // Fallback: textDocuments covers everything VSCode has in memory, slightly
+  // broader than open tabs but still a strong relevance signal.
+  try {
+    for (const doc of vscode.workspace.textDocuments) {
+      set.add(doc.uri.toString());
+    }
+  } catch {}
+  return set;
+}
+
+function prioritizeFiles(files: vscode.Uri[]): vscode.Uri[] {
+  const openUris = collectOpenTabUris();
+  const bucketOpen: vscode.Uri[] = [];
+  const bucketUser: Array<{ uri: vscode.Uri; depth: number }> = [];
+  const bucketLib: vscode.Uri[] = [];
+  for (const uri of files) {
+    if (openUris.has(uri.toString())) {
+      bucketOpen.push(uri);
+      continue;
+    }
+    const rel = vscode.workspace.asRelativePath(uri, false);
+    if (LIBRARY_PATH_RE.test('/' + rel)) {
+      bucketLib.push(uri);
+    } else {
+      bucketUser.push({ uri, depth: countSlashes(rel) });
+    }
+  }
+  bucketUser.sort((a, b) => a.depth - b.depth);
+  const out: vscode.Uri[] = new Array(bucketOpen.length + bucketUser.length + bucketLib.length);
+  let i = 0;
+  for (const u of bucketOpen) { out[i++] = u; }
+  for (const e of bucketUser) { out[i++] = e.uri; }
+  for (const u of bucketLib) { out[i++] = u; }
+  return out;
+}
+
+function countSlashes(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) { if (s.charCodeAt(i) === 47) { n++; } }
+  return n;
 }
 
 function scanText(text: string, regex: RegExp, uri: vscode.Uri): FileMatch {
