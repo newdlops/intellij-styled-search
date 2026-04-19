@@ -1,7 +1,13 @@
 import * as vscode from 'vscode';
 import { OverlayPanel } from './overlayPanel';
 
-export function activate(context: vscode.ExtensionContext) {
+/** Shape exposed via `ext.exports` for integration / E2E tests. Plain
+ *  production consumers don't need to touch this. */
+export interface ExtensionTestApi {
+  overlay: OverlayPanel;
+}
+
+export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   const overlay = OverlayPanel.get(context);
   overlay.logActivation();
   // Warm CDP + patch install in the background so the first user command
@@ -42,6 +48,8 @@ export function activate(context: vscode.ExtensionContext) {
       await overlay.diagnoseCurrentFile(query);
     }),
   );
+
+  return { overlay };
 }
 
 export function deactivate() {}

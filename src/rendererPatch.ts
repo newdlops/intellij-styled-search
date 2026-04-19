@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV50) { return 'already patched'; }
-  window.__ijFindPatchedV50 = true;
+  if (window.__ijFindPatchedV52) { return 'already patched'; }
+  window.__ijFindPatchedV52 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -18,6 +18,18 @@ export function getRendererPatchScript(): string {
       globalThis.irSearchEvent(JSON.stringify(payload));
     } catch (e) {}
   }
+
+  // Remove overlay/hover DOM left behind by a previous patch version so
+  // the new install is the ONLY instance in the page. Without this, older
+  // V50 panels accumulate after an extension upgrade and querySelector
+  // calls (including test probes) may hit stale nodes whose state the new
+  // closure no longer owns.
+  try {
+    var stale = document.querySelectorAll('.ij-find-panel, .ij-find-hover-tooltip');
+    for (var si = 0; si < stale.length; si++) {
+      try { stale[si].parentElement && stale[si].parentElement.removeChild(stale[si]); } catch (eRm) {}
+    }
+  } catch (eClean) {}
 
   // ── Capture VSCode internals via prototype interception ─────────────
   // Monkey-patch Map.set / WeakMap.set / Set.add briefly right after patch
@@ -951,7 +963,23 @@ export function getRendererPatchScript(): string {
     hideHover();
   }
 
+  var _renderPending = false;
+  function scheduleRender() {
+    if (_renderPending) { return; }
+    _renderPending = true;
+    requestAnimationFrame(function () {
+      _renderPending = false;
+      render();
+    });
+  }
+
   function render() {
+    // Preserve scroll position across re-renders. rg streams match events
+    // one file at a time; every results:file triggers a render(), and
+    // clearChildren nukes the list's scrollTop back to 0. Without this,
+    // the user watching results stream in sees the list jump back to the
+    // top with every new file.
+    var prevScrollTop = $results.scrollTop;
     clearChildren($results);
     var hasMatches = state.files.length > 0;
     // Pending candidates: show whenever we have them, whether rg is still
@@ -969,16 +997,25 @@ export function getRendererPatchScript(): string {
     }
     state.flat = [];
     var frag = document.createDocumentFragment();
+    // Extension-typing filter: rg is still scanning (or has finished) the
+    // superset query; we narrow each match to the user's current substring.
+    var filterQ = state.filterQuery || '';
+    var filterNeedle = filterQ;
+    if (filterQ && !state.options.caseSensitive) { filterNeedle = filterQ.toLowerCase(); }
     // Confirmed matches first (normal rows, one per match line).
     for (var fi = 0; fi < state.files.length; fi++) {
       var f = state.files[fi];
       for (var mi = 0; mi < f.matches.length; mi++) {
         var m = f.matches[mi];
+        if (filterQ) {
+          var hay = state.options.caseSensitive ? (m.preview || '') : (m.preview || '').toLowerCase();
+          if (hay.indexOf(filterNeedle) < 0) { continue; }
+        }
         var flatIdx = state.flat.length;
         state.flat.push({ fi: fi, mi: mi });
 
         var textEl = el('span', { className: 'ij-find-row-text' });
-        appendHighlightedInto(textEl, m.preview, m.ranges);
+        appendHighlightedInto(textEl, m.preview, rangesForCurrentQuery(m));
 
         var slashIdx = f.relPath.lastIndexOf('/');
         var fileName = slashIdx >= 0 ? f.relPath.slice(slashIdx + 1) : f.relPath;
@@ -1031,6 +1068,9 @@ export function getRendererPatchScript(): string {
       }
     }
     $results.appendChild(frag);
+    // Restore scrollTop BEFORE applyActive — if the active row is off-screen,
+    // applyActive calls scrollIntoView which will still bring it into view.
+    $results.scrollTop = prevScrollTop;
     applyActive();
     setSummary();
   }
@@ -1064,9 +1104,29 @@ export function getRendererPatchScript(): string {
     var key = f.uri + '#' + m.line;
     if (key === state.lastPreviewKey) { return; }
     state.lastPreviewKey = key;
+    // When the user is in extension-typing mode, rg's m.ranges cover the
+    // OLD (shorter) query. The preview should highlight what the user
+    // actually typed (NEW query) — recompute the range against the new
+    // substring so the findMatch decoration lands on the right span.
+    var previewRanges = rangesForCurrentQuery(m);
     // Only refresh the overlay's preview pane; do NOT touch VSCode's editor
     // area at all. Arrow-key browsing leaves no trace.
-    send({ type: 'requestPreview', uri: f.uri, line: m.line, ranges: m.ranges, contextLines: 0 });
+    send({ type: 'requestPreview', uri: f.uri, line: m.line, ranges: previewRanges, contextLines: 0 });
+  }
+
+  // If we're in extension-filter mode, compute single-line ranges for the
+  // user's NEW query against the match preview. Falls back to whatever rg
+  // originally produced when no filter is active (non-extension searches
+  // already have accurate ranges).
+  function rangesForCurrentQuery(m) {
+    var fq = state.filterQuery || '';
+    if (!fq) { return m.ranges; }
+    var preview = m.preview || '';
+    var hay = state.options.caseSensitive ? preview : preview.toLowerCase();
+    var needle = state.options.caseSensitive ? fq : fq.toLowerCase();
+    var idx = hay.indexOf(needle);
+    if (idx < 0) { return m.ranges; }
+    return [{ start: idx, end: idx + fq.length }];
   }
 
   function openActive() {
@@ -1096,11 +1156,56 @@ export function getRendererPatchScript(): string {
     clearPreview();
     if (!q) {
       state.files = []; state.flat = []; state.activeIndex = -1; state.searching = false;
+      state.rgQuery = ''; state.filterQuery = '';
       setStatus('Type a query', false);
       render();
       send({ type: 'cancel' });
       return;
     }
+    // Smart search-cancellation policy (preserves accuracy):
+    //   - Extension (new strictly extends old): the in-flight/finished rg has
+    //     the SUPERSET of matches we need. Don't cancel — just re-filter
+    //     client-side on preview.includes(newQ) so the visible set becomes
+    //     the exact subset for the new query. No wasted rg restart.
+    //   - Backspace / disjoint / multi-line / options change: cancel and
+    //     restart, because client-side substring filter can't reconstruct
+    //     matches we never scanned for (backspace) or can't reliably judge
+    //     multi-line spans.
+    var oldQ = state.rgQuery || '';
+    var oldOpts = state.rgOptions;
+    var optsChanged = !oldOpts ||
+      oldOpts.caseSensitive !== state.options.caseSensitive ||
+      oldOpts.wholeWord !== state.options.wholeWord ||
+      oldOpts.useRegex !== state.options.useRegex;
+    var involvesMultiline = q.indexOf('\\n') >= 0 || oldQ.indexOf('\\n') >= 0;
+    var isExtension = oldQ && q.length > oldQ.length && q.indexOf(oldQ) === 0 &&
+      !optsChanged && !involvesMultiline;
+    if (isExtension) {
+      state.filterQuery = q;
+      render();
+      // Show actual visible match count. state.flat is post-filter, so
+      // state.flat.length is what the user sees. Don't blockade the status
+      // with "Filtering..." — the user has already found what they need
+      // in the list, the background rg scan is just catching extra matches
+      // that may or may not pass the filter.
+      var visibleRows = 0;
+      for (var fk = 0; fk < state.flat.length; fk++) {
+        if (!state.flat[fk].pendingUri) { visibleRows++; }
+      }
+      if (state.searching) {
+        setStatus(visibleRows + ' match' + (visibleRows === 1 ? '' : 'es') + ' (scanning\u2026)', true);
+      } else {
+        setStatus(visibleRows + ' match' + (visibleRows === 1 ? '' : 'es'), false);
+      }
+      return;
+    }
+    state.rgQuery = q;
+    state.rgOptions = {
+      caseSensitive: state.options.caseSensitive,
+      wholeWord: state.options.wholeWord,
+      useRegex: state.options.useRegex,
+    };
+    state.filterQuery = '';
     send({
       type: 'log',
       msg: 'triggerSearch: len=' + q.length + '(raw=' + raw.length + ') hasNL=' +
@@ -1710,11 +1815,12 @@ export function getRendererPatchScript(): string {
       var ok = window.__ijFindSetPreviewContent(state.previewMonacoEditor, fullText, lang);
       send({ type: 'log', msg: 'monacoReal reuse setModel=' + ok });
       if (ok) {
-        try { state.previewMonacoEditor.revealLineInCenter(msg.focusLine + 1); } catch (e) {}
         try {
           var rect = state.previewMonacoHost.getBoundingClientRect();
           state.previewMonacoEditor.layout({ width: Math.floor(rect.width), height: Math.floor(rect.height) });
         } catch (e) {}
+        applyPreviewMatchDecorations(state.previewMonacoEditor, msg);
+        try { revealMatchImmediate(state.previewMonacoEditor, msg); } catch (e) {}
         state.previewMode = 'monaco';
         return;
       }
@@ -1744,12 +1850,84 @@ export function getRendererPatchScript(): string {
       var r2 = host.getBoundingClientRect();
       editor.layout({ width: Math.floor(r2.width), height: Math.floor(r2.height) });
     } catch (e) {}
-    try { editor.revealLineInCenter(msg.focusLine + 1); } catch (e) {}
+    // Apply decorations BEFORE reveal so they're painted in the same frame
+    // the viewport lands — otherwise the user sees scrolling-to-match and
+    // then a subsequent flash when highlights appear.
+    applyPreviewMatchDecorations(editor, msg);
+    try { revealMatchImmediate(editor, msg); } catch (e) {}
     // Post-render check
     try {
       var vl = editor.getDomNode && editor.getDomNode() && editor.getDomNode().querySelectorAll('.view-line');
       send({ type: 'log', msg: 'monacoReal rendered viewLines=' + (vl ? vl.length : '?') });
     } catch (e) {}
+  }
+
+  // Scroll the preview to the match without the default smooth animation.
+  // For multi-line matches, put the start near the top of the viewport so
+  // as many match lines as possible are visible. ScrollType.Immediate = 1.
+  function revealMatchImmediate(editor, msg) {
+    var startLn = msg.focusLine + 1;
+    var r0 = msg.ranges && msg.ranges[0];
+    if (r0 && typeof r0.endLine === 'number' && r0.endLine > msg.focusLine) {
+      var endLn = r0.endLine + 1;
+      var endCol = (typeof r0.endCol === 'number') ? (r0.endCol + 1) : 1;
+      var startCol = (typeof r0.start === 'number') ? (r0.start + 1) : 1;
+      if (typeof editor.revealRangeNearTop === 'function') {
+        editor.revealRangeNearTop({
+          startLineNumber: startLn, startColumn: startCol,
+          endLineNumber: endLn, endColumn: endCol,
+        }, 1);
+        return;
+      }
+      if (typeof editor.revealLines === 'function') {
+        editor.revealLines(startLn, endLn, 1);
+        return;
+      }
+    }
+    if (typeof editor.revealLineInCenter === 'function') {
+      editor.revealLineInCenter(startLn, 1);
+    } else if (typeof editor.revealLine === 'function') {
+      editor.revealLine(startLn, 1);
+    }
+  }
+
+  // Apply findMatch decorations for the current preview.
+  //
+  // We emit ONE Monaco Range per source match — no per-line splitting, no
+  // whole-line strip. inlineClassName 'findMatch currentFindMatch' alone
+  // colors the background of the matched characters, and Monaco handles
+  // the cross-line rendering internally (start column on startLine -> end
+  // of line -> full middle lines -> end column on endLine). A single range
+  // renders as a visually continuous character-background highlight from
+  // match start to match end.
+  function applyPreviewMatchDecorations(editor, msg) {
+    try {
+      var focusLineMonaco = msg.focusLine + 1;
+      var decos = [];
+      (msg.ranges || []).forEach(function (r, matchIdx) {
+        var startLn = focusLineMonaco;
+        var endLn = (typeof r.endLine === 'number') ? (r.endLine + 1) : startLn;
+        var endCol = (typeof r.endCol === 'number') ? (r.endCol + 1) : (r.end + 1);
+        decos.push({
+          range: {
+            startLineNumber: startLn,
+            startColumn: r.start + 1,
+            endLineNumber: endLn,
+            endColumn: endCol,
+          },
+          options: {
+            inlineClassName: matchIdx === 0 ? 'findMatch currentFindMatch' : 'findMatch',
+            isWholeLine: false,
+          },
+        });
+      });
+      if (state.previewMonacoMatchDecos) {
+        state.previewMonacoMatchDecos = editor.deltaDecorations(state.previewMonacoMatchDecos, []);
+      }
+      if (decos.length > 0) {
+        state.previewMonacoMatchDecos = editor.deltaDecorations([], decos);
+      }
+    } catch (e) { send({ type: 'log', msg: 'monacoReal decorate threw: ' + (e && e.message) }); }
   }
 
   function disposePreviewMonacoEditor() {
@@ -2650,6 +2828,47 @@ export function getRendererPatchScript(): string {
         ' firstEditorProps=[' + firstEditorProps.join(',') + ']';
     } catch (e) { return 'status-err: ' + (e && e.message); }
   };
+  // Test-only probes. Safe to ship — they just expose read-only state the
+  // E2E suite polls to avoid racing async CDP evals.
+  window.__ijFindGetSearchState = function () {
+    try {
+      return {
+        searching: !!state.searching,
+        filesCount: (state.files || []).length,
+        flatCount: (state.flat || []).length,
+        activeIndex: typeof state.activeIndex === 'number' ? state.activeIndex : -1,
+        previewMode: state.previewMode || null,
+        previewUri: state.previewUri || null,
+        lastPreviewKey: state.lastPreviewKey || null,
+        inputValue: $q ? $q.value : null,
+        rgQuery: state.rgQuery || '',
+        filterQuery: state.filterQuery || '',
+      };
+    } catch (e) { return { err: String(e && e.message) }; }
+  };
+  window.__ijFindGetPreviewDecorations = function () {
+    try {
+      var editor = state.previewMonacoEditor;
+      if (!editor) { return { editor: null, decorations: [] }; }
+      var model = editor.getModel && editor.getModel();
+      if (!model) { return { editor: 'no-model', decorations: [] }; }
+      var raw = model.getAllDecorations();
+      var out = [];
+      for (var i = 0; i < raw.length; i++) {
+        var d = raw[i];
+        var inlineCls = (d.options && d.options.inlineClassName) || '';
+        if (!/findMatch/.test(inlineCls)) { continue; }
+        out.push({
+          startLineNumber: d.range.startLineNumber,
+          startColumn: d.range.startColumn,
+          endLineNumber: d.range.endLineNumber,
+          endColumn: d.range.endColumn,
+          inlineClassName: inlineCls,
+        });
+      }
+      return { editor: 'ok', decorations: out, lineCount: model.getLineCount ? model.getLineCount() : -1 };
+    } catch (e) { return { err: String(e && e.message) }; }
+  };
   window.__ijFindOnMessage = function (msg) {
     switch (msg.type) {
       case 'results:start':
@@ -2673,7 +2892,11 @@ export function getRendererPatchScript(): string {
       case 'results:file':
         state.confirmedUris[msg.match.uri] = true;
         state.files.push(msg.match);
-        render();
+        // rg streams file-at-a-time. Rendering on every event nukes the
+        // results DOM and can steal a click mid-action. Coalesce to one
+        // render per animation frame — multiple events within ~16ms become
+        // a single DOM rebuild.
+        scheduleRender();
         var sofar = 0;
         for (var i = 0; i < state.files.length; i++) { sofar += state.files[i].matches.length; }
         setStatus(sofar + ' matches in ' + state.files.length + ' files', true);

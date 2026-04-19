@@ -1,9 +1,64 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
+import * as path from 'path';
+import * as fs from 'fs';
+import { Worker } from 'worker_threads';
 import { parseRegex } from './codesearch/regexAst';
 import { analyze } from './codesearch/regexInfo';
 import { PostingSource, TrigramQuery, evalQuery, qAnd, qTri } from './codesearch/trigramQuery';
-import { deserialize, serialize } from './codesearch/binaryIndex';
+import { serializeV3 } from './codesearch/binaryIndex';
+
+// A posting list entry that hasn't been materialized into memory yet.
+// `offset` is the byte offset within the on-disk postings section; `length`
+// is the number of u32 entries. Resolved to a Uint32Array on first access
+// via `resolvePosting()`.
+interface LazyPosting {
+  kind: 'lazy';
+  offset: number;
+  length: number;
+}
+type Posting = LazyPosting | Uint32Array | Set<number>;
+
+interface WorkerLoadResult {
+  kind: 'v2' | 'v3';
+  readMs: number;
+  parseMs: number;
+  nextId: number;
+  fileMeta: Array<[number, string, number, number]>;
+  triArr: Array<[string, number, number]>;
+  // v2-only: full buffer was transferred
+  buffer?: ArrayBuffer;
+  byteOffsetBase?: number;
+  byteLength?: number;
+  // v3-only: absolute file offset where postings section begins
+  postingsStart?: number;
+  totalBytes?: number;
+}
+
+/** Spawn the parse worker, hand it the on-disk index path, and wait for
+ *  the zero-copy transfer. Returns null for ENOENT / invalid formats — the
+ *  caller treats those as a fresh (empty) index. */
+function loadIndexInWorker(absPath: string): Promise<WorkerLoadResult | null> {
+  return new Promise((resolve, reject) => {
+    const workerFile = path.join(__dirname, 'indexWorker.js');
+    const worker = new Worker(workerFile);
+    let done = false;
+    const finish = (fn: () => void) => { if (!done) { done = true; fn(); } };
+    worker.once('message', (msg: any) => {
+      // Detach listeners before terminate to avoid leak warnings.
+      worker.removeAllListeners('error');
+      worker.terminate();
+      if (msg && msg.ok) { finish(() => resolve(msg as WorkerLoadResult)); }
+      else { finish(() => resolve(null)); }
+    });
+    worker.once('error', (err) => {
+      worker.removeAllListeners('message');
+      worker.terminate();
+      finish(() => reject(err));
+    });
+    worker.postMessage({ path: absPath });
+  });
+}
 
 function u32ArrayContains(a: Uint32Array, id: number): boolean {
   // Binary search on sorted-ascending Uint32Array.
@@ -57,10 +112,11 @@ export interface ReconcileProgress {
 }
 
 export class TrigramIndex {
-  // Posting lists: Uint32Array (sorted ascending) after load, or Set<number>
-  // while we're mutating (indexFile add/remove). save() compacts everything
-  // back to Uint32Array before writing.
-  private tris = new Map<string, Set<number> | Uint32Array>();
+  // Posting lists live in three states:
+  //   LazyPosting   — not yet read from disk; fd + offset+length known
+  //   Uint32Array   — materialized, sorted ascending
+  //   Set<number>   — being mutated by indexFile; save() compacts back
+  private tris = new Map<string, Posting>();
   private fileMeta = new Map<number, FileMeta>();
   private uriToId = new Map<string, number>();
   // File ids whose disk content may disagree with the trigrams we have for
@@ -73,6 +129,12 @@ export class TrigramIndex {
   private nextId = 1;
   private dirty = false;
   private ready = false;
+  // Open file descriptor for on-disk postings (v3 lazy mode). Queries call
+  // fs.readSync to pull individual posting byte ranges. undefined means
+  // there's no backing file yet (fresh index, or the index is fully in
+  // memory after a legacy v2 load / rebuild).
+  private fd: number | undefined;
+  private postingsStart = 0;
   private initPromise: Promise<void> | undefined;
   private rebuildPromise: Promise<void> | undefined;
   private saveTimer: NodeJS.Timeout | undefined;
@@ -109,7 +171,7 @@ export class TrigramIndex {
     const missingFromFile: string[] = [];
     for (const tri of probeTrigrams) {
       totalChecked++;
-      const posting = this.tris.get(tri);
+      const posting = this.resolvePosting(tri);
       if (!posting) {
         missingFromFile.push(tri);
         continue;
@@ -172,48 +234,125 @@ export class TrigramIndex {
 
   private async load(): Promise<void> {
     const fileUri = vscode.Uri.joinPath(this.storageDir, this.indexFileName());
-    try {
-      const tRead = Date.now();
-      const bytes = await vscode.workspace.fs.readFile(fileUri);
-      const tParse = Date.now();
-      const image = deserialize(Buffer.from(bytes));
-      const tDone = Date.now();
-      if (!image) { return; }
-      this.nextId = image.nextId || 1;
-      this.fileMeta = image.fileMeta;
-      this.uriToId = new Map();
-      for (const [id, meta] of this.fileMeta) { this.uriToId.set(meta.uri, id); }
-      // Posting lists stay as Uint32Array — no Set construction, no per-
-      // trigram heap allocation. evalQuery operates directly on them.
-      this.tris = new Map();
-      for (const [tri, posting] of image.tris) {
-        this.tris.set(tri, posting);
-      }
-      this.log.appendLine(
-        `TrigramIndex loaded: ${this.fileMeta.size} files, ${this.tris.size} trigrams ` +
-        `(read=${tParse - tRead}ms parse=${tDone - tParse}ms ` +
-        `total=${tDone - tRead}ms, bin=${Math.round(bytes.length / 1024)}KB)`
-      );
-    } catch {
-      // Fresh start
+    const t0 = Date.now();
+    let result: WorkerLoadResult | null;
+    try { result = await loadIndexInWorker(fileUri.fsPath); }
+    catch (err) {
+      this.log.appendLine(`TrigramIndex worker load errored: ${err instanceof Error ? err.message : err}`);
+      return;
     }
+    if (!result) {
+      // No cached index on disk (ENOENT) or invalid format — fresh start.
+      return;
+    }
+    this.nextId = result.nextId || 1;
+    this.fileMeta = new Map();
+    this.uriToId = new Map();
+    for (const [id, uri, mtime, size] of result.fileMeta) {
+      this.fileMeta.set(id, { uri, mtime, size });
+      this.uriToId.set(uri, id);
+    }
+    this.tris = new Map();
+    if (result.kind === 'v3') {
+      // Lazy mode: keep postings on disk, store only TOC refs. We open our
+      // own fd — the worker closes its copy before returning.
+      try { this.fd = fs.openSync(fileUri.fsPath, 'r'); }
+      catch (err) {
+        this.log.appendLine(`TrigramIndex: can't open index fd: ${err instanceof Error ? err.message : err}`);
+        return;
+      }
+      this.postingsStart = result.postingsStart!;
+      for (let i = 0; i < result.triArr.length; i++) {
+        const [tri, offset, length] = result.triArr[i];
+        this.tris.set(tri, { kind: 'lazy', offset, length });
+      }
+      const tDone = Date.now();
+      this.log.appendLine(
+        `TrigramIndex loaded (v3 lazy): ${this.fileMeta.size} files, ${this.tris.size} trigrams ` +
+        `(worker read=${result.readMs}ms parse=${result.parseMs}ms ` +
+        `main=${tDone - t0 - result.readMs - result.parseMs}ms ` +
+        `total=${tDone - t0}ms, meta=${Math.round((result.totalBytes || 0) / 1024)}KB)`,
+      );
+      return;
+    }
+    // v2 fallback: worker transferred the whole buffer, we make views.
+    const buf = result.buffer!;
+    const base = result.byteOffsetBase!;
+    for (let i = 0; i < result.triArr.length; i++) {
+      const [tri, relOff, postLen] = result.triArr[i];
+      const abs = base + relOff;
+      let posting: Uint32Array;
+      if ((abs & 3) === 0) {
+        posting = new Uint32Array(buf, abs, postLen);
+      } else {
+        posting = new Uint32Array(postLen);
+        const view = new DataView(buf, abs, postLen * 4);
+        for (let j = 0; j < postLen; j++) {
+          posting[j] = view.getUint32(j * 4, true);
+        }
+      }
+      this.tris.set(tri, posting);
+    }
+    // Mark dirty so the next save migrates us to v3 layout.
+    this.dirty = true;
+    this.scheduleSave(60_000);
+    const tDone = Date.now();
+    this.log.appendLine(
+      `TrigramIndex loaded (v2 → will migrate to v3): ${this.fileMeta.size} files, ${this.tris.size} trigrams ` +
+      `(worker read=${result.readMs}ms parse=${result.parseMs}ms ` +
+      `rebuild=${tDone - t0 - result.readMs - result.parseMs}ms ` +
+      `total=${tDone - t0}ms, bin=${Math.round((result.byteLength || 0) / 1024)}KB)`,
+    );
+  }
+
+  /** Read a posting from the backing fd into a fresh Uint32Array and cache
+   *  it in the tris map (replacing the LazyPosting ref). Returns null if
+   *  the fd is closed or the read fails. */
+  private materializeLazy(tri: string, ref: LazyPosting): Uint32Array | null {
+    if (this.fd === undefined) { return null; }
+    const bytes = ref.length * 4;
+    const buf = Buffer.alloc(bytes);
+    let read = 0;
+    while (read < bytes) {
+      const n = fs.readSync(this.fd, buf, read, bytes - read, this.postingsStart + ref.offset + read);
+      if (n <= 0) { break; }
+      read += n;
+    }
+    if (read < bytes) { return null; }
+    const posting = new Uint32Array(buf.buffer, buf.byteOffset, ref.length);
+    this.tris.set(tri, posting);
+    return posting;
+  }
+
+  /** Normalize a posting to its materialized form (Uint32Array | Set). */
+  private resolvePosting(tri: string): Uint32Array | Set<number> | null {
+    const p = this.tris.get(tri);
+    if (!p) { return null; }
+    if ((p as LazyPosting).kind === 'lazy') {
+      return this.materializeLazy(tri, p as LazyPosting);
+    }
+    return p as Uint32Array | Set<number>;
   }
 
   private async save(): Promise<void> {
     const fileUri = vscode.Uri.joinPath(this.storageDir, this.indexFileName());
-    // Compact all posting lists to Uint32Array (sorted) for on-disk form.
-    // Sets left over from indexFile updates convert here. We yield every
-    // ~15ms so CDP response processing (e.g., the first show() roundtrip
-    // after reconcile) isn't held hostage for 300+ ms by this sync work.
+    // Compact all posting lists to Uint32Array (sorted). Materializes any
+    // still-lazy postings by reading them from the backing fd. Yields
+    // every ~15ms so CDP response processing isn't held hostage.
     const compactTris = new Map<string, Uint32Array>();
     let checkpoint = Date.now();
+    let materialized = 0;
     for (const [tri, posting] of this.tris) {
       if (posting instanceof Uint32Array) {
         compactTris.set(tri, posting);
+      } else if ((posting as LazyPosting).kind === 'lazy') {
+        const loaded = this.materializeLazy(tri, posting as LazyPosting);
+        if (loaded) { compactTris.set(tri, loaded); materialized++; }
       } else {
-        const arr = new Uint32Array(posting.size);
+        const set = posting as Set<number>;
+        const arr = new Uint32Array(set.size);
         let k = 0;
-        for (const id of posting) { arr[k++] = id; }
+        for (const id of set) { arr[k++] = id; }
         arr.sort();
         compactTris.set(tri, arr);
         this.tris.set(tri, arr);
@@ -225,25 +364,60 @@ export class TrigramIndex {
     }
     try {
       const tSer = Date.now();
-      // Serialize can still be multi-hundred-ms sync work. Do it in a
-      // microtask boundary so at least there's one yield point before it.
       await new Promise<void>((r) => setImmediate(r));
-      const buf = serialize({
+      const buf = serializeV3({
         nextId: this.nextId,
         fileMeta: this.fileMeta,
         tris: compactTris,
       });
       const tWrite = Date.now();
+      // Close the current fd before writing — on Windows the write would
+      // fail with EBUSY, and on POSIX we want the new file descriptor to
+      // point at the fresh inode afterwards.
+      if (this.fd !== undefined) {
+        try { fs.closeSync(this.fd); } catch {}
+        this.fd = undefined;
+      }
       await vscode.workspace.fs.writeFile(fileUri, buf);
+      // Re-open fd and flip every loaded posting back to a LazyPosting ref
+      // so we return to a small in-memory footprint. Loaded postings get
+      // GC'd once the Map entries are replaced.
+      try {
+        this.fd = fs.openSync(fileUri.fsPath, 'r');
+        this.relazyFromImage(compactTris, buf);
+      } catch (err) {
+        this.log.appendLine(`TrigramIndex: fd re-open after save failed: ${err instanceof Error ? err.message : err}`);
+      }
       this.dirty = false;
       this.log.appendLine(
-        `TrigramIndex saved: ${Math.round(buf.length / 1024)} KB ` +
+        `TrigramIndex saved (v3): ${Math.round(buf.length / 1024)} KB ` +
         `(trigrams ${compactTris.size}, files ${this.fileMeta.size}, ` +
-        `serialize=${tWrite - tSer}ms write=${Date.now() - tWrite}ms)`,
+        `materialized=${materialized}, serialize=${tWrite - tSer}ms write=${Date.now() - tWrite}ms)`,
       );
     } catch (err) {
       this.log.appendLine(`TrigramIndex save failed: ${err instanceof Error ? err.message : err}`);
     }
+  }
+
+  /** After writing a fresh v3 file, walk the serialized buffer's header to
+   *  find `postingsStart`, then replace every entry in `this.tris` with a
+   *  LazyPosting ref pointing into the new file. The previously-loaded
+   *  Uint32Arrays get GC'd, giving us back a small heap footprint. */
+  private relazyFromImage(compactTris: Map<string, Uint32Array>, buf: Buffer): void {
+    // Header layout: [magic 4][version 4][nextId 4][fileCount 4][triCount 4]
+    //                [fileMetaEnd 4][tocEnd 4][reserved 4]
+    if (buf.length < 32) { return; }
+    const tocEnd = buf.readUInt32LE(24);
+    this.postingsStart = tocEnd;
+    // Walk compactTris in insertion order (same as serialize traverses the
+    // map) to reconstruct postOffsets without re-parsing the TOC.
+    let off = 0;
+    const fresh = new Map<string, Posting>();
+    for (const [tri, posting] of compactTris) {
+      fresh.set(tri, { kind: 'lazy', offset: off, length: posting.length });
+      off += posting.length * 4;
+    }
+    this.tris = fresh;
   }
 
   private scheduleSave(delayMs = 30_000): void {
@@ -255,10 +429,22 @@ export class TrigramIndex {
     }, delayMs);
   }
 
+  /** @internal Force an immediate save, skipping the debounce timer. Used
+   *  by E2E tests that need a deterministic flush point before asserting
+   *  on-disk layout or reloading into a fresh instance. */
+  async flushToDisk(): Promise<void> {
+    if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = undefined; }
+    await this.save();
+  }
+
   dispose(): void {
     if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = undefined; }
     if (this.watcher) { this.watcher.dispose(); this.watcher = undefined; }
     if (this.dirty) { void this.save(); }
+    if (this.fd !== undefined) {
+      try { fs.closeSync(this.fd); } catch {}
+      this.fd = undefined;
+    }
   }
 
   /** Wipe the in-memory index + disk cache and rebuild from scratch.
@@ -285,6 +471,10 @@ export class TrigramIndex {
     // Block reads during rebuild — callers get null candidates and fall
     // back to full rg scans until we're done.
     this.ready = false;
+    if (this.fd !== undefined) {
+      try { fs.closeSync(this.fd); } catch {}
+      this.fd = undefined;
+    }
     this.tris.clear();
     this.fileMeta.clear();
     this.uriToId.clear();
@@ -432,7 +622,8 @@ export class TrigramIndex {
   }
 
   /** Get the posting for `tri` as a mutable Set, converting the Uint32Array
-   *  form on first write. Caller can then call .add/.delete directly. */
+   *  / LazyPosting form on first write. Caller can then call .add/.delete
+   *  directly. Lazy postings get materialized via fd read. */
   private mutablePosting(tri: string): Set<number> {
     const existing = this.tris.get(tri);
     if (existing instanceof Set) { return existing; }
@@ -441,6 +632,15 @@ export class TrigramIndex {
       for (let i = 0; i < existing.length; i++) { s.add(existing[i]); }
       this.tris.set(tri, s);
       return s;
+    }
+    if (existing && (existing as LazyPosting).kind === 'lazy') {
+      const resolved = this.materializeLazy(tri, existing as LazyPosting);
+      if (resolved) {
+        const s = new Set<number>();
+        for (let i = 0; i < resolved.length; i++) { s.add(resolved[i]); }
+        this.tris.set(tri, s);
+        return s;
+      }
     }
     const fresh = new Set<number>();
     this.tris.set(tri, fresh);
@@ -453,20 +653,12 @@ export class TrigramIndex {
     this.fileMeta.delete(id);
     this.uriToId.delete(meta.uri);
     this.stale.delete(id);
-    // Remove fileId from any trigram set that contains it. Walk every tri;
-    // for Uint32Array postings we only pay the Set conversion when the
-    // file is actually present.
-    for (const [tri, posting] of this.tris) {
-      if (posting instanceof Uint32Array) {
-        // Binary search — cheap presence check before converting.
-        if (!u32ArrayContains(posting, id)) { continue; }
-        const s = this.mutablePosting(tri);
-        s.delete(id);
-        if (s.size === 0) { this.tris.delete(tri); }
-      } else {
-        if (posting.delete(id) && posting.size === 0) { this.tris.delete(tri); }
-      }
-    }
+    // NOTE: we intentionally do NOT walk every trigram to remove this id
+    // from its posting. With lazy postings that would force a read of all
+    // ~600K postings from disk for a single removed file. Instead we
+    // leave the stale fileId in postings — candidatesFor filters them out
+    // at query time via the `fileMeta.get(id)` guard, and the next save
+    // rewrites every posting cleanly anyway.
   }
 
   private async indexFile(uri: vscode.Uri): Promise<void> {
@@ -500,19 +692,17 @@ export class TrigramIndex {
       if (id === undefined) {
         id = this.nextId++;
         this.uriToId.set(uriStr, id);
-      } else {
-        // Remove the file's old trigrams before we add the new set.
-        for (const [tri, posting] of this.tris) {
-          if (posting instanceof Uint32Array) {
-            if (!u32ArrayContains(posting, id)) { continue; }
-            const s = this.mutablePosting(tri);
-            s.delete(id);
-            if (s.size === 0) { this.tris.delete(tri); }
-          } else {
-            if (posting.delete(id) && posting.size === 0) { this.tris.delete(tri); }
-          }
-        }
       }
+      // NOTE: previously we walked every trigram posting to scrub the old
+      // fileId before adding the new trigrams. That worked when all
+      // postings lived in memory, but with the v3 lazy layout it would
+      // force a read of all ~600K postings from disk on every reindex.
+      // Instead we add the new trigrams and leave stale fileIds in old
+      // trigrams' postings. Candidates will include a few false positives
+      // (posting claims file X contains trigram T, but the new content
+      // doesn't), but rg verifies every candidate on disk, so the final
+      // result is still correct. The next save() compacts/rewrites every
+      // posting and the stale entries disappear naturally.
       const uniq = extractTrigramsLower(text);
       this.fileMeta.set(id, { uri: uriStr, mtime: stat.mtime, size: stat.size });
       for (const tri of uniq) {
@@ -594,7 +784,7 @@ export class TrigramIndex {
     const info = analyze(ast);
     const tq: TrigramQuery = info.match;
     const source: PostingSource = {
-      get: (tri: string) => this.tris.get(tri) ?? null,
+      get: (tri: string) => this.resolvePosting(tri),
       allFiles: () => {
         const all = new Set<number>();
         for (const id of this.fileMeta.keys()) { all.add(id); }
@@ -639,7 +829,7 @@ export class TrigramIndex {
     for (const t of qtris) { qList.push(qTri(t)); }
     const tq = qAnd(qList);
     const source: PostingSource = {
-      get: (tri: string) => this.tris.get(tri) ?? null,
+      get: (tri: string) => this.resolvePosting(tri),
       allFiles: () => {
         const all = new Set<number>();
         for (const id of this.fileMeta.keys()) { all.add(id); }

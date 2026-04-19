@@ -53,6 +53,9 @@ export class OverlayPanel {
   // across sources — a single shared counter would drop legit events when
   // different windows' __seqs interleave (see V50 patch comment).
   private lastSeenSeqBySrc = new Map<string, number>();
+  // Pending bridge-liveness pings awaiting their own log echo back through
+  // the bridge chain. See verifyBridgeAlive() for why we need this.
+  private bridgePings = new Map<string, () => void>();
 
   static get(context: vscode.ExtensionContext): OverlayPanel {
     if (!OverlayPanel.instance) {
@@ -106,6 +109,32 @@ export class OverlayPanel {
         this.log.appendLine(`Lazy capture failed: ${err instanceof Error ? err.message : err}`);
       });
     }, 1200);
+  }
+
+  /** Fire a sentinel-tagged log event from the first patched workbench
+   *  window through `globalThis.irSearchEvent` and wait for the same
+   *  payload to round-trip back through the bridge into
+   *  `handleRendererEvent`. Returns false if the echo doesn't arrive
+   *  within `timeoutMs` — the caller typically forces a reinject at that
+   *  point. */
+  private async verifyBridgeAlive(timeoutMs = 400): Promise<boolean> {
+    const wins = await this.listWorkbenchWindowIds();
+    if (wins.length === 0) { return false; }
+    const pingId = '__ij-bridge-ping-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const pong = new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        this.bridgePings.delete(pingId);
+        resolve(false);
+      }, timeoutMs);
+      this.bridgePings.set(pingId, () => { clearTimeout(timer); resolve(true); });
+    });
+    const expr = `try { globalThis.irSearchEvent && globalThis.irSearchEvent(JSON.stringify({type:'log',msg:${JSON.stringify(pingId)}})); } catch (e) {}`;
+    // Fire the ping into whichever window is first — bridges forward
+    // from ANY window back to the ext host, so one ping is enough to
+    // prove the chain is alive.
+    try { await this.evalInWindow(wins[0], expr); }
+    catch { return false; }
+    return pong;
   }
 
   private async listWorkbenchWindowIds(): Promise<number[]> {
@@ -305,6 +334,158 @@ export class OverlayPanel {
     }
   }
 
+  /** @internal Used by E2E tests to wait for the index to finish its
+   *  initial disk load + reconcile before asserting search behaviour. */
+  async waitForIndexReady(timeoutMs = 60_000): Promise<void> {
+    const start = Date.now();
+    while (!this.trigramIndex.isReady) {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`Trigram index did not become ready within ${timeoutMs}ms`);
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  /** @internal Run the same search pipeline runSearch() uses, but collect
+   *  FileMatch events synchronously and return them. Skips the overlay UI
+   *  (no CDP, no renderer) — tests get deterministic results independent
+   *  of the VSCode window state. */
+  async searchForTests(options: SearchOptions): Promise<FileMatch[]> {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length === 0) { return []; }
+    const matches: FileMatch[] = [];
+    const { uris: candidates } = this.trigramIndex.candidatesFor(options.query, {
+      useRegex: options.useRegex,
+      caseSensitive: options.caseSensitive,
+      wholeWord: options.wholeWord,
+    });
+    let paths: string[] | null = null;
+    if (candidates) {
+      if (candidates.size === 0) { return []; }
+      const uris: vscode.Uri[] = [];
+      for (const u of candidates) {
+        try { uris.push(vscode.Uri.parse(u)); } catch {}
+      }
+      paths = prioritizeFiles(uris).map((u) => u.fsPath);
+    }
+    const cts = new vscode.CancellationTokenSource();
+    await new Promise<void>((resolve, reject) => {
+      runRgSearch(
+        options,
+        cts.token,
+        {
+          onFile: (m) => { matches.push(m); },
+          onDone: () => { resolve(); },
+          onError: (err) => { reject(err); },
+        },
+        paths,
+      ).catch(reject);
+    });
+    return matches;
+  }
+
+  /** @internal Exposed so tests can drive the index directly. */
+  getTrigramIndex(): TrigramIndex {
+    return this.trigramIndex;
+  }
+
+  /** @internal Await the CDP attach + renderer patch install. Tests that
+   *  exercise the overlay UI call this first and skip (via assert.skip-like
+   *  try/catch) if the test environment can't open the inspector. */
+  async awaitInjection(): Promise<void> {
+    await this.ensureInjected();
+  }
+
+  /** @internal Run the capture diagnostic synchronously (no lazy delay)
+   *  and report what state `__ijFindMonaco` ended up in. Tests use this
+   *  instead of relying on `scheduleLazyCapture` racing their setup. */
+  async forceCaptureForTests(): Promise<string> {
+    this.captureTriggered = true; // prevent the scheduler from running again
+    try { await this.triggerCaptureDiagnostic(); }
+    catch (err) {
+      return 'capture-threw:' + (err instanceof Error ? err.message : String(err));
+    }
+    try {
+      const wins = await this.listWorkbenchWindowIds();
+      for (const id of wins) {
+        const r = await this.evalInWindow(id,
+          `(function(){try{var m=window.__ijFindMonaco;return m?('ctor='+(!!m.ctor)+' inst='+(!!m.inst)+' modelSvc='+(!!m.modelSvc)):'no-monaco'}catch(e){return 'err:'+(e&&e.message)}})()`,
+        );
+        if (/ctor=true inst=true modelSvc=true/.test(r)) { return 'ready:win=' + id; }
+      }
+    } catch {}
+    return 'not-ready';
+  }
+
+  /** @internal Poll renderer globals until `__ijFindMonaco` is populated
+   *  (ctor + instantiation service + model service). Tests that assert on
+   *  monaco decorations call this so they don't race the lazy capture
+   *  diagnostic (which takes ~1.5–3 s after the first show()). */
+  async waitForMonacoReadyForTests(timeoutMs = 20_000): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const wins = await this.listWorkbenchWindowIds();
+        for (const id of wins) {
+          const result = await this.evalInWindow(
+            id,
+            `(function(){try{var m=window.__ijFindMonaco;return m&&m.ctor&&m.inst&&m.modelSvc?'ready':'not-ready'}catch(e){return 'err:'+(e&&e.message)}})()`,
+          );
+          if (result === 'ready') { return true; }
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    return false;
+  }
+
+  /** @internal Evaluate an expression in the currently-active workbench
+   *  window and return its String() result. Used by renderer-level tests
+   *  to probe `window.__ijFindStatus` and similar. Throws if the overlay
+   *  hasn't latched onto a window yet (call `show()` first). */
+  async evalInActiveWindowForTests(jsExpr: string): Promise<string> {
+    if (this.activeWindowId === undefined) {
+      throw new Error('no active workbench window — call overlay.show(...) first');
+    }
+    return this.evalInWindow(this.activeWindowId, jsExpr);
+  }
+
+  /** @internal Forcibly close the current CDP WebSocket — simulates the
+   *  bridge dying mid-session (e.g. another extension detaching the
+   *  webContents debugger). `ensureInjected()` on the next operation
+   *  should notice and reopen. Returns whether a socket was actually
+   *  closed. */
+  closeWebSocketForTests(): boolean {
+    if (this.ws) {
+      try { this.ws.close(); } catch {}
+      this.ws = undefined;
+      return true;
+    }
+    return false;
+  }
+
+  /** @internal Snapshot of connection state, for assertions after a
+   *  bridge-kill + recover cycle. */
+  getConnectionStateForTests(): { wsOpen: boolean; activeWindowId: number | undefined } {
+    return {
+      wsOpen: !!(this.ws && this.ws.readyState === (this.ws as any).constructor.OPEN),
+      activeWindowId: this.activeWindowId,
+    };
+  }
+
+  /** @internal Deliver a raw RendererEvent payload to handleRendererEvent
+   *  as if it had arrived through the bridge. Tests use this to probe the
+   *  per-source dedup logic without needing two separate windows. */
+  injectRendererEventForTests(payload: string): void {
+    this.handleRendererEvent(payload);
+  }
+
+  /** @internal Return a snapshot of the per-source dedup map so tests can
+   *  assert on its contents after injectRendererEventForTests calls. */
+  getDedupStateForTests(): Array<[string, number]> {
+    return Array.from(this.lastSeenSeqBySrc.entries());
+  }
+
   logActivation() {
     this.log.show(true);
     this.log.appendLine(`[${new Date().toISOString()}] Extension activated. Ext host pid=${process.pid}, ppid=${process.ppid}`);
@@ -426,6 +607,18 @@ export class OverlayPanel {
     );
     try {
       await this.ensureInjected();
+      // Bridge state in the main process can go stale between command
+      // invocations — another extension may detach webContents.debugger,
+      // our bridge listener may be dropped, or a test VSCode instance may
+      // have contended for the same inspector port. A quick ping catches
+      // these cases so we can force-reinject before the user sees a
+      // broken search pane.
+      const alive = await this.verifyBridgeAlive(400);
+      if (!alive) {
+        this.log.appendLine('Bridge ping failed — forcing reinject before show');
+        try { await this.forceReinject(); }
+        catch (err) { this.log.appendLine(`forceReinject threw: ${err instanceof Error ? err.message : err}`); }
+      }
       const tInjected = Date.now();
       // Single-roundtrip fast path: in one CDP message we locate the focused
       // workbench window, send __ijFindShow into it (awaited), and fire-and-
@@ -779,6 +972,14 @@ export class OverlayPanel {
     catch {
       this.log.appendLine(`handleRendererEvent: JSON parse failed, payload=${payload.slice(0, 120)}`);
       return;
+    }
+    // Bridge-liveness ping echo. See verifyBridgeAlive(). Handled before
+    // dedup because ping uses a sentinel msg we want to match even if a
+    // stale listener delivers it more than once.
+    if (evt.type === 'log' && typeof (evt as any).msg === 'string') {
+      const m: string = (evt as any).msg;
+      const pingCb = this.bridgePings.get(m);
+      if (pingCb) { this.bridgePings.delete(m); pingCb(); return; }
     }
     if (typeof evt.__seq === 'number' && typeof evt.__src === 'string') {
       const last = this.lastSeenSeqBySrc.get(evt.__src) ?? -1;
