@@ -10,6 +10,13 @@ export interface SearchOptions {
 export interface MatchRange {
   start: number;
   end: number;
+  /** Absolute file line (0-based) where the match ENDS, when it spans
+   *  multiple lines. When omitted, the match is single-line and `end` is
+   *  the column on the match's starting line. */
+  endLine?: number;
+  /** Column on `endLine` where the match ends. Only meaningful when
+   *  `endLine` is set (multi-line matches). */
+  endCol?: number;
 }
 
 export interface FileMatch {

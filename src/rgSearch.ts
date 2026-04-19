@@ -224,35 +224,84 @@ export async function runRgSearch(
         let lineText = line;
         if (lineText.endsWith('\n')) { lineText = lineText.slice(0, -1); }
         if (lineText.endsWith('\r')) { lineText = lineText.slice(0, -1); }
-        // rg submatch offsets are byte offsets into the line. Convert to
-        // string char offsets for the renderer. For ASCII lines they match;
-        // for multi-byte lines we recompute by walking the buffer.
+        const startLine = Math.max(0, m.line_number - 1);
         const isAscii = isAsciiOnly(lineText);
+        const isMulti = lineText.indexOf('\n') >= 0;
+        // Convert each submatch's byte range to (line, col) endpoints so
+        // multi-line literal matches (rg -U --fixed-strings) carry their
+        // full span into the preview highlighter, not just the first line.
+        const splitLines = isMulti ? lineText.split('\n') : [lineText];
         const ranges: MatchRange[] = [];
         for (const sm of m.submatches) {
-          if (isAscii) {
-            ranges.push({ start: sm.start, end: sm.end });
-          } else {
+          let subStart: number, subEnd: number;
+          if (isAscii) { subStart = sm.start; subEnd = sm.end; }
+          else {
             const { startChar, endChar } = byteRangeToChar(lineText, sm.start, sm.end);
-            ranges.push({ start: startChar, end: endChar });
+            subStart = startChar;
+            subEnd = endChar;
+          }
+          if (!isMulti) {
+            ranges.push({ start: subStart, end: subEnd });
+            continue;
+          }
+          // Walk split lines to find which one subStart / subEnd fall on.
+          let cursor = 0;
+          let smStartLine = startLine, smStartCol = 0;
+          let smEndLine = startLine, smEndCol = 0;
+          for (let li = 0; li < splitLines.length; li++) {
+            const lStart = cursor;
+            const lEnd = cursor + splitLines[li].length;
+            if (subStart >= lStart && subStart <= lEnd) {
+              smStartLine = startLine + li;
+              smStartCol = subStart - lStart;
+            }
+            if (subEnd >= lStart && subEnd <= lEnd) {
+              smEndLine = startLine + li;
+              smEndCol = subEnd - lStart;
+              break;
+            }
+            cursor = lEnd + 1; // +1 for the \n between split lines
+          }
+          if (smStartLine === smEndLine) {
+            ranges.push({ start: smStartCol, end: smEndCol });
+          } else {
+            // Range spans from (smStartLine, smStartCol) to (smEndLine, smEndCol).
+            // `start`/`end` describe the first-line portion (for the result
+            // list's inline highlight); endLine/endCol carry the full span
+            // so the preview Monaco decoration covers every line.
+            const firstLineIdx = smStartLine - startLine;
+            const firstLineLen = splitLines[firstLineIdx].length;
+            ranges.push({
+              start: smStartCol,
+              end: firstLineLen,
+              endLine: smEndLine,
+              endCol: smEndCol,
+            });
           }
         }
-        // Multi-line matches produce a single 'match' event with line_number
-        // pointing at first match line. Preview the first line only; renderer
-        // fetches surrounding lines on demand.
-        const firstLineEnd = lineText.indexOf('\n');
-        const displayLine = firstLineEnd >= 0 ? lineText.slice(0, firstLineEnd) : lineText;
+        // Preview the first line only in the result list; renderer fetches
+        // surrounding lines on demand.
+        const displayLine = splitLines[0];
         const firstRange = ranges[0];
         if (firstRange) {
           const clipped = clipLine(displayLine, {
             start: Math.min(firstRange.start, displayLine.length),
             end: Math.min(firstRange.end, displayLine.length),
           });
-          // Clamp additional ranges to the single-line preview window.
+          // Preserve endLine/endCol from the original range so Monaco
+          // decoration spans every line of the match. clipLine only
+          // reshapes start/end for the clipped preview string.
+          const outRanges: MatchRange[] = clipped.ranges.map((r, i) => {
+            const src = ranges[i] ?? firstRange;
+            if (typeof src.endLine === 'number') {
+              return { start: r.start, end: r.end, endLine: src.endLine, endCol: src.endCol };
+            }
+            return r;
+          });
           pendingFile.matches.push({
-            line: Math.max(0, m.line_number - 1),
+            line: startLine,
             preview: clipped.preview,
-            ranges: clipped.ranges,
+            ranges: outRanges,
           });
           totalMatches += 1;
           if (totalMatches >= maxResults) {

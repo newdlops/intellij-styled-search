@@ -2124,9 +2124,14 @@ export function getRendererPatchScript(): string {
       editor.setPosition({ lineNumber: focusLine, column: col });
     } catch (e) {}
     // Briefly highlight the search match using Monaco decorations.
+    // For multi-line matches (endLine/endCol present), we extend the range
+    // across lines so every line of the match is visibly highlighted —
+    // previously only the match's starting line got the findMatch style.
     try {
       var ranges = (msg.ranges || []).map(function (r) {
-        return new api.Range(focusLine, r.start + 1, focusLine, r.end + 1);
+        var endLineMonaco = (typeof r.endLine === 'number') ? (r.endLine + 1) : focusLine;
+        var endColMonaco = (typeof r.endCol === 'number') ? (r.endCol + 1) : (r.end + 1);
+        return new api.Range(focusLine, r.start + 1, endLineMonaco, endColMonaco);
       });
       if (state.monacoMatchDecos) { state.monacoMatchDecos = editor.deltaDecorations(state.monacoMatchDecos, []); }
       if (ranges.length === 0) {

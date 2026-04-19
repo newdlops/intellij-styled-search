@@ -760,8 +760,16 @@ export class OverlayPanel {
       cb(msg);
       return;
     }
-    if (msg.method === 'Runtime.bindingCalled' && msg.params?.name === BRIDGE_BINDING) {
-      this.handleRendererEvent(String(msg.params.payload));
+    if (msg.method === 'Runtime.bindingCalled') {
+      // Log every binding-called event we see on this CDP session. When
+      // renderer events mysteriously fail to reach handleRendererEvent, this
+      // tells us whether they even left the main-process bridge.
+      const name = msg.params?.name;
+      const payloadLen = String(msg.params?.payload ?? '').length;
+      this.log.appendLine(`[cdp] bindingCalled name=${name} payloadLen=${payloadLen}`);
+      if (name === BRIDGE_BINDING) {
+        this.handleRendererEvent(String(msg.params.payload));
+      }
     }
   }
 
