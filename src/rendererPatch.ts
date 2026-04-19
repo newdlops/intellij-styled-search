@@ -1,11 +1,22 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV45) { return 'already patched'; }
-  window.__ijFindPatchedV45 = true;
+  if (window.__ijFindPatchedV50) { return 'already patched'; }
+  window.__ijFindPatchedV50 = true;
 
+  // Unique id per patch install (per window). Paired with __seq below so the
+  // ext host can dedup duplicate deliveries from accumulated CDP listeners
+  // WITHOUT accidentally dropping legitimate events from *other* windows that
+  // have their own independent __seq counters — a single global lastSeenSeq
+  // would drop win=101's __seq=1 if win=95 had already bumped it to 200.
+  var __ijFindInstanceId = 'ij-' + Math.random().toString(36).slice(2) + '-' + Date.now();
+  var __ijFindSeq = 0;
   function send(payload) {
-    try { globalThis.irSearchEvent(JSON.stringify(payload)); } catch (e) {}
+    try {
+      payload.__seq = ++__ijFindSeq;
+      payload.__src = __ijFindInstanceId;
+      globalThis.irSearchEvent(JSON.stringify(payload));
+    } catch (e) {}
   }
 
   // ── Capture VSCode internals via prototype interception ─────────────
@@ -599,6 +610,8 @@ export function getRendererPatchScript(): string {
     '  background: var(--vscode-list-activeSelectionBackground, #094771);',
     '  color: var(--vscode-list-activeSelectionForeground, #ffffff);',
     '}',
+    '.ij-find-row-pending { opacity: 0.45; font-style: italic; }',
+    '.ij-find-row-pending.active { opacity: 0.8; }',
     '.ij-find-row-text {',
     '  flex: 1 1 auto; min-width: 0;',
     '  overflow: hidden; text-overflow: ellipsis;',
@@ -846,6 +859,9 @@ export function getRendererPatchScript(): string {
     options: { caseSensitive: false, wholeWord: false, useRegex: false },
     files: [],
     flat: [],
+    candidates: [],             // [{uri, relPath}] — planner-narrowed files, rg hasn't confirmed yet
+    candidateTotal: 0,          // total planner candidate count (may exceed what we show)
+    confirmedUris: {},          // uri → true once rg emits a match for it
     activeIndex: -1,
     searching: false,
     debounce: null,
@@ -937,9 +953,14 @@ export function getRendererPatchScript(): string {
 
   function render() {
     clearChildren($results);
-    if (state.files.length === 0) {
+    var hasMatches = state.files.length > 0;
+    // Pending candidates: show whenever we have them, whether rg is still
+    // scanning OR the search finished with 0 matches (user still wants to
+    // see which files were considered).
+    var hasPending = state.candidates.length > 0;
+    if (!hasMatches && !hasPending) {
       var emptyText = state.searching
-        ? 'Searching...'
+        ? 'Searching\u2026'
         : ($q.value ? 'No results' : 'Type to search');
       $results.appendChild(el('div', { className: 'ij-find-empty', text: emptyText }));
       state.flat = [];
@@ -948,6 +969,7 @@ export function getRendererPatchScript(): string {
     }
     state.flat = [];
     var frag = document.createDocumentFragment();
+    // Confirmed matches first (normal rows, one per match line).
     for (var fi = 0; fi < state.files.length; fi++) {
       var f = state.files[fi];
       for (var mi = 0; mi < f.matches.length; mi++) {
@@ -958,9 +980,6 @@ export function getRendererPatchScript(): string {
         var textEl = el('span', { className: 'ij-find-row-text' });
         appendHighlightedInto(textEl, m.preview, m.ranges);
 
-        // Row shows just the filename; the preview pane already renders the
-        // breadcrumb path, so repeating the full relPath here is redundant.
-        // Full path stays in the title attribute for on-hover disclosure.
         var slashIdx = f.relPath.lastIndexOf('/');
         var fileName = slashIdx >= 0 ? f.relPath.slice(slashIdx + 1) : f.relPath;
         var locText = fileName + ':' + (m.line + 1);
@@ -975,6 +994,40 @@ export function getRendererPatchScript(): string {
           attrs: { 'data-flat': String(flatIdx) },
           children: [textEl, locEl],
         }));
+      }
+    }
+    // Pending candidate rows: planner-narrowed files that rg hasn't matched
+    // yet. Rendered in a muted style; clicking opens the file for preview
+    // even before rg confirms a hit. Rows disappear on results:done if no
+    // match came back, or upgrade to real match rows as rg emits them.
+    if (hasPending) {
+      var shown = 0;
+      var cap = 200;
+      for (var ci = 0; ci < state.candidates.length && shown < cap; ci++) {
+        var c = state.candidates[ci];
+        if (state.confirmedUris[c.uri]) { continue; }
+        var pendingFlatIdx = state.flat.length;
+        state.flat.push({ pendingUri: c.uri, pendingRelPath: c.relPath });
+        var cSlash = c.relPath.lastIndexOf('/');
+        var cName = cSlash >= 0 ? c.relPath.slice(cSlash + 1) : c.relPath;
+        var pendRow = el('div', {
+          className: 'ij-find-row ij-find-row-pending',
+          attrs: { 'data-flat': String(pendingFlatIdx), title: c.relPath },
+          children: [
+            el('span', { className: 'ij-find-row-text', text: '\u2026 scanning' }),
+            el('span', { className: 'ij-find-row-loc', text: cName }),
+          ],
+        });
+        frag.appendChild(pendRow);
+        shown++;
+      }
+      if (state.candidateTotal > shown + state.files.length) {
+        var overflowEl = el('div', {
+          className: 'ij-find-empty',
+          text: '+ ' + (state.candidateTotal - shown - state.files.length) +
+                ' more candidate file(s) being scanned\u2026',
+        });
+        frag.appendChild(overflowEl);
       }
     }
     $results.appendChild(frag);
@@ -997,6 +1050,15 @@ export function getRendererPatchScript(): string {
     state.activeIndex = flatIdx;
     applyActive();
     var fm = state.flat[flatIdx];
+    // Pending candidate row: no match confirmed yet. Preview opens the
+    // file at line 0 so the user can skim while rg catches up.
+    if (fm.pendingUri) {
+      var pkey = fm.pendingUri + '#pending';
+      if (pkey === state.lastPreviewKey) { return; }
+      state.lastPreviewKey = pkey;
+      send({ type: 'requestPreview', uri: fm.pendingUri, line: 0, contextLines: 0 });
+      return;
+    }
     var f = state.files[fm.fi];
     var m = f.matches[fm.mi];
     var key = f.uri + '#' + m.line;
@@ -1010,6 +1072,11 @@ export function getRendererPatchScript(): string {
   function openActive() {
     if (state.activeIndex < 0 || state.activeIndex >= state.flat.length) { return; }
     var fm = state.flat[state.activeIndex];
+    if (fm.pendingUri) {
+      // No confirmed line yet — open at the top of the file.
+      send({ type: 'pinInSideEditor', uri: fm.pendingUri, line: 0, column: 0 });
+      return;
+    }
     var f = state.files[fm.fi];
     var m = f.matches[fm.mi];
     var col = (m.ranges && m.ranges[0]) ? m.ranges[0].start : 0;
@@ -1020,7 +1087,12 @@ export function getRendererPatchScript(): string {
   }
 
   function triggerSearch() {
-    var q = $q.value;
+    var raw = $q.value;
+    // Trim leading/trailing whitespace (covers spaces, tabs, newlines).
+    // Pasted selections almost always drag an extra blank line along, which
+    // would prevent rg's literal match from hitting a file that doesn't
+    // start with a newline. Interior whitespace stays intact.
+    var q = typeof raw === 'string' ? raw.trim() : '';
     clearPreview();
     if (!q) {
       state.files = []; state.flat = []; state.activeIndex = -1; state.searching = false;
@@ -1029,6 +1101,12 @@ export function getRendererPatchScript(): string {
       send({ type: 'cancel' });
       return;
     }
+    send({
+      type: 'log',
+      msg: 'triggerSearch: len=' + q.length + '(raw=' + raw.length + ') hasNL=' +
+           (q.indexOf('\\n') >= 0) +
+           ' preview=' + JSON.stringify(q.slice(0, 120)),
+    });
     send({
       type: 'search',
       options: {
@@ -2563,12 +2641,25 @@ export function getRendererPatchScript(): string {
   window.__ijFindOnMessage = function (msg) {
     switch (msg.type) {
       case 'results:start':
-        state.files = []; state.flat = []; state.activeIndex = -1; state.searching = true;
+        state.files = []; state.flat = []; state.candidates = [];
+        state.candidateTotal = 0; state.confirmedUris = {};
+        state.activeIndex = -1; state.searching = true;
         clearPreview();
-        setStatus('Searching...', true);
+        setStatus('Searching\u2026', true);
+        render();
+        break;
+      case 'results:candidates':
+        // Planner narrowed the workspace to these files; rg hasn't matched
+        // them yet. Show as pending rows so the user sees *something*
+        // clickable immediately instead of an empty Searching state.
+        state.candidates = msg.candidates || [];
+        state.candidateTotal = msg.total || state.candidates.length;
+        setStatus('Searching ' + state.candidateTotal + ' candidate file' +
+                  (state.candidateTotal === 1 ? '' : 's') + '\u2026', true);
         render();
         break;
       case 'results:file':
+        state.confirmedUris[msg.match.uri] = true;
         state.files.push(msg.match);
         render();
         var sofar = 0;
@@ -2579,8 +2670,19 @@ export function getRendererPatchScript(): string {
         state.searching = false;
         setSummary();
         if (msg.totalMatches === 0) {
-          setStatus('No matches', false);
+          // Keep candidates visible even with no matches — they were the
+          // planner's best guess, user may want to skim them manually.
+          setStatus(
+            state.candidateTotal > 0
+              ? 'No matches in ' + state.candidateTotal + ' candidate file' +
+                (state.candidateTotal === 1 ? '' : 's')
+              : 'No matches',
+            false,
+          );
         } else {
+          // Real matches came back — drop the unconfirmed candidates so the
+          // result list only shows actual hits.
+          state.candidates = [];
           setStatus(
             msg.totalMatches + ' result' + (msg.totalMatches === 1 ? '' : 's') +
             ' in ' + msg.totalFiles + ' file' + (msg.totalFiles === 1 ? '' : 's') +
@@ -2588,6 +2690,7 @@ export function getRendererPatchScript(): string {
             false
           );
         }
+        render();
         if (state.activeIndex < 0 && state.flat.length > 0) { selectMatch(0); }
         break;
       case 'results:error':

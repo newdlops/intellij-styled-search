@@ -198,7 +198,17 @@ function looksBinary(bytes: Uint8Array): boolean {
 //   0: currently open tabs (instant feedback on files the user is editing)
 //   1: user code (not in library-ish paths); sorted by path depth ascending
 //   2: library-ish paths (node_modules, vendor, venv, dist, site-packages, …)
-const LIBRARY_PATH_RE = /(?:^|\/)(?:node_modules|vendor|third_party|deps|bower_components|\.yarn|\.pnp|\.cache|venv|\.venv|env|\.env|site-packages|dist-info|egg-info|Pods|Carthage|target|out|build|dist|coverage|__pycache__)(?:\/|$)/i;
+export const LIBRARY_PATH_RE = /(?:^|\/)(?:node_modules|vendor|third_party|deps|bower_components|\.yarn|\.pnp|\.cache|venv|\.venv|env|\.env|site-packages|dist-info|egg-info|Pods|Carthage|target|out|build|dist|coverage|__pycache__|\.mypy_cache|\.pytest_cache|\.ruff_cache|\.gradle|\.idea|\.vs|\.tox|\.nox|\.parcel-cache|\.turbo)(?:\/|$)/i;
+
+// Also treat these specific files (any location) as library-ish: they're
+// giant lock / manifest files that rarely contain what a user searches for.
+const LIBRARY_FILENAME_RE = /(?:^|\/)(?:yarn\.lock|package-lock\.json|pnpm-lock\.yaml|Cargo\.lock|Pipfile\.lock|poetry\.lock|composer\.lock|Gemfile\.lock|go\.sum|bun\.lockb)$/i;
+
+export function isLibraryPath(rel: string): boolean {
+  return LIBRARY_PATH_RE.test('/' + rel) || LIBRARY_FILENAME_RE.test('/' + rel);
+}
+
+export { collectOpenTabUris };
 
 function collectOpenTabUris(): Set<string> {
   const set = new Set<string>();
@@ -225,7 +235,7 @@ function collectOpenTabUris(): Set<string> {
   return set;
 }
 
-function prioritizeFiles(files: vscode.Uri[]): vscode.Uri[] {
+export function prioritizeFiles(files: vscode.Uri[]): vscode.Uri[] {
   const openUris = collectOpenTabUris();
   const bucketOpen: vscode.Uri[] = [];
   const bucketUser: Array<{ uri: vscode.Uri; depth: number }> = [];
@@ -236,7 +246,7 @@ function prioritizeFiles(files: vscode.Uri[]): vscode.Uri[] {
       continue;
     }
     const rel = vscode.workspace.asRelativePath(uri, false);
-    if (LIBRARY_PATH_RE.test('/' + rel)) {
+    if (isLibraryPath(rel)) {
       bucketLib.push(uri);
     } else {
       bucketUser.push({ uri, depth: countSlashes(rel) });

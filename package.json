@@ -43,6 +43,11 @@
         "command": "intellijStyledSearch.rebuildIndex",
         "title": "Rebuild Search Index",
         "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.diagnoseFileInIndex",
+        "title": "Diagnose Active File in Search Index",
+        "category": "IntelliJ Search"
       }
     ],
     "keybindings": [

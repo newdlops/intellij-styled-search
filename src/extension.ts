@@ -32,6 +32,15 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showErrorMessage(`Index rebuild failed: ${msg}`);
       }
     }),
+    vscode.commands.registerCommand('intellijStyledSearch.diagnoseFileInIndex', async () => {
+      overlay.logCommand('diagnoseFileInIndex');
+      const query = await vscode.window.showInputBox({
+        prompt: 'Paste the query you expected to find in the active file',
+        placeHolder: 'e.g. class EmailTemplateParameter(TypedDict):',
+      });
+      if (query === undefined) { return; }
+      await overlay.diagnoseCurrentFile(query);
+    }),
   );
 }
 
@@ -42,9 +51,12 @@ function getQueryFromActiveEditor(): string {
   if (!editor) { return ''; }
   const { selection, document } = editor;
   if (!selection.isEmpty) {
-    const text = document.getText(selection);
-    if (text && !text.includes('\n')) { return text; }
-    if (text) { return text.split('\n')[0]; }
+    // Pass the full multi-line selection through. Leading/trailing
+    // whitespace and blank lines get trimmed — they're almost always
+    // accidental when copy/selecting code, and rg's literal matcher
+    // wouldn't match them against the file anyway.
+    const text = document.getText(selection).replace(/^[\s\n]+|[\s\n]+$/g, '');
+    if (text) { return text; }
   }
   const wordRange = document.getWordRangeAtPosition(selection.active);
   if (wordRange) { return document.getText(wordRange); }

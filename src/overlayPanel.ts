@@ -2,10 +2,10 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import { execSync } from 'child_process';
 import WebSocket from 'ws';
-import { runSearch, SearchOptions, FileMatch, MatchRange } from './search';
+import { runSearch, SearchOptions, FileMatch, MatchRange, prioritizeFiles } from './search';
 import { findRipgrepPath, runRgSearch } from './rgSearch';
 import { getRendererPatchScript } from './rendererPatch';
-import { TrigramIndex } from './trigramIndex';
+import { TrigramIndex, extractTrigramsLower } from './trigramIndex';
 
 type RendererEvent =
   | { type: 'search'; options: SearchOptions }
@@ -25,6 +25,7 @@ type HoverContent = { value: string; isTrusted: boolean; allowedCommands?: reado
 
 type OverlayMessage =
   | { type: 'results:start' }
+  | { type: 'results:candidates'; candidates: Array<{ uri: string; relPath: string }>; total: number }
   | { type: 'results:file'; match: FileMatch }
   | { type: 'results:done'; totalFiles: number; totalMatches: number; truncated: boolean }
   | { type: 'results:error'; message: string }
@@ -46,6 +47,12 @@ export class OverlayPanel {
   private trigramIndex: TrigramIndex;
   private pendingShow: string | null = null;
   private showInFlight = false;
+  // Per-source lastSeenSeq: each renderer patch install has its own instance
+  // id (`__src`) and monotonic `__seq`. We dedup duplicates delivered by
+  // accumulated CDP `message` listeners *within the same source*, but never
+  // across sources — a single shared counter would drop legit events when
+  // different windows' __seqs interleave (see V50 patch comment).
+  private lastSeenSeqBySrc = new Map<string, number>();
 
   static get(context: vscode.ExtensionContext): OverlayPanel {
     if (!OverlayPanel.instance) {
@@ -84,8 +91,13 @@ export class OverlayPanel {
 
   private captureTriggered = false;
   /** Fire the capture diagnostic exactly once per extension-host session,
-   * and only if Monaco globals aren't already populated. Runs in the
-   * background — the overlay UI renders without waiting for it. */
+   * and only if Monaco globals aren't already populated. Delayed so the
+   * user's first search completes first — capture floods the CDP channel
+   * with ~10 roundtrips + a file open/close, which otherwise queues
+   * behind postToRenderer('results:start') and visibly delays result
+   * rendering. 1200ms ≈ "show + first rg result typical case". The
+   * fallback DOM preview handles the first click gracefully if capture
+   * hasn't finished yet; the second click gets real monaco. */
   private scheduleLazyCapture(): void {
     if (this.captureTriggered) { return; }
     this.captureTriggered = true;
@@ -93,7 +105,7 @@ export class OverlayPanel {
       void this.triggerCaptureDiagnostic().catch((err) => {
         this.log.appendLine(`Lazy capture failed: ${err instanceof Error ? err.message : err}`);
       });
-    }, 500);
+    }, 1200);
   }
 
   private async listWorkbenchWindowIds(): Promise<number[]> {
@@ -136,16 +148,20 @@ export class OverlayPanel {
         return 'ctor=' + (!!(m.ctor)) + ' inst=' + (!!(m.inst)) + ' modelSvc=' + (!!(m.modelSvc));
       } catch(e){ return 'peek-err:' + (e && e.message); }
     })()`;
+    // Check all windows in parallel — if ANY already has globals populated
+    // (renderer persisted them across the extension-host restart), we skip
+    // the whole diagnostic. Serial check added ~150ms before we could bail.
+    const monacoVals = new Map<number, string>();
+    await Promise.all(windowIds.map(async (id) => {
+      try { monacoVals.set(id, await this.evalInWindow(id, monacoPeek)); }
+      catch {}
+    }));
     let alreadyReadyWin: number | null = null;
-    for (const id of windowIds) {
-      try {
-        const v = await this.evalInWindow(id, monacoPeek);
-        this.log.appendLine(`Monaco globals win=${id}: ${v}`);
-        if (/ctor=true inst=true modelSvc=true/.test(v)) {
-          alreadyReadyWin = id;
-          break;
-        }
-      } catch {}
+    for (const [id, v] of monacoVals) {
+      this.log.appendLine(`Monaco globals win=${id}: ${v}`);
+      if (alreadyReadyWin === null && /ctor=true inst=true modelSvc=true/.test(v)) {
+        alreadyReadyWin = id;
+      }
     }
     if (alreadyReadyWin !== null) {
       this.log.appendLine(`Monaco globals already present in win=${alreadyReadyWin} — skipping capture diagnostic.`);
@@ -162,13 +178,17 @@ export class OverlayPanel {
       } catch(e){ return 'peek-err:' + (e && e.message); }
     })()`;
 
-    const peekAll = async (stage: string) => {
+    const peekAll = async (stage: string, silent = false) => {
       const results = new Map<number, string>();
-      for (const id of windowIds) {
+      // Run peeks in parallel — one CDP eval per window; serial would add
+      // ~50ms per additional window for no reason.
+      await Promise.all(windowIds.map(async (id) => {
         try { results.set(id, await this.evalInWindow(id, peek)); }
         catch (err) { results.set(id, 'err:' + (err instanceof Error ? err.message : err)); }
+      }));
+      if (!silent) {
+        this.log.appendLine(`${stage}: ${[...results.entries()].map(([id, v]) => `win=${id} ${v}`).join(' | ')}`);
       }
-      this.log.appendLine(`${stage}: ${[...results.entries()].map(([id, v]) => `win=${id} ${v}`).join(' | ')}`);
       return results;
     };
 
@@ -188,32 +208,64 @@ export class OverlayPanel {
           return 'cleared';
         } catch (e) { return 'clear-err:' + (e && e.message); }
       })()`;
-      for (const id of windowIds) {
-        try { await this.evalInWindow(id, clearExpr); } catch (e) {}
-      }
+      await Promise.all(windowIds.map(async (id) => {
+        try { await this.evalInWindow(id, clearExpr); } catch {}
+      }));
       this.log.appendLine('Captures cleared — forcing real editor creation via file open/close...');
+      const t0 = Date.now();
+      let tFind = 0, tShow = 0, tPoll = 0, tClose = 0, pollIters = 0, pollPeekMaxMs = 0;
       try {
+        const tFind0 = Date.now();
         const candidates = await vscode.workspace.findFiles(
           '**/*.{json,md,txt,ts,js,py}',
           '{**/node_modules/**,**/.git/**}',
           1,
         );
+        tFind = Date.now() - tFind0;
         if (candidates.length > 0) {
           this.log.appendLine(`Capture diagnostic: opening ${candidates[0].toString()}`);
+          const tShow0 = Date.now();
           await vscode.window.showTextDocument(candidates[0], {
             viewColumn: vscode.ViewColumn.Beside,
             preserveFocus: true,
             preview: true,
           });
-          await new Promise((r) => setTimeout(r, 1000));
+          tShow = Date.now() - tShow0;
+          // Poll every 100ms instead of sleeping a flat 1s. As soon as ANY
+          // window has enough real widgets + services to run the widget-
+          // creation test, close and move on. Cuts the fixed wait from
+          // 1000ms+1500ms (= 2.5s) to typically 200–500ms.
+          const tPoll0 = Date.now();
+          let sawCaptures = false;
+          for (let i = 0; i < 20; i++) {
+            await new Promise((r) => setTimeout(r, 100));
+            const tPeek0 = Date.now();
+            const p = await peekAll('poll', true);
+            const peekMs = Date.now() - tPeek0;
+            if (peekMs > pollPeekMaxMs) { pollPeekMaxMs = peekMs; }
+            pollIters = i + 1;
+            for (const v of p.values()) {
+              const m = /widgets=(\d+)/.exec(v);
+              if (m && parseInt(m[1], 10) >= 5) { sawCaptures = true; break; }
+            }
+            if (sawCaptures) { break; }
+          }
+          tPoll = Date.now() - tPoll0;
+          const tClose0 = Date.now();
           await vscode.commands.executeCommand('workbench.action.closeEditorsInGroup');
+          tClose = Date.now() - tClose0;
         } else {
           this.log.appendLine('Capture diagnostic: no files found to open');
         }
       } catch (err) {
         this.log.appendLine(`Capture trigger failed: ${err instanceof Error ? err.message : err}`);
       }
-      await new Promise((r) => setTimeout(r, 1500));
+      this.log.appendLine(
+        `Capture force-open phase: ${Date.now() - t0}ms ` +
+        `(findFiles=${tFind}ms showTextDocument=${tShow}ms ` +
+        `poll=${tPoll}ms iters=${pollIters} peekMax=${pollPeekMaxMs}ms ` +
+        `closeEditors=${tClose}ms)`,
+      );
       const peeked = await peekAll('Capture peek after clear+force');
 
       // Find the window with most captures and run the widget-creation test there.
@@ -238,14 +290,15 @@ export class OverlayPanel {
       }
 
       // Stop capture in every window (best-effort) so Map.prototype etc.
-      // are back to normal.
-      for (const id of windowIds) {
-        try {
-          const stop = await this.evalInWindow(id, `(function(){ try { return window.__ijFindStopCapture && window.__ijFindStopCapture(); } catch(e){ return 'stop-err:' + (e && e.message); } })()`);
-          this.log.appendLine(`Capture stop win=${id}: ${stop}`);
-        } catch (err) {
-          this.log.appendLine(`Capture stop win=${id} threw: ${err instanceof Error ? err.message : err}`);
-        }
+      // are back to normal. Parallel for a small (~100ms) additional win.
+      const stopExpr = `(function(){ try { return window.__ijFindStopCapture && window.__ijFindStopCapture(); } catch(e){ return 'stop-err:' + (e && e.message); } })()`;
+      const stops = new Map<number, string>();
+      await Promise.all(windowIds.map(async (id) => {
+        try { stops.set(id, await this.evalInWindow(id, stopExpr)); }
+        catch (err) { stops.set(id, 'err:' + (err instanceof Error ? err.message : err)); }
+      }));
+      for (const [id, v] of stops) {
+        this.log.appendLine(`Capture stop win=${id}: ${v}`);
       }
     } catch (err) {
       this.log.appendLine(`Capture diagnostic failed: ${err instanceof Error ? err.message : err}`);
@@ -272,26 +325,81 @@ export class OverlayPanel {
     await this.ensureInjected();
   }
 
+  private rebuildInFlight = false;
   async rebuildIndex(): Promise<void> {
-    // Cancel any in-flight search — it was probably using the stale index.
+    if (this.rebuildInFlight) {
+      // Coalesce mash-presses into one user-facing rebuild operation.
+      this.log.appendLine('rebuildIndex: already in progress; ignoring duplicate invocation.');
+      return;
+    }
+    this.rebuildInFlight = true;
     this.cancelActive();
-    await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: 'IntelliJ Styled Search: rebuilding index',
-        cancellable: false,
-      },
-      async (progress) => {
-        progress.report({ message: 'clearing...' });
-        try {
-          await this.trigramIndex.rebuild();
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          this.log.appendLine(`Rebuild failed: ${msg}`);
-          throw err;
-        }
-      },
-    );
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'IntelliJ Styled Search: rebuilding index',
+          cancellable: false,
+        },
+        async (ui) => {
+          try {
+            await this.trigramIndex.rebuild({
+              report: (stage, current, total) => {
+                if (total > 0) {
+                  const pct = Math.min(100, Math.round((current / total) * 100));
+                  ui.report({ message: `${stage} ${current}/${total} (${pct}%)` });
+                } else {
+                  ui.report({ message: stage });
+                }
+              },
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.log.appendLine(`Rebuild failed: ${msg}`);
+            throw err;
+          }
+        },
+      );
+    } finally {
+      this.rebuildInFlight = false;
+    }
+  }
+
+  /** Debug-only: compare a query against what the index thinks about the
+   *  currently-active file. Prints whether the file is in the index, how
+   *  many of the query's trigrams are recorded for it, and the first few
+   *  trigrams that are "in the file but not in the index" — which is the
+   *  exact explanation for a failed literal search. */
+  async diagnoseCurrentFile(query: string): Promise<void> {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      vscode.window.showWarningMessage('Open a file first so we know which to diagnose.');
+      return;
+    }
+    const uri = editor.document.uri.toString();
+    const qtris = query.length >= 3 ? extractTrigramsLower(query) : new Set<string>();
+    const report = this.trigramIndex.diagnoseFile(uri, qtris);
+    const lines: string[] = [];
+    lines.push(`File: ${vscode.workspace.asRelativePath(editor.document.uri, false)}`);
+    lines.push(`URI:  ${uri}`);
+    lines.push(`Query: ${JSON.stringify(query.slice(0, 120))}${query.length > 120 ? '…' : ''}`);
+    lines.push(`Query trigrams: ${qtris.size}`);
+    if (!report.inIndex) {
+      lines.push('❌ File NOT in index. (Possible reasons: >1MB, binary, excludeGlobs, reconcile still running.)');
+    } else {
+      lines.push(`✓ File in index. fileId=${report.fileId}, mtime=${report.mtime}, size=${report.size} bytes`);
+      lines.push(`Query trigrams present in file posting: ${report.presentInFile}/${report.totalChecked}`);
+      if (report.missingFromFile.length > 0) {
+        const sample = report.missingFromFile.slice(0, 20)
+          .map((t) => JSON.stringify(t)).join(' ');
+        lines.push(`Missing-in-file trigrams (up to 20): ${sample}`);
+        lines.push('→ If literal IS in the file, these are the trigrams the index wasn\'t given — either extraction bug or file changed after index.');
+      } else if (report.totalChecked > 0) {
+        lines.push('→ Every query trigram is recorded for this file. If rg still reports 0 matches, it\'s a rg-level issue (path, flags, or file content on disk differs from what rg sees).');
+      }
+    }
+    this.log.show(true);
+    for (const l of lines) { this.log.appendLine(l); }
   }
 
   async show(initialQuery: string): Promise<void> {
@@ -312,8 +420,13 @@ export class OverlayPanel {
   }
 
   private async doShow(initialQuery: string): Promise<void> {
+    const tShow = Date.now();
+    this.log.appendLine(
+      `doShow: initialQueryLen=${initialQuery.length} preview=${JSON.stringify(initialQuery.slice(0, 80))}`,
+    );
     try {
       await this.ensureInjected();
+      const tInjected = Date.now();
       // Single-roundtrip fast path: in one CDP message we locate the focused
       // workbench window, send __ijFindShow into it (awaited), and fire-and-
       // forget __ijFindHide into every other window. Prior version did three
@@ -364,7 +477,10 @@ export class OverlayPanel {
         return;
       }
       this.activeWindowId = v.fid;
-      this.log.appendLine(`Show(win=${v.fid}): ${v.result}`);
+      const tRendered = Date.now();
+      this.log.appendLine(
+        `Show(win=${v.fid}): ${v.result} [ensureInjected=${tInjected - tShow}ms showEval=${tRendered - tInjected}ms total=${tRendered - tShow}ms]`,
+      );
       // After the overlay is visible, kick off monaco capture in the
       // background. Results + DOM-fallback preview keep working meanwhile;
       // the first preview click that lands after capture completes will
@@ -454,24 +570,31 @@ export class OverlayPanel {
   private async inject(): Promise<void> {
     const mainPid = this.findMainPid();
     if (!mainPid) { throw new Error('Could not locate VSCode main (Electron) process'); }
+    const tStart = Date.now();
     this.log.appendLine(`Main PID ${mainPid}: sending SIGUSR1`);
     try { process.kill(mainPid, 'SIGUSR1'); } catch (e) {
       throw new Error(`SIGUSR1 to pid ${mainPid} failed: ${e instanceof Error ? e.message : e}`);
     }
 
-    // Wait for the inspector listener to open, retry a few times.
+    // Wait for the inspector listener to open. Tight-loop with 25ms backoff
+    // instead of the old 200ms — the inspector is usually up in <100ms, so
+    // the extra wall-clock savings are 150–350ms per prewarm.
     let wsUrl: string | undefined;
-    for (let i = 0; i < 10; i++) {
-      await delay(200);
+    let attempts = 0;
+    for (let i = 0; i < 80; i++) {
       try {
+        attempts++;
         const targets = await fetchJson('http://127.0.0.1:9229/json/list');
         if (Array.isArray(targets) && targets.length > 0 && targets[0].webSocketDebuggerUrl) {
           wsUrl = targets[0].webSocketDebuggerUrl;
           break;
         }
       } catch {}
+      await delay(25);
     }
     if (!wsUrl) { throw new Error('CDP inspector did not come up on 127.0.0.1:9229'); }
+    const tInspector = Date.now();
+    this.log.appendLine(`Inspector up after ${tInspector - tStart}ms (${attempts} polls)`);
 
     this.log.appendLine('Connecting CDP WebSocket');
     const ws = new WebSocket(wsUrl);
@@ -485,6 +608,8 @@ export class OverlayPanel {
       ws.once('open', onOpen);
       ws.once('error', onErr);
     });
+    const tWs = Date.now();
+    this.log.appendLine(`WebSocket open after ${tWs - tInspector}ms`);
     this.ws = ws;
     ws.on('message', (data) => this.handleWsMessage(data));
     ws.on('close', () => {
@@ -543,13 +668,27 @@ export class OverlayPanel {
               results.push('ok:' + w.id + ':' + val);
               try {
                 await w.webContents.debugger.sendCommand('Runtime.addBinding', { name: ${JSON.stringify(RENDERER_BINDING)} });
-                w.webContents.debugger.on('message', function (ev, method, params) {
+                // CRITICAL: the 'message' listener accumulates across
+                // extension-host reloads (main-process state persists while
+                // the extension host restarts), and Electron's
+                // webContents.debugger inherits every prior session's
+                // listener. N listeners = 1 renderer send becomes N
+                // runSearch calls. Track our registration per-window and
+                // remove the previous one before adding the new.
+                if (!global.__ijFindBridgeListeners) { global.__ijFindBridgeListeners = new Map(); }
+                var prev = global.__ijFindBridgeListeners.get(w.id);
+                if (prev) {
+                  try { w.webContents.debugger.removeListener('message', prev); } catch (eRm) {}
+                }
+                var bridge = function (ev, method, params) {
                   if (method === 'Runtime.bindingCalled' && params && params.name === ${JSON.stringify(RENDERER_BINDING)}) {
                     if (typeof global.${BRIDGE_BINDING} === 'function') {
                       global.${BRIDGE_BINDING}(params.payload);
                     }
                   }
-                });
+                };
+                w.webContents.debugger.on('message', bridge);
+                global.__ijFindBridgeListeners.set(w.id, bridge);
               } catch (eb) { results.push('bind-err:' + w.id + ':' + eb.message); }
             } else {
               var type = r && r.result ? r.result.type : 'no-result';
@@ -599,8 +738,13 @@ export class OverlayPanel {
   }
 
   private handleRendererEvent(payload: string) {
-    let evt: RendererEvent;
+    let evt: RendererEvent & { __seq?: number; __src?: string };
     try { evt = JSON.parse(payload); } catch { return; }
+    if (typeof evt.__seq === 'number' && typeof evt.__src === 'string') {
+      const last = this.lastSeenSeqBySrc.get(evt.__src) ?? -1;
+      if (evt.__seq <= last) { return; }
+      this.lastSeenSeqBySrc.set(evt.__src, evt.__seq);
+    }
     switch (evt.type) {
       case 'search': void this.runSearch(evt.options); break;
       case 'cancel': this.cancelActive(); break;
@@ -792,20 +936,32 @@ export class OverlayPanel {
       },
       onError: (e: Error) => { void this.postToRenderer({ type: 'results:error', message: e.message }); },
     };
+    const t0 = Date.now();
+    const optTags = [
+      options.useRegex ? 'regex' : '',
+      options.caseSensitive ? 'case' : '',
+      options.wholeWord ? 'word' : '',
+      options.query.includes('\n') ? 'multiline' : '',
+    ].filter(Boolean).join(',') || 'plain';
+    this.log.appendLine(
+      `search start: len=${options.query.length} flags=[${optTags}] indexReady=${this.trigramIndex.isReady} indexSize=${this.trigramIndex.size}`,
+    );
     try {
       // Cox's codesearch planner narrows rg's file set. If the index
       // returns null, the planner couldn't constrain — rg walks the whole
       // workspace. If the index returns an empty set, the regex can't
       // match anything.
-      const candidates = this.trigramIndex.candidatesFor(options.query, {
+      const { uris: candidates, reason } = this.trigramIndex.candidatesFor(options.query, {
         useRegex: options.useRegex,
         caseSensitive: options.caseSensitive,
         wholeWord: options.wholeWord,
       });
       if (candidates) {
         this.log.appendLine(
-          `TrigramIndex candidates: ${candidates.size} / indexSize=${this.trigramIndex.size}`,
+          `TrigramIndex candidates: ${candidates.size} via ${reason}`,
         );
+      } else {
+        this.log.appendLine(`TrigramIndex candidates: null (${reason}) — rg will full-scan workspace`);
       }
       // Primary engine: the same ripgrep that VSCode's built-in "Find in
       // Files" uses. Byte-for-byte result parity + multi-thread speed.
@@ -815,15 +971,54 @@ export class OverlayPanel {
         let paths: string[] | null = null;
         if (candidates) {
           if (candidates.size === 0) {
+            this.log.appendLine(`search done: 0 matches (candidates empty) in ${Date.now() - t0}ms`);
             progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
             return;
           }
-          paths = [];
+          // Order candidates by relevance: open tabs → user code (shallow
+          // depth first) → library-ish paths (.venv, node_modules, locks,
+          // caches). Both rg scan order and the pending-row UI use this
+          // order, so user's real files appear first in every view.
+          const uris: vscode.Uri[] = [];
           for (const u of candidates) {
-            try { paths.push(vscode.Uri.parse(u).fsPath); } catch {}
+            try { uris.push(vscode.Uri.parse(u)); } catch {}
           }
+          const ordered = prioritizeFiles(uris);
+          paths = ordered.map((u) => u.fsPath);
+          const MAX_PENDING = 400;
+          const head = ordered.slice(0, MAX_PENDING);
+          const sample = head.map((u) => ({
+            uri: u.toString(),
+            relPath: vscode.workspace.asRelativePath(u, false),
+          }));
+          // Log a handful of candidate paths so we can tell when rg returns
+          // 0 matches whether the issue is "wrong files picked" (user's
+          // real file isn't in the list) vs "right files, content doesn't
+          // match the literal". Paths are relative to workspace.
+          const relPaths = ordered.map((u) => vscode.workspace.asRelativePath(u, false));
+          const head3 = relPaths.slice(0, 3).join(' | ');
+          const tail3 = relPaths.length > 6 ? ' ... ' + relPaths.slice(-3).join(' | ') : '';
+          this.log.appendLine(
+            `candidates sample [${relPaths.length}]: ${head3}${tail3}`,
+          );
+          void this.postToRenderer({
+            type: 'results:candidates',
+            candidates: sample,
+            total: paths.length,
+          });
         }
-        await runRgSearch(options, cts.token, progress, paths);
+        const rgStart = Date.now();
+        const wrappedProgress = {
+          onFile: progress.onFile,
+          onDone: (s: { totalFiles: number; totalMatches: number; truncated: boolean }) => {
+            this.log.appendLine(
+              `search done: ${s.totalMatches} matches in ${s.totalFiles} files, rg=${Date.now() - rgStart}ms total=${Date.now() - t0}ms`,
+            );
+            progress.onDone(s);
+          },
+          onError: progress.onError,
+        };
+        await runRgSearch(options, cts.token, wrappedProgress, paths, (m) => this.log.appendLine(m));
       } else {
         this.log.appendLine('rg not found — falling back to JS scan.');
         await runSearch(options, cts.token, progress, candidates);

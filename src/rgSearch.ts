@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 import { SearchOptions, SearchProgress, FileMatch, MatchRange } from './search';
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -87,6 +88,7 @@ export async function runRgSearch(
   token: vscode.CancellationToken,
   progress: SearchProgress,
   candidateFiles?: string[] | null,
+  logger?: (msg: string) => void,
 ): Promise<void> {
   const rgPath = findRipgrepPath();
   if (!rgPath) {
@@ -109,7 +111,11 @@ export async function runRgSearch(
     '--json',
     '--hidden',
     '--no-messages',
-    '--max-filesize', String(maxFileSize) + 'B',
+    // CAUTION: rg accepts K/M/G suffix only. Passing '1048576B' makes rg
+    // bail with "invalid numeric value" and exit silently — which was
+    // manifesting as all searches returning 0 matches in ~7ms while
+    // claiming success, because --no-messages suppressed the error.
+    '--max-filesize', String(maxFileSize),
     '--max-columns', '4096',
     '--max-columns-preview',
     '--no-ignore-parent',
@@ -120,10 +126,26 @@ export async function runRgSearch(
   if (opts.caseSensitive) { args.push('--case-sensitive'); }
   else { args.push('--ignore-case'); }
   if (opts.wholeWord) { args.push('--word-regexp'); }
+  let candidateListFile: string | undefined;
   if (candidateFiles && candidateFiles.length > 0) {
-    // Index narrowed the search to a candidate file list. Feed it via
-    // stdin with --files-from=- and skip the workspace walk entirely.
-    args.push('--files-from=-');
+    // Index narrowed the search to a candidate file list. Write it to a
+    // tmp file and pass `--files-from <path>` — previously we fed stdin,
+    // which silently produced 0 matches for every narrowed query (rg
+    // apparently wasn't consuming our writes). A real file path is both
+    // simpler and bypasses any stdin buffering/pipe timing issues.
+    candidateListFile = path.join(
+      os.tmpdir(),
+      `ij-find-files-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`,
+    );
+    fs.writeFileSync(candidateListFile, candidateFiles.join('\n') + '\n', 'utf-8');
+    args.push('--files-from', candidateListFile);
+    // CRITICAL: our trigram index ignores .gitignore (it indexes every
+    // non-binary file in the workspace). rg by default *respects*
+    // .gitignore, so when we hand it a candidate list that includes
+    // gitignored files (e.g. .venv/**, .mypy_cache/**, yarn.lock), rg
+    // silently skips them and returns 0 matches. Disable ignore handling
+    // so rg actually reads every file we asked for.
+    args.push('--no-ignore');
   } else {
     // ripgrep --glob with '!' prefix is exclusion. Convert **/foo/** style
     // globs to ripgrep's format (which is the same glob syntax).
@@ -140,19 +162,18 @@ export async function runRgSearch(
   let truncated = false;
   let killed = false;
 
-  const wantStdin = !!(candidateFiles && candidateFiles.length > 0);
+  if (logger) {
+    // Rebuild a shell-quoted command for manual reproduction in a terminal.
+    const quoted = args.map((a) => (/[\s"'\\]/.test(a) ? `'${a.replace(/'/g, "'\\''")}'` : a)).join(' ');
+    logger(
+      `rg exec: cwd=${folders[0].uri.fsPath} filesFrom=${candidateListFile ? candidateFiles!.length + 'paths' : 'none'} args: ${quoted}`,
+    );
+  }
   const child: ChildProcess = spawn(rgPath, args, {
     cwd: folders[0].uri.fsPath,
     env: { ...process.env },
-    stdio: [wantStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
-  if (wantStdin && child.stdin) {
-    // Feed candidate paths, one per line. Use fsPaths; rg resolves them
-    // relative to cwd or as absolute.
-    child.stdin.on('error', () => { /* EPIPE if rg exits early */ });
-    for (const p of candidateFiles!) { child.stdin.write(p + '\n'); }
-    child.stdin.end();
-  }
 
   const cancelHandler = token.onCancellationRequested(() => {
     killed = true;
@@ -255,17 +276,43 @@ export async function runRgSearch(
       try { handleEvent(JSON.parse(line) as RgEvent); } catch {}
     }
   });
-  // Silence stderr (rg surfaces IO warnings etc. that aren't useful to us).
-  child.stderr!.on('data', () => {});
+  // Capture stderr so we can surface fatal argument errors (e.g., unknown
+  // flag, bad --max-filesize) that rg writes before exiting. Without this
+  // the parent just sees 0 matches and can't tell scrape-failed from
+  // actually-no-matches.
+  let stderrBuf = '';
+  child.stderr!.setEncoding('utf-8');
+  child.stderr!.on('data', (chunk: string) => {
+    stderrBuf += chunk;
+    if (stderrBuf.length > 4096) { stderrBuf = stderrBuf.slice(-4096); }
+  });
 
+  let exitCode: number | null = null;
   await new Promise<void>((resolve) => {
-    child.on('close', () => resolve());
+    child.on('close', (code) => { exitCode = code; resolve(); });
     child.on('error', (err) => {
       progress.onError(err);
       resolve();
     });
   });
   cancelHandler.dispose();
+
+  // rg exits 0 on matches, 1 on no-matches-but-success, 2 on fatal error.
+  if (logger) {
+    const trimmed = stderrBuf.trim();
+    logger(
+      `rg exit: code=${exitCode}${trimmed ? ` stderr=${JSON.stringify(trimmed.slice(0, 300))}` : ''}`,
+    );
+  }
+  // If we got a fatal exit and stderr has content, surface it so the user
+  // knows rg rejected the arguments instead of quietly returning 0 hits.
+  if ((exitCode === null || exitCode >= 2) && stderrBuf.trim().length > 0 && !killed) {
+    progress.onError(new Error(`ripgrep: ${stderrBuf.trim().slice(0, 300)}`));
+  }
+
+  if (candidateListFile) {
+    try { fs.unlinkSync(candidateListFile); } catch {}
+  }
 
   // Final flush (rg sends 'end' per file but last file may not if killed).
   flushFile();
