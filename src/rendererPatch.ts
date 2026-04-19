@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV76) { return 'already patched'; }
-  window.__ijFindPatchedV76 = true;
+  if (window.__ijFindPatchedV77) { return 'already patched'; }
+  window.__ijFindPatchedV77 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -2609,34 +2609,37 @@ export function getRendererPatchScript(): string {
   // force-open dance — no extra tab flash, no lost editor state.
   window.__ijFindCaptureFromDom = function () {
     try {
-      var before = caps.widgets.length;
+      var targetCaps = window.__ijFindCaptures;
+      if (!targetCaps) { return 'no-caps'; }
+      try { if (!caps) { caps = targetCaps; } } catch (eCaps) {}
+      var before = targetCaps.widgets.length;
       var editors = document.querySelectorAll('.editor-group-container .monaco-editor');
-      for (var i = 0; i < editors.length && caps.widgets.length < 50; i++) {
+      for (var i = 0; i < editors.length && targetCaps.widgets.length < 50; i++) {
         var widget = findMonacoWidget(editors[i]);
         if (!widget) { continue; }
-        caps.widgets.push({ v: widget, src: 'dom-capture', key: stringifyKey(i) });
+        targetCaps.widgets.push({ v: widget, src: 'dom-capture', key: stringifyKey(i) });
         try {
-          if (widget.constructor && caps.widgetCtors.indexOf(widget.constructor) < 0 &&
-              caps.widgetCtors.length < 10) {
-            caps.widgetCtors.push(widget.constructor);
+          if (widget.constructor && targetCaps.widgetCtors.indexOf(widget.constructor) < 0 &&
+              targetCaps.widgetCtors.length < 10) {
+            targetCaps.widgetCtors.push(widget.constructor);
           }
         } catch (eCtor) {}
         try {
           var inst = widget._instantiationService;
           if (inst && typeof inst.createInstance === 'function' &&
               typeof inst.invokeFunction === 'function' &&
-              caps.services.length < 40) {
-            caps.services.push({
+              targetCaps.services.length < 40) {
+            targetCaps.services.push({
               v: inst, src: 'dom-capture', key: stringifyKey(i),
               kind: 'IInstantiationService',
             });
           }
         } catch (eSvc) {}
       }
-      return 'added=' + (caps.widgets.length - before) +
-             ' widgets=' + caps.widgets.length +
-             ' services=' + caps.services.length +
-             ' ctors=' + caps.widgetCtors.length;
+      return 'added=' + (targetCaps.widgets.length - before) +
+             ' widgets=' + targetCaps.widgets.length +
+             ' services=' + targetCaps.services.length +
+             ' ctors=' + targetCaps.widgetCtors.length;
     } catch (e) { return 'dom-capture-err:' + (e && e.message); }
   };
 

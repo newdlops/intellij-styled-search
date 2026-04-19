@@ -364,9 +364,61 @@ export class OverlayPanel {
       }
       return results;
     };
+    const stopCaptureAll = async () => {
+      // Stop capture in every window so prototype monkey-patches revert.
+      const stopExpr = `(function(){ try { return window.__ijFindStopCapture && window.__ijFindStopCapture(); } catch(e){ return 'stop-err:' + (e && e.message); } })()`;
+      await Promise.all(windowIds.map(async (id) => {
+        try {
+          const r = await this.evalInWindow(id, stopExpr);
+          this.log.appendLine(`Capture stop win=${id}: ${r}`);
+        } catch {}
+      }));
+    };
+    const runWidgetCreateTest = async (winId: number, label: string): Promise<boolean> => {
+      const testExpr = `(function(){ try { return window.__ijFindTestCreateWidget ? window.__ijFindTestCreateWidget() : 'no-test-fn'; } catch(e){ return 'test-throw:' + (e && e.message); } })()`;
+      try {
+        const testResult = await this.evalInWindow(winId, testExpr);
+        this.log.appendLine(`TEST widget create (win=${winId}, ${label}): ${String(testResult).slice(0, 2000)}`);
+      } catch (err) {
+        this.log.appendLine(`TEST widget eval failed: ${err instanceof Error ? err.message : err}`);
+      }
+      return this.isMonacoReadyInWindow(winId);
+    };
+    const findBestCapturedWindow = (peeked: Map<number, string>): { id: number; widgets: number; services: number; ctors: number } | null => {
+      let best: { id: number; widgets: number; services: number; ctors: number } | null = null;
+      for (const [id, v] of peeked) {
+        const widgetsMatch = /widgets=(\d+)/.exec(v);
+        const servicesMatch = /services=(\d+)/.exec(v);
+        const ctorsMatch = /ctors=(\d+)/.exec(v);
+        const widgets = widgetsMatch ? parseInt(widgetsMatch[1], 10) : 0;
+        const services = servicesMatch ? parseInt(servicesMatch[1], 10) : 0;
+        const ctors = ctorsMatch ? parseInt(ctorsMatch[1], 10) : 0;
+        if (widgets <= 0 || services <= 0) { continue; }
+        if (preferredWindowId !== undefined && id === preferredWindowId) {
+          return { id, widgets, services, ctors };
+        }
+        if (preferredWindowId !== undefined) { continue; }
+        if (!best || widgets + services + ctors > best.widgets + best.services + best.ctors) {
+          best = { id, widgets, services, ctors };
+        }
+      }
+      return best;
+    };
 
     try {
-      await peekAll('Capture peek initial (boot-time, likely dummies)');
+      const initialPeek = await peekAll('Capture peek initial');
+      const existingCapture = findBestCapturedWindow(initialPeek);
+      if (existingCapture) {
+        this.log.appendLine(
+          `Existing captures in win=${existingCapture.id} ` +
+          `(widgets=${existingCapture.widgets} services=${existingCapture.services} ctors=${existingCapture.ctors}) — testing before clearing.`,
+        );
+        if (await runWidgetCreateTest(existingCapture.id, 'existing-captures')) {
+          await stopCaptureAll();
+          return;
+        }
+        this.log.appendLine(`Existing captures in win=${existingCapture.id} did not yield Monaco; falling back to fresh DOM/force capture.`);
+      }
       // Boot-time captures are almost always DI stubs (getModel()=null).
       // Clear them everywhere and force a real editor creation so fresh
       // Map/Array/Set writes land in a clean capture buffer.
@@ -421,22 +473,8 @@ export class OverlayPanel {
       }
       if (bestDomWin !== null && (preferredWindowId === undefined || bestDomWin === preferredWindowId)) {
         this.log.appendLine(`DOM scan yielded widgets=${bestDomWidgets} in win=${bestDomWin} — skipping force-open.`);
-        // Run TEST widget create directly.
-        const testExpr = `(function(){ try { return window.__ijFindTestCreateWidget ? window.__ijFindTestCreateWidget() : 'no-test-fn'; } catch(e){ return 'test-throw:' + (e && e.message); } })()`;
-        try {
-          const testResult = await this.evalInWindow(bestDomWin, testExpr);
-          this.log.appendLine(`TEST widget create (win=${bestDomWin}, DOM path): ${String(testResult).slice(0, 2000)}`);
-        } catch (err) {
-          this.log.appendLine(`TEST widget eval failed: ${err instanceof Error ? err.message : err}`);
-        }
-        // Stop capture in every window so prototype monkey-patches revert.
-        const stopExpr = `(function(){ try { return window.__ijFindStopCapture && window.__ijFindStopCapture(); } catch(e){ return 'stop-err:' + (e && e.message); } })()`;
-        await Promise.all(windowIds.map(async (id) => {
-          try {
-            const r = await this.evalInWindow(id, stopExpr);
-            this.log.appendLine(`Capture stop win=${id}: ${r}`);
-          } catch {}
-        }));
+        await runWidgetCreateTest(bestDomWin, 'DOM path');
+        await stopCaptureAll();
         return;
       }
       if (bestDomWin !== null && preferredWindowId !== undefined) {
@@ -564,28 +602,14 @@ export class OverlayPanel {
       }
       if (bestWin !== null && bestScore > 0) {
         this.log.appendLine(`Running TEST widget create in win=${bestWin} (services=${bestScore})...`);
-        const testExpr = `(function(){ try { return window.__ijFindTestCreateWidget ? window.__ijFindTestCreateWidget() : 'no-test-fn'; } catch(e){ return 'test-throw:' + (e && e.message); } })()`;
-        try {
-          const testResult = await this.evalInWindow(bestWin, testExpr);
-          this.log.appendLine(`TEST widget create (win=${bestWin}): ${String(testResult).slice(0, 2000)}`);
-        } catch (err) {
-          this.log.appendLine(`TEST widget eval failed: ${err instanceof Error ? err.message : err}`);
-        }
+        await runWidgetCreateTest(bestWin, 'force-open');
       } else {
         this.log.appendLine('No window has captures — skipping widget creation test.');
       }
 
       // Stop capture in every window (best-effort) so Map.prototype etc.
       // are back to normal. Parallel for a small (~100ms) additional win.
-      const stopExpr = `(function(){ try { return window.__ijFindStopCapture && window.__ijFindStopCapture(); } catch(e){ return 'stop-err:' + (e && e.message); } })()`;
-      const stops = new Map<number, string>();
-      await Promise.all(windowIds.map(async (id) => {
-        try { stops.set(id, await this.evalInWindow(id, stopExpr)); }
-        catch (err) { stops.set(id, 'err:' + (err instanceof Error ? err.message : err)); }
-      }));
-      for (const [id, v] of stops) {
-        this.log.appendLine(`Capture stop win=${id}: ${v}`);
-      }
+      await stopCaptureAll();
     } catch (err) {
       this.log.appendLine(`Capture diagnostic failed: ${err instanceof Error ? err.message : err}`);
     }
@@ -893,18 +917,37 @@ export class OverlayPanel {
       // serial roundtrips and cost ~200–400 ms of visible lag on cold start.
       const showExpr = `(function(){ try { return window.__ijFindShow ? window.__ijFindShow(${JSON.stringify(initialQuery)}) : 'no-show-fn'; } catch (e) { return 'show-throw:' + (e && e.message); } })()`;
       const hideExpr = `try { window.__ijFindHide && window.__ijFindHide(); } catch (e) {}`;
+      const workspaceName = vscode.workspace.name || vscode.workspace.workspaceFolders?.[0]?.name || '';
       const script = `
         (async function () {
           var BW = require('electron').BrowserWindow;
+          var expectedWorkspaceName = ${JSON.stringify(workspaceName)};
+          var expectedWorkspaceNameLower = expectedWorkspaceName.toLowerCase();
+          function isWorkbench(win) {
+            try {
+              var url = (win.webContents && win.webContents.getURL && win.webContents.getURL()) || '';
+              return /workbench\\.(?:esm\\.)?html/.test(url);
+            } catch (e) { return false; }
+          }
+          function titleMatchesWorkspace(win) {
+            if (!expectedWorkspaceNameLower) { return true; }
+            try {
+              var title = (win.getTitle && win.getTitle()) || '';
+              return title.toLowerCase().indexOf(expectedWorkspaceNameLower) >= 0;
+            } catch (e) { return false; }
+          }
           var focused = BW.getFocusedWindow();
-          if (!focused) {
+          var focusedUsable = focused && isWorkbench(focused) && titleMatchesWorkspace(focused);
+          if (!focusedUsable) {
             var ws = BW.getAllWindows();
+            var firstWorkbench = null;
+            var matchingWorkbench = null;
             for (var i = 0; i < ws.length; i++) {
-              try {
-                var url = (ws[i].webContents && ws[i].webContents.getURL && ws[i].webContents.getURL()) || '';
-                if (/workbench\\.(?:esm\\.)?html/.test(url)) { focused = ws[i]; break; }
-              } catch (e) {}
+              if (!isWorkbench(ws[i])) { continue; }
+              if (!firstWorkbench) { firstWorkbench = ws[i]; }
+              if (titleMatchesWorkspace(ws[i])) { matchingWorkbench = ws[i]; break; }
             }
+            focused = matchingWorkbench || (focused && isWorkbench(focused) ? focused : firstWorkbench);
           }
           if (!focused) { return { fid: 0, result: 'no-focus' }; }
           var fid = focused.id;
@@ -1185,10 +1228,19 @@ export class OverlayPanel {
                 if (prev) {
                   try { w.webContents.debugger.removeListener('message', prev); } catch (eRm) {}
                 }
+                const bridgeWinId = w.id;
                 var bridge = function (ev, method, params) {
                   if (method === 'Runtime.bindingCalled' && params && params.name === ${JSON.stringify(RENDERER_BINDING)}) {
                     if (typeof global.${BRIDGE_BINDING} === 'function') {
-                      global.${BRIDGE_BINDING}(params.payload);
+                      var payload = params.payload;
+                      try {
+                        var parsed = JSON.parse(String(payload));
+                        if (parsed && typeof parsed === 'object') {
+                          parsed.__win = bridgeWinId;
+                          payload = JSON.stringify(parsed);
+                        }
+                      } catch (ePayload) {}
+                      global.${BRIDGE_BINDING}(payload);
                     }
                   }
                 };
@@ -1238,7 +1290,7 @@ export class OverlayPanel {
   }
 
   private handleRendererEvent(payload: string) {
-    let evt: RendererEvent & { __seq?: number; __src?: string };
+    let evt: RendererEvent & { __seq?: number; __src?: string; __win?: number };
     try { evt = JSON.parse(payload); }
     catch {
       this.log.appendLine(`handleRendererEvent: JSON parse failed, payload=${payload.slice(0, 120)}`);
@@ -1262,6 +1314,15 @@ export class OverlayPanel {
     } else {
       this.log.appendLine(`handleRendererEvent: no __seq/__src, type=${(evt as any).type}`);
     }
+    if (
+      typeof evt.__win === 'number' &&
+      this.activeWindowId !== undefined &&
+      evt.__win !== this.activeWindowId &&
+      evt.type !== 'log'
+    ) {
+      this.log.appendLine(`ignore renderer event from inactive win=${evt.__win} active=${this.activeWindowId} type=${(evt as any).type}`);
+      return;
+    }
     switch (evt.type) {
       case 'search': void this.runSearch(evt.options); break;
       case 'loadMore': void this.loadMoreSearch(); break;
@@ -1277,7 +1338,7 @@ export class OverlayPanel {
       case 'requestHover': void this.sendHover(evt.reqId, evt.uri, evt.line, evt.column, evt.x, evt.y); break;
       case 'runCommand': void this.runHoverCommand(evt.command, evt.args); break;
       case 'saveFile': void this.saveFile(evt.uri, evt.content); break;
-      case 'log': this.log.appendLine(`[renderer] ${evt.msg}`); break;
+      case 'log': this.log.appendLine(`[renderer${typeof evt.__win === 'number' ? ` win=${evt.__win}` : ''}] ${evt.msg}`); break;
     }
   }
 

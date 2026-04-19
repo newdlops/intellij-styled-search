@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 6,
+            "activePatchIndex": 7,
             "patches": [
                 {
                     "date": 1776584800003,
@@ -32,6 +32,10 @@
                 {
                     "date": 1776607925763,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellij-styled-search\",\n   \"displayName\": \"IntelliJ Styled Search\",\n   \"description\": \"IntelliJ IDEA style project search — peek-like movable panel with workspace file results\",\n-  \"version\": \"0.0.4\",\n+  \"version\": \"0.0.5\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"resources/icon.png\",\n   \"repository\": {\n@@ -103,10 +103,10 @@\n           \"description\": \"Maximum file size (bytes) to include in search.\"\n         },\n         \"intellijStyledSearch.maxResults\": {\n           \"type\": \"number\",\n-          \"default\": 0,\n-          \"description\": \"Maximum number of match lines to return. Values at or below 0 fall back to the built-in safety cap.\"\n+          \"default\": 2000,\n+          \"description\": \"How many match lines to load per batch. Scrolling near the bottom loads the next batch. Values at or below 0 fall back to the built-in default.\"\n         }\n       }\n     }\n   },\n"
+                },
+                {
+                    "date": 1776611026600,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellij-styled-search\",\n   \"displayName\": \"IntelliJ Styled Search\",\n   \"description\": \"IntelliJ IDEA style project search — peek-like movable panel with workspace file results\",\n-  \"version\": \"0.0.5\",\n+  \"version\": \"0.0.6\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"resources/icon.png\",\n   \"repository\": {\n"
                 }
             ],
             "date": 1776584800003,
