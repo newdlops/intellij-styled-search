@@ -240,7 +240,57 @@ export class OverlayPanel {
       await Promise.all(windowIds.map(async (id) => {
         try { await this.evalInWindow(id, clearExpr); } catch {}
       }));
-      this.log.appendLine('Captures cleared — forcing real editor creation via file open/close...');
+      // First try to grab widget/service refs from any editor the user
+      // already has open, straight from the live DOM. Success here means
+      // we can skip the file force-open entirely — no `client.md` (or
+      // whatever the first .md in the workspace is) gets briefly opened
+      // and torn down.
+      const domCaptureExpr = `(function(){try{return window.__ijFindCaptureFromDom?window.__ijFindCaptureFromDom():'no-fn'}catch(e){return 'throw:'+(e&&e.message)}})()`;
+      let domCaptureSummaries: string[] = [];
+      await Promise.all(windowIds.map(async (id) => {
+        try {
+          const r = await this.evalInWindow(id, domCaptureExpr);
+          domCaptureSummaries.push(`win=${id} ${r}`);
+        } catch (err) { domCaptureSummaries.push(`win=${id} err:${err instanceof Error ? err.message : err}`); }
+      }));
+      this.log.appendLine(`Capture via DOM scan: ${domCaptureSummaries.join(' | ')}`);
+
+      // Peek again to see if DOM scan gave us enough to run the widget-
+      // creation test without needing to force-open a file.
+      const afterDomPeek = await peekAll('Capture peek after DOM scan', true);
+      let bestDomWin: number | null = null;
+      let bestDomWidgets = 0;
+      for (const [id, v] of afterDomPeek) {
+        const widgetsMatch = /widgets=(\d+)/.exec(v);
+        const servicesMatch = /services=(\d+)/.exec(v);
+        const widgets = widgetsMatch ? parseInt(widgetsMatch[1], 10) : 0;
+        const services = servicesMatch ? parseInt(servicesMatch[1], 10) : 0;
+        if (widgets > 0 && services > 0 && widgets > bestDomWidgets) {
+          bestDomWidgets = widgets;
+          bestDomWin = id;
+        }
+      }
+      if (bestDomWin !== null) {
+        this.log.appendLine(`DOM scan yielded widgets=${bestDomWidgets} in win=${bestDomWin} — skipping force-open.`);
+        // Run TEST widget create directly.
+        const testExpr = `(function(){ try { return window.__ijFindTestCreateWidget ? window.__ijFindTestCreateWidget() : 'no-test-fn'; } catch(e){ return 'test-throw:' + (e && e.message); } })()`;
+        try {
+          const testResult = await this.evalInWindow(bestDomWin, testExpr);
+          this.log.appendLine(`TEST widget create (win=${bestDomWin}, DOM path): ${String(testResult).slice(0, 2000)}`);
+        } catch (err) {
+          this.log.appendLine(`TEST widget eval failed: ${err instanceof Error ? err.message : err}`);
+        }
+        // Stop capture in every window so prototype monkey-patches revert.
+        const stopExpr = `(function(){ try { return window.__ijFindStopCapture && window.__ijFindStopCapture(); } catch(e){ return 'stop-err:' + (e && e.message); } })()`;
+        await Promise.all(windowIds.map(async (id) => {
+          try {
+            const r = await this.evalInWindow(id, stopExpr);
+            this.log.appendLine(`Capture stop win=${id}: ${r}`);
+          } catch {}
+        }));
+        return;
+      }
+      this.log.appendLine('Captures cleared — no DOM-visible widgets, forcing real editor creation via file open/close...');
       const t0 = Date.now();
       let tFind = 0, tShow = 0, tPoll = 0, tClose = 0, pollIters = 0, pollPeekMaxMs = 0;
       try {
@@ -252,9 +302,32 @@ export class OverlayPanel {
         );
         tFind = Date.now() - tFind0;
         if (candidates.length > 0) {
-          this.log.appendLine(`Capture diagnostic: opening ${candidates[0].toString()}`);
+          // Record which tabs already existed so we DON'T close them when
+          // tearing down our capture-only editor. Previously we used
+          // `workbench.action.closeEditorsInGroup` which nukes every tab
+          // in the active group — that silently destroyed the user's
+          // other open tabs if our `Beside` happened to land on an
+          // already-populated column.
+          const fileUri = candidates[0];
+          const fileUriStr = fileUri.toString();
+          const preExistingUris = new Set<string>();
+          let userAlreadyHadThisTab = false;
+          for (const group of vscode.window.tabGroups.all) {
+            for (const tab of group.tabs) {
+              const input = tab.input as unknown as { uri?: vscode.Uri };
+              if (input && input.uri && typeof input.uri.toString === 'function') {
+                const u = input.uri.toString();
+                preExistingUris.add(u);
+                if (u === fileUriStr) { userAlreadyHadThisTab = true; }
+              }
+            }
+          }
+          this.log.appendLine(
+            `Capture diagnostic: opening ${fileUriStr}` +
+            (userAlreadyHadThisTab ? ' (already open — will NOT close afterwards)' : ''),
+          );
           const tShow0 = Date.now();
-          await vscode.window.showTextDocument(candidates[0], {
+          await vscode.window.showTextDocument(fileUri, {
             viewColumn: vscode.ViewColumn.Beside,
             preserveFocus: true,
             preview: true,
@@ -262,8 +335,7 @@ export class OverlayPanel {
           tShow = Date.now() - tShow0;
           // Poll every 100ms instead of sleeping a flat 1s. As soon as ANY
           // window has enough real widgets + services to run the widget-
-          // creation test, close and move on. Cuts the fixed wait from
-          // 1000ms+1500ms (= 2.5s) to typically 200–500ms.
+          // creation test, close and move on.
           const tPoll0 = Date.now();
           let sawCaptures = false;
           for (let i = 0; i < 20; i++) {
@@ -281,7 +353,27 @@ export class OverlayPanel {
           }
           tPoll = Date.now() - tPoll0;
           const tClose0 = Date.now();
-          await vscode.commands.executeCommand('workbench.action.closeEditorsInGroup');
+          // Close ONLY tabs we introduced, leaving every pre-existing
+          // tab (including the one we landed beside) intact.
+          if (!userAlreadyHadThisTab) {
+            const targets: vscode.Tab[] = [];
+            for (const group of vscode.window.tabGroups.all) {
+              for (const tab of group.tabs) {
+                const input = tab.input as unknown as { uri?: vscode.Uri };
+                if (input && input.uri && typeof input.uri.toString === 'function' &&
+                    input.uri.toString() === fileUriStr && !preExistingUris.has(input.uri.toString())) {
+                  // Above condition is strict: file URI matches AND it
+                  // wasn't in preExistingUris snapshot — i.e., the tab
+                  // we just created.
+                  targets.push(tab);
+                }
+              }
+            }
+            if (targets.length > 0) {
+              try { await vscode.window.tabGroups.close(targets, true); }
+              catch (errClose) { this.log.appendLine(`Capture close tab failed: ${errClose instanceof Error ? errClose.message : errClose}`); }
+            }
+          }
           tClose = Date.now() - tClose0;
         } else {
           this.log.appendLine('Capture diagnostic: no files found to open');

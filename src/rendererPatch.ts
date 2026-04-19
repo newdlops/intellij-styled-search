@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV55) { return 'already patched'; }
-  window.__ijFindPatchedV55 = true;
+  if (window.__ijFindPatchedV56) { return 'already patched'; }
+  window.__ijFindPatchedV56 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -2117,7 +2117,45 @@ export function getRendererPatchScript(): string {
     return null;
   }
 
-  // Search \`.monaco-editor\`, each of its ancestors up to .editor-group-container,
+  // Scan the live DOM for any existing code-editor widget the user
+  // already has open and register it into caps.widgets / caps.services /
+  // caps.widgetCtors WITHOUT needing to force-open a new file. When the
+  // user has at least one editor visible this short-circuits the whole
+  // force-open dance — no extra tab flash, no lost editor state.
+  window.__ijFindCaptureFromDom = function () {
+    try {
+      var before = caps.widgets.length;
+      var editors = document.querySelectorAll('.editor-group-container .monaco-editor');
+      for (var i = 0; i < editors.length && caps.widgets.length < 50; i++) {
+        var widget = findMonacoWidget(editors[i]);
+        if (!widget) { continue; }
+        caps.widgets.push({ v: widget, src: 'dom-capture', key: stringifyKey(i) });
+        try {
+          if (widget.constructor && caps.widgetCtors.indexOf(widget.constructor) < 0 &&
+              caps.widgetCtors.length < 10) {
+            caps.widgetCtors.push(widget.constructor);
+          }
+        } catch (eCtor) {}
+        try {
+          var inst = widget._instantiationService;
+          if (inst && typeof inst.createInstance === 'function' &&
+              typeof inst.invokeFunction === 'function' &&
+              caps.services.length < 40) {
+            caps.services.push({
+              v: inst, src: 'dom-capture', key: stringifyKey(i),
+              kind: 'IInstantiationService',
+            });
+          }
+        } catch (eSvc) {}
+      }
+      return 'added=' + (caps.widgets.length - before) +
+             ' widgets=' + caps.widgets.length +
+             ' services=' + caps.services.length +
+             ' ctors=' + caps.widgetCtors.length;
+    } catch (e) { return 'dom-capture-err:' + (e && e.message); }
+  };
+
+  // Search .monaco-editor, each of its ancestors up to .editor-group-container,
   // and its own key descendants for the widget instance.
   function findMonacoWidget(startEl) {
     if (!startEl) { return null; }
