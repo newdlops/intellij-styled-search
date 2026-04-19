@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV64) { return 'already patched'; }
-  window.__ijFindPatchedV64 = true;
+  if (window.__ijFindPatchedV67) { return 'already patched'; }
+  window.__ijFindPatchedV67 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -777,13 +777,19 @@ export function getRendererPatchScript(): string {
 
     '.ij-find-results {',
     '  flex: 1 1 auto; overflow: auto; padding: 2px 0;',
+    '  position: relative;',
     '  min-height: 60px;',
+    '}',
+    '.ij-find-results-inner {',
+    '  position: relative;',
+    '  min-height: 100%;',
     '}',
     '.ij-find-row {',
     '  display: flex; align-items: center; gap: 12px;',
     '  padding: 1px 12px; cursor: pointer;',
     '  font-family: var(--vscode-editor-font-family, monospace);',
     '  font-size: 12px; line-height: 18px;',
+    '  height: 20px; box-sizing: border-box;',
     '}',
     '.ij-find-row:hover { background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.05)); }',
     '.ij-find-row.active {',
@@ -792,6 +798,8 @@ export function getRendererPatchScript(): string {
     '}',
     '.ij-find-row-pending { opacity: 0.45; font-style: italic; }',
     '.ij-find-row-pending.active { opacity: 0.8; }',
+    '.ij-find-row-info { color: var(--vscode-descriptionForeground, #9d9d9d); cursor: default; }',
+    '.ij-find-row-info:hover { background: transparent; }',
     '.ij-find-row-text {',
     '  flex: 1 1 auto; min-width: 0;',
     '  overflow: hidden; text-overflow: ellipsis;',
@@ -1054,6 +1062,8 @@ export function getRendererPatchScript(): string {
 
   var $toolbar = el('div', { className: 'ij-find-toolbar', children: [$searchRow, $statusRow] });
   var $results = el('div', { className: 'ij-find-results', attrs: { tabindex: '0' } });
+  var $resultsInner = el('div', { className: 'ij-find-results-inner' });
+  $results.appendChild($resultsInner);
   var $splitter = el('div', { className: 'ij-find-splitter', title: 'Drag to resize' });
 
   var $modifiedDot = el('span', { className: 'ij-find-modified-dot', title: 'Unsaved changes' });
@@ -1118,7 +1128,10 @@ export function getRendererPatchScript(): string {
     stolenGroupOrigStyles: null,
     previewMonacoEditor: null,
     previewMonacoHost: null,
+    resultsInfoText: '',
   };
+  var RESULT_ROW_HEIGHT = 20;
+  var RESULT_OVERSCAN = 12;
 
   function setStatus(text, spinning) {
     $status.textContent = text;
@@ -1180,6 +1193,7 @@ export function getRendererPatchScript(): string {
   }
 
   var _renderPending = false;
+  var _resultsViewportPending = false;
   function scheduleRender() {
     if (_renderPending) { return; }
     _renderPending = true;
@@ -1189,14 +1203,107 @@ export function getRendererPatchScript(): string {
     });
   }
 
+  function scheduleResultsViewportRender() {
+    if (_resultsViewportPending) { return; }
+    _resultsViewportPending = true;
+    requestAnimationFrame(function () {
+      _resultsViewportPending = false;
+      renderResultsViewport();
+    });
+  }
+
+  function totalRenderableRows() {
+    return state.flat.length + (state.resultsInfoText ? 1 : 0);
+  }
+
+  function placeVirtualRow(row, rowIdx) {
+    row.style.position = 'absolute';
+    row.style.top = (rowIdx * RESULT_ROW_HEIGHT) + 'px';
+    row.style.left = '0';
+    row.style.right = '0';
+  }
+
+  function buildResultRow(flatIdx) {
+    var item = state.flat[flatIdx];
+    var row;
+    if (item.pendingUri) {
+      var cPath = item.pendingRelPath || item.pendingUri;
+      var cSlash = cPath.lastIndexOf('/');
+      var cName = cSlash >= 0 ? cPath.slice(cSlash + 1) : cPath;
+      row = el('div', {
+        className: 'ij-find-row ij-find-row-pending' + (flatIdx === state.activeIndex ? ' active' : ''),
+        attrs: { 'data-flat': String(flatIdx), title: cPath },
+        children: [
+          el('span', { className: 'ij-find-row-text', text: '\u2026 scanning' }),
+          el('span', { className: 'ij-find-row-loc', text: cName }),
+        ],
+      });
+      return row;
+    }
+    var f = state.files[item.fi];
+    var m = f.matches[item.mi];
+    var textEl = el('span', { className: 'ij-find-row-text' });
+    appendHighlightedInto(textEl, m.preview, rangesForCurrentQuery(m));
+    var slashIdx = f.relPath.lastIndexOf('/');
+    var fileName = slashIdx >= 0 ? f.relPath.slice(slashIdx + 1) : f.relPath;
+    var locText = fileName + ':' + (m.line + 1);
+    return el('div', {
+      className: 'ij-find-row' + (flatIdx === state.activeIndex ? ' active' : ''),
+      attrs: { 'data-flat': String(flatIdx) },
+      children: [
+        textEl,
+        el('span', {
+          className: 'ij-find-row-loc',
+          title: f.relPath + ':' + (m.line + 1),
+          text: locText,
+        }),
+      ],
+    });
+  }
+
+  function buildInfoRow(rowIdx) {
+    return el('div', {
+      className: 'ij-find-row ij-find-row-info',
+      children: [el('span', { className: 'ij-find-row-text', text: state.resultsInfoText })],
+    });
+  }
+
+  function ensureActiveVisible() {
+    if (state.activeIndex < 0 || state.activeIndex >= state.flat.length) { return; }
+    var viewportHeight = Math.max($results.clientHeight || 0, RESULT_ROW_HEIGHT);
+    var top = state.activeIndex * RESULT_ROW_HEIGHT;
+    var bottom = top + RESULT_ROW_HEIGHT;
+    var viewTop = $results.scrollTop;
+    var viewBottom = viewTop + viewportHeight;
+    if (top < viewTop) {
+      $results.scrollTop = top;
+    } else if (bottom > viewBottom) {
+      $results.scrollTop = Math.max(0, bottom - viewportHeight);
+    }
+  }
+
+  function renderResultsViewport() {
+    clearChildren($resultsInner);
+    var totalRows = totalRenderableRows();
+    if (totalRows === 0) {
+      $resultsInner.style.height = 'auto';
+      return;
+    }
+    $resultsInner.style.height = (totalRows * RESULT_ROW_HEIGHT) + 'px';
+    var viewportHeight = Math.max($results.clientHeight || 0, RESULT_ROW_HEIGHT * 8);
+    var scrollTop = $results.scrollTop;
+    var start = Math.max(0, Math.floor(scrollTop / RESULT_ROW_HEIGHT) - RESULT_OVERSCAN);
+    var end = Math.min(totalRows, Math.ceil((scrollTop + viewportHeight) / RESULT_ROW_HEIGHT) + RESULT_OVERSCAN);
+    var frag = document.createDocumentFragment();
+    for (var rowIdx = start; rowIdx < end; rowIdx++) {
+      var row = rowIdx < state.flat.length ? buildResultRow(rowIdx) : buildInfoRow(rowIdx);
+      placeVirtualRow(row, rowIdx);
+      frag.appendChild(row);
+    }
+    $resultsInner.appendChild(frag);
+  }
+
   function render() {
-    // Preserve scroll position across re-renders. rg streams match events
-    // one file at a time; every results:file triggers a render(), and
-    // clearChildren nukes the list's scrollTop back to 0. Without this,
-    // the user watching results stream in sees the list jump back to the
-    // top with every new file.
-    var prevScrollTop = $results.scrollTop;
-    clearChildren($results);
     var hasMatches = state.files.length > 0;
     // Pending candidates: show whenever we have them, whether rg is still
     // scanning OR the search finished with 0 matches (user still wants to
@@ -1206,13 +1313,16 @@ export function getRendererPatchScript(): string {
       var emptyText = state.searching
         ? 'Searching\u2026'
         : ($q.value ? 'No results' : 'Type to search');
-      $results.appendChild(el('div', { className: 'ij-find-empty', text: emptyText }));
+      clearChildren($resultsInner);
+      $resultsInner.style.height = 'auto';
+      $resultsInner.appendChild(el('div', { className: 'ij-find-empty', text: emptyText }));
       state.flat = [];
+      state.resultsInfoText = '';
       setSummary();
       return;
     }
     state.flat = [];
-    var frag = document.createDocumentFragment();
+    state.resultsInfoText = '';
     // Extension-typing filter: rg is still scanning (or has finished) the
     // superset query; we narrow each match to the user's current substring.
     var filterQ = state.filterQuery || '';
@@ -1227,26 +1337,7 @@ export function getRendererPatchScript(): string {
           var hay = state.options.caseSensitive ? (m.preview || '') : (m.preview || '').toLowerCase();
           if (hay.indexOf(filterNeedle) < 0) { continue; }
         }
-        var flatIdx = state.flat.length;
         state.flat.push({ fi: fi, mi: mi });
-
-        var textEl = el('span', { className: 'ij-find-row-text' });
-        appendHighlightedInto(textEl, m.preview, rangesForCurrentQuery(m));
-
-        var slashIdx = f.relPath.lastIndexOf('/');
-        var fileName = slashIdx >= 0 ? f.relPath.slice(slashIdx + 1) : f.relPath;
-        var locText = fileName + ':' + (m.line + 1);
-        var locEl = el('span', {
-          className: 'ij-find-row-loc',
-          title: f.relPath + ':' + (m.line + 1),
-          text: locText,
-        });
-
-        frag.appendChild(el('div', {
-          className: 'ij-find-row',
-          attrs: { 'data-flat': String(flatIdx) },
-          children: [textEl, locEl],
-        }));
       }
     }
     // Pending candidate rows: planner-narrowed files that rg hasn't matched
@@ -1259,52 +1350,30 @@ export function getRendererPatchScript(): string {
       for (var ci = 0; ci < state.candidates.length && shown < cap; ci++) {
         var c = state.candidates[ci];
         if (state.confirmedUris[c.uri]) { continue; }
-        var pendingFlatIdx = state.flat.length;
         state.flat.push({ pendingUri: c.uri, pendingRelPath: c.relPath });
-        var cSlash = c.relPath.lastIndexOf('/');
-        var cName = cSlash >= 0 ? c.relPath.slice(cSlash + 1) : c.relPath;
-        var pendRow = el('div', {
-          className: 'ij-find-row ij-find-row-pending',
-          attrs: { 'data-flat': String(pendingFlatIdx), title: c.relPath },
-          children: [
-            el('span', { className: 'ij-find-row-text', text: '\u2026 scanning' }),
-            el('span', { className: 'ij-find-row-loc', text: cName }),
-          ],
-        });
-        frag.appendChild(pendRow);
         shown++;
       }
       if (state.candidateTotal > shown + state.files.length) {
-        var overflowEl = el('div', {
-          className: 'ij-find-empty',
-          text: '+ ' + (state.candidateTotal - shown - state.files.length) +
-                ' more candidate file(s) being scanned\u2026',
-        });
-        frag.appendChild(overflowEl);
+        state.resultsInfoText = '+ ' + (state.candidateTotal - shown - state.files.length) +
+          ' more candidate file(s) being scanned\u2026';
       }
     }
-    $results.appendChild(frag);
-    // Restore scrollTop BEFORE applyActive — if the active row is off-screen,
-    // applyActive calls scrollIntoView which will still bring it into view.
-    $results.scrollTop = prevScrollTop;
-    applyActive();
+    if (state.activeIndex >= state.flat.length) {
+      state.activeIndex = state.flat.length > 0 ? state.flat.length - 1 : -1;
+    }
+    applyActive(false);
     setSummary();
   }
 
-  function applyActive() {
-    var rows = $results.querySelectorAll('.ij-find-row');
-    for (var i = 0; i < rows.length; i++) { rows[i].classList.remove('active'); }
-    if (state.activeIndex >= 0 && state.activeIndex < rows.length) {
-      var row = rows[state.activeIndex];
-      row.classList.add('active');
-      row.scrollIntoView({ block: 'nearest' });
-    }
+  function applyActive(shouldScroll) {
+    if (shouldScroll) { ensureActiveVisible(); }
+    renderResultsViewport();
   }
 
   function selectMatch(flatIdx) {
     if (flatIdx < 0 || flatIdx >= state.flat.length) { return; }
     state.activeIndex = flatIdx;
-    applyActive();
+    applyActive(true);
     var fm = state.flat[flatIdx];
     // Pending candidate row: no match confirmed yet. Preview opens the
     // file at line 0 so the user can skim while rg catches up.
@@ -1364,11 +1433,10 @@ export function getRendererPatchScript(): string {
 
   function triggerSearch() {
     var raw = $q.value;
-    // Trim leading/trailing whitespace (covers spaces, tabs, newlines).
-    // Pasted selections almost always drag an extra blank line along, which
-    // would prevent rg's literal match from hitting a file that doesn't
-    // start with a newline. Interior whitespace stays intact.
-    var q = typeof raw === 'string' ? raw.trim() : '';
+    // Preserve the query byte-for-byte. Multi-line search selections often
+    // begin with indentation, and trimming that indentation changes the
+    // literal search target into a different string.
+    var q = typeof raw === 'string' ? raw : '';
     clearPreview();
     if (!q) {
       state.files = []; state.flat = []; state.activeIndex = -1; state.searching = false;
@@ -1489,7 +1557,10 @@ export function getRendererPatchScript(): string {
     var row = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row') : null;
     if (!row) { return; }
     var flatIdx = parseInt(row.getAttribute('data-flat') || '-1', 10);
-    if (flatIdx >= 0) { state.activeIndex = flatIdx; applyActive(); openActive(); }
+    if (flatIdx >= 0) { state.activeIndex = flatIdx; applyActive(true); openActive(); }
+  });
+  $results.addEventListener('scroll', function () {
+    if (state.flat.length > 0 || state.resultsInfoText) { scheduleResultsViewportRender(); }
   });
 
   // Drag header

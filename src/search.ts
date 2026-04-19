@@ -100,7 +100,8 @@ export async function runSearch(
   const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
   const excludeGlobs = cfg.get<string[]>('excludeGlobs', []);
   const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
-  const maxResults = cfg.get<number>('maxResults', 2000);
+  const maxResults = cfg.get<number>('maxResults', 0);
+  const resultLimit = Number.isFinite(maxResults) && maxResults > 0 ? maxResults : 0;
 
   let files: vscode.Uri[];
   // Fast path: trigram index already told us exactly which files could
@@ -174,14 +175,14 @@ export async function runSearch(
           continue;
         }
 
-        const fileMatch = scanText(text, regex, uri);
+        const fileMatch = scanText(text, regex, uri, opts.query.includes('\n'));
         if (fileMatch.matches.length === 0) { continue; }
 
         totalMatches += fileMatch.matches.length;
         filesWithMatches++;
         progress.onFile(fileMatch);
 
-        if (totalMatches >= maxResults) {
+        if (resultLimit > 0 && totalMatches >= resultLimit) {
           truncated = true;
           return;
         }
@@ -274,9 +275,12 @@ function countSlashes(s: string): number {
   return n;
 }
 
-function scanText(text: string, regex: RegExp, uri: vscode.Uri): FileMatch {
+function scanText(text: string, regex: RegExp, uri: vscode.Uri, allowMultiline = false): FileMatch {
   const rel = vscode.workspace.asRelativePath(uri, false);
   const result: FileMatch = { uri: uri.toString(), relPath: rel, matches: [] };
+  if (allowMultiline) {
+    return scanTextMultiline(text, regex, result);
+  }
 
   let lineStart = 0;
   let lineNo = 0;
@@ -314,4 +318,70 @@ function scanText(text: string, regex: RegExp, uri: vscode.Uri): FileMatch {
     }
   }
   return result;
+}
+
+function scanTextMultiline(text: string, regex: RegExp, result: FileMatch): FileMatch {
+  const lineStarts = buildLineStarts(text);
+  regex.lastIndex = 0;
+
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(text)) !== null) {
+    const startOffset = m.index;
+    const endOffset = startOffset + m[0].length;
+    const startLine = lineIndexForOffset(lineStarts, startOffset);
+    const endLookupOffset = endOffset > startOffset ? endOffset - 1 : endOffset;
+    const endLine = lineIndexForOffset(lineStarts, endLookupOffset);
+    const startLineOffset = lineStarts[startLine];
+    const endLineOffset = lineStarts[endLine];
+    const previewLine = readLineAt(text, startLineOffset);
+    const startCol = Math.max(0, startOffset - startLineOffset);
+    const endCol = Math.max(0, endOffset - endLineOffset);
+    const rawRange: MatchRange = startLine === endLine
+      ? { start: startCol, end: endCol }
+      : { start: startCol, end: previewLine.length, endLine, endCol };
+    const clipped = clipLine(previewLine, {
+      start: Math.min(rawRange.start, previewLine.length),
+      end: Math.min(rawRange.end, previewLine.length),
+    });
+    const range = clipped.ranges[0];
+    result.matches.push({
+      line: startLine,
+      preview: clipped.preview,
+      ranges: [typeof rawRange.endLine === 'number'
+        ? { start: range.start, end: range.end, endLine: rawRange.endLine, endCol: rawRange.endCol }
+        : range],
+    });
+    if (m[0].length === 0) { regex.lastIndex++; }
+  }
+
+  return result;
+}
+
+function buildLineStarts(text: string): number[] {
+  const starts = [0];
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) { starts.push(i + 1); }
+  }
+  return starts;
+}
+
+function lineIndexForOffset(lineStarts: number[], offset: number): number {
+  let lo = 0;
+  let hi = lineStarts.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const start = lineStarts[mid];
+    const next = mid + 1 < lineStarts.length ? lineStarts[mid + 1] : Number.MAX_SAFE_INTEGER;
+    if (offset < start) { hi = mid - 1; }
+    else if (offset >= next) { lo = mid + 1; }
+    else { return mid; }
+  }
+  return Math.max(0, Math.min(lineStarts.length - 1, lo));
+}
+
+function readLineAt(text: string, start: number): string {
+  let end = text.indexOf('\n', start);
+  if (end < 0) { end = text.length; }
+  if (end > start && text.charCodeAt(end - 1) === 13) { end--; }
+  return text.slice(start, end);
 }

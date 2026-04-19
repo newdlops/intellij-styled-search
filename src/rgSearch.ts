@@ -328,7 +328,8 @@ export async function runRgSearch(
   const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
   const excludeGlobs = cfg.get<string[]>('excludeGlobs', []);
   const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
-  const maxResults = cfg.get<number>('maxResults', 2000);
+  const maxResults = cfg.get<number>('maxResults', 0);
+  const resultLimit = Number.isFinite(maxResults) && maxResults > 0 ? maxResults : 0;
 
   const isMultiline = opts.query.includes('\n');
   const args: string[] = [
@@ -529,7 +530,7 @@ export async function runRgSearch(
             ranges: outRanges,
           });
           totalMatches += 1;
-          if (totalMatches >= maxResults) {
+          if (resultLimit > 0 && totalMatches >= resultLimit) {
             truncated = true;
             try { child.kill('SIGTERM'); } catch {}
           }

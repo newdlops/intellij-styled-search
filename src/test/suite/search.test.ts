@@ -80,6 +80,40 @@ suite('Search — engine end-to-end against fixture workspace', () => {
     assert.ok(endLine > matches[0].matches[0].line, 'endLine should be past match start');
   });
 
+  test('multi-line literal with indentation matches exactly', async () => {
+    const { overlay } = await getApi();
+    const query = [
+      '    def process(self, data: str) -> str:',
+      '        self.counter += 1',
+    ].join('\n');
+    const matches = await overlay.searchForTests({
+      query,
+      caseSensitive: true,
+      wholeWord: false,
+      useRegex: false,
+    });
+    assert.deepStrictEqual(relPaths(matches), ['alpha.py']);
+  });
+
+  test('case-sensitive literal search respects case', async () => {
+    const { overlay } = await getApi();
+    const exact = await overlay.searchForTests({
+      query: 'BETA_DEFAULT',
+      caseSensitive: true,
+      wholeWord: false,
+      useRegex: false,
+    });
+    assert.deepStrictEqual(relPaths(exact), ['beta.js']);
+
+    const wrongCase = await overlay.searchForTests({
+      query: 'beta_default',
+      caseSensitive: true,
+      wholeWord: false,
+      useRegex: false,
+    });
+    assert.deepStrictEqual(wrongCase, [], 'wrong-case literal query should not match');
+  });
+
   test('UTF-8 / Korean literal hits docs.md', async () => {
     const { overlay } = await getApi();
     const matches = await overlay.searchForTests({

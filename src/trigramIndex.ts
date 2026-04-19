@@ -730,6 +730,13 @@ export class TrigramIndex {
     if (query.length === 0) {
       return { uris: null, reason: 'empty-query' };
     }
+    if (!opts.useRegex && query.includes('\n')) {
+      // Multi-line literal searches are correctness-sensitive: renderer-side
+      // query normalization bugs or newline/indentation mismatches become
+      // impossible to distinguish from a bad index if we return an empty
+      // candidate set here. Let rg verify against the full workspace.
+      return { uris: null, reason: 'literal-multiline-full-scan' };
+    }
 
     // Non-regex, non-whole-word: literal search. Even multi-line literal
     // queries just need "every file must contain every trigram" — Cox's

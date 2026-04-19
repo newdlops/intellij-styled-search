@@ -161,4 +161,24 @@ suite('Extension-typing filter — client-side narrowing', () => {
     assert.strictEqual(after.rgQuery, 'class AlphaServic');
     assert.strictEqual(after.filterQuery, '');
   });
+
+  test('multiline query preserves indentation exactly', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const api = await getApi();
+    const query = [
+      '    def process(self, data: str) -> str:',
+      '        self.counter += 1',
+    ].join('\n');
+
+    await api.overlay.show(query);
+    const after = await waitUntil(
+      api,
+      (s) => !s.searching && s.inputValue === query && s.rgQuery === query && s.filesCount > 0,
+      10_000,
+      'multiline query to survive renderer roundtrip without trimming',
+    );
+    assert.strictEqual(after.inputValue, query);
+    assert.strictEqual(after.rgQuery, query);
+  });
 });

@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -104,8 +104,8 @@
         },
         "intellijStyledSearch.maxResults": {
           "type": "number",
-          "default": 2000,
-          "description": "Maximum number of match lines to return."
+          "default": 0,
+          "description": "Maximum number of match lines to return. Set to 0 or less for unlimited."
         }
       }
     }
