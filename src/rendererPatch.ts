@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV69) { return 'already patched'; }
-  window.__ijFindPatchedV69 = true;
+  if (window.__ijFindPatchedV70) { return 'already patched'; }
+  window.__ijFindPatchedV70 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -3307,6 +3307,7 @@ export function getRendererPatchScript(): string {
         inputValue: $q ? $q.value : null,
         scopeValue: $scope ? $scope.value : null,
         rgQuery: state.rgQuery || '',
+        rgScope: state.rgScope || '',
         filterQuery: state.filterQuery || '',
       };
     } catch (e) { return { err: String(e && e.message) }; }

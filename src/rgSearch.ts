@@ -366,15 +366,14 @@ export async function runRgSearch(
     return;
   }
   const useNarrowing = !!(narrowedFiles && narrowedFiles.length > 0 && narrowedFiles.length <= MAX_POSITIONAL);
-  if (useNarrowing) {
-    // CRITICAL: our trigram index ignores .gitignore (it indexes every
-    // non-binary file in the workspace). rg by default *respects*
-    // .gitignore, so when we hand it a candidate list that includes
-    // gitignored files (e.g. .venv/**, .mypy_cache/**, yarn.lock), rg
-    // silently skips them and returns 0 matches. Disable ignore handling
-    // so rg actually reads every file we asked for.
-    args.push('--no-ignore');
-  } else {
+  // Always disable rg's gitignore handling: our trigram index indexes every
+  // non-binary file (including .venv, node_modules, site-packages). If rg
+  // were allowed to respect .gitignore, narrowed queries would silently
+  // drop those files, and full-scan fallbacks would hide them from users
+  // who cleared excludeGlobs specifically to reach them. The user's
+  // excludeGlobs setting is the sole source of truth for exclusions.
+  args.push('--no-ignore');
+  if (!useNarrowing) {
     for (const g of includeGlobs) { args.push('--glob', g); }
     // ripgrep --glob with '!' prefix is exclusion. Convert **/foo/** style
     // globs to ripgrep's format (which is the same glob syntax).

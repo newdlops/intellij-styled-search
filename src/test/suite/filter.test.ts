@@ -17,6 +17,7 @@ interface SearchState {
   inputValue: string | null;
   scopeValue?: string | null;
   rgQuery: string;
+  rgScope?: string;
   filterQuery: string;
   err?: string;
 }
@@ -83,6 +84,25 @@ suite('Extension-typing filter — client-side narrowing', () => {
       (s) => !s.searching && s.rgQuery === '' && s.filterQuery === '',
       5_000,
       'clear prior renderer search state',
+    );
+  });
+
+  // Later test suites (e.g. preview highlight) reuse the overlay's scope
+  // input across suites — if this suite leaves scope=nested/ set in the
+  // DOM, the next suite's multi-line search runs with that scope and
+  // returns 0 matches. Clear scope explicitly in teardown so suite order
+  // doesn't matter.
+  teardown(async function () {
+    if (!cdpAvailable) { return; }
+    const api = await getApi();
+    await api.overlay.evalInActiveWindowForTests(
+      `(function(){
+        var scope = document.querySelector('.ij-find-scope');
+        if (!scope) { return 'no-scope'; }
+        scope.value = '';
+        scope.dispatchEvent(new Event('input', { bubbles: true }));
+        return 'cleared';
+      })()`,
     );
   });
 
@@ -218,5 +238,48 @@ suite('Extension-typing filter — client-side narrowing', () => {
     );
     const after = await probeState(api);
     assert.strictEqual(after.scopeValue, 'tests/fixtures/workspace/**/*.py');
+  });
+
+  test('typing scope input filters rg results to matching files', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(20_000);
+    const api = await getApi();
+
+    await api.overlay.show('class');
+    const baseline = await waitUntil(
+      api,
+      (s) => !s.searching && s.rgQuery === 'class' && s.filesCount > 0,
+      10_000,
+      'baseline search for class (no scope) to settle',
+    );
+    assert.ok(baseline.filesCount >= 2, `baseline should hit multiple files, got ${JSON.stringify(baseline)}`);
+
+    // Apply scope by user-typed input: set value AND dispatch input event so
+    // the renderer's scheduleSearch actually fires.
+    await api.overlay.evalInActiveWindowForTests(
+      `(function(){
+        var scope = document.querySelector('.ij-find-scope');
+        if (!scope) { return 'no-scope'; }
+        scope.value = 'nested/';
+        scope.dispatchEvent(new Event('input', { bubbles: true }));
+        return 'dispatched';
+      })()`,
+    );
+    const scoped = await waitUntil(
+      api,
+      (s) => !s.searching && s.rgQuery === 'class' && s.scopeValue === 'nested/' && s.rgScope === 'nested/',
+      10_000,
+      'scope-narrowed search to settle with scope=nested/',
+    );
+    assert.strictEqual(
+      scoped.rgScope,
+      'nested/',
+      `renderer-side rgScope should have advanced to nested/. got ${JSON.stringify(scoped)}`,
+    );
+    assert.strictEqual(
+      scoped.filesCount,
+      1,
+      `scoping to nested/ should yield exactly one file (delta.js). got ${JSON.stringify(scoped)}`,
+    );
   });
 });

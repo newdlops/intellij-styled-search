@@ -91,6 +91,18 @@ suite('Preview highlight — decoration regression', () => {
       cdpAvailable = false;
     }
     if (!cdpAvailable) { return; }
+    // Clear any scope left over from a prior suite (e.g. filter tests set
+    // scope=nested/ and we'd run every show() scoped to a dir that doesn't
+    // contain docs.md or alpha.py).
+    await api.overlay.evalInActiveWindowForTests(
+      `(function(){
+        var scope = document.querySelector('.ij-find-scope');
+        if (!scope) { return 'no-scope'; }
+        scope.value = '';
+        scope.dispatchEvent(new Event('input', { bubbles: true }));
+        return 'cleared';
+      })()`,
+    );
     await api.overlay.rebuildIndex();
     await api.overlay.waitForIndexReady(30_000);
     // Force a Monaco editor to exist in the workbench so the capture

@@ -121,7 +121,9 @@ export async function runSearch(
     let ci = 0;
     for (const u of candidateUris) { files[ci++] = vscode.Uri.parse(u); }
   } else {
-    const excludePattern = excludeGlobs.length > 0 ? `{${excludeGlobs.join(',')}}` : undefined;
+    // null (not undefined) so findFiles bypasses VSCode's default
+    // search.exclude. Empty excludeGlobs means "search everything".
+    const excludePattern = excludeGlobs.length > 0 ? `{${excludeGlobs.join(',')}}` : null;
     try {
       files = await vscode.workspace.findFiles('**/*', excludePattern, 100_000, token);
     } catch (err) {

@@ -159,4 +159,30 @@ suite('Search — engine end-to-end against fixture workspace', () => {
     });
     assert.deepStrictEqual(matches, [], 'expected no matches');
   });
+
+  // Regression: `candidatesFor` used to bail out for any query containing
+  // '\n', forcing rg to scan every file in the workspace. On large
+  // workspaces (e.g. 215K files with .venv) that was 3-8s per search.
+  // Trigram intersection must return a narrowed candidate set for
+  // multi-line literal queries — the block's long unique text is exactly
+  // where narrowing wins big.
+  test('multi-line literal candidatesFor returns narrowed set including the matching file', async () => {
+    const { overlay } = await getApi();
+    const idx = overlay.getTrigramIndex();
+    const query = [
+      '> Line one of the pull quote.',
+      '> Line two continues here.',
+      '> Line three wraps up.',
+    ].join('\n');
+    const { uris, reason } = idx.candidatesFor(query, {
+      useRegex: false,
+      caseSensitive: false,
+      wholeWord: false,
+    });
+    assert.ok(uris !== null, `expected narrowed candidate set for multi-line literal, got null (reason=${reason})`);
+    assert.ok(uris!.size > 0, `expected at least the matching file in candidates, got empty set (reason=${reason})`);
+    assert.ok(uris!.size < idx.size, `narrowing should be stricter than the whole index; got size=${uris!.size}/${idx.size} reason=${reason}`);
+    const docsMd = Array.from(uris!).find((u) => u.endsWith('/docs.md'));
+    assert.ok(docsMd, `docs.md (the file containing the block) must be in candidate set; got ${JSON.stringify(Array.from(uris!).slice(0, 5))} reason=${reason}`);
+  });
 });

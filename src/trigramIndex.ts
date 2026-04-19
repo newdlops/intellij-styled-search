@@ -129,6 +129,15 @@ export class TrigramIndex {
   private nextId = 1;
   private dirty = false;
   private ready = false;
+  // Running tally of WHY each indexFile call skipped (or didn't). Printed
+  // at the end of reconcile so the user can see if the index is dropping
+  // files silently — a 95% skip rate on a Python .venv workspace means
+  // something is too strict (maxFileSize, binary false-positive, or a
+  // pervasive stat/read error on symlinked site-packages).
+  private skipCounts = {
+    binaryExt: 0, statError: 0, directory: 0, tooBig: 0,
+    readError: 0, binaryContent: 0, decodeError: 0, indexed: 0,
+  };
   // Open file descriptor for on-disk postings (v3 lazy mode). Queries call
   // fs.readSync to pull individual posting byte ranges. undefined means
   // there's no backing file yet (fresh index, or the index is fully in
@@ -498,14 +507,24 @@ export class TrigramIndex {
     await this.save();
   }
 
-  private getExcludePattern(): string | undefined {
+  private getExcludePattern(): string | null {
+    // null (not undefined) so findFiles bypasses VSCode's default
+    // search.exclude + files.exclude (which silently drop node_modules,
+    // .venv, site-packages, etc.). Our excludeGlobs setting is the sole
+    // source of truth; an empty list means index EVERY non-binary file.
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     const globs = cfg.get<string[]>('excludeGlobs', []);
-    return globs.length > 0 ? `{${globs.join(',')}}` : undefined;
+    return globs.length > 0 ? `{${globs.join(',')}}` : null;
   }
 
   private async reconcileWorkspace(progress?: ReconcileProgress): Promise<void> {
     const excludePattern = this.getExcludePattern();
+    // Reset skip-reason tally for this reconcile run so the final log line
+    // reflects THIS pass only, not lifetime counts.
+    this.skipCounts = {
+      binaryExt: 0, statError: 0, directory: 0, tooBig: 0,
+      readError: 0, binaryContent: 0, decodeError: 0, indexed: 0,
+    };
     progress?.report('discovering files', 0, 0);
     // No maxResults cap: hitting an artificial limit causes boundary churn
     // (VSCode returns a different subset each session, so files near the cap
@@ -601,6 +620,10 @@ export class TrigramIndex {
     }
     await Promise.all(indexWorkers);
     progress?.report('indexing', toIndex.length, toIndex.length);
+    const s = this.skipCounts;
+    this.log.appendLine(
+      `TrigramIndex indexFile tally: indexed=${s.indexed} binaryExt=${s.binaryExt} tooBig=${s.tooBig} binaryContent=${s.binaryContent} readError=${s.readError} statError=${s.statError} directory=${s.directory} decodeError=${s.decodeError}`,
+    );
     if (toIndex.length > 0 || removed > 0) { this.scheduleSave(5_000); }
   }
 
@@ -671,21 +694,23 @@ export class TrigramIndex {
     try {
       // Skip obvious non-text by extension / size.
       const ext = getExt(uri.fsPath);
-      if (BINARY_EXT.has(ext)) { return; }
+      if (BINARY_EXT.has(ext)) { this.skipCounts.binaryExt++; return; }
       let stat: vscode.FileStat;
-      try { stat = await vscode.workspace.fs.stat(uri); } catch { return; }
-      if (stat.type === vscode.FileType.Directory) { return; }
+      try { stat = await vscode.workspace.fs.stat(uri); } catch { this.skipCounts.statError++; return; }
+      if (stat.type === vscode.FileType.Directory) { this.skipCounts.directory++; return; }
       const maxFileSize = vscode.workspace.getConfiguration('intellijStyledSearch').get<number>('maxFileSize', 1_048_576);
       if (stat.size > maxFileSize) {
         // Too big; treat as excluded.
+        this.skipCounts.tooBig++;
         this.removeByUri(uriStr);
         return;
       }
       let bytes: Uint8Array;
-      try { bytes = await vscode.workspace.fs.readFile(uri); } catch { return; }
-      if (looksBinary(bytes)) { this.removeByUri(uriStr); return; }
+      try { bytes = await vscode.workspace.fs.readFile(uri); } catch { this.skipCounts.readError++; return; }
+      if (looksBinary(bytes)) { this.skipCounts.binaryContent++; this.removeByUri(uriStr); return; }
       let text: string;
-      try { text = new TextDecoder('utf-8', { fatal: false }).decode(bytes); } catch { return; }
+      try { text = new TextDecoder('utf-8', { fatal: false }).decode(bytes); } catch { this.skipCounts.decodeError++; return; }
+      this.skipCounts.indexed++;
 
       // Allocate or reuse a fileId.
       let id = this.uriToId.get(uriStr);
@@ -730,19 +755,17 @@ export class TrigramIndex {
     if (query.length === 0) {
       return { uris: null, reason: 'empty-query' };
     }
-    if (!opts.useRegex && query.includes('\n')) {
-      // Multi-line literal searches are correctness-sensitive: renderer-side
-      // query normalization bugs or newline/indentation mismatches become
-      // impossible to distinguish from a bad index if we return an empty
-      // candidate set here. Let rg verify against the full workspace.
-      return { uris: null, reason: 'literal-multiline-full-scan' };
-    }
 
     // Non-regex, non-whole-word: literal search. Even multi-line literal
     // queries just need "every file must contain every trigram" — Cox's
     // planner is for REGEX analysis. Running the planner on a 174-char
     // multi-line paste costs ~500 ms per keystroke (64×64 suffix×prefix
     // combos feed trigramsOf thousands of times); fast-path is ~5 ms.
+    // Multi-line is SAFE here because extractTrigramsLower walks the full
+    // byte sequence — newline chars are just characters that contribute
+    // trigrams like "):\n" and "\n   ". The file-indexing path does the
+    // exact same extraction, so a file containing the multi-line literal
+    // must contain every trigram we extract from the query.
     if (!opts.useRegex && !opts.wholeWord) {
       if (query.length < 3) {
         return { uris: null, reason: `query-too-short(${query.length})` };
@@ -769,6 +792,19 @@ export class TrigramIndex {
         const missingStr = missing.length > 0
           ? `,missing=[${missing.join(',')}]`
           : ',all-trigrams-indexed-but-empty-intersection';
+        // Safety net for multi-line literal queries: when EVERY query
+        // trigram exists in the index but no file contains them all, the
+        // most likely explanation is that the source file wasn't indexed
+        // yet (reconcile still running, or .gitignore'd .venv/node_modules
+        // files that findFiles can still skip even with exclude=null).
+        // Fall back to a full rg scan — empty-narrowing false negatives on
+        // a 200+ trigram query almost never mean "truly no match"; they
+        // mean the index is incomplete. Single-line queries stay narrowed
+        // because a short query hitting 0 files usually IS a real miss and
+        // full-scan is not worth the cost.
+        if (missing.length === 0 && query.includes('\n')) {
+          return { uris: null, reason: `fast-path-fallback(trigrams=${qtris.size},indexSize=${this.fileMeta.size}${multi}${staleStr},empty-intersection→full-scan)` };
+        }
         return { uris: out, reason: `fast-path(trigrams=${qtris.size},indexSize=${this.fileMeta.size}${multi}${staleStr}${missingStr})` };
       }
       return { uris: out, reason: `fast-path(trigrams=${qtris.size},indexSize=${this.fileMeta.size}${multi}${staleStr})` };
