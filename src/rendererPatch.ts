@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV52) { return 'already patched'; }
-  window.__ijFindPatchedV52 = true;
+  if (window.__ijFindPatchedV54) { return 'already patched'; }
+  window.__ijFindPatchedV54 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -802,6 +802,19 @@ export function getRendererPatchScript(): string {
     '.ij-md-hr {',
     '  height: 1px; margin: 8px 0; border: none;',
     '  background: var(--vscode-editorHoverWidget-border, var(--vscode-widget-border, #454545));',
+    '}',
+    // Explicit highlight class for Monaco preview decorations. VSCode's
+    // built-in .findMatch / .currentFindMatch classes sometimes don't
+    // reach our stolen-widget preview instance (theme scoping / CSS
+    // variables not resolving the same way), so we ship our own rule
+    // with the same theme token as a fallback.
+    '.ij-find-preview-match {',
+    '  background-color: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 92, 0, 0.33)) !important;',
+    '  box-sizing: border-box;',
+    '}',
+    '.ij-find-preview-match-active {',
+    '  background-color: var(--vscode-editor-findMatchBackground, rgba(234, 92, 0, 0.6)) !important;',
+    '  box-sizing: border-box;',
     '}',
   ].join('\\n');
   document.head.appendChild(style);
@@ -1893,33 +1906,66 @@ export function getRendererPatchScript(): string {
 
   // Apply findMatch decorations for the current preview.
   //
-  // We emit ONE Monaco Range per source match — no per-line splitting, no
-  // whole-line strip. inlineClassName 'findMatch currentFindMatch' alone
-  // colors the background of the matched characters, and Monaco handles
-  // the cross-line rendering internally (start column on startLine -> end
-  // of line -> full middle lines -> end column on endLine). A single range
-  // renders as a visually continuous character-background highlight from
-  // match start to match end.
+  // For multi-line matches (endLine/endCol present) we explode the span
+  // into one single-line range per file line because Monaco's cross-line
+  // inlineClassName rendering doesn't always paint the background on
+  // middle lines — per-line ranges give us a guaranteed continuous
+  // character-background highlight from startCol on startLine through
+  // every intermediate line's full content to endCol on endLine.
+  //
+  // Every sub-range belonging to the SAME source match gets the same
+  // currentFindMatch class so a multi-line match looks uniformly
+  // highlighted top-to-bottom, not "first line strong + rest faint".
   function applyPreviewMatchDecorations(editor, msg) {
     try {
+      var model = editor.getModel && editor.getModel();
+      var maxColFor = function (ln) {
+        try { return model ? model.getLineMaxColumn(ln) : 1073741823; }
+        catch (e) { return 1073741823; }
+      };
       var focusLineMonaco = msg.focusLine + 1;
       var decos = [];
       (msg.ranges || []).forEach(function (r, matchIdx) {
         var startLn = focusLineMonaco;
         var endLn = (typeof r.endLine === 'number') ? (r.endLine + 1) : startLn;
         var endCol = (typeof r.endCol === 'number') ? (r.endCol + 1) : (r.end + 1);
-        decos.push({
-          range: {
-            startLineNumber: startLn,
-            startColumn: r.start + 1,
-            endLineNumber: endLn,
-            endColumn: endCol,
-          },
-          options: {
-            inlineClassName: matchIdx === 0 ? 'findMatch currentFindMatch' : 'findMatch',
-            isWholeLine: false,
-          },
-        });
+        // Apply BOTH our own class (guaranteed to load; explicit !important
+        // background) AND Monaco's built-in one (gets minimap hints, overview
+        // ruler contribution for free if the theme has them).
+        var cls = matchIdx === 0
+          ? 'ij-find-preview-match-active findMatch currentFindMatch'
+          : 'ij-find-preview-match findMatch';
+        var sub = [];
+        if (startLn === endLn) {
+          sub.push({
+            startLineNumber: startLn, startColumn: r.start + 1,
+            endLineNumber: endLn, endColumn: endCol,
+          });
+        } else {
+          // First match line: start col -> end of the line.
+          sub.push({
+            startLineNumber: startLn, startColumn: r.start + 1,
+            endLineNumber: startLn, endColumn: maxColFor(startLn),
+          });
+          // Middle lines: col 1 -> end of line.
+          for (var ln = startLn + 1; ln < endLn; ln++) {
+            sub.push({
+              startLineNumber: ln, startColumn: 1,
+              endLineNumber: ln, endColumn: maxColFor(ln),
+            });
+          }
+          // Last match line: col 1 -> end col.
+          sub.push({
+            startLineNumber: endLn, startColumn: 1,
+            endLineNumber: endLn, endColumn: endCol,
+          });
+        }
+        for (var si = 0; si < sub.length; si++) {
+          decos.push({
+            range: sub[si],
+            options: { inlineClassName: cls, isWholeLine: false },
+          });
+        }
       });
       if (state.previewMonacoMatchDecos) {
         state.previewMonacoMatchDecos = editor.deltaDecorations(state.previewMonacoMatchDecos, []);

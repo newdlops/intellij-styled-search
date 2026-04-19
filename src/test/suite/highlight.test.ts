@@ -136,21 +136,26 @@ suite('Preview highlight — decoration regression', () => {
       probe.decorations!.length > 0,
       `expected at least one findMatch decoration, got ${JSON.stringify(probe)}`,
     );
-    const multi = probe.decorations!.find((d) => d.endLineNumber > d.startLineNumber);
+    // applyPreviewMatchDecorations splits a multi-line match into one
+    // single-line decoration per file line the match covers. For our
+    // 3-line fixture blockquote we expect at least 3 decorations, each
+    // carrying the findMatch class. If only the first line is highlighted
+    // we'd see exactly 1 — that's the regression.
+    const findMatchCount = probe.decorations!.filter((d) => /findMatch/.test(d.inlineClassName)).length;
     assert.ok(
-      multi,
-      'no decoration spans multiple lines. Raw: ' + JSON.stringify(probe.decorations),
+      findMatchCount >= 3,
+      `expected ≥3 per-line findMatch decorations for a 3-line match, got ${findMatchCount}. ` +
+      `Raw: ${JSON.stringify(probe.decorations)}`,
     );
-    // The highlight must reach ≥3 lines because our fixture match is a
-    // 3-line blockquote; anything less means only the first line(s) got
-    // painted.
+    // Verify the decorations actually span distinct consecutive lines —
+    // rules out duplicates that all point at the start line.
+    const lines = new Set(probe.decorations!
+      .filter((d) => /findMatch/.test(d.inlineClassName))
+      .map((d) => d.startLineNumber));
     assert.ok(
-      multi!.endLineNumber - multi!.startLineNumber >= 2,
-      `multi-line decoration spans only ${multi!.endLineNumber - multi!.startLineNumber} ` +
-      `lines; expected ≥2. Decoration: ${JSON.stringify(multi)}`,
+      lines.size >= 3,
+      `decorations should cover ≥3 distinct lines, got ${lines.size} (lines=${Array.from(lines).join(',')})`,
     );
-    // And it must be a real findMatch (not just rangeHighlight).
-    assert.match(multi!.inlineClassName, /findMatch/, 'decoration lost findMatch class');
   });
 
   test('re-running search replaces preview decorations (regression: highlight disappears on refresh)', async function () {
