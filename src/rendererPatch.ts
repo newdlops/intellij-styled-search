@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV70) { return 'already patched'; }
-  window.__ijFindPatchedV70 = true;
+  if (window.__ijFindPatchedV75) { return 'already patched'; }
+  window.__ijFindPatchedV75 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -268,7 +268,7 @@ export function getRendererPatchScript(): string {
       var editor = m.inst.createInstance(m.ctor, host, {
         automaticLayout: true,
         readOnly: false,
-        minimap: { enabled: false },
+        minimap: { enabled: !state || state.minimapEnabled !== false },
         scrollBeyondLastLine: false,
         renderLineHighlight: 'all',
         fixedOverflowWidgets: true,
@@ -276,6 +276,17 @@ export function getRendererPatchScript(): string {
         // Sticky scroll (the header that pins the current function/class
         // as you scroll) adds visual noise to a read-mostly preview.
         stickyScroll: { enabled: false },
+        // Keep selection/clipboard behavior first-class: copyWithSyntax…
+        // lets Cmd+C inside preview carry styled text into other apps,
+        // and contextmenu re-enables the right-click "Copy" entry that
+        // capture's widgetOpts=bare would otherwise leave unwired.
+        contextmenu: true,
+        copyWithSyntaxHighlighting: true,
+        // Show a 2-lane overview ruler and cursor position marker on the
+        // scrollbar so the user can see where their cursor is while
+        // scrolling a long file.
+        overviewRulerLanes: 3,
+        hideCursorInOverviewRuler: false,
       }, m.widgetOptions);
       return editor;
     } catch (e) {
@@ -864,11 +875,29 @@ export function getRendererPatchScript(): string {
     '}',
     '.ij-find-preview-header {',
     '  padding: 4px 10px; flex: 0 0 auto;',
+    '  display: flex; align-items: center; gap: 6px;',
     '  font-size: 11px;',
     '  color: var(--vscode-descriptionForeground, #9d9d9d);',
     '  border-bottom: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, transparent));',
-    '  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;',
     '  user-select: none;',
+    '}',
+    '.ij-find-preview-path {',
+    '  flex: 1 1 auto; min-width: 0;',
+    '  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;',
+    '}',
+    '.ij-find-minimap-toggle {',
+    '  flex: 0 0 auto;',
+    '  font-size: 10px; padding: 1px 6px;',
+    '  background: transparent;',
+    '  color: inherit;',
+    '  border: 1px solid var(--vscode-widget-border, #555);',
+    '  border-radius: 3px; cursor: pointer;',
+    '}',
+    '.ij-find-minimap-toggle:hover { background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)); }',
+    '.ij-find-minimap-toggle[aria-pressed="true"] {',
+    '  background: var(--vscode-inputOption-activeBackground, rgba(14,99,156,0.5));',
+    '  color: var(--vscode-inputOption-activeForeground, #ffffff);',
+    '  border-color: var(--vscode-inputOption-activeBorder, #007acc);',
     '}',
     '.ij-find-preview-body {',
     '  flex: 1 1 auto; position: relative; overflow: auto;',
@@ -911,6 +940,20 @@ export function getRendererPatchScript(): string {
     // Host element for the embedded Monaco editor. Monaco needs a sized box.
     '.ij-find-monaco-host {',
     '  flex: 1 1 auto; width: 100%; height: 100%; min-height: 0; overflow: hidden;',
+    '}',
+    // Monaco draws text selection as absolutely-positioned divs behind
+    // each glyph. When the editor does not have DOM focus (e.g. user just
+    // tabbed back to the query input), Monaco flips to the
+    // "inactive selection" color which many themes render as
+    // near-transparent — the minimap still shows the selection but the
+    // actual editor area looks blank. Force the inactive selection to
+    // inherit the active color so drag / Shift+Arrow produces a visible
+    // highlight regardless of focus state. Two selectors cover both the
+    // "monacoReal" path (ij-find-monaco-preview-host) and the fallback
+    // "monaco.editor.create" path (ij-find-monaco-host).
+    '.ij-find-monaco-host .monaco-editor .selected-text,',
+    '.ij-find-monaco-preview-host .monaco-editor .selected-text {',
+    '  background-color: var(--vscode-editor-selectionBackground, rgba(38,79,120,0.75)) !important;',
     '}',
     '.ij-find-modified-dot {',
     '  display: inline-block; width: 8px; height: 8px;',
@@ -1094,7 +1137,13 @@ export function getRendererPatchScript(): string {
 
   var $modifiedDot = el('span', { className: 'ij-find-modified-dot', title: 'Unsaved changes' });
   var $previewPath = el('span', { className: 'ij-find-preview-path', text: '' });
-  var $previewHeader = el('div', { className: 'ij-find-preview-header', children: [$modifiedDot, $previewPath] });
+  var $minimapToggle = el('button', {
+    className: 'ij-find-minimap-toggle',
+    title: 'Toggle minimap',
+    text: 'Map',
+    attrs: { type: 'button', 'aria-pressed': 'true' },
+  });
+  var $previewHeader = el('div', { className: 'ij-find-preview-header', children: [$modifiedDot, $previewPath, $minimapToggle] });
   var $previewBody = el('div', { className: 'ij-find-preview-body' });
   var $preview = el('div', { className: 'ij-find-preview', children: [$previewHeader, $previewBody] });
 
@@ -1125,6 +1174,15 @@ export function getRendererPatchScript(): string {
     candidates: [],             // [{uri, relPath}] — planner-narrowed files, rg hasn't confirmed yet
     candidateTotal: 0,          // total planner candidate count (may exceed what we show)
     confirmedUris: {},          // uri → true once rg emits a match for it
+    fileIndexByUri: {},         // uri → index into state.files, so chunked file payloads merge
+    searchId: 0,
+    hasMoreResults: false,
+    loadingMore: false,
+    pageSize: 2000,
+    lastBatchOffset: 0,
+    lastBatchMatches: 0,
+    lastBatchFiles: 0,
+    lastBatchMode: '',
     activeIndex: -1,
     searching: false,
     debounce: null,
@@ -1137,6 +1195,9 @@ export function getRendererPatchScript(): string {
     monacoEditor: null,        // monaco.editor.IStandaloneCodeEditor
     monacoHost: null,          // div hosting the editor
     monacoChangeListener: null,
+    minimapEnabled: true,      // persisted via $minimapToggle; every new preview editor honours it
+    searchStartTs: 0,          // ms timestamp when results:start arrived; feeds the elapsed-time counter
+    searchTicker: null,        // setInterval handle refreshing the status with live elapsed time
     previewMode: '',           // 'monaco' | 'stolen' | 'dom'
     lastPreviewMsg: null,
     editing: false,
@@ -1174,6 +1235,49 @@ export function getRendererPatchScript(): string {
     } else {
       $summary.textContent = matches + ' result' + (matches === 1 ? '' : 's') + ' in ' + files + ' file' + (files === 1 ? '' : 's');
     }
+  }
+
+  // Render elapsed time as ' (N.Ns)' or ' (Nms)' — appended to status
+  // messages so the user sees a live counter during long searches.
+  function formatElapsed(ms) {
+    if (!ms || ms < 0) { return ''; }
+    if (ms < 1000) { return ' (' + ms + 'ms)'; }
+    return ' (' + (ms / 1000).toFixed(1) + 's)';
+  }
+  // Status rewrite used by both results:start/file/candidates while the
+  // search is in flight. Keeps the elapsed-time suffix updated on every
+  // 100ms ticker tick without duplicating the count-formatting branches.
+  function updateSearchingStatus() {
+    var elapsed = state.searchStartTs ? Date.now() - state.searchStartTs : 0;
+    var matches = 0;
+    for (var i = 0; i < state.files.length; i++) { matches += state.files[i].matches.length; }
+    var base;
+    if (matches > 0) {
+      base = matches + ' match' + (matches === 1 ? '' : 'es') + ' in ' + state.files.length +
+             ' file' + (state.files.length === 1 ? '' : 's');
+    } else if (state.candidateTotal > 0) {
+      base = 'Searching ' + state.candidateTotal + ' candidate file' +
+             (state.candidateTotal === 1 ? '' : 's') + '\u2026';
+    } else {
+      base = 'Searching\u2026';
+    }
+    setStatus(base + formatElapsed(elapsed), true);
+  }
+
+  function countVisibleRows() {
+    var filterQ = state.filterQuery || '';
+    var filterNeedle = filterQ;
+    if (filterQ && !state.options.caseSensitive) { filterNeedle = filterQ.toLowerCase(); }
+    var visible = 0;
+    for (var fi = 0; fi < state.files.length; fi++) {
+      var f = state.files[fi];
+      for (var mi = 0; mi < f.matches.length; mi++) {
+        if (!filterQ) { visible++; continue; }
+        var hay = state.options.caseSensitive ? (f.matches[mi].preview || '') : (f.matches[mi].preview || '').toLowerCase();
+        if (hay.indexOf(filterNeedle) >= 0) { visible++; }
+      }
+    }
+    return visible;
   }
 
   function parseScopeInput(raw) {
@@ -1342,6 +1446,7 @@ export function getRendererPatchScript(): string {
       frag.appendChild(row);
     }
     $resultsInner.appendChild(frag);
+    maybeLoadMoreResults();
   }
 
   function render() {
@@ -1397,6 +1502,13 @@ export function getRendererPatchScript(): string {
       if (state.candidateTotal > shown + state.files.length) {
         state.resultsInfoText = '+ ' + (state.candidateTotal - shown - state.files.length) +
           ' more candidate file(s) being scanned\u2026';
+      }
+    }
+    if (!state.resultsInfoText) {
+      if (state.loadingMore) {
+        state.resultsInfoText = 'Loading next ' + state.pageSize + ' results\u2026';
+      } else if (state.hasMoreResults) {
+        state.resultsInfoText = 'Scroll to load next ' + state.pageSize + ' results\u2026';
       }
     }
     if (state.activeIndex >= state.flat.length) {
@@ -1484,6 +1596,8 @@ export function getRendererPatchScript(): string {
     if (!q) {
       state.files = []; state.flat = []; state.activeIndex = -1; state.searching = false;
       state.rgQuery = ''; state.filterQuery = ''; state.rgScope = '';
+      state.hasMoreResults = false; state.loadingMore = false;
+      if (state.searchTicker) { clearInterval(state.searchTicker); state.searchTicker = null; }
       setStatus('Type a query', false);
       render();
       send({ type: 'cancel' });
@@ -1517,10 +1631,7 @@ export function getRendererPatchScript(): string {
       // with "Filtering..." — the user has already found what they need
       // in the list, the background rg scan is just catching extra matches
       // that may or may not pass the filter.
-      var visibleRows = 0;
-      for (var fk = 0; fk < state.flat.length; fk++) {
-        if (!state.flat[fk].pendingUri) { visibleRows++; }
-      }
+      var visibleRows = countVisibleRows();
       if (state.searching) {
         setStatus(visibleRows + ' match' + (visibleRows === 1 ? '' : 'es') + ' (scanning\u2026)', true);
       } else {
@@ -1536,6 +1647,8 @@ export function getRendererPatchScript(): string {
     };
     state.rgScope = scopeRaw;
     state.filterQuery = '';
+    state.hasMoreResults = false;
+    state.loadingMore = false;
     send({
       type: 'log',
       msg: 'triggerSearch: len=' + q.length + '(raw=' + raw.length + ') hasNL=' +
@@ -1566,6 +1679,23 @@ export function getRendererPatchScript(): string {
     state.filterQuery = '';
     state.rgScope = '';
     triggerSearch(false);
+  }
+
+  function requestMoreResults() {
+    if (state.searching || state.loadingMore || !state.hasMoreResults || !$q.value) { return; }
+    state.loadingMore = true;
+    setStatus('Loading next ' + state.pageSize + ' results\u2026', true);
+    scheduleRender();
+    send({ type: 'loadMore' });
+  }
+
+  function maybeLoadMoreResults() {
+    if (state.searching || state.loadingMore || !state.hasMoreResults) { return; }
+    var viewportHeight = Math.max($results.clientHeight || 0, RESULT_ROW_HEIGHT);
+    var threshold = RESULT_ROW_HEIGHT * 6;
+    var totalHeight = totalRenderableRows() * RESULT_ROW_HEIGHT;
+    var remaining = totalHeight - ($results.scrollTop + viewportHeight);
+    if (remaining <= threshold) { requestMoreResults(); }
   }
 
   function toggleOpt(key, btn) {
@@ -1613,6 +1743,23 @@ export function getRendererPatchScript(): string {
   $optRegex.addEventListener('click', function () { toggleOpt('useRegex', $optRegex); });
   $refresh.onclick = refreshSearch;
   $refresh.addEventListener('click', refreshSearch);
+  function applyMinimapSetting() {
+    var ed = state.previewMonacoEditor || state.monacoEditor;
+    if (ed && typeof ed.updateOptions === 'function') {
+      try { ed.updateOptions({ minimap: { enabled: !!state.minimapEnabled } }); } catch (e) {}
+    }
+    $minimapToggle.setAttribute('aria-pressed', String(!!state.minimapEnabled));
+  }
+  applyMinimapSetting();
+  $minimapToggle.addEventListener('click', function (e) {
+    e.preventDefault();
+    state.minimapEnabled = !state.minimapEnabled;
+    applyMinimapSetting();
+    // Keep focus in the editor so the button click doesn't strand the user
+    // with an unfocused preview (re-introduces the inactive-selection bug).
+    var ed = state.previewMonacoEditor || state.monacoEditor;
+    if (ed && typeof ed.focus === 'function') { try { ed.focus(); } catch (eF) {} }
+  });
   $close.addEventListener('click', function () { window.__ijFindHide(); });
 
   $results.addEventListener('click', function (e) {
@@ -1629,6 +1776,7 @@ export function getRendererPatchScript(): string {
   });
   $results.addEventListener('scroll', function () {
     if (state.flat.length > 0 || state.resultsInfoText) { scheduleResultsViewportRender(); }
+    maybeLoadMoreResults();
   });
 
   // Drag header
@@ -2177,6 +2325,7 @@ export function getRendererPatchScript(): string {
         } catch (e) {}
         applyPreviewMatchDecorations(state.previewMonacoEditor, msg);
         try { revealMatchImmediate(state.previewMonacoEditor, msg); } catch (e) {}
+        placeCursorAtMatch(state.previewMonacoEditor, msg);
         state.previewMode = 'monaco';
         return;
       }
@@ -2211,10 +2360,27 @@ export function getRendererPatchScript(): string {
     // then a subsequent flash when highlights appear.
     applyPreviewMatchDecorations(editor, msg);
     try { revealMatchImmediate(editor, msg); } catch (e) {}
+    placeCursorAtMatch(editor, msg);
     // Post-render check
     try {
       var vl = editor.getDomNode && editor.getDomNode() && editor.getDomNode().querySelectorAll('.view-line');
       send({ type: 'log', msg: 'monacoReal rendered viewLines=' + (vl ? vl.length : '?') });
+    } catch (e) {}
+  }
+
+  // Seat a real cursor at the match start so (a) the overview-ruler draws a
+  // horizontal marker at the current line, (b) the minimap highlights the
+  // viewport area, and (c) scrolling shows a visible position indicator.
+  // Without an explicit setPosition the editor has no caret until the user
+  // clicks inside it, and every visual cursor-position affordance stays
+  // blank.
+  function placeCursorAtMatch(editor, msg) {
+    try {
+      if (!editor || typeof editor.setPosition !== 'function') { return; }
+      var line = (typeof msg.focusLine === 'number' ? msg.focusLine : 0) + 1;
+      var r0 = msg.ranges && msg.ranges[0];
+      var col = (r0 && typeof r0.start === 'number') ? r0.start + 1 : 1;
+      editor.setPosition({ lineNumber: line, column: col });
     } catch (e) {}
   }
 
@@ -2304,10 +2470,31 @@ export function getRendererPatchScript(): string {
           });
         }
         for (var si = 0; si < sub.length; si++) {
-          decos.push({
-            range: sub[si],
-            options: { inlineClassName: cls, isWholeLine: false },
-          });
+          // Only seed overview-ruler + minimap markers on the FIRST sub-
+          // range of each match — putting one per exploded line produces
+          // a dense streak on multi-line hits and drowns out the actual
+          // cursor marker. The first sub-range lands at the match's
+          // starting line, which is what the user wants to jump to.
+          var addRulerMarker = si === 0;
+          var opts = { inlineClassName: cls, isWholeLine: false };
+          if (addRulerMarker) {
+            // Theme color tokens — Monaco resolves these to the theme's
+            // selection/find colors. Fallback literal is a
+            // Monaco-findMatch yellow-ish.
+            opts.overviewRuler = {
+              color: matchIdx === 0
+                ? { id: 'editor.findMatchHighlightBackground' }
+                : { id: 'editor.findMatchBackground' },
+              position: 4, // OverviewRulerLane.Right
+            };
+            opts.minimap = {
+              color: matchIdx === 0
+                ? { id: 'minimap.findMatchHighlight' }
+                : { id: 'minimap.findMatchHighlight' },
+              position: 1, // MinimapPosition.Inline
+            };
+          }
+          decos.push({ range: sub[si], options: opts });
         }
       });
       if (state.previewMonacoMatchDecos) {
@@ -2639,15 +2826,18 @@ export function getRendererPatchScript(): string {
       editor = api.editor.create(host, {
         automaticLayout: true,
         readOnly: false,
-        minimap: { enabled: false },
+        minimap: { enabled: !state || state.minimapEnabled !== false },
         scrollBeyondLastLine: false,
         lineNumbers: 'on',
         glyphMargin: false,
         folding: true,
         contextmenu: true,
+        copyWithSyntaxHighlighting: true,
         fontSize: 12,
         renderLineHighlight: 'all',
         occurrencesHighlight: true,
+        overviewRulerLanes: 3,
+        hideCursorInOverviewRuler: false,
       });
       send({ type: 'log', msg: 'monaco.editor.create OK editorType=' + typeof editor + ' hasGetModel=' + (editor && typeof editor.getModel === 'function') });
     } catch (e) {
@@ -3136,6 +3326,20 @@ export function getRendererPatchScript(): string {
     $hoverTooltip.style.top = y + 'px';
   }
 
+  // Mousedown in the preview pane must hand focus to the Monaco editor. Without
+  // this, dragging to select or Shift+arrow keeps focus on the overlay query,
+  // and Monaco renders the selection in its "inactive" style — which the theme
+  // draws as near-transparent, so users see selection markers in the minimap
+  // overview but nothing in the actual editor. Focusing the editor flips the
+  // selection layer to the theme's active color AND wires up cursor-position
+  // indicators on the scrollbar / minimap.
+  $previewBody.addEventListener('mousedown', function () {
+    var ed = state.previewMonacoEditor || state.monacoEditor;
+    if (ed && typeof ed.focus === 'function') {
+      try { ed.focus(); } catch (e) {}
+    }
+  }, true);
+
   $previewBody.addEventListener('mousemove', function (e) {
     if (!state.previewUri) { return; }
     // In Monaco mode, the embedded editor handles hover natively via VSCode
@@ -3306,6 +3510,14 @@ export function getRendererPatchScript(): string {
         lastPreviewKey: state.lastPreviewKey || null,
         inputValue: $q ? $q.value : null,
         scopeValue: $scope ? $scope.value : null,
+        searchId: typeof state.searchId === 'number' ? state.searchId : 0,
+        hasMoreResults: !!state.hasMoreResults,
+        loadingMore: !!state.loadingMore,
+        pageSize: typeof state.pageSize === 'number' ? state.pageSize : 0,
+        lastBatchOffset: typeof state.lastBatchOffset === 'number' ? state.lastBatchOffset : 0,
+        lastBatchMatches: typeof state.lastBatchMatches === 'number' ? state.lastBatchMatches : 0,
+        lastBatchFiles: typeof state.lastBatchFiles === 'number' ? state.lastBatchFiles : 0,
+        lastBatchMode: state.lastBatchMode || '',
         rgQuery: state.rgQuery || '',
         rgScope: state.rgScope || '',
         filterQuery: state.filterQuery || '',
@@ -3345,48 +3557,110 @@ export function getRendererPatchScript(): string {
     } catch (e) { return { err: String(e && e.message) }; }
   };
   window.__ijFindOnMessage = function (msg) {
+    var msgSearchId = typeof msg.searchId === 'number' ? msg.searchId : null;
     switch (msg.type) {
       case 'results:start':
         state.files = []; state.flat = []; state.candidates = [];
-        state.candidateTotal = 0; state.confirmedUris = {};
+        state.candidateTotal = 0; state.confirmedUris = {}; state.fileIndexByUri = {};
+        state.searchId = msgSearchId !== null ? msgSearchId : ((state.searchId || 0) + 1);
+        state.filterQuery = '';
+        state.hasMoreResults = false;
+        state.loadingMore = false;
+        state.lastBatchOffset = 0;
+        state.lastBatchMatches = 0;
+        state.lastBatchFiles = 0;
+        state.lastBatchMode = 'start';
         state.activeIndex = -1; state.searching = true;
+        state.searchStartTs = Date.now();
+        if (state.searchTicker) { clearInterval(state.searchTicker); }
+        // Tick the status every 100ms with elapsed time so the user sees
+        // the search is progressing even during a long full-scan.
+        state.searchTicker = setInterval(function () {
+          if (!state.searching) { return; }
+          updateSearchingStatus();
+        }, 100);
         clearPreview();
-        setStatus('Searching\u2026', true);
+        updateSearchingStatus();
         render();
         break;
       case 'results:candidates':
+        if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
         // Planner narrowed the workspace to these files; rg hasn't matched
         // them yet. Show as pending rows so the user sees *something*
         // clickable immediately instead of an empty Searching state.
         state.candidates = msg.candidates || [];
         state.candidateTotal = msg.total || state.candidates.length;
-        setStatus('Searching ' + state.candidateTotal + ' candidate file' +
-                  (state.candidateTotal === 1 ? '' : 's') + '\u2026', true);
+        updateSearchingStatus();
         render();
         break;
       case 'results:file':
+        if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
+        if (!msg.match || !msg.match.uri) { break; }
         state.confirmedUris[msg.match.uri] = true;
-        state.files.push(msg.match);
+        var fileIdx = state.fileIndexByUri[msg.match.uri];
+        if (typeof fileIdx === 'number' && state.files[fileIdx]) {
+          Array.prototype.push.apply(state.files[fileIdx].matches, msg.match.matches || []);
+        } else {
+          state.fileIndexByUri[msg.match.uri] = state.files.length;
+          state.files.push(msg.match);
+        }
         // rg streams file-at-a-time. Rendering on every event nukes the
         // results DOM and can steal a click mid-action. Coalesce to one
         // render per animation frame — multiple events within ~16ms become
         // a single DOM rebuild.
         scheduleRender();
-        var sofar = 0;
-        for (var i = 0; i < state.files.length; i++) { sofar += state.files[i].matches.length; }
-        setStatus(sofar + ' matches in ' + state.files.length + ' files', true);
+        updateSearchingStatus();
+        // Show the preview for the FIRST match as soon as it arrives, not
+        // after the whole search finishes. On a slow full-scan (multi-
+        // second rg run) this is the difference between staring at an
+        // empty preview pane for 10s vs seeing the first hit in <100ms.
+        if (state.activeIndex < 0) {
+          // render() / scheduleRender() may not have flushed state.flat
+          // yet — do a sync rebuild so selectMatch can find row 0.
+          render();
+          if (state.flat.length > 0) { selectMatch(0); }
+        }
         break;
       case 'results:done':
+        if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
         state.searching = false;
+        state.loadingMore = false;
+        state.hasMoreResults = !!msg.truncated;
+        if (typeof msg.pageSize === 'number' && msg.pageSize > 0) { state.pageSize = msg.pageSize; }
+        state.lastBatchOffset = typeof msg.offset === 'number' ? msg.offset : 0;
+        state.lastBatchMatches = typeof msg.pageMatches === 'number' ? msg.pageMatches : 0;
+        state.lastBatchFiles = typeof msg.pageFiles === 'number' ? msg.pageFiles : 0;
+        state.lastBatchMode = state.lastBatchOffset > 0 ? 'append' : 'initial';
+        if (state.searchTicker) { clearInterval(state.searchTicker); state.searchTicker = null; }
         setSummary();
-        if (msg.totalMatches === 0) {
+        if (state.lastBatchOffset > 0) {
+          if (state.lastBatchMatches === 0) {
+            setStatus(
+              'No additional results' + formatElapsed(Date.now() - (state.searchStartTs || Date.now())),
+              false,
+            );
+          } else {
+            var visibleRows = countVisibleRows();
+            var appendStatus = 'Loaded +' + state.lastBatchMatches + ' result' +
+              (state.lastBatchMatches === 1 ? '' : 's') +
+              ' in ' + state.lastBatchFiles + ' file' + (state.lastBatchFiles === 1 ? '' : 's') +
+              ' (' + msg.totalMatches + ' total';
+            if (state.filterQuery) { appendStatus += ', ' + visibleRows + ' visible'; }
+            appendStatus += ')';
+            if (msg.truncated) { appendStatus += ', scroll for more'; }
+            setStatus(
+              appendStatus + formatElapsed(Date.now() - (state.searchStartTs || Date.now())),
+              false,
+            );
+          }
+        } else if (msg.totalMatches === 0) {
           // Keep candidates visible even with no matches — they were the
           // planner's best guess, user may want to skim them manually.
           setStatus(
-            state.candidateTotal > 0
+            (state.candidateTotal > 0
               ? 'No matches in ' + state.candidateTotal + ' candidate file' +
                 (state.candidateTotal === 1 ? '' : 's')
-              : 'No matches',
+              : 'No matches') + formatElapsed(Date.now() - (state.searchStartTs || Date.now())),
             false,
           );
         } else {
@@ -3396,7 +3670,8 @@ export function getRendererPatchScript(): string {
           setStatus(
             msg.totalMatches + ' result' + (msg.totalMatches === 1 ? '' : 's') +
             ' in ' + msg.totalFiles + ' file' + (msg.totalFiles === 1 ? '' : 's') +
-            (msg.truncated ? ' (truncated)' : ''),
+            (msg.truncated ? ' (truncated)' : '') +
+            formatElapsed(Date.now() - (state.searchStartTs || Date.now())),
             false
           );
         }
@@ -3404,7 +3679,12 @@ export function getRendererPatchScript(): string {
         if (state.activeIndex < 0 && state.flat.length > 0) { selectMatch(0); }
         break;
       case 'results:error':
+        if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
         state.searching = false;
+        state.loadingMore = false;
+        state.hasMoreResults = false;
+        state.lastBatchMode = 'error';
+        if (state.searchTicker) { clearInterval(state.searchTicker); state.searchTicker = null; }
         setStatus('Error: ' + msg.message, false);
         break;
       case 'preview':

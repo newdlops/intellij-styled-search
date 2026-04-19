@@ -2,7 +2,15 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import { execSync } from 'child_process';
 import WebSocket from 'ws';
-import { runSearch, SearchOptions, FileMatch, MatchRange, prioritizeFiles } from './search';
+import {
+  runSearch,
+  SearchOptions,
+  FileMatch,
+  MatchRange,
+  prioritizeFiles,
+  mergeFileMatches,
+  getConfiguredResultLimit,
+} from './search';
 import { configureRipgrepInstall, ensureRipgrepInstalled, findRipgrepPath, runRgSearch } from './rgSearch';
 import { getRendererPatchScript } from './rendererPatch';
 import { TrigramIndex, extractTrigramsLower } from './trigramIndex';
@@ -10,6 +18,7 @@ import { compileIncludeMatcher } from './pathScope';
 
 type RendererEvent =
   | { type: 'search'; options: SearchOptions }
+  | { type: 'loadMore' }
   | { type: 'cancel' }
   | { type: 'openFile'; uri: string; line: number; column: number }
   | { type: 'previewFile'; uri: string; line: number; column: number }
@@ -25,13 +34,34 @@ type PreviewLine = { lineNumber: number; text: string };
 type HoverContent = { value: string; isTrusted: boolean; allowedCommands?: readonly string[] };
 
 type OverlayMessage =
-  | { type: 'results:start' }
-  | { type: 'results:candidates'; candidates: Array<{ uri: string; relPath: string }>; total: number }
-  | { type: 'results:file'; match: FileMatch }
-  | { type: 'results:done'; totalFiles: number; totalMatches: number; truncated: boolean }
-  | { type: 'results:error'; message: string }
+  | { type: 'results:start'; searchId: number }
+  | { type: 'results:candidates'; searchId: number; candidates: Array<{ uri: string; relPath: string }>; total: number }
+  | { type: 'results:file'; searchId: number; match: FileMatch }
+  | {
+      type: 'results:done';
+      searchId: number;
+      totalFiles: number;
+      totalMatches: number;
+      truncated: boolean;
+      pageSize: number;
+      pageFiles: number;
+      pageMatches: number;
+      offset: number;
+    }
+  | { type: 'results:error'; searchId: number; message: string }
   | { type: 'preview'; uri: string; relPath: string; focusLine: number; ranges?: MatchRange[]; lines: PreviewLine[]; languageId: string }
   | { type: 'hover'; reqId: number; uri: string; line: number; column: number; x: number; y: number; contents: HoverContent[] };
+
+type SearchSession = {
+  searchId: number;
+  options: SearchOptions;
+  pageSize: number;
+  loadedMatches: number;
+  loadedUris: Set<string>;
+  hasMore: boolean;
+  orderedCandidatePaths: string[] | null;
+  scopedCandidateUris: Set<string> | null;
+};
 
 const BRIDGE_BINDING = 'irSearchMainBridge';
 const RENDERER_BINDING = 'irSearchEvent';
@@ -49,6 +79,9 @@ export class OverlayPanel {
   private pendingShow: string | null = null;
   private showInFlight = false;
   private capturePromise: Promise<void> | undefined;
+  private searchSeq = 0;
+  private currentSearchSession: SearchSession | undefined;
+  private rendererPostChain: Promise<void> = Promise.resolve();
   // Per-source lastSeenSeq: each renderer patch install has its own instance
   // id (`__src`) and monotonic `__seq`. We dedup duplicates delivered by
   // accumulated CDP `message` listeners *within the same source*, but never
@@ -528,7 +561,7 @@ export class OverlayPanel {
         paths,
       ).catch(reject);
     });
-    return matches;
+    return mergeFileMatches(matches);
   }
 
   /** @internal Exposed so tests can drive the index directly. */
@@ -765,8 +798,12 @@ export class OverlayPanel {
       // our bridge listener may be dropped, or a test VSCode instance may
       // have contended for the same inspector port. A quick ping catches
       // these cases so we can force-reinject before the user sees a
-      // broken search pane.
-      const alive = await this.verifyBridgeAlive(400);
+      // broken search pane. Ping timeout tightened from 400ms→100ms:
+      // local CDP roundtrip is ~20-50ms, so 100ms still catches a dead
+      // bridge but shaves ~300ms off every "bridge alive" invocation —
+      // that latency was the visible gap between the user hitting the
+      // search shortcut and the overlay appearing.
+      const alive = await this.verifyBridgeAlive(100);
       if (!alive) {
         this.log.appendLine('Bridge ping failed — forcing reinject before show');
         try { await this.forceReinject(); }
@@ -1146,7 +1183,11 @@ export class OverlayPanel {
     }
     switch (evt.type) {
       case 'search': void this.runSearch(evt.options); break;
-      case 'cancel': this.cancelActive(); break;
+      case 'loadMore': void this.loadMoreSearch(); break;
+      case 'cancel':
+        this.currentSearchSession = undefined;
+        this.cancelActive();
+        break;
       case 'openFile': void this.openFile(evt.uri, evt.line, evt.column, false); break;
       case 'previewFile': void this.openFile(evt.uri, evt.line, evt.column, true); break;
       case 'requestPreview': void this.handlePreviewRequest(evt); break;
@@ -1162,15 +1203,27 @@ export class OverlayPanel {
   private async openInSideEditor(uriStr: string, line: number, column: number, preview: boolean, preserveFocus: boolean) {
     try {
       const uri = vscode.Uri.parse(uriStr);
-      const doc = await vscode.workspace.openTextDocument(uri);
       const pos = new vscode.Position(Math.max(0, line), Math.max(0, column));
-      // Open in Beside; the renderer immediately hides that editor-group
-      // container so the user never sees a new column/tab. We steal the
-      // monaco widget out of the hidden group. The widget shares VSCode's
-      // TextModel, so edits in our preview propagate to any tab the user
-      // already has open on the same file (and vice-versa).
+      // Double-click / Enter routing: focus the file's EXISTING tab when
+      // it's already open anywhere, otherwise open a fresh non-preview tab
+      // in column 1. Prior behaviour was Beside (always split), which left
+      // a duplicate tab next to the overlay's stolen preview every time.
+      let existingColumn: vscode.ViewColumn | undefined;
+      try {
+        const groups = (vscode.window as any).tabGroups?.all ?? [];
+        outer: for (const group of groups) {
+          for (const tab of group.tabs ?? []) {
+            const input = tab.input;
+            if (input && typeof input === 'object' && 'uri' in input && (input as any).uri?.toString() === uriStr) {
+              existingColumn = group.viewColumn;
+              break outer;
+            }
+          }
+        }
+      } catch {}
+      const doc = await vscode.workspace.openTextDocument(uri);
       await vscode.window.showTextDocument(doc, {
-        viewColumn: vscode.ViewColumn.Beside,
+        viewColumn: existingColumn ?? vscode.ViewColumn.One,
         preserveFocus,
         preview,
         selection: new vscode.Range(pos, pos),
@@ -1330,18 +1383,32 @@ export class OverlayPanel {
     }
   }
 
+  private baseSearchOptions(options: SearchOptions): SearchOptions {
+    return {
+      query: options.query,
+      caseSensitive: options.caseSensitive,
+      wholeWord: options.wholeWord,
+      useRegex: options.useRegex,
+      includePatterns: options.includePatterns ? [...options.includePatterns] : undefined,
+    };
+  }
+
   private async runSearch(options: SearchOptions) {
     this.cancelActive();
-    const cts = new vscode.CancellationTokenSource();
-    this.activeSearch = cts;
-    await this.postToRenderer({ type: 'results:start' });
-    const progress = {
-      onFile: (m: FileMatch) => { if (!cts.token.isCancellationRequested) { void this.postToRenderer({ type: 'results:file', match: m }); } },
-      onDone: (s: { totalFiles: number; totalMatches: number; truncated: boolean }) => {
-        if (!cts.token.isCancellationRequested) { void this.postToRenderer({ type: 'results:done', ...s }); }
-      },
-      onError: (e: Error) => { void this.postToRenderer({ type: 'results:error', message: e.message }); },
+    const searchId = ++this.searchSeq;
+    const pageSize = getConfiguredResultLimit();
+    const session: SearchSession = {
+      searchId,
+      options: this.baseSearchOptions(options),
+      pageSize,
+      loadedMatches: 0,
+      loadedUris: new Set<string>(),
+      hasMore: false,
+      orderedCandidatePaths: null,
+      scopedCandidateUris: null,
     };
+    this.currentSearchSession = session;
+    await this.postToRenderer({ type: 'results:start', searchId });
     const t0 = Date.now();
     const optTags = [
       options.useRegex ? 'regex' : '',
@@ -1385,65 +1452,128 @@ export class OverlayPanel {
       } else {
         this.log.appendLine(`TrigramIndex candidates: null (${reason}) — rg will full-scan workspace`);
       }
-      // Primary engine: the same ripgrep that VSCode's built-in "Find in
-      // Files" uses. Byte-for-byte result parity + multi-thread speed.
-      // Falls back to the JS+trigram path only if rg isn't locatable.
+      session.scopedCandidateUris = scopedCandidates;
+      if (scopedCandidates) {
+        if (scopedCandidates.size === 0) {
+          this.log.appendLine(`search done: 0 matches (candidates empty) in ${Date.now() - t0}ms`);
+          await this.postToRenderer({
+            type: 'results:done',
+            searchId,
+            totalFiles: 0,
+            totalMatches: 0,
+            truncated: false,
+            pageSize: session.pageSize,
+            pageFiles: 0,
+            pageMatches: 0,
+            offset: 0,
+          });
+          return;
+        }
+        // Order candidates by relevance once per search session. Later
+        // pagination reuses the same order so offset-based reruns don't
+        // duplicate or skip matches when the user's open tabs change.
+        const uris: vscode.Uri[] = [];
+        for (const u of scopedCandidates) {
+          try { uris.push(vscode.Uri.parse(u)); } catch {}
+        }
+        const ordered = prioritizeFiles(uris);
+        session.orderedCandidatePaths = ordered.map((u) => u.fsPath);
+        const MAX_PENDING = 400;
+        const head = ordered.slice(0, MAX_PENDING);
+        const sample = head.map((u) => ({
+          uri: u.toString(),
+          relPath: vscode.workspace.asRelativePath(u, false),
+        }));
+        const relPaths = ordered.map((u) => vscode.workspace.asRelativePath(u, false));
+        const head3 = relPaths.slice(0, 3).join(' | ');
+        const tail3 = relPaths.length > 6 ? ' ... ' + relPaths.slice(-3).join(' | ') : '';
+        this.log.appendLine(
+          `candidates sample [${relPaths.length}]: ${head3}${tail3}`,
+        );
+        void this.postToRenderer({
+          type: 'results:candidates',
+          searchId,
+          candidates: sample,
+          total: session.orderedCandidatePaths.length,
+        });
+      }
+      await this.runSearchPage(session, t0);
+    } finally {
+      if (this.currentSearchSession === session && session.loadedMatches === 0 && !session.hasMore) {
+        // Keep the session only while the same query is still the current one.
+        // Non-empty sessions are retained so scroll-driven pagination can
+        // request the next page after the initial batch completes.
+        this.currentSearchSession = session;
+      }
+    }
+  }
+
+  private async loadMoreSearch() {
+    const session = this.currentSearchSession;
+    if (!session || !session.hasMore) { return; }
+    if (this.activeSearch) { return; }
+    this.log.appendLine(
+      `search loadMore: offset=${session.loadedMatches} pageSize=${session.pageSize} queryLen=${session.options.query.length}`,
+    );
+    await this.runSearchPage(session, Date.now());
+  }
+
+  private async runSearchPage(session: SearchSession, startedAt: number): Promise<void> {
+    const cts = new vscode.CancellationTokenSource();
+    this.activeSearch = cts;
+    const offset = session.loadedMatches;
+    let batchMatches = 0;
+    const batchUris = new Set<string>();
+    const progress = {
+      onFile: (m: FileMatch) => {
+        if (cts.token.isCancellationRequested || this.currentSearchSession !== session) { return; }
+        batchMatches += m.matches.length;
+        batchUris.add(m.uri);
+        void this.postToRenderer({ type: 'results:file', searchId: session.searchId, match: m });
+      },
+      onDone: (s: { totalFiles: number; totalMatches: number; truncated: boolean }) => {
+        if (cts.token.isCancellationRequested || this.currentSearchSession !== session) { return; }
+        for (const uri of batchUris) { session.loadedUris.add(uri); }
+        session.loadedMatches += batchMatches;
+        session.hasMore = s.truncated;
+        this.log.appendLine(
+          `search page done: batch=${batchMatches} loaded=${session.loadedMatches} files=${session.loadedUris.size} more=${session.hasMore} elapsed=${Date.now() - startedAt}ms offset=${offset}`,
+        );
+        void this.postToRenderer({
+          type: 'results:done',
+          searchId: session.searchId,
+          totalFiles: session.loadedUris.size,
+          totalMatches: session.loadedMatches,
+          truncated: session.hasMore,
+          pageSize: session.pageSize,
+          pageFiles: batchUris.size,
+          pageMatches: batchMatches,
+          offset,
+        });
+      },
+      onError: (e: Error) => {
+        if (this.currentSearchSession !== session) { return; }
+        void this.postToRenderer({ type: 'results:error', searchId: session.searchId, message: e.message });
+      },
+    };
+    const pageOptions: SearchOptions = {
+      ...session.options,
+      resultOffset: offset,
+      resultLimit: session.pageSize,
+    };
+    try {
       const rgPath = findRipgrepPath();
       if (rgPath) {
-        let paths: string[] | null = null;
-        if (scopedCandidates) {
-          if (scopedCandidates.size === 0) {
-            this.log.appendLine(`search done: 0 matches (candidates empty) in ${Date.now() - t0}ms`);
-            progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
-            return;
-          }
-          // Order candidates by relevance: open tabs → user code (shallow
-          // depth first) → library-ish paths (.venv, node_modules, locks,
-          // caches). Both rg scan order and the pending-row UI use this
-          // order, so user's real files appear first in every view.
-          const uris: vscode.Uri[] = [];
-          for (const u of scopedCandidates) {
-            try { uris.push(vscode.Uri.parse(u)); } catch {}
-          }
-          const ordered = prioritizeFiles(uris);
-          paths = ordered.map((u) => u.fsPath);
-          const MAX_PENDING = 400;
-          const head = ordered.slice(0, MAX_PENDING);
-          const sample = head.map((u) => ({
-            uri: u.toString(),
-            relPath: vscode.workspace.asRelativePath(u, false),
-          }));
-          // Log a handful of candidate paths so we can tell when rg returns
-          // 0 matches whether the issue is "wrong files picked" (user's
-          // real file isn't in the list) vs "right files, content doesn't
-          // match the literal". Paths are relative to workspace.
-          const relPaths = ordered.map((u) => vscode.workspace.asRelativePath(u, false));
-          const head3 = relPaths.slice(0, 3).join(' | ');
-          const tail3 = relPaths.length > 6 ? ' ... ' + relPaths.slice(-3).join(' | ') : '';
-          this.log.appendLine(
-            `candidates sample [${relPaths.length}]: ${head3}${tail3}`,
-          );
-          void this.postToRenderer({
-            type: 'results:candidates',
-            candidates: sample,
-            total: paths.length,
-          });
-        }
-        const rgStart = Date.now();
-        const wrappedProgress = {
-          onFile: progress.onFile,
-          onDone: (s: { totalFiles: number; totalMatches: number; truncated: boolean }) => {
-            this.log.appendLine(
-              `search done: ${s.totalMatches} matches in ${s.totalFiles} files, rg=${Date.now() - rgStart}ms total=${Date.now() - t0}ms`,
-            );
-            progress.onDone(s);
-          },
-          onError: progress.onError,
-        };
-        await runRgSearch(options, cts.token, wrappedProgress, paths, (m) => this.log.appendLine(m));
+        await runRgSearch(
+          pageOptions,
+          cts.token,
+          progress,
+          session.orderedCandidatePaths,
+          (m) => this.log.appendLine(m),
+        );
       } else {
         this.log.appendLine('rg not found — falling back to JS scan.');
-        await runSearch(options, cts.token, progress, scopedCandidates);
+        await runSearch(pageOptions, cts.token, progress, session.scopedCandidateUris);
       }
     } finally {
       if (this.activeSearch === cts) {
@@ -1455,13 +1585,25 @@ export class OverlayPanel {
 
   private async postToRenderer(msg: OverlayMessage) {
     if (this.activeWindowId === undefined) { return; }
+    const windowId = this.activeWindowId;
     const payload = JSON.stringify(msg);
     const js = `try { window.__ijFindOnMessage && window.__ijFindOnMessage(${payload}); } catch (e) {}`;
-    try {
-      await this.evalInWindow(this.activeWindowId, js);
-    } catch (err) {
-      this.log.appendLine(`postToRenderer failed: ${err instanceof Error ? err.message : err}`);
-    }
+    const deliver = async () => {
+      try {
+        const timeoutMs = 1000;
+        await Promise.race([
+          this.evalInWindow(windowId, js),
+          delay(timeoutMs).then(() => {
+            throw new Error(`timed out after ${timeoutMs}ms`);
+          }),
+        ]);
+      } catch (err) {
+        this.log.appendLine(`postToRenderer failed: ${err instanceof Error ? err.message : err}`);
+      }
+    };
+    const next = this.rendererPostChain.then(deliver, deliver);
+    this.rendererPostChain = next.then(() => undefined, () => undefined);
+    await next;
   }
 
   private async openFile(uriStr: string, line: number, column: number, preview: boolean) {

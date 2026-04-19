@@ -4,7 +4,16 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as https from 'https';
 import * as os from 'os';
-import { SearchOptions, SearchProgress, FileMatch, MatchRange } from './search';
+import {
+  SearchOptions,
+  SearchProgress,
+  FileMatch,
+  MatchRange,
+  getRequestedResultLimit,
+  getRequestedResultOffset,
+  FILE_MATCH_CHUNK_MATCH_LIMIT,
+  FILE_MATCH_CHUNK_CHAR_LIMIT,
+} from './search';
 import { compileIncludeMatcher, toRipgrepGlobs } from './pathScope';
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -286,6 +295,10 @@ type RgEvent = RgBegin | RgMatch | RgEnd | { type: 'summary'; data: unknown } | 
 
 const MAX_LINE_PREVIEW = 400;
 
+function estimateBufferedMatchSize(match: FileMatch['matches'][number]): number {
+  return (match.preview?.length ?? 0) + (match.ranges?.length ?? 0) * 48 + 64;
+}
+
 function clipLine(line: string, range: MatchRange): { preview: string; ranges: MatchRange[] } {
   if (line.length <= MAX_LINE_PREVIEW) {
     return { preview: line, ranges: [range] };
@@ -329,8 +342,8 @@ export async function runRgSearch(
   const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
   const excludeGlobs = cfg.get<string[]>('excludeGlobs', []);
   const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
-  const maxResults = cfg.get<number>('maxResults', 0);
-  const resultLimit = Number.isFinite(maxResults) && maxResults > 0 ? maxResults : 0;
+  const resultLimit = getRequestedResultLimit(opts, cfg);
+  const resultOffset = getRequestedResultOffset(opts);
   const includeMatcher = compileIncludeMatcher(opts.includePatterns);
   const includeGlobs = toRipgrepGlobs(opts.includePatterns);
 
@@ -397,6 +410,7 @@ export async function runRgSearch(
   let totalFiles = 0;
   let truncated = false;
   let killed = false;
+  let skippedMatches = 0;
 
   if (logger) {
     // Rebuild a shell-quoted command for manual reproduction in a terminal.
@@ -427,20 +441,29 @@ export async function runRgSearch(
     relPath: string;
     fsPath: string;
     matches: FileMatch['matches'];
+    approxChars: number;
+    emitted: boolean;
   } | null = null;
 
-  function flushFile() {
-    if (pendingFile && pendingFile.matches.length > 0) {
+  function flushFile(final = false) {
+    if (!pendingFile) { return; }
+    if (pendingFile.matches.length > 0) {
       progress.onFile({ uri: pendingFile.uri, relPath: pendingFile.relPath, matches: pendingFile.matches });
-      totalFiles++;
+      pendingFile.matches = [];
+      pendingFile.approxChars = 0;
+      if (!pendingFile.emitted) {
+        totalFiles++;
+        pendingFile.emitted = true;
+      }
     }
-    pendingFile = null;
+    if (final) { pendingFile = null; }
   }
 
   function handleEvent(evt: RgEvent) {
     if (truncated || killed) { return; }
     switch (evt.type) {
       case 'begin': {
+        flushFile(true);
         const fsPath = evt.data.path.text;
         const uri = vscode.Uri.file(fsPath);
         pendingFile = {
@@ -448,6 +471,8 @@ export async function runRgSearch(
           relPath: vscode.workspace.asRelativePath(uri, false),
           fsPath,
           matches: [],
+          approxChars: 0,
+          emitted: false,
         };
         break;
       }
@@ -534,21 +559,34 @@ export async function runRgSearch(
             }
             return r;
           });
-          pendingFile.matches.push({
+          const outMatch = {
             line: startLine,
             preview: clipped.preview,
             ranges: outRanges,
-          });
+          };
+          if (resultOffset > skippedMatches) {
+            skippedMatches++;
+            break;
+          }
+          pendingFile.matches.push(outMatch);
+          pendingFile.approxChars += estimateBufferedMatchSize(outMatch);
           totalMatches += 1;
+          if (
+            pendingFile.matches.length >= FILE_MATCH_CHUNK_MATCH_LIMIT ||
+            pendingFile.approxChars >= FILE_MATCH_CHUNK_CHAR_LIMIT
+          ) {
+            flushFile(false);
+          }
           if (resultLimit > 0 && totalMatches >= resultLimit) {
             truncated = true;
+            flushFile(false);
             try { child.kill('SIGTERM'); } catch {}
           }
         }
         break;
       }
       case 'end': {
-        flushFile();
+        flushFile(true);
         break;
       }
     }
@@ -600,7 +638,7 @@ export async function runRgSearch(
   }
 
   // Final flush (rg sends 'end' per file but last file may not if killed).
-  flushFile();
+  flushFile(true);
   progress.onDone({ totalFiles, totalMatches, truncated });
 }
 

@@ -15,6 +15,10 @@ function relPaths(matches: FileMatch[]): string[] {
   return matches.map((m) => m.relPath).sort();
 }
 
+function countMatchLines(matches: FileMatch[]): number {
+  return matches.reduce((sum, m) => sum + m.matches.length, 0);
+}
+
 suite('Search — engine end-to-end against fixture workspace', () => {
   suiteSetup(async function () {
     this.timeout(60_000);
@@ -158,6 +162,89 @@ suite('Search — engine end-to-end against fixture workspace', () => {
       useRegex: false,
     });
     assert.deepStrictEqual(matches, [], 'expected no matches');
+  });
+
+  test('default safety cap prevents unbounded result explosions', async function () {
+    this.timeout(60_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const prior = cfg.inspect<number>('maxResults');
+    const generated = vscode.Uri.joinPath(folder!.uri, 'generated-many-results.txt');
+    const lines = Array.from({ length: 2500 }, (_, i) => `safetycap needle ${i}`).join('\n');
+
+    try {
+      await cfg.update('maxResults', 0, vscode.ConfigurationTarget.Workspace);
+      await vscode.workspace.fs.writeFile(generated, Buffer.from(lines, 'utf8'));
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+
+      const matches = await overlay.searchForTests({
+        query: 'safetycap needle',
+        caseSensitive: false,
+        wholeWord: false,
+        useRegex: false,
+      });
+
+      assert.deepStrictEqual(relPaths(matches), ['generated-many-results.txt']);
+      assert.strictEqual(
+        countMatchLines(matches),
+        2000,
+        `expected built-in safety cap to truncate at 2000 match lines, got ${countMatchLines(matches)}`,
+      );
+    } finally {
+      try { await vscode.workspace.fs.delete(generated); } catch {}
+      await cfg.update('maxResults', prior?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+    }
+  });
+
+  test('offset + limit pages through large result sets without duplicating prior matches', async function () {
+    this.timeout(60_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const generated = vscode.Uri.joinPath(folder!.uri, 'generated-paged-results.txt');
+    const lines = Array.from({ length: 2500 }, (_, i) => `paged needle ${i}`).join('\n');
+
+    try {
+      await vscode.workspace.fs.writeFile(generated, Buffer.from(lines, 'utf8'));
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+
+      const page1 = await overlay.searchForTests({
+        query: 'paged needle',
+        caseSensitive: false,
+        wholeWord: false,
+        useRegex: false,
+        resultLimit: 2000,
+      });
+      const page2 = await overlay.searchForTests({
+        query: 'paged needle',
+        caseSensitive: false,
+        wholeWord: false,
+        useRegex: false,
+        resultOffset: 2000,
+        resultLimit: 2000,
+      });
+
+      assert.deepStrictEqual(relPaths(page1), ['generated-paged-results.txt']);
+      assert.deepStrictEqual(relPaths(page2), ['generated-paged-results.txt']);
+      assert.strictEqual(countMatchLines(page1), 2000, 'first page should stop at the batch size');
+      assert.strictEqual(countMatchLines(page2), 500, 'second page should contain only the remaining matches');
+      assert.strictEqual(page2[0].matches[0].line, 2000, 'second page should resume at line 2001 (0-based 2000)');
+      assert.strictEqual(
+        page2[0].matches[page2[0].matches.length - 1].line,
+        2499,
+        'second page should end at the last matching line',
+      );
+    } finally {
+      try { await vscode.workspace.fs.delete(generated); } catch {}
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+    }
   });
 
   // Regression: `candidatesFor` used to bail out for any query containing

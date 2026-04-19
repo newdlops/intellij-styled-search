@@ -36,7 +36,7 @@ IntelliJ Styled Search adds an IntelliJ IDEA-like project search panel to VS Cod
 | --- | --- | --- |
 | `intellijStyledSearch.excludeGlobs` | common build/cache folders | Glob patterns excluded from full searches. |
 | `intellijStyledSearch.maxFileSize` | `1048576` | Maximum file size in bytes to search. |
-| `intellijStyledSearch.maxResults` | `2000` | Maximum number of match lines to return. |
+| `intellijStyledSearch.maxResults` | `2000` | Match lines to load per batch. Scrolling near the bottom loads the next batch. Values at or below `0` use the built-in default. |
 
 ## Runtime Notes
 
@@ -57,4 +57,3 @@ Package locally:
 ```bash
 vsce package
 ```
-

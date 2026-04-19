@@ -7,6 +7,8 @@ export interface SearchOptions {
   wholeWord: boolean;
   useRegex: boolean;
   includePatterns?: string[];
+  resultOffset?: number;
+  resultLimit?: number;
 }
 
 export interface MatchRange {
@@ -68,6 +70,95 @@ function getExt(fsPath: string): string {
 }
 
 const MAX_LINE_PREVIEW = 400;
+export const DEFAULT_MAX_RESULTS = 2000;
+export const HARD_MAX_RESULTS = 10000;
+export const FILE_MATCH_CHUNK_MATCH_LIMIT = 200;
+export const FILE_MATCH_CHUNK_CHAR_LIMIT = 64 * 1024;
+
+export function getConfiguredResultLimit(
+  cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
+): number {
+  const raw = cfg.get<number>('maxResults', DEFAULT_MAX_RESULTS);
+  if (!Number.isFinite(raw)) { return DEFAULT_MAX_RESULTS; }
+  if (raw <= 0) { return DEFAULT_MAX_RESULTS; }
+  return Math.max(1, Math.min(Math.floor(raw), HARD_MAX_RESULTS));
+}
+
+export function getRequestedResultOffset(opts: SearchOptions): number {
+  const raw = opts.resultOffset;
+  if (!Number.isFinite(raw)) { return 0; }
+  return Math.max(0, Math.floor(raw!));
+}
+
+export function getRequestedResultLimit(
+  opts: SearchOptions,
+  cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
+): number {
+  const raw = opts.resultLimit;
+  if (!Number.isFinite(raw) || raw === undefined) { return getConfiguredResultLimit(cfg); }
+  if (raw <= 0) { return getConfiguredResultLimit(cfg); }
+  return Math.max(1, Math.min(Math.floor(raw), HARD_MAX_RESULTS));
+}
+
+function estimateMatchPayloadSize(match: FileMatch['matches'][number]): number {
+  return (match.preview?.length ?? 0) + (match.ranges?.length ?? 0) * 48 + 64;
+}
+
+export function splitFileMatchChunks(
+  fileMatch: FileMatch,
+  matchLimit = FILE_MATCH_CHUNK_MATCH_LIMIT,
+  charLimit = FILE_MATCH_CHUNK_CHAR_LIMIT,
+): FileMatch[] {
+  if (fileMatch.matches.length === 0) { return []; }
+  const chunks: FileMatch[] = [];
+  let current: FileMatch['matches'] = [];
+  let currentChars = 0;
+
+  const pushChunk = () => {
+    if (current.length === 0) { return; }
+    chunks.push({
+      uri: fileMatch.uri,
+      relPath: fileMatch.relPath,
+      matches: current,
+    });
+    current = [];
+    currentChars = 0;
+  };
+
+  for (const match of fileMatch.matches) {
+    const weight = estimateMatchPayloadSize(match);
+    if (current.length > 0 && (current.length >= matchLimit || currentChars + weight > charLimit)) {
+      pushChunk();
+    }
+    current.push(match);
+    currentChars += weight;
+    if (current.length >= matchLimit || currentChars >= charLimit) {
+      pushChunk();
+    }
+  }
+  pushChunk();
+  return chunks;
+}
+
+export function mergeFileMatches(matches: FileMatch[]): FileMatch[] {
+  const merged = new Map<string, FileMatch>();
+  const ordered: FileMatch[] = [];
+  for (const match of matches) {
+    const existing = merged.get(match.uri);
+    if (existing) {
+      existing.matches.push(...match.matches);
+      continue;
+    }
+    const copy: FileMatch = {
+      uri: match.uri,
+      relPath: match.relPath,
+      matches: [...match.matches],
+    };
+    merged.set(copy.uri, copy);
+    ordered.push(copy);
+  }
+  return ordered;
+}
 
 function clipLine(line: string, range: MatchRange): { preview: string; ranges: MatchRange[] } {
   if (line.length <= MAX_LINE_PREVIEW) {
@@ -102,8 +193,8 @@ export async function runSearch(
   const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
   const excludeGlobs = cfg.get<string[]>('excludeGlobs', []);
   const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
-  const maxResults = cfg.get<number>('maxResults', 0);
-  const resultLimit = Number.isFinite(maxResults) && maxResults > 0 ? maxResults : 0;
+  const resultLimit = getRequestedResultLimit(opts, cfg);
+  const resultOffset = getRequestedResultOffset(opts);
   const includeMatcher = compileIncludeMatcher(opts.includePatterns);
 
   let files: vscode.Uri[];
@@ -155,8 +246,9 @@ export async function runSearch(
   // Raised from 8 → 24. Candidate sets from the trigram index are usually
   // a few thousand files; FS latency dominates and macOS / Linux handle
   // this concurrency level without thrashing.
-  const concurrency = 24;
+  const concurrency = (opts.resultLimit !== undefined || resultOffset > 0) ? 1 : 24;
   let idx = 0;
+  let skippedMatches = 0;
 
   const workers: Promise<void>[] = [];
   for (let w = 0; w < concurrency; w++) {
@@ -188,13 +280,42 @@ export async function runSearch(
           continue;
         }
 
+        const remainingLimit = resultLimit > 0 ? Math.max(0, resultLimit - totalMatches) : 0;
+        if (resultLimit > 0 && remainingLimit === 0) {
+          truncated = true;
+          return;
+        }
+
         const fileMatch = scanText(text, regex, uri, opts.query.includes('\n'));
         if (fileMatch.matches.length === 0) { continue; }
 
-        totalMatches += fileMatch.matches.length;
-        filesWithMatches++;
-        progress.onFile(fileMatch);
+        let sliceStart = 0;
+        if (resultOffset > skippedMatches) {
+          sliceStart = Math.min(fileMatch.matches.length, resultOffset - skippedMatches);
+          skippedMatches += sliceStart;
+        }
+        if (sliceStart >= fileMatch.matches.length) { continue; }
 
+        const slicedMatches = resultLimit > 0
+          ? fileMatch.matches.slice(sliceStart, sliceStart + remainingLimit)
+          : fileMatch.matches.slice(sliceStart);
+        if (slicedMatches.length === 0) { continue; }
+
+        totalMatches += slicedMatches.length;
+        filesWithMatches++;
+        const slicedFileMatch: FileMatch = {
+          uri: fileMatch.uri,
+          relPath: fileMatch.relPath,
+          matches: slicedMatches,
+        };
+        for (const chunk of splitFileMatchChunks(slicedFileMatch)) {
+          progress.onFile(chunk);
+        }
+
+        if (resultLimit > 0 && sliceStart + slicedMatches.length < fileMatch.matches.length) {
+          truncated = true;
+          return;
+        }
         if (resultLimit > 0 && totalMatches >= resultLimit) {
           truncated = true;
           return;
@@ -288,11 +409,17 @@ function countSlashes(s: string): number {
   return n;
 }
 
-function scanText(text: string, regex: RegExp, uri: vscode.Uri, allowMultiline = false): FileMatch {
+function scanText(
+  text: string,
+  regex: RegExp,
+  uri: vscode.Uri,
+  allowMultiline = false,
+  maxMatchLines = 0,
+): FileMatch {
   const rel = vscode.workspace.asRelativePath(uri, false);
   const result: FileMatch = { uri: uri.toString(), relPath: rel, matches: [] };
   if (allowMultiline) {
-    return scanTextMultiline(text, regex, result);
+    return scanTextMultiline(text, regex, result, maxMatchLines);
   }
 
   let lineStart = 0;
@@ -324,6 +451,9 @@ function scanText(text: string, regex: RegExp, uri: vscode.Uri, allowMultiline =
               : ranges.filter(r => r.end <= MAX_LINE_PREVIEW);
             result.matches.push({ line: lineNo, preview, ranges: clippedRanges });
           }
+          if (maxMatchLines > 0 && result.matches.length >= maxMatchLines) {
+            return result;
+          }
         }
       }
       lineStart = i + 1;
@@ -333,7 +463,7 @@ function scanText(text: string, regex: RegExp, uri: vscode.Uri, allowMultiline =
   return result;
 }
 
-function scanTextMultiline(text: string, regex: RegExp, result: FileMatch): FileMatch {
+function scanTextMultiline(text: string, regex: RegExp, result: FileMatch, maxMatchLines = 0): FileMatch {
   const lineStarts = buildLineStarts(text);
   regex.lastIndex = 0;
 
@@ -364,6 +494,9 @@ function scanTextMultiline(text: string, regex: RegExp, result: FileMatch): File
         ? { start: range.start, end: range.end, endLine: rawRange.endLine, endCol: rawRange.endCol }
         : range],
     });
+    if (maxMatchLines > 0 && result.matches.length >= maxMatchLines) {
+      return result;
+    }
     if (m[0].length === 0) { regex.lastIndex++; }
   }
 

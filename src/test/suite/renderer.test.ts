@@ -60,6 +60,85 @@ suite('Renderer — overlay UI probes', () => {
     );
   });
 
+  test('chunked results for the same file merge into one renderer entry', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const alphaUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py').toString();
+
+    await overlay.show('');
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var alpha = ${JSON.stringify(alphaUri)};
+        var q = document.querySelector('.ij-find-query');
+        if (q) { q.value = ''; }
+        if (window.__ijFindRefreshSearch) { window.__ijFindRefreshSearch(); }
+        window.__ijFindOnMessage({ type: 'results:start', searchId: 901 });
+        window.__ijFindOnMessage({
+          type: 'results:file',
+          searchId: 901,
+          match: { uri: alpha, relPath: 'alpha.py', matches: [{ line: 0, preview: 'class AlphaService:', ranges: [{ start: 0, end: 5 }] }] }
+        });
+        window.__ijFindOnMessage({
+          type: 'results:file',
+          searchId: 901,
+          match: { uri: alpha, relPath: 'alpha.py', matches: [{ line: 3, preview: 'return data.strip()', ranges: [{ start: 0, end: 6 }] }] }
+        });
+        window.__ijFindOnMessage({ type: 'results:done', searchId: 901, totalFiles: 1, totalMatches: 2, truncated: false });
+        return JSON.stringify(window.__ijFindGetSearchState());
+      })()`,
+    );
+    const state = JSON.parse(raw) as { filesCount: number; flatCount: number; searchId: number };
+    assert.strictEqual(state.searchId, 901, `renderer should track the active search id: ${raw}`);
+    assert.strictEqual(state.filesCount, 1, `chunked payloads should merge into one file entry: ${raw}`);
+    assert.strictEqual(state.flatCount, 2, `merged file should expose both match rows: ${raw}`);
+  });
+
+  test('stale search results are ignored after a newer search starts', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const alphaUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py').toString();
+    const betaUri = vscode.Uri.joinPath(folder!.uri, 'beta.js').toString();
+
+    await overlay.show('');
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var alpha = ${JSON.stringify(alphaUri)};
+        var beta = ${JSON.stringify(betaUri)};
+        var q = document.querySelector('.ij-find-query');
+        if (q) { q.value = ''; }
+        if (window.__ijFindRefreshSearch) { window.__ijFindRefreshSearch(); }
+        window.__ijFindOnMessage({ type: 'results:start', searchId: 910 });
+        window.__ijFindOnMessage({
+          type: 'results:file',
+          searchId: 910,
+          match: { uri: alpha, relPath: 'alpha.py', matches: [{ line: 0, preview: 'class AlphaService:', ranges: [{ start: 0, end: 5 }] }] }
+        });
+        window.__ijFindOnMessage({ type: 'results:start', searchId: 911 });
+        window.__ijFindOnMessage({
+          type: 'results:file',
+          searchId: 910,
+          match: { uri: alpha, relPath: 'alpha.py', matches: [{ line: 1, preview: 'stale alpha', ranges: [{ start: 0, end: 5 }] }] }
+        });
+        window.__ijFindOnMessage({
+          type: 'results:file',
+          searchId: 911,
+          match: { uri: beta, relPath: 'beta.js', matches: [{ line: 0, preview: 'class BetaWidget {}', ranges: [{ start: 0, end: 4 }] }] }
+        });
+        return JSON.stringify(window.__ijFindGetSearchState());
+      })()`,
+    );
+    const state = JSON.parse(raw) as { filesCount: number; flatCount: number; searchId: number };
+    assert.strictEqual(state.searchId, 911, `renderer should keep the newest search active: ${raw}`);
+    assert.strictEqual(state.filesCount, 1, `stale results should not survive into the newer search: ${raw}`);
+    assert.strictEqual(state.flatCount, 1, `only the newest search result should remain visible: ${raw}`);
+  });
+
   // NOTE: input.value population is already covered end-to-end by
   // filter.test.ts which reads it via state.inputValue probe — that path
   // doesn't depend on getting the right window back out of a `querySelector`
