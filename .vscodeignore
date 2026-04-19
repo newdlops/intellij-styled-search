@@ -1,8 +1,16 @@
 .vscode/**
 .vscode-test/**
+.claude/**
+.lh/**
+scripts/**
 src/**
 .gitignore
 tsconfig.json
 **/*.map
 **/*.ts
 node_modules/**
+!node_modules/ws/**
+out/test/**
+tests/**
+.vscode-test.mjs
+vscode_monacoeditor_monkeypatch.md

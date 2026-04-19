@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="IntelliJ Styled Search icon">
+  <defs>
+    <linearGradient id="panel" x1="16" y1="12" x2="112" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#20242c"/>
+      <stop offset="0.55" stop-color="#171b22"/>
+      <stop offset="1" stop-color="#0d1117"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="24" y1="25" x2="104" y2="103" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#23c4ff"/>
+      <stop offset="0.52" stop-color="#35d07f"/>
+      <stop offset="1" stop-color="#ffb84d"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#000000" flood-opacity="0.36"/>
+    </filter>
+  </defs>
+  <rect width="128" height="128" rx="24" fill="#0b0f14"/>
+  <rect x="14" y="14" width="100" height="100" rx="18" fill="url(#panel)" filter="url(#shadow)"/>
+  <path d="M28 37h72" stroke="url(#accent)" stroke-width="6" stroke-linecap="round"/>
+  <path d="M28 56h37" stroke="#d7e2ef" stroke-width="6" stroke-linecap="round" opacity="0.88"/>
+  <path d="M28 75h28" stroke="#7f8fa6" stroke-width="6" stroke-linecap="round" opacity="0.78"/>
+  <path d="M28 94h52" stroke="#d7e2ef" stroke-width="6" stroke-linecap="round" opacity="0.88"/>
+  <circle cx="78" cy="70" r="21" fill="none" stroke="#23c4ff" stroke-width="8"/>
+  <path d="M93 85l16 16" stroke="#ffb84d" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="78" cy="70" r="10" fill="#35d07f" opacity="0.2"/>
+</svg>
+

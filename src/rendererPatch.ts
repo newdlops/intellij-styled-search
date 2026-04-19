@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV56) { return 'already patched'; }
-  window.__ijFindPatchedV56 = true;
+  if (window.__ijFindPatchedV64) { return 'already patched'; }
+  window.__ijFindPatchedV64 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -25,11 +25,17 @@ export function getRendererPatchScript(): string {
   // calls (including test probes) may hit stale nodes whose state the new
   // closure no longer owns.
   try {
-    var stale = document.querySelectorAll('.ij-find-panel, .ij-find-hover-tooltip');
+    var stale = document.querySelectorAll('.ij-find-overlay, .ij-find-panel, .ij-find-hover-tooltip, .ij-find-preview-overflow-root, .ij-find-preview-overflow');
     for (var si = 0; si < stale.length; si++) {
       try { stale[si].parentElement && stale[si].parentElement.removeChild(stale[si]); } catch (eRm) {}
     }
   } catch (eClean) {}
+  // Drop cached monaco refs from a previous patch version. They may carry
+  // stale widgetOptions (e.g. V56s contributions-empty setting which
+  // disabled hover/LSP contributions) and would keep being reused until a
+  // full VSCode restart — clear so the next capture diagnostic
+  // repopulates with this versions settings.
+  try { window.__ijFindMonaco = null; } catch (eMM) {}
 
   // ── Capture VSCode internals via prototype interception ─────────────
   // Monkey-patch Map.set / WeakMap.set / Set.add briefly right after patch
@@ -184,16 +190,92 @@ export function getRendererPatchScript(): string {
   // in our overlay's preview pane. Services are borrowed from the widget
   // that was already alive in VSCode — theme / font / extensions all come
   // through automatically.
+  // Dedicated overflow host for the preview editors overflow widgets
+  // (hover, suggest, parameter hints, code action lightbulb, etc.).
+  //
+  // Requirements:
+  //   1. Live as a body-level sibling of our overlay. If this stays inside
+  //      .monaco-workbench, the workbench stacking context can still keep
+  //      native Monaco hover/suggest widgets underneath the search panel.
+  //   2. Carry .monaco-workbench + .monaco-editor ancestry so Monacos widget
+  //      styles such as ".monaco-editor .monaco-hover" still match.
+  //   3. Copy VS Code theme custom properties from the real workbench so
+  //      --vscode-editorHoverWidget-background and friends resolve.
+  //   4. Stack above our overlay panel (z-index 2147483000) so the hover
+  //      popup isnt hidden behind the preview UI.
+  //   5. Take no visual space itself (0x0 box) and not intercept input
+  //      outside the widgets own bounds.
+  function syncPreviewOverflowTheme(root) {
+    try {
+      var source = document.querySelector('.monaco-workbench') || document.body;
+      if (!source || !root || !window.getComputedStyle) { return; }
+      var cs = window.getComputedStyle(source);
+      for (var i = 0; i < cs.length; i++) {
+        var name = cs[i];
+        if (name && name.indexOf('--vscode-') === 0) {
+          var value = cs.getPropertyValue(name);
+          if (value) { root.style.setProperty(name, value); }
+        }
+      }
+      root.style.setProperty('color', cs.getPropertyValue('--vscode-foreground') || cs.color || 'inherit');
+      root.style.setProperty('font-family', cs.getPropertyValue('--vscode-font-family') || cs.fontFamily || 'inherit');
+      root.style.setProperty('font-size', cs.getPropertyValue('--vscode-font-size') || cs.fontSize || 'inherit');
+    } catch (e) {}
+  }
+  function getOrCreatePreviewOverflowHost() {
+    var root = document.querySelector('.ij-find-preview-overflow-root');
+    var existing = root && root.querySelector('.ij-find-preview-overflow');
+    if (existing && existing.parentElement) {
+      if (root.parentElement !== document.body) { document.body.appendChild(root); }
+      syncPreviewOverflowTheme(root);
+      return existing;
+    }
+    root = document.createElement('div');
+    root.className = 'monaco-workbench ij-find-preview-overflow-root';
+    root.style.cssText = [
+      'position:fixed',
+      'top:0',
+      'left:0',
+      'width:0',
+      'height:0',
+      'overflow:visible',
+      'z-index:2147483600',
+      'pointer-events:none',
+    ].join(';');
+    var node = document.createElement('div');
+    node.className = 'monaco-editor ij-find-preview-overflow';
+    node.style.cssText = [
+      'position:fixed',
+      'top:0',
+      'left:0',
+      'width:0',
+      'height:0',
+      'overflow:visible',
+      'z-index:2147483600',
+      'pointer-events:none',
+    ].join(';');
+    root.appendChild(node);
+    syncPreviewOverflowTheme(root);
+    document.body.appendChild(root);
+    return node;
+  }
+
   window.__ijFindCreatePreviewEditor = function (host) {
     var m = window.__ijFindMonaco;
     if (!m || !m.ctor || !m.inst) { return null; }
     try {
+      var overflowHost = getOrCreatePreviewOverflowHost();
       var editor = m.inst.createInstance(m.ctor, host, {
         automaticLayout: true,
         readOnly: false,
         minimap: { enabled: false },
         scrollBeyondLastLine: false,
         renderLineHighlight: 'all',
+        fixedOverflowWidgets: true,
+        overflowWidgetsDomNode: overflowHost,
+        // Sticky scroll (the header that pins the current function/class
+        // as you scroll) adds visual noise to a read-mostly preview.
+        stickyScroll: { enabled: false },
       }, m.widgetOptions);
       return editor;
     } catch (e) {
@@ -261,6 +343,34 @@ export function getRendererPatchScript(): string {
     }
   };
 
+  function findRealWidgetCtor(widget, report) {
+    if (!widget) { return null; }
+    try {
+      var p = Object.getPrototypeOf(widget);
+      var depth = 0;
+      while (p && depth < 12) {
+        var keys = [];
+        try { keys = Object.getOwnPropertyNames(p); } catch (eKeys) {}
+        var hasL = keys.indexOf('layout') >= 0;
+        var hasM = keys.indexOf('getModel') >= 0;
+        var hasD = keys.indexOf('getDomNode') >= 0;
+        var ctorName = '?';
+        try { ctorName = (p.constructor && p.constructor.name) || '?'; } catch (eName) {}
+        if (report) {
+          report.push('proto[' + depth + '] ctor=' + ctorName +
+            ' hasLGD=' + hasL + '/' + hasM + '/' + hasD +
+            ' keys=' + keys.slice(0, 30).join(','));
+        }
+        if (hasL && hasM && hasD && p.constructor) { return p.constructor; }
+        p = Object.getPrototypeOf(p);
+        depth++;
+      }
+    } catch (e) {
+      if (report) { report.push('proto walk err: ' + e.message); }
+    }
+    return null;
+  }
+
   window.__ijFindTestCreateWidget = function () {
     // Fast path: if a previous run already captured the real class + services,
     // don't recreate anything — we'd just burn a boot-time stub slot. Renderer
@@ -296,40 +406,23 @@ export function getRendererPatchScript(): string {
     report.push('captured widgets total=' + caps.widgets.length + ' real=' + realWidgets.length);
     report.push('widgetCtors=' + caps.widgetCtors.length + ' serviceMaps=' + caps.serviceMaps.length);
 
-    // 1. Candidates: constructors captured, plus proto chain of any real widget.
+    // 1. Candidates: real widget proto-walk first, then whatever was captured.
     var candidates = [];
-    for (var i = 0; i < caps.widgetCtors.length; i++) {
-      var c = caps.widgetCtors[i];
-      candidates.push({ ctor: c, src: 'captured[' + i + ']' });
+    function pushCandidate(ctor, src) {
+      if (!ctor) { return; }
+      for (var ci = 0; ci < candidates.length; ci++) {
+        if (candidates[ci].ctor === ctor) { return; }
+      }
+      candidates.push({ ctor: ctor, src: src });
     }
     var w0 = (realWidgets[0] && realWidgets[0].v) || (caps.widgets[0] && caps.widgets[0].v);
     if (realWidgets.length > 0) {
       report.push('real[0] uri=' + realWidgets[0].uri.slice(0, 100) + ' tag=' + realWidgets[0].tag);
     }
-    if (w0) {
-      try {
-        var p = Object.getPrototypeOf(w0);
-        var depth = 0;
-        while (p && depth < 8) {
-          var keys = [];
-          try { keys = Object.getOwnPropertyNames(p); } catch (e) {}
-          var hasL = keys.indexOf('layout') >= 0;
-          var hasM = keys.indexOf('getModel') >= 0;
-          var hasD = keys.indexOf('getDomNode') >= 0;
-          var ctorName = '?';
-          try { ctorName = (p.constructor && p.constructor.name) || '?'; } catch (e) {}
-          report.push('proto[' + depth + '] ctor=' + ctorName + ' hasLGD=' + hasL + '/' + hasM + '/' + hasD + ' keys=' + keys.slice(0, 30).join(','));
-          if (hasL && hasM && hasD) {
-            try {
-              if (p.constructor && candidates.every(function (ce) { return ce.ctor !== p.constructor; })) {
-                candidates.push({ ctor: p.constructor, src: 'proto[' + depth + '].constructor' });
-              }
-            } catch (e) {}
-          }
-          p = Object.getPrototypeOf(p);
-          depth++;
-        }
-      } catch (e) { report.push('proto walk err: ' + e.message); }
+    var realCtor = findRealWidgetCtor(w0, report);
+    pushCandidate(realCtor, 'real-widget-proto');
+    for (var i = 0; i < caps.widgetCtors.length; i++) {
+      pushCandidate(caps.widgetCtors[i], 'captured[' + i + ']');
     }
 
     // 2. Log real info from the captured widget so we know what we're looking at.
@@ -362,7 +455,16 @@ export function getRendererPatchScript(): string {
 
     // 4. Find an IInstantiationService from widget[0] if possible (same
     //    services tree as the widget — safest choice).
-    var inst = caps.services[0].v;
+    var inst = null;
+    try {
+      var directInst = w0 && w0._instantiationService;
+      if (directInst &&
+          typeof directInst.createInstance === 'function' &&
+          typeof directInst.invokeFunction === 'function') {
+        inst = directInst;
+        report.push('using widget[0]._instantiationService');
+      }
+    } catch (eDirect) {}
     try {
       if (w0) {
         var keysW = Object.getOwnPropertyNames(w0);
@@ -379,6 +481,10 @@ export function getRendererPatchScript(): string {
         }
       }
     } catch (e) {}
+    if (!inst) {
+      inst = caps.services[0].v;
+      report.push('using captured service[0] as IInstantiationService');
+    }
 
     // 5. Create an off-screen host (invisible) and try each candidate. The
     //    host only needs to live long enough for createInstance + setModel +
@@ -404,24 +510,39 @@ export function getRendererPatchScript(): string {
       readOnly: false,
       theme: 'vs-dark',
     };
-    var widgetOptions = { isSimpleWidget: false, contributions: [] };
+    var widgetOptionCandidates = [
+      { value: { isSimpleWidget: false }, label: 'widgetOpts=bare' },
+      { value: { isSimpleWidget: false, contributions: [] }, label: 'widgetOpts=contributions' },
+    ];
 
     var createdEditor = null;
+    var winnerWidgetOptions = null;
     for (var cj = 0; cj < candidates.length && !createdEditor; cj++) {
       var Ctor = candidates[cj].ctor;
       var srcLabel = candidates[cj].src;
-      // Try: createInstance(Ctor, host, opts), createInstance(..., widgetOpts), new Ctor(host, opts), new Ctor(host, opts, widgetOpts)
-      var attempts = [
-        { fn: function (C) { return inst.createInstance(C, host, testOptions); }, label: 'createInstance(host,opts)' },
-        { fn: function (C) { return inst.createInstance(C, host, testOptions, widgetOptions); }, label: 'createInstance(host,opts,wo)' },
-        { fn: function (C) { return new C(host, testOptions); }, label: 'new(host,opts)' },
-        { fn: function (C) { return new C(host, testOptions, widgetOptions); }, label: 'new(host,opts,wo)' },
-      ];
+      var attempts = [];
+      for (var wo = 0; wo < widgetOptionCandidates.length; wo++) {
+        (function (entry) {
+          attempts.push({
+            fn: function (C) { return inst.createInstance(C, host, testOptions, entry.value); },
+            label: 'createInstance(host,opts,' + entry.label + ')',
+            widgetOptions: entry.value,
+          });
+          attempts.push({
+            fn: function (C) { return new C(host, testOptions, entry.value); },
+            label: 'new(host,opts,' + entry.label + ')',
+            widgetOptions: entry.value,
+          });
+        })(widgetOptionCandidates[wo]);
+      }
+      attempts.push({ fn: function (C) { return inst.createInstance(C, host, testOptions); }, label: 'createInstance(host,opts)', widgetOptions: null });
+      attempts.push({ fn: function (C) { return new C(host, testOptions); }, label: 'new(host,opts)', widgetOptions: null });
       for (var aa = 0; aa < attempts.length && !createdEditor; aa++) {
         try {
           var ed = attempts[aa].fn(Ctor);
           if (ed && typeof ed === 'object') {
             createdEditor = ed;
+            winnerWidgetOptions = attempts[aa].widgetOptions;
             report.push('OK ' + srcLabel + ' ' + attempts[aa].label + ' → ' + (ed.constructor && ed.constructor.name));
             break;
           }
@@ -438,11 +559,13 @@ export function getRendererPatchScript(): string {
 
     // ── Persist captured services so renderPreview can create real
     // monaco widgets long after capture stops ─────────────────────────
-    var winnerCtor = null;
-    for (var cw = 0; cw < candidates.length; cw++) {
-      if (createdEditor && createdEditor.constructor === candidates[cw].ctor) {
-        winnerCtor = candidates[cw].ctor;
-        break;
+    var winnerCtor = realCtor || findRealWidgetCtor(createdEditor, report);
+    if (!winnerCtor) {
+      for (var cw = 0; cw < candidates.length; cw++) {
+        if (createdEditor && createdEditor.constructor === candidates[cw].ctor) {
+          winnerCtor = candidates[cw].ctor;
+          break;
+        }
       }
     }
     if (!winnerCtor) { winnerCtor = candidates[0] && candidates[0].ctor; }
@@ -450,7 +573,7 @@ export function getRendererPatchScript(): string {
       ctor: winnerCtor,
       inst: inst,
       modelSvc: null, // filled below
-      widgetOptions: widgetOptions,
+      widgetOptions: winnerWidgetOptions || { isSimpleWidget: false },
     };
 
     // ── Post-create: force proper rendering ───────────────────────────
@@ -861,6 +984,31 @@ export function getRendererPatchScript(): string {
     '  background-color: var(--vscode-editor-findMatchBackground, rgba(234, 92, 0, 0.6)) !important;',
     '  box-sizing: border-box;',
     '}',
+    // Force the preview editors overflow widgets (hover popup, suggest
+    // box, parameter hints, code action glyph, etc.) above our overlay
+    // panel. The body-level root avoids the workbench stacking context;
+    // descendant z-index stamping covers Monaco widgets that create their
+    // own positioned boxes.
+    '.ij-find-preview-overflow-root,',
+    '.ij-find-preview-overflow {',
+    '  position: fixed !important;',
+    '  top: 0 !important; left: 0 !important;',
+    '  width: 0 !important; height: 0 !important;',
+    '  overflow: visible !important;',
+    '  z-index: 2147483600 !important;',
+    '  pointer-events: none;',
+    '}',
+    '.ij-find-preview-overflow,',
+    '.ij-find-preview-overflow * {',
+    '  z-index: 2147483601 !important;',
+    '}',
+    '.ij-find-preview-overflow .monaco-hover,',
+    '.ij-find-preview-overflow .suggest-widget,',
+    '.ij-find-preview-overflow .parameter-hints-widget,',
+    '.ij-find-preview-overflow .monaco-menu,',
+    '.ij-find-preview-overflow .context-view {',
+    '  pointer-events: auto;',
+    '}',
   ].join('\\n');
   document.head.appendChild(style);
 
@@ -1009,6 +1157,7 @@ export function getRendererPatchScript(): string {
   function clearPreview() {
     $previewPath.textContent = '';
     $preview.classList.remove('ij-find-modified');
+    if (state.stolenEditor) { restoreStolenEditor(); }
     if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
       // Keep editor in memory; just blank out its model contents.
       try { state.monacoEditor.setValue(''); } catch (e) {}
@@ -1865,6 +2014,7 @@ export function getRendererPatchScript(): string {
   }
 
   function renderPreviewMonacoReal(msg) {
+    if (state.stolenEditor) { restoreStolenEditor(); }
     var fullText = (msg.lines || []).map(function (l) { return l.text; }).join('\\n');
     var lang = msg.languageId || 'plaintext';
     send({ type: 'log', msg: 'monacoReal lines=' + (msg.lines ? msg.lines.length : 0) + ' lang=' + lang + ' reuse=' + !!(state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody) });
@@ -2458,6 +2608,7 @@ export function getRendererPatchScript(): string {
   }
 
   function renderPreviewDOM(msg) {
+    if (state.stolenEditor) { restoreStolenEditor(); }
     state.previewMode = 'dom';
     // If we previously hosted Monaco, detach it.
     if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
@@ -2883,6 +3034,13 @@ export function getRendererPatchScript(): string {
         document.body.appendChild(panel);
         document.body.appendChild($hoverTooltip);
       }
+      try {
+        var previewOverflowRoot = document.querySelector('.ij-find-preview-overflow-root');
+        if (previewOverflowRoot) {
+          document.body.appendChild(previewOverflowRoot);
+          syncPreviewOverflowTheme(previewOverflowRoot);
+        }
+      } catch (e) {}
       // Paint the overlay BEFORE firing the search — otherwise the browser
       // processes our JS (send to extension → runRgSearch → network roundtrip)
       // inside the same microtask and the panel appears only after the first

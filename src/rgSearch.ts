@@ -2,26 +2,247 @@ import * as vscode from 'vscode';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as https from 'https';
+import * as os from 'os';
 import { SearchOptions, SearchProgress, FileMatch, MatchRange } from './search';
 
 // ──────────────────────────────────────────────────────────────────────────
 // Ripgrep-backed search engine.
 //
-// VSCode ships its own ripgrep binary under @vscode/ripgrep. We borrow it to
-// get ripgrep-grade speed and accuracy — byte-for-byte parity with VSCode's
-// built-in "Find in Files" engine, since that uses the same rg.
+// Prefer a ripgrep binary installed into this extension's globalStorage on
+// first activation. Fall back to VSCode's own @vscode/ripgrep while that
+// install is unavailable, unsupported, or still in progress.
 //
 // We invoke rg with --json so results stream as one-object-per-line. Each
 // file's matches are buffered until we see its "end" message, then emitted
 // as a FileMatch. The process can be cancelled by killing the child.
 // ──────────────────────────────────────────────────────────────────────────
 
-let cachedRgPath: string | null | undefined;
+const RIPGREP_VERSION = 'v15.0.1';
+const RIPGREP_PREBUILT_REPO = 'microsoft/ripgrep-prebuilt';
 
-/** Locate VSCode's bundled rg. Checks the runtime env first (any extension
- * host implicitly sits inside an install), then common install paths. */
+type RipgrepArchiveExt = 'tar.gz' | 'zip';
+type RipgrepTarget = {
+  key: string;
+  triple: string;
+  archiveExt: RipgrepArchiveExt;
+  exe: 'rg' | 'rg.exe';
+};
+
+let cachedRgPath: string | null | undefined;
+let rgInstallRoot: string | undefined;
+let installPromise: Promise<string | null> | undefined;
+let installAttempted = false;
+
+export function configureRipgrepInstall(context: vscode.ExtensionContext): void {
+  rgInstallRoot = path.join(context.globalStorageUri.fsPath, 'ripgrep', RIPGREP_VERSION);
+  cachedRgPath = undefined;
+}
+
+function getRipgrepTarget(): RipgrepTarget | null {
+  switch (process.platform) {
+    case 'darwin':
+      if (process.arch === 'x64') {
+        return { key: 'darwin-x64', triple: 'x86_64-apple-darwin', archiveExt: 'tar.gz', exe: 'rg' };
+      }
+      if (process.arch === 'arm64') {
+        return { key: 'darwin-arm64', triple: 'aarch64-apple-darwin', archiveExt: 'tar.gz', exe: 'rg' };
+      }
+      return null;
+    case 'win32':
+      if (process.arch === 'x64') {
+        return { key: 'win32-x64', triple: 'x86_64-pc-windows-msvc', archiveExt: 'zip', exe: 'rg.exe' };
+      }
+      if (process.arch === 'arm64') {
+        return { key: 'win32-arm64', triple: 'aarch64-pc-windows-msvc', archiveExt: 'zip', exe: 'rg.exe' };
+      }
+      if (process.arch === 'ia32') {
+        return { key: 'win32-ia32', triple: 'i686-pc-windows-msvc', archiveExt: 'zip', exe: 'rg.exe' };
+      }
+      return null;
+    case 'linux':
+      if (process.arch === 'x64') {
+        return { key: 'linux-x64', triple: 'x86_64-unknown-linux-musl', archiveExt: 'tar.gz', exe: 'rg' };
+      }
+      if (process.arch === 'arm64') {
+        return { key: 'linux-arm64', triple: 'aarch64-unknown-linux-musl', archiveExt: 'tar.gz', exe: 'rg' };
+      }
+      return null;
+    default:
+      return null;
+  }
+}
+
+function ripgrepReleaseUrl(target: RipgrepTarget): string {
+  const asset = `ripgrep-${RIPGREP_VERSION}-${target.triple}.${target.archiveExt}`;
+  return `https://github.com/${RIPGREP_PREBUILT_REPO}/releases/download/${RIPGREP_VERSION}/${asset}`;
+}
+
+function findInstalledRipgrepPath(): string | null {
+  if (!rgInstallRoot) { return null; }
+  const target = getRipgrepTarget();
+  if (!target) { return null; }
+  const candidate = path.join(rgInstallRoot, target.key, target.exe);
+  try {
+    if (fs.existsSync(candidate)) { return candidate; }
+  } catch {}
+  return null;
+}
+
+export async function ensureRipgrepInstalled(logger?: (msg: string) => void): Promise<string | null> {
+  const existing = findInstalledRipgrepPath();
+  if (existing) { return existing; }
+  if (!rgInstallRoot) { return null; }
+  const target = getRipgrepTarget();
+  if (!target) {
+    logger?.(`ripgrep install skipped: unsupported platform ${process.platform}-${process.arch}`);
+    return null;
+  }
+  if (installPromise) { return installPromise; }
+  if (installAttempted) { return null; }
+  installAttempted = true;
+  installPromise = installRipgrep(target, logger).catch((err) => {
+    logger?.(`ripgrep install failed: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  });
+  return installPromise;
+}
+
+async function installRipgrep(target: RipgrepTarget, logger?: (msg: string) => void): Promise<string> {
+  if (!rgInstallRoot) { throw new Error('ripgrep install root is not configured'); }
+  const outDir = path.join(rgInstallRoot, target.key);
+  const outBin = path.join(outDir, target.exe);
+  const tmpRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), `ij-search-rg-${target.key}-`));
+  const archivePath = path.join(tmpRoot, `ripgrep-${RIPGREP_VERSION}-${target.triple}.${target.archiveExt}`);
+  const extractDir = path.join(tmpRoot, 'extract');
+
+  try {
+    const url = ripgrepReleaseUrl(target);
+    logger?.(`ripgrep install: downloading ${url}`);
+    await downloadFile(url, archivePath);
+    await extractArchive(archivePath, extractDir, target);
+    const extracted = await findFileByName(extractDir, target.exe);
+    if (!extracted) {
+      throw new Error(`downloaded archive did not contain ${target.exe}`);
+    }
+
+    await fs.promises.rm(outDir, { recursive: true, force: true });
+    await fs.promises.mkdir(outDir, { recursive: true });
+    await fs.promises.copyFile(extracted, outBin);
+    if (target.exe === 'rg') {
+      await fs.promises.chmod(outBin, 0o755);
+    }
+    await fs.promises.writeFile(
+      path.join(rgInstallRoot, 'install.json'),
+      JSON.stringify({
+        tool: 'ripgrep',
+        version: RIPGREP_VERSION,
+        target: target.key,
+        triple: target.triple,
+        binary: path.relative(rgInstallRoot, outBin),
+        source: `https://github.com/${RIPGREP_PREBUILT_REPO}`,
+        installedAt: new Date().toISOString(),
+      }, null, 2) + '\n',
+    );
+    cachedRgPath = outBin;
+    logger?.(`ripgrep install: ready at ${outBin}`);
+    return outBin;
+  } finally {
+    await fs.promises.rm(tmpRoot, { recursive: true, force: true });
+  }
+}
+
+function downloadFile(url: string, dest: string, redirects = 0): Promise<void> {
+  if (redirects > 8) {
+    return Promise.reject(new Error(`too many redirects for ${url}`));
+  }
+  return new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(dest);
+    const req = https.get(url, { headers: { 'user-agent': 'intellij-styled-search' } }, (res) => {
+      const status = res.statusCode ?? 0;
+      if (status >= 300 && status < 400 && res.headers.location) {
+        res.resume();
+        out.close(() => {
+          fs.rm(dest, { force: true }, () => {
+            const next = new URL(res.headers.location!, url).toString();
+            downloadFile(next, dest, redirects + 1).then(resolve, reject);
+          });
+        });
+        return;
+      }
+      if (status !== 200) {
+        res.resume();
+        out.close(() => {
+          fs.rm(dest, { force: true }, () => reject(new Error(`download failed with HTTP ${status}`)));
+        });
+        return;
+      }
+      res.pipe(out);
+      out.on('finish', () => out.close(() => resolve()));
+    });
+    req.on('error', (err) => {
+      out.close(() => {
+        fs.rm(dest, { force: true }, () => reject(err));
+      });
+    });
+  });
+}
+
+async function extractArchive(archivePath: string, destDir: string, target: RipgrepTarget): Promise<void> {
+  await fs.promises.rm(destDir, { recursive: true, force: true });
+  await fs.promises.mkdir(destDir, { recursive: true });
+  try {
+    if (target.archiveExt === 'zip') {
+      await runProcess('tar', ['-xf', archivePath, '-C', destDir]);
+    } else {
+      await runProcess('tar', ['-xzf', archivePath, '-C', destDir]);
+    }
+  } catch (err) {
+    if (process.platform !== 'win32' || target.archiveExt !== 'zip') { throw err; }
+    const command = `Expand-Archive -LiteralPath ${powerShellQuote(archivePath)} -DestinationPath ${powerShellQuote(destDir)} -Force`;
+    await runProcess('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command]);
+  }
+}
+
+function runProcess(command: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: 'ignore' });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) { resolve(); }
+      else { reject(new Error(`${command} exited with ${code}`)); }
+    });
+  });
+}
+
+async function findFileByName(dir: string, basename: string): Promise<string | null> {
+  const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isFile() && entry.name === basename) { return full; }
+    if (entry.isDirectory()) {
+      const nested = await findFileByName(full, basename);
+      if (nested) { return nested; }
+    }
+  }
+  return null;
+}
+
+function powerShellQuote(value: string): string {
+  return "'" + value.replace(/'/g, "''") + "'";
+}
+
+/** Locate rg. Checks the configured install dir, then VSCode's bundled rg. */
 export function findRipgrepPath(): string | null {
   if (cachedRgPath !== undefined) { return cachedRgPath; }
+  const envPath = process.env.INTELLIJ_STYLED_SEARCH_RG_PATH;
+  if (envPath) {
+    try {
+      if (fs.existsSync(envPath)) { cachedRgPath = envPath; return envPath; }
+    } catch {}
+  }
+  const installed = findInstalledRipgrepPath();
+  if (installed) { cachedRgPath = installed; return installed; }
   const candidates: string[] = [];
   // process.execPath points at the Electron binary; rg lives alongside the
   // app's node_modules. Walk up from execPath to find the Resources/app dir.
@@ -89,7 +310,11 @@ export async function runRgSearch(
   candidateFiles?: string[] | null,
   logger?: (msg: string) => void,
 ): Promise<void> {
-  const rgPath = findRipgrepPath();
+  let rgPath = findRipgrepPath();
+  if (!rgPath) {
+    await ensureRipgrepInstalled(logger);
+    rgPath = findRipgrepPath();
+  }
   if (!rgPath) {
     progress.onError(new Error('ripgrep binary not found'));
     return;

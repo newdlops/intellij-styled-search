@@ -3,7 +3,7 @@ import * as http from 'http';
 import { execSync } from 'child_process';
 import WebSocket from 'ws';
 import { runSearch, SearchOptions, FileMatch, MatchRange, prioritizeFiles } from './search';
-import { findRipgrepPath, runRgSearch } from './rgSearch';
+import { configureRipgrepInstall, ensureRipgrepInstalled, findRipgrepPath, runRgSearch } from './rgSearch';
 import { getRendererPatchScript } from './rendererPatch';
 import { TrigramIndex, extractTrigramsLower } from './trigramIndex';
 
@@ -47,6 +47,7 @@ export class OverlayPanel {
   private trigramIndex: TrigramIndex;
   private pendingShow: string | null = null;
   private showInFlight = false;
+  private capturePromise: Promise<void> | undefined;
   // Per-source lastSeenSeq: each renderer patch install has its own instance
   // id (`__src`) and monotonic `__seq`. We dedup duplicates delivered by
   // accumulated CDP `message` listeners *within the same source*, but never
@@ -68,6 +69,8 @@ export class OverlayPanel {
     this.log = vscode.window.createOutputChannel('IntelliJ Styled Search');
     context.subscriptions.push(this.log);
     context.subscriptions.push({ dispose: () => this.dispose() });
+    configureRipgrepInstall(context);
+    void ensureRipgrepInstalled((msg) => this.log.appendLine(msg));
     // Kick off the trigram index in the background. Search remains available
     // (via full scan) while the initial build runs.
     this.trigramIndex = new TrigramIndex(context.globalStorageUri, this.log);
@@ -92,23 +95,54 @@ export class OverlayPanel {
     }
   }
 
-  private captureTriggered = false;
-  /** Fire the capture diagnostic exactly once per extension-host session,
-   * and only if Monaco globals aren't already populated. Delayed so the
-   * user's first search completes first — capture floods the CDP channel
-   * with ~10 roundtrips + a file open/close, which otherwise queues
-   * behind postToRenderer('results:start') and visibly delays result
-   * rendering. 1200ms ≈ "show + first rg result typical case". The
-   * fallback DOM preview handles the first click gracefully if capture
-   * hasn't finished yet; the second click gets real monaco. */
-  private scheduleLazyCapture(): void {
-    if (this.captureTriggered) { return; }
-    this.captureTriggered = true;
-    setTimeout(() => {
-      void this.triggerCaptureDiagnostic().catch((err) => {
-        this.log.appendLine(`Lazy capture failed: ${err instanceof Error ? err.message : err}`);
-      });
-    }, 1200);
+  private lastCaptureAttemptAt = 0;
+  /** Start Monaco capture after the overlay is attached. The first preview
+   * request awaits the same promise, so it does not render the non-editable
+   * DOM fallback just because capture is still racing in the background. */
+  private scheduleLazyCapture(preferredWindowId?: number): void {
+    void this.ensureMonacoCapture(preferredWindowId).catch((err) => {
+      this.log.appendLine(`Monaco capture failed: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  private async ensureMonacoCapture(preferredWindowId?: number): Promise<void> {
+    if (preferredWindowId !== undefined && await this.isMonacoReadyInWindow(preferredWindowId)) { return; }
+    if (preferredWindowId === undefined && await this.isMonacoReadyAnywhere()) { return; }
+    if (this.capturePromise) {
+      await this.capturePromise;
+      if (preferredWindowId !== undefined && await this.isMonacoReadyInWindow(preferredWindowId)) { return; }
+      if (preferredWindowId === undefined && await this.isMonacoReadyAnywhere()) { return; }
+    }
+    const now = Date.now();
+    if (now - this.lastCaptureAttemptAt < 1500) { return; }
+    this.lastCaptureAttemptAt = now;
+    try {
+      this.capturePromise = this.triggerCaptureDiagnostic(preferredWindowId);
+      await this.capturePromise;
+    } finally {
+      this.capturePromise = undefined;
+    }
+  }
+
+  private async isMonacoReadyInWindow(winId: number): Promise<boolean> {
+    try {
+      const r = await this.evalInWindow(winId,
+        `(function(){try{var m=window.__ijFindMonaco;return m&&m.ctor&&m.inst&&m.modelSvc?'ready':'not-ready'}catch(e){return 'err:'+(e&&e.message)}})()`,
+      );
+      return r === 'ready';
+    } catch {
+      return false;
+    }
+  }
+
+  private async isMonacoReadyAnywhere(): Promise<boolean> {
+    try {
+      const wins = await this.listWorkbenchWindowIds();
+      for (const id of wins) {
+        if (await this.isMonacoReadyInWindow(id)) { return true; }
+      }
+    } catch {}
+    return false;
   }
 
   /** Fire a sentinel-tagged log event from the first patched workbench
@@ -161,10 +195,13 @@ export class OverlayPanel {
     return Array.isArray(v) ? v as number[] : [];
   }
 
-  private async triggerCaptureDiagnostic(): Promise<void> {
+  private async triggerCaptureDiagnostic(preferredWindowId?: number): Promise<void> {
     this.log.appendLine('Capture diagnostic: starting...');
     const windowIds = await this.listWorkbenchWindowIds();
-    this.log.appendLine(`Workbench windows: [${windowIds.join(', ')}]`);
+    this.log.appendLine(
+      `Workbench windows: [${windowIds.join(', ')}]` +
+      (preferredWindowId !== undefined ? ` preferred=${preferredWindowId}` : ''),
+    );
     if (windowIds.length === 0) { return; }
 
     // Renderer globals persist across extension-host restarts. If a previous
@@ -188,7 +225,9 @@ export class OverlayPanel {
     let alreadyReadyWin: number | null = null;
     for (const [id, v] of monacoVals) {
       this.log.appendLine(`Monaco globals win=${id}: ${v}`);
-      if (alreadyReadyWin === null && /ctor=true inst=true modelSvc=true/.test(v)) {
+      if (alreadyReadyWin === null &&
+          (preferredWindowId === undefined || id === preferredWindowId) &&
+          /ctor=true inst=true modelSvc=true/.test(v)) {
         alreadyReadyWin = id;
       }
     }
@@ -265,12 +304,17 @@ export class OverlayPanel {
         const servicesMatch = /services=(\d+)/.exec(v);
         const widgets = widgetsMatch ? parseInt(widgetsMatch[1], 10) : 0;
         const services = servicesMatch ? parseInt(servicesMatch[1], 10) : 0;
+        if (preferredWindowId !== undefined && id === preferredWindowId && widgets > 0 && services > 0) {
+          bestDomWidgets = widgets;
+          bestDomWin = id;
+          break;
+        }
         if (widgets > 0 && services > 0 && widgets > bestDomWidgets) {
           bestDomWidgets = widgets;
           bestDomWin = id;
         }
       }
-      if (bestDomWin !== null) {
+      if (bestDomWin !== null && (preferredWindowId === undefined || bestDomWin === preferredWindowId)) {
         this.log.appendLine(`DOM scan yielded widgets=${bestDomWidgets} in win=${bestDomWin} — skipping force-open.`);
         // Run TEST widget create directly.
         const testExpr = `(function(){ try { return window.__ijFindTestCreateWidget ? window.__ijFindTestCreateWidget() : 'no-test-fn'; } catch(e){ return 'test-throw:' + (e && e.message); } })()`;
@@ -289,6 +333,11 @@ export class OverlayPanel {
           } catch {}
         }));
         return;
+      }
+      if (bestDomWin !== null && preferredWindowId !== undefined) {
+        this.log.appendLine(
+          `DOM scan yielded widgets in win=${bestDomWin}, but preview is in win=${preferredWindowId}; forcing capture in the preview window.`,
+        );
       }
       this.log.appendLine('Captures cleared — no DOM-visible widgets, forcing real editor creation via file open/close...');
       const t0 = Date.now();
@@ -395,6 +444,11 @@ export class OverlayPanel {
       for (const [id, peekStr] of peeked) {
         const m = /services=(\d+)/.exec(peekStr);
         const svcCount = m ? parseInt(m[1], 10) : 0;
+        if (preferredWindowId !== undefined && id === preferredWindowId && svcCount > 0) {
+          bestWin = id;
+          bestScore = svcCount;
+          break;
+        }
         if (svcCount > bestScore) { bestScore = svcCount; bestWin = id; }
       }
       if (bestWin !== null && bestScore > 0) {
@@ -492,7 +546,6 @@ export class OverlayPanel {
    *  and report what state `__ijFindMonaco` ended up in. Tests use this
    *  instead of relying on `scheduleLazyCapture` racing their setup. */
   async forceCaptureForTests(): Promise<string> {
-    this.captureTriggered = true; // prevent the scheduler from running again
     try { await this.triggerCaptureDiagnostic(); }
     catch (err) {
       return 'capture-threw:' + (err instanceof Error ? err.message : String(err));
@@ -786,11 +839,11 @@ export class OverlayPanel {
       this.log.appendLine(
         `Show(win=${v.fid}): ${v.result} [ensureInjected=${tInjected - tShow}ms showEval=${tRendered - tInjected}ms total=${tRendered - tShow}ms]`,
       );
-      // After the overlay is visible, kick off monaco capture in the
-      // background. Results + DOM-fallback preview keep working meanwhile;
-      // the first preview click that lands after capture completes will
-      // upgrade to a real monaco widget.
-      this.scheduleLazyCapture();
+      // After the overlay is visible, kick off Monaco capture for the same
+      // renderer window that owns the preview pane. requestPreview awaits
+      // this when needed, so the first preview can mount as Monaco instead
+      // of permanently rendering the non-editable DOM fallback.
+      this.scheduleLazyCapture(v.fid);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log.appendLine(`show() failed: ${err instanceof Error ? err.stack : msg}`);
@@ -1088,7 +1141,7 @@ export class OverlayPanel {
       case 'cancel': this.cancelActive(); break;
       case 'openFile': void this.openFile(evt.uri, evt.line, evt.column, false); break;
       case 'previewFile': void this.openFile(evt.uri, evt.line, evt.column, true); break;
-      case 'requestPreview': void this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges); break;
+      case 'requestPreview': void this.handlePreviewRequest(evt); break;
       case 'openInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, true, true); break;
       case 'pinInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, false, false); break;
       case 'requestHover': void this.sendHover(evt.reqId, evt.uri, evt.line, evt.column, evt.x, evt.y); break;
@@ -1157,6 +1210,13 @@ export class OverlayPanel {
       this.log.appendLine(`runHoverCommand(${command}) failed: ${err instanceof Error ? err.message : err}`);
       vscode.window.showErrorMessage(`Command failed: ${command}`);
     }
+  }
+
+  private async handlePreviewRequest(evt: Extract<RendererEvent, { type: 'requestPreview' }>) {
+    if (this.activeWindowId !== undefined) {
+      await this.ensureMonacoCapture(this.activeWindowId);
+    }
+    await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges);
   }
 
   private async sendPreview(uriStr: string, line: number, _contextLines: number, ranges: MatchRange[] | undefined) {
@@ -1373,7 +1433,11 @@ export class OverlayPanel {
     if (this.activeWindowId === undefined) { return; }
     const payload = JSON.stringify(msg);
     const js = `try { window.__ijFindOnMessage && window.__ijFindOnMessage(${payload}); } catch (e) {}`;
-    await this.evalInWindow(this.activeWindowId, js);
+    try {
+      await this.evalInWindow(this.activeWindowId, js);
+    } catch (err) {
+      this.log.appendLine(`postToRenderer failed: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   private async openFile(uriStr: string, line: number, column: number, preview: boolean) {

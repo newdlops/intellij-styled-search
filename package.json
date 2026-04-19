@@ -2,9 +2,18 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.0",
+  "version": "0.0.2",
   "publisher": "newdlops",
   "license": "MIT",
+  "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/newdlops/intellij-styled-search.git"
+  },
+  "bugs": {
+    "url": "https://github.com/newdlops/intellij-styled-search/issues"
+  },
+  "homepage": "https://github.com/newdlops/intellij-styled-search#readme",
   "engines": {
     "vscode": "^1.75.0"
   },

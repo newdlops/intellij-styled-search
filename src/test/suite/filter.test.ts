@@ -61,6 +61,27 @@ suite('Extension-typing filter — client-side narrowing', () => {
     }
   });
 
+  setup(async function () {
+    if (!cdpAvailable) { return; }
+    const api = await getApi();
+    await api.overlay.show('');
+    await api.overlay.evalInActiveWindowForTests(
+      `(function(){
+        var q = document.querySelector('.ij-find-query');
+        if (!q) { return 'no-query'; }
+        q.value = '';
+        q.dispatchEvent(new Event('input', { bubbles: true }));
+        return 'cleared';
+      })()`,
+    );
+    await waitUntil(
+      api,
+      (s) => !s.searching && s.rgQuery === '' && s.filterQuery === '',
+      5_000,
+      'clear prior renderer search state',
+    );
+  });
+
   test('typing an extension of the query does NOT re-run rg', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);
