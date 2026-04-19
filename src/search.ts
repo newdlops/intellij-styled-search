@@ -1,10 +1,12 @@
 import * as vscode from 'vscode';
+import { compileIncludeMatcher } from './pathScope';
 
 export interface SearchOptions {
   query: string;
   caseSensitive: boolean;
   wholeWord: boolean;
   useRegex: boolean;
+  includePatterns?: string[];
 }
 
 export interface MatchRange {
@@ -102,6 +104,7 @@ export async function runSearch(
   const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
   const maxResults = cfg.get<number>('maxResults', 0);
   const resultLimit = Number.isFinite(maxResults) && maxResults > 0 ? maxResults : 0;
+  const includeMatcher = compileIncludeMatcher(opts.includePatterns);
 
   let files: vscode.Uri[];
   // Fast path: trigram index already told us exactly which files could
@@ -123,6 +126,14 @@ export async function runSearch(
       files = await vscode.workspace.findFiles('**/*', excludePattern, 100_000, token);
     } catch (err) {
       progress.onError(err as Error);
+      return;
+    }
+  }
+
+  if (includeMatcher) {
+    files = files.filter((uri) => includeMatcher(vscode.workspace.asRelativePath(uri, false)));
+    if (files.length === 0) {
+      progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
       return;
     }
   }

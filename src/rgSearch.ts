@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as https from 'https';
 import * as os from 'os';
 import { SearchOptions, SearchProgress, FileMatch, MatchRange } from './search';
+import { compileIncludeMatcher, toRipgrepGlobs } from './pathScope';
 
 // ──────────────────────────────────────────────────────────────────────────
 // Ripgrep-backed search engine.
@@ -330,6 +331,8 @@ export async function runRgSearch(
   const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
   const maxResults = cfg.get<number>('maxResults', 0);
   const resultLimit = Number.isFinite(maxResults) && maxResults > 0 ? maxResults : 0;
+  const includeMatcher = compileIncludeMatcher(opts.includePatterns);
+  const includeGlobs = toRipgrepGlobs(opts.includePatterns);
 
   const isMultiline = opts.query.includes('\n');
   const args: string[] = [
@@ -355,7 +358,14 @@ export async function runRgSearch(
   // headroom for other args, 5000 paths is a safe ceiling before `spawn`
   // would start erroring with E2BIG.
   const MAX_POSITIONAL = 5000;
-  const useNarrowing = !!(candidateFiles && candidateFiles.length > 0 && candidateFiles.length <= MAX_POSITIONAL);
+  const narrowedFiles = candidateFiles && includeMatcher
+    ? candidateFiles.filter((fsPath) => includeMatcher(vscode.workspace.asRelativePath(vscode.Uri.file(fsPath), false)))
+    : candidateFiles;
+  if (candidateFiles && narrowedFiles && narrowedFiles.length === 0) {
+    progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
+    return;
+  }
+  const useNarrowing = !!(narrowedFiles && narrowedFiles.length > 0 && narrowedFiles.length <= MAX_POSITIONAL);
   if (useNarrowing) {
     // CRITICAL: our trigram index ignores .gitignore (it indexes every
     // non-binary file in the workspace). rg by default *respects*
@@ -365,6 +375,7 @@ export async function runRgSearch(
     // so rg actually reads every file we asked for.
     args.push('--no-ignore');
   } else {
+    for (const g of includeGlobs) { args.push('--glob', g); }
     // ripgrep --glob with '!' prefix is exclusion. Convert **/foo/** style
     // globs to ripgrep's format (which is the same glob syntax).
     for (const g of excludeGlobs) { args.push('--glob', '!' + g); }
@@ -377,7 +388,7 @@ export async function runRgSearch(
     // `--files-from` at all (rg exits 2: "unrecognized flag"), which was
     // showing up as silent 0-match results for every narrowed query.
     args.push('--');
-    for (const p of candidateFiles!) { args.push(p); }
+    for (const p of narrowedFiles!) { args.push(p); }
   } else {
     // Search each workspace folder.
     for (const f of folders) { args.push('--', f.uri.fsPath); }
@@ -396,7 +407,7 @@ export async function runRgSearch(
     const quoted = args.map((a) => (/[\s"'\\]/.test(a) ? `'${a.replace(/'/g, "'\\''")}'` : a)).join(' ');
     const shown = quoted.length > 2048 ? quoted.slice(0, 2048) + ` … (${quoted.length} chars total)` : quoted;
     logger(
-      `rg exec: cwd=${folders[0].uri.fsPath} narrow=${useNarrowing ? candidateFiles!.length + 'paths' : 'none'} args: ${shown}`,
+      `rg exec: cwd=${folders[0].uri.fsPath} narrow=${useNarrowing ? narrowedFiles!.length + 'paths' : 'none'} args: ${shown}`,
     );
   }
   const child: ChildProcess = spawn(rgPath, args, {

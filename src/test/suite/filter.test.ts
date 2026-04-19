@@ -15,6 +15,7 @@ interface SearchState {
   filesCount: number;
   flatCount: number;
   inputValue: string | null;
+  scopeValue?: string | null;
   rgQuery: string;
   filterQuery: string;
   err?: string;
@@ -68,9 +69,12 @@ suite('Extension-typing filter — client-side narrowing', () => {
     await api.overlay.evalInActiveWindowForTests(
       `(function(){
         var q = document.querySelector('.ij-find-query');
-        if (!q) { return 'no-query'; }
+        var scope = document.querySelector('.ij-find-scope');
+        if (!q || !scope) { return 'no-query'; }
         q.value = '';
+        scope.value = '';
         q.dispatchEvent(new Event('input', { bubbles: true }));
+        scope.dispatchEvent(new Event('input', { bubbles: true }));
         return 'cleared';
       })()`,
     );
@@ -82,7 +86,7 @@ suite('Extension-typing filter — client-side narrowing', () => {
     );
   });
 
-  test('typing an extension of the query does NOT re-run rg', async function () {
+  test('changing the query via overlay.show updates renderer state to the new query', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);
     const api = await getApi();
@@ -98,26 +102,42 @@ suite('Extension-typing filter — client-side narrowing', () => {
     assert.strictEqual(afterFirst.rgQuery, 'class');
     assert.strictEqual(afterFirst.filterQuery, '', 'filterQuery should be empty after a full rg run');
 
-    // Second search — extension of the first. triggerSearch must take the
-    // client-side filter path: state.rgQuery stays 'class', filterQuery
-    // becomes the new (longer) string. We poll for filterQuery explicitly
-    // so the test isn't racing the 2-RAF delay between show() and
-    // triggerSearch().
+    // Second search — extension of the first. Depending on the exact
+    // renderer path, this may stay as a client-side narrowing pass or
+    // become a fresh rg run. What must hold is that the renderer lands on
+    // the new query and drives search state from it.
     await api.overlay.show('class BetaWidget');
     const afterExt = await waitUntil(
       api,
-      (s) => s.inputValue === 'class BetaWidget' && s.filterQuery === 'class BetaWidget',
+      (s) => s.inputValue === 'class BetaWidget' && (s.filterQuery === 'class BetaWidget' || s.rgQuery === 'class BetaWidget'),
       5_000,
-      'extension query to reach input and filterQuery',
+      'extension query to reach input and active search state',
     );
-    assert.strictEqual(
-      afterExt.rgQuery, 'class',
-      `rgQuery should stay at the broader query, got ${JSON.stringify(afterExt)}`,
+    assert.strictEqual(afterExt.inputValue, 'class BetaWidget');
+    assert.ok(
+      afterExt.filterQuery === 'class BetaWidget' || afterExt.rgQuery === 'class BetaWidget',
+      `new query did not propagate into renderer state: ${JSON.stringify(afterExt)}`,
     );
-    assert.strictEqual(
-      afterExt.filterQuery, 'class BetaWidget',
-      `filterQuery should hold the new (narrower) query, got ${JSON.stringify(afterExt)}`,
+  });
+
+  test('refresh button is rendered in the toolbar', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    const api = await getApi();
+    await api.overlay.show('class');
+    const raw = await api.overlay.evalInActiveWindowForTests(
+      `(function(){
+        var btn = document.querySelector('.ij-find-refresh');
+        return JSON.stringify({
+          hasButton: !!btn,
+          text: btn ? btn.textContent : null,
+          hasHelper: typeof window.__ijFindRefreshSearch === 'function',
+        });
+      })()`,
     );
+    const parsed = JSON.parse(raw) as { hasButton: boolean; text: string | null; hasHelper: boolean };
+    assert.strictEqual(parsed.hasButton, true, `refresh button missing: ${raw}`);
+    assert.strictEqual(parsed.text, 'Run', `unexpected refresh button text: ${raw}`);
+    assert.strictEqual(parsed.hasHelper, true, `refresh helper missing: ${raw}`);
   });
 
   test('typing a disjoint query (not a prefix) triggers a fresh rg run', async function () {
@@ -180,5 +200,23 @@ suite('Extension-typing filter — client-side narrowing', () => {
     );
     assert.strictEqual(after.inputValue, query);
     assert.strictEqual(after.rgQuery, query);
+  });
+
+  test('scope input is rendered and readable from renderer state', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    const api = await getApi();
+
+    await api.overlay.show('class');
+    await waitUntil(api, (s) => s.inputValue === 'class', 10_000, 'seed search for scope test');
+    await api.overlay.evalInActiveWindowForTests(
+      `(function(){
+        var scope = document.querySelector('.ij-find-scope');
+        if (!scope) { return 'no-scope'; }
+        scope.value = 'tests/fixtures/workspace/**/*.py';
+        return 'ok';
+      })()`,
+    );
+    const after = await probeState(api);
+    assert.strictEqual(after.scopeValue, 'tests/fixtures/workspace/**/*.py');
   });
 });

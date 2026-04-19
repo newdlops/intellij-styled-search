@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV67) { return 'already patched'; }
-  window.__ijFindPatchedV67 = true;
+  if (window.__ijFindPatchedV69) { return 'already patched'; }
+  window.__ijFindPatchedV69 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -728,6 +728,7 @@ export function getRendererPatchScript(): string {
     '  border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-widget-border));',
     '}',
     '.ij-find-search-row { display: flex; gap: 6px; align-items: flex-start; }',
+    '.ij-find-scope-row { margin-top: 6px; }',
     '.ij-find-query {',
     '  flex: 1; padding: 5px 8px;',
     '  font-family: var(--vscode-editor-font-family, monospace);',
@@ -744,6 +745,19 @@ export function getRendererPatchScript(): string {
     '  box-sizing: border-box;',
     '}',
     '.ij-find-query:focus { border-color: var(--vscode-focusBorder, #007acc); }',
+    '.ij-find-scope {',
+    '  width: 100%; padding: 5px 8px;',
+    '  font-family: var(--vscode-editor-font-family, monospace);',
+    '  font-size: 12px;',
+    '  line-height: 1.4;',
+    '  background: var(--vscode-input-background, #3c3c3c);',
+    '  color: var(--vscode-input-foreground, #cccccc);',
+    '  border: 1px solid var(--vscode-input-border, transparent);',
+    '  border-radius: 2px; outline: none;',
+    '  box-sizing: border-box;',
+    '  min-height: 26px;',
+    '}',
+    '.ij-find-scope:focus { border-color: var(--vscode-focusBorder, #007acc); }',
     '.ij-find-opts { display: flex; gap: 2px; }',
     '.ij-find-opt {',
     '  min-width: 26px; height: 26px; padding: 0 6px;',
@@ -760,6 +774,7 @@ export function getRendererPatchScript(): string {
     '  color: var(--vscode-inputOption-activeForeground, #ffffff);',
     '  border-color: var(--vscode-inputOption-activeBorder, #007acc);',
     '}',
+    '.ij-find-refresh { min-width: 42px; }',
     '.ij-find-status-row {',
     '  margin-top: 6px; display: flex; align-items: center; gap: 8px;',
     '  font-size: 11px;',
@@ -1053,14 +1068,25 @@ export function getRendererPatchScript(): string {
   var $optCase = el('button', { className: 'ij-find-opt', title: 'Match Case (Alt+C)', text: 'Aa', attrs: { 'data-opt': 'caseSensitive', 'aria-pressed': 'false' } });
   var $optWord = el('button', { className: 'ij-find-opt', title: 'Whole Word (Alt+W)', text: 'W', attrs: { 'data-opt': 'wholeWord', 'aria-pressed': 'false' } });
   var $optRegex = el('button', { className: 'ij-find-opt', title: 'Regex (Alt+R)', text: '.*', attrs: { 'data-opt': 'useRegex', 'aria-pressed': 'false' } });
-  var $opts = el('div', { className: 'ij-find-opts', children: [$optCase, $optWord, $optRegex] });
+  var $refresh = el('button', { className: 'ij-find-opt ij-find-refresh', title: 'Refresh Search', text: 'Run', attrs: { type: 'button', 'aria-label': 'Refresh search' } });
+  var $opts = el('div', { className: 'ij-find-opts', children: [$optCase, $optWord, $optRegex, $refresh] });
   var $searchRow = el('div', { className: 'ij-find-search-row', children: [$q, $opts] });
+  var $scope = el('input', {
+    className: 'ij-find-scope',
+    attrs: {
+      placeholder: 'Files to include (Ant patterns: src/**, **/*.ts, api/)',
+      spellcheck: 'false',
+      autocomplete: 'off',
+      type: 'text',
+    },
+  });
+  var $scopeRow = el('div', { className: 'ij-find-scope-row', children: [$scope] });
 
   var $status = el('span', { className: 'ij-find-status', text: 'Type a query' });
   var $spinner = el('span', { className: 'ij-find-spinner hidden' });
   var $statusRow = el('div', { className: 'ij-find-status-row', children: [$status, $spinner] });
 
-  var $toolbar = el('div', { className: 'ij-find-toolbar', children: [$searchRow, $statusRow] });
+  var $toolbar = el('div', { className: 'ij-find-toolbar', children: [$searchRow, $scopeRow, $statusRow] });
   var $results = el('div', { className: 'ij-find-results', attrs: { tabindex: '0' } });
   var $resultsInner = el('div', { className: 'ij-find-results-inner' });
   $results.appendChild($resultsInner);
@@ -1129,6 +1155,7 @@ export function getRendererPatchScript(): string {
     previewMonacoEditor: null,
     previewMonacoHost: null,
     resultsInfoText: '',
+    rgScope: '',
   };
   var RESULT_ROW_HEIGHT = 20;
   var RESULT_OVERSCAN = 12;
@@ -1147,6 +1174,20 @@ export function getRendererPatchScript(): string {
     } else {
       $summary.textContent = matches + ' result' + (matches === 1 ? '' : 's') + ' in ' + files + ' file' + (files === 1 ? '' : 's');
     }
+  }
+
+  function parseScopeInput(raw) {
+    if (!raw) { return []; }
+    var parts = String(raw).split(/[\\n,;]+/);
+    var out = [];
+    var seen = {};
+    for (var i = 0; i < parts.length; i++) {
+      var trimmed = parts[i].trim();
+      if (!trimmed || seen[trimmed]) { continue; }
+      seen[trimmed] = true;
+      out.push(trimmed);
+    }
+    return out;
   }
 
   function appendHighlightedInto(container, text, ranges) {
@@ -1431,16 +1472,18 @@ export function getRendererPatchScript(): string {
     send({ type: 'pinInSideEditor', uri: f.uri, line: m.line, column: col });
   }
 
-  function triggerSearch() {
+  function triggerSearch(forceRestart) {
     var raw = $q.value;
+    var scopeRaw = $scope.value || '';
     // Preserve the query byte-for-byte. Multi-line search selections often
     // begin with indentation, and trimming that indentation changes the
     // literal search target into a different string.
     var q = typeof raw === 'string' ? raw : '';
+    var includePatterns = parseScopeInput(scopeRaw);
     clearPreview();
     if (!q) {
       state.files = []; state.flat = []; state.activeIndex = -1; state.searching = false;
-      state.rgQuery = ''; state.filterQuery = '';
+      state.rgQuery = ''; state.filterQuery = ''; state.rgScope = '';
       setStatus('Type a query', false);
       render();
       send({ type: 'cancel' });
@@ -1457,12 +1500,14 @@ export function getRendererPatchScript(): string {
     //     multi-line spans.
     var oldQ = state.rgQuery || '';
     var oldOpts = state.rgOptions;
+    var oldScope = state.rgScope || '';
     var optsChanged = !oldOpts ||
       oldOpts.caseSensitive !== state.options.caseSensitive ||
       oldOpts.wholeWord !== state.options.wholeWord ||
-      oldOpts.useRegex !== state.options.useRegex;
+      oldOpts.useRegex !== state.options.useRegex ||
+      oldScope !== scopeRaw;
     var involvesMultiline = q.indexOf('\\n') >= 0 || oldQ.indexOf('\\n') >= 0;
-    var isExtension = oldQ && q.length > oldQ.length && q.indexOf(oldQ) === 0 &&
+    var isExtension = !forceRestart && oldQ && q.length > oldQ.length && q.indexOf(oldQ) === 0 &&
       !optsChanged && !involvesMultiline;
     if (isExtension) {
       state.filterQuery = q;
@@ -1489,11 +1534,13 @@ export function getRendererPatchScript(): string {
       wholeWord: state.options.wholeWord,
       useRegex: state.options.useRegex,
     };
+    state.rgScope = scopeRaw;
     state.filterQuery = '';
     send({
       type: 'log',
       msg: 'triggerSearch: len=' + q.length + '(raw=' + raw.length + ') hasNL=' +
            (q.indexOf('\\n') >= 0) +
+           ' scope=' + JSON.stringify(scopeRaw.slice(0, 120)) +
            ' preview=' + JSON.stringify(q.slice(0, 120)),
     });
     send({
@@ -1503,13 +1550,22 @@ export function getRendererPatchScript(): string {
         caseSensitive: state.options.caseSensitive,
         wholeWord: state.options.wholeWord,
         useRegex: state.options.useRegex,
+        includePatterns: includePatterns,
       },
     });
   }
 
   function scheduleSearch() {
     if (state.debounce) { clearTimeout(state.debounce); }
-    state.debounce = setTimeout(triggerSearch, 150);
+    state.debounce = setTimeout(function () { triggerSearch(false); }, 150);
+  }
+
+  function refreshSearch() {
+    if (state.debounce) { clearTimeout(state.debounce); state.debounce = null; }
+    state.rgQuery = '';
+    state.filterQuery = '';
+    state.rgScope = '';
+    triggerSearch(false);
   }
 
   function toggleOpt(key, btn) {
@@ -1527,6 +1583,7 @@ export function getRendererPatchScript(): string {
   }
 
   $q.addEventListener('input', function () { autosizeQuery(); scheduleSearch(); });
+  $scope.addEventListener('input', scheduleSearch);
   $q.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       // Shift+Enter: insert literal newline (textarea default) → enables
@@ -1542,9 +1599,20 @@ export function getRendererPatchScript(): string {
     else if (e.key === 'PageUp') { e.preventDefault(); moveActive(-10); }
     else if (e.key === 'Escape') { e.preventDefault(); window.__ijFindHide(); }
   });
+  $scope.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') {
+      if (state.debounce) { clearTimeout(state.debounce); }
+      e.preventDefault();
+      refreshSearch();
+    } else if (e.key === 'ArrowDown') { e.preventDefault(); moveActive(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); moveActive(-1); }
+    else if (e.key === 'Escape') { e.preventDefault(); window.__ijFindHide(); }
+  });
   $optCase.addEventListener('click', function () { toggleOpt('caseSensitive', $optCase); });
   $optWord.addEventListener('click', function () { toggleOpt('wholeWord', $optWord); });
   $optRegex.addEventListener('click', function () { toggleOpt('useRegex', $optRegex); });
+  $refresh.onclick = refreshSearch;
+  $refresh.addEventListener('click', refreshSearch);
   $close.addEventListener('click', function () { window.__ijFindHide(); });
 
   $results.addEventListener('click', function (e) {
@@ -3107,6 +3175,7 @@ export function getRendererPatchScript(): string {
 
   window.__ijFindShow = function (initialQuery) {
     try {
+      var wasVisible = panel.classList.contains('visible');
       panel.classList.add('visible');
       panel.style.setProperty('display', 'flex', 'important');
       panel.style.setProperty('visibility', 'visible', 'important');
@@ -3130,13 +3199,37 @@ export function getRendererPatchScript(): string {
       // inside the same microtask and the panel appears only after the first
       // results:start message lands. rAF guarantees one paint first.
       if (typeof initialQuery === 'string' && initialQuery && initialQuery !== $q.value) {
+        var oldQ = state.rgQuery || '';
+        var oldScope = state.rgScope || '';
+        var scopeRaw = $scope.value || '';
+        var extendsCurrent = wasVisible &&
+          !!oldQ &&
+          oldScope === scopeRaw &&
+          initialQuery.length > oldQ.length &&
+          initialQuery.indexOf(oldQ) === 0 &&
+          initialQuery.indexOf('\\n') < 0 &&
+          oldQ.indexOf('\\n') < 0;
         $q.value = initialQuery;
         autosizeQuery();
-        setStatus('Searching\u2026', true);
-        render();
-        requestAnimationFrame(function () {
-          requestAnimationFrame(triggerSearch);
-        });
+        if (extendsCurrent) {
+          state.filterQuery = initialQuery;
+          render();
+          var visibleRows = 0;
+          for (var fk = 0; fk < state.flat.length; fk++) {
+            if (!state.flat[fk].pendingUri) { visibleRows++; }
+          }
+          if (state.searching) {
+            setStatus(visibleRows + ' match' + (visibleRows === 1 ? '' : 'es') + ' (scanning\u2026)', true);
+          } else {
+            setStatus(visibleRows + ' match' + (visibleRows === 1 ? '' : 'es'), false);
+          }
+        } else {
+          setStatus('Searching\u2026', true);
+          render();
+          requestAnimationFrame(function () {
+            requestAnimationFrame(function () { triggerSearch(false); });
+          });
+        }
       }
       setTimeout(function () { try { $q.focus(); $q.select(); } catch (e) {} }, 0);
       return 'show ok';
@@ -3212,9 +3305,19 @@ export function getRendererPatchScript(): string {
         previewUri: state.previewUri || null,
         lastPreviewKey: state.lastPreviewKey || null,
         inputValue: $q ? $q.value : null,
+        scopeValue: $scope ? $scope.value : null,
         rgQuery: state.rgQuery || '',
         filterQuery: state.filterQuery || '',
       };
+    } catch (e) { return { err: String(e && e.message) }; }
+  };
+  window.__ijFindRefreshSearch = refreshSearch;
+  window.__ijFindSetScopeValue = function (value, forceRestart) {
+    try {
+      $scope.value = value == null ? '' : String(value);
+      if (forceRestart) { refreshSearch(); }
+      else { scheduleSearch(); }
+      return window.__ijFindGetSearchState();
     } catch (e) { return { err: String(e && e.message) }; }
   };
   window.__ijFindGetPreviewDecorations = function () {

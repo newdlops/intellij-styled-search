@@ -6,6 +6,7 @@ import { runSearch, SearchOptions, FileMatch, MatchRange, prioritizeFiles } from
 import { configureRipgrepInstall, ensureRipgrepInstalled, findRipgrepPath, runRgSearch } from './rgSearch';
 import { getRendererPatchScript } from './rendererPatch';
 import { TrigramIndex, extractTrigramsLower } from './trigramIndex';
+import { compileIncludeMatcher } from './pathScope';
 
 type RendererEvent =
   | { type: 'search'; options: SearchOptions }
@@ -1347,6 +1348,7 @@ export class OverlayPanel {
       options.caseSensitive ? 'case' : '',
       options.wholeWord ? 'word' : '',
       options.query.includes('\n') ? 'multiline' : '',
+      options.includePatterns && options.includePatterns.length > 0 ? `scope=${options.includePatterns.length}` : '',
     ].filter(Boolean).join(',') || 'plain';
     this.log.appendLine(
       `search start: len=${options.query.length} flags=[${optTags}] indexReady=${this.trigramIndex.isReady} indexSize=${this.trigramIndex.size}`,
@@ -1361,9 +1363,24 @@ export class OverlayPanel {
         caseSensitive: options.caseSensitive,
         wholeWord: options.wholeWord,
       });
-      if (candidates) {
+      const includeMatcher = compileIncludeMatcher(options.includePatterns);
+      const scopedCandidates = candidates && includeMatcher
+        ? (() => {
+            const filtered = new Set<string>();
+            for (const u of candidates) {
+              try {
+                const uri = vscode.Uri.parse(u);
+                if (includeMatcher(vscode.workspace.asRelativePath(uri, false))) {
+                  filtered.add(u);
+                }
+              } catch {}
+            }
+            return filtered;
+          })()
+        : candidates;
+      if (scopedCandidates) {
         this.log.appendLine(
-          `TrigramIndex candidates: ${candidates.size} via ${reason}`,
+          `TrigramIndex candidates: ${scopedCandidates.size} via ${reason}`,
         );
       } else {
         this.log.appendLine(`TrigramIndex candidates: null (${reason}) — rg will full-scan workspace`);
@@ -1374,8 +1391,8 @@ export class OverlayPanel {
       const rgPath = findRipgrepPath();
       if (rgPath) {
         let paths: string[] | null = null;
-        if (candidates) {
-          if (candidates.size === 0) {
+        if (scopedCandidates) {
+          if (scopedCandidates.size === 0) {
             this.log.appendLine(`search done: 0 matches (candidates empty) in ${Date.now() - t0}ms`);
             progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
             return;
@@ -1385,7 +1402,7 @@ export class OverlayPanel {
           // caches). Both rg scan order and the pending-row UI use this
           // order, so user's real files appear first in every view.
           const uris: vscode.Uri[] = [];
-          for (const u of candidates) {
+          for (const u of scopedCandidates) {
             try { uris.push(vscode.Uri.parse(u)); } catch {}
           }
           const ordered = prioritizeFiles(uris);
@@ -1426,7 +1443,7 @@ export class OverlayPanel {
         await runRgSearch(options, cts.token, wrappedProgress, paths, (m) => this.log.appendLine(m));
       } else {
         this.log.appendLine('rg not found — falling back to JS scan.');
-        await runSearch(options, cts.token, progress, candidates);
+        await runSearch(options, cts.token, progress, scopedCandidates);
       }
     } finally {
       if (this.activeSearch === cts) {

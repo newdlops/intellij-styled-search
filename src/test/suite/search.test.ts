@@ -114,6 +114,30 @@ suite('Search — engine end-to-end against fixture workspace', () => {
     assert.deepStrictEqual(wrongCase, [], 'wrong-case literal query should not match');
   });
 
+  test('include pattern scopes search to matching files', async () => {
+    const { overlay } = await getApi();
+    const matches = await overlay.searchForTests({
+      query: 'class',
+      caseSensitive: false,
+      wholeWord: false,
+      useRegex: false,
+      includePatterns: ['**/*.py'],
+    });
+    assert.deepStrictEqual(relPaths(matches), ['alpha.py']);
+  });
+
+  test('directory include pattern scopes search to nested subtree', async () => {
+    const { overlay } = await getApi();
+    const matches = await overlay.searchForTests({
+      query: 'DirectoryScopedThing',
+      caseSensitive: true,
+      wholeWord: false,
+      useRegex: false,
+      includePatterns: ['nested/'],
+    });
+    assert.deepStrictEqual(relPaths(matches), ['nested/delta.js']);
+  });
+
   test('UTF-8 / Korean literal hits docs.md', async () => {
     const { overlay } = await getApi();
     const matches = await overlay.searchForTests({
