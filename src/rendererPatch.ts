@@ -836,6 +836,7 @@ export function getRendererPatchScript(): string {
     '  flex: 0 0 240px;',
     '  display: flex; flex-direction: column;',
     '  background: var(--vscode-editor-background, #1e1e1e);',
+    '  min-width: 0;',
     '  min-height: 0;',
     '}',
     '.ij-find-preview-header {',
@@ -847,10 +848,17 @@ export function getRendererPatchScript(): string {
     '  user-select: none;',
     '}',
     '.ij-find-preview-body {',
-    '  flex: 1 1 auto; overflow: auto;',
+    '  flex: 1 1 auto; position: relative; overflow: auto;',
     '  font-family: var(--vscode-editor-font-family, monospace);',
     '  font-size: 12px; line-height: 18px;',
     '  padding: 4px 0;',
+    '  min-width: 0; min-height: 0;',
+    '  scrollbar-gutter: stable both-edges;',
+    '}',
+    '.ij-find-preview-content {',
+    '  min-width: 100%;',
+    '  width: max-content;',
+    '  min-height: 100%;',
     '}',
     // When a stolen monaco editor is mounted in this body, keep our own
     // padding / typography rules from bleeding into it. Nothing is forced
@@ -865,6 +873,7 @@ export function getRendererPatchScript(): string {
     '}',
     '.ij-find-preview-line {',
     '  display: flex; gap: 8px; padding: 0 10px; white-space: pre;',
+    '  width: max-content; min-width: 100%; box-sizing: border-box;',
     '  color: var(--vscode-editor-foreground, #d4d4d4);',
     '}',
     '.ij-find-preview-line.focus {',
@@ -875,7 +884,7 @@ export function getRendererPatchScript(): string {
     '  color: var(--vscode-editorLineNumber-foreground, #858585);',
     '  user-select: none;',
     '}',
-    '.ij-find-preview-text { flex: 1 1 auto; min-width: 0; }',
+    '.ij-find-preview-text { flex: 0 0 auto; min-width: 0; }',
     // Host element for the embedded Monaco editor. Monaco needs a sized box.
     '.ij-find-monaco-host {',
     '  flex: 1 1 auto; width: 100%; height: 100%; min-height: 0; overflow: hidden;',
@@ -2616,6 +2625,7 @@ export function getRendererPatchScript(): string {
     }
     $previewBody.classList.remove('ij-find-editor-mounted');
     clearChildren($previewBody);
+    var contentEl = el('div', { className: 'ij-find-preview-content' });
     var focusEl = null;
     var frag = document.createDocumentFragment();
     for (var i = 0; i < msg.lines.length; i++) {
@@ -2636,9 +2646,12 @@ export function getRendererPatchScript(): string {
       frag.appendChild(lineEl);
       if (isFocus) { focusEl = lineEl; }
     }
-    $previewBody.appendChild(frag);
+    contentEl.appendChild(frag);
+    $previewBody.appendChild(contentEl);
     if (focusEl) {
-      setTimeout(function () { try { focusEl.scrollIntoView({ block: 'center' }); } catch (e) {} }, 0);
+      setTimeout(function () {
+        try { focusEl.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) {}
+      }, 0);
     }
   }
 

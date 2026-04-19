@@ -546,11 +546,18 @@ export class OverlayPanel {
    *  and report what state `__ijFindMonaco` ended up in. Tests use this
    *  instead of relying on `scheduleLazyCapture` racing their setup. */
   async forceCaptureForTests(): Promise<string> {
-    try { await this.triggerCaptureDiagnostic(); }
+    const preferredWindowId = this.activeWindowId;
+    try { await this.triggerCaptureDiagnostic(preferredWindowId); }
     catch (err) {
       return 'capture-threw:' + (err instanceof Error ? err.message : String(err));
     }
     try {
+      if (preferredWindowId !== undefined) {
+        const r = await this.evalInWindow(preferredWindowId,
+          `(function(){try{var m=window.__ijFindMonaco;return m?('ctor='+(!!m.ctor)+' inst='+(!!m.inst)+' modelSvc='+(!!m.modelSvc)):'no-monaco'}catch(e){return 'err:'+(e&&e.message)}})()`,
+        );
+        return /ctor=true inst=true modelSvc=true/.test(r) ? ('ready:win=' + preferredWindowId) : r;
+      }
       const wins = await this.listWorkbenchWindowIds();
       for (const id of wins) {
         const r = await this.evalInWindow(id,
