@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV54) { return 'already patched'; }
-  window.__ijFindPatchedV54 = true;
+  if (window.__ijFindPatchedV55) { return 'already patched'; }
+  window.__ijFindPatchedV55 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -201,14 +201,59 @@ export function getRendererPatchScript(): string {
       return null;
     }
   };
-  window.__ijFindSetPreviewContent = function (editor, content, languageId) {
+  // Look up an existing TextModel in VSCode's ModelService by URI string.
+  // When a file is open in VSCode (or has been touched via
+  // vscode.workspace.openTextDocument), its model is registered here and
+  // shared with any widget attached to it. Reusing it means edits in our
+  // preview propagate straight into VSCode's buffer (and any open tab on
+  // the same file picks the change up in real time).
+  function findSharedModelByUri(uriStr) {
+    if (!uriStr) { return null; }
+    var m = window.__ijFindMonaco;
+    if (!m || !m.modelSvc) { return null; }
+    try {
+      var models = typeof m.modelSvc.getModels === 'function' ? m.modelSvc.getModels() : [];
+      for (var i = 0; i < models.length; i++) {
+        var mdl = models[i];
+        try {
+          if (mdl && mdl.uri && typeof mdl.uri.toString === 'function' && mdl.uri.toString() === uriStr) {
+            return mdl;
+          }
+        } catch (eLoop) {}
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  window.__ijFindSetPreviewContent = function (editor, content, languageId, uriStr) {
     var m = window.__ijFindMonaco;
     if (!m || !m.modelSvc || !editor) { return false; }
     try {
-      var model = m.modelSvc.createModel(content || '', languageId || 'plaintext');
+      var shared = findSharedModelByUri(uriStr);
       var old = editor.getModel && editor.getModel();
+      if (shared) {
+        // Share VSCode's buffer. Edits flow both ways. Do NOT overwrite
+        // its content — VSCode's buffer may have unsaved edits newer than
+        // whatever content we were handed.
+        if (old === shared) { return true; }
+        editor.setModel(shared);
+        // Only dispose the OLD model if it's one we created ourselves
+        // (not registered under a real URI). Disposing a shared VSCode
+        // model would break every other editor that references it.
+        if (old && old.dispose && old !== shared) {
+          var isIsolated = false;
+          try { isIsolated = !(old.uri && old.uri.scheme && old.uri.scheme !== 'inmemory'); } catch (eU) { isIsolated = false; }
+          if (isIsolated) { try { old.dispose(); } catch (eD) {} }
+        }
+        send({ type: 'log', msg: 'setPreviewContent: reused shared model uri=' + uriStr });
+        return true;
+      }
+      // Fall back to an isolated model when the file isn't in VSCode's
+      // ModelService. Edits here stay in-memory until the user saves.
+      var model = m.modelSvc.createModel(content || '', languageId || 'plaintext');
       editor.setModel(model);
       if (old && old.dispose && old !== model) { try { old.dispose(); } catch (e) {} }
+      send({ type: 'log', msg: 'setPreviewContent: isolated model (no shared model for ' + uriStr + ')' });
       return true;
     } catch (e) {
       send({ type: 'log', msg: 'setPreviewContent err: ' + (e && e.message) });
@@ -1825,7 +1870,7 @@ export function getRendererPatchScript(): string {
     send({ type: 'log', msg: 'monacoReal lines=' + (msg.lines ? msg.lines.length : 0) + ' lang=' + lang + ' reuse=' + !!(state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody) });
     // Reuse existing widget if it's still mounted in our preview body.
     if (state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody) {
-      var ok = window.__ijFindSetPreviewContent(state.previewMonacoEditor, fullText, lang);
+      var ok = window.__ijFindSetPreviewContent(state.previewMonacoEditor, fullText, lang, msg.uri);
       send({ type: 'log', msg: 'monacoReal reuse setModel=' + ok });
       if (ok) {
         try {
@@ -1857,7 +1902,7 @@ export function getRendererPatchScript(): string {
     state.previewMonacoEditor = editor;
     state.previewMonacoHost = host;
     state.previewMode = 'monaco';
-    var setOk = window.__ijFindSetPreviewContent(editor, fullText, lang);
+    var setOk = window.__ijFindSetPreviewContent(editor, fullText, lang, msg.uri);
     send({ type: 'log', msg: 'monacoReal setPreviewContent=' + setOk });
     try {
       var r2 = host.getBoundingClientRect();
