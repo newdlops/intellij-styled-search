@@ -63,6 +63,11 @@ type SearchSession = {
   scopedCandidateUris: Set<string> | null;
 };
 
+type CaptureDiagnosticOptions = {
+  allowForceOpen?: boolean;
+  reason?: string;
+};
+
 const BRIDGE_BINDING = 'irSearchMainBridge';
 const RENDERER_BINDING = 'irSearchEvent';
 
@@ -79,6 +84,8 @@ export class OverlayPanel {
   private pendingShow: string | null = null;
   private showInFlight = false;
   private capturePromise: Promise<void> | undefined;
+  private backgroundCapturePromise: Promise<void> | undefined;
+  private backgroundCaptureTimer: ReturnType<typeof setTimeout> | undefined;
   private searchSeq = 0;
   private currentSearchSession: SearchSession | undefined;
   private rendererPostChain: Promise<void> = Promise.resolve();
@@ -121,15 +128,33 @@ export class OverlayPanel {
       this.log.appendLine(`ripgrep: ${rgPath || '(not found — will fall back to JS scan)'}`);
       await this.ensureInjected();
       this.log.appendLine('Prewarm complete (CDP attached, patch installed).');
-      // Do NOT run capture diagnostic here. Opening/closing a file at
-      // activation time is user-visible and competes for CPU with other
-      // extensions starting up. Capture runs lazily on the first show().
+      // Prepare Monaco capture in the background, but keep activation
+      // invisible: DOM scan only, no file open/close fallback here.
+      const windowIds = await this.listWorkbenchWindowIds();
+      if (windowIds.length === 1) {
+        const visibleEditors = await this.evalInWindow(
+          windowIds[0],
+          `(function(){
+            try { return String(document.querySelectorAll('.editor-group-container .monaco-editor').length); }
+            catch (e) { return '0'; }
+          })()`,
+        );
+        const visibleEditorCount = parseInt(visibleEditors, 10) || 0;
+        if (visibleEditorCount > 0) {
+          this.scheduleBackgroundCaptureWarmup('activation', 300);
+        } else {
+          this.log.appendLine('Prewarm: skipping background Monaco warmup because no visible editors are open yet.');
+        }
+      } else {
+        this.log.appendLine(`Prewarm: skipping background Monaco warmup because ${windowIds.length} workbench windows are open.`);
+      }
     } catch (err) {
       this.log.appendLine(`Prewarm failed: ${err instanceof Error ? err.message : err}`);
     }
   }
 
   private lastCaptureAttemptAt = 0;
+  private lastBackgroundCaptureAttemptAt = 0;
   /** Start Monaco capture after the overlay is attached. The first preview
    * request awaits the same promise, so it does not render the non-editable
    * DOM fallback just because capture is still racing in the background. */
@@ -139,9 +164,51 @@ export class OverlayPanel {
     });
   }
 
+  private scheduleBackgroundCaptureWarmup(reason: string, delayMs = 120): void {
+    if (this.backgroundCaptureTimer) {
+      clearTimeout(this.backgroundCaptureTimer);
+      this.backgroundCaptureTimer = undefined;
+    }
+    this.backgroundCaptureTimer = setTimeout(() => {
+      this.backgroundCaptureTimer = undefined;
+      void this.ensureBackgroundMonacoWarmup(reason).catch((err) => {
+        this.log.appendLine(`Background Monaco warmup failed (${reason}): ${err instanceof Error ? err.message : err}`);
+      });
+    }, delayMs);
+  }
+
+  private async ensureBackgroundMonacoWarmup(reason: string): Promise<void> {
+    if (await this.isMonacoReadyAnywhere()) { return; }
+    if (this.capturePromise) {
+      await this.capturePromise;
+      if (await this.isMonacoReadyAnywhere()) { return; }
+    }
+    if (this.backgroundCapturePromise) {
+      await this.backgroundCapturePromise;
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastBackgroundCaptureAttemptAt < 1000) { return; }
+    this.lastBackgroundCaptureAttemptAt = now;
+    try {
+      this.backgroundCapturePromise = this.triggerCaptureDiagnostic(undefined, {
+        allowForceOpen: false,
+        reason: `background:${reason}`,
+      });
+      await this.backgroundCapturePromise;
+    } finally {
+      this.backgroundCapturePromise = undefined;
+    }
+  }
+
   private async ensureMonacoCapture(preferredWindowId?: number): Promise<void> {
     if (preferredWindowId !== undefined && await this.isMonacoReadyInWindow(preferredWindowId)) { return; }
     if (preferredWindowId === undefined && await this.isMonacoReadyAnywhere()) { return; }
+    if (this.backgroundCapturePromise) {
+      await this.backgroundCapturePromise;
+      if (preferredWindowId !== undefined && await this.isMonacoReadyInWindow(preferredWindowId)) { return; }
+      if (preferredWindowId === undefined && await this.isMonacoReadyAnywhere()) { return; }
+    }
     if (this.capturePromise) {
       await this.capturePromise;
       if (preferredWindowId !== undefined && await this.isMonacoReadyInWindow(preferredWindowId)) { return; }
@@ -229,8 +296,12 @@ export class OverlayPanel {
     return Array.isArray(v) ? v as number[] : [];
   }
 
-  private async triggerCaptureDiagnostic(preferredWindowId?: number): Promise<void> {
-    this.log.appendLine('Capture diagnostic: starting...');
+  private async triggerCaptureDiagnostic(preferredWindowId?: number, options?: CaptureDiagnosticOptions): Promise<void> {
+    const allowForceOpen = options?.allowForceOpen !== false;
+    const reason = options?.reason || 'foreground';
+    this.log.appendLine(
+      `Capture diagnostic: starting (reason=${reason}, forceOpen=${allowForceOpen ? 'yes' : 'no'})...`,
+    );
     const windowIds = await this.listWorkbenchWindowIds();
     this.log.appendLine(
       `Workbench windows: [${windowIds.join(', ')}]` +
@@ -372,6 +443,12 @@ export class OverlayPanel {
         this.log.appendLine(
           `DOM scan yielded widgets in win=${bestDomWin}, but preview is in win=${preferredWindowId}; forcing capture in the preview window.`,
         );
+      }
+      if (!allowForceOpen) {
+        this.log.appendLine(
+          'Capture warmup: DOM scan did not yield a ready Monaco; skipping force-open and leaving normal foreground capture path intact.',
+        );
+        return;
       }
       this.log.appendLine('Captures cleared — no DOM-visible widgets, forcing real editor creation via file open/close...');
       const t0 = Date.now();
@@ -957,6 +1034,10 @@ export class OverlayPanel {
 
   private dispose() {
     this.cancelActive();
+    if (this.backgroundCaptureTimer) {
+      clearTimeout(this.backgroundCaptureTimer);
+      this.backgroundCaptureTimer = undefined;
+    }
     if (this.ws) {
       try { this.ws.close(); } catch {}
       this.ws = undefined;

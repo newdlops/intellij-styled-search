@@ -1,8 +1,8 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV75) { return 'already patched'; }
-  window.__ijFindPatchedV75 = true;
+  if (window.__ijFindPatchedV76) { return 'already patched'; }
+  window.__ijFindPatchedV76 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
