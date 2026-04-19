@@ -2,7 +2,6 @@ import * as vscode from 'vscode';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
-import * as os from 'os';
 import { SearchOptions, SearchProgress, FileMatch, MatchRange } from './search';
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -126,19 +125,12 @@ export async function runRgSearch(
   if (opts.caseSensitive) { args.push('--case-sensitive'); }
   else { args.push('--ignore-case'); }
   if (opts.wholeWord) { args.push('--word-regexp'); }
-  let candidateListFile: string | undefined;
-  if (candidateFiles && candidateFiles.length > 0) {
-    // Index narrowed the search to a candidate file list. Write it to a
-    // tmp file and pass `--files-from <path>` — previously we fed stdin,
-    // which silently produced 0 matches for every narrowed query (rg
-    // apparently wasn't consuming our writes). A real file path is both
-    // simpler and bypasses any stdin buffering/pipe timing issues.
-    candidateListFile = path.join(
-      os.tmpdir(),
-      `ij-find-files-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`,
-    );
-    fs.writeFileSync(candidateListFile, candidateFiles.join('\n') + '\n', 'utf-8');
-    args.push('--files-from', candidateListFile);
+  // macOS/Linux ARG_MAX is typically ~1MB. With ~80 bytes per path and some
+  // headroom for other args, 5000 paths is a safe ceiling before `spawn`
+  // would start erroring with E2BIG.
+  const MAX_POSITIONAL = 5000;
+  const useNarrowing = !!(candidateFiles && candidateFiles.length > 0 && candidateFiles.length <= MAX_POSITIONAL);
+  if (useNarrowing) {
     // CRITICAL: our trigram index ignores .gitignore (it indexes every
     // non-binary file in the workspace). rg by default *respects*
     // .gitignore, so when we hand it a candidate list that includes
@@ -152,7 +144,15 @@ export async function runRgSearch(
     for (const g of excludeGlobs) { args.push('--glob', '!' + g); }
   }
   args.push('-e', opts.query);
-  if (!candidateFiles || candidateFiles.length === 0) {
+  if (useNarrowing) {
+    // Pass files as positional args after `--`. We previously used
+    // `--files-from=-` (stdin) and `--files-from <file>` (tmp file), but
+    // the bundled @vscode/ripgrep on some installs doesn't recognise
+    // `--files-from` at all (rg exits 2: "unrecognized flag"), which was
+    // showing up as silent 0-match results for every narrowed query.
+    args.push('--');
+    for (const p of candidateFiles!) { args.push(p); }
+  } else {
     // Search each workspace folder.
     for (const f of folders) { args.push('--', f.uri.fsPath); }
   }
@@ -164,9 +164,13 @@ export async function runRgSearch(
 
   if (logger) {
     // Rebuild a shell-quoted command for manual reproduction in a terminal.
+    // For narrowed queries the command includes every candidate path, so
+    // trim the logged line at ~2KB — enough to see the flags without
+    // flooding the output channel with thousands of paths.
     const quoted = args.map((a) => (/[\s"'\\]/.test(a) ? `'${a.replace(/'/g, "'\\''")}'` : a)).join(' ');
+    const shown = quoted.length > 2048 ? quoted.slice(0, 2048) + ` … (${quoted.length} chars total)` : quoted;
     logger(
-      `rg exec: cwd=${folders[0].uri.fsPath} filesFrom=${candidateListFile ? candidateFiles!.length + 'paths' : 'none'} args: ${quoted}`,
+      `rg exec: cwd=${folders[0].uri.fsPath} narrow=${useNarrowing ? candidateFiles!.length + 'paths' : 'none'} args: ${shown}`,
     );
   }
   const child: ChildProcess = spawn(rgPath, args, {
@@ -308,10 +312,6 @@ export async function runRgSearch(
   // knows rg rejected the arguments instead of quietly returning 0 hits.
   if ((exitCode === null || exitCode >= 2) && stderrBuf.trim().length > 0 && !killed) {
     progress.onError(new Error(`ripgrep: ${stderrBuf.trim().slice(0, 300)}`));
-  }
-
-  if (candidateListFile) {
-    try { fs.unlinkSync(candidateListFile); } catch {}
   }
 
   // Final flush (rg sends 'end' per file but last file may not if killed).

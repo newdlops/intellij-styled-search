@@ -465,13 +465,33 @@ export class OverlayPanel {
           return { fid: fid, result: String(showR) };
         })()
       `.trim();
-      const resp = await this.send('Runtime.evaluate', {
+      let resp = await this.send('Runtime.evaluate', {
         expression: script,
         awaitPromise: true,
         returnByValue: true,
         includeCommandLineAPI: true,
       });
-      const v = resp?.result?.value as { fid: number; result: string } | undefined;
+      let v = resp?.result?.value as { fid: number; result: string } | undefined;
+      // Brand-new VSCode windows may have missed the initial patch run
+      // because their renderer wasn't ready yet ("No target available" in
+      // the Injection log). Detect that via `no-show-fn` and run the patch
+      // script again — already-patched windows no-op with 'already patched'.
+      if (v && v.fid && v.result === 'no-show-fn') {
+        this.log.appendLine(`Show(win=${v.fid}): missing patch, re-running inject script...`);
+        try {
+          const report = await this.runPatchScript();
+          this.log.appendLine(`Re-inject: ${report}`);
+        } catch (e) {
+          this.log.appendLine(`Re-inject failed: ${e instanceof Error ? e.message : e}`);
+        }
+        resp = await this.send('Runtime.evaluate', {
+          expression: script,
+          awaitPromise: true,
+          returnByValue: true,
+          includeCommandLineAPI: true,
+        });
+        v = resp?.result?.value as { fid: number; result: string } | undefined;
+      }
       if (!v || !v.fid) {
         this.log.appendLine('show() aborted: no focused VSCode window');
         return;
@@ -620,6 +640,27 @@ export class OverlayPanel {
     await this.send('Runtime.enable', {});
     await this.send('Runtime.addBinding', { name: BRIDGE_BINDING });
 
+    const report = await this.runPatchScript();
+    this.log.appendLine(`Injection: ${report}`);
+    if (!/\bok:/.test(String(report))) {
+      throw new Error(`Renderer patch did not install: ${report}`);
+    }
+    // Immediately sample renderer state via __ijFindStatus to confirm DOM install.
+    try {
+      const status = await this.evalInAllWindowsCollect(
+        `(function(){ try { return window.__ijFindStatus ? window.__ijFindStatus() : 'no-status-fn'; } catch(e){ return 'status-throw:' + (e && e.message); } })()`,
+      );
+      this.log.appendLine(`Post-install status: ${status}`);
+    } catch (e) {
+      this.log.appendLine(`Post-install status probe failed: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  /** Re-run the renderer patch in every workbench window. Windows that
+   *  already have the patch return 'already patched' and are no-ops; windows
+   *  that missed the initial injection (e.g., a brand-new VSCode window whose
+   *  renderer wasn't ready yet) get a fresh attempt. */
+  private async runPatchScript(): Promise<string> {
     // Pass the patch script directly as the expression — no base64/atob round-trip,
     // which previously corrupted any non-ASCII characters (they arrived as raw UTF-8
     // bytes through atob and broke the parser).
@@ -707,20 +748,7 @@ export class OverlayPanel {
       returnByValue: true,
       awaitPromise: true,
     });
-    const report = resp?.result?.value ?? '(no result)';
-    this.log.appendLine(`Injection: ${report}`);
-    if (!/\bok:/.test(String(report))) {
-      throw new Error(`Renderer patch did not install: ${report}`);
-    }
-    // Immediately sample renderer state via __ijFindStatus to confirm DOM install.
-    try {
-      const status = await this.evalInAllWindowsCollect(
-        `(function(){ try { return window.__ijFindStatus ? window.__ijFindStatus() : 'no-status-fn'; } catch(e){ return 'status-throw:' + (e && e.message); } })()`,
-      );
-      this.log.appendLine(`Post-install status: ${status}`);
-    } catch (e) {
-      this.log.appendLine(`Post-install status probe failed: ${e instanceof Error ? e.message : e}`);
-    }
+    return String(resp?.result?.value ?? '(no result)');
   }
 
   private handleWsMessage(data: WebSocket.RawData) {
@@ -739,11 +767,20 @@ export class OverlayPanel {
 
   private handleRendererEvent(payload: string) {
     let evt: RendererEvent & { __seq?: number; __src?: string };
-    try { evt = JSON.parse(payload); } catch { return; }
+    try { evt = JSON.parse(payload); }
+    catch {
+      this.log.appendLine(`handleRendererEvent: JSON parse failed, payload=${payload.slice(0, 120)}`);
+      return;
+    }
     if (typeof evt.__seq === 'number' && typeof evt.__src === 'string') {
       const last = this.lastSeenSeqBySrc.get(evt.__src) ?? -1;
-      if (evt.__seq <= last) { return; }
+      if (evt.__seq <= last) {
+        this.log.appendLine(`dedup drop: type=${(evt as any).type} src=${evt.__src.slice(0, 14)} seq=${evt.__seq} last=${last}`);
+        return;
+      }
       this.lastSeenSeqBySrc.set(evt.__src, evt.__seq);
+    } else {
+      this.log.appendLine(`handleRendererEvent: no __seq/__src, type=${(evt as any).type}`);
     }
     switch (evt.type) {
       case 'search': void this.runSearch(evt.options); break;

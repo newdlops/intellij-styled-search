@@ -2589,6 +2589,13 @@ export function getRendererPatchScript(): string {
     } catch (e) { return 'show-err: ' + (e && e.message); }
   };
   window.__ijFindHide = function () {
+    // doShow fires fire-and-forget __ijFindHide into every non-focused
+    // workbench window to preemptively dismiss any stale overlay. Those
+    // windows never had our panel visible in this session, so we MUST NOT
+    // send cancel from them — it races with the newly-started search in
+    // the focused window and SIGTERMs rg mid-scan (manifests as rg
+    // exit=null + 0 matches).
+    var wasVisible = panel.classList.contains('visible');
     panel.classList.remove('visible');
     panel.style.removeProperty('display');
     panel.style.removeProperty('visibility');
@@ -2601,7 +2608,7 @@ export function getRendererPatchScript(): string {
     // Tear down preview monaco widget so its GPU/DOM resources are released.
     disposePreviewMonacoEditor();
     hideHover();
-    send({ type: 'cancel' });
+    if (wasVisible) { send({ type: 'cancel' }); }
   };
   window.__ijFindStatus = function () {
     try {
