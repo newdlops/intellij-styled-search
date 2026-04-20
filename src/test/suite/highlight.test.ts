@@ -80,11 +80,15 @@ async function pollUntil<T>(
 
 let cdpAvailable = false;
 let monacoReady = false;
+let priorEngineSetting: string | undefined;
 
 suite('Preview highlight — decoration regression', () => {
   suiteSetup(async function () {
     this.timeout(60_000);
     const api = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    priorEngineSetting = cfg.inspect<string>('engine')?.workspaceValue;
+    await cfg.update('engine', 'codesearch', vscode.ConfigurationTarget.Workspace);
     try {
       await api.overlay.awaitInjection();
       cdpAvailable = true;
@@ -124,6 +128,11 @@ suite('Preview highlight — decoration regression', () => {
       // eslint-disable-next-line no-console
       console.warn(`[highlight suite] monaco not ready after forceCapture: ${captureResult}`);
     }
+  });
+
+  suiteTeardown(async function () {
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    await cfg.update('engine', priorEngineSetting, vscode.ConfigurationTarget.Workspace);
   });
 
   test('multi-line match: preview carries at least one decoration whose range spans multiple lines', async function () {

@@ -33,11 +33,20 @@ export interface FileMatch {
   }>;
 }
 
+export interface SearchForTestsResult {
+  matches: FileMatch[];
+  requestedEngine: SearchEngine;
+  effectiveEngine: SearchEngine;
+  fallbackReason?: string;
+}
+
 export interface SearchProgress {
   onFile(match: FileMatch): void;
   onDone(summary: { totalFiles: number; totalMatches: number; truncated: boolean }): void;
   onError(err: Error): void;
 }
+
+export type SearchEngine = 'zoekt' | 'codesearch';
 
 const BINARY_EXT = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp',
@@ -98,6 +107,13 @@ export function getRequestedResultLimit(
   if (!Number.isFinite(raw) || raw === undefined) { return getConfiguredResultLimit(cfg); }
   if (raw <= 0) { return getConfiguredResultLimit(cfg); }
   return Math.max(1, Math.min(Math.floor(raw), HARD_MAX_RESULTS));
+}
+
+export function getConfiguredSearchEngine(
+  cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
+): SearchEngine {
+  const raw = cfg.get<string>('engine', 'zoekt');
+  return raw === 'codesearch' ? 'codesearch' : 'zoekt';
 }
 
 function estimateMatchPayloadSize(match: FileMatch['matches'][number]): number {

@@ -10,11 +10,15 @@ import {
   prioritizeFiles,
   mergeFileMatches,
   getConfiguredResultLimit,
+  getConfiguredSearchEngine,
+  type SearchForTestsResult,
+  type SearchEngine,
 } from './search';
 import { configureRipgrepInstall, ensureRipgrepInstalled, findRipgrepPath, runRgSearch } from './rgSearch';
 import { getRendererPatchScript } from './rendererPatch';
 import { TrigramIndex, extractTrigramsLower } from './trigramIndex';
 import { compileIncludeMatcher } from './pathScope';
+import { ZoektRuntime } from './zoekRuntime';
 
 type RendererEvent =
   | { type: 'search'; options: SearchOptions }
@@ -55,6 +59,8 @@ type OverlayMessage =
 type SearchSession = {
   searchId: number;
   options: SearchOptions;
+  requestedEngine: SearchEngine;
+  effectiveEngine: SearchEngine;
   pageSize: number;
   loadedMatches: number;
   loadedUris: Set<string>;
@@ -79,6 +85,7 @@ type CaptureDiagnosticOptions = {
 
 const BRIDGE_BINDING = 'irSearchMainBridge';
 const RENDERER_BINDING = 'irSearchEvent';
+const ZOEKT_PAGE_SIZE = 1000;
 
 export class OverlayPanel {
   private static instance: OverlayPanel | undefined;
@@ -90,6 +97,7 @@ export class OverlayPanel {
   private log: vscode.OutputChannel;
   private activeWindowId: number | undefined;
   private trigramIndex: TrigramIndex;
+  private zoektRuntime: ZoektRuntime;
   private pendingShow: PendingShow | null = null;
   private showInFlight = false;
   private capturePromise: Promise<void> | undefined;
@@ -121,13 +129,40 @@ export class OverlayPanel {
     context.subscriptions.push({ dispose: () => this.dispose() });
     configureRipgrepInstall(context);
     void ensureRipgrepInstalled((msg) => this.log.appendLine(msg));
-    // Kick off the trigram index in the background. Search remains available
-    // (via full scan) while the initial build runs.
     this.trigramIndex = new TrigramIndex(context.globalStorageUri, this.log);
-    void this.trigramIndex.init().catch((err) => {
-      this.log.appendLine(`TrigramIndex init failed: ${err instanceof Error ? err.message : err}`);
-    });
     context.subscriptions.push({ dispose: () => this.trigramIndex.dispose() });
+    this.zoektRuntime = new ZoektRuntime(context, this.log);
+    context.subscriptions.push({ dispose: () => this.zoektRuntime.dispose() });
+    const initialEngine = getConfiguredSearchEngine();
+    if (initialEngine === 'codesearch') {
+      this.startTrigramIndexInit('activation');
+    } else {
+      void this.trigramIndex.clear('zoekt selected on activation').catch((err) => {
+        this.log.appendLine(`TrigramIndex clear failed: ${err instanceof Error ? err.message : err}`);
+      });
+    }
+    context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration('intellijStyledSearch.engine')) { return; }
+      const engine = getConfiguredSearchEngine();
+      this.log.appendLine(`search engine changed: ${engine}`);
+      if (engine === 'zoekt') {
+        void this.trigramIndex.clear('zoekt selected in settings').catch((err) => {
+          this.log.appendLine(`TrigramIndex clear failed: ${err instanceof Error ? err.message : err}`);
+        });
+      } else {
+        this.zoektRuntime.cancelRunningProcesses('engine switched to codesearch');
+        this.startTrigramIndexInit('engine switch');
+        this.log.appendLine('codesearch selected; warming local trigram cache in background.');
+      }
+    }));
+  }
+
+  private startTrigramIndexInit(reason: string): void {
+    void this.trigramIndex.init().catch((err) => {
+      this.log.appendLine(
+        `TrigramIndex init failed (${reason}): ${err instanceof Error ? err.message : err}`,
+      );
+    });
   }
 
   /** Kick CDP + patch install off the critical path of the first command. */
@@ -164,6 +199,9 @@ export class OverlayPanel {
       } else {
         this.log.appendLine('Prewarm: skipping background Monaco warmup because no visible editors are open yet.');
       }
+      void this.zoektRuntime.prewarmIfPreferred().catch((err) => {
+        this.log.appendLine(`zoek-rs prewarm failed: ${err instanceof Error ? err.message : err}`);
+      });
     } catch (err) {
       this.log.appendLine(`Prewarm failed: ${err instanceof Error ? err.message : err}`);
     }
@@ -669,6 +707,12 @@ export class OverlayPanel {
   /** @internal Used by E2E tests to wait for the index to finish its
    *  initial disk load + reconcile before asserting search behaviour. */
   async waitForIndexReady(timeoutMs = 60_000): Promise<void> {
+    const engine = getConfiguredSearchEngine();
+    if (engine === 'zoekt') {
+      await this.zoektRuntime.waitForIdle(timeoutMs);
+      return;
+    }
+
     const start = Date.now();
     while (!this.trigramIndex.isReady) {
       if (Date.now() - start > timeoutMs) {
@@ -682,10 +726,47 @@ export class OverlayPanel {
    *  FileMatch events synchronously and return them. Skips the overlay UI
    *  (no CDP, no renderer) — tests get deterministic results independent
    *  of the VSCode window state. */
-  async searchForTests(options: SearchOptions): Promise<FileMatch[]> {
+  async searchForTestsDetailed(options: SearchOptions): Promise<SearchForTestsResult> {
     const folders = vscode.workspace.workspaceFolders;
-    if (!folders || folders.length === 0) { return []; }
+    const requestedEngine = getConfiguredSearchEngine();
+    if (!folders || folders.length === 0) {
+      return {
+        matches: [],
+        requestedEngine,
+        effectiveEngine: requestedEngine,
+        fallbackReason: 'no workspace folder',
+      };
+    }
+    if (!options.query) {
+      return {
+        matches: [],
+        requestedEngine,
+        effectiveEngine: requestedEngine,
+      };
+    }
     const matches: FileMatch[] = [];
+    let effectiveEngine: SearchEngine = requestedEngine;
+    let fallbackReason: string | undefined;
+    if (requestedEngine === 'zoekt') {
+      const readiness = await this.zoektRuntime.runSearch(
+        options,
+        new vscode.CancellationTokenSource().token,
+        {
+          onFile: (m) => { matches.push(m); },
+          onDone: () => {},
+          onError: (err) => { throw err; },
+        },
+      );
+      if (readiness.ready) {
+        return {
+          matches: mergeFileMatches(matches),
+          requestedEngine,
+          effectiveEngine,
+        };
+      }
+      effectiveEngine = 'codesearch';
+      fallbackReason = readiness.reason;
+    }
     const { uris: candidates } = this.trigramIndex.candidatesFor(options.query, {
       useRegex: options.useRegex,
       caseSensitive: options.caseSensitive,
@@ -693,7 +774,14 @@ export class OverlayPanel {
     });
     let paths: string[] | null = null;
     if (candidates) {
-      if (candidates.size === 0) { return []; }
+      if (candidates.size === 0) {
+        return {
+          matches: [],
+          requestedEngine,
+          effectiveEngine,
+          fallbackReason,
+        };
+      }
       const uris: vscode.Uri[] = [];
       for (const u of candidates) {
         try { uris.push(vscode.Uri.parse(u)); } catch {}
@@ -713,7 +801,17 @@ export class OverlayPanel {
         paths,
       ).catch(reject);
     });
-    return mergeFileMatches(matches);
+    return {
+      matches: mergeFileMatches(matches),
+      requestedEngine,
+      effectiveEngine,
+      fallbackReason,
+    };
+  }
+
+  async searchForTests(options: SearchOptions): Promise<FileMatch[]> {
+    const result = await this.searchForTestsDetailed(options);
+    return result.matches;
   }
 
   /** @internal Exposed so tests can drive the index directly. */
@@ -862,17 +960,36 @@ export class OverlayPanel {
           cancellable: false,
         },
         async (ui) => {
+          const engine = getConfiguredSearchEngine();
+          this.log.appendLine(`rebuildIndex: engine=${engine}`);
           try {
-            await this.trigramIndex.rebuild({
-              report: (stage, current, total) => {
-                if (total > 0) {
-                  const pct = Math.min(100, Math.round((current / total) * 100));
-                  ui.report({ message: `${stage} ${current}/${total} (${pct}%)` });
-                } else {
-                  ui.report({ message: stage });
+            if (engine === 'codesearch') {
+              this.zoektRuntime.cancelRunningProcesses('codesearch rebuild requested');
+              await this.trigramIndex.rebuild({
+                report: (stage, current, total) => {
+                  if (total > 0) {
+                    const pct = Math.min(100, Math.round((current / total) * 100));
+                    ui.report({ message: `${stage} ${current}/${total} (${pct}%)` });
+                  } else {
+                    ui.report({ message: stage });
+                  }
+                },
+              });
+            } else {
+              this.zoektRuntime.cancelRunningProcesses('zoekt rebuild requested');
+              ui.report({ message: 'clearing codesearch trigram cache' });
+              await this.trigramIndex.clear('zoekt rebuild requested');
+              try {
+                const usedZoekt = await this.zoektRuntime.rebuildIndex((message) => {
+                  ui.report({ message });
+                });
+                if (!usedZoekt) {
+                  this.log.appendLine('zoek-rs rebuild skipped; active zoekt engine remains unavailable.');
                 }
-              },
-            });
+              } catch (err) {
+                this.log.appendLine(`zoek-rs rebuild failed: ${err instanceof Error ? err.message : err}`);
+              }
+            }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             this.log.appendLine(`Rebuild failed: ${msg}`);
@@ -920,6 +1037,30 @@ export class OverlayPanel {
     }
     this.log.show(true);
     for (const l of lines) { this.log.appendLine(l); }
+  }
+
+  async showZoektInfo(): Promise<void> {
+    const info = await this.zoektRuntime.collectInfo();
+    if (!info) {
+      vscode.window.showWarningMessage('zoek-rs info is unavailable.');
+      return;
+    }
+    this.log.show(true);
+    this.log.appendLine(this.zoektRuntime.formatInfoReport(info));
+  }
+
+  async explainZoektQuery(options: SearchOptions): Promise<void> {
+    if (!options.query) {
+      vscode.window.showWarningMessage('Enter a query first.');
+      return;
+    }
+    const response = await this.zoektRuntime.diagnoseQuery(options);
+    if (!response) {
+      vscode.window.showWarningMessage('zoek-rs diagnose is unavailable.');
+      return;
+    }
+    this.log.show(true);
+    this.log.appendLine(this.zoektRuntime.formatDiagnoseReport(response));
   }
 
   async show(initialQuery: string, options?: ShowOptions): Promise<void> {
@@ -1129,6 +1270,7 @@ export class OverlayPanel {
 
   private dispose() {
     this.cancelActive();
+    this.zoektRuntime.cancelRunningProcesses('overlay disposed');
     if (this.backgroundCaptureTimer) {
       clearTimeout(this.backgroundCaptureTimer);
       this.backgroundCaptureTimer = undefined;
@@ -1412,6 +1554,7 @@ export class OverlayPanel {
       case 'cancel':
         this.currentSearchSession = undefined;
         this.cancelActive();
+        this.zoektRuntime.cancelRunningProcesses('search panel closed');
         break;
       case 'openFile': void this.openFile(evt.uri, evt.line, evt.column, false); break;
       case 'previewFile': void this.openFile(evt.uri, evt.line, evt.column, true); break;
@@ -1618,13 +1761,57 @@ export class OverlayPanel {
     };
   }
 
+  private pageSizeForEngine(engine: SearchEngine): number {
+    return engine === 'zoekt' ? ZOEKT_PAGE_SIZE : getConfiguredResultLimit();
+  }
+
   private async runSearch(options: SearchOptions) {
     this.cancelActive();
     const searchId = ++this.searchSeq;
-    const pageSize = getConfiguredResultLimit();
+    const requestedEngine = getConfiguredSearchEngine();
+    const emptyPageSize = this.pageSizeForEngine(requestedEngine);
+    if (!options.query) {
+      this.currentSearchSession = {
+        searchId,
+        options: this.baseSearchOptions(options),
+        requestedEngine,
+        effectiveEngine: requestedEngine,
+        pageSize: emptyPageSize,
+        loadedMatches: 0,
+        loadedUris: new Set<string>(),
+        hasMore: false,
+        orderedCandidatePaths: null,
+        scopedCandidateUris: null,
+      };
+      await this.postToRenderer({ type: 'results:start', searchId });
+      await this.postToRenderer({
+        type: 'results:done',
+        searchId,
+        totalFiles: 0,
+        totalMatches: 0,
+        truncated: false,
+        pageSize: emptyPageSize,
+        pageFiles: 0,
+        pageMatches: 0,
+        offset: 0,
+      });
+      return;
+    }
+    let effectiveEngine: SearchEngine = requestedEngine;
+    let fallbackReason: string | undefined;
+    if (requestedEngine === 'zoekt') {
+      const readiness = await this.zoektRuntime.getSearchReadiness();
+      if (!readiness.ready) {
+        effectiveEngine = 'codesearch';
+        fallbackReason = readiness.reason;
+      }
+    }
+    const pageSize = this.pageSizeForEngine(effectiveEngine);
     const session: SearchSession = {
       searchId,
       options: this.baseSearchOptions(options),
+      requestedEngine,
+      effectiveEngine,
       pageSize,
       loadedMatches: 0,
       loadedUris: new Set<string>(),
@@ -1636,6 +1823,7 @@ export class OverlayPanel {
     await this.postToRenderer({ type: 'results:start', searchId });
     const t0 = Date.now();
     const optTags = [
+      requestedEngine === effectiveEngine ? `engine=${requestedEngine}` : `engine=${requestedEngine}->${effectiveEngine}`,
       options.useRegex ? 'regex' : '',
       options.caseSensitive ? 'case' : '',
       options.wholeWord ? 'word' : '',
@@ -1645,7 +1833,18 @@ export class OverlayPanel {
     this.log.appendLine(
       `search start: len=${options.query.length} flags=[${optTags}] indexReady=${this.trigramIndex.isReady} indexSize=${this.trigramIndex.size}`,
     );
+    if (requestedEngine === 'zoekt' && effectiveEngine === 'codesearch') {
+      this.log.appendLine(
+        `Search engine zoekt selected; using codesearch fallback${fallbackReason ? ` (${fallbackReason})` : ''}.`,
+      );
+    }
     try {
+      if (session.effectiveEngine === 'zoekt') {
+        session.scopedCandidateUris = null;
+        session.orderedCandidatePaths = null;
+        await this.runSearchPage(session, t0);
+        return;
+      }
       // Cox's codesearch planner narrows rg's file set. If the index
       // returns null, the planner couldn't constrain — rg walks the whole
       // workspace. If the index returns an empty set, the regex can't
@@ -1787,18 +1986,40 @@ export class OverlayPanel {
       resultLimit: session.pageSize,
     };
     try {
-      const rgPath = findRipgrepPath();
-      if (rgPath) {
-        await runRgSearch(
-          pageOptions,
-          cts.token,
-          progress,
-          session.orderedCandidatePaths,
-          (m) => this.log.appendLine(m),
-        );
+      if (session.effectiveEngine === 'codesearch') {
+        const rgPath = findRipgrepPath();
+        if (rgPath) {
+          await runRgSearch(
+            pageOptions,
+            cts.token,
+            progress,
+            session.orderedCandidatePaths,
+            (m) => this.log.appendLine(m),
+          );
+        } else {
+          this.log.appendLine('rg not found — falling back to JS scan.');
+          await runSearch(pageOptions, cts.token, progress, session.scopedCandidateUris);
+        }
       } else {
-        this.log.appendLine('rg not found — falling back to JS scan.');
-        await runSearch(pageOptions, cts.token, progress, session.scopedCandidateUris);
+        const readiness = await this.zoektRuntime.runSearch(pageOptions, cts.token, progress);
+        if (!readiness.ready && !cts.token.isCancellationRequested) {
+          session.effectiveEngine = 'codesearch';
+          this.log.appendLine(
+            `zoek-rs runtime unavailable${readiness.reason ? ` (${readiness.reason})` : ''} — falling back to codesearch.`,
+          );
+          const rgPath = findRipgrepPath();
+          if (rgPath) {
+            await runRgSearch(
+              pageOptions,
+              cts.token,
+              progress,
+              session.orderedCandidatePaths,
+              (m) => this.log.appendLine(m),
+            );
+          } else {
+            await runSearch(pageOptions, cts.token, progress, session.scopedCandidateUris);
+          }
+        }
       }
     } finally {
       if (this.activeSearch === cts) {

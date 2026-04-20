@@ -41,7 +41,7 @@ suite('Resilience — bridge auto-repair', () => {
     const api = await getApi();
 
     // Prime with one successful show so activeWindowId etc. are set.
-    await api.overlay.show('class AlphaService:');
+    await api.overlay.show('AlphaService');
     const before = api.overlay.getConnectionStateForTests();
     assert.ok(before.wsOpen, 'WebSocket should be open before kill');
 
@@ -52,9 +52,9 @@ suite('Resilience — bridge auto-repair', () => {
     // The next show() must transparently reopen CDP + reinject the patch
     // and still deliver a search result. If ensureInjected / auto-repair
     // regresses, this hangs or leaves input/searching in a bad state.
-    await api.overlay.show('class BetaWidget');
+    await api.overlay.show('BetaWidget');
     // Poll for searching=false with input value reflecting the new query.
-    const expectedQuery = 'class BetaWidget';
+    const expectedQuery = 'BetaWidget';
     const deadline = Date.now() + 10_000;
     let s: any;
     while (Date.now() < deadline) {

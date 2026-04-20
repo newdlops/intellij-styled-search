@@ -1,0 +1,18 @@
+{
+    "sourceFile": ".vscodeignore",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 0,
+            "patches": [
+                {
+                    "date": 1776663664415,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                }
+            ],
+            "date": 1776663664415,
+            "name": "Commit-0",
+            "content": ".vscode/**\n.vscode-test/**\n.claude/**\n.lh/**\nscripts/**\nsrc/**\n.gitignore\ntsconfig.json\n**/*.map\n**/*.ts\nnode_modules/**\n!node_modules/ws/**\nout/test/**\ntests/**\n.vscode-test.mjs\nvscode_monacoeditor_monkeypatch.md\ntarget"
+        }
+    ]
+}

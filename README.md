@@ -21,6 +21,9 @@ IntelliJ Styled Search adds an IntelliJ IDEA-like project search panel to VS Cod
 | `IntelliJ Search: Find Selection in Project` | Search the current selection. |
 | `IntelliJ Search: Reinject Renderer Patch (Recovery)` | Reinstall the renderer overlay if VS Code's renderer state changes. |
 | `IntelliJ Search: Rebuild Search Index` | Rebuild the trigram search index. |
+| `IntelliJ Search: Switch Search Engine` | Switch between `zoekt` and `codesearch`, then rebuild the selected engine. |
+| `IntelliJ Search: Show Zoekt Diagnostics` | Print shard, overlay, journal, and process stats for the Rust engine. |
+| `IntelliJ Search: Explain Query With Zoekt` | Print the Rust engine's candidate plan for a query. |
 | `IntelliJ Search: Diagnose Active File in Search Index` | Inspect why the active file may not be in the index. |
 
 ## Keybindings
@@ -34,6 +37,7 @@ IntelliJ Styled Search adds an IntelliJ IDEA-like project search panel to VS Cod
 
 | Setting | Default | Description |
 | --- | --- | --- |
+| `intellijStyledSearch.engine` | `zoekt` | Search engine selection. `zoekt` uses the Rust local shard/mmap engine and falls back to `codesearch` while the runtime is unavailable or still preparing its index. `codesearch` is the current TypeScript codesearch planner plus ripgrep verifier. |
 | `intellijStyledSearch.excludeGlobs` | common build/cache folders | Glob patterns excluded from full searches. |
 | `intellijStyledSearch.maxFileSize` | `1048576` | Maximum file size in bytes to search. |
 | `intellijStyledSearch.maxResults` | `2000` | Match lines to load per batch. Scrolling near the bottom loads the next batch. Values at or below `0` use the built-in default. |
@@ -50,7 +54,10 @@ The editable preview relies on VS Code renderer internals. If the overlay appear
 npm install
 npm run compile
 npm test
+npm run bench:zoekt -- --files 10000,50000,100000
 ```
+
+`npm run bench:zoekt` saves a timestamped artifact plus `latest.json` under `artifacts/benchmarks/zoekt/`. The artifact includes the raw benchmark response, wall-clock runtime, git commit, Rust toolchain versions, and host metadata so repeated runs stay comparable.
 
 Package locally:
 

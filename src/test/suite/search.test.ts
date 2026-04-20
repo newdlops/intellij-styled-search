@@ -1,7 +1,8 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import type { ExtensionTestApi } from '../../extension';
-import type { FileMatch } from '../../search';
+import { getConfiguredSearchEngine, type FileMatch, type SearchForTestsResult } from '../../search';
+import { extractTrigramsLower } from '../../trigramIndex';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 
@@ -19,12 +20,89 @@ function countMatchLines(matches: FileMatch[]): number {
   return matches.reduce((sum, m) => sum + m.matches.length, 0);
 }
 
+function formatEngineRoute(result: SearchForTestsResult): string {
+  return [
+    `requested=${result.requestedEngine}`,
+    `effective=${result.effectiveEngine}`,
+    `fallback=${result.fallbackReason ?? 'none'}`,
+  ].join(' ');
+}
+
 suite('Search — engine end-to-end against fixture workspace', () => {
   suiteSetup(async function () {
     this.timeout(60_000);
     const { overlay } = await getApi();
     await overlay.rebuildIndex();
     await overlay.waitForIndexReady(30_000);
+  });
+
+  test('search engine setting accepts zoekt and codesearch, defaulting invalid values to zoekt', () => {
+    const cfg = (value: string) => ({
+      get: <T>(_key: string, _fallback: T) => value as T,
+    }) as vscode.WorkspaceConfiguration;
+
+    assert.strictEqual(getConfiguredSearchEngine(cfg('zoekt')), 'zoekt');
+    assert.strictEqual(getConfiguredSearchEngine(cfg('codesearch')), 'codesearch');
+    assert.strictEqual(getConfiguredSearchEngine(cfg('bad-value')), 'zoekt');
+  });
+
+  test('fixture workspace searches execute via zoekt without fallback', async () => {
+    const { overlay } = await getApi();
+    const result = await overlay.searchForTestsDetailed({
+      query: 'class AlphaService:',
+      caseSensitive: false,
+      wholeWord: false,
+      useRegex: false,
+    });
+    console.log(`[zoek-e2e] ${formatEngineRoute(result)}`);
+    assert.strictEqual(result.requestedEngine, 'zoekt');
+    assert.strictEqual(
+      result.effectiveEngine,
+      'zoekt',
+      `expected fixture search to stay on zoekt; ${formatEngineRoute(result)}`,
+    );
+    assert.deepStrictEqual(relPaths(result.matches), ['alpha.py']);
+  });
+
+  test('rebuildIndex follows codesearch setting and repopulates the trigram cache', async function () {
+    this.timeout(60_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const prior = cfg.inspect<string>('engine');
+    const generated = vscode.Uri.joinPath(folder!.uri, 'rebuild-codesearch.txt');
+    const query = 'codesearch_rebuild_marker_token';
+
+    try {
+      await cfg.update('engine', 'codesearch', vscode.ConfigurationTarget.Workspace);
+      await vscode.workspace.fs.writeFile(generated, Buffer.from(`export const VALUE = "${query}";\n`, 'utf8'));
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+
+      const diagnosis = overlay.getTrigramIndex().diagnoseFile(
+        generated.toString(),
+        extractTrigramsLower(query),
+      );
+      assert.ok(diagnosis.inIndex, 'expected generated file to be present in the trigram index after rebuild');
+      assert.ok(diagnosis.presentInFile > 0, 'expected generated file to contribute trigrams after rebuild');
+
+      const result = await overlay.searchForTestsDetailed({
+        query,
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      });
+      console.log(`[rebuild-e2e] ${formatEngineRoute(result)}`);
+      assert.strictEqual(result.requestedEngine, 'codesearch');
+      assert.strictEqual(result.effectiveEngine, 'codesearch');
+      assert.deepStrictEqual(relPaths(result.matches), ['rebuild-codesearch.txt']);
+    } finally {
+      try { await vscode.workspace.fs.delete(generated); } catch {}
+      await cfg.update('engine', prior?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+    }
   });
 
   test('literal single-line match returns exactly the expected file', async () => {
@@ -277,23 +355,37 @@ suite('Search — engine end-to-end against fixture workspace', () => {
   // Trigram intersection must return a narrowed candidate set for
   // multi-line literal queries — the block's long unique text is exactly
   // where narrowing wins big.
-  test('multi-line literal candidatesFor returns narrowed set including the matching file', async () => {
+  test('multi-line literal candidatesFor returns narrowed set including the matching file', async function () {
+    this.timeout(60_000);
     const { overlay } = await getApi();
-    const idx = overlay.getTrigramIndex();
-    const query = [
-      '> Line one of the pull quote.',
-      '> Line two continues here.',
-      '> Line three wraps up.',
-    ].join('\n');
-    const { uris, reason } = idx.candidatesFor(query, {
-      useRegex: false,
-      caseSensitive: false,
-      wholeWord: false,
-    });
-    assert.ok(uris !== null, `expected narrowed candidate set for multi-line literal, got null (reason=${reason})`);
-    assert.ok(uris!.size > 0, `expected at least the matching file in candidates, got empty set (reason=${reason})`);
-    assert.ok(uris!.size < idx.size, `narrowing should be stricter than the whole index; got size=${uris!.size}/${idx.size} reason=${reason}`);
-    const docsMd = Array.from(uris!).find((u) => u.endsWith('/docs.md'));
-    assert.ok(docsMd, `docs.md (the file containing the block) must be in candidate set; got ${JSON.stringify(Array.from(uris!).slice(0, 5))} reason=${reason}`);
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const prior = cfg.inspect<string>('engine');
+
+    try {
+      await cfg.update('engine', 'codesearch', vscode.ConfigurationTarget.Workspace);
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+
+      const idx = overlay.getTrigramIndex();
+      const query = [
+        '> Line one of the pull quote.',
+        '> Line two continues here.',
+        '> Line three wraps up.',
+      ].join('\n');
+      const { uris, reason } = idx.candidatesFor(query, {
+        useRegex: false,
+        caseSensitive: false,
+        wholeWord: false,
+      });
+      assert.ok(uris !== null, `expected narrowed candidate set for multi-line literal, got null (reason=${reason})`);
+      assert.ok(uris!.size > 0, `expected at least the matching file in candidates, got empty set (reason=${reason})`);
+      assert.ok(uris!.size < idx.size, `narrowing should be stricter than the whole index; got size=${uris!.size}/${idx.size} reason=${reason}`);
+      const docsMd = Array.from(uris!).find((u) => u.endsWith('/docs.md'));
+      assert.ok(docsMd, `docs.md (the file containing the block) must be in candidate set; got ${JSON.stringify(Array.from(uris!).slice(0, 5))} reason=${reason}`);
+    } finally {
+      await cfg.update('engine', prior?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+    }
   });
 });

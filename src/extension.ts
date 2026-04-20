@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { OverlayPanel } from './overlayPanel';
+import type { SearchEngine } from './search';
 
 /** Shape exposed via `ext.exports` for integration / E2E tests. Plain
  *  production consumers don't need to touch this. */
@@ -37,6 +38,60 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
         const msg = err instanceof Error ? err.message : String(err);
         vscode.window.showErrorMessage(`Index rebuild failed: ${msg}`);
       }
+    }),
+    vscode.commands.registerCommand('intellijStyledSearch.switchEngine', async () => {
+      overlay.logCommand('switchEngine');
+      const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+      const current = cfg.get<SearchEngine>('engine', 'zoekt') === 'codesearch' ? 'codesearch' : 'zoekt';
+      const picked = await vscode.window.showQuickPick(
+        [
+          {
+            label: 'zoekt',
+            description: current === 'zoekt' ? 'Current' : 'Rust shard/mmap engine',
+            target: 'zoekt' as SearchEngine,
+          },
+          {
+            label: 'codesearch',
+            description: current === 'codesearch' ? 'Current' : 'TypeScript trigram + ripgrep engine',
+            target: 'codesearch' as SearchEngine,
+          },
+        ],
+        {
+          title: 'Switch Search Engine',
+          placeHolder: `Current engine: ${current}`,
+        },
+      );
+      if (!picked || picked.target === current) { return; }
+      const target = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+        ? vscode.ConfigurationTarget.Workspace
+        : vscode.ConfigurationTarget.Global;
+      try {
+        await cfg.update('engine', picked.target, target);
+        await overlay.rebuildIndex();
+        vscode.window.showInformationMessage(`IntelliJ Styled Search: switched engine to ${picked.target}.`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(`Search engine switch failed: ${msg}`);
+      }
+    }),
+    vscode.commands.registerCommand('intellijStyledSearch.showZoektInfo', async () => {
+      overlay.logCommand('showZoektInfo');
+      await overlay.showZoektInfo();
+    }),
+    vscode.commands.registerCommand('intellijStyledSearch.explainZoektQuery', async () => {
+      overlay.logCommand('explainZoektQuery');
+      const query = await vscode.window.showInputBox({
+        prompt: 'Query to explain with zoek-rs',
+        value: getQueryFromActiveEditor(),
+        placeHolder: 'e.g. class AlphaService:',
+      });
+      if (query === undefined) { return; }
+      await overlay.explainZoektQuery({
+        query,
+        caseSensitive: false,
+        wholeWord: false,
+        useRegex: false,
+      });
     }),
     vscode.commands.registerCommand('intellijStyledSearch.diagnoseFileInIndex', async () => {
       overlay.logCommand('diagnoseFileInIndex');

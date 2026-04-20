@@ -46,11 +46,15 @@ async function waitUntil(
 }
 
 let cdpAvailable = false;
+let priorEngineSetting: string | undefined;
 
 suite('Extension-typing filter — client-side narrowing', () => {
   suiteSetup(async function () {
     this.timeout(30_000);
     const api = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    priorEngineSetting = cfg.inspect<string>('engine')?.workspaceValue;
+    await cfg.update('engine', 'codesearch', vscode.ConfigurationTarget.Workspace);
     try {
       await api.overlay.awaitInjection();
       cdpAvailable = true;
@@ -87,6 +91,11 @@ suite('Extension-typing filter — client-side narrowing', () => {
     );
   });
 
+  suiteTeardown(async function () {
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    await cfg.update('engine', priorEngineSetting, vscode.ConfigurationTarget.Workspace);
+  });
+
   // Later test suites (e.g. preview highlight) reuse the overlay's scope
   // input across suites — if this suite leaves scope=nested/ set in the
   // DOM, the next suite's multi-line search runs with that scope and
@@ -111,31 +120,33 @@ suite('Extension-typing filter — client-side narrowing', () => {
     this.timeout(15_000);
     const api = await getApi();
 
-    // First search — sets rgQuery on the renderer side.
-    await api.overlay.show('class');
+    // First search — sets rgQuery on the renderer side. Keep the seed
+    // query narrow so the test doesn't depend on scanning every common
+    // `class` token in the repo and bundled VS Code test install.
+    await api.overlay.show('Beta');
     const afterFirst = await waitUntil(
       api,
-      (s) => !s.searching && s.rgQuery === 'class',
+      (s) => !s.searching && s.rgQuery === 'Beta',
       10_000,
-      'first search to settle with rgQuery=class',
+      'first search to settle with rgQuery=Beta',
     );
-    assert.strictEqual(afterFirst.rgQuery, 'class');
+    assert.strictEqual(afterFirst.rgQuery, 'Beta');
     assert.strictEqual(afterFirst.filterQuery, '', 'filterQuery should be empty after a full rg run');
 
     // Second search — extension of the first. Depending on the exact
     // renderer path, this may stay as a client-side narrowing pass or
     // become a fresh rg run. What must hold is that the renderer lands on
     // the new query and drives search state from it.
-    await api.overlay.show('class BetaWidget');
+    await api.overlay.show('BetaWidget');
     const afterExt = await waitUntil(
       api,
-      (s) => s.inputValue === 'class BetaWidget' && (s.filterQuery === 'class BetaWidget' || s.rgQuery === 'class BetaWidget'),
+      (s) => s.inputValue === 'BetaWidget' && (s.filterQuery === 'BetaWidget' || s.rgQuery === 'BetaWidget'),
       5_000,
       'extension query to reach input and active search state',
     );
-    assert.strictEqual(afterExt.inputValue, 'class BetaWidget');
+    assert.strictEqual(afterExt.inputValue, 'BetaWidget');
     assert.ok(
-      afterExt.filterQuery === 'class BetaWidget' || afterExt.rgQuery === 'class BetaWidget',
+      afterExt.filterQuery === 'BetaWidget' || afterExt.rgQuery === 'BetaWidget',
       `new query did not propagate into renderer state: ${JSON.stringify(afterExt)}`,
     );
   });

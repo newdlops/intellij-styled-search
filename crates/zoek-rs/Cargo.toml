@@ -1,0 +1,17 @@
+[package]
+name = "zoek-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "zoek_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zoek-rs"
+path = "src/bin/zoek-rs.rs"
+
+[dependencies]
+regex = "1.11.1"

@@ -148,6 +148,7 @@ export class TrigramIndex {
   private postingsStart = 0;
   private initPromise: Promise<void> | undefined;
   private rebuildPromise: Promise<void> | undefined;
+  private clearPromise: Promise<void> | undefined;
   private saveTimer: NodeJS.Timeout | undefined;
   private watcher: vscode.FileSystemWatcher | undefined;
 
@@ -210,6 +211,9 @@ export class TrigramIndex {
   }
 
   async init(): Promise<void> {
+    if (this.clearPromise) {
+      try { await this.clearPromise; } catch {}
+    }
     if (!this.initPromise) { this.initPromise = this.doInit(); }
     return this.initPromise;
   }
@@ -470,8 +474,48 @@ export class TrigramIndex {
     return this.rebuildPromise;
   }
 
+  async clear(reason = 'manual clear'): Promise<void> {
+    if (this.clearPromise) { return this.clearPromise; }
+    this.clearPromise = this.doClear(reason).finally(() => {
+      this.clearPromise = undefined;
+    });
+    return this.clearPromise;
+  }
+
+  private async doClear(reason: string): Promise<void> {
+    if (this.rebuildPromise) {
+      try { await this.rebuildPromise; } catch {}
+    }
+    if (this.initPromise) {
+      try { await this.initPromise; } catch {}
+    }
+    if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = undefined; }
+    if (this.watcher) { this.watcher.dispose(); this.watcher = undefined; }
+    this.ready = false;
+    this.dirty = false;
+    if (this.fd !== undefined) {
+      try { fs.closeSync(this.fd); } catch {}
+      this.fd = undefined;
+    }
+    this.tris.clear();
+    this.fileMeta.clear();
+    this.uriToId.clear();
+    this.stale.clear();
+    this.nextId = 1;
+    const fileUri = vscode.Uri.joinPath(this.storageDir, this.indexFileName());
+    try {
+      await vscode.workspace.fs.delete(fileUri, { useTrash: false });
+      this.log.appendLine(`TrigramIndex cleared (${reason}): deleted ${fileUri.fsPath}`);
+    } catch {
+      this.log.appendLine(`TrigramIndex cleared (${reason}): no persisted cache to delete`);
+    }
+  }
+
   private async doRebuild(progress?: ReconcileProgress): Promise<void> {
     progress?.report('waiting for initial load', 0, 0);
+    if (this.clearPromise) {
+      try { await this.clearPromise; } catch {}
+    }
     if (this.initPromise) {
       // Let the initial load finish its reconcile so we don't have two
       // concurrent 100K-file scans hammering the FS.
@@ -500,6 +544,7 @@ export class TrigramIndex {
       // ENOENT etc. — next save will write it either way.
     }
     this.log.appendLine('TrigramIndex: rebuilding from scratch...');
+    if (!this.watcher) { this.startWatcher(); }
     await this.reconcileWorkspace(progress);
     this.ready = true;
     this.log.appendLine(

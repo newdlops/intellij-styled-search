@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -54,6 +54,21 @@
         "category": "IntelliJ Search"
       },
       {
+        "command": "intellijStyledSearch.switchEngine",
+        "title": "Switch Search Engine",
+        "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.showZoektInfo",
+        "title": "Show Zoekt Diagnostics",
+        "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.explainZoektQuery",
+        "title": "Explain Query With Zoekt",
+        "category": "IntelliJ Search"
+      },
+      {
         "command": "intellijStyledSearch.diagnoseFileInIndex",
         "title": "Diagnose Active File in Search Index",
         "category": "IntelliJ Search"
@@ -84,6 +99,15 @@
     "configuration": {
       "title": "IntelliJ Styled Search",
       "properties": {
+        "intellijStyledSearch.engine": {
+          "type": "string",
+          "enum": [
+            "zoekt",
+            "codesearch"
+          ],
+          "default": "zoekt",
+          "markdownDescription": "Search engine to use. `zoekt` runs the Rust local shard/mmap engine with automatic codesearch fallback when the runtime is unavailable or still warming up. `codesearch` uses the existing TypeScript planner plus ripgrep verifier."
+        },
         "intellijStyledSearch.excludeGlobs": {
           "type": "array",
           "default": [
@@ -112,6 +136,7 @@
   },
   "scripts": {
     "bundle:monaco": "node scripts/bundleMonaco.js",
+    "bench:zoekt": "node scripts/runZoektBenchmark.js",
     "compile": "npm run bundle:monaco && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile",

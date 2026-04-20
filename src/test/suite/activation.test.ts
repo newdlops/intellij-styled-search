@@ -26,6 +26,9 @@ suite('Activation', () => {
       'intellijStyledSearch.searchSelection',
       'intellijStyledSearch.reinject',
       'intellijStyledSearch.rebuildIndex',
+      'intellijStyledSearch.switchEngine',
+      'intellijStyledSearch.showZoektInfo',
+      'intellijStyledSearch.explainZoektQuery',
       'intellijStyledSearch.diagnoseFileInIndex',
     ];
     const all = await vscode.commands.getCommands(true);
@@ -35,15 +38,19 @@ suite('Activation', () => {
   });
 
   test('trigram index reaches ready state on fixture workspace', async function () {
-    // `rebuild()` walks the small fixture workspace (a handful of files).
-    // On a cold CI runner this still finishes in well under 5s; pad for
-    // the initial reconcile that runs concurrently from the worker load.
+    // Default engine is zoekt. A rebuild should make the Rust engine ready
+    // without falling back to codesearch.
     this.timeout(60_000);
     const { overlay } = await getApi();
     await overlay.rebuildIndex();
     await overlay.waitForIndexReady(30_000);
-    const tri = overlay.getTrigramIndex();
-    assert.ok(tri.isReady, 'index is not ready after rebuild');
-    assert.ok(tri.size >= 3, `expected ≥3 indexed fixture files, got ${tri.size}`);
+    const result = await overlay.searchForTestsDetailed({
+      query: 'class AlphaService:',
+      caseSensitive: false,
+      wholeWord: false,
+      useRegex: false,
+    });
+    assert.strictEqual(result.requestedEngine, 'zoekt');
+    assert.strictEqual(result.effectiveEngine, 'zoekt');
   });
 });

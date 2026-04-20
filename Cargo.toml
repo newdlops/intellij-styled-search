@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/zoek-rs"]
+resolver = "2"
