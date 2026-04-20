@@ -419,6 +419,10 @@ export class OverlayPanel {
     let alreadyReadyWin: number | null = null;
     for (const [id, v] of monacoVals) {
       this.log.appendLine(`Monaco globals win=${id}: ${v}`);
+      // Monaco globals are per-renderer-window, so a ready state in some
+      // OTHER window can't satisfy a preview pane living in
+      // preferredWindowId. Only treat as already-ready when the ready
+      // window is (or could be) the preview window.
       if (alreadyReadyWin === null &&
           (preferredWindowId === undefined || id === preferredWindowId) &&
           /status=ready\b/.test(v)) {
@@ -555,16 +559,16 @@ export class OverlayPanel {
           bestDomWin = id;
         }
       }
-      if (bestDomWin !== null && (preferredWindowId === undefined || bestDomWin === preferredWindowId)) {
+      if (bestDomWin !== null) {
+        // Any window with DOM-visible widgets is enough to skip force-open.
+        // This used to require `bestDomWin === preferredWindowId`, but that
+        // re-introduced the `client.md` (first workspace doc) flash whenever
+        // the preview window differed from the one with open editors —
+        // exactly the bug `random doc open bug fix` originally addressed.
         this.log.appendLine(`DOM scan yielded widgets=${bestDomWidgets} in win=${bestDomWin} — skipping force-open.`);
         await runWidgetCreateTest(bestDomWin, 'DOM path');
         await stopCaptureAll();
         return;
-      }
-      if (bestDomWin !== null && preferredWindowId !== undefined) {
-        this.log.appendLine(
-          `DOM scan yielded widgets in win=${bestDomWin}, but preview is in win=${preferredWindowId}; forcing capture in the preview window.`,
-        );
       }
       if (!allowForceOpen) {
         this.log.appendLine(

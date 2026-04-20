@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 9,
+            "activePatchIndex": 10,
             "patches": [
                 {
                     "date": 1776584800003,
@@ -44,6 +44,10 @@
                 {
                     "date": 1776663631766,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellij-styled-search\",\n   \"displayName\": \"IntelliJ Styled Search\",\n   \"description\": \"IntelliJ IDEA style project search — peek-like movable panel with workspace file results\",\n-  \"version\": \"0.0.7\",\n+  \"version\": \"0.0.8\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"resources/icon.png\",\n   \"repository\": {\n@@ -53,8 +53,18 @@\n         \"title\": \"Rebuild Search Index\",\n         \"category\": \"IntelliJ Search\"\n       },\n       {\n+        \"command\": \"intellijStyledSearch.showZoektInfo\",\n+        \"title\": \"Show Zoekt Diagnostics\",\n+        \"category\": \"IntelliJ Search\"\n+      },\n+      {\n+        \"command\": \"intellijStyledSearch.explainZoektQuery\",\n+        \"title\": \"Explain Query With Zoekt\",\n+        \"category\": \"IntelliJ Search\"\n+      },\n+      {\n         \"command\": \"intellijStyledSearch.diagnoseFileInIndex\",\n         \"title\": \"Diagnose Active File in Search Index\",\n         \"category\": \"IntelliJ Search\"\n       }\n@@ -83,8 +93,17 @@\n     },\n     \"configuration\": {\n       \"title\": \"IntelliJ Styled Search\",\n       \"properties\": {\n+        \"intellijStyledSearch.engine\": {\n+          \"type\": \"string\",\n+          \"enum\": [\n+            \"zoekt\",\n+            \"codesearch\"\n+          ],\n+          \"default\": \"zoekt\",\n+          \"markdownDescription\": \"Search engine to use. `zoekt` runs the Rust local shard/mmap engine with automatic codesearch fallback when the runtime is unavailable or still warming up. `codesearch` uses the existing TypeScript planner plus ripgrep verifier.\"\n+        },\n         \"intellijStyledSearch.excludeGlobs\": {\n           \"type\": \"array\",\n           \"default\": [\n             \"**/node_modules/**\",\n@@ -111,8 +130,9 @@\n     }\n   },\n   \"scripts\": {\n     \"bundle:monaco\": \"node scripts/bundleMonaco.js\",\n+    \"bench:zoekt\": \"node scripts/runZoektBenchmark.js\",\n     \"compile\": \"npm run bundle:monaco && tsc -p ./\",\n     \"watch\": \"tsc -watch -p ./\",\n     \"vscode:prepublish\": \"npm run compile\",\n     \"pretest\": \"npm run compile\",\n"
+                },
+                {
+                    "date": 1776673017147,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellij-styled-search\",\n   \"displayName\": \"IntelliJ Styled Search\",\n   \"description\": \"IntelliJ IDEA style project search — peek-like movable panel with workspace file results\",\n-  \"version\": \"0.0.8\",\n+  \"version\": \"0.0.9\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"resources/icon.png\",\n   \"repository\": {\n@@ -53,8 +53,13 @@\n         \"title\": \"Rebuild Search Index\",\n         \"category\": \"IntelliJ Search\"\n       },\n       {\n+        \"command\": \"intellijStyledSearch.switchEngine\",\n+        \"title\": \"Switch Search Engine\",\n+        \"category\": \"IntelliJ Search\"\n+      },\n+      {\n         \"command\": \"intellijStyledSearch.showZoektInfo\",\n         \"title\": \"Show Zoekt Diagnostics\",\n         \"category\": \"IntelliJ Search\"\n       },\n"
                 }
             ],
             "date": 1776584800003,
