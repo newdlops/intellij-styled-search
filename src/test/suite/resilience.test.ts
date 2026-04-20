@@ -92,4 +92,39 @@ suite('Resilience — bridge auto-repair', () => {
     }
     assert.strictEqual(s.inputValue, expected, `state=${JSON.stringify(s)}`);
   });
+
+  test('show() re-patches after renderer globals are lost', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const api = await getApi();
+
+    await api.overlay.show('class AlphaService:');
+    await api.overlay.evalInActiveWindowForTests(
+      `(function(){
+        for (var k in window) {
+          if (/^__ijFindPatchedV/.test(k)) { try { delete window[k]; } catch (e) {} }
+        }
+        try { delete window.__ijFindShow; } catch (e1) { window.__ijFindShow = undefined; }
+        try { delete window.__ijFindOnMessage; } catch (e2) { window.__ijFindOnMessage = undefined; }
+        try { delete window.__ijFindStatus; } catch (e3) { window.__ijFindStatus = undefined; }
+        try { delete window.__ijFindMonaco; } catch (e4) { window.__ijFindMonaco = null; }
+        return 'cleared';
+      })()`,
+    );
+
+    const expected = 'Feature Beta';
+    await api.overlay.show(expected);
+    const deadline = Date.now() + 10_000;
+    let s: any;
+    while (Date.now() < deadline) {
+      s = await probeState(api);
+      if (!s.searching && s.inputValue === expected) { break; }
+      await new Promise((r) => setTimeout(r, 60));
+    }
+    assert.strictEqual(s.inputValue, expected, `state=${JSON.stringify(s)}`);
+    const status = await api.overlay.evalInActiveWindowForTests(
+      `(function(){return typeof window.__ijFindShow + ':' + typeof window.__ijFindOnMessage + ':' + typeof window.__ijFindStatus})()`,
+    );
+    assert.strictEqual(status, 'function:function:function');
+  });
 });

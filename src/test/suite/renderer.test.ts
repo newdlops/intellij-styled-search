@@ -60,6 +60,46 @@ suite('Renderer — overlay UI probes', () => {
     );
   });
 
+  test('force-literal show clears regex and whole-word toggles', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('');
+    await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var regex = document.querySelector('[data-opt="useRegex"]');
+        var word = document.querySelector('[data-opt="wholeWord"]');
+        if (regex && regex.getAttribute('aria-pressed') !== 'true') { regex.click(); }
+        if (word && word.getAttribute('aria-pressed') !== 'true') { word.click(); }
+        return 'ok';
+      })()`,
+    );
+
+    const query = [
+      'RtccInvestorFile,',
+      ')',
+      'from example import Something',
+    ].join('\n');
+    await overlay.show(query, { forceLiteral: true });
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        return JSON.stringify({
+          regexPressed: document.querySelector('[data-opt="useRegex"]').getAttribute('aria-pressed'),
+          wordPressed: document.querySelector('[data-opt="wholeWord"]').getAttribute('aria-pressed'),
+          state: window.__ijFindGetSearchState()
+        });
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      regexPressed: string;
+      wordPressed: string;
+      state: { inputValue: string | null };
+    };
+    assert.strictEqual(parsed.regexPressed, 'false', `regex toggle should be off: ${raw}`);
+    assert.strictEqual(parsed.wordPressed, 'false', `whole-word toggle should be off: ${raw}`);
+    assert.strictEqual(parsed.state.inputValue, query);
+  });
+
   test('chunked results for the same file merge into one renderer entry', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);

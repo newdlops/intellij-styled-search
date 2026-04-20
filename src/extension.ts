@@ -21,7 +21,7 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
     }),
     vscode.commands.registerCommand('intellijStyledSearch.searchSelection', () => {
       overlay.logCommand('searchSelection');
-      void overlay.show(getQueryFromActiveEditor());
+      void overlay.show(getQueryFromActiveEditor(), { forceLiteral: true });
     }),
     vscode.commands.registerCommand('intellijStyledSearch.reinject', async () => {
       overlay.logCommand('reinject');

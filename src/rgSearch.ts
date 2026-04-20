@@ -347,7 +347,8 @@ export async function runRgSearch(
   const includeMatcher = compileIncludeMatcher(opts.includePatterns);
   const includeGlobs = toRipgrepGlobs(opts.includePatterns);
 
-  const isMultiline = opts.query.includes('\n');
+  const isRegexMultiline = opts.useRegex;
+  const isMultiline = isRegexMultiline || opts.query.includes('\n');
   const args: string[] = [
     '--json',
     '--hidden',
@@ -362,8 +363,11 @@ export async function runRgSearch(
     '--no-ignore-parent',
   ];
   if (isMultiline) { args.push('-U'); }
-  if (opts.useRegex) { /* default: regex mode */ }
-  else { args.push('--fixed-strings'); }
+  if (opts.useRegex) {
+    args.push('--multiline-dotall');
+  } else {
+    args.push('--fixed-strings');
+  }
   if (opts.caseSensitive) { args.push('--case-sensitive'); }
   else { args.push('--ignore-case'); }
   if (opts.wholeWord) { args.push('--word-regexp'); }
@@ -635,6 +639,7 @@ export async function runRgSearch(
   // knows rg rejected the arguments instead of quietly returning 0 hits.
   if ((exitCode === null || exitCode >= 2) && stderrBuf.trim().length > 0 && !killed) {
     progress.onError(new Error(`ripgrep: ${stderrBuf.trim().slice(0, 300)}`));
+    return;
   }
 
   // Final flush (rg sends 'end' per file but last file may not if killed).

@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 7,
+            "activePatchIndex": 8,
             "patches": [
                 {
                     "date": 1776584800003,
@@ -36,6 +36,10 @@
                 {
                     "date": 1776611026600,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellij-styled-search\",\n   \"displayName\": \"IntelliJ Styled Search\",\n   \"description\": \"IntelliJ IDEA style project search — peek-like movable panel with workspace file results\",\n-  \"version\": \"0.0.5\",\n+  \"version\": \"0.0.6\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"resources/icon.png\",\n   \"repository\": {\n"
+                },
+                {
+                    "date": 1776643672682,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellij-styled-search\",\n   \"displayName\": \"IntelliJ Styled Search\",\n   \"description\": \"IntelliJ IDEA style project search — peek-like movable panel with workspace file results\",\n-  \"version\": \"0.0.6\",\n+  \"version\": \"0.0.7\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"resources/icon.png\",\n   \"repository\": {\n"
                 }
             ],
             "date": 1776584800003,

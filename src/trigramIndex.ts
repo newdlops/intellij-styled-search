@@ -103,6 +103,8 @@ const BINARY_EXT = new Set([
   '.wasm', '.node',
 ]);
 
+const REGEX_SIGNATURE_RE = /(?:\.\*|\.\+|\.\?|\*\?|\+\?)/;
+
 interface FileMeta { uri: string; mtime: number; size: number }
 
 export interface ReconcileProgress {
@@ -805,6 +807,17 @@ export class TrigramIndex {
         if (missing.length === 0 && query.includes('\n')) {
           return { uris: null, reason: `fast-path-fallback(trigrams=${qtris.size},indexSize=${this.fileMeta.size}${multi}${staleStr},empty-intersection→full-scan)` };
         }
+        // Second safety net: the user typed a regex signature (`.*`, `.+`,
+        // `.?`, `*?`, `+?`) in plain mode, so some of the literal trigrams
+        // carry `*`/`?` bytes that almost never appear in source code.
+        // Intersection is empty because of that noise, not because the
+        // query genuinely matches nothing. Fall back to a full --fixed-
+        // strings rg scan; rg will confirm there are actually zero literal
+        // matches (if any), and the reason text makes the likely mistake
+        // obvious instead of surfacing a misleading "missing *?b" miss.
+        if (REGEX_SIGNATURE_RE.test(query)) {
+          return { uris: null, reason: `fast-path-fallback(regex-meta-in-plain-mode${missingStr}→full-scan; did you mean to enable regex?)` };
+        }
         return { uris: out, reason: `fast-path(trigrams=${qtris.size},indexSize=${this.fileMeta.size}${multi}${staleStr}${missingStr})` };
       }
       return { uris: out, reason: `fast-path(trigrams=${qtris.size},indexSize=${this.fileMeta.size}${multi}${staleStr})` };
@@ -821,8 +834,8 @@ export class TrigramIndex {
     }
     const ast = parseRegex(patternSrc, {
       caseInsensitive: !opts.caseSensitive,
-      dotAll: false,
-      multiline: false,
+      dotAll: opts.useRegex,
+      multiline: opts.useRegex,
     });
     const info = analyze(ast);
     const tq: TrigramQuery = info.match;

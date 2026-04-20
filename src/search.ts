@@ -56,7 +56,7 @@ function buildRegex(opts: SearchOptions): RegExp | null {
   if (!opts.query) { return null; }
   let src = opts.useRegex ? opts.query : escapeRegex(opts.query);
   if (opts.wholeWord) { src = `\\b${src}\\b`; }
-  const flags = 'g' + (opts.caseSensitive ? '' : 'i');
+  const flags = 'g' + (opts.caseSensitive ? '' : 'i') + (opts.useRegex ? 'ms' : '');
   try {
     return new RegExp(src, flags);
   } catch {
@@ -286,7 +286,7 @@ export async function runSearch(
           return;
         }
 
-        const fileMatch = scanText(text, regex, uri, opts.query.includes('\n'));
+        const fileMatch = scanText(text, regex, uri, opts.useRegex || opts.query.includes('\n'));
         if (fileMatch.matches.length === 0) { continue; }
 
         let sliceStart = 0;

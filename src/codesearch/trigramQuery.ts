@@ -29,25 +29,38 @@ export function qTri(value: string): TrigramQuery {
   return { kind: 'tri', value };
 }
 
+// Canonical key for a subtree — used by qAnd/qOr to dedup structurally
+// identical children. Without this, case-insensitive expansion of a long
+// literal like `RadioSelectFieldBase` balloons into tens of thousands of
+// nodes (simplify() pushes one qAnd-of-trigrams per exact-set variant, and
+// trigramsOf lowercases — so every variant collapses to the same subtree).
+export function queryKey(q: TrigramQuery): string {
+  switch (q.kind) {
+    case 'any': return 'A';
+    case 'all': return 'X';
+    case 'tri': return 't' + q.value;
+    case 'and': return 'N(' + q.children.map(queryKey).join(',') + ')';
+    case 'or':  return 'O(' + q.children.map(queryKey).join(',') + ')';
+  }
+}
+
 export function qAnd(children: TrigramQuery[]): TrigramQuery {
   const flat: TrigramQuery[] = [];
-  const triSeen = new Set<string>();
+  const seen = new Set<string>();
   for (const c of children) {
     if (c.kind === 'any') { continue; }
     if (c.kind === 'all') { return ALL; }
     if (c.kind === 'and') {
       for (const g of c.children) {
-        if (g.kind === 'tri') {
-          if (triSeen.has(g.value)) { continue; }
-          triSeen.add(g.value);
-        }
+        const k = queryKey(g);
+        if (seen.has(k)) { continue; }
+        seen.add(k);
         flat.push(g);
       }
     } else {
-      if (c.kind === 'tri') {
-        if (triSeen.has(c.value)) { continue; }
-        triSeen.add(c.value);
-      }
+      const k = queryKey(c);
+      if (seen.has(k)) { continue; }
+      seen.add(k);
       flat.push(c);
     }
   }
@@ -58,23 +71,21 @@ export function qAnd(children: TrigramQuery[]): TrigramQuery {
 
 export function qOr(children: TrigramQuery[]): TrigramQuery {
   const flat: TrigramQuery[] = [];
-  const triSeen = new Set<string>();
+  const seen = new Set<string>();
   for (const c of children) {
     if (c.kind === 'all') { continue; }
     if (c.kind === 'any') { return ANY; }
     if (c.kind === 'or') {
       for (const g of c.children) {
-        if (g.kind === 'tri') {
-          if (triSeen.has(g.value)) { continue; }
-          triSeen.add(g.value);
-        }
+        const k = queryKey(g);
+        if (seen.has(k)) { continue; }
+        seen.add(k);
         flat.push(g);
       }
     } else {
-      if (c.kind === 'tri') {
-        if (triSeen.has(c.value)) { continue; }
-        triSeen.add(c.value);
-      }
+      const k = queryKey(c);
+      if (seen.has(k)) { continue; }
+      seen.add(k);
       flat.push(c);
     }
   }

@@ -44,6 +44,7 @@ interface SearchStateProbe {
   previewUri: string | null;
   lastPreviewKey: string | null;
   inputValue: string | null;
+  rgQuery?: string;
   err?: string;
 }
 
@@ -130,44 +131,59 @@ suite('Preview highlight — decoration regression', () => {
     this.timeout(20_000);
     const api = await getApi();
 
-    await api.overlay.show(MULTI_LINE_QUERY);
+    try {
+      await api.overlay.evalInActiveWindowForTests(
+        `(function(){return window.__ijFindSetScopeValue ? JSON.stringify(window.__ijFindSetScopeValue('docs.md', true)) : 'no-scope-helper'})()`,
+      );
+      await api.overlay.show(MULTI_LINE_QUERY);
 
-    // Wait for rg to finish and preview to mount as monaco.
-    await pollUntil(
-      () => probeState(api),
-      (s) => !s.searching && s.previewMode === 'monaco' && s.filesCount > 0,
-      10_000,
-      'multi-line search to finish and preview to render in monaco',
-    );
-    // Give the decoration application + reveal a frame to settle.
-    await new Promise((r) => setTimeout(r, 100));
+      // Wait for rg to finish and preview to mount as monaco.
+      await pollUntil(
+        () => probeState(api),
+        (s) => !s.searching &&
+          s.inputValue === MULTI_LINE_QUERY &&
+          s.rgQuery === MULTI_LINE_QUERY &&
+          s.previewMode === 'monaco' &&
+          !!s.previewUri &&
+          /\/docs\.md$/.test(s.previewUri) &&
+          s.filesCount > 0,
+        10_000,
+        'multi-line search to finish and preview to render in monaco',
+      );
+      // Give the decoration application + reveal a frame to settle.
+      await new Promise((r) => setTimeout(r, 100));
 
-    const probe = await probeDecos(api);
-    assert.ok(probe.decorations, `no decorations array: ${JSON.stringify(probe)}`);
-    assert.ok(
-      probe.decorations!.length > 0,
-      `expected at least one findMatch decoration, got ${JSON.stringify(probe)}`,
-    );
-    // applyPreviewMatchDecorations splits a multi-line match into one
-    // single-line decoration per file line the match covers. For our
-    // 3-line fixture blockquote we expect at least 3 decorations, each
-    // carrying the findMatch class. If only the first line is highlighted
-    // we'd see exactly 1 — that's the regression.
-    const findMatchCount = probe.decorations!.filter((d) => /findMatch/.test(d.inlineClassName)).length;
-    assert.ok(
-      findMatchCount >= 3,
-      `expected ≥3 per-line findMatch decorations for a 3-line match, got ${findMatchCount}. ` +
-      `Raw: ${JSON.stringify(probe.decorations)}`,
-    );
-    // Verify the decorations actually span distinct consecutive lines —
-    // rules out duplicates that all point at the start line.
-    const lines = new Set(probe.decorations!
-      .filter((d) => /findMatch/.test(d.inlineClassName))
-      .map((d) => d.startLineNumber));
-    assert.ok(
-      lines.size >= 3,
-      `decorations should cover ≥3 distinct lines, got ${lines.size} (lines=${Array.from(lines).join(',')})`,
-    );
+      const probe = await probeDecos(api);
+      assert.ok(probe.decorations, `no decorations array: ${JSON.stringify(probe)}`);
+      assert.ok(
+        probe.decorations!.length > 0,
+        `expected at least one findMatch decoration, got ${JSON.stringify(probe)}`,
+      );
+      // applyPreviewMatchDecorations splits a multi-line match into one
+      // single-line decoration per file line the match covers. For our
+      // 3-line fixture blockquote we expect at least 3 decorations, each
+      // carrying the findMatch class. If only the first line is highlighted
+      // we'd see exactly 1 — that's the regression.
+      const findMatchCount = probe.decorations!.filter((d) => /findMatch/.test(d.inlineClassName)).length;
+      assert.ok(
+        findMatchCount >= 3,
+        `expected ≥3 per-line findMatch decorations for a 3-line match, got ${findMatchCount}. ` +
+        `Raw: ${JSON.stringify(probe.decorations)}`,
+      );
+      // Verify the decorations actually span distinct consecutive lines —
+      // rules out duplicates that all point at the start line.
+      const lines = new Set(probe.decorations!
+        .filter((d) => /findMatch/.test(d.inlineClassName))
+        .map((d) => d.startLineNumber));
+      assert.ok(
+        lines.size >= 3,
+        `decorations should cover ≥3 distinct lines, got ${lines.size} (lines=${Array.from(lines).join(',')})`,
+      );
+    } finally {
+      await api.overlay.evalInActiveWindowForTests(
+        `(function(){return window.__ijFindSetScopeValue ? JSON.stringify(window.__ijFindSetScopeValue('', true)) : 'no-scope-helper'})()`,
+      );
+    }
   });
 
   test('re-running search replaces preview decorations (regression: highlight disappears on refresh)', async function () {

@@ -99,6 +99,30 @@ suite('Search — engine end-to-end against fixture workspace', () => {
     assert.deepStrictEqual(relPaths(matches), ['alpha.py']);
   });
 
+  test('regex search spans lines and ignores case by default', async () => {
+    const { overlay } = await getApi();
+    const matches = await overlay.searchForTests({
+      query: 'line one of the pull quote.*LINE THREE WRAPS UP',
+      caseSensitive: false,
+      wholeWord: false,
+      useRegex: true,
+    });
+    assert.deepStrictEqual(relPaths(matches), ['docs.md']);
+    const range = matches[0].matches[0].ranges[0];
+    assert.ok(
+      typeof (range as { endLine?: number }).endLine === 'number',
+      'regex match that crosses lines must carry endLine for highlighting',
+    );
+
+    const wrongCase = await overlay.searchForTests({
+      query: 'line one of the pull quote.*LINE THREE WRAPS UP',
+      caseSensitive: true,
+      wholeWord: false,
+      useRegex: true,
+    });
+    assert.deepStrictEqual(wrongCase, [], 'case-sensitive regex should not match wrong-case text');
+  });
+
   test('case-sensitive literal search respects case', async () => {
     const { overlay } = await getApi();
     const exact = await overlay.searchForTests({

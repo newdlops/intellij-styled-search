@@ -63,6 +63,15 @@ type SearchSession = {
   scopedCandidateUris: Set<string> | null;
 };
 
+export interface ShowOptions {
+  forceLiteral?: boolean;
+}
+
+type PendingShow = {
+  query: string;
+  options?: ShowOptions;
+};
+
 type CaptureDiagnosticOptions = {
   allowForceOpen?: boolean;
   reason?: string;
@@ -81,7 +90,7 @@ export class OverlayPanel {
   private log: vscode.OutputChannel;
   private activeWindowId: number | undefined;
   private trigramIndex: TrigramIndex;
-  private pendingShow: string | null = null;
+  private pendingShow: PendingShow | null = null;
   private showInFlight = false;
   private capturePromise: Promise<void> | undefined;
   private backgroundCapturePromise: Promise<void> | undefined;
@@ -131,22 +140,29 @@ export class OverlayPanel {
       // Prepare Monaco capture in the background, but keep activation
       // invisible: DOM scan only, no file open/close fallback here.
       const windowIds = await this.listWorkbenchWindowIds();
-      if (windowIds.length === 1) {
-        const visibleEditors = await this.evalInWindow(
-          windowIds[0],
-          `(function(){
-            try { return String(document.querySelectorAll('.editor-group-container .monaco-editor').length); }
-            catch (e) { return '0'; }
-          })()`,
-        );
-        const visibleEditorCount = parseInt(visibleEditors, 10) || 0;
-        if (visibleEditorCount > 0) {
-          this.scheduleBackgroundCaptureWarmup('activation', 300);
-        } else {
-          this.log.appendLine('Prewarm: skipping background Monaco warmup because no visible editors are open yet.');
+      let visibleEditorCount = 0;
+      await Promise.all(windowIds.map(async (id) => {
+        try {
+          const visibleEditors = await this.evalInWindow(
+            id,
+            `(function(){
+              try { return String(document.querySelectorAll('.editor-group-container .monaco-editor').length); }
+              catch (e) { return '0'; }
+            })()`,
+          );
+          visibleEditorCount += parseInt(visibleEditors, 10) || 0;
+        } catch {}
+      }));
+      if (visibleEditorCount > 0) {
+        if (windowIds.length > 1) {
+          this.log.appendLine(
+            `Prewarm: scheduling DOM-only Monaco warmup across ${windowIds.length} workbench windows ` +
+            `(${visibleEditorCount} visible editors).`,
+          );
         }
+        this.scheduleBackgroundCaptureWarmup('activation', 300);
       } else {
-        this.log.appendLine(`Prewarm: skipping background Monaco warmup because ${windowIds.length} workbench windows are open.`);
+        this.log.appendLine('Prewarm: skipping background Monaco warmup because no visible editors are open yet.');
       }
     } catch (err) {
       this.log.appendLine(`Prewarm failed: ${err instanceof Error ? err.message : err}`);
@@ -178,6 +194,7 @@ export class OverlayPanel {
   }
 
   private async ensureBackgroundMonacoWarmup(reason: string): Promise<void> {
+    await this.ensureRendererPatchAlive(undefined, `background:${reason}`);
     if (await this.isMonacoReadyAnywhere()) { return; }
     if (this.capturePromise) {
       await this.capturePromise;
@@ -202,6 +219,7 @@ export class OverlayPanel {
   }
 
   private async ensureMonacoCapture(preferredWindowId?: number): Promise<void> {
+    await this.ensureRendererPatchAlive(preferredWindowId, 'monaco-capture');
     if (preferredWindowId !== undefined && await this.isMonacoReadyInWindow(preferredWindowId)) { return; }
     if (preferredWindowId === undefined && await this.isMonacoReadyAnywhere()) { return; }
     if (this.backgroundCapturePromise) {
@@ -228,7 +246,7 @@ export class OverlayPanel {
   private async isMonacoReadyInWindow(winId: number): Promise<boolean> {
     try {
       const r = await this.evalInWindow(winId,
-        `(function(){try{var m=window.__ijFindMonaco;return m&&m.ctor&&m.inst&&m.modelSvc?'ready':'not-ready'}catch(e){return 'err:'+(e&&e.message)}})()`,
+        `(function(){try{return window.__ijFindMonacoStatus?window.__ijFindMonacoStatus():'not-ready:no-status'}catch(e){return 'err:'+(e&&e.message)}})()`,
       );
       return r === 'ready';
     } catch {
@@ -244,6 +262,38 @@ export class OverlayPanel {
       }
     } catch {}
     return false;
+  }
+
+  private async isRendererPatchedInWindow(winId: number): Promise<boolean> {
+    try {
+      const r = await this.evalInWindow(winId,
+        `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&window.__ijFindStatus?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`,
+      );
+      return r === 'ready';
+    } catch {
+      return false;
+    }
+  }
+
+  private async isRendererPatchedAnywhere(): Promise<boolean> {
+    try {
+      const wins = await this.listWorkbenchWindowIds();
+      for (const id of wins) {
+        if (await this.isRendererPatchedInWindow(id)) { return true; }
+      }
+    } catch {}
+    return false;
+  }
+
+  private async ensureRendererPatchAlive(preferredWindowId?: number, reason = 'unknown'): Promise<void> {
+    await this.ensureInjected();
+    if (preferredWindowId !== undefined) {
+      if (await this.isRendererPatchedInWindow(preferredWindowId)) { return; }
+    } else if (await this.isRendererPatchedAnywhere()) {
+      return;
+    }
+    const report = await this.runPatchScript();
+    this.log.appendLine(`Renderer patch refresh (${reason}): ${report}`);
   }
 
   /** Fire a sentinel-tagged log event from the first patched workbench
@@ -315,8 +365,9 @@ export class OverlayPanel {
     const monacoPeek = `(function(){
       try {
         var m = window.__ijFindMonaco;
-        if (!m) return 'none';
-        return 'ctor=' + (!!(m.ctor)) + ' inst=' + (!!(m.inst)) + ' modelSvc=' + (!!(m.modelSvc));
+        var status = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'not-ready:no-status';
+        if (!m) return 'status=' + status + ' none';
+        return 'status=' + status + ' ctor=' + (!!(m.ctor)) + ' inst=' + (!!(m.inst)) + ' modelSvc=' + (!!(m.modelSvc));
       } catch(e){ return 'peek-err:' + (e && e.message); }
     })()`;
     // Check all windows in parallel — if ANY already has globals populated
@@ -332,7 +383,7 @@ export class OverlayPanel {
       this.log.appendLine(`Monaco globals win=${id}: ${v}`);
       if (alreadyReadyWin === null &&
           (preferredWindowId === undefined || id === preferredWindowId) &&
-          /ctor=true inst=true modelSvc=true/.test(v)) {
+          /status=ready\b/.test(v)) {
         alreadyReadyWin = id;
       }
     }
@@ -411,13 +462,8 @@ export class OverlayPanel {
       if (existingCapture) {
         this.log.appendLine(
           `Existing captures in win=${existingCapture.id} ` +
-          `(widgets=${existingCapture.widgets} services=${existingCapture.services} ctors=${existingCapture.ctors}) — testing before clearing.`,
+          `(widgets=${existingCapture.widgets} services=${existingCapture.services} ctors=${existingCapture.ctors}) — refreshing before testing.`,
         );
-        if (await runWidgetCreateTest(existingCapture.id, 'existing-captures')) {
-          await stopCaptureAll();
-          return;
-        }
-        this.log.appendLine(`Existing captures in win=${existingCapture.id} did not yield Monaco; falling back to fresh DOM/force capture.`);
       }
       // Boot-time captures are almost always DI stubs (getModel()=null).
       // Clear them everywhere and force a real editor creation so fresh
@@ -591,17 +637,22 @@ export class OverlayPanel {
       let bestWin: number | null = null;
       let bestScore = 0;
       for (const [id, peekStr] of peeked) {
-        const m = /services=(\d+)/.exec(peekStr);
-        const svcCount = m ? parseInt(m[1], 10) : 0;
-        if (preferredWindowId !== undefined && id === preferredWindowId && svcCount > 0) {
+        const widgetMatch = /widgets=(\d+)/.exec(peekStr);
+        const serviceMatch = /services=(\d+)/.exec(peekStr);
+        const ctorMatch = /ctors=(\d+)/.exec(peekStr);
+        const widgetCount = widgetMatch ? parseInt(widgetMatch[1], 10) : 0;
+        const svcCount = serviceMatch ? parseInt(serviceMatch[1], 10) : 0;
+        const ctorCount = ctorMatch ? parseInt(ctorMatch[1], 10) : 0;
+        const score = widgetCount + svcCount + ctorCount;
+        if (preferredWindowId !== undefined && id === preferredWindowId && widgetCount > 0 && svcCount > 0) {
           bestWin = id;
-          bestScore = svcCount;
+          bestScore = score;
           break;
         }
-        if (svcCount > bestScore) { bestScore = svcCount; bestWin = id; }
+        if (widgetCount > 0 && svcCount > 0 && score > bestScore) { bestScore = score; bestWin = id; }
       }
       if (bestWin !== null && bestScore > 0) {
-        this.log.appendLine(`Running TEST widget create in win=${bestWin} (services=${bestScore})...`);
+        this.log.appendLine(`Running TEST widget create in win=${bestWin} (score=${bestScore})...`);
         await runWidgetCreateTest(bestWin, 'force-open');
       } else {
         this.log.appendLine('No window has captures — skipping widget creation test.');
@@ -689,16 +740,16 @@ export class OverlayPanel {
     try {
       if (preferredWindowId !== undefined) {
         const r = await this.evalInWindow(preferredWindowId,
-          `(function(){try{var m=window.__ijFindMonaco;return m?('ctor='+(!!m.ctor)+' inst='+(!!m.inst)+' modelSvc='+(!!m.modelSvc)):'no-monaco'}catch(e){return 'err:'+(e&&e.message)}})()`,
+          `(function(){try{return window.__ijFindMonacoStatus?window.__ijFindMonacoStatus():'not-ready:no-status'}catch(e){return 'err:'+(e&&e.message)}})()`,
         );
-        return /ctor=true inst=true modelSvc=true/.test(r) ? ('ready:win=' + preferredWindowId) : r;
+        return r === 'ready' ? ('ready:win=' + preferredWindowId) : r;
       }
       const wins = await this.listWorkbenchWindowIds();
       for (const id of wins) {
         const r = await this.evalInWindow(id,
-          `(function(){try{var m=window.__ijFindMonaco;return m?('ctor='+(!!m.ctor)+' inst='+(!!m.inst)+' modelSvc='+(!!m.modelSvc)):'no-monaco'}catch(e){return 'err:'+(e&&e.message)}})()`,
+          `(function(){try{return window.__ijFindMonacoStatus?window.__ijFindMonacoStatus():'not-ready:no-status'}catch(e){return 'err:'+(e&&e.message)}})()`,
         );
-        if (/ctor=true inst=true modelSvc=true/.test(r)) { return 'ready:win=' + id; }
+        if (r === 'ready') { return 'ready:win=' + id; }
       }
     } catch {}
     return 'not-ready';
@@ -709,6 +760,7 @@ export class OverlayPanel {
    *  monaco decorations call this so they don't race the lazy capture
    *  diagnostic (which takes ~1.5–3 s after the first show()). */
   async waitForMonacoReadyForTests(timeoutMs = 20_000): Promise<boolean> {
+    await this.ensureRendererPatchAlive(this.activeWindowId, 'waitForMonacoReadyForTests');
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       try {
@@ -716,7 +768,7 @@ export class OverlayPanel {
         for (const id of wins) {
           const result = await this.evalInWindow(
             id,
-            `(function(){try{var m=window.__ijFindMonaco;return m&&m.ctor&&m.inst&&m.modelSvc?'ready':'not-ready'}catch(e){return 'err:'+(e&&e.message)}})()`,
+            `(function(){try{return window.__ijFindMonacoStatus?window.__ijFindMonacoStatus():'not-ready:no-status'}catch(e){return 'err:'+(e&&e.message)}})()`,
           );
           if (result === 'ready') { return true; }
         }
@@ -870,24 +922,24 @@ export class OverlayPanel {
     for (const l of lines) { this.log.appendLine(l); }
   }
 
-  async show(initialQuery: string): Promise<void> {
+  async show(initialQuery: string, options?: ShowOptions): Promise<void> {
     // Coalesce a burst of command invocations (user mashing a shortcut)
     // into one effective show; we just remember the last query.
-    this.pendingShow = initialQuery;
+    this.pendingShow = { query: initialQuery, options };
     if (this.showInFlight) { return; }
     this.showInFlight = true;
     try {
       while (this.pendingShow !== null) {
-        const q = this.pendingShow;
+        const pending = this.pendingShow;
         this.pendingShow = null;
-        await this.doShow(q);
+        await this.doShow(pending.query, pending.options);
       }
     } finally {
       this.showInFlight = false;
     }
   }
 
-  private async doShow(initialQuery: string): Promise<void> {
+  private async doShow(initialQuery: string, options: ShowOptions = {}): Promise<void> {
     const tShow = Date.now();
     this.log.appendLine(
       `doShow: initialQueryLen=${initialQuery.length} preview=${JSON.stringify(initialQuery.slice(0, 80))}`,
@@ -915,7 +967,7 @@ export class OverlayPanel {
       // workbench window, send __ijFindShow into it (awaited), and fire-and-
       // forget __ijFindHide into every other window. Prior version did three
       // serial roundtrips and cost ~200–400 ms of visible lag on cold start.
-      const showExpr = `(function(){ try { return window.__ijFindShow ? window.__ijFindShow(${JSON.stringify(initialQuery)}) : 'no-show-fn'; } catch (e) { return 'show-throw:' + (e && e.message); } })()`;
+      const showExpr = `(function(){ try { return window.__ijFindShow ? window.__ijFindShow(${JSON.stringify(initialQuery)}, ${JSON.stringify(options)}) : 'no-show-fn'; } catch (e) { return 'show-throw:' + (e && e.message); } })()`;
       const hideExpr = `try { window.__ijFindHide && window.__ijFindHide(); } catch (e) {}`;
       const workspaceName = vscode.workspace.name || vscode.workspace.workspaceFolders?.[0]?.name || '';
       const script = `
@@ -1176,6 +1228,9 @@ export class OverlayPanel {
     const injectScript = `
       (async function () {
         var BW = require('electron').BrowserWindow;
+        var patchExpr = ${JSON.stringify(patchExpr)};
+        var rendererBindingName = ${JSON.stringify(RENDERER_BINDING)};
+        var mainBridgeBindingName = ${JSON.stringify(BRIDGE_BINDING)};
         var wins = BW.getAllWindows();
         var results = [];
         for (var i = 0; i < wins.length; i++) {
@@ -1203,7 +1258,7 @@ export class OverlayPanel {
               catch (eAtt) { results.push('attach-fail:' + w.id + ':' + eAtt.message); continue; }
             }
             try { await w.webContents.debugger.sendCommand('Runtime.enable'); } catch (eRe) {}
-            var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(patchExpr)}, returnByValue: true });
+            var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: patchExpr, returnByValue: true });
             if (r && r.exceptionDetails) {
               var ed = r.exceptionDetails;
               var exStr = ed.exception && ed.exception.description ? ed.exception.description : (ed.text || JSON.stringify(ed));
@@ -1212,10 +1267,10 @@ export class OverlayPanel {
               continue;
             }
             var val = r && r.result ? r.result.value : undefined;
-            if (val === 'ij-find patch installed' || val === 'already patched') {
+            if (val === 'ij-find patch installed' || String(val).indexOf('already patched') === 0) {
               results.push('ok:' + w.id + ':' + val);
               try {
-                await w.webContents.debugger.sendCommand('Runtime.addBinding', { name: ${JSON.stringify(RENDERER_BINDING)} });
+                await w.webContents.debugger.sendCommand('Runtime.addBinding', { name: rendererBindingName });
                 // CRITICAL: the 'message' listener accumulates across
                 // extension-host reloads (main-process state persists while
                 // the extension host restarts), and Electron's
@@ -1230,8 +1285,8 @@ export class OverlayPanel {
                 }
                 const bridgeWinId = w.id;
                 var bridge = function (ev, method, params) {
-                  if (method === 'Runtime.bindingCalled' && params && params.name === ${JSON.stringify(RENDERER_BINDING)}) {
-                    if (typeof global.${BRIDGE_BINDING} === 'function') {
+                  if (method === 'Runtime.bindingCalled' && params && params.name === rendererBindingName) {
+                    if (typeof global[mainBridgeBindingName] === 'function') {
                       var payload = params.payload;
                       try {
                         var parsed = JSON.parse(String(payload));
@@ -1240,12 +1295,40 @@ export class OverlayPanel {
                           payload = JSON.stringify(parsed);
                         }
                       } catch (ePayload) {}
-                      global.${BRIDGE_BINDING}(payload);
+                      global[mainBridgeBindingName](payload);
                     }
                   }
                 };
                 w.webContents.debugger.on('message', bridge);
                 global.__ijFindBridgeListeners.set(w.id, bridge);
+                if (!global.__ijFindReloadPatchListeners) { global.__ijFindReloadPatchListeners = new Map(); }
+                var prevReload = global.__ijFindReloadPatchListeners.get(w.id);
+                if (prevReload) {
+                  try { w.webContents.removeListener('did-finish-load', prevReload); } catch (eR1) {}
+                  try { w.webContents.removeListener('dom-ready', prevReload); } catch (eR2) {}
+                }
+                var reloadTimer = null;
+                var reloadPatch = function () {
+                  if (reloadTimer) { clearTimeout(reloadTimer); }
+                  reloadTimer = setTimeout(async function () {
+                    try {
+                      var reloadUrl = '';
+                      try { reloadUrl = (w.webContents && w.webContents.getURL && w.webContents.getURL()) || ''; } catch (eUrl) {}
+                      if (!/workbench\\.(?:esm\\.)?html(?:\\?|#|$)/.test(reloadUrl)) { return; }
+                      var attached = false;
+                      try { attached = w.webContents.debugger.isAttached(); } catch (eIs2) {}
+                      if (!attached) {
+                        try { w.webContents.debugger.attach('1.3'); } catch (eAtt2) { return; }
+                      }
+                      try { await w.webContents.debugger.sendCommand('Runtime.enable'); } catch (eRe2) {}
+                      try { await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: patchExpr, returnByValue: true }); } catch (eEval2) {}
+                      try { await w.webContents.debugger.sendCommand('Runtime.addBinding', { name: rendererBindingName }); } catch (eBind2) {}
+                    } catch (eReload) {}
+                  }, 250);
+                };
+                w.webContents.on('did-finish-load', reloadPatch);
+                w.webContents.on('dom-ready', reloadPatch);
+                global.__ijFindReloadPatchListeners.set(w.id, reloadPatch);
               } catch (eb) { results.push('bind-err:' + w.id + ':' + eb.message); }
             } else {
               var type = r && r.result ? r.result.type : 'no-result';
@@ -1556,7 +1639,7 @@ export class OverlayPanel {
       options.useRegex ? 'regex' : '',
       options.caseSensitive ? 'case' : '',
       options.wholeWord ? 'word' : '',
-      options.query.includes('\n') ? 'multiline' : '',
+      (options.useRegex || options.query.includes('\n')) ? 'multiline' : '',
       options.includePatterns && options.includePatterns.length > 0 ? `scope=${options.includePatterns.length}` : '',
     ].filter(Boolean).join(',') || 'plain';
     this.log.appendLine(
@@ -1729,16 +1812,20 @@ export class OverlayPanel {
     if (this.activeWindowId === undefined) { return; }
     const windowId = this.activeWindowId;
     const payload = JSON.stringify(msg);
-    const js = `try { window.__ijFindOnMessage && window.__ijFindOnMessage(${payload}); } catch (e) {}`;
+    const js = `(function(){try{if(!window.__ijFindOnMessage){return 'missing-onmessage'};window.__ijFindOnMessage(${payload});return 'ok'}catch(e){return 'err:'+(e&&e.message)}})()`;
     const deliver = async () => {
       try {
         const timeoutMs = 1000;
-        await Promise.race([
+        const result = await Promise.race([
           this.evalInWindow(windowId, js),
           delay(timeoutMs).then(() => {
             throw new Error(`timed out after ${timeoutMs}ms`);
           }),
         ]);
+        if (result === 'missing-onmessage') {
+          await this.ensureRendererPatchAlive(windowId, 'postToRenderer');
+          await this.evalInWindow(windowId, js);
+        }
       } catch (err) {
         this.log.appendLine(`postToRenderer failed: ${err instanceof Error ? err.message : err}`);
       }
