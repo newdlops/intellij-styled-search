@@ -77,6 +77,7 @@ pub fn search_workspace(
                 &current.text,
                 &plan.effective_query,
                 request.case_sensitive,
+                request.regex_multiline,
                 remaining_match_budget,
             )
             .map_err(|err| err.to_string())?,
@@ -344,6 +345,7 @@ mod tests {
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
+                regex_multiline: true,
                 include: vec!["src/*".to_string()],
                 limit: 10,
                 offset: 0,
@@ -385,6 +387,7 @@ mod tests {
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
+                regex_multiline: true,
                 include: vec!["src/*".to_string()],
                 limit: 10,
                 offset: 0,
@@ -432,6 +435,7 @@ mod tests {
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
+                regex_multiline: true,
                 include: vec![],
                 limit: 10,
                 offset: 0,
@@ -459,6 +463,7 @@ mod tests {
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: true,
+                regex_multiline: true,
                 include: vec![],
                 limit: 10,
                 offset: 0,
@@ -468,6 +473,34 @@ mod tests {
         .map_err(io::Error::other)?;
         assert_eq!(response.total_files_matched, 1);
         assert_eq!(response.files[0].matches[0].end_line, Some(2));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn regex_singleline_does_not_span_lines() -> io::Result<()> {
+        let root = temp_dir("regex-singleline");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/a.rs"), "foo\nbar\nbaz\n")?;
+        index_directory(&root, &EngineConfig::default())?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "foo.*baz".to_string(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: true,
+                regex_multiline: false,
+                include: vec![],
+                limit: 10,
+                offset: 0,
+            },
+            &EngineConfig::default(),
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(response.total_files_matched, 0);
 
         fs::remove_dir_all(root)?;
         Ok(())
@@ -493,6 +526,7 @@ mod tests {
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
+                regex_multiline: true,
                 include: vec![],
                 limit: 10,
                 offset: 0,
@@ -507,6 +541,7 @@ mod tests {
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
+                regex_multiline: true,
                 include: vec![],
                 limit: 10,
                 offset: 0,
@@ -541,6 +576,7 @@ mod tests {
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
+                regex_multiline: true,
                 include: vec![],
                 limit: 10,
                 offset: 0,
@@ -572,6 +608,7 @@ mod tests {
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
+                regex_multiline: true,
                 include: vec![],
                 limit: 2,
                 offset: 2,
@@ -611,6 +648,7 @@ mod tests {
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
+                regex_multiline: true,
                 include: vec!["src/*".to_string()],
                 limit: 10,
                 offset: 0,
@@ -652,6 +690,7 @@ mod tests {
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
+                regex_multiline: true,
                 include: vec!["src/*".to_string()],
                 limit: 10,
                 offset: 0,

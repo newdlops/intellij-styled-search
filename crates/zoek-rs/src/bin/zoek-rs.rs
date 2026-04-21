@@ -189,6 +189,7 @@ fn run_search(args: &[String]) -> Result<EngineResponse, String> {
         case_sensitive: false,
         whole_word: false,
         use_regex: false,
+        regex_multiline: true,
         include: Vec::new(),
         limit: 200,
         offset: 0,
@@ -207,6 +208,10 @@ fn run_search(args: &[String]) -> Result<EngineResponse, String> {
             }
             "--regex" => {
                 request.use_regex = true;
+                idx += 1;
+            }
+            "--regex-singleline" => {
+                request.regex_multiline = false;
                 idx += 1;
             }
             "--include" => {
@@ -255,6 +260,7 @@ fn run_diagnose(args: &[String]) -> Result<EngineResponse, String> {
         case_sensitive: false,
         whole_word: false,
         use_regex: false,
+        regex_multiline: true,
         include: Vec::new(),
         limit: 200,
         offset: 0,
@@ -273,6 +279,10 @@ fn run_diagnose(args: &[String]) -> Result<EngineResponse, String> {
             }
             "--regex" => {
                 request.use_regex = true;
+                idx += 1;
+            }
+            "--regex-singleline" => {
+                request.regex_multiline = false;
                 idx += 1;
             }
             "--include" => {

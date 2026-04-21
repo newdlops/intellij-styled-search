@@ -11,6 +11,7 @@ import {
   mergeFileMatches,
   getConfiguredResultLimit,
   getConfiguredSearchEngine,
+  isRegexMultilineEnabled,
   type SearchForTestsResult,
   type SearchEngine,
 } from './search';
@@ -793,6 +794,7 @@ export class OverlayPanel {
     }
     const { uris: candidates } = this.trigramIndex.candidatesFor(options.query, {
       useRegex: options.useRegex,
+      regexMultiline: options.regexMultiline,
       caseSensitive: options.caseSensitive,
       wholeWord: options.wholeWord,
     });
@@ -1790,6 +1792,7 @@ export class OverlayPanel {
       caseSensitive: options.caseSensitive,
       wholeWord: options.wholeWord,
       useRegex: options.useRegex,
+      regexMultiline: options.regexMultiline,
       includePatterns: options.includePatterns ? [...options.includePatterns] : undefined,
     };
   }
@@ -1856,7 +1859,7 @@ export class OverlayPanel {
       options.useRegex ? 'regex' : '',
       options.caseSensitive ? 'case' : '',
       options.wholeWord ? 'word' : '',
-      (options.useRegex || options.query.includes('\n')) ? 'multiline' : '',
+      (isRegexMultilineEnabled(options) || (!options.useRegex && options.query.includes('\n'))) ? 'multiline' : '',
       options.includePatterns && options.includePatterns.length > 0 ? `scope=${options.includePatterns.length}` : '',
     ].filter(Boolean).join(',') || 'plain';
     const plannerSummary = effectiveEngine === 'zoekt'
@@ -1881,6 +1884,7 @@ export class OverlayPanel {
       // match anything.
       const { uris: candidates, reason } = this.trigramIndex.candidatesFor(options.query, {
         useRegex: options.useRegex,
+        regexMultiline: options.regexMultiline,
         caseSensitive: options.caseSensitive,
         wholeWord: options.wholeWord,
       });

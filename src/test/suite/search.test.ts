@@ -201,6 +201,18 @@ suite('Search — engine end-to-end against fixture workspace', () => {
     assert.deepStrictEqual(wrongCase, [], 'case-sensitive regex should not match wrong-case text');
   });
 
+  test('regex single-line mode does not span lines', async () => {
+    const { overlay } = await getApi();
+    const matches = await overlay.searchForTests({
+      query: 'line one of the pull quote.*LINE THREE WRAPS UP',
+      caseSensitive: false,
+      wholeWord: false,
+      useRegex: true,
+      regexMultiline: false,
+    });
+    assert.deepStrictEqual(matches, [], 'single-line regex should not cross newline boundaries');
+  });
+
   test('case-sensitive literal search respects case', async () => {
     const { overlay } = await getApi();
     const exact = await overlay.searchForTests({

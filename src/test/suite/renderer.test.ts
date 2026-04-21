@@ -100,6 +100,46 @@ suite('Renderer — overlay UI probes', () => {
     assert.strictEqual(parsed.state.inputValue, query);
   });
 
+  test('regex multiline toggle is disabled until regex mode is enabled', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('');
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var regex = document.querySelector('[data-opt="useRegex"]');
+        var multiline = document.querySelector('[data-opt="regexMultiline"]');
+        var before = {
+          exists: !!multiline,
+          disabled: multiline ? multiline.getAttribute('aria-disabled') : null,
+          pressed: multiline ? multiline.getAttribute('aria-pressed') : null
+        };
+        if (regex) { regex.click(); }
+        if (multiline) { multiline.click(); }
+        return JSON.stringify({
+          before: before,
+          after: {
+            disabled: multiline ? multiline.getAttribute('aria-disabled') : null,
+            pressed: multiline ? multiline.getAttribute('aria-pressed') : null
+          },
+          state: window.__ijFindGetSearchState()
+        });
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      before: { exists: boolean; disabled: string | null; pressed: string | null };
+      after: { disabled: string | null; pressed: string | null };
+      state: { options?: { useRegex: boolean; regexMultiline: boolean } };
+    };
+    assert.strictEqual(parsed.before.exists, true, `regex multiline toggle should exist: ${raw}`);
+    assert.strictEqual(parsed.before.disabled, 'true', `regex multiline should start disabled: ${raw}`);
+    assert.strictEqual(parsed.before.pressed, 'true', `regex multiline should preserve default-on state: ${raw}`);
+    assert.strictEqual(parsed.after.disabled, 'false', `regex multiline should enable with regex mode: ${raw}`);
+    assert.strictEqual(parsed.after.pressed, 'false', `regex multiline should toggle off when clicked: ${raw}`);
+    assert.strictEqual(parsed.state.options?.useRegex, true, `renderer state should keep regex enabled: ${raw}`);
+    assert.strictEqual(parsed.state.options?.regexMultiline, false, `renderer state should reflect single-line regex mode: ${raw}`);
+  });
+
   test('chunked results for the same file merge into one renderer entry', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);

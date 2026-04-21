@@ -57,6 +57,7 @@ pub fn verify_regex(
     text: &str,
     pattern: &str,
     case_sensitive: bool,
+    regex_multiline: bool,
     limit: usize,
 ) -> Result<Vec<SearchMatch>, regex::Error> {
     if pattern.is_empty() {
@@ -64,15 +65,45 @@ pub fn verify_regex(
     }
     let regex = RegexBuilder::new(pattern)
         .case_insensitive(!case_sensitive)
-        .multi_line(true)
-        .dot_matches_new_line(true)
+        .multi_line(regex_multiline)
+        .dot_matches_new_line(regex_multiline)
         .build()?;
     let mut matches = Vec::new();
-    for found in regex.find_iter(text) {
-        matches.push(build_match(text, found.start(), found.end()));
-        if matches.len() >= limit {
+    if regex_multiline {
+        for found in regex.find_iter(text) {
+            matches.push(build_match(text, found.start(), found.end()));
+            if matches.len() >= limit {
+                break;
+            }
+        }
+        return Ok(matches);
+    }
+    let bytes = text.as_bytes();
+    let mut line_start = 0usize;
+    while line_start <= text.len() {
+        let line_end_raw = text[line_start..]
+            .find('\n')
+            .map(|offset| line_start + offset)
+            .unwrap_or(text.len());
+        let mut line_end = line_end_raw;
+        if line_end > line_start && bytes.get(line_end - 1) == Some(&b'\r') {
+            line_end -= 1;
+        }
+        let line = &text[line_start..line_end];
+        for found in regex.find_iter(line) {
+            matches.push(build_match(
+                text,
+                line_start + found.start(),
+                line_start + found.end(),
+            ));
+            if matches.len() >= limit {
+                return Ok(matches);
+            }
+        }
+        if line_end_raw >= text.len() {
             break;
         }
+        line_start = line_end_raw + 1;
     }
     Ok(matches)
 }
@@ -352,10 +383,16 @@ mod tests {
 
     #[test]
     fn regex_reports_multiline_end_line() {
-        let matches = verify_regex("foo\nbar\nbaz", "foo.*baz", true, 10).expect("regex must compile");
+        let matches = verify_regex("foo\nbar\nbaz", "foo.*baz", true, true, 10).expect("regex must compile");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].line, 0);
         assert_eq!(matches[0].end_line, Some(2));
+    }
+
+    #[test]
+    fn regex_singleline_does_not_cross_line_boundaries() {
+        let matches = verify_regex("foo\nbar\nbaz", "foo.*baz", true, false, 10).expect("regex must compile");
+        assert!(matches.is_empty());
     }
 
     #[test]

@@ -794,7 +794,7 @@ export class TrigramIndex {
   // For plain substring queries we take the fast AND-of-all-trigrams path.
   candidatesFor(
     query: string,
-    opts: { useRegex: boolean; caseSensitive?: boolean; wholeWord?: boolean },
+    opts: { useRegex: boolean; regexMultiline?: boolean; caseSensitive?: boolean; wholeWord?: boolean },
   ): { uris: Set<string> | null; reason: string } {
     if (!this.ready) {
       return { uris: null, reason: 'index-not-ready' };
@@ -877,10 +877,11 @@ export class TrigramIndex {
       patternSrc = escapeRegexSource(query);
       if (opts.wholeWord) { patternSrc = '\\b' + patternSrc + '\\b'; }
     }
+    const regexMultiline = opts.useRegex && opts.regexMultiline !== false;
     const ast = parseRegex(patternSrc, {
       caseInsensitive: !opts.caseSensitive,
-      dotAll: opts.useRegex,
-      multiline: opts.useRegex,
+      dotAll: regexMultiline,
+      multiline: regexMultiline,
     });
     const info = analyze(ast);
     const tq: TrigramQuery = info.match;

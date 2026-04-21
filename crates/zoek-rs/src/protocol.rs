@@ -85,6 +85,7 @@ pub struct SearchRequest {
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub use_regex: bool,
+    pub regex_multiline: bool,
     pub include: Vec<String>,
     pub limit: usize,
     pub offset: usize,

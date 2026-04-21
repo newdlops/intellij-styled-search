@@ -1,7 +1,7 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV80) {
+  if (window.__ijFindPatchedV81) {
     var existingStatus = 'not-ready:no-status';
     try {
       existingStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : existingStatus;
@@ -19,7 +19,7 @@ export function getRendererPatchScript(): string {
     }
     return 'already patched';
   }
-  window.__ijFindPatchedV80 = true;
+  window.__ijFindPatchedV81 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -1017,6 +1017,8 @@ export function getRendererPatchScript(): string {
     '  border-radius: 3px; cursor: pointer;',
     '}',
     '.ij-find-opt:hover { background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)); }',
+    '.ij-find-opt[aria-disabled="true"] { opacity: 0.45; cursor: default; }',
+    '.ij-find-opt[aria-disabled="true"]:hover { background: transparent; }',
     '.ij-find-opt[aria-pressed="true"] {',
     '  background: var(--vscode-inputOption-activeBackground, rgba(14,99,156,0.5));',
     '  color: var(--vscode-inputOption-activeForeground, #ffffff);',
@@ -1348,8 +1350,9 @@ export function getRendererPatchScript(): string {
   var $optCase = el('button', { className: 'ij-find-opt', title: 'Match Case (Alt+C)', text: 'Aa', attrs: { 'data-opt': 'caseSensitive', 'aria-pressed': 'false' } });
   var $optWord = el('button', { className: 'ij-find-opt', title: 'Whole Word (Alt+W)', text: 'W', attrs: { 'data-opt': 'wholeWord', 'aria-pressed': 'false' } });
   var $optRegex = el('button', { className: 'ij-find-opt', title: 'Regex (Alt+R)', text: '.*', attrs: { 'data-opt': 'useRegex', 'aria-pressed': 'false' } });
+  var $optRegexMultiline = el('button', { className: 'ij-find-opt', title: 'Regex Multiline (Alt+M)', text: 'ML', attrs: { 'data-opt': 'regexMultiline', 'aria-pressed': 'true', 'aria-disabled': 'true' } });
   var $refresh = el('button', { className: 'ij-find-opt ij-find-refresh', title: 'Refresh Search', text: 'Run', attrs: { type: 'button', 'aria-label': 'Refresh search' } });
-  var $opts = el('div', { className: 'ij-find-opts', children: [$optCase, $optWord, $optRegex, $refresh] });
+  var $opts = el('div', { className: 'ij-find-opts', children: [$optCase, $optWord, $optRegex, $optRegexMultiline, $refresh] });
   var $searchRow = el('div', { className: 'ij-find-search-row', children: [$q, $opts] });
   var $scope = el('input', {
     className: 'ij-find-scope',
@@ -1405,7 +1408,7 @@ export function getRendererPatchScript(): string {
   } catch (e) {}
 
   var state = {
-    options: { caseSensitive: false, wholeWord: false, useRegex: false },
+    options: { caseSensitive: false, wholeWord: false, useRegex: false, regexMultiline: true },
     files: [],
     flat: [],
     candidates: [],             // [{uri, relPath}] — planner-narrowed files, rg hasn't confirmed yet
@@ -1472,6 +1475,15 @@ export function getRendererPatchScript(): string {
     } else {
       $summary.textContent = matches + ' result' + (matches === 1 ? '' : 's') + ' in ' + files + ' file' + (files === 1 ? '' : 's');
     }
+  }
+
+  function effectiveRegexMultilineValue(opts) {
+    return !!(opts && opts.useRegex && opts.regexMultiline !== false);
+  }
+
+  function syncRegexMultilineUi() {
+    var enabled = !!state.options.useRegex;
+    $optRegexMultiline.setAttribute('aria-disabled', enabled ? 'false' : 'true');
   }
 
   // Render elapsed time as ' (N.Ns)' or ' (Nms)' — appended to status
@@ -1865,6 +1877,7 @@ export function getRendererPatchScript(): string {
       oldOpts.caseSensitive !== state.options.caseSensitive ||
       oldOpts.wholeWord !== state.options.wholeWord ||
       oldOpts.useRegex !== state.options.useRegex ||
+      effectiveRegexMultilineValue(oldOpts) !== effectiveRegexMultilineValue(state.options) ||
       oldScope !== scopeRaw;
     var involvesMultiline = q.indexOf('\\n') >= 0 || oldQ.indexOf('\\n') >= 0;
     // Identical-query guard: same query + same options and NOT a forceRestart.
@@ -1900,6 +1913,7 @@ export function getRendererPatchScript(): string {
       caseSensitive: state.options.caseSensitive,
       wholeWord: state.options.wholeWord,
       useRegex: state.options.useRegex,
+      regexMultiline: state.options.regexMultiline,
     };
     state.rgScope = scopeRaw;
     state.filterQuery = '';
@@ -1919,6 +1933,7 @@ export function getRendererPatchScript(): string {
         caseSensitive: state.options.caseSensitive,
         wholeWord: state.options.wholeWord,
         useRegex: state.options.useRegex,
+        regexMultiline: state.options.regexMultiline,
         includePatterns: includePatterns,
       },
     });
@@ -1955,8 +1970,10 @@ export function getRendererPatchScript(): string {
   }
 
   function toggleOpt(key, btn) {
+    if (btn && btn.getAttribute && btn.getAttribute('aria-disabled') === 'true') { return; }
     state.options[key] = !state.options[key];
     btn.setAttribute('aria-pressed', String(state.options[key]));
+    if (key === 'useRegex') { syncRegexMultilineUi(); }
     triggerSearch();
   }
 
@@ -1997,6 +2014,7 @@ export function getRendererPatchScript(): string {
   $optCase.addEventListener('click', function () { toggleOpt('caseSensitive', $optCase); });
   $optWord.addEventListener('click', function () { toggleOpt('wholeWord', $optWord); });
   $optRegex.addEventListener('click', function () { toggleOpt('useRegex', $optRegex); });
+  $optRegexMultiline.addEventListener('click', function () { toggleOpt('regexMultiline', $optRegexMultiline); });
   $refresh.addEventListener('click', refreshSearch);
   function applyMinimapSetting() {
     var ed = state.previewMonacoEditor || state.monacoEditor;
@@ -2016,6 +2034,7 @@ export function getRendererPatchScript(): string {
     if (ed && typeof ed.focus === 'function') { try { ed.focus(); } catch (eF) {} }
   });
   $close.addEventListener('click', function () { window.__ijFindHide(); });
+  syncRegexMultilineUi();
 
   $results.addEventListener('click', function (e) {
     var row = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row') : null;
@@ -2115,6 +2134,7 @@ export function getRendererPatchScript(): string {
     if (e.altKey && (e.key === 'c' || e.key === 'C')) { e.preventDefault(); toggleOpt('caseSensitive', $optCase); }
     else if (e.altKey && (e.key === 'w' || e.key === 'W')) { e.preventDefault(); toggleOpt('wholeWord', $optWord); }
     else if (e.altKey && (e.key === 'r' || e.key === 'R')) { e.preventDefault(); toggleOpt('useRegex', $optRegex); }
+    else if (e.altKey && (e.key === 'm' || e.key === 'M')) { e.preventDefault(); toggleOpt('regexMultiline', $optRegexMultiline); }
   });
 
   // ── Monaco access (aggressive multi-path probe) ─────────────────────
@@ -3677,6 +3697,7 @@ export function getRendererPatchScript(): string {
           state.options.wholeWord = false;
           $optRegex.setAttribute('aria-pressed', 'false');
           $optWord.setAttribute('aria-pressed', 'false');
+          syncRegexMultilineUi();
         }
         var oldQ = state.rgQuery || '';
         var oldOpts = state.rgOptions;
@@ -3685,7 +3706,8 @@ export function getRendererPatchScript(): string {
         var optsChangedForShow = forceLiteral || !oldOpts ||
           oldOpts.caseSensitive !== state.options.caseSensitive ||
           oldOpts.wholeWord !== state.options.wholeWord ||
-          oldOpts.useRegex !== state.options.useRegex;
+          oldOpts.useRegex !== state.options.useRegex ||
+          effectiveRegexMultilineValue(oldOpts) !== effectiveRegexMultilineValue(state.options);
         var extendsCurrent = wasVisible &&
           !!oldQ &&
           oldScope === scopeRaw &&
@@ -3812,6 +3834,12 @@ export function getRendererPatchScript(): string {
         rgQuery: state.rgQuery || '',
         rgScope: state.rgScope || '',
         filterQuery: state.filterQuery || '',
+        options: {
+          caseSensitive: !!state.options.caseSensitive,
+          wholeWord: !!state.options.wholeWord,
+          useRegex: !!state.options.useRegex,
+          regexMultiline: state.options.regexMultiline !== false,
+        },
       };
     } catch (e) { return { err: String(e && e.message) }; }
   };

@@ -77,6 +77,7 @@ export interface ZoektSearchRequest {
   caseSensitive: boolean;
   wholeWord: boolean;
   useRegex: boolean;
+  regexMultiline: boolean;
   include: string[];
   limit: number;
   offset: number;

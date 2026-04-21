@@ -6,6 +6,7 @@ export interface SearchOptions {
   caseSensitive: boolean;
   wholeWord: boolean;
   useRegex: boolean;
+  regexMultiline?: boolean;
   includePatterns?: string[];
   resultOffset?: number;
   resultLimit?: number;
@@ -61,11 +62,17 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+export function isRegexMultilineEnabled(
+  opts: Pick<SearchOptions, 'useRegex' | 'regexMultiline'>,
+): boolean {
+  return !!opts.useRegex && opts.regexMultiline !== false;
+}
+
 function buildRegex(opts: SearchOptions): RegExp | null {
   if (!opts.query) { return null; }
   let src = opts.useRegex ? opts.query : escapeRegex(opts.query);
   if (opts.wholeWord) { src = `\\b${src}\\b`; }
-  const flags = 'g' + (opts.caseSensitive ? '' : 'i') + (opts.useRegex ? 'ms' : '');
+  const flags = 'g' + (opts.caseSensitive ? '' : 'i') + (isRegexMultilineEnabled(opts) ? 'ms' : '');
   try {
     return new RegExp(src, flags);
   } catch {
@@ -302,7 +309,12 @@ export async function runSearch(
           return;
         }
 
-        const fileMatch = scanText(text, regex, uri, opts.useRegex || opts.query.includes('\n'));
+        const fileMatch = scanText(
+          text,
+          regex,
+          uri,
+          isRegexMultilineEnabled(opts) || (!opts.useRegex && opts.query.includes('\n')),
+        );
         if (fileMatch.matches.length === 0) { continue; }
 
         let sliceStart = 0;

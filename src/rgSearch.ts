@@ -11,6 +11,7 @@ import {
   MatchRange,
   getRequestedResultLimit,
   getRequestedResultOffset,
+  isRegexMultilineEnabled,
   FILE_MATCH_CHUNK_MATCH_LIMIT,
   FILE_MATCH_CHUNK_CHAR_LIMIT,
 } from './search';
@@ -347,8 +348,12 @@ export async function runRgSearch(
   const includeMatcher = compileIncludeMatcher(opts.includePatterns);
   const includeGlobs = toRipgrepGlobs(opts.includePatterns);
 
-  const isRegexMultiline = opts.useRegex;
-  const isMultiline = isRegexMultiline || opts.query.includes('\n');
+  const isRegexMultiline = isRegexMultilineEnabled(opts);
+  if (opts.useRegex && !isRegexMultiline && opts.query.includes('\n')) {
+    progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
+    return;
+  }
+  const isMultiline = isRegexMultiline || (!opts.useRegex && opts.query.includes('\n'));
   const args: string[] = [
     '--json',
     '--hidden',
@@ -364,7 +369,9 @@ export async function runRgSearch(
   ];
   if (isMultiline) { args.push('-U'); }
   if (opts.useRegex) {
-    args.push('--multiline-dotall');
+    if (isRegexMultiline) {
+      args.push('--multiline-dotall');
+    }
   } else {
     args.push('--fixed-strings');
   }

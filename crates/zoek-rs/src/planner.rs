@@ -118,6 +118,7 @@ mod tests {
             case_sensitive: true,
             whole_word: false,
             use_regex: false,
+            regex_multiline: true,
             include: vec![],
             limit: 10,
             offset: 0,
