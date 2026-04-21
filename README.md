@@ -59,7 +59,17 @@ npm run bench:zoekt -- --files 10000,50000,100000
 
 `npm run bench:zoekt` saves a timestamped artifact plus `latest.json` under `artifacts/benchmarks/zoekt/`. The artifact includes the raw benchmark response, wall-clock runtime, git commit, Rust toolchain versions, and host metadata so repeated runs stay comparable.
 
-Package locally:
+## Deployment
+
+Deployment and release steps now live in [DEPLOY.md](DEPLOY.md).
+
+Short version:
+
+- `vsce package` builds a lightweight VSIX from the current `.vscodeignore`.
+- That default VSIX does not include `target/**`, so it relies on first-run Cargo builds for the Rust `zoekt` runtime.
+- A self-contained VSIX requires prebuilding `target/release/zoek-rs` and `target/release/ijss-rebuild`, then allowing those artifacts through `.vscodeignore` before packaging.
+
+Quick local package:
 
 ```bash
 vsce package
