@@ -48,31 +48,43 @@ pub fn search_workspace(
 
     let mut verified_files = Vec::new();
     let mut total_files_scanned = 0usize;
+    let mut total_matches = 0usize;
+    let target_matches = request
+        .offset
+        .saturating_add(request.limit.max(1))
+        .saturating_add(1);
+    let mut stopped_early = false;
 
     for candidate in candidates.values() {
+        if total_matches >= target_matches {
+            stopped_early = true;
+            break;
+        }
         total_files_scanned += 1;
         let Some(current) = load_current_text(&candidate.absolute_path, config).map_err(|err| err.to_string())? else {
             continue;
         };
+        let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
         let matches = match plan.mode {
             QueryMode::Literal => verify_literal(
                 &current.text,
                 &request.query,
                 request.case_sensitive,
                 request.whole_word,
-                usize::MAX,
+                remaining_match_budget,
             ),
             QueryMode::Regex => verify_regex(
                 &current.text,
                 &plan.effective_query,
                 request.case_sensitive,
-                usize::MAX,
+                remaining_match_budget,
             )
             .map_err(|err| err.to_string())?,
         };
         if matches.is_empty() {
             continue;
         }
+        total_matches += matches.len();
         let score = score_file(&candidate.rel_path, &matches);
         verified_files.push(build_file_result(
             candidate.rel_path.clone(),
@@ -85,10 +97,9 @@ pub fn search_workspace(
 
     verified_files.sort_by(|left, right| right.score.cmp(&left.score).then_with(|| left.rel_path.cmp(&right.rel_path)));
     let total_files_matched = verified_files.len();
-    let total_matches = verified_files.iter().map(|file| file.matches.len()).sum::<usize>();
     let files = page_files_by_match_offset(&verified_files, request.offset, request.limit);
     let paged_matches = files.iter().map(|file| file.matches.len()).sum::<usize>();
-    let truncated = request.offset.saturating_add(paged_matches) < total_matches;
+    let truncated = stopped_early || request.offset.saturating_add(paged_matches) < total_matches;
 
     Ok(SearchResponse {
         ok: true,
@@ -215,13 +226,22 @@ fn candidate_doc_ids(
     reader: &ShardReader,
     plan: &crate::planner::QueryPlan,
 ) -> Result<BTreeSet<u32>, std::io::Error> {
+    let docs = reader.documents()?;
     if plan.required_grams.is_empty() {
-        return Ok(reader
-            .documents()?
-            .into_iter()
-            .map(|doc| doc.doc_id)
-            .collect::<BTreeSet<_>>());
+        return Ok(docs.into_iter().map(|doc| doc.doc_id).collect::<BTreeSet<_>>());
     }
+
+    // Any doc whose posting set was truncated at index time (indexer's
+    // max_grams_per_file cap) must be included unconditionally — the
+    // gram AND-intersection below would otherwise drop real-match files
+    // whose dropped gram happened to coincide with one of the required
+    // grams. The verifier re-scans content so including more candidates
+    // costs I/O but never correctness.
+    let incomplete_ids: BTreeSet<u32> = docs
+        .iter()
+        .filter(|doc| doc.gram_incomplete)
+        .map(|doc| doc.doc_id)
+        .collect();
 
     let mut acc: Option<BTreeSet<u32>> = None;
     for gram in &plan.required_grams {
@@ -237,7 +257,9 @@ fn candidate_doc_ids(
             break;
         }
     }
-    Ok(acc.unwrap_or_default())
+    let mut acc = acc.unwrap_or_default();
+    acc.extend(incomplete_ids);
+    Ok(acc)
 }
 
 fn docs_for_ids<'a>(docs: &'a [ShardDocument], ids: &BTreeSet<u32>) -> Vec<&'a ShardDocument> {
@@ -255,6 +277,11 @@ fn overlay_matches_plan(
     config: &EngineConfig,
 ) -> bool {
     if plan.required_grams.is_empty() {
+        return true;
+    }
+    // Mirror the shard-side incomplete handling: if the indexer truncated
+    // this overlay entry's grams, force it into the candidate set.
+    if entry.gram_incomplete {
         return true;
     }
     let grams = entry
@@ -332,6 +359,52 @@ mod tests {
     }
 
     #[test]
+    fn search_workspace_uses_shards_for_multiline_literal_queries() -> io::Result<()> {
+        let root = temp_dir("multiline-searcher");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(
+            root.join("src/a.tsx"),
+            "export const RightToConsentOrConsultInvestorsSelectTable = ({\n  name,\n  investorCandidates,\n  isShowInvestors,\n  onCheck,\n});\n",
+        )?;
+        fs::write(
+            root.join("src/b.tsx"),
+            "export const AnotherTable = ({\n  name,\n  candidates,\n});\n",
+        )?;
+        for idx in 0..32 {
+            fs::write(
+                root.join("src").join(format!("noise-{idx}.ts")),
+                format!("export const Noise{idx} = {{ name: 'value' }};\n"),
+            )?;
+        }
+        index_directory(&root, &EngineConfig::default())?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "export const RightToConsentOrConsultInvestorsSelectTable = ({\n  name,\n  investorCandidates,\n  isShowInvestors,\n  onCheck".to_string(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                include: vec!["src/*".to_string()],
+                limit: 10,
+                offset: 0,
+            },
+            &EngineConfig::default(),
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(response.total_files_matched, 1);
+        assert_eq!(response.files[0].rel_path, "src/a.tsx");
+        assert!(
+            response.total_files_scanned < 10,
+            "expected multiline literal planning to avoid scanning the whole workspace; scanned {} files",
+            response.total_files_scanned,
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn overlay_tombstone_shadows_base_document() -> io::Result<()> {
         let root = temp_dir("overlay-shadow");
         fs::create_dir_all(root.join("src"))?;
@@ -347,6 +420,7 @@ mod tests {
                 modified_unix_secs: 2,
                 content_hash: 0,
                 grams: vec![],
+                gram_incomplete: false,
             }],
         };
         fs::write(root.join(".zoek-rs/hot-overlay.json"), overlay.to_json())?;
@@ -513,6 +587,46 @@ mod tests {
         assert_eq!(response.files[0].matches.len(), 2);
         assert_eq!(response.files[0].matches[0].line, 2);
         assert_eq!(response.files[0].matches[1].line, 3);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn broad_literal_queries_stop_after_filling_the_requested_page() -> io::Result<()> {
+        let root = temp_dir("broad-literal");
+        fs::create_dir_all(root.join("src"))?;
+        for idx in 0..64 {
+            fs::write(
+                root.join("src").join(format!("f{idx:02}.ts")),
+                "class Alpha {}\nclass Beta {}\nclass Gamma {}\nclass Delta {}\n",
+            )?;
+        }
+        index_directory(&root, &EngineConfig::default())?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "class".to_string(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                include: vec!["src/*".to_string()],
+                limit: 10,
+                offset: 0,
+            },
+            &EngineConfig::default(),
+        )
+        .map_err(io::Error::other)?;
+
+        assert!(response.truncated);
+        assert_eq!(response.files.len(), 3);
+        assert_eq!(response.total_matches, 11);
+        assert!(
+            response.total_files_scanned < 10,
+            "expected broad literal query to stop early; scanned {} files",
+            response.total_files_scanned,
+        );
 
         fs::remove_dir_all(root)?;
         Ok(())

@@ -1558,6 +1558,15 @@ export function getRendererPatchScript(): string {
     }
   }
 
+  function normalizeResultPreview(text) {
+    var normalized = String(text || '');
+    normalized = normalized.split(String.fromCharCode(13)).join(' ');
+    normalized = normalized.split(String.fromCharCode(10)).join(' ');
+    normalized = normalized.split(String.fromCharCode(8232)).join(' ');
+    normalized = normalized.split(String.fromCharCode(8233)).join(' ');
+    return normalized;
+  }
+
   function clearPreview() {
     $previewPath.textContent = '';
     $preview.classList.remove('ij-find-modified');
@@ -1625,7 +1634,7 @@ export function getRendererPatchScript(): string {
     var f = state.files[item.fi];
     var m = f.matches[item.mi];
     var textEl = el('span', { className: 'ij-find-row-text' });
-    appendHighlightedInto(textEl, m.preview, rangesForCurrentQuery(m));
+    appendHighlightedInto(textEl, normalizeResultPreview(m.preview), rangesForCurrentQuery(m));
     var slashIdx = f.relPath.lastIndexOf('/');
     var fileName = slashIdx >= 0 ? f.relPath.slice(slashIdx + 1) : f.relPath;
     var locText = fileName + ':' + (m.line + 1);
@@ -1858,6 +1867,16 @@ export function getRendererPatchScript(): string {
       oldOpts.useRegex !== state.options.useRegex ||
       oldScope !== scopeRaw;
     var involvesMultiline = q.indexOf('\\n') >= 0 || oldQ.indexOf('\\n') >= 0;
+    // Identical-query guard: same query + same options and NOT a forceRestart.
+    // Without this, spurious re-fires (e.g. show() + debounce race, or the
+    // extension host bouncing back another 'search' request) each call
+    // cancelActive() server-side, killing the in-flight zoekt process before
+    // it can deliver results. Codesearch was fast enough to hide this; zoekt
+    // process startup is slow enough that the final cancel wins and the user
+    // sees "no results" for queries that should succeed.
+    if (!forceRestart && !optsChanged && oldQ && q === oldQ) {
+      return;
+    }
     var isExtension = !forceRestart && oldQ && q.length > oldQ.length && q.indexOf(oldQ) === 0 &&
       !optsChanged && !involvesMultiline;
     if (isExtension) {
@@ -1978,7 +1997,6 @@ export function getRendererPatchScript(): string {
   $optCase.addEventListener('click', function () { toggleOpt('caseSensitive', $optCase); });
   $optWord.addEventListener('click', function () { toggleOpt('wholeWord', $optWord); });
   $optRegex.addEventListener('click', function () { toggleOpt('useRegex', $optRegex); });
-  $refresh.onclick = refreshSearch;
   $refresh.addEventListener('click', refreshSearch);
   function applyMinimapSetting() {
     var ed = state.previewMonacoEditor || state.monacoEditor;

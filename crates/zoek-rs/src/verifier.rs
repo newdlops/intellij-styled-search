@@ -1,10 +1,11 @@
 use crate::config::EngineConfig;
 use crate::corpus::{decode_bytes, looks_binary_bytes};
 use crate::protocol::{SearchFileResult, SearchMatch};
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
 const MAX_PREVIEW_CHARS: usize = 240;
@@ -178,34 +179,148 @@ fn is_word_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
 
+// Ant-style glob semantics:
+//   `**`       — matches any number of path segments (including `/`).
+//   `**/X`     — any prefix path, then X in some segment.
+//   `*`        — matches within a single segment (does NOT cross `/`).
+//   `?`        — single char within a segment (not `/`).
+//   `[abc]`    — character class, `[!abc]` negation.
+// Implemented by translating to a rooted regex and caching compiled globs.
+// The previous loose matcher treated `*` as `.*` (matched `/`) so patterns
+// like `src/*.rs` incorrectly accepted `src/deep/file.rs`; it also made `**`
+// equivalent to `*`, breaking selective "only direct child" expectations.
 fn wildcard_match(pattern: &str, value: &str) -> bool {
-    let pattern_bytes = pattern.as_bytes();
-    let value_bytes = value.as_bytes();
-    let (mut p, mut v) = (0usize, 0usize);
-    let mut star = None;
-    let mut match_from = 0usize;
+    let re = match get_or_compile_glob(pattern) {
+        Some(re) => re,
+        None => return false,
+    };
+    re.is_match(value)
+}
 
-    while v < value_bytes.len() {
-        if p < pattern_bytes.len() && (pattern_bytes[p] == b'?' || pattern_bytes[p] == value_bytes[v]) {
-            p += 1;
-            v += 1;
-        } else if p < pattern_bytes.len() && pattern_bytes[p] == b'*' {
-            star = Some(p);
-            match_from = v;
-            p += 1;
-        } else if let Some(star_index) = star {
-            p = star_index + 1;
-            match_from += 1;
-            v = match_from;
-        } else {
-            return false;
+fn get_or_compile_glob(pattern: &str) -> Option<Regex> {
+    static CACHE: Mutex<Option<GlobCache>> = Mutex::new(None);
+    let mut guard = CACHE.lock().ok()?;
+    let cache = guard.get_or_insert_with(GlobCache::default);
+    if let Some(re) = cache.get(pattern) {
+        return Some(re);
+    }
+    let regex_src = glob_to_regex_source(pattern);
+    let compiled = Regex::new(&regex_src).ok()?;
+    cache.insert(pattern.to_string(), compiled.clone());
+    Some(compiled)
+}
+
+#[derive(Default)]
+struct GlobCache {
+    entries: Vec<(String, Regex)>,
+}
+
+impl GlobCache {
+    fn get(&self, pattern: &str) -> Option<Regex> {
+        self.entries
+            .iter()
+            .find(|(key, _)| key == pattern)
+            .map(|(_, re)| re.clone())
+    }
+    fn insert(&mut self, pattern: String, re: Regex) {
+        // Cap retained entries so long-running processes don't grow the
+        // cache unboundedly from per-search scope variations.
+        if self.entries.len() > 256 {
+            self.entries.drain(..128);
+        }
+        self.entries.push((pattern, re));
+    }
+}
+
+fn glob_to_regex_source(pattern: &str) -> String {
+    let bytes = pattern.as_bytes();
+    let mut out = String::from("^");
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        match ch {
+            b'*' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    // `**`: dir-spanning if isolated as its own segment.
+                    let at_segment_start = i == 0 || bytes[i - 1] == b'/';
+                    let at_segment_end = i + 2 == bytes.len() || bytes[i + 2] == b'/';
+                    if at_segment_start && at_segment_end {
+                        if i + 2 < bytes.len() && bytes[i + 2] == b'/' {
+                            // `**/` — zero or more full path segments.
+                            out.push_str("(?:[^/]+/)*");
+                            i += 3;
+                        } else {
+                            // trailing `**` — rest of the path (may include /).
+                            out.push_str(".*");
+                            i += 2;
+                        }
+                        continue;
+                    }
+                    // `**` glued into another segment → treat as `*`.
+                    out.push_str("[^/]*");
+                    i += 2;
+                    continue;
+                }
+                // single `*` — within one segment.
+                out.push_str("[^/]*");
+                i += 1;
+            }
+            b'?' => {
+                out.push_str("[^/]");
+                i += 1;
+            }
+            b'[' => {
+                // Character class. Scan until `]`.
+                let mut j = i + 1;
+                if j < bytes.len() && bytes[j] == b'!' {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b']' {
+                    j += 1;
+                }
+                while j < bytes.len() && bytes[j] != b']' {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    // Unterminated class — treat `[` as literal.
+                    out.push_str("\\[");
+                    i += 1;
+                    continue;
+                }
+                out.push('[');
+                let mut k = i + 1;
+                if k < j && bytes[k] == b'!' {
+                    out.push('^');
+                    k += 1;
+                }
+                while k < j {
+                    match bytes[k] {
+                        b'\\' => {
+                            out.push_str("\\\\");
+                        }
+                        b']' => {
+                            out.push_str("\\]");
+                        }
+                        other => out.push(other as char),
+                    }
+                    k += 1;
+                }
+                out.push(']');
+                i = j + 1;
+            }
+            b'.' | b'+' | b'(' | b')' | b'|' | b'^' | b'$' | b'\\' | b'{' | b'}' => {
+                out.push('\\');
+                out.push(ch as char);
+                i += 1;
+            }
+            other => {
+                out.push(other as char);
+                i += 1;
+            }
         }
     }
-
-    while p < pattern_bytes.len() && pattern_bytes[p] == b'*' {
-        p += 1;
-    }
-    p == pattern_bytes.len()
+    out.push('$');
+    out
 }
 
 #[cfg(test)]
@@ -239,5 +354,26 @@ mod tests {
     fn supports_simple_glob_filters() {
         assert!(matches_include_filters("src/demo/file.rs", &[String::from("src/*/*.rs")]));
         assert!(!matches_include_filters("tests/demo/file.py", &[String::from("src/*/*.rs")]));
+    }
+
+    #[test]
+    fn star_does_not_cross_path_segments() {
+        // Loose `*=.*` matching used to let `src/*.rs` accept nested paths.
+        assert!(matches_include_filters("src/file.rs", &[String::from("src/*.rs")]));
+        assert!(!matches_include_filters("src/deep/file.rs", &[String::from("src/*.rs")]));
+    }
+
+    #[test]
+    fn double_star_spans_segments() {
+        assert!(matches_include_filters("a/b/c/file.py", &[String::from("**/*.py")]));
+        assert!(matches_include_filters("file.py", &[String::from("**/*.py")]));
+        assert!(matches_include_filters("src/legal/test/foo.rs", &[String::from("**/test/**")]));
+        assert!(!matches_include_filters("src/legal/other/foo.rs", &[String::from("**/test/**")]));
+    }
+
+    #[test]
+    fn question_mark_is_single_segment_char() {
+        assert!(matches_include_filters("a1.rs", &[String::from("a?.rs")]));
+        assert!(!matches_include_filters("ab/c.rs", &[String::from("a?.rs")]));
     }
 }

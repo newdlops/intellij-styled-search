@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 use zoek_rs::config::EngineConfig;
-use zoek_rs::indexer::index_directory;
+use zoek_rs::indexer::index_directory_with_progress;
 use zoek_rs::mmap_store::StoreLayout;
 use zoek_rs::ops::{benchmark_workspaces, collect_info, diagnose_query};
 use zoek_rs::overlay::{apply_change_batch, load_overlay_with_recovery};
@@ -67,7 +67,10 @@ fn run_index(args: &[String]) -> Result<EngineResponse, String> {
         }
     }
 
-    let artifacts = index_directory(&workspace_root, &config).map_err(|err| err.to_string())?;
+    let artifacts = index_directory_with_progress(&workspace_root, &config, &mut |progress| {
+        eprintln!("{}", progress.to_stderr_line());
+    })
+    .map_err(|err| err.to_string())?;
     Ok(EngineResponse::Index(IndexResponse {
         ok: true,
         engine: EngineInfo::current(),
@@ -97,7 +100,10 @@ fn run_index(args: &[String]) -> Result<EngineResponse, String> {
 fn run_compact(args: &[String]) -> Result<EngineResponse, String> {
     let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
     let config = EngineConfig::default();
-    let artifacts = index_directory(&workspace_root, &config).map_err(|err| err.to_string())?;
+    let artifacts = index_directory_with_progress(&workspace_root, &config, &mut |progress| {
+        eprintln!("{}", progress.to_stderr_line());
+    })
+    .map_err(|err| err.to_string())?;
     Ok(EngineResponse::Index(IndexResponse {
         ok: true,
         engine: EngineInfo::current(),

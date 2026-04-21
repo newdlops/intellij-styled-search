@@ -14,34 +14,51 @@ pub struct DynamicGram {
     pub value: String,
 }
 
-pub fn extract_dynamic_grams(rel_path: &str, text: &str, max_grams: usize) -> Vec<DynamicGram> {
+/// Extract grams for indexing, up to `max_grams`. The returned flag is true
+/// when the budget was reached before all path/text tokens were visited —
+/// meaning the shard's posting set for this document is known-incomplete.
+/// Searchers must NOT exclude such docs at the AND-intersection step,
+/// otherwise files with many unique tokens become unreachable for long
+/// queries even though rg would find them.
+pub fn extract_dynamic_grams_with_overflow(
+    rel_path: &str,
+    text: &str,
+    max_grams: usize,
+) -> (Vec<DynamicGram>, bool) {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    let mut overflow = false;
+
+    macro_rules! push_gram {
+        ($gram:expr) => {{
+            if seen.insert(($gram.kind, $gram.value.clone())) {
+                if out.len() >= max_grams {
+                    overflow = true;
+                } else {
+                    out.push($gram);
+                }
+            }
+        }};
+    }
 
     for component in rel_path.split('/') {
         for gram in grams_for_token(&normalize_token(component), GramKind::Path) {
-            if seen.insert((gram.kind, gram.value.clone())) {
-                out.push(gram);
-                if out.len() >= max_grams {
-                    return out;
-                }
-            }
+            push_gram!(gram);
         }
     }
 
     for token in tokenize(text) {
         let normalized = normalize_token(token);
         for gram in grams_for_token(&normalized, classify_token_kind(&normalized)) {
-            if seen.insert((gram.kind, gram.value.clone())) {
-                out.push(gram);
-                if out.len() >= max_grams {
-                    return out;
-                }
-            }
+            push_gram!(gram);
         }
     }
 
-    out
+    (out, overflow)
+}
+
+pub fn extract_dynamic_grams(rel_path: &str, text: &str, max_grams: usize) -> Vec<DynamicGram> {
+    extract_dynamic_grams_with_overflow(rel_path, text, max_grams).0
 }
 
 pub fn grams_for_query_literal(literal: &str) -> Vec<String> {
@@ -95,15 +112,26 @@ pub fn selective_grams_for_query_literal(
     tokens.sort_by(|left, right| right.chars().count().cmp(&left.chars().count()));
     tokens.truncate(max_tokens);
 
+    // With sliding-window indexing, a single long token alone can produce
+    // dozens of grams; taking them greedily starves later tokens and
+    // reduces selectivity to "files containing token 0" instead of "files
+    // containing all N tokens". Distribute the budget round-robin across
+    // tokens so every chosen token is represented in the AND-intersection.
+    let per_token = max_grams.div_ceil(tokens.len().max(1));
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for normalized in tokens {
+        let mut emitted = 0usize;
         for gram in grams_for_token(&normalized, classify_token_kind(&normalized)) {
+            if out.len() >= max_grams {
+                return out;
+            }
+            if emitted >= per_token {
+                break;
+            }
             if seen.insert(gram.value.clone()) {
                 out.push(gram.value);
-                if out.len() >= max_grams {
-                    return out;
-                }
+                emitted += 1;
             }
         }
     }
@@ -140,21 +168,24 @@ fn grams_for_token(token: &str, kind: GramKind) -> Vec<DynamicGram> {
     }
     .min(len);
 
+    // Full sliding-window coverage: every contiguous `width`-char substring.
+    // Required so the planner (which may pick a subset of grams) always
+    // intersects with grams the indexer actually stored for the same token.
+    // The prior 3-window (prefix/middle/suffix) scheme made query-side gram
+    // selection brittle — picking a middle offset that didn't coincide with
+    // the indexer's prefix/middle/suffix would silently exclude real
+    // matches. Combined with a raised per-file cap and a `gram_incomplete`
+    // flag for overflow files, sliding window no longer sacrifices recall.
     let chars: Vec<char> = token.chars().collect();
-    let mut windows = Vec::new();
-    windows.push(chars[0..width].iter().collect::<String>());
-    if len > width {
-        let mid_start = (len - width) / 2;
-        windows.push(chars[mid_start..mid_start + width].iter().collect::<String>());
-        windows.push(chars[len - width..len].iter().collect::<String>());
-    }
-
     let mut seen = HashSet::new();
-    windows
-        .into_iter()
-        .filter(|value| seen.insert(value.clone()))
-        .map(|value| DynamicGram { kind, value })
-        .collect()
+    let mut out = Vec::new();
+    for start in 0..=(len - width) {
+        let value: String = chars[start..start + width].iter().collect();
+        if seen.insert(value.clone()) {
+            out.push(DynamicGram { kind, value });
+        }
+    }
+    out
 }
 
 #[cfg(test)]

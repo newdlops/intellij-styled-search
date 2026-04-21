@@ -13,5 +13,9 @@ path = "src/lib.rs"
 name = "zoek-rs"
 path = "src/bin/zoek-rs.rs"
 
+[[bin]]
+name = "ijss-rebuild"
+path = "src/bin/ijss-rebuild.rs"
+
 [dependencies]
 regex = "1.11.1"

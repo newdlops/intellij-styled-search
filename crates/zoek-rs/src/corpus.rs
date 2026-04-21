@@ -34,13 +34,48 @@ pub struct CorpusStats {
     pub decoded_utf16_files: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct CorpusProgress {
+    pub visited_files: usize,
+    pub total_candidate_files: usize,
+}
+
 pub fn discover_text_files(
     workspace_root: &Path,
     config: &EngineConfig,
 ) -> io::Result<(Vec<CorpusEntry>, CorpusStats)> {
     let mut entries = Vec::new();
     let mut stats = CorpusStats::default();
-    walk_dir(workspace_root, workspace_root, config, &mut entries, &mut stats)?;
+    let mut noop = |_progress: CorpusProgress| {};
+    walk_dir(workspace_root, workspace_root, config, 0, &mut entries, &mut stats, &mut noop)?;
+    entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    Ok((entries, stats))
+}
+
+pub fn count_candidate_files(workspace_root: &Path, config: &EngineConfig) -> io::Result<usize> {
+    count_files_dir(workspace_root, workspace_root, config)
+}
+
+pub fn discover_text_files_with_progress<F>(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    total_candidate_files: usize,
+    progress: &mut F,
+) -> io::Result<(Vec<CorpusEntry>, CorpusStats)>
+where
+    F: FnMut(CorpusProgress),
+{
+    let mut entries = Vec::new();
+    let mut stats = CorpusStats::default();
+    walk_dir(
+        workspace_root,
+        workspace_root,
+        config,
+        total_candidate_files,
+        &mut entries,
+        &mut stats,
+        progress,
+    )?;
     entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
     Ok((entries, stats))
 }
@@ -49,8 +84,10 @@ fn walk_dir(
     dir: &Path,
     workspace_root: &Path,
     config: &EngineConfig,
+    total_candidate_files: usize,
     entries: &mut Vec<CorpusEntry>,
     stats: &mut CorpusStats,
+    progress: &mut impl FnMut(CorpusProgress),
 ) -> io::Result<()> {
     for item in fs::read_dir(dir)? {
         let item = item?;
@@ -63,7 +100,15 @@ fn walk_dir(
                 stats.skipped_dirs += 1;
                 continue;
             }
-            walk_dir(&path, workspace_root, config, entries, stats)?;
+            walk_dir(
+                &path,
+                workspace_root,
+                config,
+                total_candidate_files,
+                entries,
+                stats,
+                progress,
+            )?;
             continue;
         }
         if !metadata.is_file() {
@@ -71,6 +116,16 @@ fn walk_dir(
         }
 
         stats.visited_files += 1;
+        if total_candidate_files > 0
+            && (stats.visited_files == 1
+                || stats.visited_files % 128 == 0
+                || stats.visited_files == total_candidate_files)
+        {
+            progress(CorpusProgress {
+                visited_files: stats.visited_files,
+                total_candidate_files,
+            });
+        }
         if metadata.len() > config.max_file_size_bytes {
             stats.skipped_too_large += 1;
             continue;
@@ -109,6 +164,32 @@ fn walk_dir(
         stats.indexed_files += 1;
     }
     Ok(())
+}
+
+fn count_files_dir(
+    dir: &Path,
+    workspace_root: &Path,
+    config: &EngineConfig,
+) -> io::Result<usize> {
+    let mut total = 0usize;
+    for item in fs::read_dir(dir)? {
+        let item = item?;
+        let path = item.path();
+        let metadata = item.metadata()?;
+        if metadata.is_dir() {
+            let file_name = item.file_name();
+            let name = file_name.to_string_lossy();
+            if config.is_excluded_dir_name(&name) || path == config.index_root(workspace_root) {
+                continue;
+            }
+            total += count_files_dir(&path, workspace_root, config)?;
+            continue;
+        }
+        if metadata.is_file() {
+            total += 1;
+        }
+    }
+    Ok(total)
 }
 
 fn normalize_rel_path(path: &Path) -> String {

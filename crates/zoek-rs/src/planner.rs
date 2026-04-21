@@ -4,6 +4,8 @@ use crate::regex_plan::extract_mandatory_literals;
 
 const MAX_QUERY_TOKENS: usize = 4;
 const MAX_QUERY_GRAMS: usize = 12;
+const MAX_MULTILINE_QUERY_TOKENS: usize = 8;
+const MAX_MULTILINE_QUERY_GRAMS: usize = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryMode {
@@ -47,10 +49,21 @@ pub fn build_query_plan(request: &SearchRequest) -> QueryPlan {
     let mut required_grams = Vec::new();
     if !request.use_regex {
         if let Some(literal) = required_literals.first() {
+            let (max_tokens, max_grams) = if literal.contains('\n') {
+                (MAX_MULTILINE_QUERY_TOKENS, MAX_MULTILINE_QUERY_GRAMS)
+            } else {
+                (MAX_QUERY_TOKENS, MAX_QUERY_GRAMS)
+            };
+            // Multiline pasted code snippets were previously forced through a
+            // full verifier scan because `required_grams` stayed empty. That
+            // is correct but catastrophic on large workspaces. Now that the
+            // index marks gram-truncated files as incomplete (and search keeps
+            // those files in the candidate set unconditionally), we can safely
+            // use a bounded selective gram set for multiline literals too.
             required_grams.extend(selective_grams_for_query_literal(
                 literal,
-                MAX_QUERY_TOKENS,
-                MAX_QUERY_GRAMS,
+                max_tokens,
+                max_grams,
             ));
         }
     } else {
@@ -89,5 +102,27 @@ fn normalize_literal(value: &str, case_sensitive: bool) -> String {
         value.to_string()
     } else {
         value.chars().flat_map(char::to_lowercase).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_query_plan;
+    use crate::protocol::SearchRequest;
+
+    #[test]
+    fn multiline_literals_still_produce_required_grams() {
+        let plan = build_query_plan(&SearchRequest {
+            workspace_root: "/tmp/workspace".to_string(),
+            query: "export const RightToConsentOrConsultInvestorsSelectTable = ({\n  name,\n  investorCandidates,\n  isShowInvestors,\n  onCheck,\n});".to_string(),
+            case_sensitive: true,
+            whole_word: false,
+            use_regex: false,
+            include: vec![],
+            limit: 10,
+            offset: 0,
+        });
+        assert!(!plan.required_grams.is_empty());
+        assert!(plan.required_grams.iter().any(|gram| gram == "righ" || gram == "inve"));
     }
 }

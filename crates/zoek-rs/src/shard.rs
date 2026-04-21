@@ -15,6 +15,13 @@ pub struct IndexedDocument {
     pub modified_unix_secs: u64,
     pub content_hash: u64,
     pub grams: Vec<String>,
+    /// Per-file "gram budget exhausted" flag. When true, the stored
+    /// `grams` set is a prefix of the document's true gram set because the
+    /// indexer hit `max_grams_per_file` before visiting every token.
+    /// Searchers must include these docs as candidates regardless of
+    /// required_grams AND-intersection, because any dropped gram would
+    /// otherwise hide legit matches.
+    pub gram_incomplete: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,7 +47,13 @@ pub struct ShardDocument {
     pub modified_unix_secs: u64,
     pub gram_count: usize,
     pub content_hash: u64,
+    pub gram_incomplete: bool,
 }
+
+// Bit flags stored in the reserved u32 after `doc_id` in each DOC record.
+// The slot was previously padding (always 0), so reading old shards yields
+// `flags=0` → `gram_incomplete=false`, matching their prior behavior.
+const DOC_FLAG_GRAM_INCOMPLETE: u32 = 1 << 0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PostingList {
@@ -73,6 +86,10 @@ pub fn build_shard_bytes(
     for (doc_id, doc) in documents.iter().enumerate() {
         let path_offset = string_blob.len() as u64;
         string_blob.extend_from_slice(doc.rel_path.as_bytes());
+        let mut flags: u32 = 0;
+        if doc.gram_incomplete {
+            flags |= DOC_FLAG_GRAM_INCOMPLETE;
+        }
         doc_records.push((
             doc_id as u32,
             path_offset,
@@ -81,6 +98,7 @@ pub fn build_shard_bytes(
             doc.modified_unix_secs,
             doc.grams.len() as u32,
             doc.content_hash,
+            flags,
         ));
         for gram in &doc.grams {
             postings_map.entry(gram.clone()).or_default().push(doc_id as u32);
@@ -143,7 +161,10 @@ pub fn build_shard_bytes(
 
     for record in &doc_records {
         push_u32(&mut bytes, record.0);
-        push_u32(&mut bytes, 0);
+        // Previously unused padding slot — now stores doc-level flags.
+        // Old shards had 0 here which maps to `gram_incomplete=false`, so
+        // reading old shards on a new binary yields prior behavior.
+        push_u32(&mut bytes, record.7);
         push_u64(&mut bytes, record.1);
         push_u32(&mut bytes, record.2);
         push_u32(&mut bytes, record.5);
@@ -190,6 +211,7 @@ impl ShardReader {
         for idx in 0..self.header.doc_count {
             let base = self.header.docs_offset as usize + idx * DOC_RECORD_BYTES;
             let doc_id = read_u32_at(&self.bytes, base)?;
+            let flags = read_u32_at(&self.bytes, base + 4)?;
             let path_offset = read_u64_at(&self.bytes, base + 8)?;
             let path_len = read_u32_at(&self.bytes, base + 16)? as usize;
             let gram_count = read_u32_at(&self.bytes, base + 20)? as usize;
@@ -203,6 +225,7 @@ impl ShardReader {
                 modified_unix_secs,
                 gram_count,
                 content_hash,
+                gram_incomplete: (flags & DOC_FLAG_GRAM_INCOMPLETE) != 0,
             });
         }
         Ok(docs)
@@ -388,6 +411,7 @@ mod tests {
                     modified_unix_secs: 1,
                     content_hash: 11,
                     grams: vec!["src".to_string(), "alph".to_string()],
+                    gram_incomplete: false,
                 },
                 IndexedDocument {
                     rel_path: "src/b.rs".to_string(),
@@ -395,6 +419,7 @@ mod tests {
                     modified_unix_secs: 2,
                     content_hash: 22,
                     grams: vec!["src".to_string(), "beta".to_string()],
+                    gram_incomplete: false,
                 },
             ],
         )?;
@@ -426,6 +451,7 @@ mod tests {
                 modified_unix_secs: idx as u64,
                 content_hash: idx as u64,
                 grams: vec![format!("g{:03}", idx), "shared".to_string()],
+                gram_incomplete: false,
             });
         }
         let build = build_shard_bytes(0, 1, &docs)?;

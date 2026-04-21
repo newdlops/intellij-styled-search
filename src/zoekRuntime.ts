@@ -45,6 +45,7 @@ type PaginatedSearchResult = {
 
 const UPDATE_DEBOUNCE_MS = 250;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
+const ZOEKT_PROGRESS_PREFIX = '__ZOEK_PROGRESS__';
 
 class ProcessCancelledError extends Error {
   constructor(message: string) {
@@ -57,13 +58,39 @@ type InvokeTextResult = {
   stdout: string;
   stderr: string;
   code: number;
+  signal: NodeJS.Signals | null;
   cancelled: boolean;
 };
+
+type InvokeTextHooks = {
+  onStderrLine?: (line: string) => boolean | void;
+};
+
+type IndexProgressListener = (message: string, percent?: number) => void;
+
+type IndexProgressState = {
+  message: string;
+  percent: number | undefined;
+};
+
+type BinaryTarget = 'engine' | 'rebuild';
+
+type ProcessKind =
+  | 'build'
+  | 'search'
+  | 'index'
+  | 'rebuild'
+  | 'update'
+  | 'info'
+  | 'diagnose'
+  | 'benchmark'
+  | 'other';
 
 type TrackedChild = {
   id: number;
   child: ChildProcess;
   label: string;
+  kind: ProcessKind;
   cancelled: boolean;
   killTimer: ReturnType<typeof setTimeout> | undefined;
 };
@@ -74,8 +101,12 @@ export class ZoektRuntime implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly lifecycleCts = new vscode.CancellationTokenSource();
   private binaryPath: string | undefined;
-  private buildPromise: Promise<string | null> | undefined;
+  private rebuildBinaryPath: string | undefined;
+  private buildPromise: Promise<void> | undefined;
   private readonly indexPromises = new Map<string, Promise<boolean>>();
+  private readonly foregroundIndexPromises = new Map<string, Promise<boolean>>();
+  private readonly indexProgressState = new Map<string, IndexProgressState>();
+  private readonly indexProgressListeners = new Map<string, Set<IndexProgressListener>>();
   private updatePromise: Promise<void> = Promise.resolve();
   private flushTimer: ReturnType<typeof setTimeout> | undefined;
   private pendingChanged = new Set<string>();
@@ -120,11 +151,19 @@ export class ZoektRuntime implements vscode.Disposable {
     }
   }
 
-  cancelRunningProcesses(reason = 'cancelled'): void {
+  cancelRunningProcesses(
+    reason = 'cancelled',
+    options?: {
+      kinds?: Iterable<ProcessKind>;
+      sweepPatterns?: string[];
+    },
+  ): void {
+    const kinds = options?.kinds ? new Set(options.kinds) : null;
     for (const tracked of this.activeChildren.values()) {
+      if (kinds && !kinds.has(tracked.kind)) { continue; }
       this.terminateTrackedChild(tracked, reason);
     }
-    void this.sweepExternalZoektProcesses(reason);
+    void this.sweepExternalZoektProcesses(reason, options?.sweepPatterns ?? this.sweepPatternsForKinds(kinds));
   }
 
   async prewarmIfPreferred(): Promise<void> {
@@ -137,24 +176,59 @@ export class ZoektRuntime implements vscode.Disposable {
     void this.ensureIndexed(workspaceRoot, 'prewarm');
   }
 
-  async rebuildIndex(report?: (message: string) => void): Promise<boolean> {
+  async rebuildIndex(report?: (message: string, percent?: number) => void): Promise<boolean> {
     const workspaceRoot = this.getWorkspaceRootPath();
     if (!workspaceRoot) { return false; }
-    const binary = await this.resolveBinary(true);
+    const existing = this.foregroundIndexPromises.get(workspaceRoot);
+    if (existing) {
+      report?.('zoek-rs: waiting for in-flight rebuild');
+      const detach = this.attachIndexProgressListener(workspaceRoot, report);
+      try {
+        return await existing;
+      } finally {
+        detach();
+      }
+    }
+    const background = this.indexPromises.get(workspaceRoot);
+    if (background) {
+      report?.('zoek-rs: stopping in-flight background index');
+      this.cancelRunningProcesses('explicit rebuild requested', {
+        kinds: ['index'],
+      });
+      try {
+        await background;
+      } catch {}
+    }
+    const binary = await this.resolveBinary(true, 'rebuild');
     if (!binary) {
-      this.log.appendLine('zoek-rs rebuild skipped: runtime binary unavailable.');
+      this.log.appendLine('zoek-rs rebuild skipped: dedicated rebuild binary unavailable.');
       return false;
     }
-    report?.('zoek-rs: indexing workspace');
-    const response = await this.invokeJson([binary, 'index', workspaceRoot]);
-    if (response.type !== 'index' || !response.ok) {
-      throw new Error(this.describeEngineFailure(response, 'zoek-rs index failed'));
-    }
-    this.logIndexWarnings(response);
-    this.log.appendLine(
-      `zoek-rs index ready: files=${response.stats.indexedFiles} shards=${response.stats.shardCount} grams=${response.stats.totalGrams}`,
-    );
-    return true;
+    const detach = this.attachIndexProgressListener(workspaceRoot, report);
+    const promise = (async () => {
+      this.emitIndexProgress(workspaceRoot, 'zoek-rs: indexing workspace');
+      const response = await this.invokeJson([binary, workspaceRoot], undefined, {
+        onStderrLine: (line) => this.handleIndexProgressLine(
+          line,
+          (message, percent) => this.emitIndexProgress(workspaceRoot, message, percent),
+        ),
+      });
+      if (response.type !== 'index' || !response.ok) {
+        throw new Error(this.describeEngineFailure(response, 'zoek-rs index failed'));
+      }
+      this.logIndexWarnings(response);
+      this.log.appendLine(
+        `zoek-rs index ready: files=${response.stats.indexedFiles} shards=${response.stats.shardCount} grams=${response.stats.totalGrams}`,
+      );
+      this.emitIndexProgress(workspaceRoot, 'zoek-rs: index ready', 100);
+      return true;
+    })().finally(() => {
+      this.foregroundIndexPromises.delete(workspaceRoot);
+      this.indexProgressState.delete(workspaceRoot);
+      detach();
+    });
+    this.foregroundIndexPromises.set(workspaceRoot, promise);
+    return promise;
   }
 
   async getSearchReadiness(): Promise<SearchReadiness> {
@@ -175,7 +249,7 @@ export class ZoektRuntime implements vscode.Disposable {
     if (await this.hasReadyIndex(workspaceRoot)) {
       return { ready: true };
     }
-    if (this.indexPromises.has(workspaceRoot)) {
+    if (this.indexPromises.has(workspaceRoot) || this.foregroundIndexPromises.has(workspaceRoot)) {
       return { ready: false, reason: 'zoek-rs index build in progress' };
     }
     void this.ensureIndexed(workspaceRoot, 'search').catch((err) => {
@@ -224,13 +298,15 @@ export class ZoektRuntime implements vscode.Disposable {
       if (token.isCancellationRequested) { return { ready: true }; }
       const page = this.paginateSearchResponse(response, options, workspaceRoot);
       if (page.matches.length === 0 && page.availableMatches > offset) {
+        // Engine internal bug: paginator produced an empty page despite
+        // the result set not being exhausted. Fall back so the user still
+        // gets results. Legitimate "zero matches" is handled below as a
+        // normal empty onDone (ready=true) — NOT a fallback, so the UI
+        // shows "0 matches" instead of silently running codesearch.
         return {
           ready: false,
           reason: 'zoek-rs returned an empty page before the result set was exhausted; verifying with codesearch',
         };
-      }
-      if (page.availableMatches === 0 && options.query.trim().length > 0) {
-        return { ready: false, reason: 'zoek-rs returned no matches; verifying with codesearch' };
       }
       for (const warning of page.warnings) {
         this.log.appendLine(`zoek-rs warning: ${warning}`);
@@ -264,7 +340,10 @@ export class ZoektRuntime implements vscode.Disposable {
     const start = Date.now();
     while (true) {
       const pendingBuild = this.buildPromise;
-      const pendingIndex = Array.from(this.indexPromises.values());
+      const pendingIndex = [
+        ...this.indexPromises.values(),
+        ...this.foregroundIndexPromises.values(),
+      ];
       const stillFlushing = !!this.flushTimer;
       if (!pendingBuild && pendingIndex.length === 0 && !stillFlushing) {
         await this.updatePromise;
@@ -495,7 +574,12 @@ export class ZoektRuntime implements vscode.Disposable {
       return;
     }
     const binary = await this.resolveBinary(false);
-    if (!binary || !await this.hasReadyIndex(workspaceRoot) || this.indexPromises.has(workspaceRoot)) {
+    if (
+      !binary ||
+      !await this.hasReadyIndex(workspaceRoot) ||
+      this.indexPromises.has(workspaceRoot) ||
+      this.foregroundIndexPromises.has(workspaceRoot)
+    ) {
       this.clearPending();
       return;
     }
@@ -556,8 +640,14 @@ export class ZoektRuntime implements vscode.Disposable {
       const binary = await this.resolveBinary(true);
       if (!binary) { return false; }
       this.log.appendLine(`zoek-rs background index start (${reason})`);
+      this.emitIndexProgress(workspaceRoot, 'zoek-rs: indexing workspace');
       try {
-        const response = await this.invokeJson([binary, 'index', workspaceRoot], this.lifecycleCts.token);
+        const response = await this.invokeJson([binary, 'index', workspaceRoot], this.lifecycleCts.token, {
+          onStderrLine: (line) => this.handleIndexProgressLine(
+            line,
+            (message, percent) => this.emitIndexProgress(workspaceRoot, message, percent),
+          ),
+        });
         if (response.type !== 'index' || !response.ok) {
           this.log.appendLine(this.describeEngineFailure(response, 'zoek-rs background index failed'));
           return false;
@@ -566,6 +656,7 @@ export class ZoektRuntime implements vscode.Disposable {
         this.log.appendLine(
           `zoek-rs background index ready: files=${response.stats.indexedFiles} shards=${response.stats.shardCount}`,
         );
+        this.emitIndexProgress(workspaceRoot, 'zoek-rs: index ready', 100);
         return true;
       } catch (err) {
         if (err instanceof ProcessCancelledError) { return false; }
@@ -573,6 +664,7 @@ export class ZoektRuntime implements vscode.Disposable {
         return false;
       } finally {
         this.indexPromises.delete(workspaceRoot);
+        this.indexProgressState.delete(workspaceRoot);
       }
     })();
     this.indexPromises.set(workspaceRoot, promise);
@@ -678,20 +770,27 @@ export class ZoektRuntime implements vscode.Disposable {
 
   private getBinaryCandidates(): string[] {
     const exeSuffix = process.platform === 'win32' ? '.exe' : '';
+    return this.getBinaryCandidatesFor('engine', exeSuffix);
+  }
+
+  private getBinaryCandidatesFor(target: BinaryTarget, exeSuffix = process.platform === 'win32' ? '.exe' : ''): string[] {
+    const baseName = target === 'rebuild' ? 'ijss-rebuild' : 'zoek-rs';
     return [
-      path.join(this.extensionRoot, 'target', 'debug', `zoek-rs${exeSuffix}`),
-      path.join(this.extensionRoot, 'target', 'release', `zoek-rs${exeSuffix}`),
+      path.join(this.extensionRoot, 'target', 'debug', `${baseName}${exeSuffix}`),
+      path.join(this.extensionRoot, 'target', 'release', `${baseName}${exeSuffix}`),
     ];
   }
 
-  private async resolveBinary(allowBuild: boolean): Promise<string | null> {
+  private async resolveBinary(allowBuild: boolean, target: BinaryTarget = 'engine'): Promise<string | null> {
     if (this.disposed) { return null; }
-    if (this.binaryPath && fs.existsSync(this.binaryPath)) {
-      return this.binaryPath;
+    const cached = target === 'rebuild' ? this.rebuildBinaryPath : this.binaryPath;
+    if (cached && fs.existsSync(cached)) {
+      return cached;
     }
-    for (const candidate of this.getBinaryCandidates()) {
+    const candidates = target === 'engine' ? this.getBinaryCandidates() : this.getBinaryCandidatesFor(target);
+    for (const candidate of candidates) {
       if (fs.existsSync(candidate)) {
-        this.binaryPath = candidate;
+        this.cacheResolvedBinary(target, candidate);
         return candidate;
       }
     }
@@ -699,7 +798,14 @@ export class ZoektRuntime implements vscode.Disposable {
       return null;
     }
     if (this.buildPromise) {
-      return this.buildPromise;
+      await this.buildPromise;
+      for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) {
+          this.cacheResolvedBinary(target, candidate);
+          return candidate;
+        }
+      }
+      return null;
     }
     const cargoToml = path.join(this.extensionRoot, 'Cargo.toml');
     if (!fs.existsSync(cargoToml)) {
@@ -708,37 +814,65 @@ export class ZoektRuntime implements vscode.Disposable {
     this.buildPromise = (async () => {
       this.log.appendLine('zoek-rs build: cargo build -q -p zoek-rs');
       try {
-        await this.invokeText(['cargo', 'build', '-q', '-p', 'zoek-rs'], this.extensionRoot, this.lifecycleCts.token);
+        const result = await this.invokeText(['cargo', 'build', '-q', '-p', 'zoek-rs'], this.extensionRoot, this.lifecycleCts.token);
+        if (result.cancelled) {
+          throw new ProcessCancelledError('cargo build cancelled');
+        }
+        if (result.code !== 0) {
+          throw new Error(
+            result.stderr.trim() ||
+            result.stdout.trim() ||
+            (result.signal ? `cargo build terminated by ${result.signal}` : `cargo build exited with code ${result.code}`),
+          );
+        }
       } catch (err) {
         if (err instanceof ProcessCancelledError) {
           this.log.appendLine('zoek-rs build cancelled.');
-          return null;
+          return;
         }
         this.log.appendLine(`zoek-rs build failed: ${err instanceof Error ? err.message : err}`);
-        return null;
+        return;
       } finally {
         this.buildPromise = undefined;
       }
-      for (const candidate of this.getBinaryCandidates()) {
-        if (fs.existsSync(candidate)) {
-          this.binaryPath = candidate;
-          this.log.appendLine(`zoek-rs build ready: ${candidate}`);
-          return candidate;
-        }
+      const engineCandidate = this.getBinaryCandidatesFor('engine').find((candidate) => fs.existsSync(candidate));
+      if (engineCandidate) {
+        this.binaryPath = engineCandidate;
+        this.log.appendLine(`zoek-rs build ready: ${engineCandidate}`);
       }
-      return null;
     })();
-    return this.buildPromise;
+    await this.buildPromise;
+    const builtCandidates = target === 'engine' ? this.getBinaryCandidates() : this.getBinaryCandidatesFor(target);
+    for (const candidate of builtCandidates) {
+      if (fs.existsSync(candidate)) {
+        this.cacheResolvedBinary(target, candidate);
+        return candidate;
+      }
+    }
+    return null;
   }
 
-  private async invokeJson(args: string[], token?: vscode.CancellationToken): Promise<ZoektEngineResponse> {
+  private async invokeJson(
+    args: string[],
+    token?: vscode.CancellationToken,
+    hooks?: InvokeTextHooks,
+  ): Promise<ZoektEngineResponse> {
     const [command, ...rest] = args;
-    const { stdout, stderr, code, cancelled } = await this.invokeText([command, ...rest], this.extensionRoot, token);
+    const { stdout, stderr, code, signal, cancelled } = await this.invokeText(
+      [command, ...rest],
+      this.extensionRoot,
+      token,
+      hooks,
+    );
     if (cancelled) {
       throw new ProcessCancelledError(`${command} cancelled`);
     }
     if (code !== 0) {
-      throw new Error(stderr.trim() || stdout.trim() || `${command} exited with code ${code}`);
+      throw new Error(
+        stderr.trim() ||
+        stdout.trim() ||
+        (signal ? `${command} terminated by ${signal}` : `${command} exited with code ${code}`),
+      );
     }
     const payload = stdout.trim();
     if (!payload) {
@@ -755,21 +889,26 @@ export class ZoektRuntime implements vscode.Disposable {
     args: string[],
     cwd: string,
     token?: vscode.CancellationToken,
+    hooks?: InvokeTextHooks,
   ): Promise<InvokeTextResult> {
     if (this.disposed) {
       return Promise.reject(new ProcessCancelledError('zoek-rs runtime disposed'));
     }
     const [command, ...rest] = args;
+    const kind = this.classifyChild(command, rest);
+    const argv0 = this.argv0ForKind(kind);
     return new Promise((resolve, reject) => {
       const child = spawn(command, rest, {
         cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
         detached: process.platform !== 'win32',
+        ...(argv0 ? { argv0 } : {}),
       });
-      const tracked = this.trackChild(child, [path.basename(command), ...rest.slice(0, 2)].join(' '));
+      const tracked = this.trackChild(child, [path.basename(command), ...rest.slice(0, 2)].join(' '), kind);
       let stdout = '';
       let stderr = '';
+      let stderrLineBuf = '';
       let finished = false;
       const cleanup = () => {
         if (finished) { return; }
@@ -797,34 +936,193 @@ export class ZoektRuntime implements vscode.Disposable {
         stdout += chunk;
       });
       child.stderr.on('data', (chunk: string) => {
-        stderr += chunk;
+        stderrLineBuf += chunk;
+        while (true) {
+          const newline = stderrLineBuf.indexOf('\n');
+          if (newline < 0) { break; }
+          const line = stderrLineBuf.slice(0, newline).replace(/\r$/, '');
+          stderrLineBuf = stderrLineBuf.slice(newline + 1);
+          const consumed = hooks?.onStderrLine?.(line) === true;
+          if (!consumed) {
+            stderr += `${line}\n`;
+          }
+        }
       });
       child.on('error', (err) => {
         cleanup();
         reject(err);
       });
-      child.on('close', (code) => {
+      child.on('close', (code, signal) => {
         cleanup();
+        if (stderrLineBuf.length > 0) {
+          const line = stderrLineBuf.replace(/\r$/, '');
+          const consumed = hooks?.onStderrLine?.(line) === true;
+          if (!consumed) {
+            stderr += line;
+          }
+        }
         resolve({
           stdout,
           stderr,
           code: code ?? -1,
+          signal: signal ?? null,
           cancelled: tracked.cancelled,
         });
       });
     });
   }
 
-  private trackChild(child: ChildProcess, label: string): TrackedChild {
+  private trackChild(child: ChildProcess, label: string, kind: ProcessKind): TrackedChild {
     const tracked: TrackedChild = {
       id: this.nextChildId++,
       child,
       label,
+      kind,
       cancelled: false,
       killTimer: undefined,
     };
     this.activeChildren.set(tracked.id, tracked);
     return tracked;
+  }
+
+  private classifyChild(command: string, rest: string[]): ProcessKind {
+    const base = path.basename(command);
+    if (base === 'cargo' && rest[0] === 'build' && rest.includes('zoek-rs')) {
+      return 'build';
+    }
+    if (base === 'ijss-rebuild') {
+      return 'rebuild';
+    }
+    if (!base.startsWith('zoek-rs')) {
+      return 'other';
+    }
+    switch (rest[0]) {
+      case 'search': return 'search';
+      case 'index': return 'index';
+      case 'update': return 'update';
+      case 'info': return 'info';
+      case 'diagnose': return 'diagnose';
+      case 'benchmark': return 'benchmark';
+      default: return 'other';
+    }
+  }
+
+  private argv0ForKind(kind: ProcessKind): string | undefined {
+    switch (kind) {
+      case 'search': return 'zoek-rs-search';
+      case 'index': return 'zoek-rs-index';
+      case 'rebuild': return 'ijss-rebuild';
+      case 'update': return 'zoek-rs-update';
+      case 'info': return 'zoek-rs-info';
+      case 'diagnose': return 'zoek-rs-diagnose';
+      case 'benchmark': return 'zoek-rs-benchmark';
+      default: return undefined;
+    }
+  }
+
+  private sweepPatternsForKinds(kinds: ReadonlySet<ProcessKind> | null): string[] {
+    if (!kinds || kinds.size === 0) {
+      return ['zoek-rs'];
+    }
+    const patterns = new Set<string>();
+    for (const kind of kinds) {
+      const argv0 = this.argv0ForKind(kind);
+      if (argv0) {
+        patterns.add(argv0);
+      }
+    }
+    return Array.from(patterns);
+  }
+
+  private handleIndexProgressLine(
+    line: string,
+    report?: (message: string, percent?: number) => void,
+  ): boolean {
+    const parsed = this.parseIndexProgressLine(line);
+    if (!parsed) {
+      return false;
+    }
+    report?.(parsed.detail, parsed.percent);
+    return true;
+  }
+
+  private attachIndexProgressListener(
+    workspaceRoot: string,
+    report?: IndexProgressListener,
+  ): () => void {
+    if (!report) {
+      return () => {};
+    }
+    let listeners = this.indexProgressListeners.get(workspaceRoot);
+    if (!listeners) {
+      listeners = new Set();
+      this.indexProgressListeners.set(workspaceRoot, listeners);
+    }
+    listeners.add(report);
+    const current = this.indexProgressState.get(workspaceRoot);
+    if (current) {
+      report(current.message, current.percent);
+    }
+    return () => {
+      const existing = this.indexProgressListeners.get(workspaceRoot);
+      if (!existing) { return; }
+      existing.delete(report);
+      if (existing.size === 0) {
+        this.indexProgressListeners.delete(workspaceRoot);
+      }
+    };
+  }
+
+  private emitIndexProgress(workspaceRoot: string, message: string, percent?: number): void {
+    this.indexProgressState.set(workspaceRoot, { message, percent });
+    const listeners = this.indexProgressListeners.get(workspaceRoot);
+    if (!listeners) { return; }
+    for (const listener of listeners) {
+      listener(message, percent);
+    }
+  }
+
+  private parseIndexProgressLine(
+    line: string,
+  ): { phase: string; current: number; total: number; percent: number; detail: string } | null {
+    if (!line.startsWith(ZOEKT_PROGRESS_PREFIX)) {
+      return null;
+    }
+    try {
+      const payload = JSON.parse(line.slice(ZOEKT_PROGRESS_PREFIX.length)) as {
+        phase?: unknown;
+        current?: unknown;
+        total?: unknown;
+        percent?: unknown;
+        detail?: unknown;
+      };
+      if (
+        typeof payload.phase !== 'string' ||
+        typeof payload.current !== 'number' ||
+        typeof payload.total !== 'number' ||
+        typeof payload.percent !== 'number' ||
+        typeof payload.detail !== 'string'
+      ) {
+        return null;
+      }
+      return {
+        phase: payload.phase,
+        current: payload.current,
+        total: payload.total,
+        percent: Math.max(0, Math.min(100, Math.round(payload.percent))),
+        detail: payload.detail,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private cacheResolvedBinary(target: BinaryTarget, candidate: string): void {
+    if (target === 'rebuild') {
+      this.rebuildBinaryPath = candidate;
+      return;
+    }
+    this.binaryPath = candidate;
   }
 
   private terminateTrackedChild(tracked: TrackedChild, reason: string): void {
@@ -859,11 +1157,11 @@ export class ZoektRuntime implements vscode.Disposable {
     }, PROCESS_KILL_TIMEOUT_MS);
   }
 
-  private async sweepExternalZoektProcesses(reason: string): Promise<void> {
+  private async sweepExternalZoektProcesses(reason: string, patterns: string[]): Promise<void> {
     if (process.platform === 'win32') { return; }
     if (this.externalSweepPromise) { return this.externalSweepPromise; }
     const promise = (async () => {
-      const lines = await this.listZoektProcesses();
+      const lines = await this.listZoektProcesses(patterns);
       if (lines.length === 0) { return; }
       const trackedPids = new Set<number>();
       for (const tracked of this.activeChildren.values()) {
@@ -897,9 +1195,12 @@ export class ZoektRuntime implements vscode.Disposable {
     return promise;
   }
 
-  private listZoektProcesses(): Promise<string[]> {
-    return new Promise((resolve) => {
-      const child = spawn('pgrep', ['-fl', 'zoek-rs'], {
+  private async listZoektProcesses(patterns: string[]): Promise<string[]> {
+    if (patterns.length === 0) {
+      return [];
+    }
+    const results = await Promise.all(patterns.map(async (pattern) => new Promise<string[]>((resolve) => {
+      const child = spawn('pgrep', ['-fl', pattern], {
         cwd: this.extensionRoot,
         stdio: ['ignore', 'pipe', 'ignore'],
         windowsHide: true,
@@ -922,6 +1223,7 @@ export class ZoektRuntime implements vscode.Disposable {
             .filter((line) => line.length > 0),
         );
       });
-    });
+    })));
+    return Array.from(new Set(results.flat()));
   }
 }

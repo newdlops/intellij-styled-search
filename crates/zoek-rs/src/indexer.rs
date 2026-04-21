@@ -1,5 +1,5 @@
 use crate::config::{EngineConfig, ENGINE_NAME, SCHEMA_VERSION};
-use crate::corpus::discover_text_files;
+use crate::corpus::{count_candidate_files, discover_text_files_with_progress};
 use crate::gram::extract_dynamic_grams;
 use crate::mmap_store::{write_atomically, StoreLayout};
 use crate::overlay::OverlayManifest;
@@ -44,8 +44,60 @@ pub struct IndexArtifacts {
     pub fingerprint: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct IndexProgress {
+    pub phase: &'static str,
+    pub current: usize,
+    pub total: usize,
+    pub percent: usize,
+    pub detail: String,
+}
+
+impl IndexProgress {
+    pub fn to_stderr_line(&self) -> String {
+        format!(
+            "__ZOEK_PROGRESS__{{\"phase\":{},\"current\":{},\"total\":{},\"percent\":{},\"detail\":{}}}",
+            json_string(self.phase),
+            self.current,
+            self.total,
+            self.percent,
+            json_string(&self.detail),
+        )
+    }
+}
+
 pub fn index_directory(workspace_root: &Path, config: &EngineConfig) -> io::Result<IndexArtifacts> {
-    let (entries, corpus_stats) = discover_text_files(workspace_root, config)?;
+    let mut noop = |_progress: IndexProgress| {};
+    index_directory_with_progress(workspace_root, config, &mut noop)
+}
+
+pub fn index_directory_with_progress<F>(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    progress: &mut F,
+) -> io::Result<IndexArtifacts>
+where
+    F: FnMut(IndexProgress),
+{
+    let total_candidate_files = count_candidate_files(workspace_root, config)?;
+    let (entries, corpus_stats) = discover_text_files_with_progress(
+        workspace_root,
+        config,
+        total_candidate_files,
+        &mut |scan| {
+            progress(IndexProgress {
+                phase: "scan",
+                current: scan.visited_files,
+                total: scan.total_candidate_files.max(1),
+                percent: weighted_percent(scan.visited_files, scan.total_candidate_files, 0, 70),
+                detail: format!(
+                    "scanning files {}/{}",
+                    scan.visited_files,
+                    scan.total_candidate_files.max(scan.visited_files),
+                ),
+            });
+        },
+    )?;
     let layout = StoreLayout::for_workspace(workspace_root, config);
     layout.ensure_dirs()?;
     let _ = layout.cleanup_stale_temp_files(30);
@@ -56,19 +108,33 @@ pub fn index_directory(workspace_root: &Path, config: &EngineConfig) -> io::Resu
         .map(|value| value.as_secs())
         .unwrap_or(0);
 
-    let indexed_docs = entries
-        .iter()
-        .map(|entry| IndexedDocument {
+    let total_entries = entries.len();
+    let mut indexed_docs = Vec::with_capacity(total_entries);
+    for (idx, entry) in entries.iter().enumerate() {
+        let (grams, overflow) = crate::gram::extract_dynamic_grams_with_overflow(
+            &entry.rel_path,
+            &entry.text,
+            config.max_grams_per_file,
+        );
+        indexed_docs.push(IndexedDocument {
             rel_path: entry.rel_path.clone(),
             byte_len: entry.size_bytes,
             modified_unix_secs: entry.modified_unix_secs,
             content_hash: stable_hash(&entry.text),
-            grams: extract_dynamic_grams(&entry.rel_path, &entry.text, config.max_grams_per_file)
-                .into_iter()
-                .map(|gram| gram.value)
-                .collect(),
-        })
-        .collect::<Vec<_>>();
+            grams: grams.into_iter().map(|gram| gram.value).collect(),
+            gram_incomplete: overflow,
+        });
+        let current = idx + 1;
+        if total_entries > 0 && (current == 1 || current % 128 == 0 || current == total_entries) {
+            progress(IndexProgress {
+                phase: "prepare",
+                current,
+                total: total_entries,
+                percent: weighted_percent(current, total_entries, 70, 20),
+                detail: format!("extracting grams {current}/{total_entries}"),
+            });
+        }
+    }
 
     let fingerprint = fingerprint_documents(&indexed_docs);
     let shards = partition_documents(&indexed_docs, config);
@@ -77,6 +143,7 @@ pub fn index_directory(workspace_root: &Path, config: &EngineConfig) -> io::Resu
     let mut total_source_bytes = 0u64;
     let mut total_shard_bytes = 0u64;
 
+    let total_shards = shards.len();
     for (shard_id, docs) in shards.iter().enumerate() {
         let shard_id = shard_id as u32;
         let build = build_shard_bytes(shard_id, now, docs)?;
@@ -95,6 +162,13 @@ pub fn index_directory(workspace_root: &Path, config: &EngineConfig) -> io::Resu
             gram_count: header.gram_count,
             file_bytes: build.bytes.len() as u64,
             source_bytes: build.source_bytes,
+        });
+        progress(IndexProgress {
+            phase: "write",
+            current: shard_artifacts.len(),
+            total: total_shards.max(1),
+            percent: weighted_percent(shard_artifacts.len(), total_shards, 90, 10),
+            detail: format!("writing shards {}/{}", shard_artifacts.len(), total_shards.max(1)),
         });
     }
 
@@ -118,6 +192,14 @@ pub fn index_directory(workspace_root: &Path, config: &EngineConfig) -> io::Resu
         .as_bytes(),
     )?;
 
+    progress(IndexProgress {
+        phase: "done",
+        current: 1,
+        total: 1,
+        percent: 100,
+        detail: "index ready".to_string(),
+    });
+
     Ok(IndexArtifacts {
         layout,
         summary: IndexSummary {
@@ -134,6 +216,17 @@ pub fn index_directory(workspace_root: &Path, config: &EngineConfig) -> io::Resu
         shards: shard_artifacts,
         fingerprint,
     })
+}
+
+fn weighted_percent(current: usize, total: usize, base: usize, weight: usize) -> usize {
+    if weight == 0 {
+        return base.min(100);
+    }
+    if total == 0 {
+        return (base + weight).min(100);
+    }
+    let pct = ((current.min(total) * weight) + (total / 2)) / total;
+    (base + pct).min(100)
 }
 
 fn partition_documents<'a>(

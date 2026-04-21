@@ -179,6 +179,50 @@ suite('Renderer — overlay UI probes', () => {
     assert.strictEqual(state.flatCount, 1, `only the newest search result should remain visible: ${raw}`);
   });
 
+  test('single visible result flattens embedded newlines in row preview', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const alphaUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py').toString();
+
+    await overlay.show('');
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var alpha = ${JSON.stringify(alphaUri)};
+        var q = document.querySelector('.ij-find-query');
+        if (q) { q.value = ''; }
+        if (window.__ijFindRefreshSearch) { window.__ijFindRefreshSearch(); }
+        window.__ijFindOnMessage({ type: 'results:start', searchId: 920 });
+        window.__ijFindOnMessage({
+          type: 'results:file',
+          searchId: 920,
+          match: {
+            uri: alpha,
+            relPath: 'alpha.py',
+            matches: [{
+              line: 0,
+              preview: 'class AlphaService:\\n    def run(self):',
+              ranges: [{ start: 0, end: 5 }]
+            }]
+          }
+        });
+        window.__ijFindOnMessage({ type: 'results:done', searchId: 920, totalFiles: 1, totalMatches: 1, truncated: false });
+        var row = document.querySelector('.ij-find-row-text');
+        var parent = row && row.closest('.ij-find-row');
+        return JSON.stringify({
+          text: row ? row.textContent : null,
+          rowHeight: parent ? Math.round(parent.getBoundingClientRect().height) : null
+        });
+      })()`,
+    );
+    const state = JSON.parse(raw) as { text: string | null; rowHeight: number | null };
+    assert.ok(state.text !== null, `expected a rendered result row: ${raw}`);
+    assert.ok(!state.text!.includes('\n'), `result row preview should be flattened to one line: ${raw}`);
+    assert.ok((state.rowHeight ?? 0) <= 22, `single result row should stay one line tall: ${raw}`);
+  });
+
   // NOTE: input.value population is already covered end-to-end by
   // filter.test.ts which reads it via state.inputValue probe — that path
   // doesn't depend on getting the right window back out of a `querySelector`

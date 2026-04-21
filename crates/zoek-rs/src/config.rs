@@ -24,7 +24,14 @@ impl Default for EngineConfig {
             max_file_size_bytes: 1_048_576,
             shard_target_bytes: 64 * 1024 * 1024,
             max_files_per_shard: 50_000,
-            max_grams_per_file: 256,
+            // 256 was low enough that large source files had many tokens
+            // pruned from the index, causing false-negatives in gram AND
+            // filtering. 8192 comfortably holds sliding-window grams for
+            // typical source files (after dedup). Files that still exceed
+            // the cap get their `gram_incomplete` flag set so the searcher
+            // skips gram filtering for them — correctness wins without
+            // unbounded size growth.
+            max_grams_per_file: 8192,
             overlay_compaction_entry_threshold: 512,
             overlay_compaction_journal_bytes_threshold: 2 * 1024 * 1024,
             excluded_dir_names: vec![

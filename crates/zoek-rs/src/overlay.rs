@@ -19,6 +19,11 @@ pub struct OverlayEntry {
     pub modified_unix_secs: u64,
     pub content_hash: u64,
     pub grams: Vec<String>,
+    /// See `IndexedDocument::gram_incomplete`. Files written into the
+    /// overlay when the indexer exhausted `max_grams_per_file` must still
+    /// be searchable; set this so the searcher skips AND-intersection for
+    /// them.
+    pub gram_incomplete: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -118,12 +123,13 @@ impl OverlayManifest {
             .iter()
             .map(|entry| {
                 format!(
-                    "{{\"relPath\":{},\"generation\":{},\"tombstone\":{},\"modifiedUnixSecs\":{},\"contentHash\":{},\"grams\":[{}]}}",
+                    "{{\"relPath\":{},\"generation\":{},\"tombstone\":{},\"modifiedUnixSecs\":{},\"contentHash\":{},\"gramIncomplete\":{},\"grams\":[{}]}}",
                     json_string(&entry.rel_path),
                     entry.generation,
                     entry.tombstone,
                     entry.modified_unix_secs,
                     entry.content_hash,
+                    entry.gram_incomplete,
                     entry.grams.iter().map(|gram| json_string(gram)).collect::<Vec<_>>().join(",")
                 )
             })
@@ -329,16 +335,19 @@ fn build_entry_for_path(
         .map(|value| value.as_secs())
         .unwrap_or(committed_unix_secs);
 
+    let (grams, overflow) = crate::gram::extract_dynamic_grams_with_overflow(
+        rel_path,
+        &text,
+        config.max_grams_per_file,
+    );
     Ok(OverlayEntry {
         rel_path: rel_path.to_string(),
         generation,
         tombstone: false,
         modified_unix_secs,
         content_hash: stable_hash(&text),
-        grams: extract_dynamic_grams(rel_path, &text, config.max_grams_per_file)
-            .into_iter()
-            .map(|gram| gram.value)
-            .collect(),
+        grams: grams.into_iter().map(|gram| gram.value).collect(),
+        gram_incomplete: overflow,
     })
 }
 
@@ -350,6 +359,7 @@ fn build_tombstone_entry(rel_path: &str, generation: u64, committed_unix_secs: u
         modified_unix_secs: committed_unix_secs,
         content_hash: 0,
         grams: Vec::new(),
+        gram_incomplete: false,
     }
 }
 
@@ -418,7 +428,7 @@ fn write_journal_record(
     };
     writeln!(
         file,
-        "{{\"generation\":{},\"committedUnixSecs\":{},\"cause\":{},\"relPath\":{},\"tombstone\":{},\"modifiedUnixSecs\":{},\"contentHash\":{},\"grams\":[{}]}}",
+        "{{\"generation\":{},\"committedUnixSecs\":{},\"cause\":{},\"relPath\":{},\"tombstone\":{},\"modifiedUnixSecs\":{},\"contentHash\":{},\"gramIncomplete\":{},\"grams\":[{}]}}",
         entry.generation,
         committed_unix_secs,
         json_string(cause),
@@ -426,6 +436,7 @@ fn write_journal_record(
         entry.tombstone,
         entry.modified_unix_secs,
         entry.content_hash,
+        entry.gram_incomplete,
         entry.grams.iter().map(|gram| json_string(gram)).collect::<Vec<_>>().join(",")
     )
 }
@@ -475,6 +486,7 @@ fn parse_journal_line(text: &str) -> io::Result<Option<JournalReplayEntry>> {
     let content_hash = parse_u64_field(text, "contentHash").unwrap_or(0);
     let tombstone = parse_bool_field(text, "tombstone").unwrap_or(false);
     let grams = parse_string_array_field(text, "grams").unwrap_or_default();
+    let gram_incomplete = parse_bool_field(text, "gramIncomplete").unwrap_or(false);
     Ok(Some(JournalReplayEntry {
         entry: OverlayEntry {
             rel_path,
@@ -483,6 +495,7 @@ fn parse_journal_line(text: &str) -> io::Result<Option<JournalReplayEntry>> {
             modified_unix_secs,
             content_hash,
             grams,
+            gram_incomplete,
         },
         committed_unix_secs,
     }))
@@ -544,6 +557,7 @@ fn parse_overlay_manifest(text: &str) -> io::Result<OverlayManifest> {
             modified_unix_secs: parse_u64_field(raw_entry, "modifiedUnixSecs").unwrap_or(0),
             content_hash: parse_u64_field(raw_entry, "contentHash").unwrap_or(0),
             grams: parse_string_array_field(raw_entry, "grams").unwrap_or_default(),
+            gram_incomplete: parse_bool_field(raw_entry, "gramIncomplete").unwrap_or(false),
         });
     }
     Ok(OverlayManifest {
@@ -742,6 +756,7 @@ mod tests {
                     modified_unix_secs: 1,
                     content_hash: 10,
                     grams: vec!["alph".to_string()],
+                    gram_incomplete: false,
                 },
                 OverlayEntry {
                     rel_path: "src/a.rs".to_string(),
@@ -750,6 +765,7 @@ mod tests {
                     modified_unix_secs: 2,
                     content_hash: 11,
                     grams: vec![],
+                    gram_incomplete: false,
                 },
             ],
         };

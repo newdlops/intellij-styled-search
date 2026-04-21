@@ -85,7 +85,25 @@ type CaptureDiagnosticOptions = {
 
 const BRIDGE_BINDING = 'irSearchMainBridge';
 const RENDERER_BINDING = 'irSearchEvent';
-const ZOEKT_PAGE_SIZE = 1000;
+
+function wrapLogWithPrefix(channel: vscode.OutputChannel, version: string): vscode.OutputChannel {
+  // Every log line gets `[<ISO ts>] [v<version>]` prefixed so bug reports
+  // pasted from the Output panel carry both real time and the running
+  // extension version without each call site having to remember.
+  const prefix = () => `[${new Date().toISOString()}] [v${version}] `;
+  return new Proxy(channel, {
+    get(target, prop, receiver) {
+      if (prop === 'appendLine') {
+        return (value: string) => target.appendLine(prefix() + value);
+      }
+      if (prop === 'append') {
+        return (value: string) => target.append(prefix() + value);
+      }
+      const out = Reflect.get(target, prop, receiver);
+      return typeof out === 'function' ? out.bind(target) : out;
+    },
+  });
+}
 
 export class OverlayPanel {
   private static instance: OverlayPanel | undefined;
@@ -124,8 +142,10 @@ export class OverlayPanel {
   }
 
   private constructor(private readonly context: vscode.ExtensionContext) {
-    this.log = vscode.window.createOutputChannel('IntelliJ Styled Search');
-    context.subscriptions.push(this.log);
+    const rawLog = vscode.window.createOutputChannel('IntelliJ Styled Search');
+    const version = (context.extension?.packageJSON?.version as string | undefined) ?? 'unknown';
+    this.log = wrapLogWithPrefix(rawLog, version);
+    context.subscriptions.push(rawLog);
     context.subscriptions.push({ dispose: () => this.dispose() });
     configureRipgrepInstall(context);
     void ensureRipgrepInstalled((msg) => this.log.appendLine(msg));
@@ -929,12 +949,12 @@ export class OverlayPanel {
 
   logActivation() {
     this.log.show(true);
-    this.log.appendLine(`[${new Date().toISOString()}] Extension activated. Ext host pid=${process.pid}, ppid=${process.ppid}`);
+    this.log.appendLine(`Extension activated. Ext host pid=${process.pid}, ppid=${process.ppid}`);
   }
 
   logCommand(name: string) {
     this.log.show(true);
-    this.log.appendLine(`[${new Date().toISOString()}] Command invoked: ${name}`);
+    this.log.appendLine(`Command invoked: ${name}`);
   }
 
   async forceReinject(): Promise<void> {
@@ -980,11 +1000,21 @@ export class OverlayPanel {
                 },
               });
             } else {
-              this.zoektRuntime.cancelRunningProcesses('zoekt rebuild requested');
+              this.zoektRuntime.cancelRunningProcesses('zoekt rebuild requested', {
+                kinds: ['search', 'update', 'info', 'diagnose', 'benchmark'],
+              });
               ui.report({ message: 'clearing codesearch trigram cache' });
               await this.trigramIndex.clear('zoekt rebuild requested');
               try {
-                const usedZoekt = await this.zoektRuntime.rebuildIndex((message) => {
+                let lastPercent = 0;
+                const usedZoekt = await this.zoektRuntime.rebuildIndex((message, percent) => {
+                  if (typeof percent === 'number') {
+                    const bounded = Math.max(0, Math.min(100, percent));
+                    const increment = Math.max(0, bounded - lastPercent);
+                    lastPercent = Math.max(lastPercent, bounded);
+                    ui.report({ message, increment });
+                    return;
+                  }
                   ui.report({ message });
                 });
                 if (!usedZoekt) {
@@ -1558,7 +1588,6 @@ export class OverlayPanel {
       case 'cancel':
         this.currentSearchSession = undefined;
         this.cancelActive();
-        this.zoektRuntime.cancelRunningProcesses('search panel closed');
         break;
       case 'openFile': void this.openFile(evt.uri, evt.line, evt.column, false); break;
       case 'previewFile': void this.openFile(evt.uri, evt.line, evt.column, true); break;
@@ -1765,15 +1794,11 @@ export class OverlayPanel {
     };
   }
 
-  private pageSizeForEngine(engine: SearchEngine): number {
-    return engine === 'zoekt' ? ZOEKT_PAGE_SIZE : getConfiguredResultLimit();
-  }
-
   private async runSearch(options: SearchOptions) {
     this.cancelActive();
     const searchId = ++this.searchSeq;
     const requestedEngine = getConfiguredSearchEngine();
-    const emptyPageSize = this.pageSizeForEngine(requestedEngine);
+    const emptyPageSize = getConfiguredResultLimit();
     if (!options.query) {
       this.currentSearchSession = {
         searchId,
@@ -1810,7 +1835,7 @@ export class OverlayPanel {
         fallbackReason = readiness.reason;
       }
     }
-    const pageSize = this.pageSizeForEngine(effectiveEngine);
+    const pageSize = getConfiguredResultLimit();
     const session: SearchSession = {
       searchId,
       options: this.baseSearchOptions(options),
@@ -1834,8 +1859,11 @@ export class OverlayPanel {
       (options.useRegex || options.query.includes('\n')) ? 'multiline' : '',
       options.includePatterns && options.includePatterns.length > 0 ? `scope=${options.includePatterns.length}` : '',
     ].filter(Boolean).join(',') || 'plain';
+    const plannerSummary = effectiveEngine === 'zoekt'
+      ? 'planner=zoekt'
+      : `indexReady=${this.trigramIndex.isReady} indexSize=${this.trigramIndex.size}`;
     this.log.appendLine(
-      `search start: len=${options.query.length} flags=[${optTags}] indexReady=${this.trigramIndex.isReady} indexSize=${this.trigramIndex.size}`,
+      `search start: len=${options.query.length} flags=[${optTags}] ${plannerSummary}`,
     );
     if (requestedEngine === 'zoekt' && effectiveEngine === 'codesearch') {
       this.log.appendLine(
@@ -1843,9 +1871,7 @@ export class OverlayPanel {
       );
     }
     try {
-      if (session.effectiveEngine === 'zoekt') {
-        session.scopedCandidateUris = null;
-        session.orderedCandidatePaths = null;
+      if (effectiveEngine === 'zoekt') {
         await this.runSearchPage(session, t0);
         return;
       }
