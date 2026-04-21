@@ -632,6 +632,46 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn substring_literal_queries_narrow_candidates_for_unicode_tokens() -> io::Result<()> {
+        let root = temp_dir("unicode-substring");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/a.rs"), "const VALUE: &str = \"한글검색지원\";\n")?;
+        for idx in 0..32 {
+            fs::write(
+                root.join("src").join(format!("noise-{idx}.rs")),
+                format!("const VALUE_{idx}: &str = \"alphabet soup\";\n"),
+            )?;
+        }
+        index_directory(&root, &EngineConfig::default())?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "한글검색".to_string(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                include: vec!["src/*".to_string()],
+                limit: 10,
+                offset: 0,
+            },
+            &EngineConfig::default(),
+        )
+        .map_err(io::Error::other)?;
+
+        assert_eq!(response.total_files_matched, 1);
+        assert_eq!(response.files[0].rel_path, "src/a.rs");
+        assert!(
+            response.total_files_scanned < 10,
+            "expected unicode substring query to avoid scanning the whole workspace; scanned {} files",
+            response.total_files_scanned,
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     fn temp_dir(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

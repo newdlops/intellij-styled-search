@@ -139,12 +139,12 @@ pub fn selective_grams_for_query_literal(
 }
 
 fn tokenize(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+    text.split(|ch: char| !is_token_char(ch))
         .filter(|token| !token.is_empty())
 }
 
 fn classify_token_kind(token: &str) -> GramKind {
-    match token.len() {
+    match token.chars().count() {
         0..=4 => GramKind::Short,
         5..=8 => GramKind::Medium,
         _ => GramKind::Long,
@@ -161,42 +161,47 @@ fn grams_for_token(token: &str, kind: GramKind) -> Vec<DynamicGram> {
         return Vec::new();
     }
 
-    let width = match kind {
-        GramKind::Short => 2,
-        GramKind::Medium | GramKind::Path => 3,
-        GramKind::Long => 4,
-    }
-    .min(len);
-
-    // Full sliding-window coverage: every contiguous `width`-char substring.
-    // Required so the planner (which may pick a subset of grams) always
-    // intersects with grams the indexer actually stored for the same token.
-    // The prior 3-window (prefix/middle/suffix) scheme made query-side gram
-    // selection brittle — picking a middle offset that didn't coincide with
-    // the indexer's prefix/middle/suffix would silently exclude real
-    // matches. Combined with a raised per-file cap and a `gram_incomplete`
-    // flag for overflow files, sliding window no longer sacrifices recall.
     let chars: Vec<char> = token.chars().collect();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for start in 0..=(len - width) {
-        let value: String = chars[start..start + width].iter().collect();
-        if seen.insert(value.clone()) {
-            out.push(DynamicGram { kind, value });
+
+    // Preserve shorter fallback grams even for long tokens so substring
+    // queries can intersect with the index regardless of the surrounding
+    // identifier length. Without this, `Alpha` could not narrow candidates
+    // inside `AlphaService`, and Hangul substrings fell back to full scans.
+    for width in gram_widths(len).rev() {
+        // Full sliding-window coverage: every contiguous `width`-char
+        // substring. Required so the planner (which may pick a subset of
+        // grams) always intersects with grams the indexer actually stored
+        // for the same token.
+        for start in 0..=(len - width) {
+            let value: String = chars[start..start + width].iter().collect();
+            if seen.insert(value.clone()) {
+                out.push(DynamicGram { kind, value });
+            }
         }
     }
     out
 }
 
+fn is_token_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn gram_widths(len: usize) -> std::ops::RangeInclusive<usize> {
+    2..=len.min(4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{extract_dynamic_grams, grams_for_query_literal, selective_grams_for_query_literal, GramKind};
+    use std::collections::HashSet;
 
     #[test]
     fn extracts_path_and_text_grams() {
         let grams = extract_dynamic_grams("src/demo/file.rs", "AlphaService handles users", 32);
         assert!(grams.iter().any(|gram| gram.kind == GramKind::Path && gram.value == "src"));
-        assert!(grams.iter().any(|gram| gram.value.contains("Alph") || gram.value.contains("vice")));
+        assert!(grams.iter().any(|gram| gram.value.contains("alph") || gram.value.contains("vice")));
     }
 
     #[test]
@@ -231,5 +236,27 @@ mod tests {
         let grams = selective_grams_for_query_literal("a ab AlphaService", 1, 12);
         assert!(grams.iter().any(|gram| gram == "alph"));
         assert!(!grams.iter().any(|gram| gram == "ab"));
+    }
+
+    #[test]
+    fn substring_query_grams_match_longer_ascii_tokens() {
+        let doc_grams = extract_dynamic_grams("src/demo/file.rs", "AlphaServiceSupport", 128)
+            .into_iter()
+            .map(|gram| gram.value)
+            .collect::<HashSet<_>>();
+        let query_grams = grams_for_query_literal("Alpha");
+        assert!(!query_grams.is_empty());
+        assert!(query_grams.iter().all(|gram| doc_grams.contains(gram)));
+    }
+
+    #[test]
+    fn substring_query_grams_match_longer_unicode_tokens() {
+        let doc_grams = extract_dynamic_grams("src/demo/file.rs", "한글검색지원", 128)
+            .into_iter()
+            .map(|gram| gram.value)
+            .collect::<HashSet<_>>();
+        let query_grams = grams_for_query_literal("한글검색");
+        assert!(!query_grams.is_empty());
+        assert!(query_grams.iter().all(|gram| doc_grams.contains(gram)));
     }
 }

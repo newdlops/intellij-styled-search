@@ -1,6 +1,5 @@
 use crate::config::EngineConfig;
 use crate::corpus::{decode_bytes, looks_binary_bytes};
-use crate::gram::extract_dynamic_grams;
 use crate::mmap_store::{write_atomically, StoreLayout};
 use crate::protocol::json_string;
 use crate::watcher::{ChangeBatch, FileChange, FileChangeKind};

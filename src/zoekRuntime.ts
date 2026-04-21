@@ -46,6 +46,7 @@ type PaginatedSearchResult = {
 const UPDATE_DEBOUNCE_MS = 250;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
 const ZOEKT_PROGRESS_PREFIX = '__ZOEK_PROGRESS__';
+const ZOEKT_SCHEMA_VERSION = 2;
 
 class ProcessCancelledError extends Error {
   constructor(message: string) {
@@ -678,6 +679,11 @@ export class ZoektRuntime implements vscode.Disposable {
       return false;
     }
     try {
+      const manifestText = await fs.promises.readFile(manifestPath, 'utf8');
+      const manifest = JSON.parse(manifestText) as { schemaVersion?: unknown };
+      if (manifest.schemaVersion !== ZOEKT_SCHEMA_VERSION) {
+        return false;
+      }
       const entries = await fs.promises.readdir(indexRoot);
       return entries.some((entry) => /^base-shard-\d+\.zrs$/.test(entry));
     } catch {

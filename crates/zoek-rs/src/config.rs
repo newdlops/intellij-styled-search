@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 pub const ENGINE_NAME: &str = "zoek-rs";
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {

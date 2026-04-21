@@ -1,6 +1,5 @@
 use crate::config::{EngineConfig, ENGINE_NAME, SCHEMA_VERSION};
 use crate::corpus::{count_candidate_files, discover_text_files_with_progress};
-use crate::gram::extract_dynamic_grams;
 use crate::mmap_store::{write_atomically, StoreLayout};
 use crate::overlay::OverlayManifest;
 use crate::protocol::json_string;
@@ -361,7 +360,7 @@ mod tests {
         let artifacts = index_directory(&root, &config)?;
         assert_eq!(artifacts.summary.shard_count, 3);
         let manifest = fs::read_to_string(root.join(".zoek-rs/manifest.json"))?;
-        assert!(manifest.contains("\"schemaVersion\":1"));
+        assert!(manifest.contains("\"schemaVersion\":2"));
         assert!(manifest.contains("base-shard-0000.zrs"));
 
         let reader = ShardReader::open(&root.join(".zoek-rs/base-shard-0000.zrs"))?;

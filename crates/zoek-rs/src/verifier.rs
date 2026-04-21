@@ -176,7 +176,7 @@ fn is_word_boundary(text: &str, start: usize, end: usize) -> bool {
 }
 
 fn is_word_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
+    ch.is_alphanumeric() || ch == '_'
 }
 
 // Ant-style glob semantics:
@@ -340,6 +340,14 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].line, 0);
         assert_eq!(matches[1].line, 1);
+    }
+
+    #[test]
+    fn verifies_unicode_whole_word_boundaries() {
+        let matches = verify_literal("한국어 한국어지원 한국어", "한국어", true, true, 10);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].start_column, 0);
+        assert_eq!(matches[1].start_column, 10);
     }
 
     #[test]
