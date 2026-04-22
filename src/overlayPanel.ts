@@ -28,6 +28,7 @@ type RendererEvent =
   | { type: 'openFile'; uri: string; line: number; column: number }
   | { type: 'previewFile'; uri: string; line: number; column: number }
   | { type: 'requestPreview'; uri: string; line: number; ranges?: MatchRange[]; contextLines: number }
+  | { type: 'revealFile'; uri: string }
   | { type: 'openInSideEditor'; uri: string; line: number; column: number }
   | { type: 'pinInSideEditor'; uri: string; line: number; column: number }
   | { type: 'requestHover'; reqId: number; uri: string; line: number; column: number; x: number; y: number }
@@ -1668,6 +1669,7 @@ export class OverlayPanel {
       case 'openFile': void this.openFile(evt.uri, evt.line, evt.column, false); break;
       case 'previewFile': void this.openFile(evt.uri, evt.line, evt.column, true); break;
       case 'requestPreview': void this.handlePreviewRequest(evt); break;
+      case 'revealFile': void this.revealFile(evt.uri); break;
       case 'openInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, true, true); break;
       case 'pinInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, false, false); break;
       case 'requestHover': void this.sendHover(evt.reqId, evt.uri, evt.line, evt.column, evt.x, evt.y); break;
@@ -1707,6 +1709,16 @@ export class OverlayPanel {
       });
     } catch (err) {
       this.log.appendLine(`openInSideEditor failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  private async revealFile(uriStr: string) {
+    try {
+      const uri = vscode.Uri.parse(uriStr);
+      await vscode.commands.executeCommand('revealInExplorer', uri);
+    } catch (err) {
+      this.log.appendLine(`revealFile failed: ${err instanceof Error ? err.message : err}`);
+      vscode.window.showErrorMessage(`Failed to reveal file: ${err instanceof Error ? err.message : err}`);
     }
   }
 

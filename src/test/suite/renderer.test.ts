@@ -263,6 +263,65 @@ suite('Renderer — overlay UI probes', () => {
     assert.ok((state.rowHeight ?? 0) <= 22, `single result row should stay one line tall: ${raw}`);
   });
 
+  test('result rows expose reveal and open actions', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const alphaUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py').toString();
+
+    await overlay.show('');
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var alpha = ${JSON.stringify(alphaUri)};
+        var q = document.querySelector('.ij-find-query');
+        if (q) { q.value = ''; }
+        if (window.__ijFindRefreshSearch) { window.__ijFindRefreshSearch(); }
+        window.__ijFindOnMessage({ type: 'results:start', searchId: 930 });
+        window.__ijFindOnMessage({
+          type: 'results:file',
+          searchId: 930,
+          match: {
+            uri: alpha,
+            relPath: 'alpha.py',
+            matches: [{
+              line: 2,
+              preview: '    return AlphaService()',
+              ranges: [{ start: 11, end: 23 }]
+            }]
+          }
+        });
+        window.__ijFindOnMessage({ type: 'results:done', searchId: 930, totalFiles: 1, totalMatches: 1, truncated: false });
+        var oldBridge = globalThis.irSearchEvent;
+        var sent = [];
+        globalThis.irSearchEvent = function (payload) {
+          try { sent.push(JSON.parse(String(payload))); } catch (e) {}
+        };
+        var reveal = document.querySelector('.ij-find-row-action[data-action="reveal"]');
+        if (reveal) { reveal.click(); }
+        var open = document.querySelector('.ij-find-row-action[data-action="open"]');
+        if (open) { open.click(); }
+        globalThis.irSearchEvent = oldBridge;
+        var labels = Array.prototype.map.call(
+          document.querySelectorAll('.ij-find-row-action'),
+          function (btn) { return btn.textContent; }
+        );
+        return JSON.stringify({ labels: labels, sent: sent });
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      labels: string[];
+      sent: Array<{ type: string; uri?: string; line?: number; column?: number }>;
+    };
+    assert.deepStrictEqual(parsed.labels, ['Reveal', 'Open'], `row should expose reveal/open actions: ${raw}`);
+    assert.ok(parsed.sent.some((msg) => msg.type === 'revealFile' && msg.uri === alphaUri), `reveal action should emit revealFile: ${raw}`);
+    assert.ok(
+      parsed.sent.some((msg) => msg.type === 'pinInSideEditor' && msg.uri === alphaUri && msg.line === 2 && msg.column === 11),
+      `open action should emit pinInSideEditor with match location: ${raw}`,
+    );
+  });
+
   // NOTE: input.value population is already covered end-to-end by
   // filter.test.ts which reads it via state.inputValue probe — that path
   // doesn't depend on getting the right window back out of a `querySelector`

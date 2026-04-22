@@ -1,7 +1,7 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV82) {
+  if (window.__ijFindPatchedV83) {
     var existingStatus = 'not-ready:no-status';
     try {
       existingStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : existingStatus;
@@ -19,7 +19,7 @@ export function getRendererPatchScript(): string {
     }
     return 'already patched';
   }
-  window.__ijFindPatchedV82 = true;
+  window.__ijFindPatchedV83 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -1147,6 +1147,31 @@ export function getRendererPatchScript(): string {
     '  text-align: right;',
     '}',
     '.ij-find-row.active .ij-find-row-loc { color: inherit; opacity: 0.85; }',
+    '.ij-find-row-actions {',
+    '  flex: 0 0 auto;',
+    '  display: flex; align-items: center; gap: 3px;',
+    '  opacity: 0.72;',
+    '}',
+    '.ij-find-row:hover .ij-find-row-actions,',
+    '.ij-find-row.active .ij-find-row-actions,',
+    '.ij-find-row:focus-within .ij-find-row-actions { opacity: 1; }',
+    '.ij-find-row-action {',
+    '  height: 18px;',
+    '  min-width: 48px;',
+    '  padding: 0 6px;',
+    '  border: 1px solid transparent;',
+    '  border-radius: 3px;',
+    '  background: transparent;',
+    '  color: inherit;',
+    '  font: 11px var(--vscode-font-family, system-ui);',
+    '  line-height: 16px;',
+    '  cursor: pointer;',
+    '}',
+    '.ij-find-row-action:hover, .ij-find-row-action:focus {',
+    '  background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08));',
+    '  border-color: var(--vscode-focusBorder, var(--vscode-widget-border, #555));',
+    '  outline: none;',
+    '}',
     // Stronger highlight palette so it stays visible on hover & active rows.
     '.ij-find-hl {',
     '  background: var(--vscode-editor-findMatchHighlightBackground, rgba(247,140,0,0.55));',
@@ -1784,6 +1809,26 @@ export function getRendererPatchScript(): string {
     row.style.right = '0';
   }
 
+  function buildRowActions() {
+    return el('span', {
+      className: 'ij-find-row-actions',
+      children: [
+        el('button', {
+          className: 'ij-find-row-action',
+          text: 'Reveal',
+          title: 'Reveal file in Explorer',
+          attrs: { type: 'button', 'data-action': 'reveal', 'aria-label': 'Reveal file in Explorer' },
+        }),
+        el('button', {
+          className: 'ij-find-row-action',
+          text: 'Open',
+          title: 'Open file',
+          attrs: { type: 'button', 'data-action': 'open', 'aria-label': 'Open file' },
+        }),
+      ],
+    });
+  }
+
   function buildResultRow(flatIdx) {
     var item = state.flat[flatIdx];
     var row;
@@ -1797,6 +1842,7 @@ export function getRendererPatchScript(): string {
         children: [
           el('span', { className: 'ij-find-row-text', text: '\u2026 scanning' }),
           el('span', { className: 'ij-find-row-loc', text: cName }),
+          buildRowActions(),
         ],
       });
       return row;
@@ -1818,6 +1864,7 @@ export function getRendererPatchScript(): string {
           title: f.relPath + ':' + (m.line + 1),
           text: locText,
         }),
+        buildRowActions(),
       ],
     });
   }
@@ -1983,21 +2030,32 @@ export function getRendererPatchScript(): string {
     return [{ start: idx, end: idx + fq.length }];
   }
 
-  function openActive() {
-    if (state.activeIndex < 0 || state.activeIndex >= state.flat.length) { return; }
-    var fm = state.flat[state.activeIndex];
+  function targetForFlatIndex(flatIdx) {
+    if (flatIdx < 0 || flatIdx >= state.flat.length) { return null; }
+    var fm = state.flat[flatIdx];
     if (fm.pendingUri) {
-      // No confirmed line yet — open at the top of the file.
-      send({ type: 'pinInSideEditor', uri: fm.pendingUri, line: 0, column: 0 });
-      return;
+      // No confirmed line yet, so use the top of the file.
+      return { uri: fm.pendingUri, line: 0, column: 0 };
     }
     var f = state.files[fm.fi];
     var m = f.matches[fm.mi];
-    var col = (m.ranges && m.ranges[0]) ? m.ranges[0].start : 0;
-    // Double-click / Enter — the explicit "open and edit" action. Pins the
-    // file in Beside with focus so the user can edit with all real VSCode
-    // features (intellisense, hover, save, undo, extensions).
-    send({ type: 'pinInSideEditor', uri: f.uri, line: m.line, column: col });
+    var ranges = rangesForCurrentQuery(m);
+    var col = (ranges && ranges[0]) ? ranges[0].start : 0;
+    return { uri: f.uri, line: m.line, column: col };
+  }
+
+  function openActive() {
+    var target = targetForFlatIndex(state.activeIndex);
+    if (!target) { return; }
+    // Double-click / explicit Open action. Pins the file with focus so the
+    // user can edit with all real VSCode features.
+    send({ type: 'pinInSideEditor', uri: target.uri, line: target.line, column: target.column });
+  }
+
+  function revealActive() {
+    var target = targetForFlatIndex(state.activeIndex);
+    if (!target) { return; }
+    send({ type: 'revealFile', uri: target.uri });
   }
 
   function triggerSearch(forceRestart, recordHistory) {
@@ -2251,12 +2309,28 @@ export function getRendererPatchScript(): string {
   renderSearchHistory();
 
   $results.addEventListener('click', function (e) {
+    var actionBtn = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row-action') : null;
+    if (actionBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      var actionRow = actionBtn.closest('.ij-find-row');
+      var actionFlatIdx = actionRow ? parseInt(actionRow.getAttribute('data-flat') || '-1', 10) : -1;
+      if (actionFlatIdx >= 0) {
+        state.activeIndex = actionFlatIdx;
+        applyActive(true);
+        var action = actionBtn.getAttribute('data-action') || '';
+        if (action === 'open') { openActive(); }
+        else if (action === 'reveal') { revealActive(); }
+      }
+      return;
+    }
     var row = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row') : null;
     if (!row) { return; }
     var flatIdx = parseInt(row.getAttribute('data-flat') || '-1', 10);
     if (flatIdx >= 0) { selectMatch(flatIdx); $q.focus(); }
   });
   $results.addEventListener('dblclick', function (e) {
+    if (e.target instanceof HTMLElement && e.target.closest('.ij-find-row-action')) { return; }
     var row = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row') : null;
     if (!row) { return; }
     var flatIdx = parseInt(row.getAttribute('data-flat') || '-1', 10);

@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 14,
+            "activePatchIndex": 15,
             "patches": [
                 {
                     "date": 1776584800003,
@@ -64,6 +64,10 @@
                 {
                     "date": 1776823793828,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellij-styled-search\",\n   \"displayName\": \"IntelliJ Styled Search\",\n   \"description\": \"IntelliJ IDEA style project search — peek-like movable panel with workspace file results\",\n-  \"version\": \"0.0.11\",\n+  \"version\": \"0.1.1\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"resources/icon.png\",\n   \"repository\": {\n@@ -129,8 +129,13 @@\n         \"intellijStyledSearch.maxResults\": {\n           \"type\": \"number\",\n           \"default\": 2000,\n           \"description\": \"How many match lines to load per batch. Scrolling near the bottom loads the next batch. Values at or below 0 fall back to the built-in default.\"\n+        },\n+        \"intellijStyledSearch.searchHistoryLimit\": {\n+          \"type\": \"number\",\n+          \"default\": 100,\n+          \"description\": \"Maximum number of executed search queries to keep in the search history dropdown. Set to 0 to disable storing search history.\"\n         }\n       }\n     }\n   },\n"
+                },
+                {
+                    "date": 1776846232164,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellij-styled-search\",\n   \"displayName\": \"IntelliJ Styled Search\",\n   \"description\": \"IntelliJ IDEA style project search — peek-like movable panel with workspace file results\",\n-  \"version\": \"0.1.1\",\n+  \"version\": \"0.1.2\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"resources/icon.png\",\n   \"repository\": {\n"
                 }
             ],
             "date": 1776584800003,
