@@ -10,19 +10,19 @@ import {
   prioritizeFiles,
   mergeFileMatches,
   getConfiguredResultLimit,
-  getConfiguredSearchEngine,
   isRegexMultilineEnabled,
+  getConfiguredSearchEngine,
   type SearchForTestsResult,
   type SearchEngine,
 } from './search';
 import { configureRipgrepInstall, ensureRipgrepInstalled, findRipgrepPath, runRgSearch } from './rgSearch';
 import { getRendererPatchScript } from './rendererPatch';
 import { TrigramIndex, extractTrigramsLower } from './trigramIndex';
-import { compileIncludeMatcher } from './pathScope';
+import { compilePathScopeMatcher } from './pathScope';
 import { ZoektRuntime } from './zoekRuntime';
 
 type RendererEvent =
-  | { type: 'search'; options: SearchOptions }
+  | { type: 'search'; options: SearchOptions; recordHistory?: boolean }
   | { type: 'loadMore' }
   | { type: 'cancel' }
   | { type: 'openFile'; uri: string; line: number; column: number }
@@ -54,6 +54,7 @@ type OverlayMessage =
       offset: number;
     }
   | { type: 'results:error'; searchId: number; message: string }
+  | { type: 'history:update'; entries: string[]; limit: number }
   | { type: 'preview'; uri: string; relPath: string; focusLine: number; ranges?: MatchRange[]; lines: PreviewLine[]; languageId: string }
   | { type: 'hover'; reqId: number; uri: string; line: number; column: number; x: number; y: number; contents: HoverContent[] };
 
@@ -86,6 +87,9 @@ type CaptureDiagnosticOptions = {
 
 const BRIDGE_BINDING = 'irSearchMainBridge';
 const RENDERER_BINDING = 'irSearchEvent';
+const SEARCH_HISTORY_KEY = 'intellijStyledSearch.searchHistory';
+const DEFAULT_SEARCH_HISTORY_LIMIT = 100;
+const HARD_SEARCH_HISTORY_LIMIT = 1000;
 
 function wrapLogWithPrefix(channel: vscode.OutputChannel, version: string): vscode.OutputChannel {
   // Every log line gets `[<ISO ts>] [v<version>]` prefixed so bug reports
@@ -163,17 +167,23 @@ export class OverlayPanel {
       });
     }
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
-      if (!event.affectsConfiguration('intellijStyledSearch.engine')) { return; }
-      const engine = getConfiguredSearchEngine();
-      this.log.appendLine(`search engine changed: ${engine}`);
-      if (engine === 'zoekt') {
-        void this.trigramIndex.clear('zoekt selected in settings').catch((err) => {
-          this.log.appendLine(`TrigramIndex clear failed: ${err instanceof Error ? err.message : err}`);
+      if (event.affectsConfiguration('intellijStyledSearch.engine')) {
+        const engine = getConfiguredSearchEngine();
+        this.log.appendLine(`search engine changed: ${engine}`);
+        if (engine === 'zoekt') {
+          void this.trigramIndex.clear('zoekt selected in settings').catch((err) => {
+            this.log.appendLine(`TrigramIndex clear failed: ${err instanceof Error ? err.message : err}`);
+          });
+        } else {
+          this.zoektRuntime.cancelRunningProcesses('engine switched to codesearch');
+          this.startTrigramIndexInit('engine switch');
+          this.log.appendLine('codesearch selected; warming local trigram cache in background.');
+        }
+      }
+      if (event.affectsConfiguration('intellijStyledSearch.searchHistoryLimit')) {
+        void this.trimSearchHistoryToLimit().then(() => this.postSearchHistoryToRenderer()).catch((err) => {
+          this.log.appendLine(`search history limit update failed: ${err instanceof Error ? err.message : err}`);
         });
-      } else {
-        this.zoektRuntime.cancelRunningProcesses('engine switched to codesearch');
-        this.startTrigramIndexInit('engine switch');
-        this.log.appendLine('codesearch selected; warming local trigram cache in background.');
       }
     }));
   }
@@ -183,6 +193,55 @@ export class OverlayPanel {
       this.log.appendLine(
         `TrigramIndex init failed (${reason}): ${err instanceof Error ? err.message : err}`,
       );
+    });
+  }
+
+  private getConfiguredSearchHistoryLimit(): number {
+    const raw = vscode.workspace
+      .getConfiguration('intellijStyledSearch')
+      .get<number>('searchHistoryLimit', DEFAULT_SEARCH_HISTORY_LIMIT);
+    if (!Number.isFinite(raw)) { return DEFAULT_SEARCH_HISTORY_LIMIT; }
+    return Math.max(0, Math.min(Math.floor(raw), HARD_SEARCH_HISTORY_LIMIT));
+  }
+
+  private readSearchHistory(limit = this.getConfiguredSearchHistoryLimit()): string[] {
+    const raw = this.context.globalState.get<unknown>(SEARCH_HISTORY_KEY, []);
+    if (!Array.isArray(raw) || limit <= 0) { return []; }
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const item of raw) {
+      if (typeof item !== 'string' || item.length === 0 || seen.has(item)) { continue; }
+      seen.add(item);
+      out.push(item);
+      if (out.length >= limit) { break; }
+    }
+    return out;
+  }
+
+  private async recordSearchHistory(query: string): Promise<void> {
+    const limit = this.getConfiguredSearchHistoryLimit();
+    if (limit <= 0 || query.length === 0) {
+      await this.postSearchHistoryToRenderer();
+      return;
+    }
+    const history = this.readSearchHistory(HARD_SEARCH_HISTORY_LIMIT)
+      .filter((item) => item !== query);
+    history.unshift(query);
+    await this.context.globalState.update(SEARCH_HISTORY_KEY, history.slice(0, limit));
+    await this.postSearchHistoryToRenderer();
+  }
+
+  private async trimSearchHistoryToLimit(): Promise<void> {
+    const limit = this.getConfiguredSearchHistoryLimit();
+    await this.context.globalState.update(SEARCH_HISTORY_KEY, this.readSearchHistory(limit));
+  }
+
+  private async postSearchHistoryToRenderer(): Promise<void> {
+    if (this.activeWindowId === undefined) { return; }
+    await this.postToRenderer({
+      type: 'history:update',
+      entries: this.readSearchHistory(),
+      limit: this.getConfiguredSearchHistoryLimit(),
     });
   }
 
@@ -773,24 +832,29 @@ export class OverlayPanel {
     let effectiveEngine: SearchEngine = requestedEngine;
     let fallbackReason: string | undefined;
     if (requestedEngine === 'zoekt') {
-      const readiness = await this.zoektRuntime.runSearch(
-        options,
-        new vscode.CancellationTokenSource().token,
-        {
-          onFile: (m) => { matches.push(m); },
-          onDone: () => {},
-          onError: (err) => { throw err; },
-        },
-      );
-      if (readiness.ready) {
-        return {
-          matches: mergeFileMatches(matches),
-          requestedEngine,
-          effectiveEngine,
-        };
+      if (options.excludePatterns && options.excludePatterns.length > 0) {
+        effectiveEngine = 'codesearch';
+        fallbackReason = 'scope exclude patterns require codesearch';
+      } else {
+        const readiness = await this.zoektRuntime.runSearch(
+          options,
+          new vscode.CancellationTokenSource().token,
+          {
+            onFile: (m) => { matches.push(m); },
+            onDone: () => {},
+            onError: (err) => { throw err; },
+          },
+        );
+        if (readiness.ready) {
+          return {
+            matches: mergeFileMatches(matches),
+            requestedEngine,
+            effectiveEngine,
+          };
+        }
+        effectiveEngine = 'codesearch';
+        fallbackReason = readiness.reason;
       }
-      effectiveEngine = 'codesearch';
-      fallbackReason = readiness.reason;
     }
     const { uris: candidates } = this.trigramIndex.candidatesFor(options.query, {
       useRegex: options.useRegex,
@@ -1233,6 +1297,9 @@ export class OverlayPanel {
       this.log.appendLine(
         `Show(win=${v.fid}): ${v.result} [ensureInjected=${tInjected - tShow}ms showEval=${tRendered - tInjected}ms total=${tRendered - tShow}ms]`,
       );
+      void this.postSearchHistoryToRenderer().catch((err) => {
+        this.log.appendLine(`post search history failed: ${err instanceof Error ? err.message : err}`);
+      });
       // After the overlay is visible, kick off Monaco capture for the same
       // renderer window that owns the preview pane. requestPreview awaits
       // this when needed, so the first preview can mount as Monaco instead
@@ -1585,7 +1652,14 @@ export class OverlayPanel {
       return;
     }
     switch (evt.type) {
-      case 'search': void this.runSearch(evt.options); break;
+      case 'search':
+        if (evt.recordHistory) {
+          void this.recordSearchHistory(evt.options.query).catch((err) => {
+            this.log.appendLine(`record search history failed: ${err instanceof Error ? err.message : err}`);
+          });
+        }
+        void this.runSearch(evt.options);
+        break;
       case 'loadMore': void this.loadMoreSearch(); break;
       case 'cancel':
         this.currentSearchSession = undefined;
@@ -1794,6 +1868,7 @@ export class OverlayPanel {
       useRegex: options.useRegex,
       regexMultiline: options.regexMultiline,
       includePatterns: options.includePatterns ? [...options.includePatterns] : undefined,
+      excludePatterns: options.excludePatterns ? [...options.excludePatterns] : undefined,
     };
   }
 
@@ -1832,10 +1907,15 @@ export class OverlayPanel {
     let effectiveEngine: SearchEngine = requestedEngine;
     let fallbackReason: string | undefined;
     if (requestedEngine === 'zoekt') {
-      const readiness = await this.zoektRuntime.getSearchReadiness();
-      if (!readiness.ready) {
+      if (options.excludePatterns && options.excludePatterns.length > 0) {
         effectiveEngine = 'codesearch';
-        fallbackReason = readiness.reason;
+        fallbackReason = 'scope exclude patterns require codesearch';
+      } else {
+        const readiness = await this.zoektRuntime.getSearchReadiness();
+        if (!readiness.ready) {
+          effectiveEngine = 'codesearch';
+          fallbackReason = readiness.reason;
+        }
       }
     }
     const pageSize = getConfiguredResultLimit();
@@ -1860,7 +1940,8 @@ export class OverlayPanel {
       options.caseSensitive ? 'case' : '',
       options.wholeWord ? 'word' : '',
       (isRegexMultilineEnabled(options) || (!options.useRegex && options.query.includes('\n'))) ? 'multiline' : '',
-      options.includePatterns && options.includePatterns.length > 0 ? `scope=${options.includePatterns.length}` : '',
+      options.includePatterns && options.includePatterns.length > 0 ? `include=${options.includePatterns.length}` : '',
+      options.excludePatterns && options.excludePatterns.length > 0 ? `exclude=${options.excludePatterns.length}` : '',
     ].filter(Boolean).join(',') || 'plain';
     const plannerSummary = effectiveEngine === 'zoekt'
       ? 'planner=zoekt'
@@ -1888,14 +1969,14 @@ export class OverlayPanel {
         caseSensitive: options.caseSensitive,
         wholeWord: options.wholeWord,
       });
-      const includeMatcher = compileIncludeMatcher(options.includePatterns);
-      const scopedCandidates = candidates && includeMatcher
+      const pathScopeMatcher = compilePathScopeMatcher(options.includePatterns, options.excludePatterns);
+      const scopedCandidates = candidates && pathScopeMatcher
         ? (() => {
             const filtered = new Set<string>();
             for (const u of candidates) {
               try {
                 const uri = vscode.Uri.parse(u);
-                if (includeMatcher(vscode.workspace.asRelativePath(uri, false))) {
+                if (pathScopeMatcher(vscode.workspace.asRelativePath(uri, false))) {
                   filtered.add(u);
                 }
               } catch {}

@@ -15,7 +15,7 @@ import {
   FILE_MATCH_CHUNK_MATCH_LIMIT,
   FILE_MATCH_CHUNK_CHAR_LIMIT,
 } from './search';
-import { compileIncludeMatcher, toRipgrepGlobs } from './pathScope';
+import { compilePathScopeMatcher, toRipgrepGlobs } from './pathScope';
 
 // ──────────────────────────────────────────────────────────────────────────
 // Ripgrep-backed search engine.
@@ -345,8 +345,9 @@ export async function runRgSearch(
   const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
   const resultLimit = getRequestedResultLimit(opts, cfg);
   const resultOffset = getRequestedResultOffset(opts);
-  const includeMatcher = compileIncludeMatcher(opts.includePatterns);
+  const pathScopeMatcher = compilePathScopeMatcher(opts.includePatterns, opts.excludePatterns);
   const includeGlobs = toRipgrepGlobs(opts.includePatterns);
+  const scopeExcludeGlobs = toRipgrepGlobs(opts.excludePatterns);
 
   const isRegexMultiline = isRegexMultilineEnabled(opts);
   if (opts.useRegex && !isRegexMultiline && opts.query.includes('\n')) {
@@ -382,8 +383,8 @@ export async function runRgSearch(
   // headroom for other args, 5000 paths is a safe ceiling before `spawn`
   // would start erroring with E2BIG.
   const MAX_POSITIONAL = 5000;
-  const narrowedFiles = candidateFiles && includeMatcher
-    ? candidateFiles.filter((fsPath) => includeMatcher(vscode.workspace.asRelativePath(vscode.Uri.file(fsPath), false)))
+  const narrowedFiles = candidateFiles && pathScopeMatcher
+    ? candidateFiles.filter((fsPath) => pathScopeMatcher(vscode.workspace.asRelativePath(vscode.Uri.file(fsPath), false)))
     : candidateFiles;
   if (candidateFiles && narrowedFiles && narrowedFiles.length === 0) {
     progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
@@ -399,6 +400,7 @@ export async function runRgSearch(
   args.push('--no-ignore');
   if (!useNarrowing) {
     for (const g of includeGlobs) { args.push('--glob', g); }
+    for (const g of scopeExcludeGlobs) { args.push('--glob', '!' + g); }
     // ripgrep --glob with '!' prefix is exclusion. Convert **/foo/** style
     // globs to ripgrep's format (which is the same glob syntax).
     for (const g of excludeGlobs) { args.push('--glob', '!' + g); }

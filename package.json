@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.0.11",
+  "version": "0.1.0",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -130,6 +130,11 @@
           "type": "number",
           "default": 2000,
           "description": "How many match lines to load per batch. Scrolling near the bottom loads the next batch. Values at or below 0 fall back to the built-in default."
+        },
+        "intellijStyledSearch.searchHistoryLimit": {
+          "type": "number",
+          "default": 100,
+          "description": "Maximum number of executed search queries to keep in the search history dropdown. Set to 0 to disable storing search history."
         }
       }
     }

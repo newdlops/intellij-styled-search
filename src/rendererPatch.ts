@@ -1,7 +1,7 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV81) {
+  if (window.__ijFindPatchedV82) {
     var existingStatus = 'not-ready:no-status';
     try {
       existingStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : existingStatus;
@@ -19,7 +19,7 @@ export function getRendererPatchScript(): string {
     }
     return 'already patched';
   }
-  window.__ijFindPatchedV81 = true;
+  window.__ijFindPatchedV82 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -977,8 +977,13 @@ export function getRendererPatchScript(): string {
     '}',
     '.ij-find-search-row { display: flex; gap: 6px; align-items: flex-start; }',
     '.ij-find-scope-row { margin-top: 6px; }',
+    '.ij-find-query-group {',
+    '  flex: 1; display: flex; gap: 4px; align-items: flex-start;',
+    '  min-width: 0;',
+    '}',
     '.ij-find-query {',
     '  flex: 1; padding: 5px 8px;',
+    '  min-width: 0;',
     '  font-family: var(--vscode-editor-font-family, monospace);',
     '  font-size: 13px;',
     '  line-height: 1.4;',
@@ -993,6 +998,68 @@ export function getRendererPatchScript(): string {
     '  box-sizing: border-box;',
     '}',
     '.ij-find-query:focus { border-color: var(--vscode-focusBorder, #007acc); }',
+    '.ij-find-history-wrap {',
+    '  position: relative;',
+    '  flex: 0 0 auto;',
+    '}',
+    '.ij-find-history {',
+    '  height: 26px; min-width: 78px; padding: 0 18px 0 7px;',
+    '  font-size: 11px;',
+    '  font-family: var(--vscode-editor-font-family, monospace);',
+    '  background: transparent;',
+    '  color: var(--vscode-foreground, #cccccc);',
+    '  border: 1px solid transparent;',
+    '  border-radius: 3px; outline: none;',
+    '  cursor: pointer;',
+    '  box-sizing: border-box;',
+    '  position: relative;',
+    '}',
+    '.ij-find-history::after {',
+    '  content: "";',
+    '  position: absolute; right: 7px; top: 50%; margin-top: -2px;',
+    '  border-left: 4px solid transparent;',
+    '  border-right: 4px solid transparent;',
+    '  border-top: 5px solid currentColor;',
+    '  opacity: 0.8;',
+    '}',
+    '.ij-find-history:hover { background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)); }',
+    '.ij-find-history:focus { border-color: var(--vscode-focusBorder, #007acc); }',
+    '.ij-find-history[aria-expanded="true"] {',
+    '  background: var(--vscode-inputOption-activeBackground, rgba(14,99,156,0.5));',
+    '  color: var(--vscode-inputOption-activeForeground, #ffffff);',
+    '  border-color: var(--vscode-inputOption-activeBorder, #007acc);',
+    '}',
+    '.ij-find-history:disabled { opacity: 0.45; cursor: default; }',
+    '.ij-find-history:disabled:hover { background: transparent; }',
+    '.ij-find-history-menu {',
+    '  position: absolute; top: 30px; right: 0;',
+    '  width: 340px; max-width: min(340px, calc(100vw - 48px));',
+    '  max-height: 220px; overflow: auto;',
+    '  display: none;',
+    '  z-index: 2147483005;',
+    '  background: var(--vscode-editorWidget-background, #252526);',
+    '  color: var(--vscode-foreground, #cccccc);',
+    '  border: 1px solid var(--vscode-widget-border, var(--vscode-contrastBorder, #454545));',
+    '  border-radius: 3px;',
+    '  box-shadow: 0 8px 28px rgba(0,0,0,0.45);',
+    '  padding: 3px 0;',
+    '}',
+    '.ij-find-history-menu.open { display: block; }',
+    '.ij-find-history-item {',
+    '  display: block; width: 100%;',
+    '  padding: 5px 9px;',
+    '  background: transparent;',
+    '  color: inherit;',
+    '  border: 0;',
+    '  text-align: left;',
+    '  font: 12px var(--vscode-editor-font-family, monospace);',
+    '  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;',
+    '  cursor: pointer;',
+    '}',
+    '.ij-find-history-item:hover, .ij-find-history-item:focus {',
+    '  background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.08));',
+    '  outline: none;',
+    '}',
     '.ij-find-scope {',
     '  width: 100%; padding: 5px 8px;',
     '  font-family: var(--vscode-editor-font-family, monospace);',
@@ -1347,17 +1414,35 @@ export function getRendererPatchScript(): string {
     var h = Math.min(160, Math.max(26, $q.scrollHeight));
     $q.style.height = h + 'px';
   }
+  var $history = el('button', {
+    className: 'ij-find-history',
+    text: 'History',
+    attrs: {
+      type: 'button',
+      title: 'Search history',
+      'aria-label': 'Search history',
+      'aria-haspopup': 'listbox',
+      'aria-expanded': 'false',
+      disabled: 'true',
+    },
+  });
+  var $historyMenu = el('div', {
+    className: 'ij-find-history-menu',
+    attrs: { role: 'listbox' },
+  });
+  var $historyWrap = el('div', { className: 'ij-find-history-wrap', children: [$history, $historyMenu] });
   var $optCase = el('button', { className: 'ij-find-opt', title: 'Match Case (Alt+C)', text: 'Aa', attrs: { 'data-opt': 'caseSensitive', 'aria-pressed': 'false' } });
   var $optWord = el('button', { className: 'ij-find-opt', title: 'Whole Word (Alt+W)', text: 'W', attrs: { 'data-opt': 'wholeWord', 'aria-pressed': 'false' } });
   var $optRegex = el('button', { className: 'ij-find-opt', title: 'Regex (Alt+R)', text: '.*', attrs: { 'data-opt': 'useRegex', 'aria-pressed': 'false' } });
   var $optRegexMultiline = el('button', { className: 'ij-find-opt', title: 'Regex Multiline (Alt+M)', text: 'ML', attrs: { 'data-opt': 'regexMultiline', 'aria-pressed': 'true', 'aria-disabled': 'true' } });
   var $refresh = el('button', { className: 'ij-find-opt ij-find-refresh', title: 'Refresh Search', text: 'Run', attrs: { type: 'button', 'aria-label': 'Refresh search' } });
   var $opts = el('div', { className: 'ij-find-opts', children: [$optCase, $optWord, $optRegex, $optRegexMultiline, $refresh] });
-  var $searchRow = el('div', { className: 'ij-find-search-row', children: [$q, $opts] });
+  var $queryGroup = el('div', { className: 'ij-find-query-group', children: [$q, $historyWrap] });
+  var $searchRow = el('div', { className: 'ij-find-search-row', children: [$queryGroup, $opts] });
   var $scope = el('input', {
     className: 'ij-find-scope',
     attrs: {
-      placeholder: 'Files to include (Ant patterns: src/**, **/*.ts, api/)',
+      placeholder: 'Files scope (Ant patterns: src/**, **/*.ts, !**/*.test.ts)',
       spellcheck: 'false',
       autocomplete: 'off',
       type: 'text',
@@ -1457,6 +1542,8 @@ export function getRendererPatchScript(): string {
     previewMonacoHost: null,
     resultsInfoText: '',
     rgScope: '',
+    searchHistory: [],
+    searchHistoryLimit: 100,
   };
   var RESULT_ROW_HEIGHT = 20;
   var RESULT_OVERSCAN = 12;
@@ -1530,17 +1617,88 @@ export function getRendererPatchScript(): string {
   }
 
   function parseScopeInput(raw) {
-    if (!raw) { return []; }
+    if (!raw) { return { includePatterns: [], excludePatterns: [] }; }
     var parts = String(raw).split(/[\\n,;]+/);
-    var out = [];
-    var seen = {};
+    var includePatterns = [];
+    var excludePatterns = [];
+    var seenInclude = {};
+    var seenExclude = {};
     for (var i = 0; i < parts.length; i++) {
       var trimmed = parts[i].trim();
+      if (!trimmed) { continue; }
+      var target = includePatterns;
+      var seen = seenInclude;
+      if (trimmed.charAt(0) === '!' || trimmed.charAt(0) === '-') {
+        trimmed = trimmed.slice(1).trim();
+        target = excludePatterns;
+        seen = seenExclude;
+      } else if (trimmed.charAt(0) === '+') {
+        trimmed = trimmed.slice(1).trim();
+      }
       if (!trimmed || seen[trimmed]) { continue; }
       seen[trimmed] = true;
-      out.push(trimmed);
+      target.push(trimmed);
     }
-    return out;
+    return { includePatterns: includePatterns, excludePatterns: excludePatterns };
+  }
+
+  function renderSearchHistory() {
+    clearChildren($historyMenu);
+    var items = state.searchHistory || [];
+    for (var i = 0; i < items.length; i++) {
+      var item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'ij-find-history-item';
+      item.setAttribute('role', 'option');
+      item.setAttribute('data-history-index', String(i));
+      var label = String(items[i]).replace(/[\\r\\n\\t ]+/g, ' ').trim();
+      item.textContent = label.length > 96 ? label.slice(0, 93) + '...' : (label || '(blank)');
+      item.title = String(items[i]);
+      $historyMenu.appendChild(item);
+    }
+    if (items.length > 0) { $history.removeAttribute('disabled'); }
+    else {
+      $history.setAttribute('disabled', 'true');
+      closeSearchHistory();
+    }
+  }
+
+  function closeSearchHistory() {
+    $historyMenu.classList.remove('open');
+    $history.setAttribute('aria-expanded', 'false');
+  }
+
+  function openSearchHistory() {
+    if (!state.searchHistory || state.searchHistory.length === 0) { return; }
+    $historyMenu.classList.add('open');
+    $history.setAttribute('aria-expanded', 'true');
+  }
+
+  function toggleSearchHistory() {
+    if ($historyMenu.classList.contains('open')) { closeSearchHistory(); }
+    else { openSearchHistory(); }
+  }
+
+  function selectSearchHistory(idx) {
+    if (idx >= 0 && state.searchHistory && idx < state.searchHistory.length) {
+      $q.value = state.searchHistory[idx];
+      autosizeQuery();
+      markSearchDirty();
+      closeSearchHistory();
+      try { $q.focus(); } catch (e) {}
+    }
+  }
+
+  function markSearchDirty(force) {
+    if (state.debounce) { clearTimeout(state.debounce); state.debounce = null; }
+    var q = typeof $q.value === 'string' ? $q.value : '';
+    if (!q) {
+      if (!state.searching) { setStatus('Type a query', false); }
+      return;
+    }
+    if (!state.searching && (force || q !== (state.rgQuery || '') || ($scope.value || '') !== (state.rgScope || ''))) {
+      setStatus('Press Enter or Run to search', false);
+    }
   }
 
   function appendHighlightedInto(container, text, ranges) {
@@ -1842,14 +2000,14 @@ export function getRendererPatchScript(): string {
     send({ type: 'pinInSideEditor', uri: f.uri, line: m.line, column: col });
   }
 
-  function triggerSearch(forceRestart) {
+  function triggerSearch(forceRestart, recordHistory) {
     var raw = $q.value;
     var scopeRaw = $scope.value || '';
     // Preserve the query byte-for-byte. Multi-line search selections often
     // begin with indentation, and trimming that indentation changes the
     // literal search target into a different string.
     var q = typeof raw === 'string' ? raw : '';
-    var includePatterns = parseScopeInput(scopeRaw);
+    var scopePatterns = parseScopeInput(scopeRaw);
     clearPreview();
     if (!q) {
       state.files = []; state.flat = []; state.activeIndex = -1; state.searching = false;
@@ -1928,20 +2086,21 @@ export function getRendererPatchScript(): string {
     });
     send({
       type: 'search',
+      recordHistory: !!recordHistory,
       options: {
         query: q,
         caseSensitive: state.options.caseSensitive,
         wholeWord: state.options.wholeWord,
         useRegex: state.options.useRegex,
         regexMultiline: state.options.regexMultiline,
-        includePatterns: includePatterns,
+        includePatterns: scopePatterns.includePatterns,
+        excludePatterns: scopePatterns.excludePatterns,
       },
     });
   }
 
   function scheduleSearch() {
-    if (state.debounce) { clearTimeout(state.debounce); }
-    state.debounce = setTimeout(function () { triggerSearch(false); }, 150);
+    markSearchDirty();
   }
 
   function refreshSearch() {
@@ -1949,7 +2108,7 @@ export function getRendererPatchScript(): string {
     state.rgQuery = '';
     state.filterQuery = '';
     state.rgScope = '';
-    triggerSearch(false);
+    triggerSearch(false, true);
   }
 
   function requestMoreResults() {
@@ -1974,7 +2133,7 @@ export function getRendererPatchScript(): string {
     state.options[key] = !state.options[key];
     btn.setAttribute('aria-pressed', String(state.options[key]));
     if (key === 'useRegex') { syncRegexMultilineUi(); }
-    triggerSearch();
+    markSearchDirty(true);
   }
 
   function moveActive(delta) {
@@ -1985,17 +2144,71 @@ export function getRendererPatchScript(): string {
     selectMatch(next);
   }
 
-  $q.addEventListener('input', function () { autosizeQuery(); scheduleSearch(); });
+  $q.addEventListener('input', function () { autosizeQuery(); markSearchDirty(); });
   $scope.addEventListener('input', scheduleSearch);
+  $history.addEventListener('click', function (e) {
+    e.preventDefault();
+    toggleSearchHistory();
+  });
+  $history.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      toggleSearchHistory();
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      openSearchHistory();
+      var first = $historyMenu.querySelector('.ij-find-history-item');
+      if (first) { try { first.focus(); } catch (eFocus) {} }
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      closeSearchHistory();
+    }
+  });
+  $historyMenu.addEventListener('click', function (e) {
+    var item = e.target instanceof HTMLElement ? e.target.closest('.ij-find-history-item') : null;
+    if (!item) { return; }
+    e.preventDefault();
+    selectSearchHistory(parseInt(item.getAttribute('data-history-index') || '-1', 10));
+  });
+  $historyMenu.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeSearchHistory();
+      try { $history.focus(); } catch (eFocus) {}
+      return;
+    }
+    if (e.key === 'Enter' || e.key === ' ') {
+      var active = document.activeElement instanceof HTMLElement ? document.activeElement.closest('.ij-find-history-item') : null;
+      if (active) {
+        e.preventDefault();
+        selectSearchHistory(parseInt(active.getAttribute('data-history-index') || '-1', 10));
+      }
+      return;
+    }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      var items = Array.prototype.slice.call($historyMenu.querySelectorAll('.ij-find-history-item'));
+      if (items.length === 0) { return; }
+      e.preventDefault();
+      var current = items.indexOf(document.activeElement);
+      var next = e.key === 'ArrowDown'
+        ? Math.min(items.length - 1, current + 1)
+        : Math.max(0, current - 1);
+      if (current < 0) { next = e.key === 'ArrowDown' ? 0 : items.length - 1; }
+      try { items[next].focus(); } catch (eFocus2) {}
+    }
+  });
+  document.addEventListener('mousedown', function (e) {
+    if (!$historyMenu.classList.contains('open')) { return; }
+    if (e.target instanceof Node && $historyWrap.contains(e.target)) { return; }
+    closeSearchHistory();
+  });
   $q.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       // Shift+Enter: insert literal newline (textarea default) → enables
-      // ripgrep multi-line search. Plain Enter: navigate or trigger search.
+      // ripgrep multi-line search. Plain Enter: execute the query.
       if (state.debounce) { clearTimeout(state.debounce); }
       e.preventDefault();
-      if (state.flat.length > 0 && state.activeIndex < 0) { selectMatch(0); }
-      else if (state.flat.length > 0) { openActive(); }
-      else { triggerSearch(); }
+      refreshSearch();
     } else if (e.key === 'ArrowDown' && !e.shiftKey) { e.preventDefault(); moveActive(1); }
     else if (e.key === 'ArrowUp' && !e.shiftKey) { e.preventDefault(); moveActive(-1); }
     else if (e.key === 'PageDown') { e.preventDefault(); moveActive(10); }
@@ -2035,6 +2248,7 @@ export function getRendererPatchScript(): string {
   });
   $close.addEventListener('click', function () { window.__ijFindHide(); });
   syncRegexMultilineUi();
+  renderSearchHistory();
 
   $results.addEventListener('click', function (e) {
     var row = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row') : null;
@@ -3834,6 +4048,8 @@ export function getRendererPatchScript(): string {
         rgQuery: state.rgQuery || '',
         rgScope: state.rgScope || '',
         filterQuery: state.filterQuery || '',
+        historyCount: state.searchHistory ? state.searchHistory.length : 0,
+        history: state.searchHistory || [],
         options: {
           caseSensitive: !!state.options.caseSensitive,
           wholeWord: !!state.options.wholeWord,
@@ -4005,6 +4221,13 @@ export function getRendererPatchScript(): string {
         state.lastBatchMode = 'error';
         if (state.searchTicker) { clearInterval(state.searchTicker); state.searchTicker = null; }
         setStatus('Error: ' + msg.message, false);
+        break;
+      case 'history:update':
+        state.searchHistory = Array.isArray(msg.entries) ? msg.entries.filter(function (entry) {
+          return typeof entry === 'string' && entry.length > 0;
+        }) : [];
+        state.searchHistoryLimit = typeof msg.limit === 'number' ? msg.limit : state.searchHistoryLimit;
+        renderSearchHistory();
         break;
       case 'preview':
         renderPreview(msg);

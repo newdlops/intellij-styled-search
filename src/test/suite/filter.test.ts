@@ -19,6 +19,8 @@ interface SearchState {
   rgQuery: string;
   rgScope?: string;
   filterQuery: string;
+  historyCount?: number;
+  history?: string[];
   err?: string;
 }
 
@@ -78,8 +80,13 @@ suite('Extension-typing filter — client-side narrowing', () => {
         if (!q || !scope) { return 'no-query'; }
         q.value = '';
         scope.value = '';
+        ['caseSensitive', 'wholeWord', 'useRegex'].forEach(function (key) {
+          var btn = document.querySelector('[data-opt="' + key + '"]');
+          if (btn && btn.getAttribute('aria-pressed') === 'true') { btn.click(); }
+        });
         q.dispatchEvent(new Event('input', { bubbles: true }));
         scope.dispatchEvent(new Event('input', { bubbles: true }));
+        if (typeof window.__ijFindRefreshSearch === 'function') { window.__ijFindRefreshSearch(); }
         return 'cleared';
       })()`,
     );
@@ -171,6 +178,68 @@ suite('Extension-typing filter — client-side narrowing', () => {
     assert.strictEqual(parsed.hasHelper, true, `refresh helper missing: ${raw}`);
   });
 
+  test('typing query waits for Enter and records history', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const api = await getApi();
+    const query = 'history_no_auto_' + Date.now();
+
+    await api.overlay.show('Beta');
+    await waitUntil(api, (s) => !s.searching && s.rgQuery === 'Beta', 10_000, 'seed search before typing');
+
+    await api.overlay.evalInActiveWindowForTests(
+      `(function(){
+        var q = document.querySelector('.ij-find-query');
+        if (!q) { return 'no-query'; }
+        q.value = ${JSON.stringify(query)};
+        q.dispatchEvent(new Event('input', { bubbles: true }));
+        return 'typed';
+      })()`,
+    );
+    await new Promise((r) => setTimeout(r, 300));
+    const typed = await probeState(api);
+    assert.strictEqual(typed.inputValue, query);
+    assert.strictEqual(typed.rgQuery, 'Beta', `typing should not start a new search: ${JSON.stringify(typed)}`);
+
+    await api.overlay.evalInActiveWindowForTests(
+      `(function(){
+        var q = document.querySelector('.ij-find-query');
+        if (!q) { return 'no-query'; }
+        q.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+        return 'entered';
+      })()`,
+    );
+    const searched = await waitUntil(
+      api,
+      (s) => !s.searching && s.rgQuery === query && !!(s.history && s.history.indexOf(query) >= 0),
+      10_000,
+      'Enter-triggered search and history update',
+    );
+    assert.ok(searched.history && searched.history.indexOf(query) >= 0, `history missing query: ${JSON.stringify(searched)}`);
+
+    await api.overlay.evalInActiveWindowForTests(
+      `(function(){
+        var q = document.querySelector('.ij-find-query');
+        var h = document.querySelector('.ij-find-history');
+        var menu = document.querySelector('.ij-find-history-menu');
+        if (!q || !h || !menu) { return 'missing'; }
+        q.value = '';
+        q.dispatchEvent(new Event('input', { bubbles: true }));
+        h.click();
+        var items = menu.querySelectorAll('.ij-find-history-item');
+        for (var i = 0; i < items.length; i++) {
+          if (items[i].title === ${JSON.stringify(query)}) {
+            items[i].click();
+            return q.value;
+          }
+        }
+        return 'not-found';
+      })()`,
+    );
+    const selected = await probeState(api);
+    assert.strictEqual(selected.inputValue, query);
+  });
+
   test('typing a disjoint query (not a prefix) triggers a fresh rg run', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);
@@ -251,7 +320,7 @@ suite('Extension-typing filter — client-side narrowing', () => {
     assert.strictEqual(after.scopeValue, 'tests/fixtures/workspace/**/*.py');
   });
 
-  test('typing scope input filters rg results to matching files', async function () {
+  test('scope input filters rg results after Run', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(20_000);
     const api = await getApi();
@@ -265,8 +334,7 @@ suite('Extension-typing filter — client-side narrowing', () => {
     );
     assert.ok(baseline.filesCount >= 2, `baseline should hit multiple files, got ${JSON.stringify(baseline)}`);
 
-    // Apply scope by user-typed input: set value AND dispatch input event so
-    // the renderer's scheduleSearch actually fires.
+    // Apply scope by user-typed input. Search should not start until Run.
     await api.overlay.evalInActiveWindowForTests(
       `(function(){
         var scope = document.querySelector('.ij-find-scope');
@@ -274,6 +342,18 @@ suite('Extension-typing filter — client-side narrowing', () => {
         scope.value = 'nested/';
         scope.dispatchEvent(new Event('input', { bubbles: true }));
         return 'dispatched';
+      })()`,
+    );
+    const dirty = await probeState(api);
+    assert.strictEqual(dirty.scopeValue, 'nested/');
+    assert.strictEqual(dirty.rgScope, '', `scope typing should not start a search: ${JSON.stringify(dirty)}`);
+
+    await api.overlay.evalInActiveWindowForTests(
+      `(function(){
+        var btn = document.querySelector('.ij-find-refresh');
+        if (!btn) { return 'no-run'; }
+        btn.click();
+        return 'clicked';
       })()`,
     );
     const scoped = await waitUntil(

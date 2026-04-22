@@ -3,7 +3,7 @@ import * as path from 'path';
 import { type ChildProcess, spawn } from 'child_process';
 import * as vscode from 'vscode';
 import {
-  compileIncludeMatcher,
+  compilePathScopeMatcher,
   toRipgrepGlobs,
 } from './pathScope';
 import {
@@ -714,7 +714,7 @@ export class ZoektRuntime implements vscode.Disposable {
     options: SearchOptions,
     workspaceRoot: string,
   ): PaginatedSearchResult {
-    const includeMatcher = compileIncludeMatcher(options.includePatterns);
+    const pathScopeMatcher = compilePathScopeMatcher(options.includePatterns, options.excludePatterns);
     const files = response.files
       .map((file): FileMatch => ({
         uri: vscode.Uri.file(path.join(workspaceRoot, file.relPath)).toString(),
@@ -725,7 +725,7 @@ export class ZoektRuntime implements vscode.Disposable {
           ranges: [this.toRange(match)],
         })),
       }))
-      .filter((file) => !includeMatcher || includeMatcher(file.relPath));
+      .filter((file) => !pathScopeMatcher || pathScopeMatcher(file.relPath));
 
     const pageMatchCount = files.reduce((sum, file) => sum + file.matches.length, 0);
 

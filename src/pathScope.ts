@@ -120,6 +120,37 @@ export function parseIncludePatternInput(input: string | readonly string[] | und
   return out;
 }
 
+export interface PathScopePatternInput {
+  includePatterns: string[];
+  excludePatterns: string[];
+}
+
+export function parsePathScopePatternInput(input: string | readonly string[] | undefined | null): PathScopePatternInput {
+  if (!input) { return { includePatterns: [], excludePatterns: [] }; }
+  const raw: readonly string[] = typeof input === 'string' ? input.split(/[\n,;]+/) : input;
+  const includePatterns: string[] = [];
+  const excludePatterns: string[] = [];
+  const seenInclude = new Set<string>();
+  const seenExclude = new Set<string>();
+  for (const item of raw) {
+    let trimmed = item.trim();
+    if (!trimmed) { continue; }
+    let target = includePatterns;
+    let seen = seenInclude;
+    if (trimmed.startsWith('!') || trimmed.startsWith('-')) {
+      trimmed = trimmed.slice(1).trim();
+      target = excludePatterns;
+      seen = seenExclude;
+    } else if (trimmed.startsWith('+')) {
+      trimmed = trimmed.slice(1).trim();
+    }
+    if (!trimmed || seen.has(trimmed)) { continue; }
+    seen.add(trimmed);
+    target.push(trimmed);
+  }
+  return { includePatterns, excludePatterns };
+}
+
 export function toRipgrepGlobs(input: string | readonly string[] | undefined | null): string[] {
   const patterns = parseIncludePatternInput(input);
   const out: string[] = [];
@@ -135,14 +166,33 @@ export function toRipgrepGlobs(input: string | readonly string[] | undefined | n
 }
 
 export function compileIncludeMatcher(input: string | readonly string[] | undefined | null): ((relPath: string) => boolean) | null {
-  const globs = toRipgrepGlobs(input);
-  if (globs.length === 0) { return null; }
-  const regexes = globs.map((glob) => new RegExp(antPatternToRegExpSource(glob)));
+  return compilePathScopeMatcher(input, undefined);
+}
+
+export function compilePathScopeMatcher(
+  includeInput: string | readonly string[] | undefined | null,
+  excludeInput: string | readonly string[] | undefined | null,
+): ((relPath: string) => boolean) | null {
+  const includeGlobs = toRipgrepGlobs(includeInput);
+  const excludeGlobs = toRipgrepGlobs(excludeInput);
+  if (includeGlobs.length === 0 && excludeGlobs.length === 0) { return null; }
+  const includeRegexes = includeGlobs.map((glob) => new RegExp(antPatternToRegExpSource(glob)));
+  const excludeRegexes = excludeGlobs.map((glob) => new RegExp(antPatternToRegExpSource(glob)));
   return (relPath: string) => {
     const normalized = normalizeSlashPath(relPath);
-    for (const re of regexes) {
-      if (re.test(normalized)) { return true; }
+    if (includeRegexes.length > 0) {
+      let included = false;
+      for (const re of includeRegexes) {
+        if (re.test(normalized)) {
+          included = true;
+          break;
+        }
+      }
+      if (!included) { return false; }
     }
-    return false;
+    for (const re of excludeRegexes) {
+      if (re.test(normalized)) { return false; }
+    }
+    return true;
   };
 }

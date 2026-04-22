@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { compileIncludeMatcher } from './pathScope';
+import { compilePathScopeMatcher } from './pathScope';
 
 export interface SearchOptions {
   query: string;
@@ -8,6 +8,7 @@ export interface SearchOptions {
   useRegex: boolean;
   regexMultiline?: boolean;
   includePatterns?: string[];
+  excludePatterns?: string[];
   resultOffset?: number;
   resultLimit?: number;
 }
@@ -218,7 +219,7 @@ export async function runSearch(
   const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
   const resultLimit = getRequestedResultLimit(opts, cfg);
   const resultOffset = getRequestedResultOffset(opts);
-  const includeMatcher = compileIncludeMatcher(opts.includePatterns);
+  const pathScopeMatcher = compilePathScopeMatcher(opts.includePatterns, opts.excludePatterns);
 
   let files: vscode.Uri[];
   // Fast path: trigram index already told us exactly which files could
@@ -246,8 +247,8 @@ export async function runSearch(
     }
   }
 
-  if (includeMatcher) {
-    files = files.filter((uri) => includeMatcher(vscode.workspace.asRelativePath(uri, false)));
+  if (pathScopeMatcher) {
+    files = files.filter((uri) => pathScopeMatcher(vscode.workspace.asRelativePath(uri, false)));
     if (files.length === 0) {
       progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
       return;

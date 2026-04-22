@@ -41,6 +41,7 @@ IntelliJ Styled Search adds an IntelliJ IDEA-like project search panel to VS Cod
 | `intellijStyledSearch.excludeGlobs` | common build/cache folders | Glob patterns excluded from full searches. |
 | `intellijStyledSearch.maxFileSize` | `1048576` | Maximum file size in bytes to search. |
 | `intellijStyledSearch.maxResults` | `2000` | Match lines to load per batch. Scrolling near the bottom loads the next batch. Values at or below `0` use the built-in default. |
+| `intellijStyledSearch.searchHistoryLimit` | `100` | Executed search queries to keep in the History dropdown. Set to `0` to disable storing search history. |
 
 ## Runtime Notes
 

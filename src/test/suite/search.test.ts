@@ -256,6 +256,18 @@ suite('Search — engine end-to-end against fixture workspace', () => {
     assert.deepStrictEqual(relPaths(matches), ['nested/delta.js']);
   });
 
+  test('exclude pattern removes files from scoped search', async () => {
+    const { overlay } = await getApi();
+    const matches = await overlay.searchForTests({
+      query: 'class',
+      caseSensitive: false,
+      wholeWord: false,
+      useRegex: false,
+      excludePatterns: ['nested/'],
+    });
+    assert.deepStrictEqual(relPaths(matches), ['alpha.py', 'beta.js', 'docs.md']);
+  });
+
   test('UTF-8 / Korean literal hits docs.md', async () => {
     const { overlay } = await getApi();
     const matches = await overlay.searchForTests({
