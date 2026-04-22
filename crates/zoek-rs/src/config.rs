@@ -35,6 +35,8 @@ impl Default for EngineConfig {
             overlay_compaction_entry_threshold: 512,
             overlay_compaction_journal_bytes_threshold: 2 * 1024 * 1024,
             excluded_dir_names: vec![
+                ".zoek-rs".to_string(),
+                ".zoekt-rs".to_string(),
                 ".git".to_string(),
                 ".hg".to_string(),
                 ".svn".to_string(),

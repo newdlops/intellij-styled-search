@@ -282,6 +282,24 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn skips_internal_index_dirs_by_default() -> io::Result<()> {
+        let root = temp_dir("corpus-internal-index-dirs");
+        fs::create_dir_all(root.join(".zoek-rs"))?;
+        fs::create_dir_all(root.join(".zoekt-rs"))?;
+        fs::write(root.join("plain.rs"), "struct AlphaService;\n")?;
+        fs::write(root.join(".zoek-rs/overlay-journal.jsonl"), "{\"generation\":1}\n")?;
+        fs::write(root.join(".zoekt-rs/stale-overlay.txt"), "stale index data\n")?;
+
+        let (entries, stats) = discover_text_files(&root, &EngineConfig::default())?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].rel_path, "plain.rs");
+        assert!(stats.skipped_dirs >= 2);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     fn temp_dir(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

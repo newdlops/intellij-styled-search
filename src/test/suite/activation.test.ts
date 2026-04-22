@@ -1,4 +1,5 @@
 import * as assert from 'assert';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import type { ExtensionTestApi } from '../../extension';
 
@@ -267,6 +268,30 @@ suite('Activation', () => {
       percent: 9,
       detail: 'scanning files 128/1024',
     });
+  });
+
+  test('getRelativePath ignores internal zoekt index directories', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+
+    assert.strictEqual(
+      runtime.getRelativePath(vscode.Uri.file(path.join(workspaceRoot, '.zoek-rs'))),
+      null,
+    );
+    assert.strictEqual(
+      runtime.getRelativePath(vscode.Uri.file(path.join(workspaceRoot, '.zoek-rs', 'overlay-journal.jsonl'))),
+      null,
+    );
+    assert.strictEqual(
+      runtime.getRelativePath(vscode.Uri.file(path.join(workspaceRoot, '.zoekt-rs', 'overlay-journal.jsonl'))),
+      null,
+    );
+    assert.strictEqual(
+      runtime.getRelativePath(vscode.Uri.file(path.join(workspaceRoot, 'nested', '.zoek-rs', 'hot-overlay.json'))),
+      null,
+    );
   });
 
   test('zoekt searches skip trigram candidate planning', async () => {

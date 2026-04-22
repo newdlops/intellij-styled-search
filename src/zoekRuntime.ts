@@ -47,6 +47,7 @@ const UPDATE_DEBOUNCE_MS = 250;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
 const ZOEKT_PROGRESS_PREFIX = '__ZOEK_PROGRESS__';
 const ZOEKT_SCHEMA_VERSION = 2;
+const ZOEKT_INTERNAL_DIR_NAMES = new Set(['.zoek-rs', '.zoekt-rs']);
 
 class ProcessCancelledError extends Error {
   constructor(message: string) {
@@ -123,7 +124,11 @@ export class ZoektRuntime implements vscode.Disposable {
     private readonly log: vscode.OutputChannel,
   ) {
     this.extensionRoot = context.extensionUri.fsPath;
-    this.watcher = vscode.workspace.createFileSystemWatcher('**/*');
+    const workspaceFolder = this.getWorkspaceFolder();
+    const watchPattern: vscode.GlobPattern = workspaceFolder
+      ? new vscode.RelativePattern(workspaceFolder, '**/*')
+      : '**/*';
+    this.watcher = vscode.workspace.createFileSystemWatcher(watchPattern);
     this.watcher.onDidChange((uri) => { this.queueChanged(uri); });
     this.watcher.onDidCreate((uri) => { this.queueChanged(uri); });
     this.watcher.onDidDelete((uri) => { this.queueDeleted(uri); });
@@ -497,6 +502,13 @@ export class ZoektRuntime implements vscode.Disposable {
     return value.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/^\/+/, '').replace(/\/+/g, '/');
   }
 
+  private isIgnoredRelativePath(normalized: string): boolean {
+    if (!normalized || normalized === '.') {
+      return true;
+    }
+    return normalized.split('/').some((segment) => ZOEKT_INTERNAL_DIR_NAMES.has(segment));
+  }
+
   private getRelativePath(uri: vscode.Uri): string | null {
     if (uri.scheme !== 'file') { return null; }
     const folder = this.getWorkspaceFolder();
@@ -507,7 +519,7 @@ export class ZoektRuntime implements vscode.Disposable {
       return null;
     }
     const normalized = this.normalizeRelativePath(relPath);
-    if (!normalized || normalized === '.' || normalized.startsWith('.zoek-rs/')) {
+    if (this.isIgnoredRelativePath(normalized)) {
       return null;
     }
     return normalized;
