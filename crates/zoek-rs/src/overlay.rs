@@ -49,6 +49,8 @@ pub struct OverlayUpdateSummary {
     pub journal_bytes: u64,
     pub compaction_suggested: bool,
     pub compaction_reason: Option<String>,
+    pub compaction_performed: bool,
+    pub compaction_trigger_reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +229,8 @@ pub fn apply_change_batch(
             journal_bytes,
             compaction_suggested: compaction_reason.is_some(),
             compaction_reason,
+            compaction_performed: false,
+            compaction_trigger_reason: None,
         });
     }
 
@@ -281,10 +285,21 @@ pub fn apply_change_batch(
     manifest.entries.extend(entries.iter().cloned());
     manifest.save(&layout.overlay_path)?;
 
-    let journal_bytes = journal_size(&layout.overlay_journal_path)?;
-    let latest_stats = manifest.latest_stats();
     let live_entries = entries.iter().filter(|entry| !entry.tombstone).count();
     let tombstones = entries.len() - live_entries;
+    let compaction_trigger_reason = compaction_reason(
+        &manifest,
+        journal_size(&layout.overlay_journal_path)?,
+        config,
+    );
+    let compaction_performed = if compaction_trigger_reason.is_some() {
+        compact_overlay_manifest(layout, &mut manifest)?;
+        true
+    } else {
+        false
+    };
+    let journal_bytes = journal_size(&layout.overlay_journal_path)?;
+    let latest_stats = manifest.latest_stats();
     let compaction_reason = compaction_reason(&manifest, journal_bytes, config);
 
     Ok(OverlayUpdateSummary {
@@ -297,7 +312,20 @@ pub fn apply_change_batch(
         journal_bytes,
         compaction_suggested: compaction_reason.is_some(),
         compaction_reason,
+        compaction_performed,
+        compaction_trigger_reason,
     })
+}
+
+fn compact_overlay_manifest(layout: &StoreLayout, manifest: &mut OverlayManifest) -> io::Result<()> {
+    let latest = manifest.latest_entries();
+    manifest.entries = latest.into_iter().map(|(_, entry)| entry).collect();
+    manifest.save(&layout.overlay_path)?;
+    match fs::remove_file(&layout.overlay_journal_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn build_entry_for_path(
@@ -827,6 +855,43 @@ mod tests {
         let summary = apply_change_batch(&root, &layout, &config, &batch)?;
         assert!(summary.compaction_suggested);
         assert!(summary.compaction_reason.is_some());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_keeps_only_latest_entry_per_path() -> io::Result<()> {
+        let root = temp_dir("overlay-latest-compact");
+        fs::create_dir_all(root.join("src"))?;
+        let mut config = EngineConfig::default();
+        config.overlay_compaction_entry_threshold = 3;
+        let layout = StoreLayout::for_workspace(&root, &config);
+        let mut generation = 0;
+        let mut last_summary = None;
+
+        for idx in 0..3 {
+            fs::write(
+                root.join("src/a.rs"),
+                format!("struct AlphaService{} {{}}\n", idx),
+            )?;
+            let batch = build_change_batch(generation, &[String::from("src/a.rs")], &[], &[]);
+            let summary = apply_change_batch(&root, &layout, &config, &batch)?;
+            generation = summary.generation;
+            last_summary = Some(summary);
+        }
+
+        let summary = last_summary.expect("summary");
+        assert!(summary.compaction_performed);
+        assert!(!summary.compaction_suggested);
+        assert_eq!(summary.overlay_total_entries, 1);
+        assert_eq!(summary.latest_visible_entries, 1);
+        assert_eq!(summary.journal_bytes, 0);
+
+        let overlay = OverlayManifest::load(&layout.overlay_path)?;
+        assert_eq!(overlay.entries.len(), 1);
+        assert_eq!(overlay.entries[0].generation, generation);
+        assert!(!layout.overlay_journal_path.exists());
+
         fs::remove_dir_all(root)?;
         Ok(())
     }

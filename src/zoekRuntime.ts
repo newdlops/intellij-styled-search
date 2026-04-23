@@ -773,6 +773,8 @@ export class ZoektRuntime implements vscode.Disposable {
       `entries=${response.entriesWritten}`,
       `live=${response.liveEntries}`,
       `tombstones=${response.tombstones}`,
+      `overlay=${response.overlayTotalEntries}`,
+      `latest=${response.latestVisibleEntries}`,
       `journal=${response.journalBytes}`,
     ];
     this.log.appendLine(parts.join(' '));

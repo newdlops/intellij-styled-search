@@ -161,6 +161,11 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
     let batch = build_change_batch(current_generation, &changed_paths, &deleted_paths, &renamed_paths);
     let summary = apply_change_batch(&workspace_root, &layout, &config, &batch).map_err(|err| err.to_string())?;
     let mut warnings = Vec::new();
+    if let Some(reason) = summary.compaction_trigger_reason.clone() {
+        if summary.compaction_performed {
+            warnings.push(format!("overlay compacted: {reason}"));
+        }
+    }
     if let Some(reason) = summary.compaction_reason.clone() {
         warnings.push(format!("compaction suggested: {reason}"));
     }
