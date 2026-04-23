@@ -1,7 +1,7 @@
 export function getRendererPatchScript(): string {
   return `
 (function () {
-  if (window.__ijFindPatchedV83) {
+  if (window.__ijFindPatchedV84) {
     var existingStatus = 'not-ready:no-status';
     try {
       existingStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : existingStatus;
@@ -19,7 +19,7 @@ export function getRendererPatchScript(): string {
     }
     return 'already patched';
   }
-  window.__ijFindPatchedV83 = true;
+  window.__ijFindPatchedV84 = true;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -472,6 +472,17 @@ export function getRendererPatchScript(): string {
     return null;
   }
 
+  function previewMinimapOptions() {
+    return {
+      enabled: !state || state.minimapEnabled !== false,
+      // Injected preview editors do not always inherit the workbench's
+      // minimap :hover styling chain. Keep the viewport slider visible so
+      // the preview has the same scroll-position affordance as real editors.
+      showSlider: 'always',
+      autohide: false,
+    };
+  }
+
   window.__ijFindCreatePreviewEditor = function (host) {
     var m = window.__ijFindMonaco;
     if (!m || !m.ctor) { return null; }
@@ -479,7 +490,7 @@ export function getRendererPatchScript(): string {
     var options = {
       automaticLayout: true,
       readOnly: false,
-      minimap: { enabled: !state || state.minimapEnabled !== false },
+      minimap: previewMinimapOptions(),
       scrollBeyondLastLine: false,
       renderLineHighlight: 'all',
       fixedOverflowWidgets: true,
@@ -1172,15 +1183,15 @@ export function getRendererPatchScript(): string {
     '  border-color: var(--vscode-focusBorder, var(--vscode-widget-border, #555));',
     '  outline: none;',
     '}',
-    // Stronger highlight palette so it stays visible on hover & active rows.
+    // Orange highlight palette so search matches stay consistent across themes.
     '.ij-find-hl {',
-    '  background: var(--vscode-editor-findMatchHighlightBackground, rgba(247,140,0,0.55));',
+    '  background: rgba(255, 139, 26, 0.50);',
     '  color: var(--vscode-editor-findMatchHighlightForeground, var(--vscode-foreground, inherit));',
     '  border-radius: 2px;',
-    '  box-shadow: inset 0 0 0 1px var(--vscode-editor-findMatchHighlightBorder, transparent);',
+    '  box-shadow: inset 0 0 0 1px rgba(255, 166, 48, 0.72);',
     '}',
     '.ij-find-row.active .ij-find-hl {',
-    '  background: var(--vscode-editor-findMatchBackground, rgba(247,140,0,0.75));',
+    '  background: rgba(255, 125, 0, 0.76);',
     '}',
     '.ij-find-empty {',
     '  padding: 20px;',
@@ -1246,6 +1257,7 @@ export function getRendererPatchScript(): string {
     // When a stolen monaco editor is mounted in this body, keep our own
     // padding / typography rules from bleeding into it. Nothing is forced
     // on the .monaco-editor child — we size it via inline style in JS.
+    '.ij-find-preview-body.ij-find-editor-mounted,',
     '.ij-find-preview-body.ij-find-stolen {',
     '  padding: 0;',
     '  overflow: hidden;',
@@ -1253,6 +1265,7 @@ export function getRendererPatchScript(): string {
     '  font-size: unset;',
     '  line-height: unset;',
     '  color: unset;',
+    '  scrollbar-gutter: auto;',
     '}',
     '.ij-find-preview-line {',
     '  display: flex; gap: 8px; padding: 0 10px; white-space: pre;',
@@ -1285,6 +1298,35 @@ export function getRendererPatchScript(): string {
     '.ij-find-monaco-host .monaco-editor .selected-text,',
     '.ij-find-monaco-preview-host .monaco-editor .selected-text {',
     '  background-color: var(--vscode-editor-selectionBackground, rgba(38,79,120,0.75)) !important;',
+    '}',
+    // The minimap slider uses VS Code theme variables without fallbacks.
+    // Our preview editor is mounted under an injected body-level overlay,
+    // so provide scoped fallbacks and force the slider above the minimap
+    // canvases. This makes the viewport thumb visible in preview just like
+    // in normal editor groups.
+    '.ij-find-monaco-host .monaco-editor .minimap,',
+    '.ij-find-monaco-preview-host .monaco-editor .minimap {',
+    '  z-index: 20 !important;',
+    '}',
+    '.ij-find-monaco-host .monaco-editor .minimap .minimap-slider,',
+    '.ij-find-monaco-preview-host .monaco-editor .minimap .minimap-slider {',
+    '  opacity: 1 !important;',
+    '  z-index: 30 !important;',
+    '  pointer-events: auto;',
+    '}',
+    '.ij-find-monaco-host .monaco-editor .minimap-slider .minimap-slider-horizontal,',
+    '.ij-find-monaco-preview-host .monaco-editor .minimap-slider .minimap-slider-horizontal {',
+    '  background: var(--vscode-minimapSlider-background, var(--vscode-scrollbarSlider-background, rgba(121,121,121,0.45))) !important;',
+    '}',
+    '.ij-find-monaco-host .monaco-editor .minimap-slider:hover .minimap-slider-horizontal,',
+    '.ij-find-monaco-preview-host .monaco-editor .minimap-slider:hover .minimap-slider-horizontal,',
+    '.ij-find-monaco-host .monaco-editor .minimap:hover .minimap-slider-horizontal,',
+    '.ij-find-monaco-preview-host .monaco-editor .minimap:hover .minimap-slider-horizontal {',
+    '  background: var(--vscode-minimapSlider-hoverBackground, var(--vscode-scrollbarSlider-hoverBackground, rgba(100,100,100,0.75))) !important;',
+    '}',
+    '.ij-find-monaco-host .monaco-editor .minimap-slider.active .minimap-slider-horizontal,',
+    '.ij-find-monaco-preview-host .monaco-editor .minimap-slider.active .minimap-slider-horizontal {',
+    '  background: var(--vscode-minimapSlider-activeBackground, var(--vscode-scrollbarSlider-activeBackground, rgba(191,191,191,0.65))) !important;',
     '}',
     '.ij-find-modified-dot {',
     '  display: inline-block; width: 8px; height: 8px;',
@@ -1380,14 +1422,13 @@ export function getRendererPatchScript(): string {
     // Explicit highlight class for Monaco preview decorations. VSCode's
     // built-in .findMatch / .currentFindMatch classes sometimes don't
     // reach our stolen-widget preview instance (theme scoping / CSS
-    // variables not resolving the same way), so we ship our own rule
-    // with the same theme token as a fallback.
+    // variables not resolving the same way), so we ship our own orange rule.
     '.ij-find-preview-match {',
-    '  background-color: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 92, 0, 0.33)) !important;',
+    '  background-color: rgba(255, 139, 26, 0.42) !important;',
     '  box-sizing: border-box;',
     '}',
     '.ij-find-preview-match-active {',
-    '  background-color: var(--vscode-editor-findMatchBackground, rgba(234, 92, 0, 0.6)) !important;',
+    '  background-color: rgba(255, 125, 0, 0.70) !important;',
     '  box-sizing: border-box;',
     '}',
     // Force the preview editors overflow widgets (hover popup, suggest
@@ -1504,9 +1545,11 @@ export function getRendererPatchScript(): string {
     children: [$header, $toolbar, $results, $splitter, $preview, $resizer],
   });
   document.body.appendChild(panel);
+  syncPreviewOverflowTheme(panel);
 
   var $hoverTooltip = el('div', { className: 'ij-find-hover-tooltip' });
   document.body.appendChild($hoverTooltip);
+  syncPreviewOverflowTheme($hoverTooltip);
 
   // When the preview pane is resized (panel corner drag or splitter), relayout
   // any stolen Monaco editor so it re-fits the available area.
@@ -2290,7 +2333,7 @@ export function getRendererPatchScript(): string {
   function applyMinimapSetting() {
     var ed = state.previewMonacoEditor || state.monacoEditor;
     if (ed && typeof ed.updateOptions === 'function') {
-      try { ed.updateOptions({ minimap: { enabled: !!state.minimapEnabled } }); } catch (e) {}
+      try { ed.updateOptions({ minimap: previewMinimapOptions() }); } catch (e) {}
     }
     $minimapToggle.setAttribute('aria-pressed', String(!!state.minimapEnabled));
   }
@@ -3402,7 +3445,7 @@ export function getRendererPatchScript(): string {
       editor = api.editor.create(host, {
         automaticLayout: true,
         readOnly: false,
-        minimap: { enabled: !state || state.minimapEnabled !== false },
+        minimap: previewMinimapOptions(),
         scrollBeyondLastLine: false,
         lineNumbers: 'on',
         glyphMargin: false,
@@ -3963,6 +4006,8 @@ export function getRendererPatchScript(): string {
       panel.style.setProperty('pointer-events', 'auto', 'important');
       panel.style.setProperty('z-index', '2147483000', 'important');
       panel.style.setProperty('position', 'fixed', 'important');
+      syncPreviewOverflowTheme(panel);
+      syncPreviewOverflowTheme($hoverTooltip);
       if (document.body.lastElementChild !== panel && document.body.lastElementChild !== $hoverTooltip) {
         document.body.appendChild(panel);
         document.body.appendChild($hoverTooltip);

@@ -548,6 +548,29 @@ export class OverlayPanel {
         } catch {}
       }));
     };
+    const refreshCaptureAll = async () => {
+      // A previous diagnostic may have stopped the prototype hooks after a
+      // successful capture attempt. Re-arm them before DOM scan / force-open,
+      // otherwise opening a real editor produces no fresh captures.
+      const captureReason = JSON.stringify(`diagnostic:${reason}`);
+      const refreshExpr = `(function(){
+        try {
+          if (window.__ijFindRefreshCapture) { return window.__ijFindRefreshCapture(${captureReason}); }
+          if (window.__ijFindStartCapture) { return window.__ijFindStartCapture(${captureReason}); }
+          return 'no-capture-fn';
+        } catch(e){ return 'refresh-err:' + (e && e.message); }
+      })()`;
+      const summaries: string[] = [];
+      await Promise.all(windowIds.map(async (id) => {
+        try {
+          const r = await this.evalInWindow(id, refreshExpr);
+          summaries.push(`win=${id} ${r}`);
+        } catch (err) {
+          summaries.push(`win=${id} err:${err instanceof Error ? err.message : err}`);
+        }
+      }));
+      this.log.appendLine(`Capture refresh: ${summaries.join(' | ')}`);
+    };
     const runWidgetCreateTest = async (winId: number, label: string): Promise<boolean> => {
       const testExpr = `(function(){ try { return window.__ijFindTestCreateWidget ? window.__ijFindTestCreateWidget() : 'no-test-fn'; } catch(e){ return 'test-throw:' + (e && e.message); } })()`;
       try {
@@ -588,6 +611,7 @@ export class OverlayPanel {
           `(widgets=${existingCapture.widgets} services=${existingCapture.services} ctors=${existingCapture.ctors}) — refreshing before testing.`,
         );
       }
+      await refreshCaptureAll();
       // Boot-time captures are almost always DI stubs (getModel()=null).
       // Clear them everywhere and force a real editor creation so fresh
       // Map/Array/Set writes land in a clean capture buffer.
