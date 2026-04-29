@@ -4,8 +4,8 @@ use crate::mmap_store::StoreLayout;
 use crate::overlay::{apply_change_batch, compaction_reason, load_overlay_with_recovery};
 use crate::planner::{build_query_plan, QueryPlan};
 use crate::protocol::{
-    BenchmarkCase, BenchmarkResponse, DiagnoseResponse, EngineInfo, GramDiagnostic, InfoResponse, RuntimeStats,
-    SearchRequest, ShardDiagnostic,
+    BenchmarkCase, BenchmarkResponse, DiagnoseResponse, EngineInfo, GramDiagnostic, InfoResponse,
+    RuntimeStats, SearchRequest, ShardDiagnostic,
 };
 use crate::searcher::search_workspace;
 use crate::shard::{ShardDocument, ShardReader};
@@ -49,7 +49,9 @@ pub fn collect_info(workspace_root: &Path, config: &EngineConfig) -> io::Result<
             .file_name()
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| shard_path.to_string_lossy().into_owned());
-        let file_bytes = fs::metadata(&shard_path).map(|metadata| metadata.len()).unwrap_or(0);
+        let file_bytes = fs::metadata(&shard_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         match ShardReader::open(&shard_path) {
             Ok(reader) => {
                 let docs = reader.documents()?;
@@ -108,7 +110,10 @@ pub fn collect_info(workspace_root: &Path, config: &EngineConfig) -> io::Result<
     })
 }
 
-pub fn diagnose_query(request: &SearchRequest, config: &EngineConfig) -> Result<DiagnoseResponse, String> {
+pub fn diagnose_query(
+    request: &SearchRequest,
+    config: &EngineConfig,
+) -> Result<DiagnoseResponse, String> {
     let workspace_root = Path::new(&request.workspace_root);
     let layout = StoreLayout::for_workspace(workspace_root, config);
     layout.ensure_dirs().map_err(|err| err.to_string())?;
@@ -119,7 +124,10 @@ pub fn diagnose_query(request: &SearchRequest, config: &EngineConfig) -> Result<
 
     let overlay = load_overlay_with_recovery(&layout).map_err(|err| err.to_string())?;
     let latest_overlay = overlay.manifest.latest_entries();
-    let overlay_live_entries = latest_overlay.values().filter(|entry| !entry.tombstone).count();
+    let overlay_live_entries = latest_overlay
+        .values()
+        .filter(|entry| !entry.tombstone)
+        .count();
     let mut warnings = overlay.warnings;
     if !cleaned_temp_files.is_empty() {
         warnings.push(format!(
@@ -224,7 +232,10 @@ pub fn diagnose_query(request: &SearchRequest, config: &EngineConfig) -> Result<
     })
 }
 
-pub fn benchmark_workspaces(file_counts: &[usize], config: &EngineConfig) -> Result<BenchmarkResponse, String> {
+pub fn benchmark_workspaces(
+    file_counts: &[usize],
+    config: &EngineConfig,
+) -> Result<BenchmarkResponse, String> {
     let mut warnings = Vec::new();
     let mut cases = Vec::new();
     for &file_count in file_counts {
@@ -244,8 +255,14 @@ pub fn benchmark_workspaces(file_counts: &[usize], config: &EngineConfig) -> Res
         for rel_path in benchmark_update_paths(file_count) {
             let abs_path = root.join(&rel_path);
             let content = fs::read_to_string(&abs_path).map_err(|err| err.to_string())?;
-            fs::write(&abs_path, format!("{content}\nUPDATED_MARKER = \"{}\"\n", rel_path.replace('/', "_")))
-                .map_err(|err| err.to_string())?;
+            fs::write(
+                &abs_path,
+                format!(
+                    "{content}\nUPDATED_MARKER = \"{}\"\n",
+                    rel_path.replace('/', "_")
+                ),
+            )
+            .map_err(|err| err.to_string())?;
             let current_generation = load_overlay_with_recovery(&layout)
                 .map_err(|err| err.to_string())?
                 .manifest
@@ -335,7 +352,9 @@ fn docs_for_ids<'a>(docs: &'a [ShardDocument], ids: &BTreeSet<u32>) -> Vec<&'a S
     if ids.is_empty() {
         return Vec::new();
     }
-    ids.iter().filter_map(|doc_id| docs.get(*doc_id as usize)).collect()
+    ids.iter()
+        .filter_map(|doc_id| docs.get(*doc_id as usize))
+        .collect()
 }
 
 fn overlay_matches_plan(entry: &crate::overlay::OverlayEntry, plan: &QueryPlan) -> bool {
@@ -345,7 +364,12 @@ fn overlay_matches_plan(entry: &crate::overlay::OverlayEntry, plan: &QueryPlan) 
     let grams = entry
         .grams
         .iter()
-        .map(|value| value.chars().flat_map(char::to_lowercase).collect::<String>())
+        .map(|value| {
+            value
+                .chars()
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
         .collect::<BTreeSet<_>>();
     plan.required_grams.iter().all(|gram| grams.contains(gram))
 }
@@ -560,7 +584,8 @@ mod tests {
 
     #[test]
     fn benchmark_runs_small_synthetic_workspace() -> io::Result<()> {
-        let response = benchmark_workspaces(&[20], &EngineConfig::default()).map_err(io::Error::other)?;
+        let response =
+            benchmark_workspaces(&[20], &EngineConfig::default()).map_err(io::Error::other)?;
         assert!(response.ok);
         assert_eq!(response.cases.len(), 1);
         assert_eq!(response.cases[0].file_count, 20);

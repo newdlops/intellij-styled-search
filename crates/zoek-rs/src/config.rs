@@ -99,13 +99,23 @@ impl EngineConfig {
         self.excluded_dir_names.iter().any(|entry| entry == name)
     }
 
+    pub fn is_overlay_update_excluded_relative_path(&self, rel_path: &str) -> bool {
+        rel_path
+            .replace('\\', "/")
+            .split('/')
+            .any(|segment| segment == ".zoek-rs" || segment == ".zoekt-rs" || segment == "target")
+    }
+
     pub fn is_binary_extension(&self, path: &Path) -> bool {
         let ext = path
             .extension()
             .and_then(|value| value.to_str())
             .map(|value| format!(".{}", value.to_ascii_lowercase()));
         match ext {
-            Some(ext) => self.binary_file_extensions.iter().any(|entry| entry == &ext),
+            Some(ext) => self
+                .binary_file_extensions
+                .iter()
+                .any(|entry| entry == &ext),
             None => false,
         }
     }

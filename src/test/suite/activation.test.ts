@@ -270,7 +270,7 @@ suite('Activation', () => {
     });
   });
 
-  test('getRelativePath ignores internal zoekt index directories', async () => {
+  test('getRelativePath ignores zoekt internals and target but keeps git and node_modules', async () => {
     const { overlay } = await getApi();
     const runtime = (overlay as any).zoektRuntime as any;
     const workspaceRoot = runtime.getWorkspaceRootPath();
@@ -289,9 +289,148 @@ suite('Activation', () => {
       null,
     );
     assert.strictEqual(
+      runtime.getRelativePath(vscode.Uri.file(path.join(workspaceRoot, '.git', 'HEAD'))),
+      '.git/HEAD',
+    );
+    assert.strictEqual(
+      runtime.getRelativePath(vscode.Uri.file(path.join(workspaceRoot, 'target', 'debug', 'build.log'))),
+      null,
+    );
+    assert.strictEqual(
+      runtime.getRelativePath(vscode.Uri.file(path.join(workspaceRoot, 'node_modules', 'pkg', 'index.js'))),
+      'node_modules/pkg/index.js',
+    );
+    assert.strictEqual(
       runtime.getRelativePath(vscode.Uri.file(path.join(workspaceRoot, 'nested', '.zoek-rs', 'hot-overlay.json'))),
       null,
     );
+  });
+
+  test('pending zoekt updates wait for an in-flight base refresh', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+
+    const originalResolveBinary = runtime.resolveBinary.bind(runtime);
+    const originalHasReadyIndex = runtime.hasReadyIndex.bind(runtime);
+    const originalScheduleFlush = runtime.scheduleFlush.bind(runtime);
+    const pending = new Promise<boolean>(() => {});
+    let retryDelay: number | undefined;
+
+    runtime.pendingChanged.add('docs.md');
+    runtime.indexPromises.set(workspaceRoot, pending);
+    runtime.resolveBinary = async () => '/tmp/zoek-rs';
+    runtime.hasReadyIndex = async () => true;
+    runtime.scheduleFlush = (delay?: number) => {
+      retryDelay = delay;
+    };
+
+    try {
+      await runtime.flushPendingUpdates();
+      assert.strictEqual(runtime.pendingChanged.has('docs.md'), true);
+      assert.strictEqual(retryDelay, 1000);
+    } finally {
+      runtime.pendingChanged.clear();
+      runtime.indexPromises.delete(workspaceRoot);
+      runtime.resolveBinary = originalResolveBinary;
+      runtime.hasReadyIndex = originalHasReadyIndex;
+      runtime.scheduleFlush = originalScheduleFlush;
+    }
+  });
+
+  test('rename crossing ignored zoekt dirs queues only the indexed side', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+
+    const originalScheduleFlush = runtime.scheduleFlush.bind(runtime);
+    let flushes = 0;
+    runtime.scheduleFlush = () => { flushes++; };
+
+    try {
+      runtime.queueRename(
+        vscode.Uri.file(path.join(workspaceRoot, 'alpha.py')),
+        vscode.Uri.file(path.join(workspaceRoot, 'target', 'alpha.py')),
+      );
+      assert.strictEqual(runtime.pendingDeleted.has('alpha.py'), true);
+      assert.strictEqual(runtime.pendingChanged.size, 0);
+
+      runtime.pendingDeleted.clear();
+      runtime.queueRename(
+        vscode.Uri.file(path.join(workspaceRoot, 'target', 'docs.md')),
+        vscode.Uri.file(path.join(workspaceRoot, 'docs.md')),
+      );
+      assert.strictEqual(runtime.pendingChanged.has('docs.md'), true);
+      assert.strictEqual(runtime.pendingDeleted.size, 0);
+      assert.strictEqual(flushes, 2);
+    } finally {
+      runtime.pendingChanged.clear();
+      runtime.pendingDeleted.clear();
+      runtime.scheduleFlush = originalScheduleFlush;
+    }
+  });
+
+  test('large overlay update starts a background base refresh', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+
+    const originalResolveBinary = runtime.resolveBinary.bind(runtime);
+    const originalHasReadyIndex = runtime.hasReadyIndex.bind(runtime);
+    const originalInvokeJson = runtime.invokeJson.bind(runtime);
+    const invoked: string[][] = [];
+
+    runtime.pendingChanged.add('docs.md');
+    runtime.lastAutoBaseRefreshAt.delete(workspaceRoot);
+    runtime.resolveBinary = async () => '/tmp/zoek-rs';
+    runtime.hasReadyIndex = async () => true;
+    runtime.invokeJson = async (args: string[]) => {
+      invoked.push(args);
+      if (args[1] === 'update') {
+        return {
+          type: 'update',
+          ok: true,
+          generation: 8,
+          entriesWritten: 600,
+          liveEntries: 590,
+          tombstones: 10,
+          overlayTotalEntries: 600,
+          latestVisibleEntries: 600,
+          journalBytes: 1024,
+          compactionSuggested: true,
+          warnings: [],
+        };
+      }
+      if (args[1] === 'compact') {
+        return {
+          type: 'index',
+          ok: true,
+          stats: { indexedFiles: 10, shardCount: 1, totalGrams: 20 },
+          warnings: [],
+        };
+      }
+      throw new Error(`unexpected args: ${args.join(' ')}`);
+    };
+
+    try {
+      await runtime.flushPendingUpdates();
+      assert.deepStrictEqual(invoked[0], ['/tmp/zoek-rs', 'update', workspaceRoot, 'docs.md']);
+      assert.deepStrictEqual(invoked[1], ['/tmp/zoek-rs', 'compact', workspaceRoot]);
+      const refresh = runtime.indexPromises.get(workspaceRoot);
+      if (refresh) {
+        await refresh;
+      }
+    } finally {
+      runtime.pendingChanged.clear();
+      runtime.indexPromises.delete(workspaceRoot);
+      runtime.lastAutoBaseRefreshAt.delete(workspaceRoot);
+      runtime.resolveBinary = originalResolveBinary;
+      runtime.hasReadyIndex = originalHasReadyIndex;
+      runtime.invokeJson = originalInvokeJson;
+    }
   });
 
   test('zoekt searches skip trigram candidate planning', async () => {

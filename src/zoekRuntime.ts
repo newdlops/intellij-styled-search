@@ -44,10 +44,16 @@ type PaginatedSearchResult = {
 };
 
 const UPDATE_DEBOUNCE_MS = 250;
+const UPDATE_RETRY_WHILE_INDEXING_MS = 1_000;
+const AUTO_BASE_REFRESH_MIN_INTERVAL_MS = 60_000;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
 const ZOEKT_PROGRESS_PREFIX = '__ZOEK_PROGRESS__';
 const ZOEKT_SCHEMA_VERSION = 2;
-const ZOEKT_INTERNAL_DIR_NAMES = new Set(['.zoek-rs', '.zoekt-rs']);
+const ZOEKT_UPDATE_IGNORED_DIR_NAMES = new Set([
+  '.zoek-rs',
+  '.zoekt-rs',
+  'target',
+]);
 
 class ProcessCancelledError extends Error {
   constructor(message: string) {
@@ -115,6 +121,7 @@ export class ZoektRuntime implements vscode.Disposable {
   private pendingDeleted = new Set<string>();
   private pendingRenames: QueuedRename[] = [];
   private readonly activeChildren = new Map<number, TrackedChild>();
+  private readonly lastAutoBaseRefreshAt = new Map<string, number>();
   private nextChildId = 1;
   private disposed = false;
   private externalSweepPromise: Promise<void> | undefined;
@@ -506,7 +513,7 @@ export class ZoektRuntime implements vscode.Disposable {
     if (!normalized || normalized === '.') {
       return true;
     }
-    return normalized.split('/').some((segment) => ZOEKT_INTERNAL_DIR_NAMES.has(segment));
+    return normalized.split('/').some((segment) => ZOEKT_UPDATE_IGNORED_DIR_NAMES.has(segment));
   }
 
   private getRelativePath(uri: vscode.Uri): string | null {
@@ -547,7 +554,20 @@ export class ZoektRuntime implements vscode.Disposable {
     if (this.disposed) { return; }
     const oldRelPath = this.getRelativePath(oldUri);
     const newRelPath = this.getRelativePath(newUri);
-    if (!oldRelPath || !newRelPath) { return; }
+    if (!oldRelPath && !newRelPath) { return; }
+    if (!oldRelPath) {
+      if (!newRelPath) { return; }
+      this.pendingDeleted.delete(newRelPath);
+      this.pendingChanged.add(newRelPath);
+      this.scheduleFlush();
+      return;
+    }
+    if (!newRelPath) {
+      this.pendingChanged.delete(oldRelPath);
+      this.pendingDeleted.add(oldRelPath);
+      this.scheduleFlush();
+      return;
+    }
     this.pendingChanged.delete(oldRelPath);
     this.pendingChanged.delete(newRelPath);
     this.pendingDeleted.delete(oldRelPath);
@@ -556,7 +576,7 @@ export class ZoektRuntime implements vscode.Disposable {
     this.scheduleFlush();
   }
 
-  private scheduleFlush(): void {
+  private scheduleFlush(delayMs = UPDATE_DEBOUNCE_MS): void {
     if (this.disposed) { return; }
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
@@ -564,7 +584,7 @@ export class ZoektRuntime implements vscode.Disposable {
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
       void this.flushPendingUpdates();
-    }, UPDATE_DEBOUNCE_MS);
+    }, delayMs);
   }
 
   private async flushPendingUpdates(): Promise<void> {
@@ -589,13 +609,19 @@ export class ZoektRuntime implements vscode.Disposable {
       return;
     }
     const binary = await this.resolveBinary(false);
-    if (
-      !binary ||
-      !await this.hasReadyIndex(workspaceRoot) ||
-      this.indexPromises.has(workspaceRoot) ||
-      this.foregroundIndexPromises.has(workspaceRoot)
-    ) {
+    if (!binary) {
       this.clearPending();
+      return;
+    }
+    const indexBusy = this.indexPromises.has(workspaceRoot) || this.foregroundIndexPromises.has(workspaceRoot);
+    const ready = !indexBusy && await this.hasReadyIndex(workspaceRoot);
+    if (indexBusy || !ready) {
+      if (!indexBusy) {
+        void this.ensureIndexed(workspaceRoot, 'file changes').catch((err) => {
+          this.log.appendLine(`zoek-rs background index failed: ${err instanceof Error ? err.message : err}`);
+        });
+      }
+      this.scheduleFlush(UPDATE_RETRY_WHILE_INDEXING_MS);
       return;
     }
 
@@ -623,6 +649,7 @@ export class ZoektRuntime implements vscode.Disposable {
           return;
         }
         this.logUpdateWarnings(response);
+        this.maybeStartBaseRefresh(workspaceRoot, binary, response);
       })
       .catch((err) => {
         if (err instanceof ProcessCancelledError) { return; }
@@ -643,6 +670,58 @@ export class ZoektRuntime implements vscode.Disposable {
     this.pendingChanged.clear();
     this.pendingDeleted.clear();
     this.pendingRenames = [];
+  }
+
+  private maybeStartBaseRefresh(
+    workspaceRoot: string,
+    binary: string,
+    update: ZoektUpdateResponse,
+  ): void {
+    if (!update.compactionSuggested || this.disposed) { return; }
+    if (this.indexPromises.has(workspaceRoot) || this.foregroundIndexPromises.has(workspaceRoot)) {
+      return;
+    }
+    const now = Date.now();
+    const lastRefresh = this.lastAutoBaseRefreshAt.get(workspaceRoot) ?? 0;
+    if (now - lastRefresh < AUTO_BASE_REFRESH_MIN_INTERVAL_MS) {
+      this.log.appendLine(
+        `zoek-rs base refresh skipped: overlay still large but a refresh was started recently (latest=${update.latestVisibleEntries})`,
+      );
+      return;
+    }
+    this.lastAutoBaseRefreshAt.set(workspaceRoot, now);
+    const promise = (async () => {
+      this.log.appendLine(
+        `zoek-rs background base refresh start: overlay latest=${update.latestVisibleEntries} total=${update.overlayTotalEntries}`,
+      );
+      this.emitIndexProgress(workspaceRoot, 'zoek-rs: refreshing search index');
+      try {
+        const response = await this.invokeJson([binary, 'compact', workspaceRoot], this.lifecycleCts.token, {
+          onStderrLine: (line) => this.handleIndexProgressLine(
+            line,
+            (message, percent) => this.emitIndexProgress(workspaceRoot, message, percent),
+          ),
+        });
+        if (response.type !== 'index' || !response.ok) {
+          this.log.appendLine(this.describeEngineFailure(response, 'zoek-rs base refresh failed'));
+          return false;
+        }
+        this.logIndexWarnings(response);
+        this.log.appendLine(
+          `zoek-rs background base refresh ready: files=${response.stats.indexedFiles} shards=${response.stats.shardCount}`,
+        );
+        this.emitIndexProgress(workspaceRoot, 'zoek-rs: index ready', 100);
+        return true;
+      } catch (err) {
+        if (err instanceof ProcessCancelledError) { return false; }
+        this.log.appendLine(`zoek-rs base refresh failed: ${err instanceof Error ? err.message : err}`);
+        return false;
+      } finally {
+        this.indexPromises.delete(workspaceRoot);
+        this.indexProgressState.delete(workspaceRoot);
+      }
+    })();
+    this.indexPromises.set(workspaceRoot, promise);
   }
 
   private async ensureIndexed(workspaceRoot: string, reason: string): Promise<boolean> {
@@ -1021,6 +1100,7 @@ export class ZoektRuntime implements vscode.Disposable {
     switch (rest[0]) {
       case 'search': return 'search';
       case 'index': return 'index';
+      case 'compact': return 'index';
       case 'update': return 'update';
       case 'info': return 'info';
       case 'diagnose': return 'diagnose';

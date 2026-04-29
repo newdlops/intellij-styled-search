@@ -37,14 +37,17 @@ pub fn search_workspace(
         Err(err) => warnings.push(format!("temp-file cleanup failed: {err}")),
     }
 
-    let candidates = match collect_index_candidates(workspace_root, &layout, &plan, config, &mut warnings) {
-        Ok(Some(candidates)) => candidates,
-        Ok(None) => fallback_candidates(workspace_root, request, &mut warnings).map_err(|err| err.to_string())?,
-        Err(err) => {
-            warnings.push(format!("index query fallback: {err}"));
-            fallback_candidates(workspace_root, request, &mut warnings).map_err(|fallback| fallback.to_string())?
-        }
-    };
+    let candidates =
+        match collect_index_candidates(workspace_root, &layout, &plan, config, &mut warnings) {
+            Ok(Some(candidates)) => candidates,
+            Ok(None) => fallback_candidates(workspace_root, request, &mut warnings)
+                .map_err(|err| err.to_string())?,
+            Err(err) => {
+                warnings.push(format!("index query fallback: {err}"));
+                fallback_candidates(workspace_root, request, &mut warnings)
+                    .map_err(|fallback| fallback.to_string())?
+            }
+        };
 
     let mut verified_files = Vec::new();
     let mut total_files_scanned = 0usize;
@@ -61,7 +64,9 @@ pub fn search_workspace(
             break;
         }
         total_files_scanned += 1;
-        let Some(current) = load_current_text(&candidate.absolute_path, config).map_err(|err| err.to_string())? else {
+        let Some(current) =
+            load_current_text(&candidate.absolute_path, config).map_err(|err| err.to_string())?
+        else {
             continue;
         };
         let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
@@ -96,7 +101,12 @@ pub fn search_workspace(
         ));
     }
 
-    verified_files.sort_by(|left, right| right.score.cmp(&left.score).then_with(|| left.rel_path.cmp(&right.rel_path)));
+    verified_files.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.rel_path.cmp(&right.rel_path))
+    });
     let total_files_matched = verified_files.len();
     let files = page_files_by_match_offset(&verified_files, request.offset, request.limit);
     let paged_matches = files.iter().map(|file| file.matches.len()).sum::<usize>();
@@ -105,7 +115,11 @@ pub fn search_workspace(
     Ok(SearchResponse {
         ok: true,
         engine: crate::protocol::EngineInfo::current(),
-        query_mode: if request.use_regex { "regex".to_string() } else { "literal".to_string() },
+        query_mode: if request.use_regex {
+            "regex".to_string()
+        } else {
+            "literal".to_string()
+        },
         total_files_scanned,
         total_files_matched,
         total_matches,
@@ -229,7 +243,10 @@ fn candidate_doc_ids(
 ) -> Result<BTreeSet<u32>, std::io::Error> {
     let docs = reader.documents()?;
     if plan.required_grams.is_empty() {
-        return Ok(docs.into_iter().map(|doc| doc.doc_id).collect::<BTreeSet<_>>());
+        return Ok(docs
+            .into_iter()
+            .map(|doc| doc.doc_id)
+            .collect::<BTreeSet<_>>());
     }
 
     // Any doc whose posting set was truncated at index time (indexer's
@@ -288,7 +305,12 @@ fn overlay_matches_plan(
     let grams = entry
         .grams
         .iter()
-        .map(|value| value.chars().flat_map(char::to_lowercase).collect::<String>())
+        .map(|value| {
+            value
+                .chars()
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
         .collect::<BTreeSet<_>>();
     let _ = config;
     plan.required_grams.iter().all(|gram| grams.contains(gram))
@@ -674,7 +696,10 @@ mod tests {
     fn substring_literal_queries_narrow_candidates_for_unicode_tokens() -> io::Result<()> {
         let root = temp_dir("unicode-substring");
         fs::create_dir_all(root.join("src"))?;
-        fs::write(root.join("src/a.rs"), "const VALUE: &str = \"한글검색지원\";\n")?;
+        fs::write(
+            root.join("src/a.rs"),
+            "const VALUE: &str = \"한글검색지원\";\n",
+        )?;
         for idx in 0..32 {
             fs::write(
                 root.join("src").join(format!("noise-{idx}.rs")),

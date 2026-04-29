@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use zoek_rs::config::EngineConfig;
 use zoek_rs::indexer::index_directory_with_progress;
-use zoek_rs::protocol::{EngineInfo, EngineResponse, ErrorResponse, IndexRequest, IndexResponse, IndexStats};
+use zoek_rs::protocol::{
+    EngineInfo, EngineResponse, ErrorResponse, IndexRequest, IndexResponse, IndexStats,
+};
 
 fn main() {
     let response = match run(env::args().skip(1).collect()) {
@@ -30,7 +32,9 @@ fn run(args: Vec<String>) -> Result<EngineResponse, String> {
     while idx < args.len() {
         match args[idx].as_str() {
             "--out" => {
-                let value = args.get(idx + 1).ok_or_else(|| "--out requires a path".to_string())?;
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--out requires a path".to_string())?;
                 request.index_dir = Some(value.clone());
                 config.index_dir_name = value.clone();
                 idx += 2;

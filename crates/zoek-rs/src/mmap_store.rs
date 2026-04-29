@@ -201,7 +201,16 @@ impl UnixMappedFile {
 
         const PROT_READ: c_int = 0x1;
         const MAP_PRIVATE: c_int = 0x0002;
-        let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
+        let ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ,
+                MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
         if ptr as isize == -1 {
             return Err(io::Error::last_os_error());
         }

@@ -279,9 +279,7 @@ impl RuntimeStats {
     pub fn to_json(&self) -> String {
         format!(
             "{{\"peakRssBytes\":{},\"minorPageFaults\":{},\"majorPageFaults\":{}}}",
-            self.peak_rss_bytes,
-            self.minor_page_faults,
-            self.major_page_faults
+            self.peak_rss_bytes, self.minor_page_faults, self.major_page_faults
         )
     }
 }
@@ -430,7 +428,11 @@ impl BenchmarkResponse {
             self.ok,
             self.engine.to_json(),
             json_string_vec(&self.warnings),
-            self.cases.iter().map(BenchmarkCase::to_json).collect::<Vec<_>>().join(",")
+            self.cases
+                .iter()
+                .map(BenchmarkCase::to_json)
+                .collect::<Vec<_>>()
+                .join(",")
         )
     }
 }
@@ -477,7 +479,11 @@ impl ErrorResponse {
 }
 
 fn json_string_vec(values: &[String]) -> String {
-    values.iter().map(|value| json_string(value)).collect::<Vec<_>>().join(",")
+    values
+        .iter()
+        .map(|value| json_string(value))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn json_string(value: &str) -> String {

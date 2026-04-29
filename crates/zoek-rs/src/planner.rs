@@ -61,9 +61,7 @@ pub fn build_query_plan(request: &SearchRequest) -> QueryPlan {
             // those files in the candidate set unconditionally), we can safely
             // use a bounded selective gram set for multiline literals too.
             required_grams.extend(selective_grams_for_query_literal(
-                literal,
-                max_tokens,
-                max_grams,
+                literal, max_tokens, max_grams,
             ));
         }
     } else {
@@ -124,6 +122,9 @@ mod tests {
             offset: 0,
         });
         assert!(!plan.required_grams.is_empty());
-        assert!(plan.required_grams.iter().any(|gram| gram == "righ" || gram == "inve"));
+        assert!(plan
+            .required_grams
+            .iter()
+            .any(|gram| gram == "righ" || gram == "inve"));
     }
 }

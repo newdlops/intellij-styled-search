@@ -47,7 +47,15 @@ pub fn discover_text_files(
     let mut entries = Vec::new();
     let mut stats = CorpusStats::default();
     let mut noop = |_progress: CorpusProgress| {};
-    walk_dir(workspace_root, workspace_root, config, 0, &mut entries, &mut stats, &mut noop)?;
+    walk_dir(
+        workspace_root,
+        workspace_root,
+        config,
+        0,
+        &mut entries,
+        &mut stats,
+        &mut noop,
+    )?;
     entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
     Ok((entries, stats))
 }
@@ -166,11 +174,7 @@ fn walk_dir(
     Ok(())
 }
 
-fn count_files_dir(
-    dir: &Path,
-    workspace_root: &Path,
-    config: &EngineConfig,
-) -> io::Result<usize> {
+fn count_files_dir(dir: &Path, workspace_root: &Path, config: &EngineConfig) -> io::Result<usize> {
     let mut total = 0usize;
     for item in fs::read_dir(dir)? {
         let item = item?;
@@ -225,7 +229,10 @@ pub fn decode_bytes(bytes: &[u8]) -> (String, TextEncoding) {
         return (decode_utf16_units(&bytes[2..], true), TextEncoding::Utf16Le);
     }
     if bytes.starts_with(&[0xfe, 0xff]) {
-        return (decode_utf16_units(&bytes[2..], false), TextEncoding::Utf16Be);
+        return (
+            decode_utf16_units(&bytes[2..], false),
+            TextEncoding::Utf16Be,
+        );
     }
     match String::from_utf8(bytes.to_vec()) {
         Ok(text) => (text, TextEncoding::Utf8),
@@ -276,7 +283,9 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(stats.skipped_binary_extension, 1);
         assert_eq!(stats.decoded_utf16_files, 1);
-        assert!(entries.iter().any(|entry| entry.encoding == TextEncoding::Utf16Le && entry.text == "hi!"));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.encoding == TextEncoding::Utf16Le && entry.text == "hi!"));
 
         fs::remove_dir_all(root)?;
         Ok(())
@@ -288,8 +297,14 @@ mod tests {
         fs::create_dir_all(root.join(".zoek-rs"))?;
         fs::create_dir_all(root.join(".zoekt-rs"))?;
         fs::write(root.join("plain.rs"), "struct AlphaService;\n")?;
-        fs::write(root.join(".zoek-rs/overlay-journal.jsonl"), "{\"generation\":1}\n")?;
-        fs::write(root.join(".zoekt-rs/stale-overlay.txt"), "stale index data\n")?;
+        fs::write(
+            root.join(".zoek-rs/overlay-journal.jsonl"),
+            "{\"generation\":1}\n",
+        )?;
+        fs::write(
+            root.join(".zoekt-rs/stale-overlay.txt"),
+            "stale index data\n",
+        )?;
 
         let (entries, stats) = discover_text_files(&root, &EngineConfig::default())?;
         assert_eq!(entries.len(), 1);

@@ -7,8 +7,8 @@ use zoek_rs::mmap_store::StoreLayout;
 use zoek_rs::ops::{benchmark_workspaces, collect_info, diagnose_query};
 use zoek_rs::overlay::{apply_change_batch, load_overlay_with_recovery};
 use zoek_rs::protocol::{
-    BenchmarkResponse, DiagnoseResponse, EngineInfo, EngineResponse, ErrorResponse, IndexRequest, IndexResponse,
-    IndexStats, InfoResponse, OverlayUpdateResponse, SearchRequest,
+    BenchmarkResponse, DiagnoseResponse, EngineInfo, EngineResponse, ErrorResponse, IndexRequest,
+    IndexResponse, IndexStats, InfoResponse, OverlayUpdateResponse, SearchRequest,
 };
 use zoek_rs::searcher::search_workspace;
 use zoek_rs::watcher::build_change_batch;
@@ -54,7 +54,9 @@ fn run_index(args: &[String]) -> Result<EngineResponse, String> {
     while idx < args.len() {
         match args[idx].as_str() {
             "--out" => {
-                let value = args.get(idx + 1).ok_or_else(|| "--out requires a path".to_string())?;
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--out requires a path".to_string())?;
                 request.index_dir = Some(value.clone());
                 config.index_dir_name = value.clone();
                 idx += 2;
@@ -141,13 +143,19 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
     while idx < args.len() {
         match args[idx].as_str() {
             "--delete" => {
-                let value = args.get(idx + 1).ok_or_else(|| "--delete requires a path".to_string())?;
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--delete requires a path".to_string())?;
                 deleted_paths.push(value.clone());
                 idx += 2;
             }
             "--rename" => {
-                let old_path = args.get(idx + 1).ok_or_else(|| "--rename requires old and new paths".to_string())?;
-                let new_path = args.get(idx + 2).ok_or_else(|| "--rename requires old and new paths".to_string())?;
+                let old_path = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--rename requires old and new paths".to_string())?;
+                let new_path = args
+                    .get(idx + 2)
+                    .ok_or_else(|| "--rename requires old and new paths".to_string())?;
                 renamed_paths.push((old_path.clone(), new_path.clone()));
                 idx += 3;
             }
@@ -158,8 +166,14 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
         }
     }
 
-    let batch = build_change_batch(current_generation, &changed_paths, &deleted_paths, &renamed_paths);
-    let summary = apply_change_batch(&workspace_root, &layout, &config, &batch).map_err(|err| err.to_string())?;
+    let batch = build_change_batch(
+        current_generation,
+        &changed_paths,
+        &deleted_paths,
+        &renamed_paths,
+    );
+    let summary = apply_change_batch(&workspace_root, &layout, &config, &batch)
+        .map_err(|err| err.to_string())?;
     let mut warnings = Vec::new();
     if let Some(reason) = summary.compaction_trigger_reason.clone() {
         if summary.compaction_performed {
@@ -220,7 +234,9 @@ fn run_search(args: &[String]) -> Result<EngineResponse, String> {
                 idx += 1;
             }
             "--include" => {
-                let value = args.get(idx + 1).ok_or_else(|| "--include requires a value".to_string())?;
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--include requires a value".to_string())?;
                 request.include.push(value.clone());
                 idx += 2;
             }
@@ -252,7 +268,8 @@ fn run_search(args: &[String]) -> Result<EngineResponse, String> {
 
 fn run_info(args: &[String]) -> Result<EngineResponse, String> {
     let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
-    let response: InfoResponse = collect_info(&workspace_root, &EngineConfig::default()).map_err(|err| err.to_string())?;
+    let response: InfoResponse =
+        collect_info(&workspace_root, &EngineConfig::default()).map_err(|err| err.to_string())?;
     Ok(EngineResponse::Info(response))
 }
 
@@ -291,7 +308,9 @@ fn run_diagnose(args: &[String]) -> Result<EngineResponse, String> {
                 idx += 1;
             }
             "--include" => {
-                let value = args.get(idx + 1).ok_or_else(|| "--include requires a value".to_string())?;
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--include requires a value".to_string())?;
                 request.include.push(value.clone());
                 idx += 2;
             }
@@ -309,10 +328,16 @@ fn run_benchmark(args: &[String]) -> Result<EngineResponse, String> {
     while idx < args.len() {
         match args[idx].as_str() {
             "--files" => {
-                let value = args.get(idx + 1).ok_or_else(|| "--files requires a comma-separated list".to_string())?;
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--files requires a comma-separated list".to_string())?;
                 file_counts = value
                     .split(',')
-                    .map(|item| item.trim().parse::<usize>().map_err(|_| format!("invalid file count: {item}")))
+                    .map(|item| {
+                        item.trim()
+                            .parse::<usize>()
+                            .map_err(|_| format!("invalid file count: {item}"))
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 idx += 2;
             }

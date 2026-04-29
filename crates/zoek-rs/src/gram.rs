@@ -57,6 +57,32 @@ pub fn extract_dynamic_grams_with_overflow(
     (out, overflow)
 }
 
+pub fn extract_dynamic_gram_values_with_overflow(
+    rel_path: &str,
+    text: &str,
+    max_grams: usize,
+) -> (Vec<String>, bool) {
+    let capacity = max_grams.saturating_mul(2).clamp(16, 16_384);
+    let mut seen = HashSet::with_capacity(capacity);
+    let mut out = Vec::with_capacity(max_grams.min(8192));
+
+    for component in rel_path.split('/') {
+        let normalized = normalize_token(component);
+        if append_gram_values_for_token(&normalized, &mut seen, &mut out, max_grams) {
+            return (out, true);
+        }
+    }
+
+    for token in tokenize(text) {
+        let normalized = normalize_token(token);
+        if append_gram_values_for_token(&normalized, &mut seen, &mut out, max_grams) {
+            return (out, true);
+        }
+    }
+
+    (out, false)
+}
+
 pub fn extract_dynamic_grams(rel_path: &str, text: &str, max_grams: usize) -> Vec<DynamicGram> {
     extract_dynamic_grams_with_overflow(rel_path, text, max_grams).0
 }
@@ -152,7 +178,85 @@ fn classify_token_kind(token: &str) -> GramKind {
 }
 
 fn normalize_token(token: &str) -> String {
+    if token.is_ascii() {
+        return token.to_ascii_lowercase();
+    }
     token.chars().flat_map(char::to_lowercase).collect()
+}
+
+fn append_gram_values_for_token(
+    token: &str,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<String>,
+    max_grams: usize,
+) -> bool {
+    if token.is_ascii() {
+        append_ascii_gram_values_for_token(token, seen, out, max_grams)
+    } else {
+        append_unicode_gram_values_for_token(token, seen, out, max_grams)
+    }
+}
+
+fn append_ascii_gram_values_for_token(
+    token: &str,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<String>,
+    max_grams: usize,
+) -> bool {
+    let bytes = token.as_bytes();
+    let len = bytes.len();
+    if len < 2 {
+        return false;
+    }
+    for width in gram_widths(len).rev() {
+        for start in 0..=(len - width) {
+            // SAFETY: this path only receives ASCII tokens, so every byte window is valid UTF-8.
+            let value =
+                unsafe { String::from_utf8_unchecked(bytes[start..start + width].to_vec()) };
+            if push_gram_value(value, seen, out, max_grams) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn append_unicode_gram_values_for_token(
+    token: &str,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<String>,
+    max_grams: usize,
+) -> bool {
+    let len = token.chars().count();
+    if len < 2 {
+        return false;
+    }
+    let chars = token.chars().collect::<Vec<_>>();
+    for width in gram_widths(len).rev() {
+        for start in 0..=(len - width) {
+            let value = chars[start..start + width].iter().collect::<String>();
+            if push_gram_value(value, seen, out, max_grams) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn push_gram_value(
+    value: String,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<String>,
+    max_grams: usize,
+) -> bool {
+    if !seen.insert(value.clone()) {
+        return false;
+    }
+    if out.len() >= max_grams {
+        return true;
+    }
+    out.push(value);
+    false
 }
 
 fn grams_for_token(token: &str, kind: GramKind) -> Vec<DynamicGram> {
@@ -194,14 +298,21 @@ fn gram_widths(len: usize) -> std::ops::RangeInclusive<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_dynamic_grams, grams_for_query_literal, selective_grams_for_query_literal, GramKind};
+    use super::{
+        extract_dynamic_gram_values_with_overflow, extract_dynamic_grams, grams_for_query_literal,
+        selective_grams_for_query_literal, GramKind,
+    };
     use std::collections::HashSet;
 
     #[test]
     fn extracts_path_and_text_grams() {
         let grams = extract_dynamic_grams("src/demo/file.rs", "AlphaService handles users", 32);
-        assert!(grams.iter().any(|gram| gram.kind == GramKind::Path && gram.value == "src"));
-        assert!(grams.iter().any(|gram| gram.value.contains("alph") || gram.value.contains("vice")));
+        assert!(grams
+            .iter()
+            .any(|gram| gram.kind == GramKind::Path && gram.value == "src"));
+        assert!(grams
+            .iter()
+            .any(|gram| gram.value.contains("alph") || gram.value.contains("vice")));
     }
 
     #[test]
@@ -226,7 +337,9 @@ mod tests {
         let grams = selective_grams_for_query_literal(literal, 4, 12);
         assert!(grams.len() <= 12);
         assert!(!grams.is_empty());
-        assert!(grams.iter().any(|gram| gram.contains("_upd") || gram.contains("dire")));
+        assert!(grams
+            .iter()
+            .any(|gram| gram.contains("_upd") || gram.contains("dire")));
     }
 
     #[test]
@@ -258,5 +371,16 @@ mod tests {
         let query_grams = grams_for_query_literal("한글검색");
         assert!(!query_grams.is_empty());
         assert!(query_grams.iter().all(|gram| doc_grams.contains(gram)));
+    }
+
+    #[test]
+    fn value_extraction_stops_once_overflow_is_known() {
+        let (grams, overflow) = extract_dynamic_gram_values_with_overflow(
+            "src/demo/file.rs",
+            "AlphaService BetaService",
+            1,
+        );
+        assert_eq!(grams.len(), 1);
+        assert!(overflow);
     }
 }

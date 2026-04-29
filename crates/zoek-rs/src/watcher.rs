@@ -92,12 +92,18 @@ mod tests {
             4,
             &[String::from("./src\\a.rs")],
             &[String::from("src/old.rs")],
-            &[(String::from("src/before.rs"), String::from("./src/after.rs"))],
+            &[(
+                String::from("src/before.rs"),
+                String::from("./src/after.rs"),
+            )],
         );
         assert_eq!(batch.generation, 5);
         assert_eq!(batch.changes[0].kind, FileChangeKind::Modify);
         assert_eq!(batch.changes[0].rel_path, "src/a.rs");
-        assert_eq!(batch.changes[2].new_rel_path.as_deref(), Some("src/after.rs"));
+        assert_eq!(
+            batch.changes[2].new_rel_path.as_deref(),
+            Some("src/after.rs")
+        );
         assert_eq!(normalize_rel_path("src/foo/../bar.rs"), "src/bar.rs");
     }
 }

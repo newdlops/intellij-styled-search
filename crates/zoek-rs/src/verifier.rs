@@ -158,7 +158,9 @@ pub fn matches_include_filters(rel_path: &str, include: &[String]) -> bool {
     if include.is_empty() {
         return true;
     }
-    include.iter().any(|pattern| wildcard_match(pattern, rel_path))
+    include
+        .iter()
+        .any(|pattern| wildcard_match(pattern, rel_path))
 }
 
 fn build_match(text: &str, start: usize, end: usize) -> SearchMatch {
@@ -194,14 +196,21 @@ fn build_preview(text: &str, start: usize, end: usize) -> String {
 
 fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
     let bounded = offset.min(text.len());
-    let line = text[..bounded].bytes().filter(|byte| *byte == b'\n').count();
+    let line = text[..bounded]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
     let line_start = text[..bounded].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
     let column = text[line_start..bounded].chars().count();
     (line, column)
 }
 
 fn is_word_boundary(text: &str, start: usize, end: usize) -> bool {
-    let left = if start == 0 { None } else { text[..start].chars().next_back() };
+    let left = if start == 0 {
+        None
+    } else {
+        text[..start].chars().next_back()
+    };
     let right = text[end..].chars().next();
     !left.map(is_word_char).unwrap_or(false) && !right.map(is_word_char).unwrap_or(false)
 }
@@ -383,7 +392,8 @@ mod tests {
 
     #[test]
     fn regex_reports_multiline_end_line() {
-        let matches = verify_regex("foo\nbar\nbaz", "foo.*baz", true, true, 10).expect("regex must compile");
+        let matches =
+            verify_regex("foo\nbar\nbaz", "foo.*baz", true, true, 10).expect("regex must compile");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].line, 0);
         assert_eq!(matches[0].end_line, Some(2));
@@ -391,34 +401,62 @@ mod tests {
 
     #[test]
     fn regex_singleline_does_not_cross_line_boundaries() {
-        let matches = verify_regex("foo\nbar\nbaz", "foo.*baz", true, false, 10).expect("regex must compile");
+        let matches =
+            verify_regex("foo\nbar\nbaz", "foo.*baz", true, false, 10).expect("regex must compile");
         assert!(matches.is_empty());
     }
 
     #[test]
     fn supports_simple_glob_filters() {
-        assert!(matches_include_filters("src/demo/file.rs", &[String::from("src/*/*.rs")]));
-        assert!(!matches_include_filters("tests/demo/file.py", &[String::from("src/*/*.rs")]));
+        assert!(matches_include_filters(
+            "src/demo/file.rs",
+            &[String::from("src/*/*.rs")]
+        ));
+        assert!(!matches_include_filters(
+            "tests/demo/file.py",
+            &[String::from("src/*/*.rs")]
+        ));
     }
 
     #[test]
     fn star_does_not_cross_path_segments() {
         // Loose `*=.*` matching used to let `src/*.rs` accept nested paths.
-        assert!(matches_include_filters("src/file.rs", &[String::from("src/*.rs")]));
-        assert!(!matches_include_filters("src/deep/file.rs", &[String::from("src/*.rs")]));
+        assert!(matches_include_filters(
+            "src/file.rs",
+            &[String::from("src/*.rs")]
+        ));
+        assert!(!matches_include_filters(
+            "src/deep/file.rs",
+            &[String::from("src/*.rs")]
+        ));
     }
 
     #[test]
     fn double_star_spans_segments() {
-        assert!(matches_include_filters("a/b/c/file.py", &[String::from("**/*.py")]));
-        assert!(matches_include_filters("file.py", &[String::from("**/*.py")]));
-        assert!(matches_include_filters("src/legal/test/foo.rs", &[String::from("**/test/**")]));
-        assert!(!matches_include_filters("src/legal/other/foo.rs", &[String::from("**/test/**")]));
+        assert!(matches_include_filters(
+            "a/b/c/file.py",
+            &[String::from("**/*.py")]
+        ));
+        assert!(matches_include_filters(
+            "file.py",
+            &[String::from("**/*.py")]
+        ));
+        assert!(matches_include_filters(
+            "src/legal/test/foo.rs",
+            &[String::from("**/test/**")]
+        ));
+        assert!(!matches_include_filters(
+            "src/legal/other/foo.rs",
+            &[String::from("**/test/**")]
+        ));
     }
 
     #[test]
     fn question_mark_is_single_segment_char() {
         assert!(matches_include_filters("a1.rs", &[String::from("a?.rs")]));
-        assert!(!matches_include_filters("ab/c.rs", &[String::from("a?.rs")]));
+        assert!(!matches_include_filters(
+            "ab/c.rs",
+            &[String::from("a?.rs")]
+        ));
     }
 }

@@ -1,5 +1,5 @@
 use crate::config::{EngineConfig, ENGINE_NAME, SCHEMA_VERSION};
-use crate::corpus::{count_candidate_files, discover_text_files_with_progress};
+use crate::corpus::{count_candidate_files, discover_text_files_with_progress, CorpusEntry};
 use crate::mmap_store::{write_atomically, StoreLayout};
 use crate::overlay::OverlayManifest;
 use crate::protocol::json_string;
@@ -9,6 +9,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Default)]
@@ -107,33 +108,7 @@ where
         .map(|value| value.as_secs())
         .unwrap_or(0);
 
-    let total_entries = entries.len();
-    let mut indexed_docs = Vec::with_capacity(total_entries);
-    for (idx, entry) in entries.iter().enumerate() {
-        let (grams, overflow) = crate::gram::extract_dynamic_grams_with_overflow(
-            &entry.rel_path,
-            &entry.text,
-            config.max_grams_per_file,
-        );
-        indexed_docs.push(IndexedDocument {
-            rel_path: entry.rel_path.clone(),
-            byte_len: entry.size_bytes,
-            modified_unix_secs: entry.modified_unix_secs,
-            content_hash: stable_hash(&entry.text),
-            grams: grams.into_iter().map(|gram| gram.value).collect(),
-            gram_incomplete: overflow,
-        });
-        let current = idx + 1;
-        if total_entries > 0 && (current == 1 || current % 128 == 0 || current == total_entries) {
-            progress(IndexProgress {
-                phase: "prepare",
-                current,
-                total: total_entries,
-                percent: weighted_percent(current, total_entries, 70, 20),
-                detail: format!("extracting grams {current}/{total_entries}"),
-            });
-        }
-    }
+    let indexed_docs = prepare_indexed_documents(&entries, config, progress);
 
     let fingerprint = fingerprint_documents(&indexed_docs);
     let shards = partition_documents(&indexed_docs, config);
@@ -167,7 +142,11 @@ where
             current: shard_artifacts.len(),
             total: total_shards.max(1),
             percent: weighted_percent(shard_artifacts.len(), total_shards, 90, 10),
-            detail: format!("writing shards {}/{}", shard_artifacts.len(), total_shards.max(1)),
+            detail: format!(
+                "writing shards {}/{}",
+                shard_artifacts.len(),
+                total_shards.max(1)
+            ),
         });
     }
 
@@ -215,6 +194,94 @@ where
         shards: shard_artifacts,
         fingerprint,
     })
+}
+
+fn prepare_indexed_documents<F>(
+    entries: &[CorpusEntry],
+    config: &EngineConfig,
+    progress: &mut F,
+) -> Vec<IndexedDocument>
+where
+    F: FnMut(IndexProgress),
+{
+    let total_entries = entries.len();
+    if total_entries == 0 {
+        return Vec::new();
+    }
+
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(total_entries);
+    if workers <= 1 || total_entries < 256 {
+        let mut indexed_docs = Vec::with_capacity(total_entries);
+        for (idx, entry) in entries.iter().enumerate() {
+            indexed_docs.push(build_indexed_document(entry, config));
+            report_prepare_progress(progress, idx + 1, total_entries);
+        }
+        return indexed_docs;
+    }
+
+    let chunk_size = total_entries.div_ceil(workers).max(1);
+    let mut completed = 0usize;
+    let mut chunks = Vec::new();
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (chunk_idx, chunk) in entries.chunks(chunk_size).enumerate() {
+            handles.push(scope.spawn(move || {
+                let docs = chunk
+                    .iter()
+                    .map(|entry| build_indexed_document(entry, config))
+                    .collect::<Vec<_>>();
+                (chunk_idx, docs)
+            }));
+        }
+        for handle in handles {
+            let (chunk_idx, docs) = handle.join().expect("gram extraction worker panicked");
+            completed += docs.len();
+            emit_prepare_progress(progress, completed.min(total_entries), total_entries);
+            chunks.push((chunk_idx, docs));
+        }
+    });
+    chunks.sort_by_key(|(chunk_idx, _)| *chunk_idx);
+
+    let mut indexed_docs = Vec::with_capacity(total_entries);
+    for (_, docs) in chunks {
+        indexed_docs.extend(docs);
+    }
+    indexed_docs
+}
+
+fn build_indexed_document(entry: &CorpusEntry, config: &EngineConfig) -> IndexedDocument {
+    let (grams, overflow) = crate::gram::extract_dynamic_gram_values_with_overflow(
+        &entry.rel_path,
+        &entry.text,
+        config.max_grams_per_file,
+    );
+    IndexedDocument {
+        rel_path: entry.rel_path.clone(),
+        byte_len: entry.size_bytes,
+        modified_unix_secs: entry.modified_unix_secs,
+        content_hash: stable_hash(&entry.text),
+        grams,
+        gram_incomplete: overflow,
+    }
+}
+
+fn report_prepare_progress(progress: &mut impl FnMut(IndexProgress), current: usize, total: usize) {
+    if total > 0 && (current == 1 || current % 128 == 0 || current == total) {
+        emit_prepare_progress(progress, current, total);
+    }
+}
+
+fn emit_prepare_progress(progress: &mut impl FnMut(IndexProgress), current: usize, total: usize) {
+    progress(IndexProgress {
+        phase: "prepare",
+        current,
+        total,
+        percent: weighted_percent(current, total, 70, 20),
+        detail: format!("extracting grams {current}/{total}"),
+    });
 }
 
 fn weighted_percent(current: usize, total: usize, base: usize, weight: usize) -> usize {
@@ -331,7 +398,11 @@ fn _artifact_paths(artifacts: &IndexArtifacts) -> (&PathBuf, &PathBuf, &PathBuf)
     (
         &artifacts.layout.manifest_path,
         &artifacts.layout.overlay_path,
-        &artifacts.shards.first().map(|shard| &shard.path).unwrap_or(&artifacts.layout.manifest_path),
+        &artifacts
+            .shards
+            .first()
+            .map(|shard| &shard.path)
+            .unwrap_or(&artifacts.layout.manifest_path),
     )
 }
 

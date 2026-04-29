@@ -171,11 +171,15 @@ pub fn load_overlay_with_recovery(layout: &StoreLayout) -> io::Result<OverlayLoa
             }
             for replay in replay_entries {
                 manifest.generation = manifest.generation.max(replay.entry.generation);
-                manifest.updated_unix_secs = manifest.updated_unix_secs.max(replay.committed_unix_secs);
+                manifest.updated_unix_secs =
+                    manifest.updated_unix_secs.max(replay.committed_unix_secs);
                 manifest.entries.push(replay.entry);
             }
             manifest.save(&layout.overlay_path)?;
-            warnings.push("overlay manifest was behind the journal; replayed newer journal entries".to_string());
+            warnings.push(
+                "overlay manifest was behind the journal; replayed newer journal entries"
+                    .to_string(),
+            );
             Ok(OverlayLoadResult {
                 manifest,
                 warnings,
@@ -190,7 +194,8 @@ pub fn load_overlay_with_recovery(layout: &StoreLayout) -> io::Result<OverlayLoa
             let mut warnings = journal.warnings;
             for replay in journal.entries {
                 manifest.generation = manifest.generation.max(replay.entry.generation);
-                manifest.updated_unix_secs = manifest.updated_unix_secs.max(replay.committed_unix_secs);
+                manifest.updated_unix_secs =
+                    manifest.updated_unix_secs.max(replay.committed_unix_secs);
                 manifest.entries.push(replay.entry);
             }
             manifest.save(&layout.overlay_path)?;
@@ -245,6 +250,9 @@ pub fn apply_change_batch(
     for change in &batch.changes {
         match change.kind {
             FileChangeKind::Create | FileChangeKind::Modify => {
+                if config.is_overlay_update_excluded_relative_path(&change.rel_path) {
+                    continue;
+                }
                 entries.push(build_entry_for_path(
                     workspace_root,
                     &change.rel_path,
@@ -254,6 +262,9 @@ pub fn apply_change_batch(
                 )?);
             }
             FileChangeKind::Delete => {
+                if config.is_overlay_update_excluded_relative_path(&change.rel_path) {
+                    continue;
+                }
                 entries.push(build_tombstone_entry(
                     &change.rel_path,
                     generation,
@@ -261,12 +272,17 @@ pub fn apply_change_batch(
                 ));
             }
             FileChangeKind::Rename => {
-                entries.push(build_tombstone_entry(
-                    &change.rel_path,
-                    generation,
-                    committed_unix_secs,
-                ));
+                if !config.is_overlay_update_excluded_relative_path(&change.rel_path) {
+                    entries.push(build_tombstone_entry(
+                        &change.rel_path,
+                        generation,
+                        committed_unix_secs,
+                    ));
+                }
                 if let Some(new_rel_path) = &change.new_rel_path {
+                    if config.is_overlay_update_excluded_relative_path(new_rel_path) {
+                        continue;
+                    }
                     entries.push(build_entry_for_path(
                         workspace_root,
                         new_rel_path,
@@ -279,7 +295,31 @@ pub fn apply_change_batch(
         }
     }
 
-    append_journal(&layout.overlay_journal_path, committed_unix_secs, &batch.changes, &entries)?;
+    if entries.is_empty() {
+        let journal_bytes = journal_size(&layout.overlay_journal_path)?;
+        let latest_stats = manifest.latest_stats();
+        let compaction_reason = compaction_reason(&manifest, journal_bytes, config);
+        return Ok(OverlayUpdateSummary {
+            generation: manifest.generation,
+            entries_written: 0,
+            live_entries: 0,
+            tombstones: 0,
+            overlay_total_entries: manifest.entries.len(),
+            latest_visible_entries: latest_stats.live_entries + latest_stats.tombstones,
+            journal_bytes,
+            compaction_suggested: compaction_reason.is_some(),
+            compaction_reason,
+            compaction_performed: false,
+            compaction_trigger_reason: None,
+        });
+    }
+
+    append_journal(
+        &layout.overlay_journal_path,
+        committed_unix_secs,
+        &batch.changes,
+        &entries,
+    )?;
     manifest.generation = generation;
     manifest.updated_unix_secs = committed_unix_secs;
     manifest.entries.extend(entries.iter().cloned());
@@ -317,7 +357,10 @@ pub fn apply_change_batch(
     })
 }
 
-fn compact_overlay_manifest(layout: &StoreLayout, manifest: &mut OverlayManifest) -> io::Result<()> {
+fn compact_overlay_manifest(
+    layout: &StoreLayout,
+    manifest: &mut OverlayManifest,
+) -> io::Result<()> {
     let latest = manifest.latest_entries();
     manifest.entries = latest.into_iter().map(|(_, entry)| entry).collect();
     manifest.save(&layout.overlay_path)?;
@@ -339,7 +382,11 @@ fn build_entry_for_path(
     let metadata = match fs::metadata(&abs_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Ok(build_tombstone_entry(rel_path, generation, committed_unix_secs));
+            return Ok(build_tombstone_entry(
+                rel_path,
+                generation,
+                committed_unix_secs,
+            ));
         }
         Err(err) => return Err(err),
     };
@@ -347,12 +394,20 @@ fn build_entry_for_path(
         || metadata.len() > config.max_file_size_bytes
         || config.is_binary_extension(&abs_path)
     {
-        return Ok(build_tombstone_entry(rel_path, generation, committed_unix_secs));
+        return Ok(build_tombstone_entry(
+            rel_path,
+            generation,
+            committed_unix_secs,
+        ));
     }
 
     let bytes = fs::read(&abs_path)?;
     if looks_binary_bytes(&bytes) {
-        return Ok(build_tombstone_entry(rel_path, generation, committed_unix_secs));
+        return Ok(build_tombstone_entry(
+            rel_path,
+            generation,
+            committed_unix_secs,
+        ));
     }
     let (text, _) = decode_bytes(&bytes);
     let modified_unix_secs = metadata
@@ -362,7 +417,7 @@ fn build_entry_for_path(
         .map(|value| value.as_secs())
         .unwrap_or(committed_unix_secs);
 
-    let (grams, overflow) = crate::gram::extract_dynamic_grams_with_overflow(
+    let (grams, overflow) = crate::gram::extract_dynamic_gram_values_with_overflow(
         rel_path,
         &text,
         config.max_grams_per_file,
@@ -373,12 +428,16 @@ fn build_entry_for_path(
         tombstone: false,
         modified_unix_secs,
         content_hash: stable_hash(&text),
-        grams: grams.into_iter().map(|gram| gram.value).collect(),
+        grams,
         gram_incomplete: overflow,
     })
 }
 
-fn build_tombstone_entry(rel_path: &str, generation: u64, committed_unix_secs: u64) -> OverlayEntry {
+fn build_tombstone_entry(
+    rel_path: &str,
+    generation: u64,
+    committed_unix_secs: u64,
+) -> OverlayEntry {
     OverlayEntry {
         rel_path: rel_path.to_string(),
         generation,
@@ -405,7 +464,9 @@ fn append_journal(
                     committed_unix_secs,
                     "rename",
                     &change.rel_path,
-                    entries.iter().find(|entry| entry.rel_path == change.rel_path),
+                    entries
+                        .iter()
+                        .find(|entry| entry.rel_path == change.rel_path),
                 )?;
                 if let Some(new_rel_path) = &change.new_rel_path {
                     write_journal_record(
@@ -413,7 +474,10 @@ fn append_journal(
                         committed_unix_secs,
                         "rename",
                         new_rel_path,
-                        entries.iter().rev().find(|entry| entry.rel_path == *new_rel_path),
+                        entries
+                            .iter()
+                            .rev()
+                            .find(|entry| entry.rel_path == *new_rel_path),
                     )?;
                 }
             }
@@ -422,21 +486,27 @@ fn append_journal(
                 committed_unix_secs,
                 "create",
                 &change.rel_path,
-                entries.iter().find(|entry| entry.rel_path == change.rel_path),
+                entries
+                    .iter()
+                    .find(|entry| entry.rel_path == change.rel_path),
             )?,
             FileChangeKind::Modify => write_journal_record(
                 &mut file,
                 committed_unix_secs,
                 "modify",
                 &change.rel_path,
-                entries.iter().find(|entry| entry.rel_path == change.rel_path),
+                entries
+                    .iter()
+                    .find(|entry| entry.rel_path == change.rel_path),
             )?,
             FileChangeKind::Delete => write_journal_record(
                 &mut file,
                 committed_unix_secs,
                 "delete",
                 &change.rel_path,
-                entries.iter().find(|entry| entry.rel_path == change.rel_path),
+                entries
+                    .iter()
+                    .find(|entry| entry.rel_path == change.rel_path),
             )?,
         }
     }
@@ -505,11 +575,11 @@ fn parse_journal_line(text: &str) -> io::Result<Option<JournalReplayEntry>> {
         Some(value) if !value.is_empty() => value,
         _ => return Ok(None),
     };
-    let generation = parse_u64_field(text, "generation").ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "missing journal generation")
-    })?;
+    let generation = parse_u64_field(text, "generation")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing journal generation"))?;
     let committed_unix_secs = parse_u64_field(text, "committedUnixSecs").unwrap_or(0);
-    let modified_unix_secs = parse_u64_field(text, "modifiedUnixSecs").unwrap_or(committed_unix_secs);
+    let modified_unix_secs =
+        parse_u64_field(text, "modifiedUnixSecs").unwrap_or(committed_unix_secs);
     let content_hash = parse_u64_field(text, "contentHash").unwrap_or(0);
     let tombstone = parse_bool_field(text, "tombstone").unwrap_or(false);
     let grams = parse_string_array_field(text, "grams").unwrap_or_default();
@@ -551,8 +621,7 @@ pub fn compaction_reason(
     if journal_bytes >= config.overlay_compaction_journal_bytes_threshold {
         return Some(format!(
             "overlay-journal-threshold({}>={})",
-            journal_bytes,
-            config.overlay_compaction_journal_bytes_threshold
+            journal_bytes, config.overlay_compaction_journal_bytes_threshold
         ));
     }
     None
@@ -796,7 +865,8 @@ mod tests {
                 },
             ],
         };
-        let parsed = OverlayManifest::load_json_for_test(&manifest.to_json()).expect("overlay must parse");
+        let parsed =
+            OverlayManifest::load_json_for_test(&manifest.to_json()).expect("overlay must parse");
         let latest = parsed.latest_entries();
         assert_eq!(latest["src/a.rs"].generation, 2);
         assert!(latest["src/a.rs"].tombstone);
@@ -897,6 +967,89 @@ mod tests {
     }
 
     #[test]
+    fn update_ignores_target_but_allows_git_and_node_modules() -> io::Result<()> {
+        let root = temp_dir("overlay-update-ignored-dirs");
+        fs::create_dir_all(root.join(".git"))?;
+        fs::create_dir_all(root.join("node_modules/pkg"))?;
+        fs::create_dir_all(root.join("target/debug"))?;
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
+        fs::write(
+            root.join("node_modules/pkg/index.js"),
+            "module.exports = 1;\n",
+        )?;
+        fs::write(root.join("target/debug/build.log"), "compiled\n")?;
+
+        let config = EngineConfig::default();
+        let layout = StoreLayout::for_workspace(&root, &config);
+        let batch = build_change_batch(
+            0,
+            &[
+                String::from(".git/HEAD"),
+                String::from("node_modules/pkg/index.js"),
+                String::from("target/debug/build.log"),
+            ],
+            &[],
+            &[],
+        );
+        let summary = apply_change_batch(&root, &layout, &config, &batch)?;
+        assert_eq!(summary.entries_written, 2);
+        assert_eq!(summary.overlay_total_entries, 2);
+        assert_eq!(summary.latest_visible_entries, 2);
+        assert!(layout.overlay_journal_path.exists());
+
+        let latest = OverlayManifest::load(&layout.overlay_path)?.latest_entries();
+        assert!(!latest[".git/HEAD"].tombstone);
+        assert!(!latest["node_modules/pkg/index.js"].tombstone);
+        assert!(!latest.contains_key("target/debug/build.log"));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rename_between_included_and_excluded_dirs_only_records_indexed_side() -> io::Result<()> {
+        let root = temp_dir("overlay-rename-excluded");
+        fs::create_dir_all(root.join("src"))?;
+        fs::create_dir_all(root.join("target/debug"))?;
+        fs::write(root.join("src/new.rs"), "struct Included {}\n")?;
+
+        let config = EngineConfig::default();
+        let layout = StoreLayout::for_workspace(&root, &config);
+        let into_index = build_change_batch(
+            0,
+            &[],
+            &[],
+            &[(
+                String::from("target/debug/new.rs"),
+                String::from("src/new.rs"),
+            )],
+        );
+        let summary = apply_change_batch(&root, &layout, &config, &into_index)?;
+        assert_eq!(summary.entries_written, 1);
+        let latest = OverlayManifest::load(&layout.overlay_path)?.latest_entries();
+        assert!(!latest["src/new.rs"].tombstone);
+        assert!(!latest.contains_key("target/debug/new.rs"));
+
+        let out_of_index = build_change_batch(
+            summary.generation,
+            &[],
+            &[],
+            &[(
+                String::from("src/new.rs"),
+                String::from("target/debug/new.rs"),
+            )],
+        );
+        let summary = apply_change_batch(&root, &layout, &config, &out_of_index)?;
+        assert_eq!(summary.entries_written, 1);
+        let latest = OverlayManifest::load(&layout.overlay_path)?.latest_entries();
+        assert!(latest["src/new.rs"].tombstone);
+        assert!(!latest.contains_key("target/debug/new.rs"));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn replays_overlay_journal_when_manifest_is_missing() -> io::Result<()> {
         let root = temp_dir("overlay-replay");
         fs::create_dir_all(root.join("src"))?;
@@ -910,7 +1063,10 @@ mod tests {
 
         let recovered = load_overlay_with_recovery(&layout)?;
         assert!(recovered.recovered);
-        assert_eq!(recovered.manifest.latest_entries()["src/a.rs"].tombstone, false);
+        assert_eq!(
+            recovered.manifest.latest_entries()["src/a.rs"].tombstone,
+            false
+        );
         assert!(layout.overlay_path.exists());
 
         fs::remove_dir_all(root)?;
@@ -927,13 +1083,19 @@ mod tests {
         let batch = build_change_batch(0, &[String::from("src/a.rs")], &[], &[]);
         apply_change_batch(&root, &layout, &config, &batch)?;
         let journal = fs::read_to_string(&layout.overlay_journal_path)?;
-        fs::write(&layout.overlay_journal_path, format!("{journal}{{\"generation\":2"))?;
+        fs::write(
+            &layout.overlay_journal_path,
+            format!("{journal}{{\"generation\":2"),
+        )?;
         fs::remove_file(&layout.overlay_path)?;
 
         let recovered = load_overlay_with_recovery(&layout)?;
         assert!(recovered.recovered);
         assert!(!recovered.warnings.is_empty());
-        assert_eq!(recovered.manifest.latest_entries()["src/a.rs"].generation, 1);
+        assert_eq!(
+            recovered.manifest.latest_entries()["src/a.rs"].generation,
+            1
+        );
 
         fs::remove_dir_all(root)?;
         Ok(())

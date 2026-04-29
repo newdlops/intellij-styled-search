@@ -101,7 +101,10 @@ pub fn build_shard_bytes(
             flags,
         ));
         for gram in &doc.grams {
-            postings_map.entry(gram.clone()).or_default().push(doc_id as u32);
+            postings_map
+                .entry(gram.clone())
+                .or_default()
+                .push(doc_id as u32);
         }
     }
 
@@ -273,7 +276,10 @@ impl ShardReader {
             let gram_start = self.header.strings_offset as usize + gram_offset as usize;
             let gram_end = gram_start + gram_len;
             let gram_bytes = self.bytes.get(gram_start..gram_end).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "gram range outside shard file")
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "gram range outside shard file",
+                )
             })?;
             match gram_bytes.cmp(needle_bytes) {
                 std::cmp::Ordering::Less => lo = mid + 1,
@@ -299,10 +305,12 @@ impl ShardReader {
     fn read_string(&self, offset: u64, len: usize) -> io::Result<String> {
         let start = self.header.strings_offset as usize + offset as usize;
         let end = start + len;
-        let slice = self
-            .bytes
-            .get(start..end)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "string range outside shard file"))?;
+        let slice = self.bytes.get(start..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "string range outside shard file",
+            )
+        })?;
         let value = std::str::from_utf8(slice)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
         Ok(value.to_string())
@@ -372,16 +380,16 @@ fn push_u64(bytes: &mut Vec<u8>, value: u64) {
 }
 
 fn read_u32_at(bytes: &[u8], offset: usize) -> io::Result<u32> {
-    let slice = bytes
-        .get(offset..offset + 4)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "u32 read outside shard file"))?;
+    let slice = bytes.get(offset..offset + 4).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "u32 read outside shard file")
+    })?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
 fn read_u64_at(bytes: &[u8], offset: usize) -> io::Result<u64> {
-    let slice = bytes
-        .get(offset..offset + 8)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "u64 read outside shard file"))?;
+    let slice = bytes.get(offset..offset + 8).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "u64 read outside shard file")
+    })?;
     Ok(u64::from_le_bytes([
         slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
     ]))
