@@ -60,6 +60,40 @@ suite('Renderer — overlay UI probes', () => {
     );
   });
 
+  test('call graph inlay click hook ignores other extension inlay DOM', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('');
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var node = document.createElement('span');
+        node.className = 'third-party-inline-inlay-hint';
+        node.textContent = 'third party hover target';
+        node.style.cssText = 'position:fixed;left:20px;top:20px;z-index:2147483647;background:transparent;';
+        var received = false;
+        node.addEventListener('click', function () { received = true; });
+        document.body.appendChild(node);
+        var ev = new MouseEvent('click', {
+          bubbles: true,
+          cancelable: true,
+          clientX: 24,
+          clientY: 24
+        });
+        var dispatchResult = node.dispatchEvent(ev);
+        var out = {
+          received: received,
+          prevented: ev.defaultPrevented || !dispatchResult
+        };
+        node.remove();
+        return JSON.stringify(out);
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as { received: boolean; prevented: boolean };
+    assert.strictEqual(parsed.received, true, `third-party inlay click should still bubble to its owner: ${raw}`);
+    assert.strictEqual(parsed.prevented, false, `third-party inlay click should not be suppressed: ${raw}`);
+  });
+
   test('force-literal show clears regex and whole-word toggles', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);

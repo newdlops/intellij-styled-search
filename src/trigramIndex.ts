@@ -7,6 +7,7 @@ import { parseRegex } from './codesearch/regexAst';
 import { analyze } from './codesearch/regexInfo';
 import { PostingSource, TrigramQuery, evalQuery, qAnd, qTri } from './codesearch/trigramQuery';
 import { serializeV3 } from './codesearch/binaryIndex';
+import { findWorkspaceFilesDirect } from './fileDiscovery';
 
 // A posting list entry that hasn't been materialized into memory yet.
 // `offset` is the byte offset within the on-disk postings section; `length`
@@ -554,18 +555,16 @@ export class TrigramIndex {
     await this.save();
   }
 
-  private getExcludePattern(): string | null {
-    // null (not undefined) so findFiles bypasses VSCode's default
-    // search.exclude + files.exclude (which silently drop node_modules,
-    // .venv, site-packages, etc.). Our excludeGlobs setting is the sole
-    // source of truth; an empty list means index EVERY non-binary file.
+  private getExcludeGlobs(): string[] {
+    // We intentionally do not use VS Code SearchService discovery here.
+    // Our excludeGlobs setting is the sole source of truth; an empty list
+    // means index EVERY non-binary file.
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-    const globs = cfg.get<string[]>('excludeGlobs', []);
-    return globs.length > 0 ? `{${globs.join(',')}}` : null;
+    return cfg.get<string[]>('excludeGlobs', []);
   }
 
   private async reconcileWorkspace(progress?: ReconcileProgress): Promise<void> {
-    const excludePattern = this.getExcludePattern();
+    const excludeGlobs = this.getExcludeGlobs();
     // Reset skip-reason tally for this reconcile run so the final log line
     // reflects THIS pass only, not lifetime counts.
     this.skipCounts = {
@@ -577,7 +576,7 @@ export class TrigramIndex {
     // (VSCode returns a different subset each session, so files near the cap
     // flap in/out of the index and force massive reindex work every run).
     // We rely on excludeGlobs + mtime delta to keep the working set sane.
-    const files = await vscode.workspace.findFiles('**/*', excludePattern);
+    const files = await findWorkspaceFilesDirect({ excludeGlobs });
     const currentUris = new Set(files.map((u) => u.toString()));
     let removed = 0;
     for (const [id, meta] of Array.from(this.fileMeta)) {

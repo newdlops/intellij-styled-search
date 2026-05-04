@@ -21,6 +21,7 @@ suite('Activation', () => {
   });
 
   test('commands are registered', async () => {
+    const ext = vscode.extensions.getExtension<ExtensionTestApi>(EXTENSION_ID);
     await getApi();
     const expected = [
       'intellijStyledSearch.searchInProject',
@@ -31,11 +32,36 @@ suite('Activation', () => {
       'intellijStyledSearch.showZoektInfo',
       'intellijStyledSearch.explainZoektQuery',
       'intellijStyledSearch.diagnoseFileInIndex',
+      'intellijStyledSearch.rebuildCallGraph',
+      'intellijStyledSearch.showCallGraphInfo',
+      'intellijStyledSearch.findCallers',
+      'intellijStyledSearch.findCallees',
+      'intellijStyledSearch.findImplementations',
+      'intellijStyledSearch.findUsages',
+      'intellijStyledSearch.startMcpServer',
+      'intellijStyledSearch.stopMcpServer',
     ];
     const all = await vscode.commands.getCommands(true);
     for (const cmd of expected) {
       assert.ok(all.includes(cmd), `command ${cmd} not registered`);
     }
+    const contributes = ext?.packageJSON?.contributes;
+    const submenu = contributes?.submenus?.find((item: { id?: string }) => item.id === 'intellijStyledSearch.editorContext');
+    assert.ok(submenu, 'IntelliJ Search editor context submenu not contributed');
+    const submenuCommands = (contributes?.menus?.['intellijStyledSearch.editorContext'] ?? [])
+      .map((item: { command?: string }) => item.command)
+      .filter(Boolean);
+    const expectedInSubmenu = expected.filter((cmd) => cmd !== 'intellijStyledSearch.findCallers');
+    for (const cmd of expectedInSubmenu) {
+      assert.ok(
+        submenuCommands.includes(cmd),
+        `command ${cmd} not present in IntelliJ Search editor context submenu`,
+      );
+    }
+    assert.ok(
+      !submenuCommands.includes('intellijStyledSearch.findCallers'),
+      'findCallers should be hidden from the context submenu because callers are folded into usages',
+    );
   });
 
   test('trigram index reaches ready state on fixture workspace', async function () {

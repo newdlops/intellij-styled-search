@@ -16,15 +16,18 @@ import {
   type SearchEngine,
 } from './search';
 import { configureRipgrepInstall, ensureRipgrepInstalled, findRipgrepPath, runRgSearch } from './rgSearch';
-import { getRendererPatchScript } from './rendererPatch';
+import { getRendererPatchScript, RENDERER_PATCH_VERSION } from './rendererPatch';
 import { TrigramIndex, extractTrigramsLower } from './trigramIndex';
 import { compilePathScopeMatcher } from './pathScope';
 import { ZoektRuntime } from './zoekRuntime';
+import { findWorkspaceFilesDirect } from './fileDiscovery';
 
 type RendererEvent =
   | { type: 'search'; options: SearchOptions; recordHistory?: boolean }
   | { type: 'loadMore' }
   | { type: 'cancel' }
+  | { type: 'panelHidden' }
+  | { type: 'trace'; phase: string; data?: unknown; light?: unknown; ir?: unknown; perf?: number }
   | { type: 'openFile'; uri: string; line: number; column: number }
   | { type: 'previewFile'; uri: string; line: number; column: number }
   | { type: 'requestPreview'; uri: string; line: number; ranges?: MatchRange[]; contextLines: number }
@@ -43,6 +46,7 @@ type OverlayMessage =
   | { type: 'results:start'; searchId: number }
   | { type: 'results:candidates'; searchId: number; candidates: Array<{ uri: string; relPath: string }>; total: number }
   | { type: 'results:file'; searchId: number; match: FileMatch }
+  | { type: 'results:batch'; searchId: number; matches: FileMatch[] }
   | {
       type: 'results:done';
       searchId: number;
@@ -74,6 +78,7 @@ type SearchSession = {
 
 export interface ShowOptions {
   forceLiteral?: boolean;
+  suppressSearch?: boolean;
 }
 
 type PendingShow = {
@@ -127,9 +132,23 @@ export class OverlayPanel {
   private capturePromise: Promise<void> | undefined;
   private backgroundCapturePromise: Promise<void> | undefined;
   private backgroundCaptureTimer: ReturnType<typeof setTimeout> | undefined;
+  private cdpIdleCloseTimer: ReturnType<typeof setTimeout> | undefined;
+  private cdpSearchIdleCloseTimer: ReturnType<typeof setTimeout> | undefined;
+  private monacoCaptureDisabledLogged = false;
+  private monacoCaptureStoppedForSession = false;
+  private rendererRecoveryUntil = 0;
   private searchSeq = 0;
   private currentSearchSession: SearchSession | undefined;
   private rendererPostChain: Promise<void> = Promise.resolve();
+  private localBridgeServer: http.Server | undefined;
+  private localBridgePort: number | undefined;
+  private localBridgePromise: Promise<void> | undefined;
+  private readonly localBridgeToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  private showSeq = 0;
+  private targetWindowMarkerText: string | undefined;
+  private targetWindowMarkerItem: vscode.StatusBarItem | undefined;
+  private disposePromise: Promise<void> | undefined;
+  private cdpCloseDeferredReasons = new Set<string>();
   // Per-source lastSeenSeq: each renderer patch install has its own instance
   // id (`__src`) and monotonic `__seq`. We dedup duplicates delivered by
   // accumulated CDP `message` listeners *within the same source*, but never
@@ -152,7 +171,7 @@ export class OverlayPanel {
     const version = (context.extension?.packageJSON?.version as string | undefined) ?? 'unknown';
     this.log = wrapLogWithPrefix(rawLog, version);
     context.subscriptions.push(rawLog);
-    context.subscriptions.push({ dispose: () => this.dispose() });
+    context.subscriptions.push({ dispose: () => { void this.dispose(); } });
     configureRipgrepInstall(context);
     void ensureRipgrepInstalled((msg) => this.log.appendLine(msg));
     this.trigramIndex = new TrigramIndex(context.globalStorageUri, this.log);
@@ -185,6 +204,18 @@ export class OverlayPanel {
         void this.trimSearchHistoryToLimit().then(() => this.postSearchHistoryToRenderer()).catch((err) => {
           this.log.appendLine(`search history limit update failed: ${err instanceof Error ? err.message : err}`);
         });
+      }
+      if (event.affectsConfiguration('intellijStyledSearch.disableMonacoCapture')) {
+        const disabled = this.isMonacoCaptureDisabled();
+        this.log.appendLine(`disableMonacoCapture changed: ${disabled}`);
+        this.monacoCaptureDisabledLogged = false;
+        if (disabled) {
+          void this.stopMonacoCapture('setting changed').catch((err) => {
+            this.log.appendLine(`stopMonacoCapture after setting change failed: ${err instanceof Error ? err.message : err}`);
+          });
+        } else {
+          this.monacoCaptureStoppedForSession = false;
+        }
       }
     }));
   }
@@ -246,43 +277,15 @@ export class OverlayPanel {
     });
   }
 
-  /** Kick CDP + patch install off the critical path of the first command. */
+  /** Warm search-only backends. CDP/renderer patching stays command-lazy. */
   async prewarm(): Promise<void> {
     try {
       const rgPath = findRipgrepPath();
       this.log.appendLine(`ripgrep: ${rgPath || '(not found — will fall back to JS scan)'}`);
-      await this.ensureInjected();
-      this.log.appendLine('Prewarm complete (CDP attached, patch installed).');
-      // Prepare Monaco capture in the background, but keep activation
-      // invisible: DOM scan only, no file open/close fallback here.
-      const windowIds = await this.listWorkbenchWindowIds();
-      let visibleEditorCount = 0;
-      await Promise.all(windowIds.map(async (id) => {
-        try {
-          const visibleEditors = await this.evalInWindow(
-            id,
-            `(function(){
-              try { return String(document.querySelectorAll('.editor-group-container .monaco-editor').length); }
-              catch (e) { return '0'; }
-            })()`,
-          );
-          visibleEditorCount += parseInt(visibleEditors, 10) || 0;
-        } catch {}
-      }));
-      if (visibleEditorCount > 0) {
-        if (windowIds.length > 1) {
-          this.log.appendLine(
-            `Prewarm: scheduling DOM-only Monaco warmup across ${windowIds.length} workbench windows ` +
-            `(${visibleEditorCount} visible editors).`,
-          );
-        }
-        this.scheduleBackgroundCaptureWarmup('activation', 300);
-      } else {
-        this.log.appendLine('Prewarm: skipping background Monaco warmup because no visible editors are open yet.');
-      }
       void this.zoektRuntime.prewarmIfPreferred().catch((err) => {
         this.log.appendLine(`zoek-rs prewarm failed: ${err instanceof Error ? err.message : err}`);
       });
+      this.log.appendLine('Prewarm complete (search backend only; CDP/Monaco capture disabled on activation).');
     } catch (err) {
       this.log.appendLine(`Prewarm failed: ${err instanceof Error ? err.message : err}`);
     }
@@ -290,10 +293,13 @@ export class OverlayPanel {
 
   private lastCaptureAttemptAt = 0;
   private lastBackgroundCaptureAttemptAt = 0;
-  /** Start Monaco capture after the overlay is attached. The first preview
-   * request awaits the same promise, so it does not render the non-editable
-   * DOM fallback just because capture is still racing in the background. */
+  /** Optional Monaco capture after the overlay is attached. Disabled by
+   * default because it touches VSCode renderer internals on the UI thread. */
   private scheduleLazyCapture(preferredWindowId?: number): void {
+    if (!this.isMonacoCaptureEnabled()) {
+      this.logMonacoCaptureDisabled('lazy');
+      return;
+    }
     void this.ensureMonacoCapture(preferredWindowId).catch((err) => {
       this.log.appendLine(`Monaco capture failed: ${err instanceof Error ? err.message : err}`);
     });
@@ -313,6 +319,10 @@ export class OverlayPanel {
   }
 
   private async ensureBackgroundMonacoWarmup(reason: string): Promise<void> {
+    if (!this.isMonacoCaptureEnabled()) {
+      this.logMonacoCaptureDisabled(`background:${reason}`);
+      return;
+    }
     await this.ensureRendererPatchAlive(undefined, `background:${reason}`);
     if (await this.isMonacoReadyAnywhere()) { return; }
     if (this.capturePromise) {
@@ -338,6 +348,10 @@ export class OverlayPanel {
   }
 
   private async ensureMonacoCapture(preferredWindowId?: number): Promise<void> {
+    if (!this.isMonacoCaptureEnabled()) {
+      this.logMonacoCaptureDisabled('foreground');
+      return;
+    }
     await this.ensureRendererPatchAlive(preferredWindowId, 'monaco-capture');
     if (preferredWindowId !== undefined && await this.isMonacoReadyInWindow(preferredWindowId)) { return; }
     if (preferredWindowId === undefined && await this.isMonacoReadyAnywhere()) { return; }
@@ -373,12 +387,245 @@ export class OverlayPanel {
     }
   }
 
+  private isMonacoCaptureEnabled(): boolean {
+    return !this.isMonacoCaptureDisabled();
+  }
+
+  private isMonacoCaptureDisabled(): boolean {
+    return this.monacoCaptureStoppedForSession || vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<boolean>('disableMonacoCapture', true);
+  }
+
+  private shouldCloseMainInspector(): boolean {
+    return vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<boolean>('closeMainInspectorAfterSearch', true);
+  }
+
+  private isRendererPerfDiagnosticsEnabled(): boolean {
+    return vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<boolean>('rendererPerfDiagnostics', false);
+  }
+
+  private isRendererSafetyDiagnosticsEnabled(): boolean {
+    return vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<boolean>('rendererSafetyDiagnostics', false);
+  }
+
+  private shouldSuspendIntelliSenseRecursionCapture(): boolean {
+    return vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<boolean>('suspendIntelliSenseRecursionCaptureDuringSearchUi', true);
+  }
+
+  private shouldEnableRendererInlayClickHook(): boolean {
+    return vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<boolean>('rendererInlayClickHook', false);
+  }
+
+  private shouldDisposeRendererPatchOnHide(): boolean {
+    return vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<boolean>('disposeRendererPatchOnHide', true);
+  }
+
+  private shouldKeepCdpOpenWhileSearchUiVisible(): boolean {
+    return vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<boolean>('keepCdpOpenWhileSearchUiVisible', true);
+  }
+
+  private shouldCloseInspectorForReason(reason: string): boolean {
+    if (!this.shouldCloseMainInspector()) { return false; }
+    // Closing Node's shared inspector from inside an active Runtime.evaluate
+    // drops the CDP socket before the response can arrive. Doing that while
+    // the Search UI is still visible made blank-panel typing fragile because
+    // each search result could race a forced inspector shutdown. Keep
+    // search/show idle cleanup to the client WebSocket only; panelHidden and
+    // explicit recovery still own full bridge/inspector teardown.
+    return /panel hidden|overlay disposed|renderer UI recovery|stop monaco capture|force reinject/i.test(reason);
+  }
+
+  private logMonacoCaptureDisabled(reason: string): void {
+    if (this.monacoCaptureDisabledLogged) { return; }
+    this.monacoCaptureDisabledLogged = true;
+    this.log.appendLine(
+      `Monaco capture disabled (${reason}); previews use DOM fallback to avoid CDP/prototype work on the VSCode UI thread.`,
+    );
+  }
+
+  private getExpectedWorkspaceName(): string {
+    return vscode.workspace.name || vscode.workspace.workspaceFolders?.[0]?.name || '';
+  }
+
+  private beginTargetWindowMarker(): vscode.Disposable {
+    try { this.targetWindowMarkerItem?.dispose(); } catch {}
+    const marker = `IJSS-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const item = vscode.window.createStatusBarItem(
+      `intellijStyledSearch.target.${marker}`,
+      vscode.StatusBarAlignment.Left,
+      100000,
+    );
+    item.text = `$(search) ${marker}`;
+    item.name = marker;
+    item.tooltip = marker;
+    item.accessibilityInformation = { label: marker, role: 'status' };
+    item.show();
+    const message = vscode.window.setStatusBarMessage(marker);
+    this.targetWindowMarkerText = marker;
+    this.targetWindowMarkerItem = item;
+    return new vscode.Disposable(() => {
+      if (this.targetWindowMarkerItem === item) {
+        this.targetWindowMarkerItem = undefined;
+        this.targetWindowMarkerText = undefined;
+      }
+      try { message.dispose(); } catch {}
+      try { item.dispose(); } catch {}
+    });
+  }
+
+  private buildTargetMarkerProbeExpression(markerText: string): string {
+    return `
+      (function () {
+        try {
+          var needle = ${JSON.stringify(markerText)};
+          function has(value) {
+            return typeof value === 'string' && value.indexOf(needle) >= 0;
+          }
+          function hasAttrs(el) {
+            try {
+              return !!el && (
+                has(el.id) ||
+                has(typeof el.className === 'string' ? el.className : '') ||
+                has(el.getAttribute && el.getAttribute('aria-label')) ||
+                has(el.getAttribute && el.getAttribute('title')) ||
+                has(el.getAttribute && el.getAttribute('data-id')) ||
+                has(el.getAttribute && el.getAttribute('data-keybinding-context'))
+              );
+            } catch (eAttrs) {
+              return false;
+            }
+          }
+          function hasNodeText(el) {
+            try {
+              return !!el && has(el.textContent);
+            } catch (eText) {
+              return false;
+            }
+          }
+          if (!needle || !document) { return false; }
+          var roots = [];
+          var rootSelectors = [
+            '.monaco-workbench .part.statusbar',
+            '.part.statusbar',
+            '.monaco-workbench .statusbar',
+            '[id="workbench.parts.statusbar"]'
+          ];
+          for (var rs = 0; rs < rootSelectors.length; rs++) {
+            try {
+              var root = document.querySelector(rootSelectors[rs]);
+              if (root && roots.indexOf(root) < 0) { roots.push(root); }
+            } catch (eRoot) {}
+          }
+          if (roots.length === 0) {
+            var direct = document.querySelectorAll('.statusbar-item, .statusbar-entry');
+            for (var d = 0; d < direct.length && d < 80; d++) {
+              if (hasAttrs(direct[d]) || hasNodeText(direct[d])) { return true; }
+            }
+            return false;
+          }
+          for (var r = 0; r < roots.length; r++) {
+            if (hasAttrs(roots[r]) || hasNodeText(roots[r])) { return true; }
+            var nodes = roots[r].querySelectorAll ? roots[r].querySelectorAll('*') : [];
+            for (var i = 0; i < nodes.length && i < 500; i++) {
+              if (hasAttrs(nodes[i]) || hasNodeText(nodes[i])) { return true; }
+            }
+          }
+          return false;
+        } catch (e) {
+          return false;
+        }
+      })()
+    `.trim();
+  }
+
+  private async resolveTargetWorkbenchWindowId(preferredWindowId?: number): Promise<number | undefined> {
+    const requestedWindowId = preferredWindowId ?? this.activeWindowId;
+    const workspaceName = this.getExpectedWorkspaceName();
+    const markerText = this.targetWindowMarkerText || '';
+    const markerProbeExpr = this.buildTargetMarkerProbeExpression(markerText);
+    const script = `
+      (async function () {
+        var BW = require('electron').BrowserWindow;
+        var requestedWindowId = ${requestedWindowId === undefined ? 'undefined' : JSON.stringify(requestedWindowId)};
+        var expectedWorkspaceName = ${JSON.stringify(workspaceName)};
+        var expectedWorkspaceNameLower = expectedWorkspaceName.toLowerCase();
+        var markerText = ${JSON.stringify(markerText)};
+        var markerProbeExpr = ${JSON.stringify(markerProbeExpr)};
+        function isWorkbench(win) {
+          try {
+            var url = (win.webContents && win.webContents.getURL && win.webContents.getURL()) || '';
+            return /workbench\\.(?:esm\\.)?html(?:\\?|#|$)/.test(url);
+          } catch (e) { return false; }
+        }
+        function getWorkbenchWindows() {
+          var wins = BW.getAllWindows();
+          var workbenches = [];
+          for (var i = 0; i < wins.length; i++) {
+            if (isWorkbench(wins[i])) { workbenches.push(wins[i]); }
+          }
+          return workbenches;
+        }
+        function titleMatchesWorkspace(win) {
+          if (!expectedWorkspaceNameLower) { return true; }
+          try {
+            var title = (win.getTitle && win.getTitle()) || '';
+            return title.toLowerCase().indexOf(expectedWorkspaceNameLower) >= 0;
+          } catch (e) { return false; }
+        }
+        async function hasMarker(win) {
+          if (!markerText) { return false; }
+          try {
+            return await win.webContents.executeJavaScript(markerProbeExpr, true) === true;
+          } catch (e) { return false; }
+        }
+        if (typeof requestedWindowId === 'number') {
+          var requested = BW.fromId(requestedWindowId);
+          if (requested && isWorkbench(requested) && (!markerText || await hasMarker(requested))) { return requested.id; }
+        }
+        var wins = getWorkbenchWindows();
+        if (markerText) {
+          for (var m = 0; m < wins.length; m++) {
+            if (await hasMarker(wins[m])) { return wins[m].id; }
+          }
+          if (wins.length === 1) { return wins[0].id; }
+          return 0;
+        }
+        var focused = BW.getFocusedWindow();
+        if (focused && isWorkbench(focused) && titleMatchesWorkspace(focused)) { return focused.id; }
+        var firstWorkbench = null;
+        for (var i = 0; i < wins.length; i++) {
+          if (!isWorkbench(wins[i])) { continue; }
+          if (!firstWorkbench) { firstWorkbench = wins[i]; }
+          if (titleMatchesWorkspace(wins[i])) { return wins[i].id; }
+        }
+        return firstWorkbench ? firstWorkbench.id : 0;
+      })()
+    `.trim();
+    try {
+      const resp = await this.send('Runtime.evaluate', {
+        expression: script,
+        awaitPromise: true,
+        returnByValue: true,
+        includeCommandLineAPI: true,
+      });
+      const id = Number(resp?.result?.value ?? 0);
+      return Number.isFinite(id) && id > 0 ? id : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async isMonacoReadyAnywhere(): Promise<boolean> {
     try {
-      const wins = await this.listWorkbenchWindowIds();
-      for (const id of wins) {
-        if (await this.isMonacoReadyInWindow(id)) { return true; }
-      }
+      const id = await this.resolveTargetWorkbenchWindowId();
+      return id !== undefined ? this.isMonacoReadyInWindow(id) : false;
     } catch {}
     return false;
   }
@@ -386,7 +633,7 @@ export class OverlayPanel {
   private async isRendererPatchedInWindow(winId: number): Promise<boolean> {
     try {
       const r = await this.evalInWindow(winId,
-        `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&window.__ijFindStatus?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`,
+        `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&window.__ijFindStatus&&window.__ijFindPatchVersion===${RENDERER_PATCH_VERSION}?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`,
       );
       return r === 'ready';
     } catch {
@@ -396,10 +643,8 @@ export class OverlayPanel {
 
   private async isRendererPatchedAnywhere(): Promise<boolean> {
     try {
-      const wins = await this.listWorkbenchWindowIds();
-      for (const id of wins) {
-        if (await this.isRendererPatchedInWindow(id)) { return true; }
-      }
+      const id = await this.resolveTargetWorkbenchWindowId();
+      return id !== undefined ? this.isRendererPatchedInWindow(id) : false;
     } catch {}
     return false;
   }
@@ -422,8 +667,8 @@ export class OverlayPanel {
    *  within `timeoutMs` — the caller typically forces a reinject at that
    *  point. */
   private async verifyBridgeAlive(timeoutMs = 400): Promise<boolean> {
-    const wins = await this.listWorkbenchWindowIds();
-    if (wins.length === 0) { return false; }
+    const winId = await this.resolveTargetWorkbenchWindowId(this.activeWindowId);
+    if (winId === undefined) { return false; }
     const pingId = '__ij-bridge-ping-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
     const pong = new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => {
@@ -433,10 +678,9 @@ export class OverlayPanel {
       this.bridgePings.set(pingId, () => { clearTimeout(timer); resolve(true); });
     });
     const expr = `try { globalThis.irSearchEvent && globalThis.irSearchEvent(JSON.stringify({type:'log',msg:${JSON.stringify(pingId)}})); } catch (e) {}`;
-    // Fire the ping into whichever window is first — bridges forward
-    // from ANY window back to the ext host, so one ping is enough to
-    // prove the chain is alive.
-    try { await this.evalInWindow(wins[0], expr); }
+    // Fire the ping only into this extension host's target workbench. Pinging
+    // every VS Code window made one search panel heat unrelated renderers.
+    try { await this.evalInWindow(winId, expr); }
     catch { return false; }
     return pong;
   }
@@ -471,9 +715,10 @@ export class OverlayPanel {
     this.log.appendLine(
       `Capture diagnostic: starting (reason=${reason}, forceOpen=${allowForceOpen ? 'yes' : 'no'})...`,
     );
-    const windowIds = await this.listWorkbenchWindowIds();
+    const targetWindowId = await this.resolveTargetWorkbenchWindowId(preferredWindowId);
+    const windowIds = targetWindowId === undefined ? [] : [targetWindowId];
     this.log.appendLine(
-      `Workbench windows: [${windowIds.join(', ')}]` +
+      `Target workbench windows: [${windowIds.join(', ')}]` +
       (preferredWindowId !== undefined ? ` preferred=${preferredWindowId}` : ''),
     );
     if (windowIds.length === 0) { return; }
@@ -679,6 +924,7 @@ export class OverlayPanel {
         this.log.appendLine(
           'Capture warmup: DOM scan did not yield a ready Monaco; skipping force-open and leaving normal foreground capture path intact.',
         );
+        await stopCaptureAll();
         return;
       }
       this.log.appendLine('Captures cleared — no DOM-visible widgets, forcing real editor creation via file open/close...');
@@ -686,11 +932,11 @@ export class OverlayPanel {
       let tFind = 0, tShow = 0, tPoll = 0, tClose = 0, pollIters = 0, pollPeekMaxMs = 0;
       try {
         const tFind0 = Date.now();
-        const candidates = await vscode.workspace.findFiles(
-          '**/*.{json,md,txt,ts,js,py}',
-          '{**/node_modules/**,**/.git/**}',
-          1,
-        );
+        const candidates = await findWorkspaceFilesDirect({
+          excludeGlobs: ['**/node_modules/**', '**/.git/**'],
+          extensions: new Set(['.json', '.md', '.txt', '.ts', '.js', '.py']),
+          maxResults: 1,
+        });
         tFind = Date.now() - tFind0;
         if (candidates.length > 0) {
           // Record which tabs already existed so we DON'T close them when
@@ -810,6 +1056,7 @@ export class OverlayPanel {
       await stopCaptureAll();
     } catch (err) {
       this.log.appendLine(`Capture diagnostic failed: ${err instanceof Error ? err.message : err}`);
+      try { await stopCaptureAll(); } catch {}
     }
   }
 
@@ -996,10 +1243,22 @@ export class OverlayPanel {
    *  to probe `window.__ijFindStatus` and similar. Throws if the overlay
    *  hasn't latched onto a window yet (call `show()` first). */
   async evalInActiveWindowForTests(jsExpr: string): Promise<string> {
-    if (this.activeWindowId === undefined) {
+    const resolved = await this.resolveTargetWorkbenchWindowId(this.activeWindowId);
+    if (resolved === undefined) {
       throw new Error('no active workbench window — call overlay.show(...) first');
     }
-    return this.evalInWindow(this.activeWindowId, jsExpr);
+    this.activeWindowId = resolved;
+    const result = await this.evalInWindow(resolved, jsExpr);
+    if (!/^no-window:|^err:No target with given id found\b/.test(result)) {
+      return result;
+    }
+    this.activeWindowId = undefined;
+    const retryWindowId = await this.resolveTargetWorkbenchWindowId();
+    if (retryWindowId === undefined || retryWindowId === resolved) {
+      return result;
+    }
+    this.activeWindowId = retryWindowId;
+    return this.evalInWindow(retryWindowId, jsExpr);
   }
 
   /** @internal Forcibly close the current CDP WebSocket — simulates the
@@ -1051,11 +1310,178 @@ export class OverlayPanel {
   async forceReinject(): Promise<void> {
     this.log.appendLine('Forcing reinject...');
     if (this.ws) {
-      try { this.ws.close(); } catch {}
-      this.ws = undefined;
+      try { await this.releaseRendererBridge('force reinject', undefined, 1500); }
+      catch (err) { this.log.appendLine(`forceReinject release failed: ${err instanceof Error ? err.message : err}`); }
+      if (this.ws) {
+        this.closeCdpWebSocket('force reinject');
+      }
     }
     this.injectPromise = undefined;
     await this.ensureInjected();
+  }
+
+  async recoverRendererUi(reason = 'manual'): Promise<string> {
+    this.log.appendLine(`Recovering renderer UI (${reason})...`);
+    this.rendererRecoveryUntil = Date.now() + 1000;
+    this.cancelActive();
+    this.currentSearchSession = undefined;
+    this.pendingShow = null;
+    this.cancelCdpIdleClose();
+    this.cancelCdpSearchIdleClose();
+    this.zoektRuntime.cancelRunningProcesses('renderer UI recovery');
+    this.rendererPostChain = Promise.resolve();
+    this.disableMonacoCaptureForSession(`recover:${reason}`);
+    const rendererReport = await this.tryRendererEmergencyRecoverViaExistingBridge(`recover:${reason}`);
+    const bridgeReport = await this.releaseRendererBridgeSafely('renderer UI recovery', 1000);
+    this.activeWindowId = undefined;
+    return [
+      'active-search=cancelled',
+      'future-monaco-capture=disabled',
+      rendererReport,
+      bridgeReport,
+      'new-cdp=not-opened',
+    ].join('; ');
+  }
+
+  async stopMonacoCapture(reason = 'manual'): Promise<string> {
+    this.log.appendLine(`Stopping Monaco capture (${reason})...`);
+    this.disableMonacoCaptureForSession(reason);
+    const bridgeReport = await this.releaseRendererBridgeSafely(`stop monaco capture:${reason}`, 1000);
+    return [
+      'future-monaco-capture=disabled',
+      bridgeReport,
+      'new-cdp=not-opened',
+    ].join('; ');
+  }
+
+  private disableMonacoCaptureForSession(reason: string): void {
+    this.monacoCaptureStoppedForSession = true;
+    this.monacoCaptureDisabledLogged = false;
+    if (this.backgroundCaptureTimer) {
+      clearTimeout(this.backgroundCaptureTimer);
+      this.backgroundCaptureTimer = undefined;
+    }
+    this.log.appendLine(`Monaco capture disabled for this extension-host session (${reason}).`);
+  }
+
+  private async ensureLocalBridgeServer(): Promise<{ port: number; token: string }> {
+    if (this.localBridgeServer && this.localBridgePort !== undefined) {
+      return { port: this.localBridgePort, token: this.localBridgeToken };
+    }
+    if (!this.localBridgePromise) {
+      this.localBridgePromise = new Promise<void>((resolve, reject) => {
+        const server = http.createServer((req, res) => {
+          void this.handleLocalBridgeRequest(req, res);
+        });
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', () => {
+          const addr = server.address();
+          if (!addr || typeof addr === 'string') {
+            try { server.close(); } catch {}
+            reject(new Error('local bridge did not receive a TCP port'));
+            return;
+          }
+          server.removeListener('error', reject);
+          this.localBridgeServer = server;
+          this.localBridgePort = addr.port;
+          this.log.appendLine(`Renderer event bridge listening on 127.0.0.1:${addr.port}`);
+          resolve();
+        });
+      }).finally(() => {
+        this.localBridgePromise = undefined;
+      });
+    }
+    await this.localBridgePromise;
+    if (!this.localBridgeServer || this.localBridgePort === undefined) {
+      throw new Error('local renderer bridge failed to start');
+    }
+    return { port: this.localBridgePort, token: this.localBridgeToken };
+  }
+
+  private async handleLocalBridgeRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    try {
+      if (req.method !== 'POST' || req.url !== '/ijss-bridge') {
+        res.writeHead(404).end();
+        return;
+      }
+      if (String(req.headers['x-ijss-token'] || '') !== this.localBridgeToken) {
+        res.writeHead(403).end();
+        return;
+      }
+      const body = await readRequestBody(req, 20 * 1024 * 1024);
+      this.handleRendererEvent(body);
+      res.writeHead(204).end();
+    } catch (err) {
+      this.log.appendLine(`local renderer bridge failed: ${err instanceof Error ? err.message : err}`);
+      try { res.writeHead(500).end(); } catch {}
+    }
+  }
+
+  private closeLocalBridgeServer(reason: string): void {
+    if (!this.localBridgeServer) { return; }
+    try { this.localBridgeServer.close(); } catch {}
+    this.localBridgeServer = undefined;
+    this.localBridgePort = undefined;
+    this.log.appendLine(`Renderer event bridge closed (${reason})`);
+  }
+
+  private async tryRendererEmergencyRecoverViaExistingBridge(reason: string): Promise<string> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.activeWindowId === undefined) {
+      return 'renderer=not-contacted(no-active-bridge)';
+    }
+    const recoverExpr = `(function(){
+      try {
+        if (window.__ijFindEmergencyRecover) {
+          return 'emergency=' + window.__ijFindEmergencyRecover(${JSON.stringify(reason)});
+        }
+        if (window.__ijFindHide) {
+          window.__ijFindHide();
+          return 'hide=ok';
+        }
+        return 'no-recover-fn';
+      } catch (e) {
+        return 'recover-err:' + (e && e.message);
+      }
+    })()`;
+    const script = `
+      (async function () {
+        var BW = require('electron').BrowserWindow;
+        var w = BW.fromId(${this.activeWindowId});
+        if (!w || !w.webContents) { return 'no-window'; }
+        try {
+          var value = await w.webContents.executeJavaScript(${JSON.stringify(recoverExpr)}, true);
+          return value === undefined || value === null ? 'no-result' : String(value);
+        } catch (e) {
+          return 'renderer-recover-err:' + (e && e.message);
+        }
+      })()
+    `.trim();
+    try {
+      const resp = await this.send('Runtime.evaluate', {
+        expression: script,
+        awaitPromise: true,
+        returnByValue: true,
+        includeCommandLineAPI: true,
+      }, 800);
+      return `renderer=${String(resp?.result?.value ?? '(no result)')}`;
+    } catch (err) {
+      return `renderer=recover-failed:${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  private async releaseRendererBridgeSafely(reason: string, timeoutMs: number): Promise<string> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.closeCdpWebSocket(`safe release skipped:${reason}`);
+      return 'bridge=no-active-bridge';
+    }
+    try {
+      const report = await this.releaseRendererBridge(reason, undefined, timeoutMs);
+      return `bridge=${report}`;
+    } catch (err) {
+      this.log.appendLine(`Renderer bridge safe release failed (${reason}): ${err instanceof Error ? err.message : err}`);
+      this.closeCdpWebSocket(`safe release failed:${reason}`);
+      return `bridge=release-failed:${err instanceof Error ? err.message : String(err)}`;
+    }
   }
 
   private rebuildInFlight = false;
@@ -1189,6 +1615,9 @@ export class OverlayPanel {
   }
 
   async show(initialQuery: string, options?: ShowOptions): Promise<void> {
+    this.rendererRecoveryUntil = 0;
+    this.cancelCdpIdleClose();
+    this.cancelCdpSearchIdleClose();
     // Coalesce a burst of command invocations (user mashing a shortcut)
     // into one effective show; we just remember the last query.
     this.pendingShow = { query: initialQuery, options };
@@ -1205,59 +1634,156 @@ export class OverlayPanel {
     }
   }
 
+  async showStaticResults(initialQuery: string, matches: FileMatch[]): Promise<void> {
+    this.cancelActive();
+    this.currentSearchSession = undefined;
+    await this.show(initialQuery, { forceLiteral: true, suppressSearch: true });
+    const searchId = ++this.searchSeq;
+    const totalMatches = matches.reduce((sum, match) => sum + match.matches.length, 0);
+    await this.postToRenderer({ type: 'results:start', searchId });
+      const batchSize = 64;
+    for (let i = 0; i < matches.length; i += batchSize) {
+      await this.postToRenderer({
+        type: 'results:batch',
+        searchId,
+        matches: matches.slice(i, i + batchSize),
+      });
+    }
+    await this.postToRenderer({
+      type: 'results:done',
+      searchId,
+      totalFiles: matches.length,
+      totalMatches,
+      truncated: false,
+      pageSize: Math.max(totalMatches, getConfiguredResultLimit()),
+      pageFiles: matches.length,
+      pageMatches: totalMatches,
+      offset: 0,
+    });
+    this.scheduleCdpSearchIdleClose('static-results-done');
+  }
+
   private async doShow(initialQuery: string, options: ShowOptions = {}): Promise<void> {
     const tShow = Date.now();
     this.log.appendLine(
       `doShow: initialQueryLen=${initialQuery.length} preview=${JSON.stringify(initialQuery.slice(0, 80))}`,
     );
+    const targetMarker = this.beginTargetWindowMarker();
     try {
+      await delay(150);
+      const showSeq = ++this.showSeq;
       await this.ensureInjected();
-      // Bridge state in the main process can go stale between command
-      // invocations — another extension may detach webContents.debugger,
-      // our bridge listener may be dropped, or a test VSCode instance may
-      // have contended for the same inspector port. A quick ping catches
-      // these cases so we can force-reinject before the user sees a
-      // broken search pane. Ping timeout tightened from 400ms→100ms:
-      // local CDP roundtrip is ~20-50ms, so 100ms still catches a dead
-      // bridge but shaves ~300ms off every "bridge alive" invocation —
-      // that latency was the visible gap between the user hitting the
-      // search shortcut and the overlay appearing.
-      const alive = await this.verifyBridgeAlive(100);
-      if (!alive) {
-        this.log.appendLine('Bridge ping failed — forcing reinject before show');
-        try { await this.forceReinject(); }
-        catch (err) { this.log.appendLine(`forceReinject threw: ${err instanceof Error ? err.message : err}`); }
-      }
       const tInjected = Date.now();
-      // Single-roundtrip fast path: in one CDP message we locate the focused
-      // workbench window, send __ijFindShow into it (awaited), and fire-and-
-      // forget __ijFindHide into every other window. Prior version did three
-      // serial roundtrips and cost ~200–400 ms of visible lag on cold start.
-      const showExpr = `(function(){ try { return window.__ijFindShow ? window.__ijFindShow(${JSON.stringify(initialQuery)}, ${JSON.stringify(options)}) : 'no-show-fn'; } catch (e) { return 'show-throw:' + (e && e.message); } })()`;
-      const hideExpr = `try { window.__ijFindHide && window.__ijFindHide(); } catch (e) {}`;
-      const workspaceName = vscode.workspace.name || vscode.workspace.workspaceFolders?.[0]?.name || '';
-      const script = `
-        (async function () {
-          var BW = require('electron').BrowserWindow;
-          var expectedWorkspaceName = ${JSON.stringify(workspaceName)};
-          var expectedWorkspaceNameLower = expectedWorkspaceName.toLowerCase();
-          function isWorkbench(win) {
-            try {
-              var url = (win.webContents && win.webContents.getURL && win.webContents.getURL()) || '';
-              return /workbench\\.(?:esm\\.)?html/.test(url);
-            } catch (e) { return false; }
+      let v = await this.evaluateShowInFocusedWindow(initialQuery, options);
+      // Brand-new VSCode windows may have missed the initial patch run
+      // because their renderer wasn't ready yet ("No target available" in
+      // the Injection log). Detect that via `no-show-fn` and run the patch
+      // script again — already-patched windows no-op with 'already patched'.
+      if (v && v.fid && v.result === 'no-show-fn') {
+        this.log.appendLine(`Show(win=${v.fid}): missing patch, re-running inject script...`);
+        try {
+          const report = await this.runPatchScript(v.fid);
+          this.log.appendLine(`Re-inject: ${report}`);
+        } catch (e) {
+          this.log.appendLine(`Re-inject failed: ${e instanceof Error ? e.message : e}`);
+        }
+        v = await this.evaluateShowInFocusedWindow(initialQuery, options);
+      }
+      if (!v || !v.fid) {
+        this.log.appendLine('show() aborted: no focused VSCode window');
+        return;
+      }
+      this.activeWindowId = v.fid;
+      this.cdpCloseDeferredReasons.clear();
+      this.cancelCdpIdleClose();
+      const tRendered = Date.now();
+      this.log.appendLine(
+        `Show(win=${v.fid}): ${v.result} [ensureInjected=${tInjected - tShow}ms showEval=${tRendered - tInjected}ms total=${tRendered - tShow}ms]`,
+      );
+      if (this.isRendererSafetyDiagnosticsEnabled()) {
+        void this.probeRendererSafety('show-complete', 700);
+      }
+      void this.postSearchHistoryToRenderer().catch((err) => {
+        this.log.appendLine(`post search history failed: ${err instanceof Error ? err.message : err}`);
+      });
+      // After the overlay is visible, kick off Monaco capture for the same
+      // renderer window that owns the preview pane. requestPreview awaits
+      // this when needed, so the first preview can mount as Monaco instead
+      // of permanently rendering the non-editable DOM fallback.
+      this.scheduleLazyCapture(v.fid);
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.scheduleBridgeRepairAfterVisible(showSeq, initialQuery, options);
+        this.scheduleCdpSearchIdleClose('show-idle', initialQuery || options.suppressSearch ? 900 : 250);
+      }
+      if (this.shouldAutoCloseCdpForTests()) {
+        this.scheduleCdpIdleClose(v.fid);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log.appendLine(`show() failed: ${err instanceof Error ? err.stack : msg}`);
+      vscode.window.showErrorMessage(`IntelliJ Styled Search: ${msg}`);
+    } finally {
+      targetMarker.dispose();
+    }
+  }
+
+  private async evaluateShowInFocusedWindow(
+    initialQuery: string,
+    options: ShowOptions,
+  ): Promise<{ fid: number; result: string } | undefined> {
+    // Single-roundtrip fast path: in one CDP message we locate this extension
+    // host's focused/matching workbench window and send __ijFindShow into it.
+    // Do not touch other windows; cross-window hide/evaluate made unrelated
+    // VS Code renderers slow when one window opened Search UI.
+    const showExpr = `(function(){ try { return window.__ijFindShow ? window.__ijFindShow(${JSON.stringify(initialQuery)}, ${JSON.stringify(options)}) : 'no-show-fn'; } catch (e) { return 'show-throw:' + (e && e.message); } })()`;
+    const workspaceName = vscode.workspace.name || vscode.workspace.workspaceFolders?.[0]?.name || '';
+    const markerText = this.targetWindowMarkerText || '';
+    const markerProbeExpr = this.buildTargetMarkerProbeExpression(markerText);
+    const script = `
+      (async function () {
+        var BW = require('electron').BrowserWindow;
+        var expectedWorkspaceName = ${JSON.stringify(workspaceName)};
+        var expectedWorkspaceNameLower = expectedWorkspaceName.toLowerCase();
+        var markerText = ${JSON.stringify(markerText)};
+        var markerProbeExpr = ${JSON.stringify(markerProbeExpr)};
+        function isWorkbench(win) {
+          try {
+            var url = (win.webContents && win.webContents.getURL && win.webContents.getURL()) || '';
+            return /workbench\\.(?:esm\\.)?html/.test(url);
+          } catch (e) { return false; }
+        }
+        function getWorkbenchWindows() {
+          var wins = BW.getAllWindows();
+          var workbenches = [];
+          for (var i = 0; i < wins.length; i++) {
+            if (isWorkbench(wins[i])) { workbenches.push(wins[i]); }
           }
-          function titleMatchesWorkspace(win) {
-            if (!expectedWorkspaceNameLower) { return true; }
-            try {
-              var title = (win.getTitle && win.getTitle()) || '';
-              return title.toLowerCase().indexOf(expectedWorkspaceNameLower) >= 0;
-            } catch (e) { return false; }
+          return workbenches;
+        }
+        function titleMatchesWorkspace(win) {
+          if (!expectedWorkspaceNameLower) { return true; }
+          try {
+            var title = (win.getTitle && win.getTitle()) || '';
+            return title.toLowerCase().indexOf(expectedWorkspaceNameLower) >= 0;
+          } catch (e) { return false; }
+        }
+        async function hasMarker(win) {
+          if (!markerText) { return false; }
+          try {
+            return await win.webContents.executeJavaScript(markerProbeExpr, true) === true;
+          } catch (e) { return false; }
+        }
+        var focused = null;
+        var ws = getWorkbenchWindows();
+        if (markerText) {
+          for (var m = 0; m < ws.length; m++) {
+            if (await hasMarker(ws[m])) { focused = ws[m]; break; }
           }
-          var focused = BW.getFocusedWindow();
+          if (!focused && ws.length === 1) { focused = ws[0]; }
+        } else {
+          focused = BW.getFocusedWindow();
           var focusedUsable = focused && isWorkbench(focused) && titleMatchesWorkspace(focused);
           if (!focusedUsable) {
-            var ws = BW.getAllWindows();
             var firstWorkbench = null;
             var matchingWorkbench = null;
             for (var i = 0; i < ws.length; i++) {
@@ -1267,90 +1793,15 @@ export class OverlayPanel {
             }
             focused = matchingWorkbench || (focused && isWorkbench(focused) ? focused : firstWorkbench);
           }
-          if (!focused) { return { fid: 0, result: 'no-focus' }; }
-          var fid = focused.id;
-          var showR;
-          try {
-            var r = await focused.webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(showExpr)}, returnByValue: true });
-            if (r && r.exceptionDetails) {
-              showR = 'exc:' + ((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text || '').split('\\n')[0].slice(0, 150);
-            } else {
-              showR = (r && r.result && r.result.value) || 'ok';
-            }
-          } catch (e) { showR = 'show-err:' + (e && e.message); }
-          var wins = BW.getAllWindows();
-          for (var j = 0; j < wins.length; j++) {
-            if (wins[j].id === fid) { continue; }
-            try { wins[j].webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(hideExpr)} }); } catch (e) {}
-          }
-          return { fid: fid, result: String(showR) };
-        })()
-      `.trim();
-      let resp = await this.send('Runtime.evaluate', {
-        expression: script,
-        awaitPromise: true,
-        returnByValue: true,
-        includeCommandLineAPI: true,
-      });
-      let v = resp?.result?.value as { fid: number; result: string } | undefined;
-      // Brand-new VSCode windows may have missed the initial patch run
-      // because their renderer wasn't ready yet ("No target available" in
-      // the Injection log). Detect that via `no-show-fn` and run the patch
-      // script again — already-patched windows no-op with 'already patched'.
-      if (v && v.fid && v.result === 'no-show-fn') {
-        this.log.appendLine(`Show(win=${v.fid}): missing patch, re-running inject script...`);
-        try {
-          const report = await this.runPatchScript();
-          this.log.appendLine(`Re-inject: ${report}`);
-        } catch (e) {
-          this.log.appendLine(`Re-inject failed: ${e instanceof Error ? e.message : e}`);
         }
-        resp = await this.send('Runtime.evaluate', {
-          expression: script,
-          awaitPromise: true,
-          returnByValue: true,
-          includeCommandLineAPI: true,
-        });
-        v = resp?.result?.value as { fid: number; result: string } | undefined;
-      }
-      if (!v || !v.fid) {
-        this.log.appendLine('show() aborted: no focused VSCode window');
-        return;
-      }
-      this.activeWindowId = v.fid;
-      const tRendered = Date.now();
-      this.log.appendLine(
-        `Show(win=${v.fid}): ${v.result} [ensureInjected=${tInjected - tShow}ms showEval=${tRendered - tInjected}ms total=${tRendered - tShow}ms]`,
-      );
-      void this.postSearchHistoryToRenderer().catch((err) => {
-        this.log.appendLine(`post search history failed: ${err instanceof Error ? err.message : err}`);
-      });
-      // After the overlay is visible, kick off Monaco capture for the same
-      // renderer window that owns the preview pane. requestPreview awaits
-      // this when needed, so the first preview can mount as Monaco instead
-      // of permanently rendering the non-editable DOM fallback.
-      this.scheduleLazyCapture(v.fid);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.log.appendLine(`show() failed: ${err instanceof Error ? err.stack : msg}`);
-      vscode.window.showErrorMessage(`IntelliJ Styled Search: ${msg}`);
-    }
-  }
-
-  private async evalInWindow(winId: number, expr: string): Promise<string> {
-    const script = `
-      (async function () {
-        var BW = require('electron').BrowserWindow;
-        var w = BW.fromId(${winId});
-        if (!w || !w.webContents) { return 'no-window:' + ${winId}; }
+        if (!focused) { return { fid: 0, result: 'no-focus' }; }
+        var fid = focused.id;
+        var showR;
         try {
-          var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(expr)}, returnByValue: true });
-          if (r && r.exceptionDetails) {
-            return 'exc:' + ((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text || '').split('\\n')[0].slice(0, 200);
-          }
-          var v = (r && r.result) ? r.result.value : undefined;
-          return v === undefined ? '' : String(v);
-        } catch (e) { return 'err:' + (e && e.message); }
+          showR = await focused.webContents.executeJavaScript(${JSON.stringify(showExpr)}, true);
+          if (showR === undefined || showR === null || showR === '') { showR = 'ok'; }
+        } catch (e) { showR = 'show-err:' + (e && e.message); }
+        return { fid: fid, result: String(showR) };
       })()
     `.trim();
     const resp = await this.send('Runtime.evaluate', {
@@ -1359,27 +1810,151 @@ export class OverlayPanel {
       returnByValue: true,
       includeCommandLineAPI: true,
     });
+    return resp?.result?.value as { fid: number; result: string } | undefined;
+  }
+
+  private scheduleBridgeRepairAfterVisible(
+    showSeq: number,
+    initialQuery: string,
+    options: ShowOptions,
+  ): void {
+    void this.repairBridgeAfterVisible(showSeq, initialQuery, options).catch((err) => {
+      this.log.appendLine(`post-show bridge repair failed: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  private shouldAutoCloseCdpForTests(): boolean {
+    return process.env.CODEX_CI === '1' || process.env.VSCODE_TEST === '1';
+  }
+
+  private async repairBridgeAfterVisible(
+    showSeq: number,
+    initialQuery: string,
+    options: ShowOptions,
+  ): Promise<void> {
+    // Keep the panel paint path short: verify/recover the renderer bridge
+    // after the UI is visible. If the first search event was lost while the
+    // bridge was stale, replaying show() below fires it again.
+    if (!initialQuery || options.suppressSearch) { return; }
+    await delay(900);
+    if (showSeq !== this.showSeq) { return; }
+    if (this.activeSearch || this.currentSearchSession) { return; }
+    this.log.appendLine('No renderer search event after show — forcing reinject and replaying visible query');
+    await this.forceReinject();
+    if (showSeq !== this.showSeq) { return; }
+    const replay = await this.evaluateShowInFocusedWindow(initialQuery, options);
+    if (showSeq !== this.showSeq) { return; }
+    if (replay && replay.fid) {
+      this.activeWindowId = replay.fid;
+      this.log.appendLine(`Bridge repair replay show(win=${replay.fid}): ${replay.result}`);
+      this.scheduleLazyCapture(replay.fid);
+    }
+  }
+
+  private async evalInWindow(winId: number, expr: string, timeoutMs = 10_000): Promise<string> {
+    const script = `
+      (async function () {
+        var BW = require('electron').BrowserWindow;
+        var w = BW.fromId(${winId});
+        if (!w || !w.webContents) { return 'no-window:' + ${winId}; }
+        try {
+          var v = await w.webContents.executeJavaScript(${JSON.stringify(expr)}, true);
+          return v === undefined ? '' : String(v);
+        } catch (e) { return 'err:' + (e && e.message); }
+      })()
+    `.trim();
+    const resp = await this.send('Runtime.evaluate', {
+        expression: script,
+        awaitPromise: true,
+        returnByValue: true,
+        includeCommandLineAPI: true,
+    }, timeoutMs);
     const value = resp?.result?.value;
     return typeof value === 'string' ? value : String(value ?? '');
   }
 
+  private async probeRendererSafety(reason: string, timeoutMs = 700): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) { return; }
+    const targetWindowId = this.activeWindowId ?? await this.resolveTargetWorkbenchWindowId();
+    if (targetWindowId === undefined) { return; }
+    const expr = `
+      (function () {
+        function shortErr(e) { return String(e && e.message || e || '').slice(0, 180); }
+        var ij = null;
+        var ir = {};
+        try {
+          ij = typeof window.__ijFindLightStatus === 'function'
+            ? window.__ijFindLightStatus()
+            : { patchVersion: window.__ijFindPatchVersion || null, hasPanel: !!window.__ijFindShow };
+        } catch (eIj) {
+          ij = { error: shortErr(eIj) };
+        }
+        try {
+          if (typeof window.__irRendererSafetyReport === 'function') {
+            ir.report = window.__irRendererSafetyReport();
+          }
+        } catch (eReport) {
+          ir.reportError = shortErr(eReport);
+        }
+        try {
+          ir.patchVersion = window.__irPatchVersion || null;
+          ir.captureActive = !!window.__irCaptureActive;
+          ir.captureSessionId = typeof window.__irCaptureSessionId === 'number' ? window.__irCaptureSessionId : null;
+          ir.hasStopCapture = typeof window.__irStopCapture === 'function';
+          ir.scanTimer = !!window.__irScanTimer;
+          ir.scanInterval = !!window.__irScanInterval;
+          ir.markdownObserver = !!window.__irMarkdownObserver;
+          ir.recaptureScheduled = !!window.__irRecaptureScheduled;
+          ir.mdRenderer = !!window.__irMdRenderer;
+          ir.monaco = !!window.__irMonaco;
+          ir.monacoCaps = !!window.__irMonacoCaps;
+        } catch (eIr) {
+          ir.error = shortErr(eIr);
+        }
+        var memory = null;
+        try {
+          if (performance && performance.memory) {
+            memory = {
+              used: performance.memory.usedJSHeapSize,
+              total: performance.memory.totalJSHeapSize,
+              limit: performance.memory.jsHeapSizeLimit
+            };
+          }
+        } catch (eMemory) {}
+        return JSON.stringify({
+          reason: ${JSON.stringify(reason)},
+          at: Date.now(),
+          perf: Math.round((performance && performance.now ? performance.now() : 0)),
+          ij: ij,
+          ir: ir,
+          memory: memory
+        });
+      })()
+    `.trim();
+    try {
+      const snapshot = await this.evalInWindow(targetWindowId, expr, timeoutMs);
+      this.log.appendLine(`renderer safety: ${snapshot}`);
+    } catch (err) {
+      this.log.appendLine(`renderer safety failed (${reason}): ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
   private async evalInAllWindowsCollect(expr: string): Promise<string> {
+    const targetWindowId = await this.resolveTargetWorkbenchWindowId(this.activeWindowId);
+    if (targetWindowId === undefined) { return '(no target workbench window)'; }
     const script = `
       (async function () {
         var BW = require('electron').BrowserWindow;
-        var wins = BW.getAllWindows();
+        var targetWindowId = ${JSON.stringify(targetWindowId)};
+        var win = BW.fromId(targetWindowId);
+        var wins = win ? [win] : [];
         var results = [];
         for (var i = 0; i < wins.length; i++) {
           var wid = wins[i].id;
           try {
-            var r = await wins[i].webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(expr)}, returnByValue: true });
-            if (r && r.exceptionDetails) {
-              results.push(wid + ':exc:' + ((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text || '').split('\\n')[0].slice(0, 150));
-            } else {
-              var v = (r && r.result) ? r.result.value : '(no-result)';
-              if (v !== undefined && v !== null && String(v) !== '') { results.push(wid + ':' + v); }
-            }
-          } catch (e) { /* debugger not attached for this window */ }
+            var v = await wins[i].webContents.executeJavaScript(${JSON.stringify(expr)}, true);
+            if (v !== undefined && v !== null && String(v) !== '') { results.push(wid + ':' + v); }
+          } catch (e) { results.push(wid + ':err:' + (e && e.message)); }
         }
         return results.join(' || ');
       })()
@@ -1396,16 +1971,205 @@ export class OverlayPanel {
     return `(non-string value: ${JSON.stringify(value).slice(0, 200)}; resp=${JSON.stringify(resp).slice(0, 200)})`;
   }
 
-  private dispose() {
+  dispose(): Promise<void> {
+    if (!this.disposePromise) {
+      this.disposePromise = this.disposeInternal();
+    }
+    return this.disposePromise;
+  }
+
+  private async disposeInternal(): Promise<void> {
     this.cancelActive();
     this.zoektRuntime.cancelRunningProcesses('overlay disposed');
     if (this.backgroundCaptureTimer) {
       clearTimeout(this.backgroundCaptureTimer);
       this.backgroundCaptureTimer = undefined;
     }
+    if (this.cdpIdleCloseTimer) {
+      clearTimeout(this.cdpIdleCloseTimer);
+      this.cdpIdleCloseTimer = undefined;
+    }
+    if (this.cdpSearchIdleCloseTimer) {
+      clearTimeout(this.cdpSearchIdleCloseTimer);
+      this.cdpSearchIdleCloseTimer = undefined;
+    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      await this.releaseRendererBridge('overlay disposed', undefined, 1500).catch((err) => {
+        this.log.appendLine(`Renderer bridge release during dispose failed: ${err instanceof Error ? err.message : err}`);
+      });
+    } else if (this.ws) {
+      this.closeCdpWebSocket('overlay disposed');
+    }
+    this.closeLocalBridgeServer('overlay disposed');
+  }
+
+  private cancelCdpIdleClose(): void {
+    if (!this.cdpIdleCloseTimer) { return; }
+    clearTimeout(this.cdpIdleCloseTimer);
+    this.cdpIdleCloseTimer = undefined;
+  }
+
+  private cancelCdpSearchIdleClose(): void {
+    if (!this.cdpSearchIdleCloseTimer) { return; }
+    clearTimeout(this.cdpSearchIdleCloseTimer);
+    this.cdpSearchIdleCloseTimer = undefined;
+  }
+
+  private scheduleCdpSearchIdleClose(reason: string, delayMs = 350): void {
+    if (this.shouldAutoCloseCdpForTests()) { return; }
+    if (this.shouldKeepCdpOpenWhileSearchUiVisible() && this.activeWindowId !== undefined) {
+      if (!this.cdpCloseDeferredReasons.has(reason)) {
+        this.cdpCloseDeferredReasons.add(reason);
+        this.log.appendLine(`CDP close deferred until panel hidden (${reason}).`);
+      }
+      return;
+    }
+    this.cancelCdpSearchIdleClose();
+    this.cdpSearchIdleCloseTimer = setTimeout(() => {
+      this.cdpSearchIdleCloseTimer = undefined;
+      if (this.showInFlight || this.pendingShow || this.activeSearch) {
+        this.scheduleCdpSearchIdleClose(reason, delayMs);
+        return;
+      }
+      const pendingPosts = this.rendererPostChain;
+      void pendingPosts.finally(() => {
+        if (this.rendererPostChain !== pendingPosts) {
+          this.scheduleCdpSearchIdleClose(reason, delayMs);
+          return;
+        }
+        if (this.showInFlight || this.pendingShow || this.activeSearch) { return; }
+        if (this.isRendererSafetyDiagnosticsEnabled()) {
+          void this.probeRendererSafety(`before-cdp-close:${reason}`, 500)
+            .finally(() => this.closeCdpAndInspectorSoon(reason));
+        } else {
+          void this.closeCdpAndInspectorSoon(reason);
+        }
+      });
+    }, delayMs);
+  }
+
+  private scheduleCdpIdleClose(sourceWindowId?: number): void {
+    this.cancelCdpIdleClose();
+    this.cdpIdleCloseTimer = setTimeout(() => {
+      this.cdpIdleCloseTimer = undefined;
+      if (sourceWindowId !== undefined && this.activeWindowId !== sourceWindowId) { return; }
+      if (this.showInFlight || this.pendingShow || this.activeSearch) { return; }
+      void this.releaseRendererBridge('panel hidden', sourceWindowId, 1500).catch((err) => {
+        this.log.appendLine(`Renderer bridge release failed: ${err instanceof Error ? err.message : err}`);
+      });
+    }, 1500);
+  }
+
+  private closeCdpWebSocket(reason: string): void {
+    const pending = Array.from(this.pending.values());
+    this.pending.clear();
+    for (const cb of pending) {
+      try { cb({ error: { message: `CDP connection closed (${reason})` } }); } catch {}
+    }
     if (this.ws) {
       try { this.ws.close(); } catch {}
       this.ws = undefined;
+    }
+    this.injectPromise = undefined;
+  }
+
+  private async closeCdpAndInspectorSoon(reason: string): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.closeCdpWebSocket(reason);
+      return;
+    }
+    if (!this.shouldCloseInspectorForReason(reason)) {
+      this.log.appendLine(`CDP WebSocket closing without inspector.close (${reason}); inspector kept until panel hidden.`);
+      this.closeCdpWebSocket(reason);
+      return;
+    }
+    try {
+      const resp = await this.send('Runtime.evaluate', {
+        expression: `try { require('inspector').close(); 'inspector=closed'; } catch (e) { 'inspector-close-err:' + (e && e.message); }`,
+        returnByValue: true,
+        includeCommandLineAPI: true,
+      }, 500);
+      this.log.appendLine(`Inspector close result (${reason}): ${String(resp?.result?.value ?? '(no result)')}`);
+    } catch (err) {
+      this.log.appendLine(`Inspector close scheduling failed (${reason}): ${err instanceof Error ? err.message : err}`);
+    } finally {
+      this.closeCdpWebSocket(reason);
+    }
+  }
+
+  private async releaseRendererBridge(reason: string, sourceWindowId?: number, timeoutMs = 2000): Promise<string> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) { return 'no-active-bridge'; }
+    const closeMainInspector = this.shouldCloseMainInspector();
+    const script = `
+      (function () {
+        var BW = require('electron').BrowserWindow;
+        var closeMainInspector = ${JSON.stringify(closeMainInspector)};
+        var wins = BW.getAllWindows();
+        var removed = 0;
+        var detached = 0;
+        for (var i = 0; i < wins.length; i++) {
+          var w = wins[i];
+          try {
+            var consoleBridge = global.__ijFindConsoleBridgeListeners && global.__ijFindConsoleBridgeListeners.get(w.id);
+            if (consoleBridge) {
+              try { w.webContents.removeListener('console-message', consoleBridge); removed++; } catch (eConsoleRm) {}
+              try { global.__ijFindConsoleBridgeListeners.delete(w.id); } catch (eConsoleDel) {}
+            }
+            var bridge = global.__ijFindBridgeListeners && global.__ijFindBridgeListeners.get(w.id);
+            if (bridge) {
+              try { w.webContents.debugger.removeListener('message', bridge); removed++; } catch (eRm) {}
+              try { global.__ijFindBridgeListeners.delete(w.id); } catch (eDel) {}
+            }
+            var reload = global.__ijFindReloadPatchListeners && global.__ijFindReloadPatchListeners.get(w.id);
+            if (reload) {
+              try { w.webContents.removeListener('did-finish-load', reload); } catch (eR1) {}
+              try { w.webContents.removeListener('dom-ready', reload); } catch (eR2) {}
+              try { global.__ijFindReloadPatchListeners.delete(w.id); } catch (eR3) {}
+            }
+            var attachedByUs = global.__ijFindAttachedWindows && global.__ijFindAttachedWindows.has(w.id);
+            var ownedByIjFind = !!(attachedByUs || bridge || reload || consoleBridge);
+            var hasKnownOtherBridge = !!(global.__irGoToTypeBridgeListeners && global.__irGoToTypeBridgeListeners.has(w.id));
+            if (ownedByIjFind && !hasKnownOtherBridge) {
+              try {
+                if (w.webContents.debugger && w.webContents.debugger.isAttached()) {
+                  w.webContents.debugger.detach();
+                  detached++;
+                }
+              } catch (eDetach) {}
+            }
+            if (ownedByIjFind) {
+              try { global.__ijFindAttachedWindows.delete(w.id); } catch (eDelAttached) {}
+            }
+          } catch (e) {}
+        }
+        try {
+          if (global.__ijFindMainHttpBridge && global.__ijFindMainHttpBridge.server) {
+            try { global.__ijFindMainHttpBridge.server.close(); } catch (eMainHttpClose) {}
+            try { delete global.__ijFindMainHttpBridge; } catch (eMainHttpDelete) {}
+          }
+        } catch (eMainHttp) {}
+        if (closeMainInspector) {
+          try {
+            require('inspector').close();
+          } catch (eCloseInspector) {}
+        }
+        return 'removed=' + removed + ' detached=' + detached + ' inspector=' + (closeMainInspector ? 'closed' : 'kept');
+      })()
+    `.trim();
+    try {
+      const resp = await this.send('Runtime.evaluate', {
+        expression: script,
+        includeCommandLineAPI: true,
+        returnByValue: true,
+      }, timeoutMs);
+      const report = String(resp?.result?.value ?? '(no result)');
+      this.log.appendLine(`Renderer bridge released (${reason}): ${report}`);
+      return report;
+    } finally {
+      this.closeCdpWebSocket(`renderer bridge released:${reason}`);
+      if (sourceWindowId === undefined || this.activeWindowId === sourceWindowId) {
+        this.activeWindowId = undefined;
+      }
     }
   }
 
@@ -1420,30 +2184,36 @@ export class OverlayPanel {
     const mainPid = this.findMainPid();
     if (!mainPid) { throw new Error('Could not locate VSCode main (Electron) process'); }
     const tStart = Date.now();
-    this.log.appendLine(`Main PID ${mainPid}: sending SIGUSR1`);
-    try { process.kill(mainPid, 'SIGUSR1'); } catch (e) {
-      throw new Error(`SIGUSR1 to pid ${mainPid} failed: ${e instanceof Error ? e.message : e}`);
-    }
-
-    // Wait for the inspector listener to open. Tight-loop with 25ms backoff
-    // instead of the old 200ms — the inspector is usually up in <100ms, so
-    // the extra wall-clock savings are 150–350ms per prewarm.
-    let wsUrl: string | undefined;
-    let attempts = 0;
-    for (let i = 0; i < 80; i++) {
-      try {
-        attempts++;
-        const targets = await fetchJson('http://127.0.0.1:9229/json/list');
-        if (Array.isArray(targets) && targets.length > 0 && targets[0].webSocketDebuggerUrl) {
-          wsUrl = targets[0].webSocketDebuggerUrl;
-          break;
+    // If VS Code's main inspector is already open, reuse it without sending
+    // SIGUSR1 again. Re-signalling the main process on every Search UI open
+    // keeps the shared inspector hot and has shown up as renderer jank.
+    let inspector = await this.findInspectorWebSocketForPid(mainPid, { rounds: 1, fetchTimeoutMs: 50, probeTimeoutMs: 120 });
+    let wsUrl = inspector.wsUrl;
+    if (!wsUrl) {
+      await this.closeStaleIjFindInspectorBlockingTarget(mainPid);
+      this.log.appendLine(`Main PID ${mainPid}: sending SIGUSR1`);
+      try { process.kill(mainPid, 'SIGUSR1'); } catch (e) {
+        throw new Error(`SIGUSR1 to pid ${mainPid} failed: ${e instanceof Error ? e.message : e}`);
+      }
+      inspector = await this.findInspectorWebSocketForPid(mainPid);
+      wsUrl = inspector.wsUrl;
+      if (!wsUrl && await this.closeStaleIjFindInspectorBlockingTarget(mainPid)) {
+        this.log.appendLine(`Main PID ${mainPid}: retrying SIGUSR1 after closing stale inspector`);
+        try { process.kill(mainPid, 'SIGUSR1'); } catch (e) {
+          throw new Error(`SIGUSR1 retry to pid ${mainPid} failed: ${e instanceof Error ? e.message : e}`);
         }
-      } catch {}
-      await delay(25);
+        inspector = await this.findInspectorWebSocketForPid(mainPid);
+        wsUrl = inspector.wsUrl;
+      }
+    } else {
+      this.log.appendLine(`Main PID ${mainPid}: reusing existing inspector`);
     }
-    if (!wsUrl) { throw new Error('CDP inspector did not come up on 127.0.0.1:9229'); }
+    if (!wsUrl) { throw new Error(`CDP inspector for VSCode main pid ${mainPid} did not come up`); }
     const tInspector = Date.now();
-    this.log.appendLine(`Inspector up after ${tInspector - tStart}ms (${attempts} polls)`);
+    this.log.appendLine(
+      `Inspector for pid ${mainPid} up on port ${inspector.port ?? '?'} after ${tInspector - tStart}ms ` +
+      `(${inspector.attempts} polls)`,
+    );
 
     this.log.appendLine('Connecting CDP WebSocket');
     const ws = new WebSocket(wsUrl);
@@ -1463,6 +2233,11 @@ export class OverlayPanel {
     ws.on('message', (data) => this.handleWsMessage(data));
     ws.on('close', () => {
       this.log.appendLine('CDP WebSocket closed');
+      const pending = Array.from(this.pending.values());
+      this.pending.clear();
+      for (const cb of pending) {
+        try { cb({ error: { message: 'CDP WebSocket closed' } }); } catch {}
+      }
       this.ws = undefined;
     });
 
@@ -1474,14 +2249,10 @@ export class OverlayPanel {
     if (!/\bok:/.test(String(report))) {
       throw new Error(`Renderer patch did not install: ${report}`);
     }
-    // Immediately sample renderer state via __ijFindStatus to confirm DOM install.
-    try {
-      const status = await this.evalInAllWindowsCollect(
-        `(function(){ try { return window.__ijFindStatus ? window.__ijFindStatus() : 'no-status-fn'; } catch(e){ return 'status-throw:' + (e && e.message); } })()`,
-      );
-      this.log.appendLine(`Post-install status: ${status}`);
-    } catch (e) {
-      this.log.appendLine(`Post-install status probe failed: ${e instanceof Error ? e.message : e}`);
+    // Keep diagnostics layout-free. The old full status probe touched
+    // getBoundingClientRect/getComputedStyle inside the VS Code renderer.
+    if (this.isRendererSafetyDiagnosticsEnabled()) {
+      void this.probeRendererSafety('post-install', 700);
     }
   }
 
@@ -1489,123 +2260,205 @@ export class OverlayPanel {
    *  already have the patch return 'already patched' and are no-ops; windows
    *  that missed the initial injection (e.g., a brand-new VSCode window whose
    *  renderer wasn't ready yet) get a fresh attempt. */
-  private async runPatchScript(): Promise<string> {
+  private async runPatchScript(targetWindowId?: number): Promise<string> {
     // Pass the patch script directly as the expression — no base64/atob round-trip,
     // which previously corrupted any non-ASCII characters (they arrived as raw UTF-8
     // bytes through atob and broke the parser).
-    const patchExpr = getRendererPatchScript();
+    const localBridge = await this.ensureLocalBridgeServer();
+    const patchExpr = getRendererPatchScript(
+      this.isMonacoCaptureEnabled(),
+      this.isRendererPerfDiagnosticsEnabled(),
+      this.shouldSuspendIntelliSenseRecursionCapture(),
+      this.shouldEnableRendererInlayClickHook(),
+      this.shouldDisposeRendererPatchOnHide(),
+    );
+    const rendererReadyExpr =
+      `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&` +
+      `window.__ijFindLightStatus&&window.__ijFindPatchVersion===${RENDERER_PATCH_VERSION}` +
+      `?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`;
+    const workspaceName = this.getExpectedWorkspaceName();
+    const markerText = this.targetWindowMarkerText || '';
+    const markerProbeExpr = this.buildTargetMarkerProbeExpression(markerText);
 
     const injectScript = `
       (async function () {
         var BW = require('electron').BrowserWindow;
         var patchExpr = ${JSON.stringify(patchExpr)};
+        var rendererReadyExpr = ${JSON.stringify(rendererReadyExpr)};
         var rendererBindingName = ${JSON.stringify(RENDERER_BINDING)};
         var mainBridgeBindingName = ${JSON.stringify(BRIDGE_BINDING)};
-        var wins = BW.getAllWindows();
+        var localBridgePort = ${JSON.stringify(localBridge.port)};
+        var localBridgeToken = ${JSON.stringify(localBridge.token)};
+        var closeMainInspector = ${JSON.stringify(this.shouldCloseMainInspector())};
+        var targetWindowId = ${targetWindowId === undefined ? 'undefined' : JSON.stringify(targetWindowId)};
+        var expectedWorkspaceName = ${JSON.stringify(workspaceName)};
+        var expectedWorkspaceNameLower = expectedWorkspaceName.toLowerCase();
+        var markerText = ${JSON.stringify(markerText)};
+        var markerProbeExpr = ${JSON.stringify(markerProbeExpr)};
+        function isWorkbench(win) {
+          try {
+            var url = (win.webContents && win.webContents.getURL && win.webContents.getURL()) || '';
+            return /workbench\\.(?:esm\\.)?html(?:\\?|#|$)/.test(url);
+          } catch (e) { return false; }
+        }
+        function getWorkbenchWindows() {
+          var wins = BW.getAllWindows();
+          var workbenches = [];
+          for (var i = 0; i < wins.length; i++) {
+            if (isWorkbench(wins[i])) { workbenches.push(wins[i]); }
+          }
+          return workbenches;
+        }
+        function titleMatchesWorkspace(win) {
+          if (!expectedWorkspaceNameLower) { return true; }
+          try {
+            var title = (win.getTitle && win.getTitle()) || '';
+            return title.toLowerCase().indexOf(expectedWorkspaceNameLower) >= 0;
+          } catch (e) { return false; }
+        }
+        async function hasMarker(win) {
+          if (!markerText) { return false; }
+          try {
+            return await win.webContents.executeJavaScript(markerProbeExpr, true) === true;
+          } catch (e) { return false; }
+        }
+        async function selectTargetWindow() {
+          if (typeof targetWindowId === 'number') {
+            var byId = BW.fromId(targetWindowId);
+            if (byId && isWorkbench(byId) && (!markerText || await hasMarker(byId))) { return byId; }
+          }
+          var all = getWorkbenchWindows();
+          if (markerText) {
+            for (var m = 0; m < all.length; m++) {
+              if (await hasMarker(all[m])) { return all[m]; }
+            }
+            if (all.length === 1) { return all[0]; }
+            return null;
+          }
+          var focused = BW.getFocusedWindow();
+          if (focused && isWorkbench(focused) && titleMatchesWorkspace(focused)) { return focused; }
+          var firstWorkbench = null;
+          for (var s = 0; s < all.length; s++) {
+            if (!isWorkbench(all[s])) { continue; }
+            if (!firstWorkbench) { firstWorkbench = all[s]; }
+            if (titleMatchesWorkspace(all[s])) { return all[s]; }
+          }
+          return firstWorkbench;
+        }
+        var target = await selectTargetWindow();
+        if (!target) { return 'skip:no-target' + (markerText ? ':marker-miss' : ''); }
+        var wins = target ? [target] : [];
         var results = [];
+        var bridgePrefix = '__IJSS_BRIDGE__';
+        function installConsoleBridge(w) {
+          if (!global.__ijFindConsoleBridgeListeners) { global.__ijFindConsoleBridgeListeners = new Map(); }
+          var prev = global.__ijFindConsoleBridgeListeners.get(w.id);
+          if (prev) {
+            try { w.webContents.removeListener('console-message', prev); } catch (eRmPrev) {}
+          }
+          var bridgeWinId = w.id;
+          var bridge = function (event) {
+            var message = '';
+            try {
+              if (event && typeof event.message === 'string') {
+                message = event.message;
+              } else if (arguments.length >= 3 && typeof arguments[2] === 'string') {
+                message = arguments[2];
+              } else if (arguments.length >= 2 && typeof arguments[1] === 'string') {
+                message = arguments[1];
+              }
+            } catch (eMsg) {}
+            if (!message || message.indexOf(bridgePrefix) !== 0) { return; }
+            var hasMainBridgeBinding = typeof global[mainBridgeBindingName] === 'function';
+            var payload = message.slice(bridgePrefix.length);
+            var parsed = null;
+            function releaseSelfIfPanelHidden() {
+              try {
+                if (!parsed || parsed.type !== 'panelHidden') { return; }
+                setTimeout(function () {
+                  try { w.webContents.removeListener('console-message', bridge); } catch (eConsoleSelfRm) {}
+                  try {
+                    if (global.__ijFindConsoleBridgeListeners &&
+                        global.__ijFindConsoleBridgeListeners.get(bridgeWinId) === bridge) {
+                      global.__ijFindConsoleBridgeListeners.delete(bridgeWinId);
+                    }
+                  } catch (eConsoleSelfDel) {}
+                  try {
+                    var hasConsoleBridges = !!(global.__ijFindConsoleBridgeListeners && global.__ijFindConsoleBridgeListeners.size);
+                    var hasDebuggerBridges = !!(global.__ijFindBridgeListeners && global.__ijFindBridgeListeners.size);
+                    var hasReloadBridges = !!(global.__ijFindReloadPatchListeners && global.__ijFindReloadPatchListeners.size);
+                    if (closeMainInspector && !hasConsoleBridges && !hasDebuggerBridges && !hasReloadBridges) {
+                      try { if (typeof process._debugEnd === 'function') { process._debugEnd(); } } catch (eDebugEnd) {}
+                      try { require('inspector').close(); } catch (eInspectorClose) {}
+                    }
+                  } catch (eMaybeClose) {}
+                }, 0);
+              } catch (eReleaseSelf) {}
+            }
+            try {
+              parsed = JSON.parse(String(payload));
+              if (parsed && typeof parsed === 'object') {
+                parsed.__win = bridgeWinId;
+                payload = JSON.stringify(parsed);
+              }
+            } catch (ePayload) {}
+            try {
+              if (typeof fetch === 'function') {
+                fetch('http://127.0.0.1:' + localBridgePort + '/ijss-bridge', {
+                  method: 'POST',
+                  headers: {
+                    'content-type': 'application/json',
+                    'x-ijss-token': localBridgeToken,
+                  },
+                  body: String(payload),
+                }).catch(function () {});
+              }
+              releaseSelfIfPanelHidden();
+              return;
+            } catch (eHttpBridge) {}
+            try { if (hasMainBridgeBinding) { global[mainBridgeBindingName](payload); } } catch (eForward) {}
+            releaseSelfIfPanelHidden();
+          };
+          w.webContents.on('console-message', bridge);
+          global.__ijFindConsoleBridgeListeners.set(w.id, bridge);
+        }
         for (var i = 0; i < wins.length; i++) {
           var w = wins[i];
           try {
-            var url = '';
-            try { url = (w.webContents && w.webContents.getURL && w.webContents.getURL()) || ''; } catch (eu) {}
-            // Only patch the main workbench windows.
-            if (!/workbench\\.(?:esm\\.)?html(?:\\?|#|$)/.test(url)) {
-              results.push('skip:' + w.id + ':url=' + url.split('?')[0].split('/').pop());
-              continue;
-            }
-            // ── Cooperative debugger attachment ──
-            // Other extensions (e.g. intellisense-recursion) use the SAME
-            // webContents.debugger to install their own bindings/listeners
-            // (irGoToType for cmd+click navigation, etc.). If we detach +
-            // reattach, we evict their session and break their plugin.
-            // Only attach if the debugger isn't already attached, and add our
-            // binding/listener on top of whatever's there. Both bindings can
-            // coexist on a single CDP session.
-            var alreadyAttached = false;
-            try { alreadyAttached = w.webContents.debugger.isAttached(); } catch (eIs) {}
-            if (!alreadyAttached) {
-              try { w.webContents.debugger.attach('1.3'); }
-              catch (eAtt) { results.push('attach-fail:' + w.id + ':' + eAtt.message); continue; }
-            }
-            try { await w.webContents.debugger.sendCommand('Runtime.enable'); } catch (eRe) {}
-            var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: patchExpr, returnByValue: true });
-            if (r && r.exceptionDetails) {
-              var ed = r.exceptionDetails;
-              var exStr = ed.exception && ed.exception.description ? ed.exception.description : (ed.text || JSON.stringify(ed));
-              results.push('exc:' + w.id + ':' + String(exStr).split('\\n')[0].slice(0, 200));
-              try { w.webContents.debugger.detach(); } catch (e3) {}
-              continue;
-            }
-            var val = r && r.result ? r.result.value : undefined;
+            installConsoleBridge(w);
+            var status = 'missing';
+            try { status = await w.webContents.executeJavaScript(rendererReadyExpr, true); } catch (eStatus) { status = 'status-err:' + eStatus.message; }
+            var val = status === 'ready'
+              ? 'already patched:fast'
+              : await w.webContents.executeJavaScript(patchExpr, true);
             if (val === 'ij-find patch installed' || String(val).indexOf('already patched') === 0) {
               results.push('ok:' + w.id + ':' + val);
               try {
-                await w.webContents.debugger.sendCommand('Runtime.addBinding', { name: rendererBindingName });
-                // CRITICAL: the 'message' listener accumulates across
-                // extension-host reloads (main-process state persists while
-                // the extension host restarts), and Electron's
-                // webContents.debugger inherits every prior session's
-                // listener. N listeners = 1 renderer send becomes N
-                // runSearch calls. Track our registration per-window and
-                // remove the previous one before adding the new.
                 if (!global.__ijFindBridgeListeners) { global.__ijFindBridgeListeners = new Map(); }
                 var prev = global.__ijFindBridgeListeners.get(w.id);
                 if (prev) {
                   try { w.webContents.debugger.removeListener('message', prev); } catch (eRm) {}
+                  try { global.__ijFindBridgeListeners.delete(w.id); } catch (eDelBridge) {}
                 }
-                const bridgeWinId = w.id;
-                var bridge = function (ev, method, params) {
-                  if (method === 'Runtime.bindingCalled' && params && params.name === rendererBindingName) {
-                    if (typeof global[mainBridgeBindingName] === 'function') {
-                      var payload = params.payload;
-                      try {
-                        var parsed = JSON.parse(String(payload));
-                        if (parsed && typeof parsed === 'object') {
-                          parsed.__win = bridgeWinId;
-                          payload = JSON.stringify(parsed);
-                        }
-                      } catch (ePayload) {}
-                      global[mainBridgeBindingName](payload);
-                    }
-                  }
-                };
-                w.webContents.debugger.on('message', bridge);
-                global.__ijFindBridgeListeners.set(w.id, bridge);
                 if (!global.__ijFindReloadPatchListeners) { global.__ijFindReloadPatchListeners = new Map(); }
                 var prevReload = global.__ijFindReloadPatchListeners.get(w.id);
                 if (prevReload) {
                   try { w.webContents.removeListener('did-finish-load', prevReload); } catch (eR1) {}
                   try { w.webContents.removeListener('dom-ready', prevReload); } catch (eR2) {}
+                  try { global.__ijFindReloadPatchListeners.delete(w.id); } catch (eDelReload) {}
                 }
-                var reloadTimer = null;
-                var reloadPatch = function () {
-                  if (reloadTimer) { clearTimeout(reloadTimer); }
-                  reloadTimer = setTimeout(async function () {
-                    try {
-                      var reloadUrl = '';
-                      try { reloadUrl = (w.webContents && w.webContents.getURL && w.webContents.getURL()) || ''; } catch (eUrl) {}
-                      if (!/workbench\\.(?:esm\\.)?html(?:\\?|#|$)/.test(reloadUrl)) { return; }
-                      var attached = false;
-                      try { attached = w.webContents.debugger.isAttached(); } catch (eIs2) {}
-                      if (!attached) {
-                        try { w.webContents.debugger.attach('1.3'); } catch (eAtt2) { return; }
-                      }
-                      try { await w.webContents.debugger.sendCommand('Runtime.enable'); } catch (eRe2) {}
-                      try { await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: patchExpr, returnByValue: true }); } catch (eEval2) {}
-                      try { await w.webContents.debugger.sendCommand('Runtime.addBinding', { name: rendererBindingName }); } catch (eBind2) {}
-                    } catch (eReload) {}
-                  }, 250);
-                };
-                w.webContents.on('did-finish-load', reloadPatch);
-                w.webContents.on('dom-ready', reloadPatch);
-                global.__ijFindReloadPatchListeners.set(w.id, reloadPatch);
-              } catch (eb) { results.push('bind-err:' + w.id + ':' + eb.message); }
+                var attachedByUs = global.__ijFindAttachedWindows && global.__ijFindAttachedWindows.has(w.id);
+                if (attachedByUs) {
+                  try { w.webContents.debugger.detach(); } catch (eDetachOld) {}
+                  try { global.__ijFindAttachedWindows.delete(w.id); } catch (eDelAttachedOld) {}
+                }
+              } catch (eb) { results.push('cleanup-err:' + w.id + ':' + eb.message); }
             } else {
-              var type = r && r.result ? r.result.type : 'no-result';
-              results.push('skip:' + w.id + ':type=' + type + ':val=' + String(val));
-              try { w.webContents.debugger.detach(); } catch (e3) {}
+              results.push('skip:' + w.id + ':val=' + String(val));
             }
-          } catch (e) { results.push('err:' + w.id + ':' + e.message); }
+          } catch (e) {
+            results.push('err:' + w.id + ':' + e.message);
+          }
         }
         return results.join(' | ');
       })()
@@ -1617,7 +2470,11 @@ export class OverlayPanel {
       returnByValue: true,
       awaitPromise: true,
     });
-    return String(resp?.result?.value ?? '(no result)');
+    if (resp?.exceptionDetails) {
+      return `exception:${resp.exceptionDetails.text || ''}:${resp.exceptionDetails.exception?.description || ''}`;
+    }
+    const report = String(resp?.result?.value ?? '(no result)');
+    return report;
   }
 
   private handleWsMessage(data: WebSocket.RawData) {
@@ -1630,12 +2487,7 @@ export class OverlayPanel {
       return;
     }
     if (msg.method === 'Runtime.bindingCalled') {
-      // Log every binding-called event we see on this CDP session. When
-      // renderer events mysteriously fail to reach handleRendererEvent, this
-      // tells us whether they even left the main-process bridge.
       const name = msg.params?.name;
-      const payloadLen = String(msg.params?.payload ?? '').length;
-      this.log.appendLine(`[cdp] bindingCalled name=${name} payloadLen=${payloadLen}`);
       if (name === BRIDGE_BINDING) {
         this.handleRendererEvent(String(msg.params.payload));
       }
@@ -1667,15 +2519,20 @@ export class OverlayPanel {
     } else {
       this.log.appendLine(`handleRendererEvent: no __seq/__src, type=${(evt as any).type}`);
     }
-    if (
-      typeof evt.__win === 'number' &&
-      this.activeWindowId !== undefined &&
-      evt.__win !== this.activeWindowId &&
-      evt.type !== 'log'
-    ) {
-      this.log.appendLine(`ignore renderer event from inactive win=${evt.__win} active=${this.activeWindowId} type=${(evt as any).type}`);
+    if (Date.now() < this.rendererRecoveryUntil && evt.type !== 'log') {
+      this.log.appendLine(`drop renderer event during recovery: type=${(evt as any).type}`);
       return;
     }
+	    if (
+	      typeof evt.__win === 'number' &&
+	      this.activeWindowId !== undefined &&
+	      evt.__win !== this.activeWindowId &&
+	      evt.type !== 'log' &&
+	      evt.type !== 'trace'
+	    ) {
+	      this.log.appendLine(`ignore renderer event from inactive win=${evt.__win} active=${this.activeWindowId} type=${(evt as any).type}`);
+	      return;
+	    }
     switch (evt.type) {
       case 'search':
         if (evt.recordHistory) {
@@ -1690,17 +2547,31 @@ export class OverlayPanel {
         this.currentSearchSession = undefined;
         this.cancelActive();
         break;
+      case 'panelHidden':
+        this.currentSearchSession = undefined;
+        this.cancelActive();
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.scheduleCdpIdleClose(evt.__win);
+        }
+        break;
       case 'openFile': void this.openFile(evt.uri, evt.line, evt.column, false); break;
       case 'previewFile': void this.openFile(evt.uri, evt.line, evt.column, true); break;
       case 'requestPreview': void this.handlePreviewRequest(evt); break;
       case 'revealFile': void this.revealFile(evt.uri); break;
       case 'openInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, true, true); break;
       case 'pinInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, false, false); break;
-      case 'requestHover': void this.sendHover(evt.reqId, evt.uri, evt.line, evt.column, evt.x, evt.y); break;
-      case 'runCommand': void this.runHoverCommand(evt.command, evt.args); break;
-      case 'saveFile': void this.saveFile(evt.uri, evt.content); break;
-      case 'log': this.log.appendLine(`[renderer${typeof evt.__win === 'number' ? ` win=${evt.__win}` : ''}] ${evt.msg}`); break;
-    }
+	      case 'requestHover': void this.sendHover(evt.reqId, evt.uri, evt.line, evt.column, evt.x, evt.y); break;
+	      case 'runCommand': void this.runHoverCommand(evt.command, evt.args); break;
+	      case 'saveFile': void this.saveFile(evt.uri, evt.content); break;
+	      case 'trace':
+	        this.log.appendLine(
+	          `[renderer-trace${typeof evt.__win === 'number' ? ` win=${evt.__win}` : ''}` +
+	          `${typeof evt.__seq === 'number' ? ` seq=${evt.__seq}` : ''}] ` +
+	          `${evt.phase} ${JSON.stringify({ data: evt.data ?? null, light: evt.light ?? null, ir: evt.ir ?? null, perf: evt.perf ?? null })}`,
+	        );
+	        break;
+	      case 'log': this.log.appendLine(`[renderer${typeof evt.__win === 'number' ? ` win=${evt.__win}` : ''}] ${evt.msg}`); break;
+	    }
   }
 
   private async openInSideEditor(uriStr: string, line: number, column: number, preview: boolean, preserveFocus: boolean) {
@@ -1787,32 +2658,48 @@ export class OverlayPanel {
   }
 
   private async handlePreviewRequest(evt: Extract<RendererEvent, { type: 'requestPreview' }>) {
+    this.cancelCdpSearchIdleClose();
     if (this.activeWindowId !== undefined) {
       await this.ensureMonacoCapture(this.activeWindowId);
     }
     await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges);
+    this.scheduleCdpSearchIdleClose('preview-delivered');
   }
 
-  private async sendPreview(uriStr: string, line: number, _contextLines: number, ranges: MatchRange[] | undefined) {
+  private async sendPreview(uriStr: string, line: number, contextLines: number, ranges: MatchRange[] | undefined) {
     try {
       const uri = vscode.Uri.parse(uriStr);
       const doc = await vscode.workspace.openTextDocument(uri);
       const allLines = doc.getText().split(/\r?\n/);
-      // Send the entire file. Cap at 10k lines to avoid massive payloads /
-      // DOM blowups; for huge files we still fall back to a window around the
-      // focus line.
-      const HARD_CAP = 10000;
-      let lines: PreviewLine[];
-      if (allLines.length <= HARD_CAP) {
-        lines = allLines.map((text, lineNumber) => ({ lineNumber, text: text ?? '' }));
-      } else {
-        const half = Math.floor(HARD_CAP / 2);
-        const start = Math.max(0, line - half);
-        const end = Math.min(allLines.length, start + HARD_CAP);
-        lines = [];
-        for (let i = start; i < end; i++) {
-          lines.push({ lineNumber: i, text: allLines[i] ?? '' });
-        }
+      // This preview is rendered inside the VS Code workbench renderer. Sending
+      // the whole file makes the search overlay compete with the editor UI
+      // itself, so keep the payload intentionally small and centered on the hit.
+      const DEFAULT_CONTEXT_LINES = 24;
+      const MAX_PREVIEW_LINES = 120;
+      const MAX_PREVIEW_LINE_CHARS = 1000;
+      const requestedContext = Number.isFinite(contextLines)
+        ? Math.max(0, Math.floor(contextLines))
+        : DEFAULT_CONTEXT_LINES;
+      const halfWindow = Math.min(
+        requestedContext,
+        Math.floor(MAX_PREVIEW_LINES / 2),
+      );
+      const targetLine = Math.max(0, Math.min(line, Math.max(0, allLines.length - 1)));
+      let start = Math.max(0, targetLine - halfWindow);
+      let end = Math.min(allLines.length, targetLine + halfWindow + 1);
+      if (end - start > MAX_PREVIEW_LINES) {
+        end = start + MAX_PREVIEW_LINES;
+      }
+      if (end - start < MAX_PREVIEW_LINES && start > 0) {
+        start = Math.max(0, end - MAX_PREVIEW_LINES);
+      }
+      const lines: PreviewLine[] = [];
+      for (let i = start; i < end; i++) {
+        const raw = allLines[i] ?? '';
+        const text = raw.length > MAX_PREVIEW_LINE_CHARS
+          ? `${raw.slice(0, MAX_PREVIEW_LINE_CHARS)}...`
+          : raw;
+        lines.push({ lineNumber: i, text });
       }
       const relPath = vscode.workspace.asRelativePath(uri, false);
       await this.postToRenderer({
@@ -1830,6 +2717,9 @@ export class OverlayPanel {
   }
 
   private async sendHover(reqId: number, uriStr: string, line: number, column: number, x: number, y: number) {
+    if (this.isMonacoCaptureDisabled()) {
+      return;
+    }
     try {
       const uri = vscode.Uri.parse(uriStr);
       // Make sure the document is loaded so language services pick it up.
@@ -2099,35 +2989,78 @@ export class OverlayPanel {
     const offset = session.loadedMatches;
     let batchMatches = 0;
     const batchUris = new Set<string>();
+    let pendingMatches: FileMatch[] = [];
+    let flushTimer: ReturnType<typeof setTimeout> | undefined;
+    let flushChain: Promise<void> = Promise.resolve();
+    const flushPendingMatches = (): Promise<void> => {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = undefined;
+      }
+      if (pendingMatches.length === 0) { return flushChain; }
+      const matches = pendingMatches;
+      pendingMatches = [];
+      flushChain = flushChain.then(() => this.postToRenderer({
+        type: 'results:batch',
+        searchId: session.searchId,
+        matches,
+      }));
+      return flushChain;
+    };
+    const scheduleFlush = () => {
+      if (flushTimer) { return; }
+      flushTimer = setTimeout(() => {
+        flushTimer = undefined;
+        void flushPendingMatches();
+      }, 25);
+    };
     const progress = {
       onFile: (m: FileMatch) => {
         if (cts.token.isCancellationRequested || this.currentSearchSession !== session) { return; }
         batchMatches += m.matches.length;
         batchUris.add(m.uri);
-        void this.postToRenderer({ type: 'results:file', searchId: session.searchId, match: m });
+        pendingMatches.push(m);
+        if (pendingMatches.length >= 32) {
+          void flushPendingMatches();
+        } else {
+          scheduleFlush();
+        }
       },
       onDone: (s: { totalFiles: number; totalMatches: number; truncated: boolean }) => {
         if (cts.token.isCancellationRequested || this.currentSearchSession !== session) { return; }
-        for (const uri of batchUris) { session.loadedUris.add(uri); }
-        session.loadedMatches += batchMatches;
-        session.hasMore = s.truncated;
-        this.log.appendLine(
-          `search page done: batch=${batchMatches} loaded=${session.loadedMatches} files=${session.loadedUris.size} more=${session.hasMore} elapsed=${Date.now() - startedAt}ms offset=${offset}`,
-        );
-        void this.postToRenderer({
-          type: 'results:done',
-          searchId: session.searchId,
-          totalFiles: session.loadedUris.size,
-          totalMatches: session.loadedMatches,
-          truncated: session.hasMore,
-          pageSize: session.pageSize,
-          pageFiles: batchUris.size,
-          pageMatches: batchMatches,
-          offset,
-        });
+        void (async () => {
+          await flushPendingMatches();
+          if (cts.token.isCancellationRequested || this.currentSearchSession !== session) { return; }
+          for (const uri of batchUris) { session.loadedUris.add(uri); }
+          session.loadedMatches += batchMatches;
+          session.hasMore = s.truncated;
+          this.log.appendLine(
+            `search page done: batch=${batchMatches} loaded=${session.loadedMatches} files=${session.loadedUris.size} more=${session.hasMore} elapsed=${Date.now() - startedAt}ms offset=${offset}`,
+          );
+          await this.postToRenderer({
+            type: 'results:done',
+            searchId: session.searchId,
+            totalFiles: session.loadedUris.size,
+            totalMatches: session.loadedMatches,
+            truncated: session.hasMore,
+            pageSize: session.pageSize,
+            pageFiles: batchUris.size,
+            pageMatches: batchMatches,
+            offset,
+          });
+          if (this.isRendererSafetyDiagnosticsEnabled()) {
+            void this.probeRendererSafety('search-page-done', 700);
+          }
+          this.scheduleCdpSearchIdleClose('search-page-done');
+        })();
       },
       onError: (e: Error) => {
         if (this.currentSearchSession !== session) { return; }
+        if (flushTimer) {
+          clearTimeout(flushTimer);
+          flushTimer = undefined;
+        }
+        pendingMatches = [];
         void this.postToRenderer({ type: 'results:error', searchId: session.searchId, message: e.message });
       },
     };
@@ -2173,6 +3106,10 @@ export class OverlayPanel {
         }
       }
     } finally {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = undefined;
+      }
       if (this.activeSearch === cts) {
         this.activeSearch.dispose();
         this.activeSearch = undefined;
@@ -2187,6 +3124,7 @@ export class OverlayPanel {
     const js = `(function(){try{if(!window.__ijFindOnMessage){return 'missing-onmessage'};window.__ijFindOnMessage(${payload});return 'ok'}catch(e){return 'err:'+(e&&e.message)}})()`;
     const deliver = async () => {
       try {
+        await this.ensureInjected();
         const timeoutMs = 1000;
         const result = await Promise.race([
           this.evalInWindow(windowId, js),
@@ -2223,46 +3161,303 @@ export class OverlayPanel {
     }
   }
 
-  private send(method: string, params: any): Promise<any> {
+  private send(method: string, params: any, timeoutMs = 10_000): Promise<any> {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('CDP WebSocket is not open'));
     }
     const id = this.msgId++;
     return new Promise((resolve, reject) => {
+      const timer = timeoutMs > 0
+        ? setTimeout(() => {
+          this.pending.delete(id);
+          reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`));
+        }, timeoutMs)
+        : undefined;
       this.pending.set(id, (resp) => {
+        if (timer) { clearTimeout(timer); }
         if (resp.error) { reject(new Error(resp.error.message || 'CDP error')); }
         else { resolve(resp.result); }
       });
       try {
         ws.send(JSON.stringify({ id, method, params }));
       } catch (e) {
+        if (timer) { clearTimeout(timer); }
         this.pending.delete(id);
         reject(e);
       }
     });
   }
 
-  private findMainPid(): number | null {
-    // Match the Electron main process of VSCode on macOS/Linux via `ps`.
-    // Accepts stable, insiders, OSS, and raw Electron dev-host binaries.
+  private async findInspectorWebSocketForPid(
+    pid: number,
+    options: { rounds?: number; fetchTimeoutMs?: number; probeTimeoutMs?: number } = {},
+  ): Promise<{ wsUrl?: string; port?: number; attempts: number }> {
+    const ports: number[] = [];
+    for (let port = 9229; port <= 9249; port++) { ports.push(port); }
+    const knownWrongTargets = new Set<string>();
+    let attempts = 0;
+    const rounds = Math.max(1, Math.min(80, options.rounds ?? 80));
+    const fetchTimeoutMs = Math.max(25, Math.min(500, options.fetchTimeoutMs ?? 150));
+    const probeTimeoutMs = Math.max(50, Math.min(1000, options.probeTimeoutMs ?? 350));
+    for (let round = 0; round < rounds; round++) {
+      for (const port of ports) {
+        let targets: any;
+        try {
+          attempts++;
+          targets = await fetchJson(`http://127.0.0.1:${port}/json/list`, fetchTimeoutMs);
+        } catch {
+          continue;
+        }
+        if (!Array.isArray(targets)) { continue; }
+        for (const target of targets) {
+          const wsUrl = String(target?.webSocketDebuggerUrl || '');
+          if (!wsUrl || knownWrongTargets.has(wsUrl)) { continue; }
+          const inspectorPid = (await this.probeInspectorInfo(wsUrl, probeTimeoutMs)).pid;
+          if (inspectorPid === pid) {
+            return { wsUrl, port, attempts };
+          }
+          if (inspectorPid !== undefined) {
+            knownWrongTargets.add(wsUrl);
+          }
+        }
+      }
+      await delay(25);
+    }
+    return { attempts };
+  }
+
+  private async closeStaleIjFindInspectorBlockingTarget(targetPid: number): Promise<boolean> {
+    let targets: any;
     try {
-      const out = execSync('ps -o pid=,command= -ax', { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+      targets = await fetchJson('http://127.0.0.1:9229/json/list', 150);
+    } catch {
+      return false;
+    }
+    if (!Array.isArray(targets)) { return false; }
+    for (const target of targets) {
+      const wsUrl = String(target?.webSocketDebuggerUrl || '');
+      if (!wsUrl) { continue; }
+      const info = await this.probeInspectorInfo(wsUrl, 350);
+      if (!info.pid || info.pid === targetPid || !info.ownedByIjFind) { continue; }
+      const report = await this.evaluateInspectorExpression(wsUrl, `
+        (function () {
+          var removed = 0;
+          var detached = 0;
+          try {
+            var BW = require('electron').BrowserWindow;
+            if (global.__ijFindConsoleBridgeListeners) {
+              try {
+                global.__ijFindConsoleBridgeListeners.forEach(function (listener, id) {
+                  try {
+                    var w = BW.fromId(Number(id));
+                    if (w && w.webContents) {
+                      w.webContents.removeListener('console-message', listener);
+                      removed++;
+                    }
+                  } catch (eConsoleRemoveOne) {}
+                });
+              } catch (eConsoleRemoveEach) {}
+              try { global.__ijFindConsoleBridgeListeners.clear(); } catch (eConsoleClear) {}
+            }
+            if (global.__ijFindBridgeListeners) {
+              try {
+                global.__ijFindBridgeListeners.forEach(function (listener, id) {
+                  try {
+                    var w = BW.fromId(Number(id));
+                    if (w && w.webContents) {
+                      w.webContents.debugger.removeListener('message', listener);
+                      removed++;
+                    }
+                  } catch (eRemoveOne) {}
+                });
+              } catch (eRemoveEach) {}
+              try { global.__ijFindBridgeListeners.clear(); } catch (eClear) {}
+            }
+            if (global.__ijFindReloadPatchListeners) {
+              try {
+                global.__ijFindReloadPatchListeners.forEach(function (listener, id) {
+                  try {
+                    var w = BW.fromId(Number(id));
+                    if (w && w.webContents) {
+                      w.webContents.removeListener('did-finish-load', listener);
+                      w.webContents.removeListener('dom-ready', listener);
+                    }
+                  } catch (eReloadOne) {}
+                });
+              } catch (eReloadEach) {}
+              try { global.__ijFindReloadPatchListeners.clear(); } catch (eReloadClear) {}
+            }
+            if (global.__ijFindAttachedWindows) {
+              try {
+                global.__ijFindAttachedWindows.forEach(function (id) {
+                  try {
+                    var w = BW.fromId(Number(id));
+                    if (w && w.webContents && w.webContents.debugger && w.webContents.debugger.isAttached()) {
+                      w.webContents.debugger.detach();
+                      detached++;
+                    }
+                  } catch (eDetachOne) {}
+                });
+              } catch (eDetachEach) {}
+              try { global.__ijFindAttachedWindows.clear(); } catch (eAttachedClear) {}
+            }
+          } catch (eCleanup) {}
+          try { delete global[${JSON.stringify(BRIDGE_BINDING)}]; } catch (eDeleteBridge) {}
+          try {
+            setTimeout(function () {
+              try {
+                if (typeof process._debugEnd === 'function') { process._debugEnd(); }
+              } catch (eDebugEnd) {}
+              try { require('inspector').close(); } catch (eCloseInspector) {}
+            }, 0);
+          } catch (eScheduleClose) {}
+          return 'pid=' + process.pid + ' removed=' + removed + ' detached=' + detached + ' inspector=closing';
+        })()
+      `.trim(), 700);
+      const targetId = String(target?.id || '');
+      if (targetId) {
+        try { await fetchText(`http://127.0.0.1:9229/json/close/${encodeURIComponent(targetId)}`, 150); } catch {}
+      }
+      this.log.appendLine(
+        `Closed stale IJSS inspector blocking pid ${targetPid}: stalePid=${info.pid} report=${String(report)}`,
+      );
+      await delay(350);
+      return true;
+    }
+    return false;
+  }
+
+  private async probeInspectorInfo(
+    wsUrl: string,
+    timeoutMs: number,
+  ): Promise<{ pid?: number; ownedByIjFind: boolean }> {
+    const value = await this.evaluateInspectorExpression(wsUrl, `
+      (function () {
+        try {
+          return {
+            pid: typeof process !== 'undefined' ? process.pid : 0,
+            ownedByIjFind: !!(
+              global.__ijFindBridgeListeners ||
+              global.__ijFindConsoleBridgeListeners ||
+              global.__ijFindAttachedWindows ||
+              global.__ijFindReloadPatchListeners ||
+              global[${JSON.stringify(BRIDGE_BINDING)}]
+            )
+          };
+        } catch (e) {
+          return { pid: 0, ownedByIjFind: false };
+        }
+      })()
+    `.trim(), timeoutMs);
+    const pid = Number((value as any)?.pid ?? 0);
+    return {
+      pid: Number.isFinite(pid) && pid > 0 ? pid : undefined,
+      ownedByIjFind: Boolean((value as any)?.ownedByIjFind),
+    };
+  }
+
+  private evaluateInspectorExpression(wsUrl: string, expression: string, timeoutMs: number): Promise<any> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let ws: WebSocket | undefined;
+      const done = (value: any) => {
+        if (settled) { return; }
+        settled = true;
+        clearTimeout(timer);
+        try { ws?.close(); } catch {}
+        resolve(value);
+      };
+      const timer = setTimeout(() => done(undefined), timeoutMs);
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.on('open', () => {
+          try {
+            ws?.send(JSON.stringify({
+              id: 1,
+              method: 'Runtime.evaluate',
+              params: {
+                expression,
+                returnByValue: true,
+              },
+            }));
+          } catch {
+            done(undefined);
+          }
+        });
+        ws.on('message', (data) => {
+          try {
+            const msg = JSON.parse(String(data));
+            if (msg.id !== 1) { return; }
+            if (msg?.result?.exceptionDetails) {
+              done(undefined);
+              return;
+            }
+            done(msg?.result?.result?.value);
+          } catch {
+            done(undefined);
+          }
+        });
+        ws.on('error', () => done(undefined));
+        ws.on('close', () => done(undefined));
+      } catch {
+        done(undefined);
+      }
+    });
+  }
+
+  private isVscodeMainProcessCommand(cmd: string): boolean {
+    if (/Helper(?:\.app|\s|\))/.test(cmd)) { return false; }
+    const patterns: RegExp[] = [
+      /\/Visual Studio Code\.app\/Contents\/MacOS\/(?:Electron|Code)(?:\s|$)/,
+      /\/Visual Studio Code - Insiders\.app\/Contents\/MacOS\/(?:Electron|Code - Insiders)(?:\s|$)/,
+      /\/VSCodium\.app\/Contents\/MacOS\/(?:Electron|VSCodium)(?:\s|$)/,
+      /\/Code - OSS\.app\/Contents\/MacOS\/(?:Electron|Code - OSS)(?:\s|$)/,
+      /\/Electron\.app\/Contents\/MacOS\/Electron(?:\s|$)/,
+    ];
+    return patterns.some((p) => p.test(cmd));
+  }
+
+  private findMainPid(): number | null {
+    // Prefer the Electron main process in this extension host's parent chain.
+    // A global "first Code.app process" match can attach CDP to another VSCode
+    // window group and make the Search UI appear in the wrong workspace.
+    try {
+      const out = execSync('ps -o pid=,ppid=,command= -ax', { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
       const lines = out.split('\n');
-      const patterns: RegExp[] = [
-        /\/Visual Studio Code\.app\/Contents\/MacOS\/(?:Electron|Code)\s*$/,
-        /\/Visual Studio Code - Insiders\.app\/Contents\/MacOS\/(?:Electron|Code - Insiders)\s*$/,
-        /\/VSCodium\.app\/Contents\/MacOS\/(?:Electron|VSCodium)\s*$/,
-        /\/Code - OSS\.app\/Contents\/MacOS\/(?:Electron|Code - OSS)\s*$/,
-        /\/Electron\.app\/Contents\/MacOS\/Electron\s*$/,
-      ];
+      const processes = new Map<number, { pid: number; ppid: number; cmd: string }>();
       for (const line of lines) {
-        const m = line.match(/^\s*(\d+)\s+(.*)$/);
+        const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
         if (!m) { continue; }
-        const cmd = m[2];
-        if (/Helper/.test(cmd)) { continue; }
-        if (patterns.some((p) => p.test(cmd))) {
-          return parseInt(m[1], 10);
+        const pid = parseInt(m[1], 10);
+        const ppid = parseInt(m[2], 10);
+        if (!Number.isFinite(pid) || !Number.isFinite(ppid)) { continue; }
+        processes.set(pid, { pid, ppid, cmd: m[3] });
+      }
+
+      let cursor = process.pid;
+      const visited = new Set<number>();
+      while (cursor > 0 && !visited.has(cursor)) {
+        visited.add(cursor);
+        const proc = processes.get(cursor);
+        if (!proc) { break; }
+        if (this.isVscodeMainProcessCommand(proc.cmd)) {
+          this.log.appendLine(`findMainPid: ancestor main pid=${proc.pid}`);
+          return proc.pid;
+        }
+        cursor = proc.ppid;
+      }
+
+      const directParent = processes.get(process.ppid);
+      if (directParent && this.isVscodeMainProcessCommand(directParent.cmd)) {
+        this.log.appendLine(`findMainPid: direct parent main pid=${directParent.pid}`);
+        return directParent.pid;
+      }
+
+      for (const proc of processes.values()) {
+        if (this.isVscodeMainProcessCommand(proc.cmd)) {
+          this.log.appendLine(`findMainPid: fallback global main pid=${proc.pid}`);
+          return proc.pid;
         }
       }
     } catch (e) {
@@ -2276,16 +3471,37 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function fetchJson(url: string): Promise<any> {
+function fetchJson(url: string, timeoutMs = 2000): Promise<any> {
+  return fetchText(url, timeoutMs).then((data) => JSON.parse(data));
+}
+
+function fetchText(url: string, timeoutMs = 2000): Promise<string> {
   return new Promise((resolve, reject) => {
     const req = http.get(url, (res) => {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
-      });
+      res.on('end', () => { resolve(data); });
     });
     req.on('error', reject);
-    req.setTimeout(2000, () => { req.destroy(new Error('HTTP timeout')); });
+    req.setTimeout(timeoutMs, () => { req.destroy(new Error('HTTP timeout')); });
+  });
+}
+
+function readRequestBody(req: http.IncomingMessage, maxBytes: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer | string) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buf.length;
+      if (size > maxBytes) {
+        reject(new Error(`request body too large: ${size}`));
+        try { req.destroy(); } catch {}
+        return;
+      }
+      chunks.push(buf);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
   });
 }

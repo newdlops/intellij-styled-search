@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { findWorkspaceFilesDirect } from './fileDiscovery';
 import { compilePathScopeMatcher } from './pathScope';
 
 export interface SearchOptions {
@@ -223,10 +224,8 @@ export async function runSearch(
 
   let files: vscode.Uri[];
   // Fast path: trigram index already told us exactly which files could
-  // contain the query. Skip the full findFiles('**/*', 100K) sweep and
-  // just materialize the candidate set. This is the single biggest search
-  // latency win for warm workspaces — findFiles on a 100K-file workspace
-  // is multi-hundred-ms on its own.
+  // contain the query. Skip the full workspace discovery sweep and just
+  // materialize the candidate set.
   if (candidateUris) {
     if (candidateUris.size === 0) {
       progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
@@ -236,11 +235,12 @@ export async function runSearch(
     let ci = 0;
     for (const u of candidateUris) { files[ci++] = vscode.Uri.parse(u); }
   } else {
-    // null (not undefined) so findFiles bypasses VSCode's default
-    // search.exclude. Empty excludeGlobs means "search everything".
-    const excludePattern = excludeGlobs.length > 0 ? `{${excludeGlobs.join(',')}}` : null;
     try {
-      files = await vscode.workspace.findFiles('**/*', excludePattern, 100_000, token);
+      files = await findWorkspaceFilesDirect({
+        excludeGlobs,
+        maxResults: 100_000,
+        token,
+      });
     } catch (err) {
       progress.onError(err as Error);
       return;

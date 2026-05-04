@@ -1,25 +1,98 @@
-export function getRendererPatchScript(): string {
+export const RENDERER_PATCH_VERSION = 99;
+
+export function getRendererPatchScript(
+  enableMonacoPreviewCapture = false,
+  enablePerfDiagnostics = false,
+  suspendIntelliSenseRecursionCapture = true,
+  enableRendererInlayClickHook = false,
+  disposeRendererPatchOnHide = true,
+): string {
+  const enableMonacoPreviewCaptureLiteral = enableMonacoPreviewCapture ? 'true' : 'false';
+  const enablePerfDiagnosticsLiteral = enablePerfDiagnostics ? 'true' : 'false';
+  const suspendIntelliSenseRecursionCaptureLiteral = suspendIntelliSenseRecursionCapture ? 'true' : 'false';
+  const enableRendererInlayClickHookLiteral = enableRendererInlayClickHook ? 'true' : 'false';
+  const disposeRendererPatchOnHideLiteral = disposeRendererPatchOnHide ? 'true' : 'false';
   return `
 (function () {
-  if (window.__ijFindPatchedV84) {
-    var existingStatus = 'not-ready:no-status';
-    try {
-      existingStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : existingStatus;
-      if (existingStatus === 'ready') { return 'already patched'; }
-      if (window.__ijFindInvalidateMonaco) {
-        window.__ijFindInvalidateMonaco('already-patched-not-ready');
-      }
-    } catch (eStatus) {}
-    try {
-      if (window.__ijFindRefreshCapture) {
-        return 'already patched; ' + window.__ijFindRefreshCapture('already-patched');
-      }
-    } catch (eRefresh) {
-      return 'already patched; refresh err: ' + (eRefresh && eRefresh.message);
+  var __ijFindPatchVersion = ${RENDERER_PATCH_VERSION};
+  var __ijFindEnableMonacoPreviewCapture = ${enableMonacoPreviewCaptureLiteral};
+  var __ijFindEnablePerfDiagnostics = ${enablePerfDiagnosticsLiteral};
+  var __ijFindShouldSuspendIntelliSenseRecursionCapture = ${suspendIntelliSenseRecursionCaptureLiteral};
+  var __ijFindEnableRendererInlayClickHook = ${enableRendererInlayClickHookLiteral};
+  var __ijFindDisposeRendererPatchOnHide = ${disposeRendererPatchOnHideLiteral};
+  try {
+    if (typeof window.__ijFindDisposeSearchUi === 'function') {
+      window.__ijFindDisposeSearchUi('patch-upgrade');
     }
-    return 'already patched';
+  } catch (eDisposePrevious) {}
+  if (window.__ijFindPatchVersion === __ijFindPatchVersion && window.__ijFindPatchedV99) {
+    try { window.__ijFindDisableMonacoProbes = !__ijFindEnableMonacoPreviewCapture; } catch (eFlag) {}
+    try { window.__ijFindPerfDiagnostics = !!__ijFindEnablePerfDiagnostics; } catch (ePerfFlag) {}
+    try { window.__ijFindShouldSuspendIntelliSenseRecursionCapture = !!__ijFindShouldSuspendIntelliSenseRecursionCapture; } catch (eIrFlag) {}
+    try { window.__ijFindEnableRendererInlayClickHook = !!__ijFindEnableRendererInlayClickHook; } catch (eInlayFlag) {}
+    try { window.__ijFindDisposeRendererPatchOnHide = !!__ijFindDisposeRendererPatchOnHide; } catch (eDisposeFlag) {}
+    if (!__ijFindEnableMonacoPreviewCapture) {
+      try { if (window.__ijFindStopCapture) { window.__ijFindStopCapture('already-patched-monaco-disabled'); } } catch (eStopAlready) {}
+      try { window.__ijFindMonaco = null; } catch (eMonacoAlready) {}
+    }
+    return 'already patched:v' + __ijFindPatchVersion;
   }
-  window.__ijFindPatchedV84 = true;
+  try { window.__ijFindPatchedV92 = false; } catch (eOldFlag) {}
+  try { window.__ijFindPatchedV93 = false; } catch (eOldFlag93) {}
+  try { window.__ijFindPatchedV94 = false; } catch (eOldFlag94) {}
+  try { window.__ijFindPatchedV95 = false; } catch (eOldFlag95) {}
+  try { window.__ijFindPatchedV96 = false; } catch (eOldFlag96) {}
+  try { window.__ijFindPatchedV97 = false; } catch (eOldFlag97) {}
+  try { window.__ijFindPatchedV98 = false; } catch (eOldFlag98) {}
+  window.__ijFindPatchedV99 = true;
+  window.__ijFindPatchVersion = __ijFindPatchVersion;
+  window.__ijFindPerfDiagnostics = !!__ijFindEnablePerfDiagnostics;
+  window.__ijFindShouldSuspendIntelliSenseRecursionCapture = !!__ijFindShouldSuspendIntelliSenseRecursionCapture;
+  window.__ijFindEnableRendererInlayClickHook = !!__ijFindEnableRendererInlayClickHook;
+  window.__ijFindDisposeRendererPatchOnHide = !!__ijFindDisposeRendererPatchOnHide;
+  function isRendererDiagnosticsEnabled() {
+    try { return window.__ijFindPerfDiagnostics === true || window.__ijFindRendererTrace === true; }
+    catch (eDiagFlag) { return false; }
+  }
+  function installIntelliSenseRecursionCaptureGuard() {
+    try {
+      if (!window.__ijFindShouldSuspendIntelliSenseRecursionCapture) { return 'disabled'; }
+      var start = window.__irStartCapture;
+      if (typeof start !== 'function') { return 'no-start'; }
+      if (start.__ijssGuarded === true) { return 'already'; }
+      var original = start.__ijssOriginal || start;
+      var guarded = function (reason) {
+        try {
+          if (window.__ijFindIrCaptureSuspended === true) {
+            return 'suppressed:ijss:' + String(reason || 'unknown');
+          }
+        } catch (eSuppressed) {}
+        return original.apply(this, arguments);
+      };
+      try { guarded.__ijssGuarded = true; } catch (eGuardFlag) {}
+      try { guarded.__ijssOriginal = original; } catch (eOrigFlag) {}
+      window.__irStartCapture = guarded;
+      return 'wrapped';
+    } catch (eGuard) {
+      return 'guard-err:' + String(eGuard && eGuard.message || eGuard).slice(0, 120);
+    }
+  }
+  function setIntelliSenseRecursionCaptureSuspended(active, reason) {
+    try {
+      if (!window.__ijFindShouldSuspendIntelliSenseRecursionCapture) { return 'disabled'; }
+      var guard = installIntelliSenseRecursionCaptureGuard();
+      window.__ijFindIrCaptureSuspended = !!active;
+      window.__ijFindIrCaptureSuspendReason = active ? String(reason || 'unknown') : '';
+      var stopped = '';
+      if (active && window.__irCaptureActive && typeof window.__irStopCapture === 'function') {
+        try { stopped = String(window.__irStopCapture('ijss:' + String(reason || 'search-ui'))); }
+        catch (eStopIr) { stopped = 'stop-err:' + String(eStopIr && eStopIr.message || eStopIr).slice(0, 120); }
+      }
+      return 'suspend=' + (!!active) + ' guard=' + guard + (stopped ? ' stop=' + stopped : '');
+    } catch (eSuspendIr) {
+      return 'suspend-err:' + String(eSuspendIr && eSuspendIr.message || eSuspendIr).slice(0, 120);
+    }
+  }
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -28,13 +101,101 @@ export function getRendererPatchScript(): string {
   // would drop win=101's __seq=1 if win=95 had already bumped it to 200.
   var __ijFindInstanceId = 'ij-' + Math.random().toString(36).slice(2) + '-' + Date.now();
   var __ijFindSeq = 0;
+  var __ijFindConsoleBridgePrefix = '__IJSS_BRIDGE__';
+  try {
+    globalThis.irSearchEvent = function (payload) {
+      try { console.info(__ijFindConsoleBridgePrefix + String(payload)); } catch (eConsole) {}
+    };
+  } catch (eBridgeInstall) {}
   function send(payload) {
     try {
+      if (__ijFindDisposed) { return; }
+      if (payload && payload.type === 'log' && !window.__ijFindDebugRendererLogs) {
+        var logMsg = String(payload.msg || '');
+        if (logMsg.indexOf('__ij-bridge-ping-') !== 0) { return; }
+      }
       payload.__seq = ++__ijFindSeq;
       payload.__src = __ijFindInstanceId;
-      globalThis.irSearchEvent(JSON.stringify(payload));
+      var raw = JSON.stringify(payload);
+      if (typeof globalThis.irSearchEvent === 'function') {
+        globalThis.irSearchEvent(raw);
+      } else {
+        console.info(__ijFindConsoleBridgePrefix + raw);
+      }
     } catch (e) {}
   }
+
+  var __ijFindDisposers = [];
+  var __ijFindDisposed = false;
+  function addDisposer(fn) {
+    if (typeof fn === 'function') { __ijFindDisposers.push(fn); }
+    return fn;
+  }
+  function on(target, type, listener, options) {
+    if (!target || typeof target.addEventListener !== 'function') { return listener; }
+    target.addEventListener(type, listener, options);
+    addDisposer(function () {
+      try { target.removeEventListener(type, listener, options); } catch (eRemoveListener) {}
+    });
+    return listener;
+  }
+  function trackObserver(observer) {
+    if (observer && typeof observer.disconnect === 'function') {
+      addDisposer(function () {
+        try { observer.disconnect(); } catch (eDisconnect) {}
+      });
+    }
+    return observer;
+  }
+  window.__ijFindDisposeSearchUi = function (reason) {
+    if (__ijFindDisposed) { return 'already-disposed'; }
+    __ijFindDisposed = true;
+    var out = [];
+    try { cancelScheduledRender(); out.push('render=cancelled'); } catch (eRender) {}
+    try { if (typeof state !== 'undefined' && state && state.searchTicker) { clearInterval(state.searchTicker); state.searchTicker = null; out.push('ticker=cleared'); } } catch (eTicker) {}
+    try { if (typeof state !== 'undefined' && state && state.debounce) { clearTimeout(state.debounce); state.debounce = null; out.push('debounce=cleared'); } } catch (eDebounce) {}
+    try { if (typeof state !== 'undefined' && state && state.hoverTimer) { clearTimeout(state.hoverTimer); state.hoverTimer = null; out.push('hoverTimer=cleared'); } } catch (eHoverTimer) {}
+    try { if (typeof hoverHideTimer !== 'undefined' && hoverHideTimer) { clearTimeout(hoverHideTimer); hoverHideTimer = null; out.push('hoverHide=cleared'); } } catch (eHoverHide) {}
+    try { if (typeof restoreStolenEditor === 'function' && state && state.stolenEditor) { restoreStolenEditor(); out.push('stolen=restored'); } } catch (eStolen) {}
+    try { if (typeof disposePreviewMonacoEditor === 'function') { disposePreviewMonacoEditor(); out.push('preview=disposed'); } } catch (ePreview) {}
+    try {
+      if (typeof state !== 'undefined' && state) {
+        state.files = [];
+        state.flat = [];
+        state.candidates = [];
+        state.confirmedUris = {};
+        state.fileIndexByUri = {};
+        state.matchCount = 0;
+        state.searching = false;
+        state.loadingMore = false;
+        state.hasMoreResults = false;
+        state.lastPreviewMsg = null;
+        out.push('state=cleared');
+      }
+    } catch (eState) {}
+    for (var di = __ijFindDisposers.length - 1; di >= 0; di--) {
+      try { __ijFindDisposers[di](); } catch (eDisposer) {}
+    }
+    __ijFindDisposers = [];
+    try { if (typeof hideHover === 'function') { hideHover(); out.push('hover=hidden'); } } catch (eHover) {}
+    try { if (typeof panel !== 'undefined' && panel && panel.parentElement) { panel.parentElement.removeChild(panel); out.push('panel=detached'); } } catch (ePanelDetach) {}
+    try { if (typeof $hoverTooltip !== 'undefined' && $hoverTooltip && $hoverTooltip.parentElement) { $hoverTooltip.parentElement.removeChild($hoverTooltip); out.push('hover=detached'); } } catch (eHoverDetach) {}
+    try {
+      var previewOverflowRoot = document.querySelector('.ij-find-preview-overflow-root');
+      if (previewOverflowRoot && previewOverflowRoot.parentElement) {
+        previewOverflowRoot.parentElement.removeChild(previewOverflowRoot);
+        out.push('overflow=detached');
+      }
+    } catch (eOverflowDetach) {}
+    try { setIntelliSenseRecursionCaptureSuspended(false, 'dispose:' + (reason || 'unknown')); } catch (eIrDispose) {}
+    try { window.__ijFindPatchedV99 = false; } catch (ePatchFlag) {}
+    try {
+      if (window.__ijFindPatchVersion === __ijFindPatchVersion) {
+        window.__ijFindPatchVersion = 0;
+      }
+    } catch (ePatchVersion) {}
+    return out.join(',') || 'disposed';
+  };
 
   // Remove overlay/hover DOM left behind by a previous patch version so
   // the new install is the ONLY instance in the page. Without this, older
@@ -47,6 +208,11 @@ export function getRendererPatchScript(): string {
       try { stale[si].parentElement && stale[si].parentElement.removeChild(stale[si]); } catch (eRm) {}
     }
   } catch (eClean) {}
+  // If an older renderer patch left prototype capture active, undo it before
+  // installing this version. A live Array/Map/Reflect hook can slow the whole
+  // VSCode renderer, not just this extension.
+  try { if (window.__ijFindStopCapture) { window.__ijFindStopCapture('patch-upgrade'); } } catch (eStopOld) {}
+  try { window.__ijFindDisableMonacoProbes = !__ijFindEnableMonacoPreviewCapture; } catch (eDisableFlag) {}
   // Drop cached monaco refs from a previous patch version. They may carry
   // stale widgetOptions (e.g. V56s contributions-empty setting which
   // disabled hover/LSP contributions) and would keep being reused until a
@@ -55,15 +221,8 @@ export function getRendererPatchScript(): string {
   try { window.__ijFindMonaco = null; } catch (eMM) {}
 
   // ── Capture VSCode internals via prototype interception ─────────────
-  // Monkey-patch Map.set / WeakMap.set / Set.add briefly right after patch
-  // install. VSCode stores widgets and services in native Map/WeakMap
-  // containers internally; anything that gets .set() in and matches one of
-  // the duck-typed signatures is captured for later use. Patches are
-  // self-removing after 30s so the overhead disappears once we have what
-  // we need (or if capture turned up empty).
-  // Always restart capture on patch load — stale captures from a previous
-  // extension-host session (renderer persists across Dev Host reloads)
-  // reference disposed widgets and we want fresh services anyway.
+  // Optional Monaco capture. This is disabled by default because these
+  // prototype hooks run on VSCode's renderer/UI thread.
   var caps = null;
   function makeCaptureState() {
     return {
@@ -82,11 +241,24 @@ export function getRendererPatchScript(): string {
     } catch (e) { return '?'; }
   }
   window.__ijFindStartCapture = function (reason) {
+    if (window.__ijFindDisableMonacoProbes) { return 'capture-disabled'; }
     try { if (window.__ijFindStopCapture) { window.__ijFindStopCapture(); } } catch (eStop) {}
     caps = makeCaptureState();
     window.__ijFindCaptures = caps;
     window.__ijFindCaptureInstalled = true;
     var capturing = true;
+    try {
+      if (window.__ijFindCaptureAutoStopTimer) {
+        clearTimeout(window.__ijFindCaptureAutoStopTimer);
+      }
+      window.__ijFindCaptureAutoStopTimer = setTimeout(function () {
+        try {
+          if (capturing && window.__ijFindStopCapture) {
+            window.__ijFindStopCapture('auto-timeout');
+          }
+        } catch (eAutoStop) {}
+      }, 8000);
+    } catch (eTimer) {}
     function sniff(v, src, k) {
       if (!capturing) { return null; }
       if (!v || typeof v !== 'object') { return null; }
@@ -148,43 +320,18 @@ export function getRendererPatchScript(): string {
       try { sniff(v, 'Set.add', null); } catch (e) {}
       return origSetAdd.call(this, v);
     };
-    var origArrayPush = Array.prototype.push;
-    Array.prototype.push = function () {
-      try {
-        for (var i = 0; i < arguments.length; i++) {
-          sniff(arguments[i], 'Array.push', i);
-        }
-      } catch (e) {}
-      return origArrayPush.apply(this, arguments);
-    };
-    // Hook Reflect.construct so that whenever any \`new X(...)\` runs via
-    // VSCode's DI container, we get the actual class X. Duck-test its
-    // prototype — if it has layout/getModel/getDomNode there, it's the
-    // widget class (or a subclass). Record distinct constructors.
-    var origReflectConstruct = Reflect.construct;
-    Reflect.construct = function (target, args, newTarget) {
-      try {
-        if (capturing && target && target.prototype) {
-          var p = target.prototype;
-          if (typeof p.layout === 'function' &&
-              typeof p.getModel === 'function' &&
-              typeof p.getDomNode === 'function') {
-            if (caps.widgetCtors.indexOf(target) < 0 && caps.widgetCtors.length < 20) {
-              caps.widgetCtors.push(target);
-            }
-          }
-        }
-      } catch (e) {}
-      return origReflectConstruct.apply(Reflect, arguments);
-    };
     window.__ijFindStopCapture = function () {
       if (!capturing) { return 'already-stopped'; }
       capturing = false;
+      try {
+        if (window.__ijFindCaptureAutoStopTimer) {
+          clearTimeout(window.__ijFindCaptureAutoStopTimer);
+          window.__ijFindCaptureAutoStopTimer = null;
+        }
+      } catch (eTimerStop) {}
       try { Map.prototype.set = origMapSet; } catch (e) {}
       try { WeakMap.prototype.set = origWeakMapSet; } catch (e) {}
       try { Set.prototype.add = origSetAdd; } catch (e) {}
-      try { Array.prototype.push = origArrayPush; } catch (e) {}
-      try { Reflect.construct = origReflectConstruct; } catch (e) {}
       window.__ijFindCaptureInstalled = false;
       // Summarise.
       var uniqKinds = {};
@@ -199,12 +346,16 @@ export function getRendererPatchScript(): string {
     return 'capture-started:' + (reason || 'unknown');
   };
   window.__ijFindRefreshCapture = function (reason) {
+    if (window.__ijFindDisableMonacoProbes) { return 'capture-disabled'; }
     try { window.__ijFindMonaco = null; } catch (eMonaco) {}
     return window.__ijFindStartCapture(reason || 'refresh');
   };
-  window.__ijFindStartCapture('patch-load');
-  // No auto-stop — extension controls the lifecycle via CDP. Patches
-  // stay installed until __ijFindStopCapture is explicitly invoked.
+  caps = makeCaptureState();
+  window.__ijFindCaptures = caps;
+  window.__ijFindCaptureInstalled = false;
+  // Prototype capture is armed only during an explicit Monaco diagnostic.
+  // Leaving it active at patch load makes normal VSCode UI work pay for our
+  // preview setup even when the search panel is closed.
 
   // ── Standalone widget creation experiment (V36) ─────────────────────
   // Uses the captured IInstantiationService + widget constructor to try
@@ -228,7 +379,7 @@ export function getRendererPatchScript(): string {
   //      styles such as ".monaco-editor .monaco-hover" still match.
   //   3. Copy VS Code theme custom properties from the real workbench so
   //      --vscode-editorHoverWidget-background and friends resolve.
-  //   4. Stack above our overlay panel (z-index 2147483000) so the hover
+  //   4. Stack above our overlay panel (z-index 10000) so the hover
   //      popup isnt hidden behind the preview UI.
   //   5. Take no visual space itself (0x0 box) and not intercept input
   //      outside the widgets own bounds.
@@ -253,12 +404,15 @@ export function getRendererPatchScript(): string {
     var root = document.querySelector('.ij-find-preview-overflow-root');
     var existing = root && root.querySelector('.ij-find-preview-overflow');
     if (existing && existing.parentElement) {
+      markSearchUiRoot(root);
+      markSearchUiRoot(existing);
       if (root.parentElement !== document.body) { document.body.appendChild(root); }
       syncPreviewOverflowTheme(root);
       return existing;
     }
     root = document.createElement('div');
     root.className = 'monaco-workbench ij-find-preview-overflow-root';
+    markSearchUiRoot(root);
     root.style.cssText = [
       'position:fixed',
       'top:0',
@@ -266,11 +420,12 @@ export function getRendererPatchScript(): string {
       'width:0',
       'height:0',
       'overflow:visible',
-      'z-index:2147483600',
+      'z-index:10020',
       'pointer-events:none',
     ].join(';');
     var node = document.createElement('div');
     node.className = 'monaco-editor ij-find-preview-overflow';
+    markSearchUiRoot(node);
     node.style.cssText = [
       'position:fixed',
       'top:0',
@@ -278,7 +433,7 @@ export function getRendererPatchScript(): string {
       'width:0',
       'height:0',
       'overflow:visible',
-      'z-index:2147483600',
+      'z-index:10020',
       'pointer-events:none',
     ].join(';');
     root.appendChild(node);
@@ -928,6 +1083,47 @@ export function getRendererPatchScript(): string {
   function clearChildren(node) {
     while (node.firstChild) { node.removeChild(node.firstChild); }
   }
+  function markSearchUiRoot(node) {
+    try {
+      node.setAttribute('data-ijss-root', 'true');
+      node.setAttribute('data-intellisense-recursion-ignore', 'true');
+      node.setAttribute('data-ir-ignore', 'true');
+    } catch (e) {}
+    return node;
+  }
+  function getSearchUiMountRoot() {
+    try {
+      return document.querySelector('.monaco-workbench') ||
+        document.querySelector('.workbench') ||
+        document.body;
+    } catch (eMountRoot) {
+      return document.body;
+    }
+  }
+  function ensureSearchUiMounted(node) {
+    try {
+      var root = getSearchUiMountRoot();
+      if (node.parentElement !== root) { root.appendChild(node); }
+      return root;
+    } catch (eMount) {
+      try { if (node.parentElement !== document.body) { document.body.appendChild(node); } } catch (eBodyMount) {}
+      return document.body;
+    }
+  }
+  function isDomPreviewHoverEnabled() {
+    return window.__ijFindEnableDomPreviewHover === true;
+  }
+  function ensureHoverTooltipMounted() {
+    if (!isDomPreviewHoverEnabled()) { return false; }
+    try {
+      if (!$hoverTooltip.parentElement) {
+        document.body.appendChild($hoverTooltip);
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
 
   var style = document.createElement('style');
   style.textContent = [
@@ -941,12 +1137,14 @@ export function getRendererPatchScript(): string {
     '  color: var(--vscode-foreground, #cccccc);',
     '  border: 1px solid var(--vscode-widget-border, var(--vscode-contrastBorder, #454545));',
     '  border-radius: 6px;',
-    '  box-shadow: 0 12px 48px rgba(0,0,0,0.6);',
-    '  z-index: 2147483000;',
+    '  box-shadow: none;',
+    '  z-index: 10000;',
     '  display: none; flex-direction: column;',
     '  font-family: var(--vscode-font-family, system-ui, -apple-system, sans-serif);',
     '  font-size: var(--vscode-font-size, 13px);',
     '  overflow: hidden;',
+    '  contain: layout paint;',
+    '  isolation: isolate;',
     '}',
     '.ij-find-overlay.visible { display: flex; }',
     '.ij-find-resizer {',
@@ -1047,12 +1245,12 @@ export function getRendererPatchScript(): string {
     '  width: 340px; max-width: min(340px, calc(100vw - 48px));',
     '  max-height: 220px; overflow: auto;',
     '  display: none;',
-    '  z-index: 2147483005;',
+    '  z-index: 10005;',
     '  background: var(--vscode-editorWidget-background, #252526);',
     '  color: var(--vscode-foreground, #cccccc);',
     '  border: 1px solid var(--vscode-widget-border, var(--vscode-contrastBorder, #454545));',
     '  border-radius: 3px;',
-    '  box-shadow: 0 8px 28px rgba(0,0,0,0.45);',
+    '  box-shadow: none;',
     '  padding: 3px 0;',
     '}',
     '.ij-find-history-menu.open { display: block; }',
@@ -1122,6 +1320,7 @@ export function getRendererPatchScript(): string {
     '  flex: 1 1 auto; overflow: auto; padding: 2px 0;',
     '  position: relative;',
     '  min-height: 60px;',
+    '  contain: layout paint;',
     '}',
     '.ij-find-results-inner {',
     '  position: relative;',
@@ -1214,6 +1413,7 @@ export function getRendererPatchScript(): string {
     '  background: var(--vscode-editor-background, #1e1e1e);',
     '  min-width: 0;',
     '  min-height: 0;',
+    '  contain: layout paint;',
     '}',
     '.ij-find-preview-header {',
     '  padding: 4px 10px; flex: 0 0 auto;',
@@ -1249,11 +1449,16 @@ export function getRendererPatchScript(): string {
     '  min-width: 0; min-height: 0;',
     '  scrollbar-gutter: stable both-edges;',
     '}',
-    '.ij-find-preview-content {',
-    '  min-width: 100%;',
-    '  width: max-content;',
-    '  min-height: 100%;',
-    '}',
+	    '.ij-find-preview-content {',
+	    '  min-width: 100%;',
+	    '  width: max-content;',
+	    '  min-height: 100%;',
+	    '}',
+	    '.ij-find-preview-truncated {',
+	    '  padding: 2px 10px;',
+	    '  color: var(--vscode-descriptionForeground, #9d9d9d);',
+	    '  font-style: italic;',
+	    '}',
     // When a stolen monaco editor is mounted in this body, keep our own
     // padding / typography rules from bleeding into it. Nothing is forced
     // on the .monaco-editor child — we size it via inline style in JS.
@@ -1364,13 +1569,13 @@ export function getRendererPatchScript(): string {
 
     '.ij-find-hover-tooltip {',
     '  position: fixed;',
-    '  z-index: 2147483647;',
+    '  z-index: 10020;',
     '  padding: 8px 12px;',
     '  background: var(--vscode-editorHoverWidget-background, #252526);',
     '  color: var(--vscode-editorHoverWidget-foreground, #cccccc);',
     '  border: 1px solid var(--vscode-editorHoverWidget-border, var(--vscode-widget-border, #454545));',
     '  border-radius: 4px;',
-    '  box-shadow: 0 6px 18px rgba(0,0,0,0.45);',
+    '  box-shadow: none;',
     '  font-family: var(--vscode-font-family, system-ui);',
     '  font-size: 13px; line-height: 1.5;',
     '  max-width: 640px; max-height: 360px;',
@@ -1442,12 +1647,12 @@ export function getRendererPatchScript(): string {
     '  top: 0 !important; left: 0 !important;',
     '  width: 0 !important; height: 0 !important;',
     '  overflow: visible !important;',
-    '  z-index: 2147483600 !important;',
+    '  z-index: 10020 !important;',
     '  pointer-events: none;',
     '}',
     '.ij-find-preview-overflow,',
     '.ij-find-preview-overflow * {',
-    '  z-index: 2147483601 !important;',
+    '  z-index: 10021 !important;',
     '}',
     '.ij-find-preview-overflow .monaco-hover,',
     '.ij-find-preview-overflow .suggest-widget,',
@@ -1544,19 +1749,20 @@ export function getRendererPatchScript(): string {
     className: 'ij-find-overlay',
     children: [$header, $toolbar, $results, $splitter, $preview, $resizer],
   });
-  document.body.appendChild(panel);
+  markSearchUiRoot(panel);
+  ensureSearchUiMounted(panel);
   syncPreviewOverflowTheme(panel);
 
   var $hoverTooltip = el('div', { className: 'ij-find-hover-tooltip' });
-  document.body.appendChild($hoverTooltip);
+  markSearchUiRoot($hoverTooltip);
   syncPreviewOverflowTheme($hoverTooltip);
 
   // When the preview pane is resized (panel corner drag or splitter), relayout
   // any stolen Monaco editor so it re-fits the available area.
   try {
-    var previewResizeObserver = new ResizeObserver(function () {
+    var previewResizeObserver = trackObserver(new ResizeObserver(function () {
       if (state && state.stolenEditor) { layoutStolenEditor(); }
-    });
+    }));
     previewResizeObserver.observe($previewBody);
   } catch (e) {}
 
@@ -1610,11 +1816,326 @@ export function getRendererPatchScript(): string {
     previewMonacoHost: null,
     resultsInfoText: '',
     rgScope: '',
-    searchHistory: [],
-    searchHistoryLimit: 100,
+	    searchHistory: [],
+	    searchHistoryLimit: 100,
+		  matchCount: 0,
+		  recoveryUntil: 0,
+		};
+  function irLightStatus() {
+    var out = {};
+    try {
+      out.patchVersion = window.__irPatchVersion || null;
+      out.captureActive = !!window.__irCaptureActive;
+      out.captureSessionId = typeof window.__irCaptureSessionId === 'number' ? window.__irCaptureSessionId : null;
+      out.hasStopCapture = typeof window.__irStopCapture === 'function';
+      out.scanTimer = !!window.__irScanTimer;
+      out.scanInterval = !!window.__irScanInterval;
+      out.markdownObserver = !!window.__irMarkdownObserver;
+      out.recaptureScheduled = !!window.__irRecaptureScheduled;
+      out.mdRenderer = !!window.__irMdRenderer;
+      out.monaco = !!window.__irMonaco;
+      out.monacoCaps = !!window.__irMonacoCaps;
+      out.ijssCaptureSuspended = !!window.__ijFindIrCaptureSuspended;
+      out.ijssCaptureGuarded = !!(window.__irStartCapture && window.__irStartCapture.__ijssGuarded);
+    } catch (e) {
+      out.error = String(e && e.message || e).slice(0, 160);
+    }
+    return out;
+  }
+  function lightStatusObject() {
+    var out = {
+      patchVersion: window.__ijFindPatchVersion || null,
+      disposed: !!__ijFindDisposed,
+      panelVisible: false,
+      panelInDom: false,
+      files: 0,
+      flat: 0,
+      candidates: 0,
+      matchCount: 0,
+      searching: false,
+      loadingMore: false,
+      hasMoreResults: false,
+      activeIndex: -1,
+      previewMode: '',
+      previewUri: '',
+      hasDebounce: false,
+      hasTicker: false,
+      hasHoverTimer: false,
+      hoverTooltipMounted: false,
+      domPreviewHoverEnabled: false,
+      monacoProbeDisabled: !!window.__ijFindDisableMonacoProbes,
+      rendererInlayClickHook: !!window.__ijFindEnableRendererInlayClickHook,
+      disposeOnHide: !!window.__ijFindDisposeRendererPatchOnHide
+    };
+    try {
+      out.panelVisible = !!(panel && panel.classList && panel.classList.contains('visible'));
+      out.panelInDom = !!(panel && panel.parentElement);
+    } catch (ePanel) {}
+    try {
+      out.files = state.files ? state.files.length : 0;
+      out.flat = state.flat ? state.flat.length : 0;
+      out.candidates = state.candidates ? state.candidates.length : 0;
+      out.matchCount = state.matchCount || 0;
+      out.searching = !!state.searching;
+      out.loadingMore = !!state.loadingMore;
+      out.hasMoreResults = !!state.hasMoreResults;
+      out.activeIndex = typeof state.activeIndex === 'number' ? state.activeIndex : -1;
+      out.previewMode = state.previewMode || '';
+      out.previewUri = state.previewUri || '';
+      out.hasDebounce = !!state.debounce;
+      out.hasTicker = !!state.searchTicker;
+      out.hasHoverTimer = !!state.hoverTimer;
+      out.hoverTooltipMounted = !!($hoverTooltip && $hoverTooltip.parentElement);
+      out.domPreviewHoverEnabled = isDomPreviewHoverEnabled();
+    } catch (eState) {
+      out.stateError = String(eState && eState.message || eState).slice(0, 160);
+    }
+    return out;
+  }
+  window.__ijFindLightStatus = lightStatusObject;
+  function trace(phase, data) {
+    try {
+      if (!isRendererDiagnosticsEnabled()) { return; }
+      send({
+        type: 'trace',
+        phase: String(phase || ''),
+        perf: Math.round((performance && performance.now ? performance.now() : 0)),
+        data: data || {},
+        light: lightStatusObject(),
+        ir: irLightStatus(),
+      });
+    } catch (eTrace) {}
+  }
+  function perfNow() {
+    try { return performance && performance.now ? performance.now() : Date.now(); }
+    catch (ePerfNow) { return Date.now(); }
+  }
+  function perfMemorySnapshot() {
+    try {
+      var mem = performance && performance.memory;
+      if (!mem) { return null; }
+      return {
+        used: Math.round(mem.usedJSHeapSize || 0),
+        total: Math.round(mem.totalJSHeapSize || 0),
+        limit: Math.round(mem.jsHeapSizeLimit || 0),
+      };
+    } catch (eMem) {
+      return null;
+    }
+  }
+  function perfDomSnapshot() {
+    try {
+      return {
+        monacoHovers: document.querySelectorAll('.monaco-hover,.monaco-editor-hover').length,
+        renderedMarkdown: document.querySelectorAll('.rendered-markdown').length,
+        tokenizedSources: document.querySelectorAll('.monaco-tokenized-source').length,
+        ijRoots: document.querySelectorAll('[data-ijss-root="true"]').length,
+        visiblePanel: isPanelVisibleForPerf(),
+        activeTag: document.activeElement && document.activeElement.tagName ? document.activeElement.tagName : '',
+        activeClass: document.activeElement && document.activeElement.className ? String(document.activeElement.className).slice(0, 120) : '',
+      };
+    } catch (eDom) {
+      return { error: String(eDom && eDom.message || eDom).slice(0, 120) };
+    }
+  }
+  function longTaskAttribution(entry) {
+    var out = [];
+    try {
+      var attr = entry && entry.attribution;
+      if (!attr || typeof attr.length !== 'number') { return out; }
+      for (var i = 0; i < attr.length && i < 6; i++) {
+        var a = attr[i] || {};
+        out.push({
+          name: a.name || '',
+          entryType: a.entryType || '',
+          containerType: a.containerType || '',
+          containerName: a.containerName || '',
+          containerId: a.containerId || '',
+          containerSrc: a.containerSrc || '',
+        });
+      }
+    } catch (eAttr) {}
+    return out;
+  }
+  var __ijPerfWatch = {
+    active: false,
+    rafId: 0,
+    reason: '',
+    startedAt: 0,
+    deadline: 0,
+    lastFrameAt: 0,
+    lastGapLogAt: 0,
+    maxGapMs: 0,
+    gapEvents: 0,
+    longTaskEvents: 0,
   };
-  var RESULT_ROW_HEIGHT = 20;
+  function isPanelVisibleForPerf() {
+    try { return !!(panel && panel.classList && panel.classList.contains('visible')); }
+    catch (eVisible) { return false; }
+  }
+  function startPerfWatch(reason, durationMs) {
+    try {
+      if (!isRendererDiagnosticsEnabled()) { return; }
+      if (typeof requestAnimationFrame !== 'function') { return; }
+      var now = perfNow();
+      var duration = Math.max(1000, Math.min(30000, typeof durationMs === 'number' ? durationMs : 12000));
+      var wasActive = __ijPerfWatch.active;
+      __ijPerfWatch.deadline = Math.max(__ijPerfWatch.deadline || 0, now + duration);
+      __ijPerfWatch.reason = wasActive ? (__ijPerfWatch.reason + ',' + reason) : String(reason || 'watch');
+      if (wasActive) { return; }
+      __ijPerfWatch.active = true;
+      __ijPerfWatch.startedAt = now;
+      __ijPerfWatch.lastFrameAt = 0;
+      __ijPerfWatch.lastGapLogAt = 0;
+      __ijPerfWatch.maxGapMs = 0;
+      __ijPerfWatch.gapEvents = 0;
+      __ijPerfWatch.longTaskEvents = 0;
+      trace('perf:watch:start', { reason: __ijPerfWatch.reason, durationMs: duration });
+      var tick = function (ts) {
+        if (!__ijPerfWatch.active) { return; }
+        var frameAt = typeof ts === 'number' ? ts : perfNow();
+        if (__ijPerfWatch.lastFrameAt > 0) {
+          var gap = frameAt - __ijPerfWatch.lastFrameAt;
+          if (gap > __ijPerfWatch.maxGapMs) { __ijPerfWatch.maxGapMs = gap; }
+          if (gap >= 80 && __ijPerfWatch.gapEvents < 24 && frameAt - __ijPerfWatch.lastGapLogAt >= 250) {
+            __ijPerfWatch.gapEvents++;
+            __ijPerfWatch.lastGapLogAt = frameAt;
+            trace('perf:raf-gap', {
+              reason: __ijPerfWatch.reason,
+              gapMs: Math.round(gap),
+              maxGapMs: Math.round(__ijPerfWatch.maxGapMs),
+              elapsedMs: Math.round(frameAt - __ijPerfWatch.startedAt),
+              memory: perfMemorySnapshot(),
+              dom: perfDomSnapshot(),
+            });
+          }
+        }
+        __ijPerfWatch.lastFrameAt = frameAt;
+        if (frameAt < __ijPerfWatch.deadline && isPanelVisibleForPerf()) {
+          __ijPerfWatch.rafId = requestAnimationFrame(tick);
+          return;
+        }
+        __ijPerfWatch.active = false;
+        __ijPerfWatch.rafId = 0;
+        trace('perf:watch:end', {
+          reason: __ijPerfWatch.reason,
+          elapsedMs: Math.round(frameAt - __ijPerfWatch.startedAt),
+          maxGapMs: Math.round(__ijPerfWatch.maxGapMs),
+          gapEvents: __ijPerfWatch.gapEvents,
+          longTaskEvents: __ijPerfWatch.longTaskEvents,
+        });
+      };
+      __ijPerfWatch.rafId = requestAnimationFrame(tick);
+    } catch (eWatch) {}
+  }
+  function stopPerfWatch(reason) {
+    try {
+      if (!__ijPerfWatch.active) { return; }
+      __ijPerfWatch.active = false;
+      if (__ijPerfWatch.rafId && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(__ijPerfWatch.rafId);
+      }
+      trace('perf:watch:stop', {
+        reason: reason || 'stop',
+        watchReason: __ijPerfWatch.reason,
+        elapsedMs: Math.round(perfNow() - __ijPerfWatch.startedAt),
+        maxGapMs: Math.round(__ijPerfWatch.maxGapMs),
+        gapEvents: __ijPerfWatch.gapEvents,
+        longTaskEvents: __ijPerfWatch.longTaskEvents,
+      });
+    } catch (eStopWatch) {}
+  }
+  function reportPerfPhase(name, startedAt, data, thresholdMs) {
+    try {
+      if (!isRendererDiagnosticsEnabled()) { return; }
+      var duration = perfNow() - startedAt;
+      var threshold = typeof thresholdMs === 'number' ? thresholdMs : 8;
+      if (duration >= threshold || window.__ijFindPerfVerbose === true) {
+        var payload = data || {};
+        payload.name = name;
+        payload.durationMs = Math.round(duration);
+        trace('perf:phase', payload);
+      }
+      if (duration >= 80) {
+        startPerfWatch('slow-phase:' + name, 6000);
+      }
+    } catch (ePhase) {}
+  }
+  (function installLongTaskObserver() {
+    try {
+      if (!isRendererDiagnosticsEnabled()) { return; }
+      if (typeof PerformanceObserver !== 'function') {
+        trace('perf:longtask-observer', { supported: false, reason: 'no-performance-observer' });
+        return;
+      }
+      var supported = PerformanceObserver.supportedEntryTypes || [];
+      if (supported.indexOf && supported.indexOf('longtask') < 0) {
+        trace('perf:longtask-observer', { supported: false, reason: 'entrytype-missing' });
+        return;
+      }
+      var observer = new PerformanceObserver(function (list) {
+        if (!isPanelVisibleForPerf() && !__ijPerfWatch.active) { return; }
+        var entries = list.getEntries ? list.getEntries() : [];
+        for (var i = 0; i < entries.length && __ijPerfWatch.longTaskEvents < 24; i++) {
+          var entry = entries[i];
+          var duration = entry && entry.duration ? entry.duration : 0;
+          if (duration < 50) { continue; }
+          __ijPerfWatch.longTaskEvents++;
+          trace('perf:longtask', {
+            durationMs: Math.round(duration),
+            startTimeMs: Math.round(entry.startTime || 0),
+            name: entry.name || '',
+            entryType: entry.entryType || '',
+            attribution: longTaskAttribution(entry),
+            memory: perfMemorySnapshot(),
+            dom: perfDomSnapshot(),
+          });
+        }
+      });
+      observer.observe({ entryTypes: ['longtask'] });
+      addDisposer(function () { try { observer.disconnect(); } catch (eDisconnectPerf) {} });
+      trace('perf:longtask-observer', { supported: true, entryTypes: supported.slice ? supported.slice(0, 40) : [] });
+    } catch (eLongTask) {
+      trace('perf:longtask-observer', { supported: false, reason: String(eLongTask && eLongTask.message || eLongTask).slice(0, 160) });
+    }
+  })();
+  (function installGcObserver() {
+    try {
+      if (!isRendererDiagnosticsEnabled()) { return; }
+      if (typeof PerformanceObserver !== 'function') { return; }
+      var supported = PerformanceObserver.supportedEntryTypes || [];
+      if (!supported.indexOf || supported.indexOf('gc') < 0) {
+        trace('perf:gc-observer', { supported: false });
+        return;
+      }
+      var observer = new PerformanceObserver(function (list) {
+        if (!isPanelVisibleForPerf() && !__ijPerfWatch.active) { return; }
+        var entries = list.getEntries ? list.getEntries() : [];
+        for (var i = 0; i < entries.length && i < 12; i++) {
+          var entry = entries[i];
+          trace('perf:gc', {
+            durationMs: Math.round(entry.duration || 0),
+            startTimeMs: Math.round(entry.startTime || 0),
+            name: entry.name || '',
+            kind: entry.kind || '',
+            memory: perfMemorySnapshot(),
+          });
+        }
+      });
+      observer.observe({ entryTypes: ['gc'] });
+      addDisposer(function () { try { observer.disconnect(); } catch (eDisconnectGc) {} });
+      trace('perf:gc-observer', { supported: true });
+    } catch (eGc) {
+      trace('perf:gc-observer', { supported: false, reason: String(eGc && eGc.message || eGc).slice(0, 160) });
+    }
+  })();
+  trace('patch:installed', {
+    monacoCaptureEnabled: !!__ijFindEnableMonacoPreviewCapture,
+    perfDiagnostics: !!__ijFindEnablePerfDiagnostics
+  });
+	  var RESULT_ROW_HEIGHT = 20;
   var RESULT_OVERSCAN = 12;
+  var SEARCHING_RENDER_MIN_INTERVAL_MS = 100;
 
   function setStatus(text, spinning) {
     $status.textContent = text;
@@ -1622,8 +2143,7 @@ export function getRendererPatchScript(): string {
   }
   function setSummary() {
     var files = state.files.length;
-    var matches = 0;
-    for (var i = 0; i < files; i++) { matches += state.files[i].matches.length; }
+    var matches = state.matchCount || 0;
     if (matches === 0) { $summary.textContent = ''; return; }
     if (state.searching) {
       $summary.textContent = matches + '+ matches in ' + files + ' file' + (files === 1 ? '' : 's');
@@ -1649,12 +2169,11 @@ export function getRendererPatchScript(): string {
     return ' (' + (ms / 1000).toFixed(1) + 's)';
   }
   // Status rewrite used by both results:start/file/candidates while the
-  // search is in flight. Keeps the elapsed-time suffix updated on every
-  // 100ms ticker tick without duplicating the count-formatting branches.
+  // search is in flight. Keeps the elapsed-time suffix updated without
+  // duplicating the count-formatting branches.
   function updateSearchingStatus() {
     var elapsed = state.searchStartTs ? Date.now() - state.searchStartTs : 0;
-    var matches = 0;
-    for (var i = 0; i < state.files.length; i++) { matches += state.files[i].matches.length; }
+    var matches = state.matchCount || 0;
     var base;
     if (matches > 0) {
       base = matches + ' match' + (matches === 1 ? '' : 'es') + ' in ' + state.files.length +
@@ -1770,6 +2289,7 @@ export function getRendererPatchScript(): string {
   }
 
   function appendHighlightedInto(container, text, ranges) {
+    ranges = sanitizeRangesForText(text, ranges);
     if (!ranges || ranges.length === 0) {
       container.appendChild(document.createTextNode(text));
       return;
@@ -1790,10 +2310,22 @@ export function getRendererPatchScript(): string {
       pos = Math.min(r.end, text.length);
     }
     if (pos < text.length) { container.appendChild(document.createTextNode(text.slice(pos))); }
-    if (painted === 0 && ranges.length > 0) {
-      // Surface unexpected cases (e.g. malformed range) so it shows up in logs.
-      send({ type: 'log', msg: 'paint=0 ranges=' + JSON.stringify(ranges).slice(0, 120) + ' textLen=' + text.length });
+  }
+
+  function sanitizeRangesForText(text, ranges) {
+    var len = String(text || '').length;
+    if (!ranges || ranges.length === 0) { return []; }
+    var out = [];
+    for (var i = 0; i < ranges.length && out.length < 16; i++) {
+      var r = ranges[i] || {};
+      var start = typeof r.start === 'number' && isFinite(r.start) ? Math.floor(r.start) : 0;
+      var end = typeof r.end === 'number' && isFinite(r.end) ? Math.floor(r.end) : start;
+      start = Math.max(0, Math.min(len, start));
+      end = Math.max(0, Math.min(len, end));
+      if (end <= start) { continue; }
+      out.push({ start: start, end: end });
     }
+    return out;
   }
 
   function normalizeResultPreview(text) {
@@ -1823,21 +2355,64 @@ export function getRendererPatchScript(): string {
 
   var _renderPending = false;
   var _resultsViewportPending = false;
+  var _renderTimer = null;
+  var _lastRenderAt = 0;
   function scheduleRender() {
     if (_renderPending) { return; }
     _renderPending = true;
-    requestAnimationFrame(function () {
-      _renderPending = false;
-      render();
-    });
+    var delay = 0;
+    if (state.searching) {
+      delay = Math.max(0, SEARCHING_RENDER_MIN_INTERVAL_MS - (Date.now() - _lastRenderAt));
+    }
+    function runRenderFrame() {
+      _renderTimer = null;
+      requestAnimationFrame(function () {
+        var renderT0 = perfNow();
+        _renderPending = false;
+        _lastRenderAt = Date.now();
+        try {
+          render();
+        } finally {
+          reportPerfPhase('render:scheduled', renderT0, {
+            searching: !!state.searching,
+            files: state.files.length,
+            flat: state.flat.length,
+            candidates: state.candidates.length,
+          }, 10);
+        }
+      });
+    }
+    if (delay > 0) {
+      _renderTimer = setTimeout(runRenderFrame, delay);
+    } else {
+      runRenderFrame();
+    }
+  }
+
+  function cancelScheduledRender() {
+    if (_renderTimer) {
+      clearTimeout(_renderTimer);
+      _renderTimer = null;
+    }
+    _renderPending = false;
+    _resultsViewportPending = false;
   }
 
   function scheduleResultsViewportRender() {
     if (_resultsViewportPending) { return; }
     _resultsViewportPending = true;
     requestAnimationFrame(function () {
+      var viewportT0 = perfNow();
       _resultsViewportPending = false;
-      renderResultsViewport();
+      try {
+        renderResultsViewport();
+      } finally {
+        reportPerfPhase('resultsViewport:scheduled', viewportT0, {
+          flat: state.flat.length,
+          activeIndex: state.activeIndex,
+          scrollTop: Math.round($results.scrollTop || 0),
+        }, 10);
+      }
     });
   }
 
@@ -1934,6 +2509,8 @@ export function getRendererPatchScript(): string {
   }
 
   function renderResultsViewport() {
+    var viewportT0 = perfNow();
+    try {
     clearChildren($resultsInner);
     var totalRows = totalRenderableRows();
     if (totalRows === 0) {
@@ -1953,9 +2530,19 @@ export function getRendererPatchScript(): string {
     }
     $resultsInner.appendChild(frag);
     maybeLoadMoreResults();
+    } finally {
+      reportPerfPhase('resultsViewport', viewportT0, {
+        flat: state.flat.length,
+        totalRows: totalRenderableRows(),
+        activeIndex: state.activeIndex,
+        scrollTop: Math.round($results.scrollTop || 0),
+      }, 10);
+    }
   }
 
   function render() {
+    var renderT0 = perfNow();
+    try {
     var hasMatches = state.files.length > 0;
     // Pending candidates: show whenever we have them, whether rg is still
     // scanning OR the search finished with 0 matches (user still wants to
@@ -2022,6 +2609,15 @@ export function getRendererPatchScript(): string {
     }
     applyActive(false);
     setSummary();
+    } finally {
+      reportPerfPhase('render', renderT0, {
+        searching: !!state.searching,
+        files: state.files.length,
+        flat: state.flat.length,
+        candidates: state.candidates.length,
+        activeIndex: state.activeIndex,
+      }, 10);
+    }
   }
 
   function applyActive(shouldScroll) {
@@ -2064,13 +2660,13 @@ export function getRendererPatchScript(): string {
   // already have accurate ranges).
   function rangesForCurrentQuery(m) {
     var fq = state.filterQuery || '';
-    if (!fq) { return m.ranges; }
-    var preview = m.preview || '';
+    var preview = normalizeResultPreview(m.preview || '');
+    if (!fq) { return sanitizeRangesForText(preview, m.ranges); }
     var hay = state.options.caseSensitive ? preview : preview.toLowerCase();
     var needle = state.options.caseSensitive ? fq : fq.toLowerCase();
     var idx = hay.indexOf(needle);
-    if (idx < 0) { return m.ranges; }
-    return [{ start: idx, end: idx + fq.length }];
+    if (idx < 0) { return sanitizeRangesForText(preview, m.ranges); }
+    return sanitizeRangesForText(preview, [{ start: idx, end: idx + fq.length }]);
   }
 
   function targetForFlatIndex(flatIdx) {
@@ -2101,14 +2697,20 @@ export function getRendererPatchScript(): string {
     send({ type: 'revealFile', uri: target.uri });
   }
 
-  function triggerSearch(forceRestart, recordHistory) {
-    var raw = $q.value;
-    var scopeRaw = $scope.value || '';
+	  function triggerSearch(forceRestart, recordHistory) {
+	    var raw = $q.value;
+	    var scopeRaw = $scope.value || '';
     // Preserve the query byte-for-byte. Multi-line search selections often
     // begin with indentation, and trimming that indentation changes the
     // literal search target into a different string.
-    var q = typeof raw === 'string' ? raw : '';
-    var scopePatterns = parseScopeInput(scopeRaw);
+	    var q = typeof raw === 'string' ? raw : '';
+    trace('search:request', {
+      len: q.length,
+      hasNewline: q.indexOf('\\n') >= 0,
+      forceRestart: !!forceRestart,
+      recordHistory: !!recordHistory,
+    });
+	    var scopePatterns = parseScopeInput(scopeRaw);
     clearPreview();
     if (!q) {
       state.files = []; state.flat = []; state.activeIndex = -1; state.searching = false;
@@ -2245,13 +2847,13 @@ export function getRendererPatchScript(): string {
     selectMatch(next);
   }
 
-  $q.addEventListener('input', function () { autosizeQuery(); markSearchDirty(); });
-  $scope.addEventListener('input', scheduleSearch);
-  $history.addEventListener('click', function (e) {
+  on($q, 'input', function () { autosizeQuery(); markSearchDirty(); });
+  on($scope, 'input', scheduleSearch);
+  on($history, 'click', function (e) {
     e.preventDefault();
     toggleSearchHistory();
   });
-  $history.addEventListener('keydown', function (e) {
+  on($history, 'keydown', function (e) {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
       toggleSearchHistory();
@@ -2265,13 +2867,13 @@ export function getRendererPatchScript(): string {
       closeSearchHistory();
     }
   });
-  $historyMenu.addEventListener('click', function (e) {
+  on($historyMenu, 'click', function (e) {
     var item = e.target instanceof HTMLElement ? e.target.closest('.ij-find-history-item') : null;
     if (!item) { return; }
     e.preventDefault();
     selectSearchHistory(parseInt(item.getAttribute('data-history-index') || '-1', 10));
   });
-  $historyMenu.addEventListener('keydown', function (e) {
+  on($historyMenu, 'keydown', function (e) {
     if (e.key === 'Escape') {
       e.preventDefault();
       closeSearchHistory();
@@ -2298,12 +2900,12 @@ export function getRendererPatchScript(): string {
       try { items[next].focus(); } catch (eFocus2) {}
     }
   });
-  document.addEventListener('mousedown', function (e) {
+  on(document, 'mousedown', function (e) {
     if (!$historyMenu.classList.contains('open')) { return; }
     if (e.target instanceof Node && $historyWrap.contains(e.target)) { return; }
     closeSearchHistory();
   });
-  $q.addEventListener('keydown', function (e) {
+  on($q, 'keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       // Shift+Enter: insert literal newline (textarea default) → enables
       // ripgrep multi-line search. Plain Enter: execute the query.
@@ -2316,7 +2918,7 @@ export function getRendererPatchScript(): string {
     else if (e.key === 'PageUp') { e.preventDefault(); moveActive(-10); }
     else if (e.key === 'Escape') { e.preventDefault(); window.__ijFindHide(); }
   });
-  $scope.addEventListener('keydown', function (e) {
+  on($scope, 'keydown', function (e) {
     if (e.key === 'Enter') {
       if (state.debounce) { clearTimeout(state.debounce); }
       e.preventDefault();
@@ -2325,11 +2927,11 @@ export function getRendererPatchScript(): string {
     else if (e.key === 'ArrowUp') { e.preventDefault(); moveActive(-1); }
     else if (e.key === 'Escape') { e.preventDefault(); window.__ijFindHide(); }
   });
-  $optCase.addEventListener('click', function () { toggleOpt('caseSensitive', $optCase); });
-  $optWord.addEventListener('click', function () { toggleOpt('wholeWord', $optWord); });
-  $optRegex.addEventListener('click', function () { toggleOpt('useRegex', $optRegex); });
-  $optRegexMultiline.addEventListener('click', function () { toggleOpt('regexMultiline', $optRegexMultiline); });
-  $refresh.addEventListener('click', refreshSearch);
+  on($optCase, 'click', function () { toggleOpt('caseSensitive', $optCase); });
+  on($optWord, 'click', function () { toggleOpt('wholeWord', $optWord); });
+  on($optRegex, 'click', function () { toggleOpt('useRegex', $optRegex); });
+  on($optRegexMultiline, 'click', function () { toggleOpt('regexMultiline', $optRegexMultiline); });
+  on($refresh, 'click', refreshSearch);
   function applyMinimapSetting() {
     var ed = state.previewMonacoEditor || state.monacoEditor;
     if (ed && typeof ed.updateOptions === 'function') {
@@ -2338,7 +2940,7 @@ export function getRendererPatchScript(): string {
     $minimapToggle.setAttribute('aria-pressed', String(!!state.minimapEnabled));
   }
   applyMinimapSetting();
-  $minimapToggle.addEventListener('click', function (e) {
+  on($minimapToggle, 'click', function (e) {
     e.preventDefault();
     state.minimapEnabled = !state.minimapEnabled;
     applyMinimapSetting();
@@ -2347,11 +2949,11 @@ export function getRendererPatchScript(): string {
     var ed = state.previewMonacoEditor || state.monacoEditor;
     if (ed && typeof ed.focus === 'function') { try { ed.focus(); } catch (eF) {} }
   });
-  $close.addEventListener('click', function () { window.__ijFindHide(); });
+  on($close, 'click', function () { window.__ijFindHide(); });
   syncRegexMultilineUi();
   renderSearchHistory();
 
-  $results.addEventListener('click', function (e) {
+  on($results, 'click', function (e) {
     var actionBtn = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row-action') : null;
     if (actionBtn) {
       e.preventDefault();
@@ -2372,23 +2974,55 @@ export function getRendererPatchScript(): string {
     var flatIdx = parseInt(row.getAttribute('data-flat') || '-1', 10);
     if (flatIdx >= 0) { selectMatch(flatIdx); $q.focus(); }
   });
-  $results.addEventListener('dblclick', function (e) {
+  on($results, 'dblclick', function (e) {
     if (e.target instanceof HTMLElement && e.target.closest('.ij-find-row-action')) { return; }
     var row = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row') : null;
     if (!row) { return; }
     var flatIdx = parseInt(row.getAttribute('data-flat') || '-1', 10);
     if (flatIdx >= 0) { state.activeIndex = flatIdx; applyActive(true); openActive(); }
   });
-  $results.addEventListener('scroll', function () {
+  on($results, 'scroll', function () {
     if (state.flat.length > 0 || state.resultsInfoText) { scheduleResultsViewportRender(); }
     maybeLoadMoreResults();
   });
+
+  function addTemporaryDocumentMouseHandlers(moveHandler, upHandler) {
+    var active = true;
+    function cleanup() {
+      if (!active) { return; }
+      active = false;
+      try { document.removeEventListener('mousemove', moveHandler, true); } catch (eMoveRemove) {}
+      try { document.removeEventListener('mouseup', wrappedUpHandler, true); } catch (eUpRemove) {}
+    }
+    function wrappedUpHandler(e) {
+      try { if (typeof upHandler === 'function') { upHandler(e); } }
+      finally { cleanup(); }
+    }
+    try {
+      document.addEventListener('mousemove', moveHandler, true);
+      document.addEventListener('mouseup', wrappedUpHandler, true);
+      addDisposer(cleanup);
+    } catch (eAddMouseHandlers) {}
+    return cleanup;
+  }
 
   // Drag header
   (function setupDrag() {
     var dragging = false;
     var startX = 0, startY = 0, origX = 0, origY = 0;
-    $header.addEventListener('mousedown', function (e) {
+    function onMove(e) {
+      if (!dragging) { return; }
+      var nx = origX + (e.clientX - startX);
+      var ny = origY + (e.clientY - startY);
+      nx = Math.max(0, Math.min(window.innerWidth - 120, nx));
+      ny = Math.max(0, Math.min(window.innerHeight - 40, ny));
+      panel.style.left = nx + 'px';
+      panel.style.top = ny + 'px';
+    }
+    function onUp() {
+      dragging = false;
+    }
+    on($header, 'mousedown', function (e) {
       if (e.target && e.target.closest && e.target.closest('.ij-find-close')) { return; }
       dragging = true;
       var rect = panel.getBoundingClientRect();
@@ -2397,25 +3031,26 @@ export function getRendererPatchScript(): string {
       panel.style.transform = 'none';
       startX = e.clientX; startY = e.clientY;
       origX = rect.left; origY = rect.top;
+      addTemporaryDocumentMouseHandlers(onMove, onUp);
       e.preventDefault();
     });
-    document.addEventListener('mousemove', function (e) {
-      if (!dragging) { return; }
-      var nx = origX + (e.clientX - startX);
-      var ny = origY + (e.clientY - startY);
-      nx = Math.max(0, Math.min(window.innerWidth - 120, nx));
-      ny = Math.max(0, Math.min(window.innerHeight - 40, ny));
-      panel.style.left = nx + 'px';
-      panel.style.top = ny + 'px';
-    });
-    document.addEventListener('mouseup', function () { dragging = false; });
   })();
 
   // Panel resize
   (function setupPanelResize() {
     var resizing = false;
     var startW = 0, startH = 0, startX = 0, startY = 0;
-    $resizer.addEventListener('mousedown', function (e) {
+    function onMove(e) {
+      if (!resizing) { return; }
+      var w = Math.max(420, Math.min(window.innerWidth - 20, startW + (e.clientX - startX)));
+      var h = Math.max(320, Math.min(window.innerHeight - 20, startH + (e.clientY - startY)));
+      panel.style.width = w + 'px';
+      panel.style.height = h + 'px';
+    }
+    function onUp() {
+      resizing = false;
+    }
+    on($resizer, 'mousedown', function (e) {
       e.preventDefault(); e.stopPropagation();
       var rect = panel.getBoundingClientRect();
       panel.style.left = rect.left + 'px';
@@ -2424,15 +3059,8 @@ export function getRendererPatchScript(): string {
       resizing = true;
       startW = rect.width; startH = rect.height;
       startX = e.clientX; startY = e.clientY;
+      addTemporaryDocumentMouseHandlers(onMove, onUp);
     });
-    document.addEventListener('mousemove', function (e) {
-      if (!resizing) { return; }
-      var w = Math.max(420, Math.min(window.innerWidth - 20, startW + (e.clientX - startX)));
-      var h = Math.max(320, Math.min(window.innerHeight - 20, startH + (e.clientY - startY)));
-      panel.style.width = w + 'px';
-      panel.style.height = h + 'px';
-    });
-    document.addEventListener('mouseup', function () { resizing = false; });
   })();
 
   // Splitter
@@ -2440,27 +3068,28 @@ export function getRendererPatchScript(): string {
     var splitting = false;
     var startY = 0;
     var startPreviewH = 0;
-    $splitter.addEventListener('mousedown', function (e) {
-      e.preventDefault();
-      splitting = true;
-      $splitter.classList.add('dragging');
-      startY = e.clientY;
-      startPreviewH = $preview.getBoundingClientRect().height;
-    });
-    document.addEventListener('mousemove', function (e) {
+    function onMove(e) {
       if (!splitting) { return; }
       var delta = startY - e.clientY;
       var panelH = panel.getBoundingClientRect().height;
       var maxPreview = panelH - 180;
       var newH = Math.max(60, Math.min(maxPreview, startPreviewH + delta));
       $preview.style.flex = '0 0 ' + newH + 'px';
-    });
-    document.addEventListener('mouseup', function () {
+    }
+    function onUp() {
       if (splitting) { splitting = false; $splitter.classList.remove('dragging'); }
+    }
+    on($splitter, 'mousedown', function (e) {
+      e.preventDefault();
+      splitting = true;
+      $splitter.classList.add('dragging');
+      startY = e.clientY;
+      startPreviewH = $preview.getBoundingClientRect().height;
+      addTemporaryDocumentMouseHandlers(onMove, onUp);
     });
   })();
 
-  document.addEventListener('keydown', function (e) {
+  on(document, 'keydown', function (e) {
     if (!panel.classList.contains('visible')) { return; }
     if (e.altKey && (e.key === 'c' || e.key === 'C')) { e.preventDefault(); toggleOpt('caseSensitive', $optCase); }
     else if (e.altKey && (e.key === 'w' || e.key === 'W')) { e.preventDefault(); toggleOpt('wholeWord', $optWord); }
@@ -2625,6 +3254,13 @@ export function getRendererPatchScript(): string {
   window.__ijFindProbe = probeReport;
 
   function ensureMonaco(cb) {
+    if (window.__ijFindDisableMonacoProbes) {
+      monacoState.tried = true;
+      monacoState.api = null;
+      monacoState.source = 'disabled';
+      cb(null);
+      return;
+    }
     if (monacoState.tried) { cb(monacoState.api); return; }
     // Path 1: direct global lookup.
     var sync = findMonacoSync();
@@ -2901,7 +3537,7 @@ export function getRendererPatchScript(): string {
     state.previewUri = msg.uri;
     state.previewLanguageId = msg.languageId || '';
     $preview.classList.remove('ij-find-modified');
-    var m = window.__ijFindMonaco;
+    var m = window.__ijFindDisableMonacoProbes ? null : window.__ijFindMonaco;
     send({ type: 'log', msg: 'renderPreview uri=' + (msg.relPath || msg.uri).slice(0, 80) +
       ' hasMonaco=' + (!!m) +
       ' ctor=' + (!!(m && m.ctor)) +
@@ -3124,6 +3760,106 @@ export function getRendererPatchScript(): string {
     $previewBody.classList.remove('ij-find-editor-mounted');
   }
 
+  window.__ijFindForceStopMonacoCapture = function (reason) {
+    var out = [];
+    try { window.__ijFindDisableMonacoProbes = true; out.push('disabled=true'); } catch (eDisable) {}
+    try {
+      if (window.__ijFindStopCapture) { out.push('stop=' + window.__ijFindStopCapture(reason || 'force-stop')); }
+      else { out.push('stop=no-fn'); }
+    } catch (eStop) { out.push('stop-err=' + (eStop && eStop.message)); }
+    try { window.__ijFindMonaco = null; out.push('monaco=null'); } catch (eMonaco) {}
+    try {
+      monacoState.tried = true;
+      monacoState.api = null;
+      monacoState.source = 'force-stopped';
+      out.push('loader=disabled');
+    } catch (eState) {}
+    try { disposePreviewMonacoEditor(); out.push('preview=disposed'); } catch (ePreview) {}
+    try {
+      if (window.__ijFindCaptures) {
+        window.__ijFindCaptures.widgets = [];
+        window.__ijFindCaptures.services = [];
+        window.__ijFindCaptures.widgetCtors = [];
+        window.__ijFindCaptures.serviceMaps = [];
+        out.push('captures=cleared');
+      }
+    } catch (eCaps) {}
+    try { window.__ijFindCaptureInstalled = false; } catch (eInstalled) {}
+    return out.join(',');
+  };
+
+  function clearSearchUiForRecovery(reason) {
+    var out = [];
+    try { cancelScheduledRender(); out.push('render=cancelled'); } catch (eRender) {}
+    try { if (state.searchTicker) { clearInterval(state.searchTicker); state.searchTicker = null; out.push('ticker=cleared'); } } catch (eTicker) {}
+    try { if (state.debounce) { clearTimeout(state.debounce); state.debounce = null; out.push('debounce=cleared'); } } catch (eDebounce) {}
+    try { if (state.hoverTimer) { clearTimeout(state.hoverTimer); state.hoverTimer = null; out.push('hoverTimer=cleared'); } } catch (eHoverTimer) {}
+    try { if (hoverHideTimer) { clearTimeout(hoverHideTimer); hoverHideTimer = null; out.push('hoverHide=cleared'); } } catch (eHoverHide) {}
+    try { if (state.stolenEditor) { restoreStolenEditor(); out.push('stolen=restored'); } } catch (eStolen) { out.push('stolen=err'); }
+    try { disposePreviewMonacoEditor(); out.push('preview=disposed'); } catch (ePreview) { out.push('preview=err'); }
+    try { hideHover(); out.push('hover=hidden'); } catch (eHover) {}
+    try {
+      state.files = [];
+      state.flat = [];
+      state.candidates = [];
+      state.candidateTotal = 0;
+      state.confirmedUris = {};
+      state.fileIndexByUri = {};
+      state.matchCount = 0;
+      state.activeIndex = -1;
+      state.searching = false;
+      state.loadingMore = false;
+      state.hasMoreResults = false;
+      state.resultsInfoText = '';
+      state.lastPreviewKey = '';
+      state.previewUri = '';
+      state.previewLanguageId = '';
+      out.push('state=cleared');
+    } catch (eState) { out.push('state=err'); }
+    try {
+      clearChildren($resultsInner);
+      $resultsInner.style.height = 'auto';
+      clearChildren($previewBody);
+      $previewBody.classList.remove('ij-find-editor-mounted', 'ij-find-stolen');
+      out.push('dom=cleared');
+    } catch (eDom) { out.push('dom=err'); }
+    try { setStatus('Recovered renderer UI', false); } catch (eStatus) {}
+    try {
+      panel.classList.remove('visible');
+      panel.style.removeProperty('display');
+      panel.style.removeProperty('visibility');
+      panel.style.removeProperty('opacity');
+      panel.style.removeProperty('pointer-events');
+      panel.style.removeProperty('z-index');
+      panel.style.removeProperty('position');
+      out.push('panel=hidden');
+    } catch (ePanel) { out.push('panel=err'); }
+    try { if (panel.parentElement) { panel.parentElement.removeChild(panel); out.push('panel=detached'); } } catch (ePanelDetach) {}
+    try { if ($hoverTooltip.parentElement) { $hoverTooltip.parentElement.removeChild($hoverTooltip); out.push('hover=detached'); } } catch (eHoverDetach) {}
+    try {
+      var previewOverflowRoot = document.querySelector('.ij-find-preview-overflow-root');
+      if (previewOverflowRoot && previewOverflowRoot.parentElement) {
+        previewOverflowRoot.parentElement.removeChild(previewOverflowRoot);
+        out.push('overflow=detached');
+      }
+    } catch (eOverflowDetach) {}
+    return out.join(',');
+  }
+
+	  window.__ijFindEmergencyRecover = function (reason) {
+	    var out = [];
+	    try { state.recoveryUntil = Date.now() + 1000; } catch (eRecoveryUntil) {}
+	    try { out.push('ir=' + setIntelliSenseRecursionCaptureSuspended(true, reason || 'emergency-recover')); }
+	    catch (eIr) { out.push('ir-err=' + (eIr && eIr.message)); }
+	    try { out.push('force=' + window.__ijFindForceStopMonacoCapture(reason || 'emergency-recover')); }
+	    catch (eForce) { out.push('force-err=' + (eForce && eForce.message)); }
+    try { out.push('dispose=' + window.__ijFindDisposeSearchUi(reason || 'emergency-recover')); }
+    catch (eDispose) { out.push('dispose-err=' + (eDispose && eDispose.message)); }
+    try { out.push('ui=' + clearSearchUiForRecovery(reason || 'emergency-recover')); }
+    catch (eUi) { out.push('ui-err:' + (eUi && eUi.message)); }
+    return out.join(' | ');
+  };
+
   // ── Steal real VSCode editor DOM ─────────────────────────────────────
   //
   // When Monaco isn't directly accessible, we fall back to reparenting an
@@ -3206,6 +3942,409 @@ export function getRendererPatchScript(): string {
       }
     } catch (e) {}
     return null;
+  }
+
+  function findMonacoWidgetOnQuiet(el) {
+    if (!el) { return null; }
+    var seen = {};
+    var keys = [];
+    try { var own = Object.getOwnPropertyNames(el); for (var i = 0; i < own.length; i++) { keys.push(own[i]); seen[own[i]] = 1; } } catch (e) {}
+    for (var k in el) { if (!seen[k]) { keys.push(k); seen[k] = 1; } }
+    for (var j = 0; j < keys.length; j++) {
+      var val;
+      try { val = el[keys[j]]; } catch (e1) { continue; }
+      if (!val || typeof val !== 'object') { continue; }
+      if (typeof val.layout === 'function' &&
+          typeof val.getModel === 'function' &&
+          typeof val.getDomNode === 'function') {
+        return val;
+      }
+      try {
+        if (val.editor && typeof val.editor.layout === 'function' && typeof val.editor.getModel === 'function') {
+          return val.editor;
+        }
+        if (val._editor && typeof val._editor.layout === 'function' && typeof val._editor.getModel === 'function') {
+          return val._editor;
+        }
+      } catch (e2) {}
+    }
+    try {
+      var syms = Object.getOwnPropertySymbols(el);
+      for (var s = 0; s < syms.length; s++) {
+        var sv;
+        try { sv = el[syms[s]]; } catch (e3) { continue; }
+        if (!sv || typeof sv !== 'object') { continue; }
+        if (typeof sv.layout === 'function' && typeof sv.getModel === 'function' && typeof sv.getDomNode === 'function') {
+          return sv;
+        }
+      }
+    } catch (e4) {}
+    return null;
+  }
+
+  function classTextOf(el) {
+    try {
+      if (!el) { return ''; }
+      if (typeof el.className === 'string') { return el.className; }
+      if (el.className && typeof el.className.baseVal === 'string') { return el.className.baseVal; }
+      return String(el.className || '');
+    } catch (e) { return ''; }
+  }
+
+  function normalizedInlineText(el) {
+    try { return (el && el.textContent ? el.textContent : '').replace(/\\s+/g, ' ').trim(); }
+    catch (e) { return ''; }
+  }
+
+  function callGraphInlayText(el) {
+    var parts = [];
+    try {
+      var text = normalizedInlineText(el);
+      if (text) { parts.push(text); }
+    } catch (eText) {}
+    try {
+      var attrs = ['aria-label', 'title', 'data-title', 'data-content', 'data-text'];
+      for (var i = 0; i < attrs.length; i++) {
+        var value = el && el.getAttribute && el.getAttribute(attrs[i]);
+        if (value) { parts.push(String(value).replace(/\\s+/g, ' ').trim()); }
+      }
+    } catch (eAttrs) {}
+    return parts.join(' ').trim();
+  }
+
+  function callGraphInlayLabelKindForElement(el) {
+    try {
+      var text = normalizedInlineText(el);
+      var textKind = text && text.length <= 160 ? callGraphInlayLabelKind(text) : '';
+      if (textKind) { return textKind; }
+    } catch (eTextKind) {}
+    try {
+      var attrs = ['aria-label', 'title', 'data-title', 'data-content', 'data-text'];
+      for (var i = 0; i < attrs.length; i++) {
+        var value = el && el.getAttribute && el.getAttribute(attrs[i]);
+        if (!value) { continue; }
+        var normalized = String(value).replace(/\\s+/g, ' ').trim();
+        var attrKind = normalized && normalized.length <= 160 ? callGraphInlayLabelKind(normalized) : '';
+        if (attrKind) { return attrKind; }
+      }
+    } catch (eAttrKind) {}
+    return '';
+  }
+
+  function callGraphInlayKindFromText(text) {
+    var m = /\\b(callees|impl|usages)\\s+\\d+\\b/.exec(text || '');
+    return m ? m[1] : '';
+  }
+
+  function exactCallGraphInlayLabel(text) {
+    return /^(?:callees|impl|usages)\\s+\\d+$/.test(text || '');
+  }
+
+  function compactCallGraphInlayLabel(text) {
+    return /^(?:callees|impl|usages)\\s+\\d+(?:\\s*\\|\\s*(?:callees|impl|usages)\\s+\\d+)*$/.test(text || '');
+  }
+
+  function callGraphInlayLabelKind(text) {
+    if (!exactCallGraphInlayLabel(text) && !compactCallGraphInlayLabel(text)) { return ''; }
+    return callGraphInlayKindFromText(text) || 'usages';
+  }
+
+  function isSearchUiEventTarget(target) {
+    try {
+      var el = target && target.nodeType === 3 ? target.parentElement : target;
+      return !!(el && el.closest && el.closest('[data-ijss-root="true"], .ij-find-overlay, .ij-find-preview-overflow-root, .ij-find-hover-tooltip'));
+    } catch (eSearchTarget) {
+      return false;
+    }
+  }
+
+  function closestCallGraphEditorLine(start) {
+    var el = start && start.nodeType === 3 ? start.parentElement : start;
+    for (var depth = 0; el && depth < 12; depth++, el = el.parentElement) {
+      if (!el || el === document.body) { break; }
+      if (el.classList && el.classList.contains('view-line')) { return el; }
+      if (el.classList && el.classList.contains('monaco-editor')) { break; }
+    }
+    return null;
+  }
+
+  function isSmallInlaySearchScope(el) {
+    try {
+      if (!el || !el.querySelectorAll) { return false; }
+      if (el.classList && el.classList.contains('monaco-editor')) { return false; }
+      if (el.classList && el.classList.contains('view-lines')) { return false; }
+      return el.children ? el.children.length <= 80 : true;
+    } catch (eScope) {
+      return false;
+    }
+  }
+
+  function findCallGraphInlayChild(el, clientX, clientY) {
+    if (!isSmallInlaySearchScope(el)) { return null; }
+    var children = el && el.querySelectorAll ? el.querySelectorAll('*') : [];
+    for (var i = 0; i < children.length; i++) {
+      var childKind = callGraphInlayLabelKindForElement(children[i]);
+      if (!childKind) { continue; }
+      try {
+        var rect = children[i].getBoundingClientRect();
+        if (clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom) {
+          return { element: children[i], kind: childKind };
+        }
+      } catch (eRect) {}
+    }
+    return null;
+  }
+
+  function findCallGraphInlayElementInAncestry(start, clientX, clientY) {
+    var el = start && start.nodeType === 3 ? start.parentElement : start;
+    for (var depth = 0; el && depth < 8; depth++, el = el.parentElement) {
+      if (!el || el === document.body) { break; }
+      if (el.classList && (el.classList.contains('view-line') || el.classList.contains('monaco-editor'))) {
+        var line = el.classList.contains('view-line') ? el : closestCallGraphEditorLine(start);
+        var lineChildHit = line ? findCallGraphInlayChild(line, clientX, clientY) : null;
+        if (lineChildHit) { return lineChildHit; }
+        break;
+      }
+      var childHit = findCallGraphInlayChild(el, clientX, clientY);
+      if (childHit) { return childHit; }
+      var kind = callGraphInlayLabelKindForElement(el);
+      if (!kind) { continue; }
+      try {
+        var rect = el.getBoundingClientRect();
+        if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) { continue; }
+      } catch (eRect) {}
+      return { element: el, kind: kind };
+    }
+    return null;
+  }
+
+  function findCallGraphInlayElement(start, clientX, clientY) {
+    if (isSearchUiEventTarget(start)) { return null; }
+    var direct = findCallGraphInlayElementInAncestry(start, clientX, clientY);
+    if (direct) { return direct; }
+    try {
+      var stack = document.elementsFromPoint ? document.elementsFromPoint(clientX, clientY) : [];
+      for (var i = 0; i < stack.length; i++) {
+        if (isSearchUiEventTarget(stack[i])) { continue; }
+        var line = closestCallGraphEditorLine(stack[i]);
+        var hit = findCallGraphInlayElementInAncestry(line || stack[i], clientX, clientY);
+        if (hit) { return hit; }
+        var childHit = line ? findCallGraphInlayChild(line, clientX, clientY) : null;
+        if (childHit) { return childHit; }
+      }
+    } catch (ePoint) {}
+    return null;
+  }
+
+  var __ijFindEditorWidgetCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function findEditorWidgetForInlayElement(el) {
+    var monacoEl = el && el.closest && el.closest('.monaco-editor');
+    if (__ijFindEditorWidgetCache && monacoEl) {
+      try {
+        var cachedWidget = __ijFindEditorWidgetCache.get(monacoEl);
+        if (cachedWidget && typeof cachedWidget.getModel === 'function') { return cachedWidget; }
+      } catch (eCacheRead) {}
+    }
+    var widget = findMonacoWidgetOnQuiet(monacoEl);
+    if (!widget && typeof findMonacoWidget === 'function') { widget = findMonacoWidget(monacoEl); }
+    if (widget) {
+      if (__ijFindEditorWidgetCache && monacoEl) {
+        try { __ijFindEditorWidgetCache.set(monacoEl, widget); } catch (eCacheSet) {}
+      }
+      return widget;
+    }
+    try {
+      var capsNow = window.__ijFindCaptures;
+      var widgets = capsNow && capsNow.widgets ? capsNow.widgets : [];
+      for (var i = 0; i < widgets.length; i++) {
+        var candidate = widgets[i] && widgets[i].v;
+        if (!candidate || typeof candidate.getDomNode !== 'function') { continue; }
+        var dom = candidate.getDomNode();
+        if (dom && dom.contains && dom.contains(el)) { return candidate; }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function editorPositionFromInlayClick(widget, event) {
+    if (!widget || typeof widget.getModel !== 'function') { return null; }
+    var model = widget.getModel();
+    if (!model || !model.uri || typeof model.uri.toString !== 'function') { return null; }
+    var pos = null;
+    try {
+      if (typeof widget.getTargetAtClientPoint === 'function') {
+        var target = widget.getTargetAtClientPoint(event.clientX, event.clientY);
+        pos = target && target.position;
+        if (!pos && target && target.range) {
+          if (typeof target.range.getStartPosition === 'function') {
+            pos = target.range.getStartPosition();
+          } else if (typeof target.range.startLineNumber === 'number') {
+            pos = { lineNumber: target.range.startLineNumber, column: target.range.startColumn || 1 };
+          }
+        }
+        if (!pos && target && target.detail && target.detail.range) {
+          var detailRange = target.detail.range;
+          if (typeof detailRange.getStartPosition === 'function') {
+            pos = detailRange.getStartPosition();
+          } else if (typeof detailRange.startLineNumber === 'number') {
+            pos = { lineNumber: detailRange.startLineNumber, column: detailRange.startColumn || 1 };
+          }
+        }
+      }
+    } catch (eTarget) {}
+    if (!pos) {
+      try {
+        var dom = widget.getDomNode && widget.getDomNode();
+        var rect = dom && dom.getBoundingClientRect && dom.getBoundingClientRect();
+        var y = rect ? event.clientY - rect.top : NaN;
+        var visible = typeof widget.getVisibleRanges === 'function' ? widget.getVisibleRanges() : [];
+        if (Number.isFinite(y) && visible && visible.length && typeof widget.getScrolledVisiblePosition === 'function') {
+          for (var vr = 0; vr < visible.length && !pos; vr++) {
+            var startLine = Math.max(1, visible[vr].startLineNumber || 1);
+            var endLine = Math.max(startLine, visible[vr].endLineNumber || startLine);
+            for (var ln = startLine; ln <= endLine; ln++) {
+              var vp = widget.getScrolledVisiblePosition({ lineNumber: ln, column: 1 });
+              if (!vp || typeof vp.top !== 'number') { continue; }
+              var height = typeof vp.height === 'number' && vp.height > 0 ? vp.height : 20;
+              if (y >= vp.top - 2 && y <= vp.top + height + 2) {
+                pos = { lineNumber: ln, column: 1 };
+                break;
+              }
+            }
+          }
+        }
+      } catch (eVisible) {}
+    }
+    if (!pos || typeof pos.lineNumber !== 'number') { return null; }
+    return {
+      uri: model.uri.toString(),
+      line: Math.max(0, pos.lineNumber - 1),
+      column: Math.max(0, (typeof pos.column === 'number' ? pos.column : 1) - 1),
+    };
+  }
+
+  var __ijFindLastInlayActivation = null;
+  function rememberCallGraphInlayActivation(event, hit) {
+    try {
+      __ijFindLastInlayActivation = {
+        at: Date.now(),
+        x: event.clientX,
+        y: event.clientY,
+        kind: hit && hit.kind || '',
+      };
+    } catch (eRememberInlay) {}
+  }
+
+  function matchesLastCallGraphInlayActivation(event) {
+    try {
+      var last = __ijFindLastInlayActivation;
+      if (!last || Date.now() - last.at > 900) { return false; }
+      return Math.abs((event.clientX || 0) - last.x) <= 3 &&
+        Math.abs((event.clientY || 0) - last.y) <= 3;
+    } catch (eLastInlay) {
+      return false;
+    }
+  }
+
+  function handleCallGraphInlayMouseDown(event) {
+    if (!event || (typeof event.button === 'number' && event.button !== 0)) { return; }
+    if (isSearchUiEventTarget(event.target)) { return; }
+    if (event.type !== 'pointerdown' && matchesLastCallGraphInlayActivation(event)) {
+      try {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+      } catch (eStopDup) {}
+      return;
+    }
+    var hit = findCallGraphInlayElement(event.target, event.clientX, event.clientY);
+    if (!hit || !hit.kind) { return; }
+    var widget = findEditorWidgetForInlayElement(hit.element);
+    var position = editorPositionFromInlayClick(widget, event);
+    if (!position) {
+      send({ type: 'log', msg: 'call graph inlay click: hit but no editor position kind=' + hit.kind });
+      return;
+    }
+    try {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+    } catch (eStop) {}
+    rememberCallGraphInlayActivation(event, hit);
+    send({
+      type: 'runCommand',
+      command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
+      args: [hit.kind, position.uri, position.line, position.column],
+    });
+  }
+
+  function suppressCallGraphInlayClick(event) {
+    if (matchesLastCallGraphInlayActivation(event)) {
+      try {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+      } catch (eStopCached) {}
+      return;
+    }
+    if (isSearchUiEventTarget(event.target)) { return; }
+    var hit = findCallGraphInlayElement(event.target, event.clientX, event.clientY);
+    if (!hit) { return; }
+    try {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+    } catch (eStop) {}
+  }
+
+  function removePriorCallGraphInlayListeners() {
+    try {
+      var registered = window.__ijFindCallGraphInlayListeners || {};
+      if (registered.pointerdown) { document.removeEventListener('pointerdown', registered.pointerdown, true); }
+      if (registered.mousedown) { document.removeEventListener('mousedown', registered.mousedown, true); }
+      if (registered.click) { document.removeEventListener('click', registered.click, true); }
+    } catch (eRegistered) {}
+    try {
+      if (typeof getEventListeners !== 'function') { return; }
+      var events = getEventListeners(document) || {};
+      var eventTypes = ['pointerdown', 'mousedown', 'click'];
+      for (var et = 0; et < eventTypes.length; et++) {
+        var type = eventTypes[et];
+        var listeners = events[type] || [];
+        for (var li = 0; li < listeners.length; li++) {
+          var listener = listeners[li] && listeners[li].listener;
+          if (typeof listener !== 'function') { continue; }
+          var src = '';
+          try { src = Function.prototype.toString.call(listener); } catch (eSrc) {}
+          if (!/handleCallGraphInlayMouseDown|suppressCallGraphInlayClick|activateCallGraphInlayAtPosition/.test(src)) { continue; }
+          try { document.removeEventListener(type, listener, true); } catch (eTrue) {}
+          try { document.removeEventListener(type, listener, false); } catch (eFalse) {}
+        }
+      }
+    } catch (eDevtools) {}
+  }
+
+  removePriorCallGraphInlayListeners();
+  if (__ijFindEnableRendererInlayClickHook) {
+    if (window.PointerEvent) {
+      on(document, 'pointerdown', handleCallGraphInlayMouseDown, true);
+    } else {
+      on(document, 'mousedown', handleCallGraphInlayMouseDown, true);
+    }
+    on(document, 'click', suppressCallGraphInlayClick, true);
+    window.__ijFindCallGraphInlayListeners = {
+      pointerdown: window.PointerEvent ? handleCallGraphInlayMouseDown : null,
+      mousedown: window.PointerEvent ? null : handleCallGraphInlayMouseDown,
+      click: suppressCallGraphInlayClick,
+      enabled: true,
+    };
+  } else {
+    window.__ijFindCallGraphInlayListeners = {
+      pointerdown: null,
+      mousedown: null,
+      click: null,
+      enabled: false,
+    };
   }
 
   // Scan the live DOM for any existing code-editor widget the user
@@ -3542,10 +4681,17 @@ export function getRendererPatchScript(): string {
     // across lines so every line of the match is visibly highlighted —
     // previously only the match's starting line got the findMatch style.
     try {
-      var ranges = (msg.ranges || []).map(function (r) {
-        var endLineMonaco = (typeof r.endLine === 'number') ? (r.endLine + 1) : focusLine;
-        var endColMonaco = (typeof r.endCol === 'number') ? (r.endCol + 1) : (r.end + 1);
-        return new api.Range(focusLine, r.start + 1, endLineMonaco, endColMonaco);
+      var focusText = '';
+      try {
+        for (var fl = 0; fl < (msg.lines || []).length; fl++) {
+          if (msg.lines[fl] && msg.lines[fl].lineNumber === msg.focusLine) {
+            focusText = String(msg.lines[fl].text || '');
+            break;
+          }
+        }
+      } catch (eFocusText) {}
+      var ranges = sanitizeRangesForText(focusText, msg.ranges || []).map(function (r) {
+        return new api.Range(focusLine, r.start + 1, focusLine, r.end + 1);
       });
       if (state.monacoMatchDecos) { state.monacoMatchDecos = editor.deltaDecorations(state.monacoMatchDecos, []); }
       if (ranges.length === 0) {
@@ -3564,7 +4710,44 @@ export function getRendererPatchScript(): string {
     } catch (e) {}
   }
 
+  function boundedPreviewLines(msg) {
+    var rawLines = Array.isArray(msg && msg.lines) ? msg.lines : [];
+    var maxLines = 360;
+    var maxChars = 1600;
+    var startIdx = 0;
+    var endIdx = rawLines.length;
+    var omittedBefore = 0;
+    var omittedAfter = 0;
+    if (rawLines.length > maxLines) {
+      var focusIdx = -1;
+      for (var fi = 0; fi < rawLines.length; fi++) {
+        if (rawLines[fi] && rawLines[fi].lineNumber === msg.focusLine) { focusIdx = fi; break; }
+      }
+      if (focusIdx < 0) { focusIdx = 0; }
+      var half = Math.floor(maxLines / 2);
+      startIdx = Math.max(0, Math.min(focusIdx - half, rawLines.length - maxLines));
+      endIdx = Math.min(rawLines.length, startIdx + maxLines);
+      omittedBefore = startIdx;
+      omittedAfter = rawLines.length - endIdx;
+    }
+    var out = [];
+    for (var i = startIdx; i < endIdx; i++) {
+      var line = rawLines[i] || {};
+      var text = String(line.text || '');
+      if (text.length > maxChars) { text = text.slice(0, maxChars) + '...'; }
+      out.push({ lineNumber: line.lineNumber, text: text });
+    }
+    return { lines: out, omittedBefore: omittedBefore, omittedAfter: omittedAfter };
+  }
+
   function renderPreviewDOM(msg) {
+    var previewT0 = perfNow();
+    startPerfWatch('preview:dom', 8000);
+    trace('preview:dom:start', {
+      uri: msg && msg.uri ? String(msg.uri).slice(-120) : '',
+      lineCount: msg && msg.lines ? msg.lines.length : 0,
+      focusLine: msg ? msg.focusLine : undefined,
+    });
     if (state.stolenEditor) { restoreStolenEditor(); }
     state.previewMode = 'dom';
     // If we previously hosted Monaco, detach it.
@@ -3573,11 +4756,18 @@ export function getRendererPatchScript(): string {
     }
     $previewBody.classList.remove('ij-find-editor-mounted');
     clearChildren($previewBody);
+    var bounded = boundedPreviewLines(msg);
     var contentEl = el('div', { className: 'ij-find-preview-content' });
     var focusEl = null;
     var frag = document.createDocumentFragment();
-    for (var i = 0; i < msg.lines.length; i++) {
-      var line = msg.lines[i];
+    if (bounded.omittedBefore > 0) {
+      frag.appendChild(el('div', {
+        className: 'ij-find-preview-line ij-find-preview-truncated',
+        text: '... ' + bounded.omittedBefore + ' earlier line(s) omitted',
+      }));
+    }
+    for (var i = 0; i < bounded.lines.length; i++) {
+      var line = bounded.lines[i];
       var isFocus = (line.lineNumber === msg.focusLine);
       var lineEl = el('div', {
         className: 'ij-find-preview-line' + (isFocus ? ' focus' : ''),
@@ -3594,6 +4784,12 @@ export function getRendererPatchScript(): string {
       frag.appendChild(lineEl);
       if (isFocus) { focusEl = lineEl; }
     }
+    if (bounded.omittedAfter > 0) {
+      frag.appendChild(el('div', {
+        className: 'ij-find-preview-line ij-find-preview-truncated',
+        text: '... ' + bounded.omittedAfter + ' later line(s) omitted',
+      }));
+    }
     contentEl.appendChild(frag);
     $previewBody.appendChild(contentEl);
     if (focusEl) {
@@ -3601,6 +4797,17 @@ export function getRendererPatchScript(): string {
         try { focusEl.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) {}
       }, 0);
     }
+    trace('preview:dom:end', {
+      renderedLines: bounded.lines.length,
+      omittedBefore: bounded.omittedBefore,
+      omittedAfter: bounded.omittedAfter,
+      durationMs: Math.round(perfNow() - previewT0),
+    });
+    reportPerfPhase('preview:dom', previewT0, {
+      renderedLines: bounded.lines.length,
+      omittedBefore: bounded.omittedBefore,
+      omittedAfter: bounded.omittedAfter,
+    }, 10);
   }
 
   // ── Hover ────────────────────────────────────────────────────────────
@@ -3663,7 +4870,7 @@ export function getRendererPatchScript(): string {
       text: label,
       attrs: { href: '#', title: 'Run: ' + cmd.name },
     });
-    a.addEventListener('click', function (e) {
+    on(a, 'click', function (e) {
       e.preventDefault();
       send({ type: 'runCommand', command: cmd.name, args: cmd.args });
     });
@@ -3907,6 +5114,7 @@ export function getRendererPatchScript(): string {
   function showHoverContents(msg) {
     if (msg.reqId !== state.hoverReqId) { return; }
     if (!msg.contents || msg.contents.length === 0) { hideHover(); return; }
+    if (!ensureHoverTooltipMounted()) { return; }
     cancelHoverHide();
     clearChildren($hoverTooltip);
     // Build the inner structure with the SAME class names VSCode's real hover
@@ -3952,18 +5160,23 @@ export function getRendererPatchScript(): string {
   // overview but nothing in the actual editor. Focusing the editor flips the
   // selection layer to the theme's active color AND wires up cursor-position
   // indicators on the scrollbar / minimap.
-  $previewBody.addEventListener('mousedown', function () {
+  on($previewBody, 'mousedown', function () {
     var ed = state.previewMonacoEditor || state.monacoEditor;
     if (ed && typeof ed.focus === 'function') {
       try { ed.focus(); } catch (e) {}
     }
   }, true);
 
-  $previewBody.addEventListener('mousemove', function (e) {
+  on($previewBody, 'mousemove', function (e) {
     if (!state.previewUri) { return; }
     // In Monaco mode, the embedded editor handles hover natively via VSCode
     // language services — don't double-show a custom tooltip.
     if (state.previewMode === 'monaco') { return; }
+    // DOM fallback previews must stay inert by default. Asking the extension
+    // host for hover content on mousemove can reopen CDP and run hover providers
+    // from the workbench renderer, which is exactly the path we avoid when
+    // Monaco capture is disabled.
+    if (window.__ijFindEnableDomPreviewHover !== true) { return; }
     cancelHoverHide();
     if (state.hoverTimer) { clearTimeout(state.hoverTimer); }
     state.hoverTimer = setTimeout(function () {
@@ -3988,28 +5201,39 @@ export function getRendererPatchScript(): string {
       });
     }, 280);
   });
-  $previewBody.addEventListener('mouseleave', function () {
+  on($previewBody, 'mouseleave', function () {
     if (state.hoverTimer) { clearTimeout(state.hoverTimer); state.hoverTimer = null; }
     scheduleHoverHide(220);
   });
   // Keep hover open while user moves into / interacts with the tooltip.
-  $hoverTooltip.addEventListener('mouseenter', cancelHoverHide);
-  $hoverTooltip.addEventListener('mouseleave', function () { scheduleHoverHide(180); });
+  on($hoverTooltip, 'mouseenter', cancelHoverHide);
+  on($hoverTooltip, 'mouseleave', function () { scheduleHoverHide(180); });
 
-  window.__ijFindShow = function (initialQuery, showOptions) {
-    try {
-      var wasVisible = panel.classList.contains('visible');
+	  window.__ijFindShow = function (initialQuery, showOptions) {
+	    try {
+	      if (Date.now() < (state.recoveryUntil || 0)) { return 'suppressed:recovery'; }
+	      var wasVisible = panel.classList.contains('visible');
+      setIntelliSenseRecursionCaptureSuspended(true, 'search-ui-visible');
+      var showT0 = perfNow();
+      startPerfWatch('show', 15000);
+      trace('show:start', {
+        queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0,
+        hasNewline: typeof initialQuery === 'string' && initialQuery.indexOf('\\n') >= 0,
+        wasVisible: !!wasVisible,
+      });
       panel.classList.add('visible');
       panel.style.setProperty('display', 'flex', 'important');
       panel.style.setProperty('visibility', 'visible', 'important');
       panel.style.setProperty('opacity', '1', 'important');
       panel.style.setProperty('pointer-events', 'auto', 'important');
-      panel.style.setProperty('z-index', '2147483000', 'important');
+      panel.style.setProperty('z-index', '10000', 'important');
       panel.style.setProperty('position', 'fixed', 'important');
       syncPreviewOverflowTheme(panel);
-      syncPreviewOverflowTheme($hoverTooltip);
-      if (document.body.lastElementChild !== panel && document.body.lastElementChild !== $hoverTooltip) {
-        document.body.appendChild(panel);
+      if (isDomPreviewHoverEnabled()) {
+        syncPreviewOverflowTheme($hoverTooltip);
+      }
+      ensureSearchUiMounted(panel);
+      if (isDomPreviewHoverEnabled() && document.body.lastElementChild !== $hoverTooltip) {
         document.body.appendChild($hoverTooltip);
       }
       try {
@@ -4018,20 +5242,23 @@ export function getRendererPatchScript(): string {
           document.body.appendChild(previewOverflowRoot);
           syncPreviewOverflowTheme(previewOverflowRoot);
         }
-      } catch (e) {}
+	      } catch (e) {}
+      trace('show:visible', { wasVisible: !!wasVisible });
       // Paint the overlay BEFORE firing the search — otherwise the browser
       // processes our JS (send to extension → runRgSearch → network roundtrip)
       // inside the same microtask and the panel appears only after the first
       // results:start message lands. rAF guarantees one paint first.
-      if (typeof initialQuery === 'string' && initialQuery && initialQuery !== $q.value) {
-        var forceLiteral = !!(showOptions && showOptions.forceLiteral);
-        if (forceLiteral) {
-          state.options.useRegex = false;
-          state.options.wholeWord = false;
-          $optRegex.setAttribute('aria-pressed', 'false');
-          $optWord.setAttribute('aria-pressed', 'false');
-          syncRegexMultilineUi();
-        }
+	      var suppressSearch = !!(showOptions && showOptions.suppressSearch);
+	      var forceLiteral = !!(showOptions && showOptions.forceLiteral);
+      trace('show:options', { suppressSearch: suppressSearch, forceLiteral: forceLiteral });
+      if (forceLiteral) {
+        state.options.useRegex = false;
+        state.options.wholeWord = false;
+        $optRegex.setAttribute('aria-pressed', 'false');
+        $optWord.setAttribute('aria-pressed', 'false');
+        syncRegexMultilineUi();
+      }
+      if (typeof initialQuery === 'string' && (suppressSearch || (initialQuery && initialQuery !== $q.value))) {
         var oldQ = state.rgQuery || '';
         var oldOpts = state.rgOptions;
         var oldScope = state.rgScope || '';
@@ -4052,7 +5279,14 @@ export function getRendererPatchScript(): string {
         $q.value = initialQuery;
         autosizeQuery();
         if (state.debounce) { clearTimeout(state.debounce); state.debounce = null; }
-        if (extendsCurrent) {
+        if (suppressSearch) {
+          state.rgQuery = '';
+          state.filterQuery = '';
+          state.rgScope = '';
+          if (state.debounce) { clearTimeout(state.debounce); state.debounce = null; }
+          setStatus('Loading results\u2026', true);
+          render();
+        } else if (extendsCurrent) {
           state.filterQuery = initialQuery;
           render();
           var visibleRows = 0;
@@ -4068,30 +5302,32 @@ export function getRendererPatchScript(): string {
           setStatus('Searching\u2026', true);
           render();
           var showSearchFired = false;
-          function fireShowSearch() {
-            if (showSearchFired) { return; }
-            showSearchFired = true;
-            triggerSearch(false);
-          }
+	          function fireShowSearch() {
+	            if (showSearchFired) { return; }
+	            showSearchFired = true;
+            trace('show:triggerSearch', { queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0 });
+	            triggerSearch(false);
+	          }
           requestAnimationFrame(function () {
             requestAnimationFrame(fireShowSearch);
           });
           setTimeout(fireShowSearch, 50);
         }
       }
-      setTimeout(function () { try { $q.focus(); $q.select(); } catch (e) {} }, 0);
-      return 'show ok';
+	      setTimeout(function () { try { $q.focus(); $q.select(); } catch (e) {} }, 0);
+      trace('show:end', { queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0, durationMs: Math.round(perfNow() - showT0) });
+      reportPerfPhase('show', showT0, {
+        queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0,
+        wasVisible: !!wasVisible,
+      }, 10);
+	      return 'show ok';
     } catch (e) { return 'show-err: ' + (e && e.message); }
   };
-  window.__ijFindHide = function () {
-    // doShow fires fire-and-forget __ijFindHide into every non-focused
-    // workbench window to preemptively dismiss any stale overlay. Those
-    // windows never had our panel visible in this session, so we MUST NOT
-    // send cancel from them — it races with the newly-started search in
-    // the focused window and SIGTERMs rg mid-scan (manifests as rg
-    // exit=null + 0 matches).
-    var wasVisible = panel.classList.contains('visible');
-    panel.classList.remove('visible');
+	  window.__ijFindHide = function () {
+	    var wasVisible = panel.classList.contains('visible');
+    trace('hide:start', { wasVisible: !!wasVisible });
+    stopPerfWatch('hide');
+	    panel.classList.remove('visible');
     panel.style.removeProperty('display');
     panel.style.removeProperty('visibility');
     panel.style.removeProperty('opacity');
@@ -4102,9 +5338,46 @@ export function getRendererPatchScript(): string {
     if (state.stolenEditor) { restoreStolenEditor(); }
     // Tear down preview monaco widget so its GPU/DOM resources are released.
     disposePreviewMonacoEditor();
+    cancelScheduledRender();
+    if (state.searchTicker) { clearInterval(state.searchTicker); state.searchTicker = null; }
+    if (state.debounce) { clearTimeout(state.debounce); state.debounce = null; }
+    state.searchId = (state.searchId || 0) + 1;
+    state.files = [];
+    state.flat = [];
+    state.candidates = [];
+    state.candidateTotal = 0;
+    state.confirmedUris = {};
+    state.fileIndexByUri = {};
+    state.matchCount = 0;
+    state.activeIndex = -1;
+    state.searching = false;
+    state.loadingMore = false;
+    state.hasMoreResults = false;
+    state.resultsInfoText = '';
+    state.rgQuery = '';
+    state.filterQuery = '';
+    state.rgScope = '';
+    try {
+      clearChildren($resultsInner);
+      $resultsInner.style.height = 'auto';
+    } catch (eClearResults) {}
     hideHover();
-    if (wasVisible) { send({ type: 'cancel' }); }
-  };
+    if (wasVisible) {
+      send({ type: 'cancel' });
+      send({ type: 'panelHidden' });
+    }
+    setIntelliSenseRecursionCaptureSuspended(false, 'search-ui-hidden');
+    trace('hide:end', { wasVisible: !!wasVisible });
+    if (window.__ijFindDisposeRendererPatchOnHide) {
+      setTimeout(function () {
+        try {
+          if (typeof window.__ijFindDisposeSearchUi === 'function') {
+            window.__ijFindDisposeSearchUi('hide');
+          }
+        } catch (eDisposeOnHide) {}
+      }, 0);
+    }
+	  };
   window.__ijFindStatus = function () {
     try {
       var r = panel.getBoundingClientRect();
@@ -4129,6 +5402,7 @@ export function getRendererPatchScript(): string {
       }
       var monacoStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-monaco-status';
       return 'inDom=' + document.body.contains(panel) +
+        ' patchVersion=' + window.__ijFindPatchVersion +
         ' disp=' + cs.display +
         ' z=' + cs.zIndex +
         ' rect=' + Math.round(r.x) + ',' + Math.round(r.y) + ',' + Math.round(r.width) + 'x' + Math.round(r.height) +
@@ -4210,12 +5484,48 @@ export function getRendererPatchScript(): string {
       return { editor: 'ok', decorations: out, lineCount: model.getLineCount ? model.getLineCount() : -1 };
     } catch (e) { return { err: String(e && e.message) }; }
   };
-  window.__ijFindOnMessage = function (msg) {
-    var msgSearchId = typeof msg.searchId === 'number' ? msg.searchId : null;
-    switch (msg.type) {
-      case 'results:start':
+  function acceptFileMatch(match) {
+    if (!match || !match.uri) { return false; }
+    state.confirmedUris[match.uri] = true;
+    var fileIdx = state.fileIndexByUri[match.uri];
+    if (typeof fileIdx === 'number' && state.files[fileIdx]) {
+      Array.prototype.push.apply(state.files[fileIdx].matches, match.matches || []);
+    } else {
+      state.fileIndexByUri[match.uri] = state.files.length;
+      state.files.push(match);
+    }
+    state.matchCount += (match.matches || []).length;
+    return true;
+  }
+
+  function afterResultsChanged() {
+    // rg streams in bursts. Rendering on every file nukes the results DOM
+    // and runs inside the workbench renderer, so coalesce to one frame.
+    scheduleRender();
+    updateSearchingStatus();
+    if (state.activeIndex < 0) {
+      render();
+      if (state.flat.length > 0) { selectMatch(0); }
+    }
+  }
+
+	  window.__ijFindOnMessage = function (msg) {
+	    if (__ijFindDisposed) { return 'disposed'; }
+	    if (Date.now() < (state.recoveryUntil || 0)) { return 'suppressed:recovery'; }
+	    if (!panel.classList.contains('visible') && msg && /^(results:|preview$|hover$)/.test(String(msg.type || ''))) {
+	      return 'ignored:hidden';
+	    }
+	    var msgSearchId = typeof msg.searchId === 'number' ? msg.searchId : null;
+      var msgT0 = perfNow();
+      try {
+	    switch (msg.type) {
+	      case 'results:start':
+        startPerfWatch('results:start', 12000);
+        trace('results:start', { searchId: msgSearchId });
+	        cancelScheduledRender();
         state.files = []; state.flat = []; state.candidates = [];
         state.candidateTotal = 0; state.confirmedUris = {}; state.fileIndexByUri = {};
+        state.matchCount = 0;
         state.searchId = msgSearchId !== null ? msgSearchId : ((state.searchId || 0) + 1);
         state.filterQuery = '';
         state.hasMoreResults = false;
@@ -4227,12 +5537,11 @@ export function getRendererPatchScript(): string {
         state.activeIndex = -1; state.searching = true;
         state.searchStartTs = Date.now();
         if (state.searchTicker) { clearInterval(state.searchTicker); }
-        // Tick the status every 100ms with elapsed time so the user sees
-        // the search is progressing even during a long full-scan.
+        // Keep progress visible without keeping the workbench renderer hot.
         state.searchTicker = setInterval(function () {
           if (!state.searching) { return; }
           updateSearchingStatus();
-        }, 100);
+        }, 500);
         clearPreview();
         updateSearchingStatus();
         render();
@@ -4247,36 +5556,38 @@ export function getRendererPatchScript(): string {
         updateSearchingStatus();
         render();
         break;
-      case 'results:file':
-        if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
-        if (!msg.match || !msg.match.uri) { break; }
-        state.confirmedUris[msg.match.uri] = true;
-        var fileIdx = state.fileIndexByUri[msg.match.uri];
-        if (typeof fileIdx === 'number' && state.files[fileIdx]) {
-          Array.prototype.push.apply(state.files[fileIdx].matches, msg.match.matches || []);
-        } else {
-          state.fileIndexByUri[msg.match.uri] = state.files.length;
-          state.files.push(msg.match);
+	      case 'results:file':
+	        if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
+	        if (acceptFileMatch(msg.match)) {
+          trace('results:file', {
+            searchId: msgSearchId,
+            uri: msg.match && msg.match.uri ? String(msg.match.uri).slice(-120) : '',
+            matches: msg.match && msg.match.matches ? msg.match.matches.length : 0,
+          });
+          afterResultsChanged();
         }
-        // rg streams file-at-a-time. Rendering on every event nukes the
-        // results DOM and can steal a click mid-action. Coalesce to one
-        // render per animation frame — multiple events within ~16ms become
-        // a single DOM rebuild.
-        scheduleRender();
-        updateSearchingStatus();
-        // Show the preview for the FIRST match as soon as it arrives, not
-        // after the whole search finishes. On a slow full-scan (multi-
-        // second rg run) this is the difference between staring at an
-        // empty preview pane for 10s vs seeing the first hit in <100ms.
-        if (state.activeIndex < 0) {
-          // render() / scheduleRender() may not have flushed state.flat
-          // yet — do a sync rebuild so selectMatch can find row 0.
-          render();
-          if (state.flat.length > 0) { selectMatch(0); }
-        }
-        break;
-      case 'results:done':
-        if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
+	        break;
+	      case 'results:batch':
+	        if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
+	        var batch = Array.isArray(msg.matches) ? msg.matches : [];
+        startPerfWatch('results:batch', 8000);
+        trace('results:batch', { searchId: msgSearchId, files: batch.length });
+	        var changed = false;
+	        for (var bi = 0; bi < batch.length; bi++) {
+	          changed = acceptFileMatch(batch[bi]) || changed;
+	        }
+	        if (changed) { afterResultsChanged(); }
+	        break;
+	      case 'results:done':
+	        if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
+        startPerfWatch('results:done', 8000);
+        trace('results:done:start', {
+          searchId: msgSearchId,
+          totalMatches: msg.totalMatches,
+          totalFiles: msg.totalFiles,
+          truncated: !!msg.truncated,
+        });
+	        cancelScheduledRender();
         state.searching = false;
         state.loadingMore = false;
         state.hasMoreResults = !!msg.truncated;
@@ -4329,11 +5640,17 @@ export function getRendererPatchScript(): string {
             false
           );
         }
-        render();
-        if (state.activeIndex < 0 && state.flat.length > 0) { selectMatch(0); }
-        break;
+	        render();
+	        if (state.activeIndex < 0 && state.flat.length > 0) { selectMatch(0); }
+        trace('results:done:end', {
+          searchId: msgSearchId,
+          flat: state.flat.length,
+          activeIndex: state.activeIndex,
+        });
+	        break;
       case 'results:error':
         if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
+        cancelScheduledRender();
         state.searching = false;
         state.loadingMore = false;
         state.hasMoreResults = false;
@@ -4349,12 +5666,19 @@ export function getRendererPatchScript(): string {
         renderSearchHistory();
         break;
       case 'preview':
+        startPerfWatch('preview:message', 8000);
         renderPreview(msg);
         break;
       case 'hover':
         showHoverContents(msg);
         break;
     }
+      } finally {
+        reportPerfPhase('message:' + String(msg && msg.type || ''), msgT0, {
+          type: String(msg && msg.type || ''),
+          searchId: msgSearchId,
+        }, 8);
+      }
   };
 
   return 'ij-find patch installed';
