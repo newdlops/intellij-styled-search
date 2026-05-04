@@ -56,7 +56,6 @@ const ZOEKT_SCHEMA_VERSION = 2;
 const ZOEKT_UPDATE_IGNORED_DIR_NAMES = new Set([
   '.zoek-rs',
   '.zoekt-rs',
-  'target',
 ]);
 
 class ProcessCancelledError extends Error {
@@ -291,8 +290,8 @@ export class ZoektRuntime implements vscode.Disposable {
     }
     const detach = this.attachIndexProgressListener(workspaceRoot, report);
     const promise = (async () => {
-      this.emitIndexProgress(workspaceRoot, 'zoek-rs: indexing workspace');
-      const response = await this.invokeJson([binary, workspaceRoot], undefined, {
+      this.emitIndexProgress(workspaceRoot, 'zoek-rs: force rebuilding workspace index');
+      const response = await this.invokeJson([binary, workspaceRoot, '--force'], undefined, {
         onStderrLine: (line) => this.handleIndexProgressLine(
           line,
           (message, percent) => this.emitIndexProgress(workspaceRoot, message, percent),

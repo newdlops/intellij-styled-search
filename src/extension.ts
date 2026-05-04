@@ -40,6 +40,89 @@ const CALL_GRAPH_USAGE_SEARCH_INCLUDE_PATTERNS = [
 
 let activeOverlay: OverlayPanel | undefined;
 
+type CallGraphInlayKind = 'usages' | 'callees' | 'impl';
+
+type CallGraphInlayRegistryEntry = {
+  readonly line: number;
+  readonly kind: CallGraphInlayKind;
+  readonly symbolId: string;
+  readonly label: string;
+  readonly hintColumn: number;
+};
+
+class CallGraphInlayRegistry {
+  private readonly entriesByUri = new Map<string, Map<number, CallGraphInlayRegistryEntry[]>>();
+  private readonly invalidatedUris = new Set<string>();
+
+  clearAll(): void {
+    this.entriesByUri.clear();
+    this.invalidatedUris.clear();
+  }
+
+  clearDocument(uri: vscode.Uri): void {
+    const uriKey = uri.toString();
+    this.entriesByUri.delete(uriKey);
+    this.invalidatedUris.delete(uriKey);
+  }
+
+  invalidateDocument(uri: vscode.Uri): void {
+    const uriKey = uri.toString();
+    this.entriesByUri.delete(uriKey);
+    this.invalidatedUris.add(uriKey);
+  }
+
+  isInvalidated(uri: vscode.Uri): boolean {
+    return this.invalidatedUris.has(uri.toString());
+  }
+
+  replaceRange(uri: vscode.Uri, range: vscode.Range, entries: CallGraphInlayRegistryEntry[]): void {
+    const uriKey = uri.toString();
+    const byLine = this.entriesByUri.get(uriKey) ?? new Map<number, CallGraphInlayRegistryEntry[]>();
+    const startLine = Math.max(0, range.start.line);
+    const endLine = Math.max(startLine, range.end.line);
+    for (const line of byLine.keys()) {
+      if (line >= startLine && line <= endLine) {
+        byLine.delete(line);
+      }
+    }
+    for (const entry of entries) {
+      if (!Number.isFinite(entry.line) || entry.line < 0) { continue; }
+      const line = Math.floor(entry.line);
+      const current = byLine.get(line) ?? [];
+      current.push({ ...entry, line });
+      byLine.set(line, current);
+    }
+    if (byLine.size === 0) {
+      this.entriesByUri.delete(uriKey);
+      return;
+    }
+    this.entriesByUri.set(uriKey, byLine);
+  }
+
+  resolve(uri: vscode.Uri, line: number, kind: string, column?: number): CallGraphInlayRegistryEntry | undefined {
+    if (!Number.isFinite(line) || line < 0) { return undefined; }
+    const normalizedKind = normalizeCallGraphInlayKind(kind);
+    const matches = this.entriesByUri
+      .get(uri.toString())
+      ?.get(Math.floor(line))
+      ?.filter((entry) => entry.kind === normalizedKind) ?? [];
+    if (matches.length === 0) { return undefined; }
+    if (!Number.isFinite(column)) { return matches[0]; }
+    const safeColumn = Math.max(0, Math.floor(column ?? 0));
+    return [...matches].sort((a, b) => {
+      const aDistance = Math.abs(a.hintColumn - safeColumn);
+      const bDistance = Math.abs(b.hintColumn - safeColumn);
+      return aDistance - bDistance || a.symbolId.localeCompare(b.symbolId);
+    })[0];
+  }
+}
+
+function normalizeCallGraphInlayKind(kind: string): CallGraphInlayKind {
+  if (kind === 'impl' || kind === 'implementations') { return 'impl'; }
+  if (kind === 'callees') { return 'callees'; }
+  return 'usages';
+}
+
 /** Shape exposed via `ext.exports` for integration / E2E tests. Plain
  *  production consumers don't need to touch this. */
 export interface ExtensionTestApi {
@@ -53,10 +136,28 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   activeOverlay = overlay;
   const callGraphLog = overlay.getLogChannel();
   const callGraph = new CallGraphService(context, callGraphLog);
+  const callGraphInlayRegistry = new CallGraphInlayRegistry();
   const mcpServer = new CallGraphMcpServer(callGraph, callGraphLog);
   context.subscriptions.push(callGraph, mcpServer);
   context.subscriptions.push(
-    vscode.languages.registerInlayHintsProvider(CALL_GRAPH_DOCUMENT_SELECTOR, new CallGraphInlayHintsProvider(overlay, callGraph)),
+    vscode.workspace.onDidChangeTextDocument((event) => {
+      callGraphInlayRegistry.invalidateDocument(event.document.uri);
+    }),
+    vscode.workspace.onDidSaveTextDocument((document) => {
+      callGraphInlayRegistry.invalidateDocument(document.uri);
+    }),
+    vscode.workspace.onDidCloseTextDocument((document) => {
+      callGraphInlayRegistry.clearDocument(document.uri);
+    }),
+    callGraph.onDidChangeSnapshot(() => {
+      callGraphInlayRegistry.clearAll();
+    }),
+  );
+  context.subscriptions.push(
+    vscode.languages.registerInlayHintsProvider(
+      CALL_GRAPH_DOCUMENT_SELECTOR,
+      new CallGraphInlayHintsProvider(overlay, callGraph, callGraphInlayRegistry),
+    ),
     vscode.languages.registerImplementationProvider(CALL_GRAPH_DOCUMENT_SELECTOR, new CallGraphImplementationProvider(callGraph)),
   );
   overlay.logActivation();
@@ -216,7 +317,7 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
                   lastLogAt = now;
                   lastStage = progress.stage;
                 }
-              }, token);
+              }, token, { force: true });
               ui.report({ increment: Math.max(0, 100 - lastPercent), message: 'done; writing summary' });
               callGraphLog.appendLine(callGraph.formatInfoReport(snapshot));
             } finally {
@@ -291,7 +392,47 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       line: number,
       column?: number,
     ) => {
-      await activateCallGraphInlayAtPosition(overlay, callGraph, callGraphLog, kind, uriString, line, column);
+      await activateCallGraphInlayAtPosition(
+        overlay,
+        callGraph,
+        callGraphLog,
+        callGraphInlayRegistry,
+        kind,
+        uriString,
+        line,
+        column,
+      );
+    }),
+    vscode.commands.registerCommand('intellijStyledSearch.activateCallGraphInlayAtVisibleLine', async (
+      kind: string,
+      lineOrdinal: number,
+      column?: number,
+    ) => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) {
+        callGraphLog.appendLine('call graph inlay click ignored: no active editor for visible-line resolution');
+        return;
+      }
+      const line = documentLineFromVisibleLineOrdinal(editor, lineOrdinal);
+      if (line === undefined) {
+        callGraphLog.appendLine(`call graph inlay click ignored: visible line ${lineOrdinal} is outside active editor ranges`);
+        return;
+      }
+      const registered = callGraphInlayRegistry.resolve(editor.document.uri, line, kind, column);
+      if (registered) {
+        await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, registered, 'inlay registry visible-line');
+        return;
+      }
+      await activateCallGraphInlayAtPosition(
+        overlay,
+        callGraph,
+        callGraphLog,
+        callGraphInlayRegistry,
+        kind,
+        editor.document.uri.toString(),
+        line,
+        column,
+      );
     }),
     vscode.commands.registerCommand('intellijStyledSearch.startMcpServer', async () => {
       overlay.logCommand('startMcpServer');
@@ -324,16 +465,13 @@ async function activateCallGraphInlayAtPosition(
   overlay: OverlayPanel,
   callGraph: CallGraphService,
   callGraphLog: vscode.OutputChannel,
+  registry: CallGraphInlayRegistry,
   kind: string,
   uriString?: string,
   line?: number,
   column?: number,
 ): Promise<void> {
-  const normalizedKind = kind === 'impl' || kind === 'implementations'
-    ? 'impl'
-    : kind === 'callees'
-      ? 'callees'
-      : 'usages';
+  const normalizedKind = normalizeCallGraphInlayKind(kind);
   const activeEditor = vscode.window.activeTextEditor;
   const uri = uriString
     ? vscode.Uri.parse(uriString)
@@ -347,22 +485,58 @@ async function activateCallGraphInlayAtPosition(
     callGraphLog.appendLine('call graph inlay click ignored: no active editor for fallback resolution');
     return;
   }
+  const registered = registry.resolve(uri, safeLine, normalizedKind, safeColumn);
+  if (registered) {
+    await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, registered, 'inlay registry position');
+    return;
+  }
+  if (registry.isInvalidated(uri)) {
+    callGraphLog.appendLine(`call graph inlay click ignored: registry pending refresh for ${uri.toString()}`);
+    return;
+  }
   const symbol = resolveInlaySymbolAtLine(callGraph, uri, safeLine, safeColumn);
   if (!symbol) {
     callGraphLog.appendLine(`call graph inlay click ignored: no symbol at ${uriString}:${safeLine + 1}`);
     return;
   }
-  const command = `activateCallGraphInlayAtPosition:${normalizedKind}`;
-  await runDedupedCallGraphSymbolCommand(command, symbol.id, async () => {
-    if (normalizedKind === 'impl') {
-      await showCallGraphImplementationResult(overlay, callGraph, symbol.id);
+  await activateCallGraphInlayEntry(
+    overlay,
+    callGraph,
+    callGraphLog,
+    {
+      line: safeLine,
+      kind: normalizedKind,
+      symbolId: symbol.id,
+      label: symbol.qualifiedName,
+      hintColumn: symbol.range.endColumn,
+    },
+    'symbol line fallback',
+    symbol,
+  );
+}
+
+async function activateCallGraphInlayEntry(
+  overlay: OverlayPanel,
+  callGraph: CallGraphService,
+  callGraphLog: vscode.OutputChannel,
+  entry: CallGraphInlayRegistryEntry,
+  source: string,
+  symbol?: CallGraphSymbol,
+): Promise<void> {
+  callGraphLog.appendLine(
+    `call graph inlay click source: ${source} kind=${entry.kind} query=${JSON.stringify(entry.label)}`,
+  );
+  const command = `activateCallGraphInlay:${entry.kind}`;
+  await runDedupedCallGraphSymbolCommand(command, entry.symbolId, async () => {
+    if (entry.kind === 'impl') {
+      await showCallGraphImplementationResult(overlay, callGraph, entry.symbolId, entry.label);
       return;
     }
-    if (normalizedKind === 'callees') {
-      await showCallGraphQueryResult(overlay, callGraph, callGraphLog, 'callees', symbol.id);
+    if (entry.kind === 'callees') {
+      await showCallGraphQueryResult(overlay, callGraph, callGraphLog, 'callees', entry.symbolId, entry.label);
       return;
     }
-    await showCallGraphUsageResult(overlay, callGraph, callGraphLog, symbol.id);
+    await showCallGraphUsageResult(overlay, callGraph, callGraphLog, entry.symbolId, entry.label, symbol);
   });
 }
 
@@ -386,6 +560,25 @@ function resolveInlaySymbolAtLine(
     return aDistance - bDistance || a.symbol.range.startColumn - b.symbol.range.startColumn;
   });
   return sorted[0]?.symbol;
+}
+
+function documentLineFromVisibleLineOrdinal(
+  editor: vscode.TextEditor,
+  lineOrdinal: number,
+): number | undefined {
+  if (!Number.isFinite(lineOrdinal) || lineOrdinal < 0) { return undefined; }
+  let remaining = Math.floor(lineOrdinal);
+  const ranges = [...editor.visibleRanges].sort((a, b) => a.start.line - b.start.line);
+  for (const range of ranges) {
+    const start = Math.max(0, range.start.line);
+    const end = Math.min(editor.document.lineCount - 1, range.end.line);
+    const count = Math.max(0, end - start + 1);
+    if (remaining < count) {
+      return start + remaining;
+    }
+    remaining -= count;
+  }
+  return undefined;
 }
 
 const callGraphSymbolCommandDedupe = new Map<string, { startedAt: number; promise: Promise<void> }>();
@@ -461,9 +654,13 @@ async function showCallGraphQueryResult(
   log: vscode.OutputChannel,
   direction: 'callers' | 'callees',
   explicitQuery?: string,
+  explicitLabel?: string,
 ): Promise<void> {
   try {
     const title = direction === 'callers' ? 'Find Callers' : 'Find Callees';
+    if (explicitQuery && !callGraph.getSnapshot()) {
+      await showCallGraphPendingPanel(overlay, title, explicitLabel ?? explicitQuery);
+    }
     if (!await ensureCallGraphReadyForUi(callGraph, title)) { return; }
     const query = explicitQuery ?? await getCallGraphQuery(callGraph, title);
     if (!query) { return; }
@@ -564,9 +761,13 @@ async function showCallGraphImplementationResult(
   overlay: OverlayPanel,
   callGraph: CallGraphService,
   explicitQuery?: string,
+  explicitLabel?: string,
 ): Promise<void> {
   try {
     const title = 'Find Implementations';
+    if (explicitQuery && !callGraph.getSnapshot()) {
+      await showCallGraphPendingPanel(overlay, title, explicitLabel ?? explicitQuery);
+    }
     if (!await ensureCallGraphReadyForUi(callGraph, title)) { return; }
     const query = explicitQuery ?? await getCallGraphQuery(callGraph, title);
     if (!query) { return; }
@@ -589,45 +790,122 @@ async function showCallGraphUsageResult(
   callGraph: CallGraphService,
   callGraphLog: vscode.OutputChannel,
   explicitQuery?: string,
+  explicitLabel?: string,
+  explicitSymbol?: CallGraphSymbol,
 ): Promise<void> {
   try {
     const title = 'Find Usages';
+    if (explicitQuery && !callGraph.getSnapshot()) {
+      await showCallGraphPendingPanel(overlay, title, explicitLabel ?? explicitQuery);
+    }
+
+    if (explicitQuery) {
+      const explicitSymbolId = explicitSymbol?.id ?? explicitQuery;
+      if (explicitSymbol || isCallGraphSymbolId(explicitSymbolId)) {
+        const cachedUsages = await callGraph.findUsagesForSymbolIdFromCache(explicitSymbolId);
+        if (cachedUsages) {
+          await showCallGraphUsageMatches(
+            overlay,
+            callGraphLog,
+            title,
+            explicitQuery,
+            explicitSymbol,
+            cachedUsages,
+            'call graph cache-index',
+            false,
+            explicitLabel ?? explicitSymbol?.qualifiedName ?? labelFromCallGraphSymbolId(explicitSymbolId),
+          );
+          return;
+        }
+      }
+    }
+
     if (!await ensureCallGraphReadyForUi(callGraph, title)) { return; }
     const query = explicitQuery ?? await getCallGraphQuery(callGraph, title);
     if (!query) { return; }
     const targetSymbol = callGraph.resolveSymbols(query, 1)[0];
     const usages = callGraph.findUsages(query);
-    let sourceLabel = 'call graph cache';
-    let matches = await buildCallGraphUsageFileMatches(usages);
-    const graphMatchCount = countFileMatchMatches(matches);
-    callGraphLog.appendLine(`find usages source: callgraph-cache query=${JSON.stringify(targetSymbol?.qualifiedName ?? query)} matches=${graphMatchCount}`);
-    if (targetSymbol && shouldSearchUsageTextFallback(targetSymbol, graphMatchCount)) {
-      const searched = await searchWorkspaceForUsageText(overlay, targetSymbol);
-      const searchMatches = searched.result.matches;
-      const total = countFileMatchMatches(searchMatches);
-      if (total > 0) {
-        const searchLabel = searched.result.requestedEngine === searched.result.effectiveEngine
-          ? searched.result.effectiveEngine
-          : `${searched.result.requestedEngine}->${searched.result.effectiveEngine}`;
-        sourceLabel = graphMatchCount > 0 ? `${sourceLabel}+${searchLabel}` : searchLabel;
-        matches = graphMatchCount > 0 ? mergeFileMatches(matches, searchMatches) : searchMatches;
-      }
-      callGraphLog.appendLine(
-        `find usages text fallback: query=${JSON.stringify(targetSymbol.name)} requested=${searched.result.requestedEngine} ` +
-        `effective=${searched.result.effectiveEngine} matches=${total}` +
-        `${searched.result.fallbackReason ? ` fallbackReason=${searched.result.fallbackReason}` : ''}`,
-      );
-    }
-    if (matches.length === 0) {
-      vscode.window.showInformationMessage('No usages found for the selected call graph symbol.');
-      return;
-    }
-    const targetLabel = targetSymbol?.qualifiedName ?? 'selected symbol';
-    await overlay.showStaticResults(`${title} [${sourceLabel}]: ${targetLabel}`, matches);
+    await showCallGraphUsageMatches(
+      overlay,
+      callGraphLog,
+      title,
+      query,
+      targetSymbol,
+      usages,
+      'call graph cache',
+      !explicitQuery,
+      explicitLabel,
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     vscode.window.showErrorMessage(`Call graph usages failed: ${msg}`);
   }
+}
+
+async function showCallGraphUsageMatches(
+  overlay: OverlayPanel,
+  callGraphLog: vscode.OutputChannel,
+  title: string,
+  query: string,
+  targetSymbol: CallGraphSymbol | undefined,
+  usages: CallGraphReference[],
+  initialSourceLabel: string,
+  allowTextFallback: boolean,
+  targetLabelOverride?: string,
+): Promise<void> {
+  let sourceLabel = initialSourceLabel;
+  let matches = await buildCallGraphUsageFileMatches(usages);
+  const graphMatchCount = countFileMatchMatches(matches);
+  const targetLabel = targetLabelOverride ?? targetSymbol?.qualifiedName ?? query;
+  callGraphLog.appendLine(
+    `find usages source: ${initialSourceLabel} query=${JSON.stringify(targetLabel)} ` +
+    `matches=${graphMatchCount}`,
+  );
+  if (allowTextFallback && targetSymbol && shouldSearchUsageTextFallback(targetSymbol, graphMatchCount)) {
+    const searched = await searchWorkspaceForUsageText(overlay, targetSymbol);
+    const searchMatches = searched.result.matches;
+    const total = countFileMatchMatches(searchMatches);
+    if (total > 0) {
+      const searchLabel = searched.result.requestedEngine === searched.result.effectiveEngine
+        ? searched.result.effectiveEngine
+        : `${searched.result.requestedEngine}->${searched.result.effectiveEngine}`;
+      sourceLabel = graphMatchCount > 0 ? `${sourceLabel}+${searchLabel}` : searchLabel;
+      matches = graphMatchCount > 0 ? mergeFileMatches(matches, searchMatches) : searchMatches;
+    }
+    callGraphLog.appendLine(
+      `find usages text fallback: query=${JSON.stringify(targetSymbol.name)} requested=${searched.result.requestedEngine} ` +
+      `effective=${searched.result.effectiveEngine} matches=${total}` +
+      `${searched.result.fallbackReason ? ` fallbackReason=${searched.result.fallbackReason}` : ''}`,
+    );
+  }
+  if (matches.length === 0) {
+    vscode.window.showInformationMessage('No usages found for the selected call graph symbol.');
+    return;
+  }
+  await overlay.showStaticResults(`${title} [${sourceLabel}]: ${targetLabel}`, matches);
+}
+
+function labelFromCallGraphSymbolId(symbolId: string): string {
+  const parts = symbolId.split(':');
+  return parts.length >= 4 ? parts[parts.length - 2] || symbolId : symbolId;
+}
+
+function isCallGraphSymbolId(value: string): boolean {
+  const parts = value.split(':');
+  return parts.length >= 4 && /^(?:python|java|kotlin|typescript|javascript)$/.test(parts[0] ?? '');
+}
+
+async function showCallGraphPendingPanel(
+  overlay: OverlayPanel,
+  title: string,
+  label: string,
+): Promise<void> {
+  await overlay.show(`${title}: ${label}`, {
+    forceLiteral: true,
+    suppressSearch: true,
+    statusText: 'Loading call graph results...',
+    loading: true,
+  });
 }
 
 function shouldSearchUsageTextFallback(symbol: CallGraphSymbol, graphMatchCount: number): boolean {
@@ -912,6 +1190,7 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
   constructor(
     private readonly overlay: OverlayPanel,
     private readonly callGraph: CallGraphService,
+    private readonly registry: CallGraphInlayRegistry,
   ) {
     this.onDidChangeInlayHints = callGraph.onDidChangeSnapshot;
   }
@@ -922,26 +1201,40 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
     token: vscode.CancellationToken,
   ): Promise<vscode.InlayHint[]> {
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-    if (!cfg.get<boolean>('callGraphInlayHints', true) || token.isCancellationRequested) { return []; }
+    if (token.isCancellationRequested) { return []; }
+    if (!cfg.get<boolean>('callGraphInlayHints', true)) {
+      this.registry.replaceRange(document.uri, range, []);
+      return [];
+    }
     const hasSnapshot = !!this.callGraph.getSnapshot();
     if (!hasSnapshot) {
       const restored = await this.callGraph.ensureDocumentSummariesRestored(document.uri);
       if (token.isCancellationRequested) { return []; }
-      if (!restored) { return []; }
+      if (!restored) {
+        this.registry.replaceRange(document.uri, range, []);
+        return [];
+      }
     }
     const showCalleeInlayHints = cfg.get<boolean>('callGraphShowCalleeInlayHints', false);
     const summaries = this.callGraph.getSnapshot()
       ? this.callGraph.getSymbolRelationSummariesForDocument(document.uri, range)
       : this.callGraph.getCachedSymbolRelationSummariesForDocument(document.uri, range);
-    const hints = summaries
+    const hints: vscode.InlayHint[] = [];
+    const registryEntries: CallGraphInlayRegistryEntry[] = [];
+    for (const summary of summaries
       .filter((summary) => summary.symbol.range.startLine >= 0 && summary.symbol.range.startLine < document.lineCount)
-      .filter((summary) => isCallGraphInlayDefinitionLine(document, summary.symbol))
-      .map((summary) => buildCallGraphInlayHint(
+      .filter((summary) => isCallGraphInlayDefinitionLine(document, summary.symbol))) {
+      const lineEndColumn = document.lineAt(summary.symbol.range.startLine).range.end.character;
+      const hint = buildCallGraphInlayHint(
         summary,
         showCalleeInlayHints,
-        document.lineAt(summary.symbol.range.startLine).range.end.character,
-      ))
-      .filter((hint): hint is vscode.InlayHint => !!hint);
+        lineEndColumn,
+      );
+      if (!hint) { continue; }
+      hints.push(hint);
+      registryEntries.push(...buildCallGraphInlayRegistryEntries(summary, showCalleeInlayHints, lineEndColumn));
+    }
+    this.registry.replaceRange(document.uri, range, registryEntries);
     if (hints.length > 0) {
       this.overlay.scheduleRendererInlayClickHookWarmup('call-graph-inlay-hints');
     }
@@ -1040,6 +1333,30 @@ function buildCallGraphInlayHint(
   );
   hint.paddingLeft = true;
   return hint;
+}
+
+function buildCallGraphInlayRegistryEntries(
+  summary: CallGraphSymbolRelationSummary,
+  showCalleeInlayHints: boolean,
+  lineEndColumn: number,
+): CallGraphInlayRegistryEntry[] {
+  const base = {
+    line: summary.symbol.range.startLine,
+    symbolId: summary.symbol.id,
+    label: summary.symbol.qualifiedName,
+    hintColumn: lineEndColumn,
+  };
+  const entries: CallGraphInlayRegistryEntry[] = [];
+  if (showCalleeInlayHints && summary.calleeCount > 0) {
+    entries.push({ ...base, kind: 'callees' });
+  }
+  if (summary.implementationCount > 0) {
+    entries.push({ ...base, kind: 'impl' });
+  }
+  if (summary.usageCount > 0) {
+    entries.push({ ...base, kind: 'usages' });
+  }
+  return entries;
 }
 
 function makeInlayCommandPart(

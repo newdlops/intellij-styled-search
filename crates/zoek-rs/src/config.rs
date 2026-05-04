@@ -34,19 +34,7 @@ impl Default for EngineConfig {
             max_grams_per_file: 8192,
             overlay_compaction_entry_threshold: 512,
             overlay_compaction_journal_bytes_threshold: 2 * 1024 * 1024,
-            excluded_dir_names: vec![
-                ".zoek-rs".to_string(),
-                ".zoekt-rs".to_string(),
-                ".git".to_string(),
-                ".hg".to_string(),
-                ".svn".to_string(),
-                "node_modules".to_string(),
-                "dist".to_string(),
-                "build".to_string(),
-                "out".to_string(),
-                "coverage".to_string(),
-                "target".to_string(),
-            ],
+            excluded_dir_names: vec![".zoek-rs".to_string(), ".zoekt-rs".to_string()],
             binary_file_extensions: vec![
                 ".png".to_string(),
                 ".jpg".to_string(),
@@ -103,7 +91,7 @@ impl EngineConfig {
         rel_path
             .replace('\\', "/")
             .split('/')
-            .any(|segment| segment == ".zoek-rs" || segment == ".zoekt-rs" || segment == "target")
+            .any(|segment| segment == ".zoek-rs" || segment == ".zoekt-rs")
     }
 
     pub fn is_binary_extension(&self, path: &Path) -> bool {

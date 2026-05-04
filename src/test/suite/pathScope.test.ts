@@ -57,4 +57,12 @@ suite('Path scope matcher', () => {
     assert.strictEqual(matcher!('nested/delta.js'), true);
     assert.strictEqual(matcher!('nested/delta.js.map'), false);
   });
+
+  test('hidden generated workspace directories can be pruned by subtree globs', () => {
+    const matcher = compilePathScopeMatcher([], ['**/.vscode-test/**', '**/node_modules/**']);
+    assert.ok(matcher, 'matcher should be created');
+    assert.strictEqual(matcher!('.vscode-test/vscode-darwin-arm64/out/vs/editor/worker.js'), false);
+    assert.strictEqual(matcher!('packages/app/node_modules/lib/index.js'), false);
+    assert.strictEqual(matcher!('src/callGraph.ts'), true);
+  });
 });

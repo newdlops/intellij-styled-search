@@ -8,6 +8,7 @@ import { analyze } from './codesearch/regexInfo';
 import { PostingSource, TrigramQuery, evalQuery, qAnd, qTri } from './codesearch/trigramQuery';
 import { serializeV3 } from './codesearch/binaryIndex';
 import { findWorkspaceFilesDirect } from './fileDiscovery';
+import { decodeTextBytes, getFileExtension, hasBinaryFileExtension, looksBinaryContent } from './textFiles';
 
 // A posting list entry that hasn't been materialized into memory yet.
 // `offset` is the byte offset within the on-disk postings section; `length`
@@ -94,15 +95,6 @@ function u32ArrayContains(a: Uint32Array, id: number): boolean {
 // pruned trigram forced the query planner to over-filter ("file doesn't
 // have this tri → exclude") even when the trigram was deliberately unindexed.
 // Cox's codesearch tolerates fat indexes; we keep everything.
-
-const BINARY_EXT = new Set([
-  '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp',
-  '.pdf', '.zip', '.gz', '.tar', '.7z', '.rar',
-  '.mp3', '.mp4', '.mov', '.avi', '.wav', '.flac',
-  '.woff', '.woff2', '.ttf', '.eot', '.otf',
-  '.exe', '.dll', '.so', '.dylib', '.class', '.o', '.a',
-  '.wasm', '.node',
-]);
 
 const REGEX_SIGNATURE_RE = /(?:\.\*|\.\+|\.\?|\*\?|\+\?)/;
 
@@ -739,8 +731,7 @@ export class TrigramIndex {
     if (preexistingId !== undefined) { this.stale.add(preexistingId); }
     try {
       // Skip obvious non-text by extension / size.
-      const ext = getExt(uri.fsPath);
-      if (BINARY_EXT.has(ext)) { this.skipCounts.binaryExt++; return; }
+      if (hasBinaryFileExtension(uri.fsPath)) { this.skipCounts.binaryExt++; return; }
       let stat: vscode.FileStat;
       try { stat = await vscode.workspace.fs.stat(uri); } catch { this.skipCounts.statError++; return; }
       if (stat.type === vscode.FileType.Directory) { this.skipCounts.directory++; return; }
@@ -753,9 +744,9 @@ export class TrigramIndex {
       }
       let bytes: Uint8Array;
       try { bytes = await vscode.workspace.fs.readFile(uri); } catch { this.skipCounts.readError++; return; }
-      if (looksBinary(bytes)) { this.skipCounts.binaryContent++; this.removeByUri(uriStr); return; }
+      if (looksBinaryContent(bytes)) { this.skipCounts.binaryContent++; this.removeByUri(uriStr); return; }
       let text: string;
-      try { text = new TextDecoder('utf-8', { fatal: false }).decode(bytes); } catch { this.skipCounts.decodeError++; return; }
+      try { text = decodeTextBytes(bytes); } catch { this.skipCounts.decodeError++; return; }
       this.skipCounts.indexed++;
 
       // Allocate or reuse a fileId.
@@ -953,16 +944,7 @@ function escapeRegexSource(s: string): string {
 }
 
 function getExt(fsPath: string): string {
-  const i = fsPath.lastIndexOf('.');
-  return i >= 0 ? fsPath.slice(i).toLowerCase() : '';
-}
-
-function looksBinary(bytes: Uint8Array): boolean {
-  const sampleLen = Math.min(bytes.length, 4096);
-  for (let i = 0; i < sampleLen; i++) {
-    if (bytes[i] === 0) { return true; }
-  }
-  return false;
+  return getFileExtension(fsPath);
 }
 
 export function extractTrigramsLower(text: string): Set<string> {

@@ -60,7 +60,17 @@ type OverlayMessage =
     }
   | { type: 'results:error'; searchId: number; message: string }
   | { type: 'history:update'; entries: string[]; limit: number }
-  | { type: 'preview'; uri: string; relPath: string; focusLine: number; ranges?: MatchRange[]; lines: PreviewLine[]; languageId: string }
+  | {
+      type: 'preview';
+      uri: string;
+      relPath: string;
+      focusLine: number;
+      ranges?: MatchRange[];
+      lines: PreviewLine[];
+      languageId: string;
+      baseLine: number;
+      fullFile: boolean;
+    }
   | { type: 'hover'; reqId: number; uri: string; line: number; column: number; x: number; y: number; contents: HoverContent[] };
 
 type SearchSession = {
@@ -80,6 +90,8 @@ export interface ShowOptions {
   forceLiteral?: boolean;
   suppressSearch?: boolean;
   preferredWindowId?: number;
+  statusText?: string;
+  loading?: boolean;
 }
 
 type PendingShow = {
@@ -98,6 +110,8 @@ type PendingStaticResults = {
 
 type CaptureDiagnosticOptions = {
   allowForceOpen?: boolean;
+  forceOpenUri?: vscode.Uri;
+  holdForceOpenedTab?: boolean;
   reason?: string;
 };
 
@@ -146,6 +160,8 @@ export class OverlayPanel {
   private capturePromise: Promise<void> | undefined;
   private backgroundCapturePromise: Promise<void> | undefined;
   private backgroundCaptureTimer: ReturnType<typeof setTimeout> | undefined;
+  private previewCaptureHoldTabs: vscode.Tab[] = [];
+  private previewCaptureHoldTimer: ReturnType<typeof setTimeout> | undefined;
   private cdpIdleCloseTimer: ReturnType<typeof setTimeout> | undefined;
   private cdpSearchIdleCloseTimer: ReturnType<typeof setTimeout> | undefined;
   private monacoCaptureDisabledLogged = false;
@@ -378,7 +394,11 @@ export class OverlayPanel {
     }
   }
 
-  private async ensureMonacoCapture(preferredWindowId?: number): Promise<void> {
+  private async ensureMonacoCapture(
+    preferredWindowId?: number,
+    forceOpenUri?: vscode.Uri,
+    options: { allowForceOpen?: boolean; holdForceOpenedTab?: boolean; reason?: string } = {},
+  ): Promise<void> {
     if (!this.isMonacoCaptureEnabled()) {
       this.logMonacoCaptureDisabled('foreground');
       return;
@@ -397,14 +417,44 @@ export class OverlayPanel {
       if (preferredWindowId === undefined && await this.isMonacoReadyAnywhere()) { return; }
     }
     const now = Date.now();
-    if (now - this.lastCaptureAttemptAt < 1500) { return; }
+    if (!forceOpenUri && now - this.lastCaptureAttemptAt < 1500) { return; }
     this.lastCaptureAttemptAt = now;
     try {
-      this.capturePromise = this.triggerCaptureDiagnostic(preferredWindowId);
+      const allowForceOpen = options.allowForceOpen ?? !!forceOpenUri;
+      this.capturePromise = this.triggerCaptureDiagnostic(preferredWindowId, {
+        allowForceOpen,
+        forceOpenUri,
+        holdForceOpenedTab: options.holdForceOpenedTab ?? false,
+        reason: options.reason ?? (forceOpenUri ? `preview:${forceOpenUri.toString()}` : 'foreground'),
+      });
       await this.capturePromise;
     } finally {
       this.capturePromise = undefined;
     }
+  }
+
+  private holdPreviewCaptureTabs(tabs: vscode.Tab[]): void {
+    for (const tab of tabs) {
+      if (!this.previewCaptureHoldTabs.includes(tab)) {
+        this.previewCaptureHoldTabs.push(tab);
+      }
+    }
+  }
+
+  private releasePreviewCaptureTabsSoon(reason: string, delayMs = 1500): void {
+    if (this.previewCaptureHoldTabs.length === 0) { return; }
+    if (this.previewCaptureHoldTimer) {
+      clearTimeout(this.previewCaptureHoldTimer);
+    }
+    this.previewCaptureHoldTimer = setTimeout(() => {
+      this.previewCaptureHoldTimer = undefined;
+      const tabs = this.previewCaptureHoldTabs.splice(0);
+      if (tabs.length === 0) { return; }
+      void vscode.window.tabGroups.close(tabs, true).then(
+        () => this.log.appendLine(`Capture diagnostic: released ${tabs.length} held preview capture tab(s) (${reason}).`),
+        (err) => this.log.appendLine(`Capture diagnostic: release held tabs failed (${reason}): ${err instanceof Error ? err.message : err}`),
+      );
+    }, delayMs);
   }
 
   private async isMonacoReadyInWindow(winId: number): Promise<boolean> {
@@ -424,7 +474,7 @@ export class OverlayPanel {
 
   private isMonacoCaptureDisabled(): boolean {
     return this.monacoCaptureStoppedForSession || vscode.workspace.getConfiguration('intellijStyledSearch')
-      .get<boolean>('disableMonacoCapture', true);
+      .get<boolean>('disableMonacoCapture', false);
   }
 
   private shouldCloseMainInspector(): boolean {
@@ -787,9 +837,12 @@ export class OverlayPanel {
 
   private async triggerCaptureDiagnostic(preferredWindowId?: number, options?: CaptureDiagnosticOptions): Promise<void> {
     const allowForceOpen = options?.allowForceOpen !== false;
+    const forceOpenUri = options?.forceOpenUri;
+    const holdForceOpenedTab = options?.holdForceOpenedTab === true;
     const reason = options?.reason || 'foreground';
     this.log.appendLine(
-      `Capture diagnostic: starting (reason=${reason}, forceOpen=${allowForceOpen ? 'yes' : 'no'})...`,
+      `Capture diagnostic: starting (reason=${reason}, forceOpen=${allowForceOpen ? 'yes' : 'no'}` +
+      (forceOpenUri ? `, forceOpenUri=${forceOpenUri.toString()}` : '') + ')...',
     );
     const targetWindowId = await this.resolveTargetWorkbenchWindowId(preferredWindowId);
     const windowIds = targetWindowId === undefined ? [] : [targetWindowId];
@@ -911,7 +964,7 @@ export class OverlayPanel {
         const widgets = widgetsMatch ? parseInt(widgetsMatch[1], 10) : 0;
         const services = servicesMatch ? parseInt(servicesMatch[1], 10) : 0;
         const ctors = ctorsMatch ? parseInt(ctorsMatch[1], 10) : 0;
-        if (widgets <= 0 || services <= 0) { continue; }
+        if (services <= 0) { continue; }
         if (preferredWindowId !== undefined && id === preferredWindowId) {
           return { id, widgets, services, ctors };
         }
@@ -929,8 +982,14 @@ export class OverlayPanel {
       if (existingCapture) {
         this.log.appendLine(
           `Existing captures in win=${existingCapture.id} ` +
-          `(widgets=${existingCapture.widgets} services=${existingCapture.services} ctors=${existingCapture.ctors}) — refreshing before testing.`,
+          `(widgets=${existingCapture.widgets} services=${existingCapture.services} ctors=${existingCapture.ctors}) — testing before refresh.`,
         );
+        const promoted = await runWidgetCreateTest(existingCapture.id, 'existing-capture');
+        if (promoted) {
+          await stopCaptureAll();
+          return;
+        }
+        this.log.appendLine('Existing captures did not promote to Monaco — refreshing capture buffer.');
       }
       await refreshCaptureAll();
       // Boot-time captures are almost always DI stubs (getModel()=null).
@@ -968,87 +1027,87 @@ export class OverlayPanel {
       // Peek again to see if DOM scan gave us enough to run the widget-
       // creation test without needing to force-open a file.
       const afterDomPeek = await peekAll('Capture peek after DOM scan', true);
-      let bestDomWin: number | null = null;
-      let bestDomWidgets = 0;
-      for (const [id, v] of afterDomPeek) {
-        const widgetsMatch = /widgets=(\d+)/.exec(v);
-        const servicesMatch = /services=(\d+)/.exec(v);
-        const widgets = widgetsMatch ? parseInt(widgetsMatch[1], 10) : 0;
-        const services = servicesMatch ? parseInt(servicesMatch[1], 10) : 0;
-        if (preferredWindowId !== undefined && id === preferredWindowId && widgets > 0 && services > 0) {
-          bestDomWidgets = widgets;
-          bestDomWin = id;
-          break;
+      const domCapture = findBestCapturedWindow(afterDomPeek);
+      if (domCapture) {
+        this.log.appendLine(
+          `DOM/captured services in win=${domCapture.id} ` +
+          `(widgets=${domCapture.widgets} services=${domCapture.services} ctors=${domCapture.ctors}) — testing before force-open.`,
+        );
+        const promoted = await runWidgetCreateTest(domCapture.id, 'DOM/service path');
+        if (promoted) {
+          await stopCaptureAll();
+          return;
         }
-        if (widgets > 0 && services > 0 && widgets > bestDomWidgets) {
-          bestDomWidgets = widgets;
-          bestDomWin = id;
-        }
-      }
-      if (bestDomWin !== null) {
-        // Any window with DOM-visible widgets is enough to skip force-open.
-        // This used to require `bestDomWin === preferredWindowId`, but that
-        // re-introduced the `client.md` (first workspace doc) flash whenever
-        // the preview window differed from the one with open editors —
-        // exactly the bug `random doc open bug fix` originally addressed.
-        this.log.appendLine(`DOM scan yielded widgets=${bestDomWidgets} in win=${bestDomWin} — skipping force-open.`);
-        await runWidgetCreateTest(bestDomWin, 'DOM path');
-        await stopCaptureAll();
-        return;
+        this.log.appendLine('DOM/service captures did not promote to Monaco.');
       }
       if (!allowForceOpen) {
         this.log.appendLine(
-          'Capture warmup: DOM scan did not yield a ready Monaco; skipping force-open and leaving normal foreground capture path intact.',
+          'Capture warmup: DOM scan did not yield a ready Monaco; skipping force-open and leaving capture hooks armed for the history capture path.',
         );
-        await stopCaptureAll();
         return;
       }
       this.log.appendLine('Captures cleared — no DOM-visible widgets, forcing real editor creation via file open/close...');
       const t0 = Date.now();
       let tFind = 0, tShow = 0, tPoll = 0, tClose = 0, pollIters = 0, pollPeekMaxMs = 0;
+      const forceOpenedCloseTargets: vscode.Tab[] = [];
       try {
         const tFind0 = Date.now();
-        const candidates = await findWorkspaceFilesDirect({
-          excludeGlobs: ['**/node_modules/**', '**/.git/**'],
-          extensions: new Set(['.json', '.md', '.txt', '.ts', '.js', '.py']),
-          maxResults: 1,
-        });
-        tFind = Date.now() - tFind0;
-        if (candidates.length > 0) {
-          // Record which tabs already existed so we DON'T close them when
-          // tearing down our capture-only editor. Previously we used
-          // `workbench.action.closeEditorsInGroup` which nukes every tab
-          // in the active group — that silently destroyed the user's
-          // other open tabs if our `Beside` happened to land on an
-          // already-populated column.
-          const fileUri = candidates[0];
-          const fileUriStr = fileUri.toString();
-          const preExistingUris = new Set<string>();
-          let userAlreadyHadThisTab = false;
-          for (const group of vscode.window.tabGroups.all) {
-            for (const tab of group.tabs) {
-              const input = tab.input as unknown as { uri?: vscode.Uri };
-              if (input && input.uri && typeof input.uri.toString === 'function') {
-                const u = input.uri.toString();
-                preExistingUris.add(u);
-                if (u === fileUriStr) { userAlreadyHadThisTab = true; }
-              }
+        const preExistingUris = new Set<string>();
+        for (const group of vscode.window.tabGroups.all) {
+          for (const tab of group.tabs) {
+            const input = tab.input as unknown as { uri?: vscode.Uri };
+            if (input && input.uri && typeof input.uri.toString === 'function') {
+              preExistingUris.add(input.uri.toString());
             }
           }
+        }
+
+        let fileUri: vscode.Uri | undefined;
+        if (forceOpenUri && !preExistingUris.has(forceOpenUri.toString())) {
+          fileUri = forceOpenUri;
+        } else {
+          const candidates = await findWorkspaceFilesDirect({
+            excludeGlobs: [
+              '**/node_modules/**',
+              '**/.git/**',
+              '**/out/**',
+              '**/dist/**',
+              '**/build/**',
+              '**/.vscode/.auto-import-cache/**',
+              '**/*.vsix',
+            ],
+            extensions: new Set(['.json', '.md', '.txt', '.ts', '.js', '.py']),
+            maxResults: 128,
+          });
+          fileUri = candidates.find((candidate) => !preExistingUris.has(candidate.toString()));
+          if (!fileUri && forceOpenUri) { fileUri = forceOpenUri; }
+        }
+        tFind = Date.now() - tFind0;
+
+        let captureDoc: vscode.TextDocument | undefined;
+        if (fileUri) {
+          const userAlreadyHadThisTab = preExistingUris.has(fileUri.toString());
+          captureDoc = userAlreadyHadThisTab
+            ? await vscode.workspace.openTextDocument({
+              language: 'typescript',
+              content: '// IntelliJ Styled Search capture buffer\n',
+            })
+            : await vscode.workspace.openTextDocument(fileUri);
+          const captureUriStr = captureDoc.uri.toString();
           this.log.appendLine(
-            `Capture diagnostic: opening ${fileUriStr}` +
-            (userAlreadyHadThisTab ? ' (already open — will NOT close afterwards)' : ''),
+            `Capture diagnostic: opening ${captureUriStr}` +
+            (userAlreadyHadThisTab ? ` (capture-only fallback; requested ${fileUri.toString()} is already open)` : ''),
           );
           const tShow0 = Date.now();
-          await vscode.window.showTextDocument(fileUri, {
+          await vscode.window.showTextDocument(captureDoc, {
             viewColumn: vscode.ViewColumn.Beside,
             preserveFocus: true,
             preview: true,
           });
           tShow = Date.now() - tShow0;
           // Poll every 100ms instead of sleeping a flat 1s. As soon as ANY
-          // window has enough real widgets + services to run the widget-
-          // creation test, close and move on.
+          // window has enough real widgets + services, run the widget-
+          // creation test while that source editor is still alive.
           const tPoll0 = Date.now();
           let sawCaptures = false;
           for (let i = 0; i < 20; i++) {
@@ -1065,41 +1124,30 @@ export class OverlayPanel {
             if (sawCaptures) { break; }
           }
           tPoll = Date.now() - tPoll0;
-          const tClose0 = Date.now();
-          // Close ONLY tabs we introduced, leaving every pre-existing
-          // tab (including the one we landed beside) intact.
-          if (!userAlreadyHadThisTab) {
-            const targets: vscode.Tab[] = [];
-            for (const group of vscode.window.tabGroups.all) {
-              for (const tab of group.tabs) {
-                const input = tab.input as unknown as { uri?: vscode.Uri };
-                if (input && input.uri && typeof input.uri.toString === 'function' &&
-                    input.uri.toString() === fileUriStr && !preExistingUris.has(input.uri.toString())) {
-                  // Above condition is strict: file URI matches AND it
-                  // wasn't in preExistingUris snapshot — i.e., the tab
-                  // we just created.
-                  targets.push(tab);
-                }
+          const tCollectClose0 = Date.now();
+          // Record ONLY tabs we introduced, leaving every pre-existing tab
+          // (including the one we landed beside) intact. We close/hold them
+          // after the widget-creation test, not before; closing first disposes
+          // the exact InstantiationService we need to create the overlay editor.
+          for (const group of vscode.window.tabGroups.all) {
+            for (const tab of group.tabs) {
+              const input = tab.input as unknown as { uri?: vscode.Uri };
+              if (input && input.uri && typeof input.uri.toString === 'function' &&
+                  input.uri.toString() === captureUriStr && !preExistingUris.has(input.uri.toString())) {
+                // Above condition is strict: URI matches AND it wasn't in
+                // the preExistingUris snapshot — i.e., the tab we created
+                // purely to make VS Code instantiate a fresh editor widget.
+                forceOpenedCloseTargets.push(tab);
               }
             }
-            if (targets.length > 0) {
-              try { await vscode.window.tabGroups.close(targets, true); }
-              catch (errClose) { this.log.appendLine(`Capture close tab failed: ${errClose instanceof Error ? errClose.message : errClose}`); }
-            }
           }
-          tClose = Date.now() - tClose0;
+          tClose = Date.now() - tCollectClose0;
         } else {
           this.log.appendLine('Capture diagnostic: no files found to open');
         }
       } catch (err) {
         this.log.appendLine(`Capture trigger failed: ${err instanceof Error ? err.message : err}`);
       }
-      this.log.appendLine(
-        `Capture force-open phase: ${Date.now() - t0}ms ` +
-        `(findFiles=${tFind}ms showTextDocument=${tShow}ms ` +
-        `poll=${tPoll}ms iters=${pollIters} peekMax=${pollPeekMaxMs}ms ` +
-        `closeEditors=${tClose}ms)`,
-      );
       const peeked = await peekAll('Capture peek after clear+force');
 
       // Find the window with most captures and run the widget-creation test there.
@@ -1126,6 +1174,27 @@ export class OverlayPanel {
       } else {
         this.log.appendLine('No window has captures — skipping widget creation test.');
       }
+
+      if (forceOpenedCloseTargets.length > 0) {
+        const tClose0 = Date.now();
+        if (holdForceOpenedTab) {
+          this.holdPreviewCaptureTabs(forceOpenedCloseTargets);
+          this.log.appendLine(
+            `Capture diagnostic: holding ${forceOpenedCloseTargets.length} introduced tab(s) until preview render completes.`,
+          );
+        } else {
+          try { await vscode.window.tabGroups.close(forceOpenedCloseTargets, true); }
+          catch (errClose) { this.log.appendLine(`Capture close tab failed: ${errClose instanceof Error ? errClose.message : errClose}`); }
+        }
+        tClose += Date.now() - tClose0;
+      }
+
+      this.log.appendLine(
+        `Capture force-open phase: ${Date.now() - t0}ms ` +
+        `(findFiles=${tFind}ms showTextDocument=${tShow}ms ` +
+        `poll=${tPoll}ms iters=${pollIters} peekMax=${pollPeekMaxMs}ms ` +
+        `closeEditors=${tClose}ms)`,
+      );
 
       // Stop capture in every window (best-effort) so Map.prototype etc.
       // are back to normal. Parallel for a small (~100ms) additional win.
@@ -2153,6 +2222,11 @@ export class OverlayPanel {
       clearTimeout(this.backgroundCaptureTimer);
       this.backgroundCaptureTimer = undefined;
     }
+    if (this.previewCaptureHoldTimer) {
+      clearTimeout(this.previewCaptureHoldTimer);
+      this.previewCaptureHoldTimer = undefined;
+    }
+    this.previewCaptureHoldTabs = [];
     if (this.cdpIdleCloseTimer) {
       clearTimeout(this.cdpIdleCloseTimer);
       this.cdpIdleCloseTimer = undefined;
@@ -2860,46 +2934,43 @@ export class OverlayPanel {
   private async handlePreviewRequest(evt: Extract<RendererEvent, { type: 'requestPreview' }>) {
     this.cancelCdpSearchIdleClose();
     if (this.activeWindowId !== undefined) {
-      await this.ensureMonacoCapture(this.activeWindowId);
+      try {
+        await this.ensureMonacoCapture(this.activeWindowId, undefined, {
+          allowForceOpen: false,
+          reason: 'preview-request',
+        });
+        if (!(await this.isMonacoReadyInWindow(this.activeWindowId))) {
+          this.log.appendLine('preview Monaco capture still not ready; retrying v0.1.5 force-open capture path.');
+          await this.ensureMonacoCapture(this.activeWindowId, vscode.Uri.parse(evt.uri), {
+            allowForceOpen: true,
+            holdForceOpenedTab: true,
+            reason: 'preview-request-force-open',
+          });
+        }
+      } catch (err) {
+        this.log.appendLine(`preview Monaco capture failed: ${err instanceof Error ? err.message : err}`);
+      }
     }
     await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges);
+    this.releasePreviewCaptureTabsSoon('preview-delivered');
     this.scheduleCdpSearchIdleClose('preview-delivered');
   }
 
-  private async sendPreview(uriStr: string, line: number, contextLines: number, ranges: MatchRange[] | undefined) {
+  private async sendPreview(
+    uriStr: string,
+    line: number,
+    _contextLines: number,
+    ranges: MatchRange[] | undefined,
+  ) {
     try {
       const uri = vscode.Uri.parse(uriStr);
       const doc = await vscode.workspace.openTextDocument(uri);
       const allLines = doc.getText().split(/\r?\n/);
-      // This preview is rendered inside the VS Code workbench renderer. Sending
-      // the whole file makes the search overlay compete with the editor UI
-      // itself, so keep the payload intentionally small and centered on the hit.
-      const DEFAULT_CONTEXT_LINES = 24;
-      const MAX_PREVIEW_LINES = 120;
-      const MAX_PREVIEW_LINE_CHARS = 1000;
-      const requestedContext = Number.isFinite(contextLines)
-        ? Math.max(0, Math.floor(contextLines))
-        : DEFAULT_CONTEXT_LINES;
-      const halfWindow = Math.min(
-        requestedContext,
-        Math.floor(MAX_PREVIEW_LINES / 2),
-      );
-      const targetLine = Math.max(0, Math.min(line, Math.max(0, allLines.length - 1)));
-      let start = Math.max(0, targetLine - halfWindow);
-      let end = Math.min(allLines.length, targetLine + halfWindow + 1);
-      if (end - start > MAX_PREVIEW_LINES) {
-        end = start + MAX_PREVIEW_LINES;
-      }
-      if (end - start < MAX_PREVIEW_LINES && start > 0) {
-        start = Math.max(0, end - MAX_PREVIEW_LINES);
-      }
+      let start = 0;
+      let end = allLines.length;
       const lines: PreviewLine[] = [];
       for (let i = start; i < end; i++) {
-        const raw = allLines[i] ?? '';
-        const text = raw.length > MAX_PREVIEW_LINE_CHARS
-          ? `${raw.slice(0, MAX_PREVIEW_LINE_CHARS)}...`
-          : raw;
-        lines.push({ lineNumber: i, text });
+        lines.push({ lineNumber: i, text: allLines[i] ?? '' });
       }
       const relPath = vscode.workspace.asRelativePath(uri, false);
       await this.postToRenderer({
@@ -2910,6 +2981,8 @@ export class OverlayPanel {
         ranges,
         lines,
         languageId: doc.languageId,
+        baseLine: start,
+        fullFile: start === 0 && end === allLines.length,
       });
     } catch (err) {
       this.log.appendLine(`preview fetch failed: ${err instanceof Error ? err.message : err}`);

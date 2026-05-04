@@ -46,9 +46,15 @@ suite('Call graph', () => {
     const py = vscode.Uri.joinPath(folder.uri, 'callgraph_fixture.py');
     const savePy = vscode.Uri.joinPath(folder.uri, 'callgraph_save_fixture.py');
     const js = vscode.Uri.joinPath(folder.uri, 'callgraph_fixture.js');
+    const binaryJs = vscode.Uri.joinPath(folder.uri, 'callgraph_binary_noise.js');
     const java = vscode.Uri.joinPath(folder.uri, 'CallGraphFixture.java');
     const kt = vscode.Uri.joinPath(folder.uri, 'CallGraphFixture.kt');
     try {
+      await vscode.workspace.getConfiguration('intellijStyledSearch').update(
+        'callGraphIncludeUnresolvedEdges',
+        true,
+        vscode.ConfigurationTarget.Workspace,
+      );
       await vscode.workspace.fs.writeFile(py, Buffer.from([
         'GRAPH_LIMIT = 7',
         '',
@@ -187,6 +193,10 @@ suite('Call graph', () => {
         '}',
         '',
       ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.writeFile(binaryJs, Buffer.from([
+        0x63, 0x6c, 0x61, 0x73, 0x73, 0x20, 0x42, 0x69, 0x6e, 0x61, 0x72, 0x79,
+        0x4e, 0x6f, 0x69, 0x73, 0x65, 0x20, 0x7b, 0x7d, 0x00, 0x00,
+      ]));
       await vscode.workspace.fs.writeFile(java, Buffer.from([
         'class GraphJava extends GraphJavaBase {',
         '  private GraphJavaBase worker;',
@@ -316,10 +326,17 @@ suite('Call graph', () => {
           concurrency: progress.concurrency,
         });
       });
-      assert.ok(progressEvents.some((event) => event.stage === 'parsing'), 'expected parsing progress events');
       assert.ok(progressEvents.some((event) => event.stage === 'done'), 'expected done progress event');
       assert.ok(progressEvents.some((event) => event.concurrency >= 1), 'expected progress to include worker count');
       assert.ok(snapshot.stats.parseConcurrency >= 1, 'expected snapshot stats to include parse concurrency');
+      const forcedStages: string[] = [];
+      await api.callGraph.rebuild((progress) => {
+        forcedStages.push(progress.stage);
+      }, undefined, { force: true });
+      assert.ok(
+        forcedStages.includes('parsing'),
+        `expected forced rebuild to skip cached snapshot reuse and parse files, got ${forcedStages.join(', ')}`,
+      );
       const progressMessage = formatCallGraphProgressMessage({
         stage: 'parsing',
         message: 'parsing files',
@@ -335,6 +352,7 @@ suite('Call graph', () => {
       assert.ok(progressMessage.includes('workers=8'), 'expected progress message to include worker count');
       const names = snapshot.symbols.map((symbol) => symbol.qualifiedName);
       assert.ok(names.includes('GraphPy.root'), 'expected Python method symbol');
+      assert.ok(!names.includes('BinaryNoise'), 'expected binary-looking source file to be skipped');
       assert.ok(names.includes('GraphPy.leaf'), 'expected Python leaf symbol');
       assert.ok(names.includes('GRAPH_LIMIT'), 'expected Python constant symbol');
       assert.ok(names.includes('GraphJs.root'), 'expected JavaScript method symbol');
@@ -454,6 +472,12 @@ suite('Call graph', () => {
         cachedClassSummary && cachedClassSummary.usageCount === refreshedClassSummary.usageCount,
         `expected cached document summary to expose usage counts without full snapshot restore; full=${refreshedClassSummary.usageCount} cached=${cachedClassSummary?.usageCount ?? 'missing'}`,
       );
+      const cachedClassUsages = await api.callGraph.findUsagesForSymbolIdFromCache(refreshedClassSummary.symbol.id);
+      assert.ok(
+        cachedClassUsages?.some((reference) => reference.enclosingSymbolId?.includes('graph_py_top2')),
+        'expected cached symbol relation index to serve usages without full snapshot restore',
+      );
+      assert.strictEqual(api.callGraph.getSnapshot(), undefined, 'expected cached usage query to avoid restoring the full snapshot');
       api.callGraph.dropDocumentSummariesForTests();
       assert.strictEqual(
         await api.callGraph.ensureDocumentSummariesRestored(py),
@@ -674,9 +698,15 @@ suite('Call graph', () => {
         undefined,
         vscode.ConfigurationTarget.Workspace,
       );
+      await vscode.workspace.getConfiguration('intellijStyledSearch').update(
+        'callGraphIncludeUnresolvedEdges',
+        undefined,
+        vscode.ConfigurationTarget.Workspace,
+      );
       try { await vscode.workspace.fs.delete(py); } catch {}
       try { await vscode.workspace.fs.delete(savePy); } catch {}
       try { await vscode.workspace.fs.delete(js); } catch {}
+      try { await vscode.workspace.fs.delete(binaryJs); } catch {}
       try { await vscode.workspace.fs.delete(java); } catch {}
       try { await vscode.workspace.fs.delete(kt); } catch {}
       await api.callGraph.rebuild();
@@ -824,6 +854,11 @@ suite('Call graph', () => {
     assert.ok(folder, 'expected fixture workspace folder');
     const ts = vscode.Uri.joinPath(folder.uri, 'callgraph_impl_fixture.ts');
     try {
+      await vscode.workspace.getConfiguration('intellijStyledSearch').update(
+        'callGraphIncludeUnresolvedEdges',
+        true,
+        vscode.ConfigurationTarget.Workspace,
+      );
       await vscode.workspace.fs.writeFile(ts, Buffer.from([
         'interface WorkerContract {',
         '  run(payload: WorkerPayload): WorkerMode;',
@@ -924,6 +959,11 @@ suite('Call graph', () => {
       const enumSummary = summaries.find((summary) => summary.symbol.qualifiedName === 'WorkerMode');
       assert.ok(enumSummary && enumSummary.usageCount >= 2, 'expected enum inlay summary to include usages');
     } finally {
+      await vscode.workspace.getConfiguration('intellijStyledSearch').update(
+        'callGraphIncludeUnresolvedEdges',
+        undefined,
+        vscode.ConfigurationTarget.Workspace,
+      );
       try { await vscode.workspace.fs.delete(ts); } catch {}
       await api.callGraph.rebuild();
     }

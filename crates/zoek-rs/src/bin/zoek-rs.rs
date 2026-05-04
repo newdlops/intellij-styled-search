@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 
 use zoek_rs::config::EngineConfig;
@@ -69,6 +70,18 @@ fn run_index(args: &[String]) -> Result<EngineResponse, String> {
         }
     }
 
+    if request.force {
+        let index_root = config.index_root(&workspace_root);
+        if index_root.exists() {
+            fs::remove_dir_all(&index_root).map_err(|err| {
+                format!(
+                    "failed to clear previous index {}: {err}",
+                    index_root.to_string_lossy()
+                )
+            })?;
+        }
+    }
+
     let artifacts = index_directory_with_progress(&workspace_root, &config, &mut |progress| {
         eprintln!("{}", progress.to_stderr_line());
     })
@@ -91,11 +104,7 @@ fn run_index(args: &[String]) -> Result<EngineResponse, String> {
             overlay_entries: artifacts.summary.overlay_entries,
             total_grams: artifacts.summary.total_grams,
         },
-        warnings: if request.force {
-            vec!["force flag accepted but phase5 still rebuilds from scratch".to_string()]
-        } else {
-            Vec::new()
-        },
+        warnings: Vec::new(),
     }))
 }
 

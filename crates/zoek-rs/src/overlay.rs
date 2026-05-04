@@ -967,17 +967,20 @@ mod tests {
     }
 
     #[test]
-    fn update_ignores_target_but_allows_git_and_node_modules() -> io::Result<()> {
+    fn update_ignores_internal_index_dirs_but_allows_git_node_modules_and_target() -> io::Result<()>
+    {
         let root = temp_dir("overlay-update-ignored-dirs");
         fs::create_dir_all(root.join(".git"))?;
         fs::create_dir_all(root.join("node_modules/pkg"))?;
         fs::create_dir_all(root.join("target/debug"))?;
+        fs::create_dir_all(root.join(".zoek-rs"))?;
         fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
         fs::write(
             root.join("node_modules/pkg/index.js"),
             "module.exports = 1;\n",
         )?;
         fs::write(root.join("target/debug/build.log"), "compiled\n")?;
+        fs::write(root.join(".zoek-rs/overlay-journal.jsonl"), "{}\n")?;
 
         let config = EngineConfig::default();
         let layout = StoreLayout::for_workspace(&root, &config);
@@ -987,20 +990,22 @@ mod tests {
                 String::from(".git/HEAD"),
                 String::from("node_modules/pkg/index.js"),
                 String::from("target/debug/build.log"),
+                String::from(".zoek-rs/overlay-journal.jsonl"),
             ],
             &[],
             &[],
         );
         let summary = apply_change_batch(&root, &layout, &config, &batch)?;
-        assert_eq!(summary.entries_written, 2);
-        assert_eq!(summary.overlay_total_entries, 2);
-        assert_eq!(summary.latest_visible_entries, 2);
+        assert_eq!(summary.entries_written, 3);
+        assert_eq!(summary.overlay_total_entries, 3);
+        assert_eq!(summary.latest_visible_entries, 3);
         assert!(layout.overlay_journal_path.exists());
 
         let latest = OverlayManifest::load(&layout.overlay_path)?.latest_entries();
         assert!(!latest[".git/HEAD"].tombstone);
         assert!(!latest["node_modules/pkg/index.js"].tombstone);
-        assert!(!latest.contains_key("target/debug/build.log"));
+        assert!(!latest["target/debug/build.log"].tombstone);
+        assert!(!latest.contains_key(".zoek-rs/overlay-journal.jsonl"));
 
         fs::remove_dir_all(root)?;
         Ok(())
@@ -1010,7 +1015,7 @@ mod tests {
     fn rename_between_included_and_excluded_dirs_only_records_indexed_side() -> io::Result<()> {
         let root = temp_dir("overlay-rename-excluded");
         fs::create_dir_all(root.join("src"))?;
-        fs::create_dir_all(root.join("target/debug"))?;
+        fs::create_dir_all(root.join(".zoek-rs"))?;
         fs::write(root.join("src/new.rs"), "struct Included {}\n")?;
 
         let config = EngineConfig::default();
@@ -1019,31 +1024,25 @@ mod tests {
             0,
             &[],
             &[],
-            &[(
-                String::from("target/debug/new.rs"),
-                String::from("src/new.rs"),
-            )],
+            &[(String::from(".zoek-rs/new.rs"), String::from("src/new.rs"))],
         );
         let summary = apply_change_batch(&root, &layout, &config, &into_index)?;
         assert_eq!(summary.entries_written, 1);
         let latest = OverlayManifest::load(&layout.overlay_path)?.latest_entries();
         assert!(!latest["src/new.rs"].tombstone);
-        assert!(!latest.contains_key("target/debug/new.rs"));
+        assert!(!latest.contains_key(".zoek-rs/new.rs"));
 
         let out_of_index = build_change_batch(
             summary.generation,
             &[],
             &[],
-            &[(
-                String::from("src/new.rs"),
-                String::from("target/debug/new.rs"),
-            )],
+            &[(String::from("src/new.rs"), String::from(".zoek-rs/new.rs"))],
         );
         let summary = apply_change_batch(&root, &layout, &config, &out_of_index)?;
         assert_eq!(summary.entries_written, 1);
         let latest = OverlayManifest::load(&layout.overlay_path)?.latest_entries();
         assert!(latest["src/new.rs"].tombstone);
-        assert!(!latest.contains_key("target/debug/new.rs"));
+        assert!(!latest.contains_key(".zoek-rs/new.rs"));
 
         fs::remove_dir_all(root)?;
         Ok(())

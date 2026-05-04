@@ -94,6 +94,86 @@ suite('Renderer — overlay UI probes', () => {
     assert.strictEqual(parsed.prevented, false, `third-party inlay click should not be suppressed: ${raw}`);
   });
 
+  test('call graph inlay click hook resolves plain no-position clicks through visible line', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('');
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(async function(){
+        var oldBridge = globalThis.irSearchEvent;
+        var sent = [];
+        globalThis.irSearchEvent = function (payload) {
+          try { sent.push(JSON.parse(String(payload))); } catch (e) {}
+        };
+        var editor = document.createElement('div');
+        editor.className = 'monaco-editor';
+        editor.style.cssText = 'position:fixed;left:30px;top:30px;width:160px;height:30px;z-index:2147483647;';
+        var lines = document.createElement('div');
+        lines.className = 'view-lines';
+        var line = document.createElement('div');
+        line.className = 'view-line';
+        var hint = document.createElement('span');
+        hint.className = 'inline-hints-widget';
+        hint.textContent = 'usages 2';
+        hint.style.cssText = 'display:inline-block;padding:2px;';
+        var pointerReceived = false;
+        var clickReceived = false;
+        hint.addEventListener('pointerdown', function () { pointerReceived = true; });
+        hint.addEventListener('click', function () { clickReceived = true; });
+        line.appendChild(hint);
+        lines.appendChild(line);
+        editor.appendChild(lines);
+        document.body.appendChild(editor);
+        var pointer = new PointerEvent('pointerdown', {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+          clientX: 36,
+          clientY: 36
+        });
+        var pointerDispatch = hint.dispatchEvent(pointer);
+        var click = new MouseEvent('click', {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+          clientX: 36,
+          clientY: 36
+        });
+        var clickDispatch = hint.dispatchEvent(click);
+        await new Promise(function (resolve) { setTimeout(resolve, 25); });
+        editor.remove();
+        globalThis.irSearchEvent = oldBridge;
+        return JSON.stringify({
+          pointerReceived: pointerReceived,
+          clickReceived: clickReceived,
+          pointerPrevented: pointer.defaultPrevented || !pointerDispatch,
+          clickPrevented: click.defaultPrevented || !clickDispatch,
+          sent: sent
+        });
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      pointerReceived: boolean;
+      clickReceived: boolean;
+      pointerPrevented: boolean;
+      clickPrevented: boolean;
+      sent: Array<{ type?: string; command?: string }>;
+    };
+    assert.strictEqual(parsed.pointerReceived, false, `plain no-position pointerdown should be handled by visible-line fallback: ${raw}`);
+    assert.strictEqual(parsed.clickReceived, false, `duplicate click should be suppressed after visible-line fallback: ${raw}`);
+    assert.strictEqual(parsed.pointerPrevented, true, `plain no-position inlay pointerdown should be suppressed after fallback command: ${raw}`);
+    assert.strictEqual(parsed.clickPrevented, true, `duplicate click should be suppressed after fallback command: ${raw}`);
+    assert.ok(
+      !parsed.sent.some((msg) => msg.type === 'runCommand' && msg.command === 'intellijStyledSearch.activateCallGraphInlayAtPosition'),
+      `no-position inlay should not run active-cursor fallback command: ${raw}`,
+    );
+    assert.ok(
+      parsed.sent.some((msg) => msg.type === 'runCommand' && msg.command === 'intellijStyledSearch.activateCallGraphInlayAtVisibleLine'),
+      `plain no-position inlay should run visible-line command: ${raw}`,
+    );
+  });
+
   test('force-literal show clears regex and whole-word toggles', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);
@@ -132,6 +212,48 @@ suite('Renderer — overlay UI probes', () => {
     assert.strictEqual(parsed.regexPressed, 'false', `regex toggle should be off: ${raw}`);
     assert.strictEqual(parsed.wordPressed, 'false', `whole-word toggle should be off: ${raw}`);
     assert.strictEqual(parsed.state.inputValue, query);
+  });
+
+  test('suppressed initial search keeps the full panel layout mounted', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('DirectWorkspaceFileOptions', {
+      forceLiteral: true,
+      suppressSearch: true,
+      statusText: 'Loading call graph results...',
+      loading: true,
+    });
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var panel = document.querySelector('.ij-find-overlay');
+        return JSON.stringify({
+          shell: !!(panel && panel.classList.contains('ij-find-shell')),
+          results: !!document.querySelector('.ij-find-overlay > .ij-find-results'),
+          splitter: !!document.querySelector('.ij-find-overlay > .ij-find-splitter'),
+          preview: !!document.querySelector('.ij-find-overlay > .ij-find-preview'),
+          resizer: !!document.querySelector('.ij-find-overlay > .ij-find-resizer'),
+          statusText: document.querySelector('.ij-find-status') ? document.querySelector('.ij-find-status').textContent : '',
+          spinnerHidden: document.querySelector('.ij-find-spinner') ? document.querySelector('.ij-find-spinner').classList.contains('hidden') : true
+        });
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      shell: boolean;
+      results: boolean;
+      splitter: boolean;
+      preview: boolean;
+      resizer: boolean;
+      statusText: string;
+      spinnerHidden: boolean;
+    };
+    assert.strictEqual(parsed.shell, false, `suppressed show should not shrink to shell mode: ${raw}`);
+    assert.strictEqual(parsed.results, true, `results pane should remain mounted: ${raw}`);
+    assert.strictEqual(parsed.splitter, true, `splitter should remain mounted: ${raw}`);
+    assert.strictEqual(parsed.preview, true, `preview pane should remain mounted: ${raw}`);
+    assert.strictEqual(parsed.resizer, true, `resizer should remain mounted: ${raw}`);
+    assert.strictEqual(parsed.statusText, 'Loading call graph results...', `custom loading status should render: ${raw}`);
+    assert.strictEqual(parsed.spinnerHidden, false, `loading spinner should render: ${raw}`);
   });
 
   test('regex multiline toggle is disabled until regex mode is enabled', async function () {

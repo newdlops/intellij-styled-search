@@ -229,7 +229,7 @@ suite('Activation', () => {
       assert.deepStrictEqual(cancellations, [
         { reason: 'explicit rebuild requested', kinds: ['index'] },
       ]);
-      assert.deepStrictEqual(invokedArgs, ['/tmp/ijss-rebuild', workspaceRoot]);
+      assert.deepStrictEqual(invokedArgs, ['/tmp/ijss-rebuild', workspaceRoot, '--force']);
     } finally {
       runtime.indexPromises.delete(workspaceRoot);
       runtime.cancelRunningProcesses = originalCancelRunningProcesses;
@@ -296,7 +296,7 @@ suite('Activation', () => {
     });
   });
 
-  test('getRelativePath ignores zoekt internals and target but keeps git and node_modules', async () => {
+  test('getRelativePath ignores zoekt internals but keeps git target and node_modules', async () => {
     const { overlay } = await getApi();
     const runtime = (overlay as any).zoektRuntime as any;
     const workspaceRoot = runtime.getWorkspaceRootPath();
@@ -320,7 +320,7 @@ suite('Activation', () => {
     );
     assert.strictEqual(
       runtime.getRelativePath(vscode.Uri.file(path.join(workspaceRoot, 'target', 'debug', 'build.log'))),
-      null,
+      'target/debug/build.log',
     );
     assert.strictEqual(
       runtime.getRelativePath(vscode.Uri.file(path.join(workspaceRoot, 'node_modules', 'pkg', 'index.js'))),
@@ -378,14 +378,14 @@ suite('Activation', () => {
     try {
       runtime.queueRename(
         vscode.Uri.file(path.join(workspaceRoot, 'alpha.py')),
-        vscode.Uri.file(path.join(workspaceRoot, 'target', 'alpha.py')),
+        vscode.Uri.file(path.join(workspaceRoot, '.zoek-rs', 'alpha.py')),
       );
       assert.strictEqual(runtime.pendingDeleted.has('alpha.py'), true);
       assert.strictEqual(runtime.pendingChanged.size, 0);
 
       runtime.pendingDeleted.clear();
       runtime.queueRename(
-        vscode.Uri.file(path.join(workspaceRoot, 'target', 'docs.md')),
+        vscode.Uri.file(path.join(workspaceRoot, '.zoek-rs', 'docs.md')),
         vscode.Uri.file(path.join(workspaceRoot, 'docs.md')),
       );
       assert.strictEqual(runtime.pendingChanged.has('docs.md'), true);

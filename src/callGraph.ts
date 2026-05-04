@@ -4,6 +4,8 @@ import { promisify } from 'util';
 import { gzip, gunzip } from 'zlib';
 import * as vscode from 'vscode';
 import { findWorkspaceFilesDirect } from './fileDiscovery';
+import { compilePathScopeMatcher } from './pathScope';
+import { decodeTextBytes, looksBinaryContent } from './textFiles';
 
 export type CallGraphLanguage = 'python' | 'java' | 'kotlin' | 'typescript' | 'javascript';
 export type CallGraphSymbolKind = 'class' | 'interface' | 'enum' | 'type' | 'struct' | 'function' | 'method' | 'constructor' | 'constant';
@@ -127,6 +129,10 @@ export interface CallGraphRebuildProgress {
   concurrency: number;
 }
 
+export interface CallGraphRebuildOptions {
+  force?: boolean;
+}
+
 type CallGraphVariableBinding = {
   variableName: string;
   className: string;
@@ -183,6 +189,7 @@ type CallGraphCacheManifest = {
   chunks: CallGraphCacheChunk[];
   recordIndex?: CallGraphRecordIndexEntry[];
   recordOverrides?: CallGraphRecordOverrideChunk[];
+  symbolRelations?: CallGraphSymbolRelationChunk[];
   documentSummaries?: CallGraphDocumentSummaryChunk[];
   documentSummaryFiles?: CallGraphDocumentSummaryFileChunk[];
   snapshot?: {
@@ -219,6 +226,15 @@ type CallGraphRecordOverride = {
   record?: CallGraphFileRecord;
   deleted?: boolean;
   updatedAtUnixMs: number;
+};
+
+type CallGraphSymbolRelationRecord = {
+  symbolId: string;
+  usages: CallGraphReference[];
+};
+
+type CallGraphSymbolRelationChunk = CallGraphCacheChunk & {
+  bucket: number;
 };
 
 type CallGraphDocumentSummaryChunk = CallGraphCacheChunk & {
@@ -272,6 +288,21 @@ type CallGraphParseLimits = {
 type CallGraphCpuBudget = {
   percent: number;
   maxPauseMs: number;
+};
+
+type CallGraphBuildLimits = {
+  maxCallsites: number;
+  maxReferenceCandidates: number;
+  memoryBudgetMb: number;
+};
+
+type CallGraphBuildBudgetState = {
+  acceptedCallsites: number;
+  acceptedReferenceCandidates: number;
+  droppedCallsites: number;
+  droppedReferenceCandidates: number;
+  firstCallsiteLimitRelPath?: string;
+  firstReferenceCandidateLimitRelPath?: string;
 };
 
 type ResolvedCallTarget = {
@@ -418,13 +449,21 @@ const VALUE_BINDING_TYPE_NAMES = new Set([
 const MAX_CALL_GRAPH_CONCURRENCY = 32;
 const MAX_POSSIBLE_EDGES_PER_CALL = 40;
 const DEFAULT_CALL_GRAPH_CONCURRENCY = getDefaultCallGraphConcurrency();
-const DEFAULT_CALL_GRAPH_MAX_EDGES = 10_000_000;
+const DEFAULT_CALL_GRAPH_MAX_EDGES = 1_000_000;
+const DEFAULT_CALL_GRAPH_MAX_CALLSITES = 1_000_000;
+const DEFAULT_CALL_GRAPH_MAX_REFERENCE_CANDIDATES = 1_000_000;
+const DEFAULT_CALL_GRAPH_MEMORY_BUDGET_MB = 1_024;
 const CALL_GRAPH_SOURCE_GLOB = '**/*.{py,java,kt,kts,ts,tsx,js,jsx,mjs,cjs}';
-const CALL_GRAPH_CACHE_VERSION = 9;
+const CALL_GRAPH_CACHE_VERSION = 14;
 const CALL_GRAPH_INCREMENTAL_DEBOUNCE_MS = 1_500;
 const CALL_GRAPH_CACHE_RECORDS_PER_CHUNK = 1_000;
 const CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK = 50_000;
+const CALL_GRAPH_SYMBOL_RELATION_BUCKETS = 256;
 const CALL_GRAPH_DOCUMENT_SUMMARY_BUCKETS = 256;
+const INTERNAL_CALL_GRAPH_EXCLUDE_GLOBS = [
+  '**/.zoek-rs/**',
+  '**/.zoekt-rs/**',
+];
 const gzipAsync = promisify(gzip);
 const gunzipAsync = promisify(gunzip);
 
@@ -446,6 +485,9 @@ export class CallGraphService implements vscode.Disposable {
   private cacheConfigSignature: string | undefined;
   private cacheManifest: CallGraphCacheManifest | undefined;
   private cacheRecordsLoaded = false;
+  private readonly symbolRelationBucketsByIndex = new Map<number, Map<string, CallGraphSymbolRelationRecord>>();
+  private readonly symbolRelationLoadedBuckets = new Set<number>();
+  private readonly symbolRelationBucketPromises = new Map<number, Promise<void>>();
   private readonly documentSummaryBucketsByIndex = new Map<number, Map<string, CallGraphDocumentSummaryRecord>>();
   private readonly documentSummaryLoadedBuckets = new Set<number>();
   private readonly documentSummaryBucketPromises = new Map<number, Promise<void>>();
@@ -573,9 +615,10 @@ export class CallGraphService implements vscode.Disposable {
   async rebuild(
     report?: (progress: CallGraphRebuildProgress) => void,
     token?: vscode.CancellationToken,
+    options: CallGraphRebuildOptions = {},
   ): Promise<CallGraphSnapshot> {
     if (this.rebuildPromise) { return this.rebuildPromise; }
-    this.rebuildPromise = this.doRebuild(report, token).finally(() => {
+    this.rebuildPromise = this.doRebuild(report, token, options).finally(() => {
       this.rebuildPromise = undefined;
     });
     return this.rebuildPromise;
@@ -691,6 +734,58 @@ export class CallGraphService implements vscode.Disposable {
       }
     }
     return out;
+  }
+
+  async findUsagesForSymbolIdFromCache(
+    symbolId: string,
+    limit = 500,
+  ): Promise<CallGraphReference[] | undefined> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const manifest = this.cacheManifest;
+    const started = Date.now();
+    if (folder && manifest?.snapshot && symbolId && Array.isArray(manifest.symbolRelations)) {
+      let baseUsages: CallGraphReference[] = [];
+      if (manifest.symbolRelations.length > 0) {
+        const bucket = symbolRelationBucketForSymbolId(symbolId);
+        await this.ensureSymbolRelationBucketLoaded(folder.uri.fsPath, bucket, manifest.symbolRelations);
+        const record = this.getCachedSymbolRelationRecord(symbolId);
+        baseUsages = record?.usages ?? [];
+      }
+      const overrides = await this.loadRecordOverrides(folder.uri.fsPath, manifest);
+      const overriddenUris = new Set(overrides.map((override) => override.uri));
+      const relationIndex: RelationSummaryIndex = {
+        callersBySymbolId: new Map(),
+        calleesBySymbolId: new Map(),
+        usagesBySymbolId: new Map([[
+          symbolId,
+          baseUsages.filter((reference) => !overriddenUris.has(reference.uri)).slice(0, limit),
+        ]]),
+      };
+      if (overrides.length > 0) {
+        await this.mergeRecordOverrideRelationsForSymbolIds(
+          folder.uri.fsPath,
+          manifest,
+          new Set([symbolId]),
+          relationIndex,
+        );
+      }
+      const usages = (relationIndex.usagesBySymbolId.get(symbolId) ?? []).slice(0, limit);
+      this.log.appendLine(
+        `call graph cached usage query: source=symbol-relations symbolId=${JSON.stringify(symbolId)} ` +
+        `matches=${usages.length} elapsed=${Date.now() - started}ms`,
+      );
+      return usages;
+    }
+    const snapshot = this.snapshot;
+    if (snapshot && this.relationSummaryCache?.snapshot === snapshot) {
+      const usages = (this.relationSummaryCache.index.usagesBySymbolId.get(symbolId) ?? []).slice(0, limit);
+      this.log.appendLine(
+        `call graph cached usage query: source=memory-relation-index symbolId=${JSON.stringify(symbolId)} ` +
+        `matches=${usages.length} elapsed=${Date.now() - started}ms`,
+      );
+      return usages;
+    }
+    return undefined;
   }
 
   findImplementations(symbolOrQuery: string, limit = 200): CallGraphSymbol[] {
@@ -893,7 +988,7 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   private scheduleIncrementalRefresh(uri: vscode.Uri, reason: string): void {
-    if (this.disposed) { return; }
+    if (this.disposed || isCallGraphExcludedUri(uri)) { return; }
     this.pendingChangedUris.add(uri.toString());
     if (this.incrementalTimer) {
       clearTimeout(this.incrementalTimer);
@@ -908,7 +1003,7 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   private scheduleIncrementalRefreshIfSupported(uri: vscode.Uri, reason: string): void {
-    if (uri.scheme !== 'file' || !isSupportedSourceUri(uri)) { return; }
+    if (uri.scheme !== 'file' || !isSupportedSourceUri(uri) || isCallGraphExcludedUri(uri)) { return; }
     this.scheduleIncrementalRefresh(uri, reason);
   }
 
@@ -950,6 +1045,7 @@ export class CallGraphService implements vscode.Disposable {
     const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
     const parseLimits = getConfiguredCallGraphParseLimits(cfg);
     const cpuBudget = getConfiguredCallGraphCpuBudget(cfg);
+    const excludeMatcher = createCallGraphExcludeMatcher(cfg);
     const uniqueUris = dedupeStrings(uris.map((uri) => uri.toString())).map((value) => vscode.Uri.parse(value));
     const previousOverrides = new Map<string, CallGraphRecordOverride>();
     for (const uri of uniqueUris) {
@@ -961,7 +1057,7 @@ export class CallGraphService implements vscode.Disposable {
     const overrides: CallGraphRecordOverride[] = [];
     for (const uri of uniqueUris) {
       const uriString = uri.toString();
-      if (!isSupportedSourceUri(uri)) {
+      if (!isSupportedSourceUri(uri) || isUriExcludedFromCallGraph(uri, folder.uri.fsPath, excludeMatcher)) {
         overrides.push({ uri: uriString, deleted: true, updatedAtUnixMs: Date.now() });
         continue;
       }
@@ -1009,9 +1105,11 @@ export class CallGraphService implements vscode.Disposable {
     const started = Date.now();
     const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
     const resolveOptions = getConfiguredCallGraphResolveOptions(cfg);
+    const buildLimits = getConfiguredCallGraphBuildLimits(cfg);
     const parseConcurrency = getConfiguredCallGraphConcurrency(cfg);
     const parseLimits = getConfiguredCallGraphParseLimits(cfg);
     const cpuBudget = getConfiguredCallGraphCpuBudget(cfg);
+    const excludeMatcher = createCallGraphExcludeMatcher(cfg);
     const uniqueUris = dedupeStrings(uris.map((uri) => uri.toString())).map((value) => vscode.Uri.parse(value));
     let changed = 0;
     let skipped = 0;
@@ -1019,7 +1117,7 @@ export class CallGraphService implements vscode.Disposable {
     const overrides: CallGraphRecordOverride[] = [];
     for (const uri of uniqueUris) {
       const uriString = uri.toString();
-      if (!isSupportedSourceUri(uri)) {
+      if (!isSupportedSourceUri(uri) || isUriExcludedFromCallGraph(uri, folder.uri.fsPath, excludeMatcher)) {
         if (this.snapshot.symbols.some((symbol) => symbol.uri === uriString) || this.fileRecordsByUri.delete(uriString)) {
           changed += 1;
           overrides.push({ uri: uriString, deleted: true, updatedAtUnixMs: Date.now() });
@@ -1193,6 +1291,11 @@ export class CallGraphService implements vscode.Disposable {
         await this.deleteCacheDir(folder.uri.fsPath, CALL_GRAPH_CACHE_VERSION);
         return;
       }
+      if (!Array.isArray(manifest.symbolRelations)) {
+        this.log.appendLine('call graph cache deleted: missing symbol relation index');
+        await this.deleteCacheDir(folder.uri.fsPath, CALL_GRAPH_CACHE_VERSION);
+        return;
+      }
       this.cacheManifest = manifest as CallGraphCacheManifest;
       this.cacheConfigSignature = configSignature;
       this.cacheRecordsLoaded = false;
@@ -1204,7 +1307,8 @@ export class CallGraphService implements vscode.Disposable {
           `edges=${stats.edgeCount} references=${stats.referenceCount} recordChunks=${this.cacheManifest.chunks.length} ` +
           `recordIndex=${this.cacheManifest.recordIndex?.length ?? 0} ` +
           `recordOverrides=${this.cacheManifest.recordOverrides?.length ?? 0} ` +
-          `snapshotChunks=${countSnapshotChunks(this.cacheManifest)} documentSummaryBuckets=${countDocumentSummaryBuckets(this.cacheManifest)} ` +
+          `snapshotChunks=${countSnapshotChunks(this.cacheManifest)} symbolRelationBuckets=${countSymbolRelationBuckets(this.cacheManifest)} ` +
+          `documentSummaryBuckets=${countDocumentSummaryBuckets(this.cacheManifest)} ` +
           `documentSummaryFiles=${countDocumentSummaryFiles(this.cacheManifest)} ` +
           `cachedAt=${cachedAt} restore=lazy`,
         );
@@ -1213,6 +1317,7 @@ export class CallGraphService implements vscode.Disposable {
           `call graph cache metadata loaded: recordChunks=${this.cacheManifest.chunks.length} ` +
           `recordIndex=${this.cacheManifest.recordIndex?.length ?? 0} ` +
           `recordOverrides=${this.cacheManifest.recordOverrides?.length ?? 0} ` +
+          `symbolRelationBuckets=${countSymbolRelationBuckets(this.cacheManifest)} ` +
           `documentSummaryBuckets=${countDocumentSummaryBuckets(this.cacheManifest)} documentSummaryFiles=${countDocumentSummaryFiles(this.cacheManifest)} ` +
           `cachedAt=${cachedAt} restore=records-fallback`,
         );
@@ -1368,6 +1473,58 @@ export class CallGraphService implements vscode.Disposable {
       this.log.appendLine(`call graph record cache load skipped: ${err instanceof Error ? err.message : String(err)}`);
       return false;
     }
+  }
+
+  private async ensureSymbolRelationBucketLoaded(
+    workspaceRoot: string,
+    bucket: number,
+    chunks: CallGraphSymbolRelationChunk[],
+  ): Promise<void> {
+    if (this.symbolRelationLoadedBuckets.has(bucket)) { return; }
+    const existing = this.symbolRelationBucketPromises.get(bucket);
+    if (existing) {
+      await existing;
+      return;
+    }
+    const promise = this.doLoadSymbolRelationBucket(workspaceRoot, bucket, chunks).finally(() => {
+      this.symbolRelationBucketPromises.delete(bucket);
+    });
+    this.symbolRelationBucketPromises.set(bucket, promise);
+    await promise;
+  }
+
+  private async doLoadSymbolRelationBucket(
+    workspaceRoot: string,
+    bucket: number,
+    chunks: CallGraphSymbolRelationChunk[],
+  ): Promise<void> {
+    const chunk = chunks.find((entry) => entry.bucket === bucket);
+    if (!chunk) {
+      this.symbolRelationLoadedBuckets.add(bucket);
+      return;
+    }
+    const started = Date.now();
+    try {
+      const records = await this.readCacheArrayChunk<CallGraphSymbolRelationRecord>(workspaceRoot, chunk);
+      let bucketRecords = this.symbolRelationBucketsByIndex.get(bucket);
+      if (!bucketRecords) {
+        bucketRecords = new Map<string, CallGraphSymbolRelationRecord>();
+        this.symbolRelationBucketsByIndex.set(bucket, bucketRecords);
+      }
+      for (const record of records) {
+        bucketRecords.set(record.symbolId, record);
+      }
+      this.symbolRelationLoadedBuckets.add(bucket);
+      this.log.appendLine(
+        `call graph symbol relation bucket loaded: bucket=${bucket} symbols=${records.length} elapsed=${Date.now() - started}ms`,
+      );
+    } catch (err) {
+      this.log.appendLine(`call graph symbol relation load skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private getCachedSymbolRelationRecord(symbolId: string): CallGraphSymbolRelationRecord | undefined {
+    return this.symbolRelationBucketsByIndex.get(symbolRelationBucketForSymbolId(symbolId))?.get(symbolId);
   }
 
   private async ensureDocumentSummaryBucketLoaded(
@@ -1844,7 +2001,14 @@ export class CallGraphService implements vscode.Disposable {
       this.cacheRecordsLoaded = false;
     }
     this.cacheConfigSignature = configSignature;
+    this.clearSymbolRelationCache();
     this.onDidChangeSnapshotEmitter.fire();
+  }
+
+  private clearSymbolRelationCache(): void {
+    this.symbolRelationBucketsByIndex.clear();
+    this.symbolRelationLoadedBuckets.clear();
+    this.symbolRelationBucketPromises.clear();
   }
 
   private clearDocumentSummaryCache(): void {
@@ -1874,14 +2038,21 @@ export class CallGraphService implements vscode.Disposable {
           (bytes) => { totalBytes += bytes; },
         ));
         const summaryStarted = Date.now();
+        const relationIndex = this.getRelationSummaryIndex(snapshot);
         const documentSummaryRecords = await buildDocumentSummaryRecords(
           snapshot,
           this.getIndex(snapshot),
-          this.getRelationSummaryIndex(snapshot),
+          relationIndex,
         );
         const documentSummaries = await this.writeDocumentSummaryBuckets(
           folder.uri.fsPath,
           documentSummaryRecords,
+          (bytes) => { totalBytes += bytes; },
+        );
+        const symbolRelationRecords = buildSymbolRelationRecords(relationIndex);
+        const symbolRelations = await this.writeSymbolRelationBuckets(
+          folder.uri.fsPath,
+          symbolRelationRecords,
           (bytes) => { totalBytes += bytes; },
         );
         const snapshotChunks = {
@@ -1914,6 +2085,7 @@ export class CallGraphService implements vscode.Disposable {
           builtAtUnixMs: snapshot.builtAtUnixMs,
           chunks,
           recordIndex,
+          symbolRelations,
           documentSummaries,
           snapshot: {
             builtAtUnixMs: snapshot.builtAtUnixMs,
@@ -1930,7 +2102,8 @@ export class CallGraphService implements vscode.Disposable {
         this.replaceDocumentSummaryCache(documentSummaryRecords);
         this.log.appendLine(
           `call graph cache saved: files=${records.length} recordChunks=${chunks.length} snapshotChunks=${countSnapshotChunks(manifest)} ` +
-          `documentSummaryBuckets=${documentSummaries.length} documentSummaryFiles=${documentSummaryRecords.length} ` +
+          `symbolRelationBuckets=${symbolRelations.length} documentSummaryBuckets=${documentSummaries.length} ` +
+          `documentSummaryFiles=${documentSummaryRecords.length} ` +
           `documentSummaryElapsed=${Date.now() - summaryStarted}ms bytes=${totalBytes}`,
         );
       } catch (err) {
@@ -2022,6 +2195,31 @@ export class CallGraphService implements vscode.Disposable {
     onBytes(encoded.byteLength);
     await vscode.workspace.fs.writeFile(this.cacheChunkUri(workspaceRoot, file), encoded);
     return { uri: override.uri, uriHash, updatedAtUnixMs: override.updatedAtUnixMs, file, count: 1 };
+  }
+
+  private async writeSymbolRelationBuckets(
+    workspaceRoot: string,
+    records: CallGraphSymbolRelationRecord[],
+    onBytes: (bytes: number) => void,
+  ): Promise<CallGraphSymbolRelationChunk[]> {
+    const buckets = new Map<number, CallGraphSymbolRelationRecord[]>();
+    for (const record of records) {
+      const bucket = symbolRelationBucketForSymbolId(record.symbolId);
+      const bucketRecords = buckets.get(bucket) ?? [];
+      bucketRecords.push(record);
+      buckets.set(bucket, bucketRecords);
+    }
+    const chunks: CallGraphSymbolRelationChunk[] = [];
+    for (const [bucket, bucketRecords] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
+      bucketRecords.sort((a, b) => a.symbolId.localeCompare(b.symbolId));
+      const file = `symbol-relations-${bucket}.json.gz`;
+      const encoded = await gzipAsync(Buffer.from(JSON.stringify(bucketRecords), 'utf8'));
+      onBytes(encoded.byteLength);
+      await vscode.workspace.fs.writeFile(this.cacheChunkUri(workspaceRoot, file), encoded);
+      chunks.push({ bucket, file, count: bucketRecords.length });
+      await yieldToExtensionHost();
+    }
+    return chunks;
   }
 
   private async writeDocumentSummaryBuckets(
@@ -2297,9 +2495,31 @@ export class CallGraphService implements vscode.Disposable {
     return Array.isArray(this.cacheManifest?.recordIndex);
   }
 
+  private async clearForForceRebuild(workspaceRoot: string): Promise<void> {
+    try { await this.cacheWritePromise; } catch {}
+    if (this.snapshotRestorePromise) {
+      try { await this.snapshotRestorePromise; } catch {}
+    }
+    this.snapshot = undefined;
+    this.indexCache = undefined;
+    this.relationSummaryCache = undefined;
+    this.fileRecordsByUri.clear();
+    this.cacheRecordsLoaded = false;
+    this.cacheManifest = undefined;
+    this.cacheConfigSignature = undefined;
+    this.clearSymbolRelationCache();
+    this.clearDocumentSummaryCache();
+    const deleted = await this.deleteCacheDir(workspaceRoot, CALL_GRAPH_CACHE_VERSION);
+    this.log.appendLine(
+      `call graph force rebuild: ${deleted ? 'deleted previous cache' : 'no previous cache to delete'} ` +
+      `currentVersion=${CALL_GRAPH_CACHE_VERSION}`,
+    );
+  }
+
   private async doRebuild(
     report?: (progress: CallGraphRebuildProgress) => void,
     token?: vscode.CancellationToken,
+    options: CallGraphRebuildOptions = {},
   ): Promise<CallGraphSnapshot> {
     const started = Date.now();
     const folder = vscode.workspace.workspaceFolders?.[0];
@@ -2310,12 +2530,13 @@ export class CallGraphService implements vscode.Disposable {
       await this.restorePromise;
     }
     const workspaceRoot = folder.uri.fsPath;
+    if (options.force) {
+      await this.clearForForceRebuild(workspaceRoot);
+    }
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-    const excludeGlobs = [
-      ...cfg.get<string[]>('excludeGlobs', []),
-      ...cfg.get<string[]>('callGraphExcludeGlobs', []),
-    ];
+    const excludeGlobs = getConfiguredCallGraphExcludeGlobs(cfg);
     const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
+    const buildLimits = getConfiguredCallGraphBuildLimits(cfg);
     const parseConcurrency = getConfiguredCallGraphConcurrency(cfg);
     const resolveOptions = getConfiguredCallGraphResolveOptions(cfg);
     const parseLimits = getConfiguredCallGraphParseLimits(cfg);
@@ -2378,9 +2599,11 @@ export class CallGraphService implements vscode.Disposable {
     });
     progressState.total = sourceFiles.length;
     progressState.current = 0;
-    emitProgress('indexing', 'checking call graph cache metadata', true);
+    emitProgress(options.force ? 'parsing' : 'indexing', options.force
+      ? 'forced rebuild requested; skipping cached record reuse'
+      : 'checking call graph cache metadata', true);
     let cachedRecordsAvailable = false;
-    const fastSnapshot = await this.tryRebuildFromIndexedCache({
+    const fastSnapshot = options.force ? undefined : await this.tryRebuildFromIndexedCache({
       workspaceRoot,
       sourceFiles,
       maxFileSize,
@@ -2405,7 +2628,7 @@ export class CallGraphService implements vscode.Disposable {
       emitProgress('done', `done in ${Date.now() - started}ms`, true);
       return fastSnapshot;
     }
-    if (this.cacheManifest?.configSignature === configSignature) {
+    if (!options.force && this.cacheManifest?.configSignature === configSignature) {
       cachedRecordsAvailable = await this.ensureCachedRecordsLoaded();
       if (cachedRecordsAvailable && await this.persistRecordIndexFromLoadedRecordsIfMissing()) {
         progressState.current = 0;
@@ -2437,7 +2660,9 @@ export class CallGraphService implements vscode.Disposable {
         }
       }
     }
-    const cachedRecordsByUri = cachedRecordsAvailable ? new Map(this.fileRecordsByUri) : new Map<string, CallGraphFileRecord>();
+    const cachedRecordsByUri = !options.force && cachedRecordsAvailable
+      ? new Map(this.fileRecordsByUri)
+      : new Map<string, CallGraphFileRecord>();
     let reusedFiles = 0;
     progressState.current = 0;
     progressState.total = sourceFiles.length;
@@ -2446,57 +2671,69 @@ export class CallGraphService implements vscode.Disposable {
       `parsing ${sourceFiles.length} source files with ${parseConcurrency} workers`,
       true,
     );
-    const parsedResults = await mapWithConcurrency(sourceFiles, parseConcurrency, async (uri) => {
+    const records: CallGraphFileRecord[] = [];
+    const buildBudgetState = createCallGraphBuildBudgetState();
+    await forEachWithConcurrency(sourceFiles, parseConcurrency, async (uri) => {
       throwIfCancelled();
+      let result: ParsedSourceFileResult;
       if (this.disposed) {
         progressState.current += 1;
         progressState.skippedFiles += 1;
         emitProgress('parsing', `parsed ${progressState.current}/${progressState.total}`);
-        return { record: undefined, warnings: [] as string[], skipped: true } satisfies ParsedSourceFileResult;
-      }
-      try {
-        const cachedRecord = cachedRecordsByUri.get(uri.toString());
-        if (cachedRecord) {
-          try {
-            const stat = await vscode.workspace.fs.stat(uri);
-            if (fileMetadataMatches(cachedRecord, stat)) {
-              progressState.current += 1;
-              progressState.parsedFiles += 1;
-              reusedFiles += 1;
-              emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`);
-              return { record: cachedRecord, warnings: [] as string[], skipped: false, reused: true } satisfies ParsedSourceFileResult;
+        result = { record: undefined, warnings: [], skipped: true };
+      } else {
+        try {
+          const cachedRecord = cachedRecordsByUri.get(uri.toString());
+          if (cachedRecord) {
+            try {
+              const stat = await vscode.workspace.fs.stat(uri);
+              if (fileMetadataMatches(cachedRecord, stat)) {
+                progressState.current += 1;
+                progressState.parsedFiles += 1;
+                reusedFiles += 1;
+                emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`);
+                result = { record: cachedRecord, warnings: [], skipped: false, reused: true };
+                if (result.record) {
+                  applyCallGraphBuildBudgetsToRecord(result.record, buildLimits, buildBudgetState);
+                  records.push(result.record);
+                }
+                return;
+              }
+            } catch {
+              // Fall through to parsing; parseSourceFileRecord will surface a useful warning if the file vanished.
             }
-          } catch {
-            // Fall through to parsing; parseSourceFileRecord will surface a useful warning if the file vanished.
           }
-        }
-        const parseStarted = Date.now();
-        const parsed = await parseSourceFileRecord(uri, maxFileSize, parseLimits);
-        await applyCallGraphCpuBudget(Date.now() - parseStarted, cpuBudget, token);
-        throwIfCancelled();
-        progressState.current += 1;
-        if (parsed.record) {
-          progressState.parsedFiles += 1;
-        } else {
+          const parseStarted = Date.now();
+          result = await parseSourceFileRecord(uri, maxFileSize, parseLimits);
+          await applyCallGraphCpuBudget(Date.now() - parseStarted, cpuBudget, token);
+          throwIfCancelled();
+          progressState.current += 1;
+          if (result.record) {
+            progressState.parsedFiles += 1;
+          } else {
+            progressState.skippedFiles += 1;
+          }
+          progressState.warningCount += result.warnings.length;
+          emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`);
+        } catch (err) {
+          const warning = `failed to parse ${uri.fsPath}: ${err instanceof Error ? err.message : String(err)}`;
+          progressState.current += 1;
           progressState.skippedFiles += 1;
+          progressState.warningCount += 1;
+          emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`);
+          result = { record: undefined, warnings: [warning], skipped: true };
         }
-        progressState.warningCount += parsed.warnings.length;
-        emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`);
-        return parsed;
-      } catch (err) {
-        const warning = `failed to parse ${uri.fsPath}: ${err instanceof Error ? err.message : String(err)}`;
-        progressState.current += 1;
-        progressState.skippedFiles += 1;
-        progressState.warningCount += 1;
-        emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`);
-        return { record: undefined, warnings: [warning], skipped: true } satisfies ParsedSourceFileResult;
+      }
+      if (result.record) {
+        applyCallGraphBuildBudgetsToRecord(result.record, buildLimits, buildBudgetState);
+        records.push(result.record);
+      }
+      if (result.warnings.length > 0) {
+        warnings.push(...result.warnings);
       }
     });
     emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`, true);
-    const records = parsedResults
-      .map((result) => result.record)
-      .filter((result): result is CallGraphFileRecord => !!result);
-    warnings.push(...parsedResults.flatMap((result) => result.warnings));
+    appendCallGraphBuildBudgetWarnings(warnings, buildLimits, buildBudgetState);
     const parsedWarnings = records.flatMap((record) => record.parsed.warnings);
     warnings.push(...parsedWarnings);
     progressState.warningCount = warnings.length;
@@ -2504,16 +2741,22 @@ export class CallGraphService implements vscode.Disposable {
     progressState.total = records.reduce((sum, record) => sum + record.parsed.symbols.length, 0);
     emitProgress('indexing', `indexing ${progressState.total} symbols`, true);
     throwIfCancelled();
-    const index = buildSymbolIndex(records.flatMap((record) => record.parsed.symbols), records.flatMap((record) => record.parsed.bindings));
+    const symbols = records.flatMap((record) => record.parsed.symbols);
+    const bindings = records.flatMap((record) => record.parsed.bindings);
+    const index = buildSymbolIndex(symbols, bindings);
+    bindings.length = 0;
+    const referenceCandidates = records.flatMap((record) => record.parsed.referenceCandidates);
     const references = resolveReferenceCandidates(
-      records.flatMap((record) => record.parsed.referenceCandidates),
-      records.flatMap((record) => record.parsed.symbols),
+      referenceCandidates,
+      symbols,
       index,
     );
+    referenceCandidates.length = 0;
     const calls = records.flatMap((record) => record.parsed.calls);
+    const callsiteCount = calls.length;
     progressState.current = 0;
-    progressState.total = calls.length;
-    emitProgress('resolving', `resolving ${calls.length} callsites`, true);
+    progressState.total = callsiteCount;
+    emitProgress('resolving', `resolving ${callsiteCount} callsites`, true);
     const resolvedCalls = await resolveCallsAsync(calls, index, {
       token,
       resolveOptions,
@@ -2523,6 +2766,7 @@ export class CallGraphService implements vscode.Disposable {
         emitProgress('resolving', `resolved ${current}/${total} callsites`);
       },
     });
+    calls.length = 0;
     const edges = resolvedCalls.edges;
     if (resolvedCalls.edgeLimitHit) {
       warnings.push(`call graph unique edge limit reached at ${resolveOptions.maxEdges}; skipped additional materialized edges`);
@@ -2540,7 +2784,6 @@ export class CallGraphService implements vscode.Disposable {
       typescript: 0,
       javascript: 0,
     };
-    const symbols = records.flatMap((record) => record.parsed.symbols);
     for (const symbol of symbols) {
       languageCounts[symbol.language] += 1;
     }
@@ -2562,7 +2805,7 @@ export class CallGraphService implements vscode.Disposable {
         elapsedMs: Date.now() - started,
         parseConcurrency,
         skippedFileCount: progressState.skippedFiles,
-        callsiteCount: calls.length,
+        callsiteCount,
         skippedPossibleEdgeCount: resolvedCalls.skippedPossibleEdgeCount,
         skippedUnresolvedEdgeCount: resolvedCalls.skippedUnresolvedEdgeCount,
         edgeLimitHit: resolvedCalls.edgeLimitHit,
@@ -2732,6 +2975,10 @@ function countSnapshotChunks(manifest: CallGraphCacheManifest): number {
   return snapshot.symbols.length + snapshot.edges.length + snapshot.references.length;
 }
 
+function countSymbolRelationBuckets(manifest: CallGraphCacheManifest): number {
+  return manifest.symbolRelations?.length ?? 0;
+}
+
 function countDocumentSummaryBuckets(manifest: CallGraphCacheManifest): number {
   return manifest.documentSummaries?.length ?? 0;
 }
@@ -2746,6 +2993,15 @@ function findDocumentSummaryFileChunk(
 ): CallGraphDocumentSummaryFileChunk | undefined {
   const uriHash = stableHash(uriString);
   return manifest.documentSummaryFiles?.find((chunk) => chunk.uri === uriString || chunk.uriHash === uriHash);
+}
+
+function buildSymbolRelationRecords(relationIndex: RelationSummaryIndex): CallGraphSymbolRelationRecord[] {
+  const records: CallGraphSymbolRelationRecord[] = [];
+  for (const [symbolId, usages] of relationIndex.usagesBySymbolId) {
+    if (usages.length === 0) { continue; }
+    records.push({ symbolId, usages });
+  }
+  return records.sort((a, b) => a.symbolId.localeCompare(b.symbolId));
 }
 
 async function buildDocumentSummaryRecords(
@@ -2891,6 +3147,12 @@ function documentSummaryBucketForUri(uriString: string): number {
   return Math.abs(parsed) % CALL_GRAPH_DOCUMENT_SUMMARY_BUCKETS;
 }
 
+function symbolRelationBucketForSymbolId(symbolId: string): number {
+  const parsed = Number.parseInt(stableHash(symbolId), 36);
+  if (!Number.isFinite(parsed)) { return 0; }
+  return Math.abs(parsed) % CALL_GRAPH_SYMBOL_RELATION_BUCKETS;
+}
+
 function parseFile(
   language: CallGraphLanguage,
   uri: vscode.Uri,
@@ -2918,6 +3180,9 @@ async function parseSourceFileRecord(
     return { skipped: true, warnings: [] };
   }
   const stat = await vscode.workspace.fs.stat(uri);
+  if (stat.type === vscode.FileType.Directory) {
+    return { skipped: true, warnings: [] };
+  }
   if (stat.size > maxFileSize) {
     return { skipped: true, warnings: [] };
   }
@@ -2926,7 +3191,10 @@ async function parseSourceFileRecord(
     return { skipped: true, warnings: [] };
   }
   const bytes = await vscode.workspace.fs.readFile(uri);
-  const text = Buffer.from(bytes).toString('utf8');
+  if (looksBinaryContent(bytes)) {
+    return { skipped: true, warnings: [] };
+  }
+  const text = decodeTextBytes(bytes);
   const relPath = vscode.workspace.asRelativePath(uri, false).replace(/\\/g, '/');
   const lineCheck = checkParseLineLimits(text, limits);
   if (lineCheck) {
@@ -5603,22 +5871,37 @@ function getDefaultCallGraphConcurrency(): number {
   const cpuCount = Number.isFinite(availableParallelism) && availableParallelism && availableParallelism > 0
     ? availableParallelism
     : os.cpus().length || 4;
-  return Math.max(2, Math.min(MAX_CALL_GRAPH_CONCURRENCY, Math.max(cpuCount, cpuCount * 2)));
+  return Math.max(2, Math.min(8, Math.ceil(cpuCount / 2)));
 }
 
 function getConfiguredCallGraphConcurrency(
   cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
 ): number {
   const raw = cfg.get<number>('callGraphConcurrency', 0);
-  if (!Number.isFinite(raw) || raw <= 0) { return DEFAULT_CALL_GRAPH_CONCURRENCY; }
-  return Math.max(1, Math.min(Math.floor(raw), MAX_CALL_GRAPH_CONCURRENCY));
+  const requested = !Number.isFinite(raw) || raw <= 0
+    ? DEFAULT_CALL_GRAPH_CONCURRENCY
+    : Math.max(1, Math.min(Math.floor(raw), MAX_CALL_GRAPH_CONCURRENCY));
+  return capCallGraphConcurrencyForMemoryBudget(requested, getConfiguredCallGraphBuildLimits(cfg).memoryBudgetMb);
+}
+
+function capCallGraphConcurrencyForMemoryBudget(concurrency: number, memoryBudgetMb: number): number {
+  const memoryCap = memoryBudgetMb < 512
+    ? 2
+    : memoryBudgetMb < 1_024
+      ? 4
+      : memoryBudgetMb < 2_048
+        ? 8
+        : memoryBudgetMb < 4_096
+          ? 12
+          : 16;
+  return Math.max(1, Math.min(concurrency, memoryCap, MAX_CALL_GRAPH_CONCURRENCY));
 }
 
 function getConfiguredCallGraphResolveOptions(
   cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
 ): CallGraphResolveOptions {
   const includePossibleEdges = cfg.get<boolean>('callGraphIncludePossibleEdges', false);
-  const includeUnresolvedEdges = cfg.get<boolean>('callGraphIncludeUnresolvedEdges', true);
+  const includeUnresolvedEdges = cfg.get<boolean>('callGraphIncludeUnresolvedEdges', false);
   const rawMaxEdges = cfg.get<number>('callGraphMaxEdges', DEFAULT_CALL_GRAPH_MAX_EDGES);
   const rawMaxPossibleTargets = cfg.get<number>('callGraphMaxPossibleTargetsPerCall', 8);
   const maxEdges = Number.isFinite(rawMaxEdges) && rawMaxEdges > 0
@@ -5632,6 +5915,34 @@ function getConfiguredCallGraphResolveOptions(
     includeUnresolvedEdges,
     maxEdges,
     maxPossibleTargetsPerCall,
+  };
+}
+
+function getConfiguredCallGraphBuildLimits(
+  cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
+): CallGraphBuildLimits {
+  return {
+    maxCallsites: getBoundedIntegerSetting(
+      cfg,
+      'callGraphMaxCallsites',
+      DEFAULT_CALL_GRAPH_MAX_CALLSITES,
+      0,
+      10_000_000,
+    ),
+    maxReferenceCandidates: getBoundedIntegerSetting(
+      cfg,
+      'callGraphMaxReferenceCandidates',
+      DEFAULT_CALL_GRAPH_MAX_REFERENCE_CANDIDATES,
+      0,
+      10_000_000,
+    ),
+    memoryBudgetMb: getBoundedIntegerSetting(
+      cfg,
+      'callGraphMemoryBudgetMb',
+      DEFAULT_CALL_GRAPH_MEMORY_BUDGET_MB,
+      256,
+      16_384,
+    ),
   };
 }
 
@@ -5721,6 +6032,64 @@ function delayWithCancellation(ms: number, token?: vscode.CancellationToken): Pr
   });
 }
 
+function createCallGraphBuildBudgetState(): CallGraphBuildBudgetState {
+  return {
+    acceptedCallsites: 0,
+    acceptedReferenceCandidates: 0,
+    droppedCallsites: 0,
+    droppedReferenceCandidates: 0,
+  };
+}
+
+function applyCallGraphBuildBudgetsToRecord(
+  record: CallGraphFileRecord,
+  limits: CallGraphBuildLimits,
+  state: CallGraphBuildBudgetState,
+): void {
+  const callsiteAllowance = getRemainingCallGraphBudget(limits.maxCallsites, state.acceptedCallsites);
+  if (callsiteAllowance !== undefined && record.parsed.calls.length > callsiteAllowance) {
+    state.droppedCallsites += record.parsed.calls.length - callsiteAllowance;
+    state.firstCallsiteLimitRelPath ??= record.relPath;
+    record.parsed.calls = callsiteAllowance > 0 ? record.parsed.calls.slice(0, callsiteAllowance) : [];
+  }
+  state.acceptedCallsites += record.parsed.calls.length;
+
+  const referenceAllowance = getRemainingCallGraphBudget(
+    limits.maxReferenceCandidates,
+    state.acceptedReferenceCandidates,
+  );
+  if (referenceAllowance !== undefined && record.parsed.referenceCandidates.length > referenceAllowance) {
+    state.droppedReferenceCandidates += record.parsed.referenceCandidates.length - referenceAllowance;
+    state.firstReferenceCandidateLimitRelPath ??= record.relPath;
+    record.parsed.referenceCandidates = referenceAllowance > 0
+      ? record.parsed.referenceCandidates.slice(0, referenceAllowance)
+      : [];
+  }
+  state.acceptedReferenceCandidates += record.parsed.referenceCandidates.length;
+}
+
+function getRemainingCallGraphBudget(limit: number, accepted: number): number | undefined {
+  if (limit <= 0) { return undefined; }
+  return Math.max(0, limit - accepted);
+}
+
+function appendCallGraphBuildBudgetWarnings(
+  warnings: string[],
+  limits: CallGraphBuildLimits,
+  state: CallGraphBuildBudgetState,
+): void {
+  if (state.droppedCallsites > 0) {
+    warnings.push(
+      `call graph callsite budget reached at ${limits.maxCallsites}; dropped ${state.droppedCallsites} callsites starting near ${state.firstCallsiteLimitRelPath ?? 'unknown file'}`,
+    );
+  }
+  if (state.droppedReferenceCandidates > 0) {
+    warnings.push(
+      `call graph reference candidate budget reached at ${limits.maxReferenceCandidates}; dropped ${state.droppedReferenceCandidates} candidates starting near ${state.firstReferenceCandidateLimitRelPath ?? 'unknown file'}`,
+    );
+  }
+}
+
 function buildRecordIndexFromRecords(records: readonly CallGraphFileRecord[]): CallGraphRecordIndexEntry[] {
   return records
     .map((record) => ({
@@ -5767,10 +6136,52 @@ function getCallGraphConfigSignature(
   return JSON.stringify({
     version: CALL_GRAPH_CACHE_VERSION,
     maxFileSize: cfg.get<number>('maxFileSize', 1_048_576),
-    excludeGlobs: cfg.get<string[]>('excludeGlobs', []),
-    callGraphExcludeGlobs: cfg.get<string[]>('callGraphExcludeGlobs', []),
+    excludeGlobs: getConfiguredCallGraphExcludeGlobs(cfg),
+    parseLimits: getConfiguredCallGraphParseLimits(cfg),
+    buildLimits: getConfiguredCallGraphBuildLimits(cfg),
     resolveOptions: getConfiguredCallGraphResolveOptions(cfg),
   });
+}
+
+function getConfiguredCallGraphExcludeGlobs(cfg: vscode.WorkspaceConfiguration): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const glob of [
+    ...INTERNAL_CALL_GRAPH_EXCLUDE_GLOBS,
+    ...cfg.get<string[]>('excludeGlobs', []),
+    ...cfg.get<string[]>('callGraphExcludeGlobs', []),
+  ]) {
+    const trimmed = glob.trim();
+    if (!trimmed || seen.has(trimmed)) { continue; }
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function createCallGraphExcludeMatcher(cfg: vscode.WorkspaceConfiguration): ((relPath: string) => boolean) | null {
+  return compilePathScopeMatcher(undefined, getConfiguredCallGraphExcludeGlobs(cfg));
+}
+
+function isCallGraphExcludedUri(uri: vscode.Uri): boolean {
+  if (uri.scheme !== 'file') { return false; }
+  const folder = vscode.workspace.getWorkspaceFolder(uri) ?? vscode.workspace.workspaceFolders?.[0];
+  if (!folder) { return false; }
+  const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+  return isUriExcludedFromCallGraph(uri, folder.uri.fsPath, createCallGraphExcludeMatcher(cfg));
+}
+
+function isUriExcludedFromCallGraph(
+  uri: vscode.Uri,
+  workspaceRoot: string,
+  excludeMatcher: ((relPath: string) => boolean) | null,
+): boolean {
+  if (!excludeMatcher) { return false; }
+  const relPath = path.relative(workspaceRoot, uri.fsPath).replace(/\\/g, '/');
+  if (!relPath || relPath.startsWith('../') || relPath === '..' || path.isAbsolute(relPath)) {
+    return false;
+  }
+  return !excludeMatcher(relPath);
 }
 
 async function mapWithConcurrency<T, R>(
@@ -5793,6 +6204,26 @@ async function mapWithConcurrency<T, R>(
     }
   }));
   return results;
+}
+
+async function forEachWithConcurrency<T>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length || 1);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) { return; }
+      await worker(items[index], index);
+      if ((index & 31) === 31) {
+        await yieldToExtensionHost();
+      }
+    }
+  }));
 }
 
 function yieldToExtensionHost(): Promise<void> {

@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { findWorkspaceFilesDirect } from './fileDiscovery';
 import { compilePathScopeMatcher } from './pathScope';
+import { decodeTextBytes, hasBinaryFileExtension, looksBinaryContent } from './textFiles';
 
 export interface SearchOptions {
   query: string;
@@ -51,15 +52,6 @@ export interface SearchProgress {
 
 export type SearchEngine = 'zoekt' | 'codesearch';
 
-const BINARY_EXT = new Set([
-  '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp',
-  '.pdf', '.zip', '.gz', '.tar', '.7z', '.rar',
-  '.mp3', '.mp4', '.mov', '.avi', '.wav', '.flac',
-  '.woff', '.woff2', '.ttf', '.eot', '.otf',
-  '.exe', '.dll', '.so', '.dylib', '.class', '.o', '.a',
-  '.wasm', '.node',
-]);
-
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -80,11 +72,6 @@ function buildRegex(opts: SearchOptions): RegExp | null {
   } catch {
     return null;
   }
-}
-
-function getExt(fsPath: string): string {
-  const i = fsPath.lastIndexOf('.');
-  return i >= 0 ? fsPath.slice(i).toLowerCase() : '';
 }
 
 const MAX_LINE_PREVIEW = 400;
@@ -283,7 +270,7 @@ export async function runSearch(
         const i = idx++;
         if (i >= files.length) { return; }
         const uri = files[i];
-        if (BINARY_EXT.has(getExt(uri.fsPath))) { continue; }
+        if (hasBinaryFileExtension(uri.fsPath)) { continue; }
 
         let bytes: Uint8Array;
         try {
@@ -295,11 +282,11 @@ export async function runSearch(
           continue;
         }
 
-        if (looksBinary(bytes)) { continue; }
+        if (looksBinaryContent(bytes)) { continue; }
 
         let text: string;
         try {
-          text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+          text = decodeTextBytes(bytes);
         } catch {
           continue;
         }
@@ -355,14 +342,6 @@ export async function runSearch(
 
   await Promise.all(workers);
   progress.onDone({ totalFiles: filesWithMatches, totalMatches, truncated });
-}
-
-function looksBinary(bytes: Uint8Array): boolean {
-  const sampleLen = Math.min(bytes.length, 4096);
-  for (let i = 0; i < sampleLen; i++) {
-    if (bytes[i] === 0) { return true; }
-  }
-  return false;
 }
 
 // Priority groups for streaming order. Lower is searched first.

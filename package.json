@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.617",
+  "version": "0.1.642",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -242,19 +242,8 @@
         },
         "intellijStyledSearch.excludeGlobs": {
           "type": "array",
-          "default": [
-            "**/node_modules/**",
-            "**/.git/**",
-            "**/out/**",
-            "**/dist/**",
-            "**/build/**",
-            "**/.next/**",
-            "**/coverage/**",
-            "**/.vscode/.auto-import-cache/**",
-            "**/*.vsix",
-            "**/.DS_Store"
-          ],
-          "description": "Glob patterns to exclude from search."
+          "default": [],
+          "description": "User-controlled glob patterns to exclude from search. Binary and oversized files are filtered separately."
         },
         "intellijStyledSearch.searchOnOpen": {
           "type": "boolean",
@@ -338,8 +327,8 @@
         },
         "intellijStyledSearch.disableMonacoCapture": {
           "type": "boolean",
-          "default": true,
-          "description": "Disable Monaco capture/prototype probing for search previews. Enabled by default to avoid CDP and renderer prototype hooks affecting VS Code UI responsiveness."
+          "default": false,
+          "description": "Disable Monaco capture/prototype probing for search previews. When disabled, previews use a real Monaco editor with shared buffers, language services, minimap, syntax highlighting, and save support."
         },
         "intellijStyledSearch.closeMainInspectorAfterSearch": {
           "type": "boolean",
@@ -398,7 +387,7 @@
           "default": 0,
           "minimum": 0,
           "maximum": 32,
-          "description": "Maximum number of source files parsed concurrently when rebuilding the call graph. Set to 0 to auto-size from system parallelism, capped at 32."
+          "description": "Maximum number of source files parsed concurrently when rebuilding the call graph. Set to 0 to auto-size from system parallelism. The effective worker count is also capped by intellijStyledSearch.callGraphMemoryBudgetMb."
         },
         "intellijStyledSearch.callGraphCpuBudgetPercent": {
           "type": "number",
@@ -435,6 +424,27 @@
           "maximum": 1000000,
           "description": "Maximum usage/reference candidates extracted from a single file. Set to 0 for unlimited extraction."
         },
+        "intellijStyledSearch.callGraphMaxCallsites": {
+          "type": "number",
+          "default": 1000000,
+          "minimum": 0,
+          "maximum": 10000000,
+          "description": "Maximum callsites kept across one call graph rebuild. Set to 0 for unlimited extraction. When the limit is reached, the rebuild finishes with a warning instead of growing until the extension host runs out of memory."
+        },
+        "intellijStyledSearch.callGraphMaxReferenceCandidates": {
+          "type": "number",
+          "default": 1000000,
+          "minimum": 0,
+          "maximum": 10000000,
+          "description": "Maximum usage/reference candidates kept across one call graph rebuild. Set to 0 for unlimited extraction. When the limit is reached, the rebuild finishes with a warning."
+        },
+        "intellijStyledSearch.callGraphMemoryBudgetMb": {
+          "type": "number",
+          "default": 1024,
+          "minimum": 256,
+          "maximum": 16384,
+          "description": "Approximate call graph rebuild memory budget in MB. This caps parser concurrency so large repositories do not start too many parser workers for the extension host heap."
+        },
         "intellijStyledSearch.callGraphMaxAssignedFunctionNamesPerFile": {
           "type": "number",
           "default": 500,
@@ -459,16 +469,8 @@
         },
         "intellijStyledSearch.callGraphExcludeGlobs": {
           "type": "array",
-          "default": [
-            "**/.venv/**",
-            "**/venv/**",
-            "**/.tox/**",
-            "**/site-packages/**",
-            "**/__pycache__/**",
-            "**/.mypy_cache/**",
-            "**/.pytest_cache/**"
-          ],
-          "description": "Additional glob patterns excluded only from call graph rebuilds."
+          "default": [],
+          "description": "User-controlled glob patterns excluded only from call graph rebuilds. Binary and oversized files are filtered separately."
         },
         "intellijStyledSearch.callGraphIncludePossibleEdges": {
           "type": "boolean",
@@ -477,12 +479,12 @@
         },
         "intellijStyledSearch.callGraphIncludeUnresolvedEdges": {
           "type": "boolean",
-          "default": true,
-          "description": "Materialize unresolved, dynamic, and external callsites as one dynamic edge per callsite. This keeps dynamic calls visible without exploding ambiguous possible edges."
+          "default": false,
+          "description": "Materialize unresolved, dynamic, and external callsites as one dynamic edge per callsite. Disabled by default because unresolved callsites can number in the millions in generated or dependency-heavy repositories."
         },
         "intellijStyledSearch.callGraphMaxEdges": {
           "type": "number",
-          "default": 10000000,
+          "default": 1000000,
           "minimum": 1000,
           "description": "Maximum unique materialized call graph edges stored in memory during a rebuild."
         },
