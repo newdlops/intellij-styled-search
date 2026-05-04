@@ -43,7 +43,11 @@ type PaginatedSearchResult = {
   warnings: string[];
 };
 
-const UPDATE_DEBOUNCE_MS = 250;
+const DEFAULT_UPDATE_DEBOUNCE_MS = 5_000;
+const DEFAULT_UPDATE_COOLDOWN_MS = 5_000;
+const DEFAULT_UPDATE_LOG_MIN_INTERVAL_MS = 10_000;
+const DEFAULT_BACKGROUND_BUILD_DELAY_MS = 30_000;
+const DEFAULT_BACKGROUND_INDEX_DELAY_MS = 30_000;
 const UPDATE_RETRY_WHILE_INDEXING_MS = 1_000;
 const AUTO_BASE_REFRESH_MIN_INTERVAL_MS = 60_000;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
@@ -105,7 +109,7 @@ type TrackedChild = {
 
 export class ZoektRuntime implements vscode.Disposable {
   private readonly extensionRoot: string;
-  private readonly watcher: vscode.FileSystemWatcher;
+  private readonly watcher: vscode.FileSystemWatcher | undefined;
   private readonly disposables: vscode.Disposable[] = [];
   private readonly lifecycleCts = new vscode.CancellationTokenSource();
   private binaryPath: string | undefined;
@@ -125,22 +129,47 @@ export class ZoektRuntime implements vscode.Disposable {
   private nextChildId = 1;
   private disposed = false;
   private externalSweepPromise: Promise<void> | undefined;
+  private updatePauseDepth = 0;
+  private updatePausedReason = '';
+  private updateInFlight = false;
+  private lastUpdateFinishedAt = 0;
+  private lastUpdateLogAt = 0;
+  private suppressedUpdateLogCount = 0;
+  private backgroundBuildTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly backgroundIndexTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private excludeMatcherCache: {
+    key: string;
+    matcher: ((relPath: string) => boolean) | null;
+  } | undefined;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly log: vscode.OutputChannel,
   ) {
     this.extensionRoot = context.extensionUri.fsPath;
-    const workspaceFolder = this.getWorkspaceFolder();
-    const watchPattern: vscode.GlobPattern = workspaceFolder
-      ? new vscode.RelativePattern(workspaceFolder, '**/*')
-      : '**/*';
-    this.watcher = vscode.workspace.createFileSystemWatcher(watchPattern);
-    this.watcher.onDidChange((uri) => { this.queueChanged(uri); });
-    this.watcher.onDidCreate((uri) => { this.queueChanged(uri); });
-    this.watcher.onDidDelete((uri) => { this.queueDeleted(uri); });
+    if (this.shouldWatchExternalFileDeletes()) {
+      const workspaceFolder = this.getWorkspaceFolder();
+      const watchPattern: vscode.GlobPattern = workspaceFolder
+        ? new vscode.RelativePattern(workspaceFolder, '**/*')
+        : '**/*';
+      this.watcher = vscode.workspace.createFileSystemWatcher(
+        watchPattern,
+        true,
+        true,
+        false,
+      );
+      this.watcher.onDidDelete((uri) => { this.queueDeleted(uri, 'external-delete'); });
+    }
     this.disposables.push(
-      this.watcher,
+      ...(this.watcher ? [this.watcher] : []),
+      vscode.workspace.onDidSaveTextDocument((document) => {
+        this.queueSavedDocument(document);
+      }),
+      vscode.workspace.onDidDeleteFiles((event) => {
+        for (const uri of event.files) {
+          this.queueDeleted(uri, 'delete');
+        }
+      }),
       vscode.workspace.onDidRenameFiles((event) => {
         for (const file of event.files) {
           this.queueRename(file.oldUri, file.newUri);
@@ -156,6 +185,14 @@ export class ZoektRuntime implements vscode.Disposable {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
     }
+    if (this.backgroundBuildTimer) {
+      clearTimeout(this.backgroundBuildTimer);
+      this.backgroundBuildTimer = undefined;
+    }
+    for (const timer of this.backgroundIndexTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.backgroundIndexTimers.clear();
     this.lifecycleCts.cancel();
     this.clearPending();
     this.cancelRunningProcesses('runtime disposed');
@@ -179,19 +216,54 @@ export class ZoektRuntime implements vscode.Disposable {
     void this.sweepExternalZoektProcesses(reason, options?.sweepPatterns ?? this.sweepPatternsForKinds(kinds));
   }
 
+  pauseFileUpdates(reason: string): vscode.Disposable {
+    this.updatePauseDepth += 1;
+    this.updatePausedReason = reason;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = undefined;
+    }
+    this.cancelRunningProcesses(`paused file updates: ${reason}`, { kinds: ['update'] });
+    this.log.appendLine(`zoek-rs updates paused: ${reason}`);
+    let disposed = false;
+    return new vscode.Disposable(() => {
+      if (disposed) { return; }
+      disposed = true;
+      this.updatePauseDepth = Math.max(0, this.updatePauseDepth - 1);
+      if (this.updatePauseDepth > 0) { return; }
+      const pausedReason = this.updatePausedReason;
+      this.updatePausedReason = '';
+      this.log.appendLine(`zoek-rs updates resumed: ${pausedReason || reason}`);
+      if (
+        this.pendingChanged.size > 0 ||
+        this.pendingDeleted.size > 0 ||
+        this.pendingRenames.length > 0
+      ) {
+        this.scheduleFlush(2_000);
+      }
+    });
+  }
+
   async prewarmIfPreferred(): Promise<void> {
     if (this.getConfiguredEngine() !== 'zoekt') { return; }
+    if (!this.shouldPrewarmOnActivation()) {
+      return;
+    }
     const workspaceRoot = this.getWorkspaceRootPath();
     if (!workspaceRoot) { return; }
-    const binary = await this.resolveBinary(true);
-    if (!binary) { return; }
+    const binary = await this.resolveBinary(false);
+    if (!binary) {
+      this.scheduleBackgroundBuild('prewarm');
+      return;
+    }
     if (await this.hasReadyIndex(workspaceRoot)) { return; }
-    void this.ensureIndexed(workspaceRoot, 'prewarm');
+    this.scheduleBackgroundIndex(workspaceRoot, 'prewarm');
   }
 
   async rebuildIndex(report?: (message: string, percent?: number) => void): Promise<boolean> {
     const workspaceRoot = this.getWorkspaceRootPath();
     if (!workspaceRoot) { return false; }
+    this.cancelScheduledBackgroundPreparation();
     const existing = this.foregroundIndexPromises.get(workspaceRoot);
     if (existing) {
       report?.('zoek-rs: waiting for in-flight rebuild');
@@ -251,13 +323,14 @@ export class ZoektRuntime implements vscode.Disposable {
     }
     const binary = await this.resolveBinary(false);
     if (!binary) {
-      if (this.buildPromise) {
-        return { ready: false, reason: 'zoek-rs binary build in progress' };
+      if (this.buildPromise || this.backgroundBuildTimer) {
+        return { ready: false, reason: 'zoek-rs binary build pending' };
       }
-      void this.resolveBinary(true).catch((err) => {
-        this.log.appendLine(`zoek-rs background build failed: ${err instanceof Error ? err.message : err}`);
-      });
-      return { ready: false, reason: 'zoek-rs binary build started' };
+      if (this.shouldBuildBinaryInBackgroundOnSearch()) {
+        this.scheduleBackgroundBuild('search');
+        return { ready: false, reason: 'zoek-rs binary unavailable; background build scheduled' };
+      }
+      return { ready: false, reason: 'zoek-rs binary unavailable; run Rebuild Search Index to build it' };
     }
     if (await this.hasReadyIndex(workspaceRoot)) {
       return { ready: true };
@@ -265,10 +338,11 @@ export class ZoektRuntime implements vscode.Disposable {
     if (this.indexPromises.has(workspaceRoot) || this.foregroundIndexPromises.has(workspaceRoot)) {
       return { ready: false, reason: 'zoek-rs index build in progress' };
     }
-    void this.ensureIndexed(workspaceRoot, 'search').catch((err) => {
-      this.log.appendLine(`zoek-rs background index failed: ${err instanceof Error ? err.message : err}`);
-    });
-    return { ready: false, reason: 'zoek-rs index incomplete; background build started' };
+    if (this.shouldIndexInBackgroundOnSearch()) {
+      this.scheduleBackgroundIndex(workspaceRoot, 'search');
+      return { ready: false, reason: 'zoek-rs index incomplete; background index scheduled' };
+    }
+    return { ready: false, reason: 'zoek-rs index incomplete; run Rebuild Search Index to build it' };
   }
 
   async runSearch(
@@ -383,7 +457,7 @@ export class ZoektRuntime implements vscode.Disposable {
   async collectInfo(): Promise<ZoektInfoResponse | null> {
     const workspaceRoot = this.getWorkspaceRootPath();
     if (!workspaceRoot) { return null; }
-    const binary = await this.resolveBinary(true);
+    const binary = await this.resolveBinary(false);
     if (!binary) { return null; }
     try {
       const response = await this.invokeJson([binary, 'info', workspaceRoot]);
@@ -401,7 +475,7 @@ export class ZoektRuntime implements vscode.Disposable {
   async diagnoseQuery(options: SearchOptions): Promise<ZoektDiagnoseResponse | null> {
     const workspaceRoot = this.getWorkspaceRootPath();
     if (!workspaceRoot || !options.query) { return null; }
-    const binary = await this.resolveBinary(true);
+    const binary = await this.resolveBinary(false);
     if (!binary) { return null; }
     try {
       const response = await this.invokeJson([
@@ -513,7 +587,83 @@ export class ZoektRuntime implements vscode.Disposable {
     if (!normalized || normalized === '.') {
       return true;
     }
-    return normalized.split('/').some((segment) => ZOEKT_UPDATE_IGNORED_DIR_NAMES.has(segment));
+    if (normalized.split('/').some((segment) => ZOEKT_UPDATE_IGNORED_DIR_NAMES.has(segment))) {
+      return true;
+    }
+    const matcher = this.getUpdateExcludeMatcher();
+    return !!matcher && !matcher(normalized);
+  }
+
+  private getUpdateExcludeMatcher(): ((relPath: string) => boolean) | null {
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const excludeGlobs = cfg.get<string[]>('excludeGlobs', []);
+    const key = JSON.stringify(excludeGlobs);
+    if (this.excludeMatcherCache?.key === key) {
+      return this.excludeMatcherCache.matcher;
+    }
+    const matcher = compilePathScopeMatcher(undefined, excludeGlobs);
+    this.excludeMatcherCache = { key, matcher };
+    return matcher;
+  }
+
+  private shouldRunIncrementalFileUpdates(): boolean {
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    return cfg.get<boolean>('zoektIncrementalFileUpdates', true);
+  }
+
+  private shouldWatchExternalFileDeletes(): boolean {
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    return cfg.get<boolean>('zoektWatchExternalFileDeletes', false);
+  }
+
+  private shouldPrewarmOnActivation(): boolean {
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    return cfg.get<boolean>('zoektPrewarmOnActivation', false);
+  }
+
+  private shouldBuildBinaryInBackgroundOnSearch(): boolean {
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    return cfg.get<boolean>('zoektBuildBinaryInBackgroundOnSearch', false);
+  }
+
+  private shouldIndexInBackgroundOnSearch(): boolean {
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    return cfg.get<boolean>('zoektIndexInBackgroundOnSearch', false);
+  }
+
+  private getConfiguredUpdateDebounceMs(): number {
+    const raw = vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<number>('zoektUpdateDebounceMs', DEFAULT_UPDATE_DEBOUNCE_MS);
+    if (!Number.isFinite(raw)) { return DEFAULT_UPDATE_DEBOUNCE_MS; }
+    return Math.max(250, Math.min(Math.floor(raw), 60_000));
+  }
+
+  private getConfiguredUpdateCooldownMs(): number {
+    const raw = vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<number>('zoektUpdateCooldownMs', DEFAULT_UPDATE_COOLDOWN_MS);
+    if (!Number.isFinite(raw)) { return DEFAULT_UPDATE_COOLDOWN_MS; }
+    return Math.max(0, Math.min(Math.floor(raw), 60_000));
+  }
+
+  private getConfiguredUpdateLogMinIntervalMs(): number {
+    const raw = vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<number>('zoektUpdateLogMinIntervalMs', DEFAULT_UPDATE_LOG_MIN_INTERVAL_MS);
+    if (!Number.isFinite(raw)) { return DEFAULT_UPDATE_LOG_MIN_INTERVAL_MS; }
+    return Math.max(0, Math.min(Math.floor(raw), 300_000));
+  }
+
+  private getConfiguredBackgroundBuildDelayMs(): number {
+    const raw = vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<number>('zoektBackgroundBuildDelayMs', DEFAULT_BACKGROUND_BUILD_DELAY_MS);
+    if (!Number.isFinite(raw)) { return DEFAULT_BACKGROUND_BUILD_DELAY_MS; }
+    return Math.max(0, Math.min(Math.floor(raw), 300_000));
+  }
+
+  private getConfiguredBackgroundIndexDelayMs(): number {
+    const raw = vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<number>('zoektBackgroundIndexDelayMs', DEFAULT_BACKGROUND_INDEX_DELAY_MS);
+    if (!Number.isFinite(raw)) { return DEFAULT_BACKGROUND_INDEX_DELAY_MS; }
+    return Math.max(0, Math.min(Math.floor(raw), 300_000));
   }
 
   private getRelativePath(uri: vscode.Uri): string | null {
@@ -532,26 +682,36 @@ export class ZoektRuntime implements vscode.Disposable {
     return normalized;
   }
 
-  private queueChanged(uri: vscode.Uri): void {
+  private queueSavedDocument(document: vscode.TextDocument): void {
+    if (document.isUntitled || document.uri.scheme !== 'file') { return; }
+    this.queueChanged(document.uri, 'save');
+  }
+
+  private queueChanged(uri: vscode.Uri, reason: string): void {
     if (this.disposed) { return; }
+    if (!this.shouldRunIncrementalFileUpdates()) { return; }
     const relPath = this.getRelativePath(uri);
     if (!relPath) { return; }
     this.pendingDeleted.delete(relPath);
     this.pendingChanged.add(relPath);
+    this.logQueuedUpdate(reason);
     this.scheduleFlush();
   }
 
-  private queueDeleted(uri: vscode.Uri): void {
+  private queueDeleted(uri: vscode.Uri, reason: string): void {
     if (this.disposed) { return; }
+    if (!this.shouldRunIncrementalFileUpdates()) { return; }
     const relPath = this.getRelativePath(uri);
     if (!relPath) { return; }
     this.pendingChanged.delete(relPath);
     this.pendingDeleted.add(relPath);
+    this.logQueuedUpdate(reason);
     this.scheduleFlush();
   }
 
   private queueRename(oldUri: vscode.Uri, newUri: vscode.Uri): void {
     if (this.disposed) { return; }
+    if (!this.shouldRunIncrementalFileUpdates()) { return; }
     const oldRelPath = this.getRelativePath(oldUri);
     const newRelPath = this.getRelativePath(newUri);
     if (!oldRelPath && !newRelPath) { return; }
@@ -559,12 +719,14 @@ export class ZoektRuntime implements vscode.Disposable {
       if (!newRelPath) { return; }
       this.pendingDeleted.delete(newRelPath);
       this.pendingChanged.add(newRelPath);
+      this.logQueuedUpdate('rename-create');
       this.scheduleFlush();
       return;
     }
     if (!newRelPath) {
       this.pendingChanged.delete(oldRelPath);
       this.pendingDeleted.add(oldRelPath);
+      this.logQueuedUpdate('rename-delete');
       this.scheduleFlush();
       return;
     }
@@ -573,11 +735,26 @@ export class ZoektRuntime implements vscode.Disposable {
     this.pendingDeleted.delete(oldRelPath);
     this.pendingDeleted.delete(newRelPath);
     this.pendingRenames.push({ oldRelPath, newRelPath });
+    this.logQueuedUpdate('rename');
     this.scheduleFlush();
   }
 
-  private scheduleFlush(delayMs = UPDATE_DEBOUNCE_MS): void {
+  private logQueuedUpdate(reason: string): void {
+    if (this.getConfiguredUpdateLogMinIntervalMs() === 0) {
+      this.log.appendLine(`zoek-rs update queued: reason=${reason}`);
+    }
+  }
+
+  private scheduleFlush(delayMs = this.getConfiguredUpdateDebounceMs()): void {
     if (this.disposed) { return; }
+    if (this.updatePauseDepth > 0) { return; }
+    const cooldownMs = this.getConfiguredUpdateCooldownMs();
+    if (cooldownMs > 0 && this.lastUpdateFinishedAt > 0) {
+      const remainingCooldownMs = cooldownMs - (Date.now() - this.lastUpdateFinishedAt);
+      if (remainingCooldownMs > 0) {
+        delayMs = Math.max(delayMs, remainingCooldownMs);
+      }
+    }
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
     }
@@ -599,6 +776,17 @@ export class ZoektRuntime implements vscode.Disposable {
     ) {
       return;
     }
+    if (this.updatePauseDepth > 0) {
+      return;
+    }
+    if (!this.shouldRunIncrementalFileUpdates()) {
+      this.clearPending();
+      return;
+    }
+    if (this.updateInFlight) {
+      this.scheduleFlush();
+      return;
+    }
     if (this.getConfiguredEngine() !== 'zoekt') {
       this.clearPending();
       return;
@@ -616,12 +804,12 @@ export class ZoektRuntime implements vscode.Disposable {
     const indexBusy = this.indexPromises.has(workspaceRoot) || this.foregroundIndexPromises.has(workspaceRoot);
     const ready = !indexBusy && await this.hasReadyIndex(workspaceRoot);
     if (indexBusy || !ready) {
-      if (!indexBusy) {
-        void this.ensureIndexed(workspaceRoot, 'file changes').catch((err) => {
-          this.log.appendLine(`zoek-rs background index failed: ${err instanceof Error ? err.message : err}`);
-        });
+      if (indexBusy) {
+        this.scheduleFlush(UPDATE_RETRY_WHILE_INDEXING_MS);
+        return;
       }
-      this.scheduleFlush(UPDATE_RETRY_WHILE_INDEXING_MS);
+      this.clearPending();
+      this.log.appendLine('zoek-rs update skipped: index is not ready; run Rebuild Search Index to refresh saved changes');
       return;
     }
 
@@ -630,6 +818,7 @@ export class ZoektRuntime implements vscode.Disposable {
     const renamed = this.pendingRenames.map((item) => [item.oldRelPath, item.newRelPath] as const);
     this.clearPending();
 
+    this.updateInFlight = true;
     this.updatePromise = this.updatePromise
       .then(async () => {
         const args: string[] = [binary, 'update', workspaceRoot];
@@ -654,6 +843,10 @@ export class ZoektRuntime implements vscode.Disposable {
       .catch((err) => {
         if (err instanceof ProcessCancelledError) { return; }
         this.log.appendLine(`zoek-rs update failed: ${err instanceof Error ? err.message : err}`);
+      })
+      .finally(() => {
+        this.updateInFlight = false;
+        this.lastUpdateFinishedAt = Date.now();
       });
 
     await this.updatePromise;
@@ -765,6 +958,53 @@ export class ZoektRuntime implements vscode.Disposable {
     return promise;
   }
 
+  private scheduleBackgroundBuild(reason: string): void {
+    if (this.disposed || this.backgroundBuildTimer || this.buildPromise || this.binaryPath) {
+      return;
+    }
+    const delayMs = this.getConfiguredBackgroundBuildDelayMs();
+    this.log.appendLine(`zoek-rs background build scheduled: reason=${reason} delay=${delayMs}ms`);
+    this.backgroundBuildTimer = setTimeout(() => {
+      this.backgroundBuildTimer = undefined;
+      if (this.disposed) { return; }
+      void this.resolveBinary(true).catch((err) => {
+        this.log.appendLine(`zoek-rs background build failed: ${err instanceof Error ? err.message : err}`);
+      });
+    }, delayMs);
+  }
+
+  private scheduleBackgroundIndex(workspaceRoot: string, reason: string): void {
+    if (
+      this.disposed ||
+      this.indexPromises.has(workspaceRoot) ||
+      this.foregroundIndexPromises.has(workspaceRoot) ||
+      this.backgroundIndexTimers.has(workspaceRoot)
+    ) {
+      return;
+    }
+    const delayMs = this.getConfiguredBackgroundIndexDelayMs();
+    this.log.appendLine(`zoek-rs background index scheduled: reason=${reason} delay=${delayMs}ms`);
+    const timer = setTimeout(() => {
+      this.backgroundIndexTimers.delete(workspaceRoot);
+      if (this.disposed) { return; }
+      void this.ensureIndexed(workspaceRoot, reason).catch((err) => {
+        this.log.appendLine(`zoek-rs background index failed: ${err instanceof Error ? err.message : err}`);
+      });
+    }, delayMs);
+    this.backgroundIndexTimers.set(workspaceRoot, timer);
+  }
+
+  private cancelScheduledBackgroundPreparation(): void {
+    if (this.backgroundBuildTimer) {
+      clearTimeout(this.backgroundBuildTimer);
+      this.backgroundBuildTimer = undefined;
+    }
+    for (const timer of this.backgroundIndexTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.backgroundIndexTimers.clear();
+  }
+
   private async hasReadyIndex(workspaceRoot: string): Promise<boolean> {
     const indexRoot = path.join(workspaceRoot, '.zoek-rs');
     const manifestPath = path.join(indexRoot, 'manifest.json');
@@ -847,6 +1087,12 @@ export class ZoektRuntime implements vscode.Disposable {
   }
 
   private logUpdateWarnings(response: ZoektUpdateResponse): void {
+    const now = Date.now();
+    const minIntervalMs = this.getConfiguredUpdateLogMinIntervalMs();
+    if (response.warnings.length === 0 && minIntervalMs > 0 && now - this.lastUpdateLogAt < minIntervalMs) {
+      this.suppressedUpdateLogCount += 1;
+      return;
+    }
     const parts = [
       `zoek-rs update: generation=${response.generation}`,
       `entries=${response.entriesWritten}`,
@@ -856,6 +1102,11 @@ export class ZoektRuntime implements vscode.Disposable {
       `latest=${response.latestVisibleEntries}`,
       `journal=${response.journalBytes}`,
     ];
+    if (this.suppressedUpdateLogCount > 0) {
+      parts.push(`suppressedLogs=${this.suppressedUpdateLogCount}`);
+      this.suppressedUpdateLogCount = 0;
+    }
+    this.lastUpdateLogAt = now;
     this.log.appendLine(parts.join(' '));
     for (const warning of response.warnings) {
       this.log.appendLine(`zoek-rs warning: ${warning}`);

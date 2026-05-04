@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.62",
+  "version": "0.1.617",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -249,9 +249,77 @@
             "**/dist/**",
             "**/build/**",
             "**/.next/**",
-            "**/coverage/**"
+            "**/coverage/**",
+            "**/.vscode/.auto-import-cache/**",
+            "**/*.vsix",
+            "**/.DS_Store"
           ],
           "description": "Glob patterns to exclude from search."
+        },
+        "intellijStyledSearch.searchOnOpen": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run the initial search immediately when Search UI opens with a prefilled query. Disabled by default so opening the UI only renders the lightweight query shell; press Enter or Run to search."
+        },
+        "intellijStyledSearch.zoektIncrementalFileUpdates": {
+          "type": "boolean",
+          "default": true,
+          "description": "Keep the zoekt index updated from confirmed editor saves and VS Code delete/rename operations. Disable to stop background zoekt update processes; manual index rebuild will still refresh search results."
+        },
+        "intellijStyledSearch.zoektPrewarmOnActivation": {
+          "type": "boolean",
+          "default": false,
+          "description": "Build or prepare zoekt on extension activation. Disabled by default so startup does not run cargo build or workspace indexing."
+        },
+        "intellijStyledSearch.zoektBuildBinaryInBackgroundOnSearch": {
+          "type": "boolean",
+          "default": false,
+          "description": "When zoekt is selected but the binary is missing, schedule a delayed background build after a search. Disabled by default; use Rebuild Search Index to start this work explicitly."
+        },
+        "intellijStyledSearch.zoektIndexInBackgroundOnSearch": {
+          "type": "boolean",
+          "default": false,
+          "description": "When zoekt is selected but the index is missing, schedule delayed background indexing after a search. Disabled by default; searches show a rebuild recommendation and use fallback until Rebuild Search Index is run."
+        },
+        "intellijStyledSearch.zoektBackgroundBuildDelayMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 0,
+          "maximum": 300000,
+          "description": "Delay before an opt-in background zoekt binary build starts."
+        },
+        "intellijStyledSearch.zoektBackgroundIndexDelayMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 0,
+          "maximum": 300000,
+          "description": "Delay before an opt-in background zoekt index build starts."
+        },
+        "intellijStyledSearch.zoektWatchExternalFileDeletes": {
+          "type": "boolean",
+          "default": false,
+          "description": "Watch external filesystem delete events for zoekt incremental updates. Disabled by default so the extension does not subscribe to every workspace file event; saved editor documents and VS Code delete/rename operations are still tracked."
+        },
+        "intellijStyledSearch.zoektUpdateDebounceMs": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 250,
+          "maximum": 60000,
+          "description": "Debounce window for batching workspace file events before running a zoekt incremental update."
+        },
+        "intellijStyledSearch.zoektUpdateCooldownMs": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 0,
+          "maximum": 60000,
+          "description": "Minimum cooldown after a zoekt incremental update before another update may run."
+        },
+        "intellijStyledSearch.zoektUpdateLogMinIntervalMs": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 0,
+          "maximum": 300000,
+          "description": "Minimum interval between routine zoekt update log lines. Suppressed update logs are summarized in the next emitted line."
         },
         "intellijStyledSearch.maxFileSize": {
           "type": "number",
@@ -280,8 +348,8 @@
         },
         "intellijStyledSearch.rendererPerfDiagnostics": {
           "type": "boolean",
-          "default": false,
-          "description": "Enable verbose renderer performance tracing for Search UI diagnosis. Disabled by default because the observers and trace bridge add renderer work."
+          "default": true,
+          "description": "Enable renderer performance tracing for Search UI diagnosis. When enabled, panel open records frame gaps, event delay, event timing, long tasks, long animation frames, DOM counts, memory and phase markers in batched renderer logs."
         },
         "intellijStyledSearch.rendererSafetyDiagnostics": {
           "type": "boolean",
@@ -290,18 +358,25 @@
         },
         "intellijStyledSearch.rendererInlayClickHook": {
           "type": "boolean",
-          "default": false,
-          "description": "Enable the legacy renderer-level document click hook for call graph inlay hints. Disabled by default so hidden Search UI state leaves no global renderer input hook; VS Code native inlay hint commands remain available."
+          "default": true,
+          "description": "Enable the renderer-level direct click hook for call graph inlay hints. Enabled by default because VS Code native inlay commands may require hover/link activation instead of a single click."
         },
         "intellijStyledSearch.disposeRendererPatchOnHide": {
           "type": "boolean",
-          "default": true,
-          "description": "Fully dispose the injected Search UI renderer patch when the panel is hidden. Enabled by default to release renderer listeners and observers after each search session."
+          "default": false,
+          "description": "Fully dispose the injected Search UI renderer patch when the panel is hidden. Disabled by default so direct inlay clicks can reuse the lightweight renderer hook without repeated CDP reinjection."
         },
         "intellijStyledSearch.keepCdpOpenWhileSearchUiVisible": {
           "type": "boolean",
           "default": true,
           "description": "Keep the CDP bridge open while the Search UI panel is visible. Enabled by default to avoid repeated SIGUSR1/inspector reconnects during typing and incremental searches; cleanup still runs when the panel is hidden."
+        },
+        "intellijStyledSearch.rendererBridgeSingletonIdleMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 1000,
+          "maximum": 300000,
+          "description": "How long to keep the renderer patch bridge warm after the Search UI is hidden when direct inlay clicks are enabled. This avoids repeatedly reacquiring the renderer patch during inlay navigation."
         },
         "intellijStyledSearch.suspendIntelliSenseRecursionCaptureDuringSearchUi": {
           "type": "boolean",
@@ -313,12 +388,59 @@
           "default": 8765,
           "description": "Localhost port used by the call graph MCP JSON-RPC endpoint when `Start Call Graph MCP Server` is run. Set to 0 to let the OS choose a free port."
         },
+        "intellijStyledSearch.callGraphWatchExternalFileChanges": {
+          "type": "boolean",
+          "default": false,
+          "description": "Watch external filesystem create/change/delete events for call graph incremental updates. Disabled by default so call graph updates only follow confirmed VS Code save/create/delete/rename operations."
+        },
         "intellijStyledSearch.callGraphConcurrency": {
           "type": "number",
           "default": 0,
           "minimum": 0,
           "maximum": 32,
           "description": "Maximum number of source files parsed concurrently when rebuilding the call graph. Set to 0 to auto-size from system parallelism, capped at 32."
+        },
+        "intellijStyledSearch.callGraphCpuBudgetPercent": {
+          "type": "number",
+          "default": 35,
+          "minimum": 5,
+          "maximum": 100,
+          "description": "Approximate extension-host CPU duty cycle used by call graph parsing. Lower values insert more idle time between parsed files so VS Code remains responsive during rebuild."
+        },
+        "intellijStyledSearch.callGraphMaxParserPauseMs": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 0,
+          "maximum": 10000,
+          "description": "Maximum single cooldown pause inserted after a call graph parser slice. Set to 0 to disable the cap."
+        },
+        "intellijStyledSearch.callGraphMaxLineLength": {
+          "type": "number",
+          "default": 20000,
+          "minimum": 1000,
+          "maximum": 1000000,
+          "description": "Skip call graph parsing for files that contain a line longer than this many characters. This protects the extension host from minified or generated files."
+        },
+        "intellijStyledSearch.callGraphMaxLinesPerFile": {
+          "type": "number",
+          "default": 50000,
+          "minimum": 1000,
+          "maximum": 1000000,
+          "description": "Skip call graph parsing for files with more lines than this limit. This protects rebuild from pathological generated files."
+        },
+        "intellijStyledSearch.callGraphMaxReferenceCandidatesPerFile": {
+          "type": "number",
+          "default": 50000,
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "Maximum usage/reference candidates extracted from a single file. Set to 0 for unlimited extraction."
+        },
+        "intellijStyledSearch.callGraphMaxAssignedFunctionNamesPerFile": {
+          "type": "number",
+          "default": 500,
+          "minimum": 0,
+          "maximum": 100000,
+          "description": "Maximum anonymous-assignment function names scanned per file for usage detection. Set to 0 for unlimited extraction."
         },
         "intellijStyledSearch.callGraphInlayHints": {
           "type": "boolean",

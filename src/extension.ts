@@ -51,12 +51,12 @@ export interface ExtensionTestApi {
 export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   const overlay = OverlayPanel.get(context);
   activeOverlay = overlay;
-  const callGraphLog = vscode.window.createOutputChannel('IntelliJ Styled Search: Call Graph');
+  const callGraphLog = overlay.getLogChannel();
   const callGraph = new CallGraphService(context, callGraphLog);
   const mcpServer = new CallGraphMcpServer(callGraph, callGraphLog);
-  context.subscriptions.push(callGraphLog, callGraph, mcpServer);
+  context.subscriptions.push(callGraph, mcpServer);
   context.subscriptions.push(
-    vscode.languages.registerInlayHintsProvider(CALL_GRAPH_DOCUMENT_SELECTOR, new CallGraphInlayHintsProvider(callGraph)),
+    vscode.languages.registerInlayHintsProvider(CALL_GRAPH_DOCUMENT_SELECTOR, new CallGraphInlayHintsProvider(overlay, callGraph)),
     vscode.languages.registerImplementationProvider(CALL_GRAPH_DOCUMENT_SELECTOR, new CallGraphImplementationProvider(callGraph)),
   );
   overlay.logActivation();
@@ -72,7 +72,13 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
     }),
     vscode.commands.registerCommand('intellijStyledSearch.searchSelection', () => {
       overlay.logCommand('searchSelection');
-      void overlay.show(getQueryFromActiveEditor(), { forceLiteral: true });
+      const initialQuery = getQueryFromActiveEditor();
+      const searchOnOpen = vscode.workspace.getConfiguration('intellijStyledSearch')
+        .get<boolean>('searchOnOpen', false);
+      void overlay.show(initialQuery, {
+        forceLiteral: true,
+        suppressSearch: !!initialQuery && !searchOnOpen,
+      });
     }),
     vscode.commands.registerCommand('intellijStyledSearch.reinject', async () => {
       overlay.logCommand('reinject');
@@ -187,6 +193,7 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
               ui.report({ increment: 0, message: latestMessage });
               status.text = `$(sync~spin) Call graph ${latestPercent}%`;
             }, 1_000);
+            const zoektPause = overlay.pauseZoektFileUpdates('call graph rebuild');
             try {
               const snapshot = await callGraph.rebuild((progress) => {
                 const percent = progress.total > 0
@@ -213,6 +220,7 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
               ui.report({ increment: Math.max(0, 100 - lastPercent), message: 'done; writing summary' });
               callGraphLog.appendLine(callGraph.formatInfoReport(snapshot));
             } finally {
+              zoektPause.dispose();
               clearInterval(heartbeat);
             }
           },
@@ -236,7 +244,8 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
     vscode.commands.registerCommand('intellijStyledSearch.showCallGraphInfo', async () => {
       overlay.logCommand('showCallGraphInfo');
       try {
-        const snapshot = await callGraph.ensureBuilt();
+        if (!await ensureCallGraphReadyForUi(callGraph, 'Show Call Graph Info')) { return; }
+        const snapshot = callGraph.getSnapshot();
         callGraphLog.show(true);
         callGraphLog.appendLine(callGraph.formatInfoReport(snapshot));
       } catch (err) {
@@ -316,8 +325,8 @@ async function activateCallGraphInlayAtPosition(
   callGraph: CallGraphService,
   callGraphLog: vscode.OutputChannel,
   kind: string,
-  uriString: string,
-  line: number,
+  uriString?: string,
+  line?: number,
   column?: number,
 ): Promise<void> {
   const normalizedKind = kind === 'impl' || kind === 'implementations'
@@ -325,9 +334,19 @@ async function activateCallGraphInlayAtPosition(
     : kind === 'callees'
       ? 'callees'
       : 'usages';
-  const uri = vscode.Uri.parse(uriString);
-  const safeLine = Math.max(0, Math.floor(Number.isFinite(line) ? line : 0));
+  const activeEditor = vscode.window.activeTextEditor;
+  const uri = uriString
+    ? vscode.Uri.parse(uriString)
+    : activeEditor?.document.uri;
+  const rawLine = Number.isFinite(line) && line !== undefined && line >= 0
+    ? line
+    : activeEditor?.selection.active.line ?? 0;
+  const safeLine = Math.max(0, Math.floor(rawLine));
   const safeColumn = Math.max(0, Math.floor(Number.isFinite(column) ? column ?? 0 : 0));
+  if (!uri) {
+    callGraphLog.appendLine('call graph inlay click ignored: no active editor for fallback resolution');
+    return;
+  }
   const symbol = resolveInlaySymbolAtLine(callGraph, uri, safeLine, safeColumn);
   if (!symbol) {
     callGraphLog.appendLine(`call graph inlay click ignored: no symbol at ${uriString}:${safeLine + 1}`);
@@ -412,6 +431,30 @@ function getQueryFromActiveEditor(): string {
   return '';
 }
 
+async function ensureCallGraphReadyForUi(
+  callGraph: CallGraphService,
+  title: string,
+): Promise<boolean> {
+  const snapshot = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Window,
+      title: 'Preparing call graph',
+      cancellable: false,
+    },
+    async () => callGraph.ensureRestoredSnapshot(),
+  );
+  if (snapshot) { return true; }
+  const action = 'Rebuild Call Graph';
+  const picked = await vscode.window.showWarningMessage(
+    `IntelliJ Styled Search: call graph index is not built. ${title} needs a call graph rebuild first.`,
+    action,
+  );
+  if (picked === action) {
+    await vscode.commands.executeCommand('intellijStyledSearch.rebuildCallGraph');
+  }
+  return false;
+}
+
 async function showCallGraphQueryResult(
   overlay: OverlayPanel,
   callGraph: CallGraphService,
@@ -421,16 +464,7 @@ async function showCallGraphQueryResult(
 ): Promise<void> {
   try {
     const title = direction === 'callers' ? 'Find Callers' : 'Find Callees';
-    await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Window,
-        title: 'Preparing call graph',
-        cancellable: false,
-      },
-      async () => {
-        await callGraph.ensureBuilt();
-      },
-    );
+    if (!await ensureCallGraphReadyForUi(callGraph, title)) { return; }
     const query = explicitQuery ?? await getCallGraphQuery(callGraph, title);
     if (!query) { return; }
     const results = await vscode.window.withProgress(
@@ -533,16 +567,7 @@ async function showCallGraphImplementationResult(
 ): Promise<void> {
   try {
     const title = 'Find Implementations';
-    await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Window,
-        title: 'Preparing call graph',
-        cancellable: false,
-      },
-      async () => {
-        await callGraph.ensureBuilt();
-      },
-    );
+    if (!await ensureCallGraphReadyForUi(callGraph, title)) { return; }
     const query = explicitQuery ?? await getCallGraphQuery(callGraph, title);
     if (!query) { return; }
     const implementations = callGraph.findImplementations(query);
@@ -567,16 +592,7 @@ async function showCallGraphUsageResult(
 ): Promise<void> {
   try {
     const title = 'Find Usages';
-    await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Window,
-        title: 'Preparing call graph',
-        cancellable: false,
-      },
-      async () => {
-        await callGraph.ensureBuilt();
-      },
-    );
+    if (!await ensureCallGraphReadyForUi(callGraph, title)) { return; }
     const query = explicitQuery ?? await getCallGraphQuery(callGraph, title);
     if (!query) { return; }
     const targetSymbol = callGraph.resolveSymbols(query, 1)[0];
@@ -893,7 +909,10 @@ export function formatCallGraphProgressMessage(progress: CallGraphRebuildProgres
 class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
   readonly onDidChangeInlayHints: vscode.Event<void>;
 
-  constructor(private readonly callGraph: CallGraphService) {
+  constructor(
+    private readonly overlay: OverlayPanel,
+    private readonly callGraph: CallGraphService,
+  ) {
     this.onDidChangeInlayHints = callGraph.onDidChangeSnapshot;
   }
 
@@ -914,7 +933,7 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
     const summaries = this.callGraph.getSnapshot()
       ? this.callGraph.getSymbolRelationSummariesForDocument(document.uri, range)
       : this.callGraph.getCachedSymbolRelationSummariesForDocument(document.uri, range);
-    return summaries
+    const hints = summaries
       .filter((summary) => summary.symbol.range.startLine >= 0 && summary.symbol.range.startLine < document.lineCount)
       .filter((summary) => isCallGraphInlayDefinitionLine(document, summary.symbol))
       .map((summary) => buildCallGraphInlayHint(
@@ -923,6 +942,10 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
         document.lineAt(summary.symbol.range.startLine).range.end.character,
       ))
       .filter((hint): hint is vscode.InlayHint => !!hint);
+    if (hints.length > 0) {
+      this.overlay.scheduleRendererInlayClickHookWarmup('call-graph-inlay-hints');
+    }
+    return hints;
   }
 }
 

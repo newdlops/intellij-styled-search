@@ -79,6 +79,7 @@ type SearchSession = {
 export interface ShowOptions {
   forceLiteral?: boolean;
   suppressSearch?: boolean;
+  preferredWindowId?: number;
 }
 
 type PendingShow = {
@@ -86,9 +87,22 @@ type PendingShow = {
   options?: ShowOptions;
 };
 
+type PendingStaticResults = {
+  query: string;
+  matches: FileMatch[];
+  requestId: number;
+  sourceWindowId?: number;
+  resolve: () => void;
+  reject: (err: unknown) => void;
+};
+
 type CaptureDiagnosticOptions = {
   allowForceOpen?: boolean;
   reason?: string;
+};
+
+type PatchScriptOptions = {
+  ignoreTargetMarker?: boolean;
 };
 
 const BRIDGE_BINDING = 'irSearchMainBridge';
@@ -149,6 +163,14 @@ export class OverlayPanel {
   private targetWindowMarkerItem: vscode.StatusBarItem | undefined;
   private disposePromise: Promise<void> | undefined;
   private cdpCloseDeferredReasons = new Set<string>();
+  private rendererInlayClickWarmupTimer: ReturnType<typeof setTimeout> | undefined;
+  private lastRendererInlayClickWarmupAt = 0;
+  private rendererInlayClickHookReady = false;
+  private pendingStaticResults: PendingStaticResults | undefined;
+  private pendingStaticResultsTimer: ReturnType<typeof setTimeout> | undefined;
+  private staticResultsRequestSeq = 0;
+  private staticResultsChain: Promise<void> = Promise.resolve();
+  private rendererCommandWindowId: number | undefined;
   // Per-source lastSeenSeq: each renderer patch install has its own instance
   // id (`__src`) and monotonic `__seq`. We dedup duplicates delivered by
   // accumulated CDP `message` listeners *within the same source*, but never
@@ -158,12 +180,17 @@ export class OverlayPanel {
   // Pending bridge-liveness pings awaiting their own log echo back through
   // the bridge chain. See verifyBridgeAlive() for why we need this.
   private bridgePings = new Map<string, () => void>();
+  private lastZoektIndexPromptAt = 0;
 
   static get(context: vscode.ExtensionContext): OverlayPanel {
     if (!OverlayPanel.instance) {
       OverlayPanel.instance = new OverlayPanel(context);
     }
     return OverlayPanel.instance;
+  }
+
+  getLogChannel(): vscode.OutputChannel {
+    return this.log;
   }
 
   private constructor(private readonly context: vscode.ExtensionContext) {
@@ -285,10 +312,14 @@ export class OverlayPanel {
       void this.zoektRuntime.prewarmIfPreferred().catch((err) => {
         this.log.appendLine(`zoek-rs prewarm failed: ${err instanceof Error ? err.message : err}`);
       });
-      this.log.appendLine('Prewarm complete (search backend only; CDP/Monaco capture disabled on activation).');
+      this.log.appendLine('Prewarm complete (lightweight only; zoekt build/index and CDP/Monaco capture disabled on activation).');
     } catch (err) {
       this.log.appendLine(`Prewarm failed: ${err instanceof Error ? err.message : err}`);
     }
+  }
+
+  pauseZoektFileUpdates(reason: string): vscode.Disposable {
+    return this.zoektRuntime.pauseFileUpdates(reason);
   }
 
   private lastCaptureAttemptAt = 0;
@@ -418,10 +449,11 @@ export class OverlayPanel {
 
   private shouldEnableRendererInlayClickHook(): boolean {
     return vscode.workspace.getConfiguration('intellijStyledSearch')
-      .get<boolean>('rendererInlayClickHook', false);
+      .get<boolean>('rendererInlayClickHook', true);
   }
 
   private shouldDisposeRendererPatchOnHide(): boolean {
+    if (this.shouldEnableRendererInlayClickHook()) { return false; }
     return vscode.workspace.getConfiguration('intellijStyledSearch')
       .get<boolean>('disposeRendererPatchOnHide', true);
   }
@@ -429,6 +461,13 @@ export class OverlayPanel {
   private shouldKeepCdpOpenWhileSearchUiVisible(): boolean {
     return vscode.workspace.getConfiguration('intellijStyledSearch')
       .get<boolean>('keepCdpOpenWhileSearchUiVisible', true);
+  }
+
+  private getRendererBridgeSingletonIdleMs(): number {
+    const raw = vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<number>('rendererBridgeSingletonIdleMs', 30_000);
+    if (!Number.isFinite(raw)) { return 30_000; }
+    return Math.max(1_000, Math.min(300_000, Math.floor(raw)));
   }
 
   private shouldCloseInspectorForReason(reason: string): boolean {
@@ -448,6 +487,43 @@ export class OverlayPanel {
     this.log.appendLine(
       `Monaco capture disabled (${reason}); previews use DOM fallback to avoid CDP/prototype work on the VSCode UI thread.`,
     );
+  }
+
+  scheduleRendererInlayClickHookWarmup(reason = 'inlay-hints'): void {
+    if (!this.shouldEnableRendererInlayClickHook()) { return; }
+    if (this.rendererInlayClickHookReady) { return; }
+    const now = Date.now();
+    if (now - this.lastRendererInlayClickWarmupAt < 5000 || this.rendererInlayClickWarmupTimer) { return; }
+    this.rendererInlayClickWarmupTimer = setTimeout(() => {
+      this.rendererInlayClickWarmupTimer = undefined;
+      if (this.showInFlight || this.pendingShow) { return; }
+      this.lastRendererInlayClickWarmupAt = Date.now();
+      void this.ensureInjected({ ignoreTargetMarker: true })
+        .then(() => {
+          if (!this.showInFlight && !this.pendingShow &&
+              this.activeWindowId === undefined &&
+              this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.closeCdpWebSocket(`renderer inlay click warmup:${reason}`);
+          }
+        })
+        .catch((err) => {
+          this.log.appendLine(`renderer inlay click warmup failed (${reason}): ${err instanceof Error ? err.message : err}`);
+        });
+    }, 700);
+  }
+
+  private markRendererInlayClickHookReady(report: string, reason: string): void {
+    if (!this.shouldEnableRendererInlayClickHook()) { return; }
+    if (!/\bok:/.test(report)) { return; }
+    if (this.rendererInlayClickHookReady) { return; }
+    this.rendererInlayClickHookReady = true;
+    this.log.appendLine(`renderer inlay click hook ready (${reason}).`);
+  }
+
+  private invalidateRendererInlayClickHookReady(reason: string): void {
+    if (!this.rendererInlayClickHookReady) { return; }
+    this.rendererInlayClickHookReady = false;
+    this.log.appendLine(`renderer inlay click hook invalidated (${reason}).`);
   }
 
   private getExpectedWorkspaceName(): string {
@@ -1553,6 +1629,26 @@ export class OverlayPanel {
     }
   }
 
+  private maybePromptZoektIndexRecommendation(reason: string | undefined): void {
+    if (!reason) { return; }
+    const lower = reason.toLowerCase();
+    const needsIndex = lower.includes('zoek-rs index incomplete') || lower.includes('zoek-rs binary unavailable');
+    if (!needsIndex) { return; }
+    const now = Date.now();
+    if (now - this.lastZoektIndexPromptAt < 30_000) { return; }
+    this.lastZoektIndexPromptAt = now;
+    const action = 'Rebuild Search Index';
+    const subject = lower.includes('binary unavailable') ? 'zoekt search engine' : 'zoekt search index';
+    void vscode.window.showWarningMessage(
+      `IntelliJ Styled Search: ${subject} is not ready. Search will use codesearch fallback until the index is rebuilt.`,
+      action,
+    ).then((picked) => {
+      if (picked === action) {
+        void vscode.commands.executeCommand('intellijStyledSearch.rebuildIndex');
+      }
+    });
+  }
+
   /** Debug-only: compare a query against what the index thinks about the
    *  currently-active file. Prints whether the file is in the index, how
    *  many of the query's trigrams are recorded for it, and the first few
@@ -1635,21 +1731,67 @@ export class OverlayPanel {
   }
 
   async showStaticResults(initialQuery: string, matches: FileMatch[]): Promise<void> {
+    const requestId = ++this.staticResultsRequestSeq;
+    if (this.pendingStaticResultsTimer) {
+      clearTimeout(this.pendingStaticResultsTimer);
+      this.pendingStaticResultsTimer = undefined;
+    }
+    if (this.pendingStaticResults) {
+      this.pendingStaticResults.resolve();
+      this.pendingStaticResults = undefined;
+    }
+    return new Promise<void>((resolve, reject) => {
+      this.pendingStaticResults = {
+        query: initialQuery,
+        matches,
+        requestId,
+        sourceWindowId: this.rendererCommandWindowId,
+        resolve,
+        reject,
+      };
+      this.pendingStaticResultsTimer = setTimeout(() => {
+        this.pendingStaticResultsTimer = undefined;
+        const pending = this.pendingStaticResults;
+        this.pendingStaticResults = undefined;
+        if (!pending) { return; }
+        const run = () => this.showStaticResultsNow(
+          pending.query,
+          pending.matches,
+          pending.requestId,
+          pending.sourceWindowId,
+        );
+        const next = this.staticResultsChain.then(run, run);
+        this.staticResultsChain = next.then(() => undefined, () => undefined);
+        void next.then(pending.resolve, pending.reject);
+      }, 45);
+    });
+  }
+
+  private async showStaticResultsNow(
+    initialQuery: string,
+    matches: FileMatch[],
+    requestId: number,
+    sourceWindowId?: number,
+  ): Promise<void> {
+    if (requestId !== this.staticResultsRequestSeq) { return; }
     this.cancelActive();
     this.currentSearchSession = undefined;
-    await this.show(initialQuery, { forceLiteral: true, suppressSearch: true });
+    await this.show(initialQuery, { forceLiteral: true, suppressSearch: true, preferredWindowId: sourceWindowId });
+    if (requestId !== this.staticResultsRequestSeq) { return; }
     const searchId = ++this.searchSeq;
     const totalMatches = matches.reduce((sum, match) => sum + match.matches.length, 0);
-    await this.postToRenderer({ type: 'results:start', searchId });
-      const batchSize = 64;
+    const messages: OverlayMessage[] = [{ type: 'results:start', searchId }];
+    const batchSize = 64;
     for (let i = 0; i < matches.length; i += batchSize) {
-      await this.postToRenderer({
+      if (requestId !== this.staticResultsRequestSeq) { return; }
+      messages.push({
         type: 'results:batch',
         searchId,
         matches: matches.slice(i, i + batchSize),
       });
     }
-    await this.postToRenderer({
+    if (requestId !== this.staticResultsRequestSeq) { return; }
+    messages.push({
       type: 'results:done',
       searchId,
       totalFiles: matches.length,
@@ -1660,6 +1802,7 @@ export class OverlayPanel {
       pageMatches: totalMatches,
       offset: 0,
     });
+    await this.postMessagesToRenderer(messages);
     this.scheduleCdpSearchIdleClose('static-results-done');
   }
 
@@ -1668,13 +1811,19 @@ export class OverlayPanel {
     this.log.appendLine(
       `doShow: initialQueryLen=${initialQuery.length} preview=${JSON.stringify(initialQuery.slice(0, 80))}`,
     );
-    const targetMarker = this.beginTargetWindowMarker();
+    const directWindowId = options.preferredWindowId ?? this.rendererCommandWindowId ?? this.activeWindowId;
+    const useDirectWindow = directWindowId !== undefined && this.shouldEnableRendererInlayClickHook();
+    const targetMarker = useDirectWindow ? new vscode.Disposable(() => undefined) : this.beginTargetWindowMarker();
     try {
-      await delay(150);
+      if (!useDirectWindow) {
+        await delay(150);
+      }
       const showSeq = ++this.showSeq;
       await this.ensureInjected();
       const tInjected = Date.now();
-      let v = await this.evaluateShowInFocusedWindow(initialQuery, options);
+      let v = useDirectWindow
+        ? await this.evaluateShowInWindow(directWindowId, initialQuery, options)
+        : await this.evaluateShowInFocusedWindow(initialQuery, options);
       // Brand-new VSCode windows may have missed the initial patch run
       // because their renderer wasn't ready yet ("No target available" in
       // the Injection log). Detect that via `no-show-fn` and run the patch
@@ -1684,10 +1833,13 @@ export class OverlayPanel {
         try {
           const report = await this.runPatchScript(v.fid);
           this.log.appendLine(`Re-inject: ${report}`);
+          this.markRendererInlayClickHookReady(report, 'reinject-show');
         } catch (e) {
           this.log.appendLine(`Re-inject failed: ${e instanceof Error ? e.message : e}`);
         }
-        v = await this.evaluateShowInFocusedWindow(initialQuery, options);
+        v = useDirectWindow
+          ? await this.evaluateShowInWindow(directWindowId, initialQuery, options)
+          : await this.evaluateShowInFocusedWindow(initialQuery, options);
       }
       if (!v || !v.fid) {
         this.log.appendLine('show() aborted: no focused VSCode window');
@@ -1703,17 +1855,22 @@ export class OverlayPanel {
       if (this.isRendererSafetyDiagnosticsEnabled()) {
         void this.probeRendererSafety('show-complete', 700);
       }
-      void this.postSearchHistoryToRenderer().catch((err) => {
-        this.log.appendLine(`post search history failed: ${err instanceof Error ? err.message : err}`);
-      });
+      if (!options.suppressSearch) {
+        void this.postSearchHistoryToRenderer().catch((err) => {
+          this.log.appendLine(`post search history failed: ${err instanceof Error ? err.message : err}`);
+        });
+      }
       // After the overlay is visible, kick off Monaco capture for the same
       // renderer window that owns the preview pane. requestPreview awaits
       // this when needed, so the first preview can mount as Monaco instead
       // of permanently rendering the non-editable DOM fallback.
-      this.scheduleLazyCapture(v.fid);
+      if (initialQuery && !options.suppressSearch) {
+        this.scheduleLazyCapture(v.fid);
+      }
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.scheduleBridgeRepairAfterVisible(showSeq, initialQuery, options);
-        this.scheduleCdpSearchIdleClose('show-idle', initialQuery || options.suppressSearch ? 900 : 250);
+        const shellOnly = !initialQuery || !!options.suppressSearch;
+        this.scheduleCdpSearchIdleClose(shellOnly ? 'show-shell-idle' : 'show-idle', shellOnly ? 250 : 900, shellOnly);
       }
       if (this.shouldAutoCloseCdpForTests()) {
         this.scheduleCdpIdleClose(v.fid);
@@ -1811,6 +1968,17 @@ export class OverlayPanel {
       includeCommandLineAPI: true,
     });
     return resp?.result?.value as { fid: number; result: string } | undefined;
+  }
+
+  private async evaluateShowInWindow(
+    windowId: number,
+    initialQuery: string,
+    options: ShowOptions,
+  ): Promise<{ fid: number; result: string } | undefined> {
+    const showExpr = `(function(){ try { return window.__ijFindShow ? window.__ijFindShow(${JSON.stringify(initialQuery)}, ${JSON.stringify(options)}) : 'no-show-fn'; } catch (e) { return 'show-throw:' + (e && e.message); } })()`;
+    const result = await this.evalInWindow(windowId, showExpr);
+    if (/^no-window:/.test(result)) { return undefined; }
+    return { fid: windowId, result: result || 'ok' };
   }
 
   private scheduleBridgeRepairAfterVisible(
@@ -1993,6 +2161,10 @@ export class OverlayPanel {
       clearTimeout(this.cdpSearchIdleCloseTimer);
       this.cdpSearchIdleCloseTimer = undefined;
     }
+    if (this.rendererInlayClickWarmupTimer) {
+      clearTimeout(this.rendererInlayClickWarmupTimer);
+      this.rendererInlayClickWarmupTimer = undefined;
+    }
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       await this.releaseRendererBridge('overlay disposed', undefined, 1500).catch((err) => {
         this.log.appendLine(`Renderer bridge release during dispose failed: ${err instanceof Error ? err.message : err}`);
@@ -2015,9 +2187,9 @@ export class OverlayPanel {
     this.cdpSearchIdleCloseTimer = undefined;
   }
 
-  private scheduleCdpSearchIdleClose(reason: string, delayMs = 350): void {
+  private scheduleCdpSearchIdleClose(reason: string, delayMs = 350, allowWhileVisible = false): void {
     if (this.shouldAutoCloseCdpForTests()) { return; }
-    if (this.shouldKeepCdpOpenWhileSearchUiVisible() && this.activeWindowId !== undefined) {
+    if (!allowWhileVisible && this.shouldKeepCdpOpenWhileSearchUiVisible() && this.activeWindowId !== undefined) {
       if (!this.cdpCloseDeferredReasons.has(reason)) {
         this.cdpCloseDeferredReasons.add(reason);
         this.log.appendLine(`CDP close deferred until panel hidden (${reason}).`);
@@ -2050,14 +2222,25 @@ export class OverlayPanel {
 
   private scheduleCdpIdleClose(sourceWindowId?: number): void {
     this.cancelCdpIdleClose();
+    const keepRendererSingleton = this.shouldEnableRendererInlayClickHook();
+    const delayMs = keepRendererSingleton ? this.getRendererBridgeSingletonIdleMs() : 1500;
     this.cdpIdleCloseTimer = setTimeout(() => {
       this.cdpIdleCloseTimer = undefined;
-      if (sourceWindowId !== undefined && this.activeWindowId !== sourceWindowId) { return; }
+      if (sourceWindowId !== undefined && this.activeWindowId !== undefined && this.activeWindowId !== sourceWindowId) { return; }
       if (this.showInFlight || this.pendingShow || this.activeSearch) { return; }
+      if (keepRendererSingleton) {
+        this.log.appendLine(`Renderer bridge singleton idle close after ${delayMs}ms`);
+        this.closeCdpWebSocket('renderer singleton idle');
+        if (sourceWindowId === undefined || this.activeWindowId === sourceWindowId) {
+          this.activeWindowId = undefined;
+        }
+        this.cdpCloseDeferredReasons.clear();
+        return;
+      }
       void this.releaseRendererBridge('panel hidden', sourceWindowId, 1500).catch((err) => {
         this.log.appendLine(`Renderer bridge release failed: ${err instanceof Error ? err.message : err}`);
       });
-    }, 1500);
+    }, delayMs);
   }
 
   private closeCdpWebSocket(reason: string): void {
@@ -2099,11 +2282,14 @@ export class OverlayPanel {
 
   private async releaseRendererBridge(reason: string, sourceWindowId?: number, timeoutMs = 2000): Promise<string> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) { return 'no-active-bridge'; }
-    const closeMainInspector = this.shouldCloseMainInspector();
+    const keepConsoleBridgeForInlay = this.shouldEnableRendererInlayClickHook() &&
+      /panel hidden/i.test(reason);
+    const closeMainInspector = this.shouldCloseMainInspector() && !keepConsoleBridgeForInlay;
     const script = `
       (function () {
         var BW = require('electron').BrowserWindow;
         var closeMainInspector = ${JSON.stringify(closeMainInspector)};
+        var keepConsoleBridgeForInlay = ${JSON.stringify(keepConsoleBridgeForInlay)};
         var wins = BW.getAllWindows();
         var removed = 0;
         var detached = 0;
@@ -2112,8 +2298,10 @@ export class OverlayPanel {
           try {
             var consoleBridge = global.__ijFindConsoleBridgeListeners && global.__ijFindConsoleBridgeListeners.get(w.id);
             if (consoleBridge) {
-              try { w.webContents.removeListener('console-message', consoleBridge); removed++; } catch (eConsoleRm) {}
-              try { global.__ijFindConsoleBridgeListeners.delete(w.id); } catch (eConsoleDel) {}
+              if (!keepConsoleBridgeForInlay) {
+                try { w.webContents.removeListener('console-message', consoleBridge); removed++; } catch (eConsoleRm) {}
+                try { global.__ijFindConsoleBridgeListeners.delete(w.id); } catch (eConsoleDel) {}
+              }
             }
             var bridge = global.__ijFindBridgeListeners && global.__ijFindBridgeListeners.get(w.id);
             if (bridge) {
@@ -2173,14 +2361,14 @@ export class OverlayPanel {
     }
   }
 
-  private async ensureInjected(): Promise<void> {
+  private async ensureInjected(options: PatchScriptOptions = {}): Promise<void> {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) { return; }
     if (this.injectPromise) { return this.injectPromise; }
-    this.injectPromise = this.inject().finally(() => { this.injectPromise = undefined; });
+    this.injectPromise = this.inject(options).finally(() => { this.injectPromise = undefined; });
     return this.injectPromise;
   }
 
-  private async inject(): Promise<void> {
+  private async inject(options: PatchScriptOptions = {}): Promise<void> {
     const mainPid = this.findMainPid();
     if (!mainPid) { throw new Error('Could not locate VSCode main (Electron) process'); }
     const tStart = Date.now();
@@ -2244,11 +2432,12 @@ export class OverlayPanel {
     await this.send('Runtime.enable', {});
     await this.send('Runtime.addBinding', { name: BRIDGE_BINDING });
 
-    const report = await this.runPatchScript();
+    const report = await this.runPatchScript(undefined, options);
     this.log.appendLine(`Injection: ${report}`);
     if (!/\bok:/.test(String(report))) {
       throw new Error(`Renderer patch did not install: ${report}`);
     }
+    this.markRendererInlayClickHookReady(String(report), options.ignoreTargetMarker ? 'warmup' : 'inject');
     // Keep diagnostics layout-free. The old full status probe touched
     // getBoundingClientRect/getComputedStyle inside the VS Code renderer.
     if (this.isRendererSafetyDiagnosticsEnabled()) {
@@ -2260,7 +2449,7 @@ export class OverlayPanel {
    *  already have the patch return 'already patched' and are no-ops; windows
    *  that missed the initial injection (e.g., a brand-new VSCode window whose
    *  renderer wasn't ready yet) get a fresh attempt. */
-  private async runPatchScript(targetWindowId?: number): Promise<string> {
+  private async runPatchScript(targetWindowId?: number, options: PatchScriptOptions = {}): Promise<string> {
     // Pass the patch script directly as the expression — no base64/atob round-trip,
     // which previously corrupted any non-ASCII characters (they arrived as raw UTF-8
     // bytes through atob and broke the parser).
@@ -2277,7 +2466,7 @@ export class OverlayPanel {
       `window.__ijFindLightStatus&&window.__ijFindPatchVersion===${RENDERER_PATCH_VERSION}` +
       `?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`;
     const workspaceName = this.getExpectedWorkspaceName();
-    const markerText = this.targetWindowMarkerText || '';
+    const markerText = options.ignoreTargetMarker ? '' : (this.targetWindowMarkerText || '');
     const markerProbeExpr = this.buildTargetMarkerProbeExpression(markerText);
 
     const injectScript = `
@@ -2290,6 +2479,7 @@ export class OverlayPanel {
         var localBridgePort = ${JSON.stringify(localBridge.port)};
         var localBridgeToken = ${JSON.stringify(localBridge.token)};
         var closeMainInspector = ${JSON.stringify(this.shouldCloseMainInspector())};
+        var keepConsoleBridgeForInlay = ${JSON.stringify(this.shouldEnableRendererInlayClickHook())};
         var targetWindowId = ${targetWindowId === undefined ? 'undefined' : JSON.stringify(targetWindowId)};
         var expectedWorkspaceName = ${JSON.stringify(workspaceName)};
         var expectedWorkspaceNameLower = expectedWorkspaceName.toLowerCase();
@@ -2375,6 +2565,7 @@ export class OverlayPanel {
             function releaseSelfIfPanelHidden() {
               try {
                 if (!parsed || parsed.type !== 'panelHidden') { return; }
+                if (keepConsoleBridgeForInlay) { return; }
                 setTimeout(function () {
                   try { w.webContents.removeListener('console-message', bridge); } catch (eConsoleSelfRm) {}
                   try {
@@ -2550,6 +2741,9 @@ export class OverlayPanel {
       case 'panelHidden':
         this.currentSearchSession = undefined;
         this.cancelActive();
+        if (this.shouldDisposeRendererPatchOnHide() && !this.shouldEnableRendererInlayClickHook()) {
+          this.invalidateRendererInlayClickHookReady('panel hidden');
+        }
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
           this.scheduleCdpIdleClose(evt.__win);
         }
@@ -2561,7 +2755,7 @@ export class OverlayPanel {
       case 'openInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, true, true); break;
       case 'pinInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, false, false); break;
 	      case 'requestHover': void this.sendHover(evt.reqId, evt.uri, evt.line, evt.column, evt.x, evt.y); break;
-	      case 'runCommand': void this.runHoverCommand(evt.command, evt.args); break;
+	      case 'runCommand': void this.runHoverCommand(evt.command, evt.args, evt.__win); break;
 	      case 'saveFile': void this.saveFile(evt.uri, evt.content); break;
 	      case 'trace':
 	        this.log.appendLine(
@@ -2646,14 +2840,20 @@ export class OverlayPanel {
     }
   }
 
-  private async runHoverCommand(command: string, args: unknown[]) {
+  private async runHoverCommand(command: string, args: unknown[], sourceWindowId?: number) {
     if (typeof command !== 'string' || !command) { return; }
+    const previousWindowId = this.rendererCommandWindowId;
+    if (typeof sourceWindowId === 'number') {
+      this.rendererCommandWindowId = sourceWindowId;
+    }
     try {
       const safeArgs = Array.isArray(args) ? args : (args === undefined || args === null ? [] : [args]);
       await vscode.commands.executeCommand(command, ...safeArgs);
     } catch (err) {
       this.log.appendLine(`runHoverCommand(${command}) failed: ${err instanceof Error ? err.message : err}`);
       vscode.window.showErrorMessage(`Command failed: ${command}`);
+    } finally {
+      this.rendererCommandWindowId = previousWindowId;
     }
   }
 
@@ -2841,6 +3041,7 @@ export class OverlayPanel {
         if (!readiness.ready) {
           effectiveEngine = 'codesearch';
           fallbackReason = readiness.reason;
+          this.maybePromptZoektIndexRecommendation(readiness.reason);
         }
       }
     }
@@ -3088,6 +3289,7 @@ export class OverlayPanel {
         const readiness = await this.zoektRuntime.runSearch(pageOptions, cts.token, progress);
         if (!readiness.ready && !cts.token.isCancellationRequested) {
           session.effectiveEngine = 'codesearch';
+          this.maybePromptZoektIndexRecommendation(readiness.reason);
           this.log.appendLine(
             `zoek-rs runtime unavailable${readiness.reason ? ` (${readiness.reason})` : ''} — falling back to codesearch.`,
           );
@@ -3118,10 +3320,15 @@ export class OverlayPanel {
   }
 
   private async postToRenderer(msg: OverlayMessage) {
+    await this.postMessagesToRenderer([msg]);
+  }
+
+  private async postMessagesToRenderer(messages: OverlayMessage[]) {
     if (this.activeWindowId === undefined) { return; }
+    if (messages.length === 0) { return; }
     const windowId = this.activeWindowId;
-    const payload = JSON.stringify(msg);
-    const js = `(function(){try{if(!window.__ijFindOnMessage){return 'missing-onmessage'};window.__ijFindOnMessage(${payload});return 'ok'}catch(e){return 'err:'+(e&&e.message)}})()`;
+    const payload = JSON.stringify(messages);
+    const js = `(function(){try{if(!window.__ijFindOnMessage){return 'missing-onmessage'};var msgs=${payload};for(var i=0;i<msgs.length;i++){window.__ijFindOnMessage(msgs[i]);}return 'ok'}catch(e){return 'err:'+(e&&e.message)}})()`;
     const deliver = async () => {
       try {
         await this.ensureInjected();

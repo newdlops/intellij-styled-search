@@ -181,6 +181,7 @@ type CallGraphCacheManifest = {
   configSignature: string;
   builtAtUnixMs: number;
   chunks: CallGraphCacheChunk[];
+  recordIndex?: CallGraphRecordIndexEntry[];
   recordOverrides?: CallGraphRecordOverrideChunk[];
   documentSummaries?: CallGraphDocumentSummaryChunk[];
   documentSummaryFiles?: CallGraphDocumentSummaryFileChunk[];
@@ -197,6 +198,14 @@ type CallGraphCacheManifest = {
 type CallGraphCacheChunk = {
   file: string;
   count: number;
+};
+
+type CallGraphRecordIndexEntry = {
+  uri: string;
+  relPath: string;
+  language: CallGraphLanguage;
+  mtime: number;
+  size: number;
 };
 
 type CallGraphRecordOverrideChunk = CallGraphCacheChunk & {
@@ -224,6 +233,7 @@ type CallGraphDocumentSummaryFileChunk = CallGraphCacheChunk & {
 type ParsedSourceFileResult = {
   record?: CallGraphFileRecord;
   skipped: boolean;
+  reused?: boolean;
   warnings: string[];
 };
 
@@ -250,6 +260,18 @@ type CallGraphResolveOptions = {
   includeUnresolvedEdges: boolean;
   maxEdges: number;
   maxPossibleTargetsPerCall: number;
+};
+
+type CallGraphParseLimits = {
+  maxLineLength: number;
+  maxLinesPerFile: number;
+  maxReferenceCandidatesPerFile: number;
+  maxAssignedFunctionNamesPerFile: number;
+};
+
+type CallGraphCpuBudget = {
+  percent: number;
+  maxPauseMs: number;
 };
 
 type ResolvedCallTarget = {
@@ -315,6 +337,13 @@ const SOURCE_EXTENSIONS = new Set([
   '.mjs',
   '.cjs',
 ]);
+
+const DEFAULT_CALL_GRAPH_PARSE_LIMITS: CallGraphParseLimits = {
+  maxLineLength: 20_000,
+  maxLinesPerFile: 50_000,
+  maxReferenceCandidatesPerFile: 50_000,
+  maxAssignedFunctionNamesPerFile: 500,
+};
 
 const LANGUAGE_BY_EXTENSION = new Map<string, CallGraphLanguage>([
   ['.py', 'python'],
@@ -391,7 +420,7 @@ const MAX_POSSIBLE_EDGES_PER_CALL = 40;
 const DEFAULT_CALL_GRAPH_CONCURRENCY = getDefaultCallGraphConcurrency();
 const DEFAULT_CALL_GRAPH_MAX_EDGES = 10_000_000;
 const CALL_GRAPH_SOURCE_GLOB = '**/*.{py,java,kt,kts,ts,tsx,js,jsx,mjs,cjs}';
-const CALL_GRAPH_CACHE_VERSION = 8;
+const CALL_GRAPH_CACHE_VERSION = 9;
 const CALL_GRAPH_INCREMENTAL_DEBOUNCE_MS = 1_500;
 const CALL_GRAPH_CACHE_RECORDS_PER_CHUNK = 1_000;
 const CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK = 50_000;
@@ -408,7 +437,7 @@ export class CallGraphService implements vscode.Disposable {
   private relationSummaryCache: { snapshot: CallGraphSnapshot; index: RelationSummaryIndex } | undefined;
   private readonly fileRecordsByUri = new Map<string, CallGraphFileRecord>();
   private readonly pendingChangedUris = new Set<string>();
-  private readonly watcher: vscode.FileSystemWatcher;
+  private readonly watcher: vscode.FileSystemWatcher | undefined;
   private restorePromise: Promise<void> | undefined;
   private snapshotRestorePromise: Promise<void> | undefined;
   private incrementalTimer: ReturnType<typeof setTimeout> | undefined;
@@ -429,21 +458,43 @@ export class CallGraphService implements vscode.Disposable {
     private readonly context: vscode.ExtensionContext,
     private readonly log: vscode.OutputChannel,
   ) {
-    this.watcher = vscode.workspace.createFileSystemWatcher(CALL_GRAPH_SOURCE_GLOB);
-    context.subscriptions.push(
-      this.watcher,
-      this.watcher.onDidCreate((uri) => this.scheduleIncrementalRefresh(uri, 'created')),
-      this.watcher.onDidChange((uri) => {
-        const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
-        if (openDocument) { return; }
-        this.scheduleIncrementalRefresh(uri, 'changed');
-      }),
-      this.watcher.onDidDelete((uri) => this.scheduleIncrementalRefresh(uri, 'deleted')),
-      vscode.workspace.onDidSaveTextDocument((document) => {
-        if (document.uri.scheme === 'file' && isSupportedSourceUri(document.uri)) {
-          this.scheduleIncrementalRefresh(document.uri, 'saved');
+    const disposables: vscode.Disposable[] = [];
+    if (this.shouldWatchExternalFileChanges()) {
+      this.watcher = vscode.workspace.createFileSystemWatcher(CALL_GRAPH_SOURCE_GLOB);
+      disposables.push(
+        this.watcher,
+        this.watcher.onDidCreate((uri) => this.scheduleIncrementalRefresh(uri, 'external-created')),
+        this.watcher.onDidChange((uri) => {
+          const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
+          if (openDocument) { return; }
+          this.scheduleIncrementalRefresh(uri, 'external-changed');
+        }),
+        this.watcher.onDidDelete((uri) => this.scheduleIncrementalRefresh(uri, 'external-deleted')),
+      );
+    }
+    disposables.push(
+      vscode.workspace.onDidCreateFiles((event) => {
+        for (const uri of event.files) {
+          this.scheduleIncrementalRefreshIfSupported(uri, 'created');
         }
       }),
+      vscode.workspace.onDidDeleteFiles((event) => {
+        for (const uri of event.files) {
+          this.scheduleIncrementalRefreshIfSupported(uri, 'deleted');
+        }
+      }),
+      vscode.workspace.onDidRenameFiles((event) => {
+        for (const file of event.files) {
+          this.scheduleIncrementalRefreshIfSupported(file.oldUri, 'renamed-old');
+          this.scheduleIncrementalRefreshIfSupported(file.newUri, 'renamed-new');
+        }
+      }),
+      vscode.workspace.onDidSaveTextDocument((document) => {
+        this.scheduleIncrementalRefreshIfSupported(document.uri, 'saved');
+      }),
+    );
+    context.subscriptions.push(
+      ...disposables,
     );
     this.restorePromise = this.restorePersistedCacheManifest();
   }
@@ -454,7 +505,7 @@ export class CallGraphService implements vscode.Disposable {
       clearTimeout(this.incrementalTimer);
       this.incrementalTimer = undefined;
     }
-    this.watcher.dispose();
+    this.watcher?.dispose();
     this.onDidChangeSnapshotEmitter.dispose();
   }
 
@@ -856,6 +907,16 @@ export class CallGraphService implements vscode.Disposable {
     }, CALL_GRAPH_INCREMENTAL_DEBOUNCE_MS);
   }
 
+  private scheduleIncrementalRefreshIfSupported(uri: vscode.Uri, reason: string): void {
+    if (uri.scheme !== 'file' || !isSupportedSourceUri(uri)) { return; }
+    this.scheduleIncrementalRefresh(uri, reason);
+  }
+
+  private shouldWatchExternalFileChanges(): boolean {
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    return cfg.get<boolean>('callGraphWatchExternalFileChanges', false);
+  }
+
   private async refreshChangedFiles(uris: vscode.Uri[], reason: string): Promise<void> {
     if (uris.length === 0 || this.disposed) { return; }
     if (this.rebuildPromise) {
@@ -887,6 +948,8 @@ export class CallGraphService implements vscode.Disposable {
     const started = Date.now();
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
+    const parseLimits = getConfiguredCallGraphParseLimits(cfg);
+    const cpuBudget = getConfiguredCallGraphCpuBudget(cfg);
     const uniqueUris = dedupeStrings(uris.map((uri) => uri.toString())).map((value) => vscode.Uri.parse(value));
     const previousOverrides = new Map<string, CallGraphRecordOverride>();
     for (const uri of uniqueUris) {
@@ -903,7 +966,9 @@ export class CallGraphService implements vscode.Disposable {
         continue;
       }
       try {
-        const parsed = await parseSourceFileRecord(uri, maxFileSize);
+        const parseStarted = Date.now();
+        const parsed = await parseSourceFileRecord(uri, maxFileSize, parseLimits);
+        await applyCallGraphCpuBudget(Date.now() - parseStarted, cpuBudget);
         overrides.push(parsed.record
           ? { uri: uriString, record: parsed.record, updatedAtUnixMs: Date.now() }
           : { uri: uriString, deleted: true, updatedAtUnixMs: Date.now() });
@@ -945,6 +1010,8 @@ export class CallGraphService implements vscode.Disposable {
     const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
     const resolveOptions = getConfiguredCallGraphResolveOptions(cfg);
     const parseConcurrency = getConfiguredCallGraphConcurrency(cfg);
+    const parseLimits = getConfiguredCallGraphParseLimits(cfg);
+    const cpuBudget = getConfiguredCallGraphCpuBudget(cfg);
     const uniqueUris = dedupeStrings(uris.map((uri) => uri.toString())).map((value) => vscode.Uri.parse(value));
     let changed = 0;
     let skipped = 0;
@@ -960,7 +1027,9 @@ export class CallGraphService implements vscode.Disposable {
         continue;
       }
       try {
-        const parsed = await parseSourceFileRecord(uri, maxFileSize);
+        const parseStarted = Date.now();
+        const parsed = await parseSourceFileRecord(uri, maxFileSize, parseLimits);
+        await applyCallGraphCpuBudget(Date.now() - parseStarted, cpuBudget);
         if (parsed.record) {
           if (this.fileRecordsByUri.size > 0) {
             this.fileRecordsByUri.set(uriString, parsed.record);
@@ -1104,6 +1173,7 @@ export class CallGraphService implements vscode.Disposable {
     if (!folder) { return; }
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     const configSignature = getCallGraphConfigSignature(cfg);
+    await this.deleteLegacyCacheDirs(folder.uri.fsPath);
     try {
       const raw = await vscode.workspace.fs.readFile(this.cacheManifestUri(folder.uri.fsPath));
       const inflated = await gunzipAsync(Buffer.from(raw));
@@ -1114,7 +1184,13 @@ export class CallGraphService implements vscode.Disposable {
         manifest.configSignature !== configSignature ||
         !Array.isArray(manifest.chunks)
       ) {
-        this.log.appendLine('call graph cache ignored: version, workspace, or settings changed');
+        this.log.appendLine('call graph cache deleted: version, workspace, or settings changed');
+        await this.deleteCacheDir(folder.uri.fsPath, CALL_GRAPH_CACHE_VERSION);
+        return;
+      }
+      if (!Array.isArray(manifest.recordIndex)) {
+        this.log.appendLine('call graph cache deleted: missing record index');
+        await this.deleteCacheDir(folder.uri.fsPath, CALL_GRAPH_CACHE_VERSION);
         return;
       }
       this.cacheManifest = manifest as CallGraphCacheManifest;
@@ -1126,6 +1202,7 @@ export class CallGraphService implements vscode.Disposable {
         this.log.appendLine(
           `call graph cache metadata loaded: files=${stats.fileCount} symbols=${stats.symbolCount} ` +
           `edges=${stats.edgeCount} references=${stats.referenceCount} recordChunks=${this.cacheManifest.chunks.length} ` +
+          `recordIndex=${this.cacheManifest.recordIndex?.length ?? 0} ` +
           `recordOverrides=${this.cacheManifest.recordOverrides?.length ?? 0} ` +
           `snapshotChunks=${countSnapshotChunks(this.cacheManifest)} documentSummaryBuckets=${countDocumentSummaryBuckets(this.cacheManifest)} ` +
           `documentSummaryFiles=${countDocumentSummaryFiles(this.cacheManifest)} ` +
@@ -1134,6 +1211,7 @@ export class CallGraphService implements vscode.Disposable {
       } else {
         this.log.appendLine(
           `call graph cache metadata loaded: recordChunks=${this.cacheManifest.chunks.length} ` +
+          `recordIndex=${this.cacheManifest.recordIndex?.length ?? 0} ` +
           `recordOverrides=${this.cacheManifest.recordOverrides?.length ?? 0} ` +
           `documentSummaryBuckets=${countDocumentSummaryBuckets(this.cacheManifest)} documentSummaryFiles=${countDocumentSummaryFiles(this.cacheManifest)} ` +
           `cachedAt=${cachedAt} restore=records-fallback`,
@@ -1144,6 +1222,34 @@ export class CallGraphService implements vscode.Disposable {
       if (code !== 'FileNotFound') {
         this.log.appendLine(`call graph cache metadata skipped: ${err instanceof Error ? err.message : String(err)}`);
       }
+    }
+  }
+
+  private async deleteLegacyCacheDirs(workspaceRoot: string): Promise<void> {
+    let deleted = 0;
+    for (let version = 1; version < CALL_GRAPH_CACHE_VERSION; version++) {
+      if (await this.deleteCacheDir(workspaceRoot, version)) {
+        deleted += 1;
+      }
+    }
+    if (deleted > 0) {
+      this.log.appendLine(`call graph legacy cache deleted: dirs=${deleted} currentVersion=${CALL_GRAPH_CACHE_VERSION}`);
+    }
+  }
+
+  private async deleteCacheDir(workspaceRoot: string, version: number): Promise<boolean> {
+    try {
+      await vscode.workspace.fs.delete(this.cacheDirUriForVersion(workspaceRoot, version), {
+        recursive: true,
+        useTrash: false,
+      });
+      return true;
+    } catch (err) {
+      const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+      if (code !== 'FileNotFound') {
+        this.log.appendLine(`call graph cache delete failed: v${version} ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return false;
     }
   }
 
@@ -1753,6 +1859,7 @@ export class CallGraphService implements vscode.Disposable {
     if (!folder) { return; }
     const configSignature = this.cacheConfigSignature ?? getCallGraphConfigSignature();
     const records = Array.from(this.fileRecordsByUri.values()).sort((a, b) => a.relPath.localeCompare(b.relPath));
+    const recordIndex = buildRecordIndexFromRecords(records);
     const write = async () => {
       try {
         const cacheDir = this.cacheDirUri(folder.uri.fsPath);
@@ -1806,6 +1913,7 @@ export class CallGraphService implements vscode.Disposable {
           configSignature,
           builtAtUnixMs: snapshot.builtAtUnixMs,
           chunks,
+          recordIndex,
           documentSummaries,
           snapshot: {
             builtAtUnixMs: snapshot.builtAtUnixMs,
@@ -1849,9 +1957,13 @@ export class CallGraphService implements vscode.Disposable {
       }
       const overridden = new Set(chunks.map((chunk) => chunk.uriHash));
       const existing = (manifest.recordOverrides ?? []).filter((chunk) => !overridden.has(chunk.uriHash));
+      const recordIndex = Array.isArray(manifest.recordIndex)
+        ? applyRecordOverridesToRecordIndex(manifest.recordIndex, overrides)
+        : undefined;
       const updatedManifest: CallGraphCacheManifest = {
         ...manifest,
         recordOverrides: [...existing, ...chunks],
+        ...(recordIndex ? { recordIndex } : {}),
       };
       const encodedManifest = await gzipAsync(Buffer.from(JSON.stringify(updatedManifest), 'utf8'));
       totalBytes += encodedManifest.byteLength;
@@ -1988,7 +2100,11 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   private cacheDirUri(workspaceRoot: string): vscode.Uri {
-    return vscode.Uri.joinPath(this.context.globalStorageUri, `callgraph-${stableHash(workspaceRoot)}-v${CALL_GRAPH_CACHE_VERSION}`);
+    return this.cacheDirUriForVersion(workspaceRoot, CALL_GRAPH_CACHE_VERSION);
+  }
+
+  private cacheDirUriForVersion(workspaceRoot: string, version: number): vscode.Uri {
+    return vscode.Uri.joinPath(this.context.globalStorageUri, `callgraph-${stableHash(workspaceRoot)}-v${version}`);
   }
 
   private cacheManifestUri(workspaceRoot: string): vscode.Uri {
@@ -1997,6 +2113,188 @@ export class CallGraphService implements vscode.Disposable {
 
   private cacheChunkUri(workspaceRoot: string, filename: string): vscode.Uri {
     return vscode.Uri.joinPath(this.cacheDirUri(workspaceRoot), filename);
+  }
+
+  private async tryRebuildFromIndexedCache(input: {
+    workspaceRoot: string;
+    sourceFiles: vscode.Uri[];
+    maxFileSize: number;
+    parseConcurrency: number;
+    parseLimits: CallGraphParseLimits;
+    cpuBudget: CallGraphCpuBudget;
+    resolveOptions: CallGraphResolveOptions;
+    configSignature: string;
+    started: number;
+    token?: vscode.CancellationToken;
+    onProgress?: (stage: 'checking' | 'parsing', current: number, total: number, message: string) => void;
+  }): Promise<CallGraphSnapshot | undefined> {
+    const manifest = this.cacheManifest;
+    const recordIndex = manifest?.recordIndex;
+    if (
+      !manifest?.snapshot ||
+      manifest.configSignature !== input.configSignature ||
+      !Array.isArray(recordIndex) ||
+      recordIndex.length === 0
+    ) {
+      return undefined;
+    }
+    if (!this.snapshot) {
+      await this.restorePersistedSnapshot();
+    }
+    const baseSnapshot = this.snapshot;
+    if (!baseSnapshot) { return undefined; }
+    const throwIfCancelled = () => {
+      if (input.token?.isCancellationRequested) {
+        throw new CallGraphRebuildCancelledError();
+      }
+    };
+    const indexedByUri = new Map(recordIndex.map((entry) => [entry.uri, entry]));
+    const sourceSet = new Set(input.sourceFiles.map((uri) => uri.toString()));
+    const statConcurrency = Math.min(64, Math.max(input.parseConcurrency, 8));
+    let checked = 0;
+    const statResults = await mapWithConcurrency<vscode.Uri, {
+      uri: vscode.Uri;
+      stat?: vscode.FileStat;
+      warning?: string;
+    }>(input.sourceFiles, statConcurrency, async (uri) => {
+      throwIfCancelled();
+      try {
+        const stat = await vscode.workspace.fs.stat(uri);
+        checked += 1;
+        input.onProgress?.('checking', checked, input.sourceFiles.length, `checked ${checked}/${input.sourceFiles.length} source files`);
+        return { uri, stat };
+      } catch (err) {
+        checked += 1;
+        input.onProgress?.('checking', checked, input.sourceFiles.length, `checked ${checked}/${input.sourceFiles.length} source files`);
+        return {
+          uri,
+          warning: `failed to stat ${uri.fsPath}: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    });
+    const changedUris: vscode.Uri[] = [];
+    const warnings: string[] = [];
+    let reusedFiles = 0;
+    for (const result of statResults) {
+      if (result.warning || !result.stat) {
+        if (result.warning) { warnings.push(result.warning); }
+        changedUris.push(result.uri);
+        continue;
+      }
+      const cached = indexedByUri.get(result.uri.toString());
+      if (cached && fileMetadataMatches(cached, result.stat)) {
+        reusedFiles += 1;
+        continue;
+      }
+      changedUris.push(result.uri);
+    }
+    const deletedOverrides: CallGraphRecordOverride[] = [];
+    for (const entry of recordIndex) {
+      if (!sourceSet.has(entry.uri)) {
+        deletedOverrides.push({ uri: entry.uri, deleted: true, updatedAtUnixMs: Date.now() });
+      }
+    }
+    if (changedUris.length === 0 && deletedOverrides.length === 0) {
+      this.log.appendLine(
+        `call graph rebuild reused indexed cache: files=${baseSnapshot.stats.fileCount} checked=${input.sourceFiles.length} ` +
+        `reused=${reusedFiles} elapsed=${Date.now() - input.started}ms`,
+      );
+      return baseSnapshot;
+    }
+    let parsedCount = 0;
+    let skippedCount = 0;
+    const parsedResults = await mapWithConcurrency(changedUris, input.parseConcurrency, async (uri) => {
+      throwIfCancelled();
+      try {
+        const parseStarted = Date.now();
+        const parsed = await parseSourceFileRecord(uri, input.maxFileSize, input.parseLimits);
+        await applyCallGraphCpuBudget(Date.now() - parseStarted, input.cpuBudget, input.token);
+        parsedCount += 1;
+        if (!parsed.record) { skippedCount += 1; }
+        input.onProgress?.('parsing', parsedCount, changedUris.length, `parsed changed ${parsedCount}/${changedUris.length}`);
+        return parsed;
+      } catch (err) {
+        parsedCount += 1;
+        skippedCount += 1;
+        input.onProgress?.('parsing', parsedCount, changedUris.length, `parsed changed ${parsedCount}/${changedUris.length}`);
+        return {
+          record: undefined,
+          skipped: true,
+          warnings: [`failed to parse ${uri.fsPath}: ${err instanceof Error ? err.message : String(err)}`],
+        } satisfies ParsedSourceFileResult;
+      }
+    });
+    const overrides: CallGraphRecordOverride[] = [
+      ...deletedOverrides,
+      ...parsedResults.map((result, index) => {
+        const uriString = changedUris[index].toString();
+        return result.record
+          ? { uri: uriString, record: result.record, updatedAtUnixMs: Date.now() }
+          : { uri: uriString, deleted: true, updatedAtUnixMs: Date.now() };
+      }),
+    ];
+    warnings.push(...parsedResults.flatMap((result) => result.warnings));
+    this.applyRecordOverridesToLoadedRecords(overrides);
+    const { snapshot, index } = await this.buildIncrementalSnapshotFromOverrides({
+      baseSnapshot,
+      workspaceRoot: input.workspaceRoot,
+      overrides,
+      skippedFileCount: skippedCount,
+      warnings,
+      started: input.started,
+      parseConcurrency: input.parseConcurrency,
+      resolveOptions: input.resolveOptions,
+    });
+    this.applySnapshot(snapshot, index, undefined, input.configSignature, { preserveRecords: true });
+    await this.persistRecordOverrides(overrides);
+    await this.persistDocumentSummaryFilesForRecords(
+      parsedResults.map((result) => result.record).filter((record): record is CallGraphFileRecord => !!record),
+      snapshot,
+      index,
+    );
+    this.log.appendLine(
+      `call graph indexed rebuild updated: reused=${reusedFiles} changed=${changedUris.length} deleted=${deletedOverrides.length} ` +
+      `files=${snapshot.stats.fileCount} symbols=${snapshot.stats.symbolCount} edges=${snapshot.stats.edgeCount} ` +
+      `elapsed=${snapshot.stats.elapsedMs}ms`,
+    );
+    return snapshot;
+  }
+
+  private applyRecordOverridesToLoadedRecords(overrides: CallGraphRecordOverride[]): void {
+    if (!this.cacheRecordsLoaded && this.fileRecordsByUri.size === 0) { return; }
+    for (const override of overrides) {
+      if (override.deleted || !override.record) {
+        this.fileRecordsByUri.delete(override.uri);
+      } else {
+        this.fileRecordsByUri.set(override.uri, override.record);
+      }
+    }
+  }
+
+  private async persistRecordIndexFromLoadedRecordsIfMissing(): Promise<boolean> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const manifest = this.cacheManifest;
+    if (!folder || !manifest || Array.isArray(manifest.recordIndex) || this.fileRecordsByUri.size === 0) {
+      return false;
+    }
+    const started = Date.now();
+    const recordIndex = buildRecordIndexFromRecords([...this.fileRecordsByUri.values()]);
+    const write = async () => {
+      const current = this.cacheManifest;
+      if (!current || current.builtAtUnixMs !== manifest.builtAtUnixMs || Array.isArray(current.recordIndex)) {
+        return;
+      }
+      const updatedManifest: CallGraphCacheManifest = { ...current, recordIndex };
+      const encodedManifest = await gzipAsync(Buffer.from(JSON.stringify(updatedManifest), 'utf8'));
+      await vscode.workspace.fs.writeFile(this.cacheManifestUri(folder.uri.fsPath), encodedManifest);
+      this.cacheManifest = updatedManifest;
+      this.log.appendLine(
+        `call graph record index migrated: files=${recordIndex.length} elapsed=${Date.now() - started}ms bytes=${encodedManifest.byteLength}`,
+      );
+    };
+    this.cacheWritePromise = this.cacheWritePromise.then(write, write);
+    await this.cacheWritePromise;
+    return Array.isArray(this.cacheManifest?.recordIndex);
   }
 
   private async doRebuild(
@@ -2008,6 +2306,9 @@ export class CallGraphService implements vscode.Disposable {
     if (!folder) {
       throw new Error('No workspace folder is open.');
     }
+    if (this.restorePromise) {
+      await this.restorePromise;
+    }
     const workspaceRoot = folder.uri.fsPath;
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     const excludeGlobs = [
@@ -2017,6 +2318,8 @@ export class CallGraphService implements vscode.Disposable {
     const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
     const parseConcurrency = getConfiguredCallGraphConcurrency(cfg);
     const resolveOptions = getConfiguredCallGraphResolveOptions(cfg);
+    const parseLimits = getConfiguredCallGraphParseLimits(cfg);
+    const cpuBudget = getConfiguredCallGraphCpuBudget(cfg);
     const configSignature = getCallGraphConfigSignature(cfg);
     const progressState = {
       current: 0,
@@ -2074,6 +2377,70 @@ export class CallGraphService implements vscode.Disposable {
       return SOURCE_EXTENSIONS.has(ext) && !uri.fsPath.endsWith('.d.ts');
     });
     progressState.total = sourceFiles.length;
+    progressState.current = 0;
+    emitProgress('indexing', 'checking call graph cache metadata', true);
+    let cachedRecordsAvailable = false;
+    const fastSnapshot = await this.tryRebuildFromIndexedCache({
+      workspaceRoot,
+      sourceFiles,
+      maxFileSize,
+      parseConcurrency,
+      parseLimits,
+      cpuBudget,
+      resolveOptions,
+      configSignature,
+      started,
+      token,
+      onProgress: (stage, current, total, message) => {
+        progressState.current = current;
+        progressState.total = total;
+        emitProgress(stage === 'checking' ? 'indexing' : 'parsing', message);
+      },
+    });
+    if (fastSnapshot) {
+      progressState.current = progressState.total;
+      progressState.parsedFiles = fastSnapshot.stats.fileCount;
+      progressState.skippedFiles = fastSnapshot.stats.skippedFileCount;
+      progressState.warningCount = fastSnapshot.warnings.length;
+      emitProgress('done', `done in ${Date.now() - started}ms`, true);
+      return fastSnapshot;
+    }
+    if (this.cacheManifest?.configSignature === configSignature) {
+      cachedRecordsAvailable = await this.ensureCachedRecordsLoaded();
+      if (cachedRecordsAvailable && await this.persistRecordIndexFromLoadedRecordsIfMissing()) {
+        progressState.current = 0;
+        progressState.total = sourceFiles.length;
+        const migratedFastSnapshot = await this.tryRebuildFromIndexedCache({
+          workspaceRoot,
+          sourceFiles,
+          maxFileSize,
+          parseConcurrency,
+          parseLimits,
+          cpuBudget,
+          resolveOptions,
+          configSignature,
+          started,
+          token,
+          onProgress: (stage, current, total, message) => {
+            progressState.current = current;
+            progressState.total = total;
+            emitProgress(stage === 'checking' ? 'indexing' : 'parsing', message);
+          },
+        });
+        if (migratedFastSnapshot) {
+          progressState.current = progressState.total;
+          progressState.parsedFiles = migratedFastSnapshot.stats.fileCount;
+          progressState.skippedFiles = migratedFastSnapshot.stats.skippedFileCount;
+          progressState.warningCount = migratedFastSnapshot.warnings.length;
+          emitProgress('done', `done in ${Date.now() - started}ms`, true);
+          return migratedFastSnapshot;
+        }
+      }
+    }
+    const cachedRecordsByUri = cachedRecordsAvailable ? new Map(this.fileRecordsByUri) : new Map<string, CallGraphFileRecord>();
+    let reusedFiles = 0;
+    progressState.current = 0;
+    progressState.total = sourceFiles.length;
     emitProgress(
       'parsing',
       `parsing ${sourceFiles.length} source files with ${parseConcurrency} workers`,
@@ -2088,7 +2455,24 @@ export class CallGraphService implements vscode.Disposable {
         return { record: undefined, warnings: [] as string[], skipped: true } satisfies ParsedSourceFileResult;
       }
       try {
-        const parsed = await parseSourceFileRecord(uri, maxFileSize);
+        const cachedRecord = cachedRecordsByUri.get(uri.toString());
+        if (cachedRecord) {
+          try {
+            const stat = await vscode.workspace.fs.stat(uri);
+            if (fileMetadataMatches(cachedRecord, stat)) {
+              progressState.current += 1;
+              progressState.parsedFiles += 1;
+              reusedFiles += 1;
+              emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`);
+              return { record: cachedRecord, warnings: [] as string[], skipped: false, reused: true } satisfies ParsedSourceFileResult;
+            }
+          } catch {
+            // Fall through to parsing; parseSourceFileRecord will surface a useful warning if the file vanished.
+          }
+        }
+        const parseStarted = Date.now();
+        const parsed = await parseSourceFileRecord(uri, maxFileSize, parseLimits);
+        await applyCallGraphCpuBudget(Date.now() - parseStarted, cpuBudget, token);
         throwIfCancelled();
         progressState.current += 1;
         if (parsed.record) {
@@ -2097,18 +2481,18 @@ export class CallGraphService implements vscode.Disposable {
           progressState.skippedFiles += 1;
         }
         progressState.warningCount += parsed.warnings.length;
-        emitProgress('parsing', `parsed ${progressState.current}/${progressState.total}`);
+        emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`);
         return parsed;
       } catch (err) {
         const warning = `failed to parse ${uri.fsPath}: ${err instanceof Error ? err.message : String(err)}`;
         progressState.current += 1;
         progressState.skippedFiles += 1;
         progressState.warningCount += 1;
-        emitProgress('parsing', `parsed ${progressState.current}/${progressState.total}`);
+        emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`);
         return { record: undefined, warnings: [warning], skipped: true } satisfies ParsedSourceFileResult;
       }
     });
-    emitProgress('parsing', `parsed ${progressState.current}/${progressState.total}`, true);
+    emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`, true);
     const records = parsedResults
       .map((result) => result.record)
       .filter((result): result is CallGraphFileRecord => !!result);
@@ -2188,7 +2572,7 @@ export class CallGraphService implements vscode.Disposable {
     this.applySnapshot(snapshot, index, records, configSignature);
     await this.persistCache(snapshot);
     this.log.appendLine(
-      `call graph rebuilt: files=${snapshot.stats.fileCount} skipped=${snapshot.stats.skippedFileCount} symbols=${snapshot.stats.symbolCount} edges=${snapshot.stats.edgeCount} references=${snapshot.stats.referenceCount} workers=${snapshot.stats.parseConcurrency} elapsed=${snapshot.stats.elapsedMs}ms`,
+      `call graph rebuilt: files=${snapshot.stats.fileCount} skipped=${snapshot.stats.skippedFileCount} reused=${reusedFiles} symbols=${snapshot.stats.symbolCount} edges=${snapshot.stats.edgeCount} references=${snapshot.stats.referenceCount} workers=${snapshot.stats.parseConcurrency} elapsed=${snapshot.stats.elapsedMs}ms`,
     );
     progressState.current = progressState.total;
     progressState.parsedFiles = snapshot.stats.fileCount;
@@ -2507,19 +2891,29 @@ function documentSummaryBucketForUri(uriString: string): number {
   return Math.abs(parsed) % CALL_GRAPH_DOCUMENT_SUMMARY_BUCKETS;
 }
 
-function parseFile(language: CallGraphLanguage, uri: vscode.Uri, relPath: string, text: string): ParsedFile {
+function parseFile(
+  language: CallGraphLanguage,
+  uri: vscode.Uri,
+  relPath: string,
+  text: string,
+  limits: CallGraphParseLimits = DEFAULT_CALL_GRAPH_PARSE_LIMITS,
+): ParsedFile {
   switch (language) {
     case 'python':
-      return parsePythonFile(language, uri, relPath, text);
+      return parsePythonFile(language, uri, relPath, text, limits);
     case 'java':
     case 'kotlin':
     case 'typescript':
     case 'javascript':
-      return parseBraceFile(language, uri, relPath, text);
+      return parseBraceFile(language, uri, relPath, text, limits);
   }
 }
 
-async function parseSourceFileRecord(uri: vscode.Uri, maxFileSize: number): Promise<ParsedSourceFileResult> {
+async function parseSourceFileRecord(
+  uri: vscode.Uri,
+  maxFileSize: number,
+  limits: CallGraphParseLimits = DEFAULT_CALL_GRAPH_PARSE_LIMITS,
+): Promise<ParsedSourceFileResult> {
   if (!isSupportedSourceUri(uri)) {
     return { skipped: true, warnings: [] };
   }
@@ -2534,18 +2928,55 @@ async function parseSourceFileRecord(uri: vscode.Uri, maxFileSize: number): Prom
   const bytes = await vscode.workspace.fs.readFile(uri);
   const text = Buffer.from(bytes).toString('utf8');
   const relPath = vscode.workspace.asRelativePath(uri, false).replace(/\\/g, '/');
+  const lineCheck = checkParseLineLimits(text, limits);
+  if (lineCheck) {
+    return { skipped: true, warnings: [`skipped call graph parse for ${relPath}: ${lineCheck}`] };
+  }
+  const parseStarted = Date.now();
+  const parsed = parseFile(language, uri, relPath, text, limits);
+  const parseElapsed = Date.now() - parseStarted;
+  const warnings = parseElapsed > 2_500
+    ? [`slow call graph parse: ${relPath} ${parseElapsed}ms size=${stat.size}`]
+    : [];
   return {
     skipped: false,
-    warnings: [],
+    warnings,
     record: {
       uri: uri.toString(),
       relPath,
       language,
       mtime: stat.mtime,
       size: stat.size,
-      parsed: parseFile(language, uri, relPath, text),
+      parsed,
     },
   };
+}
+
+function checkParseLineLimits(text: string, limits: CallGraphParseLimits): string | undefined {
+  let lineCount = 1;
+  let currentLineLength = 0;
+  let maxLineLength = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 10 /* \n */) {
+      if (currentLineLength > maxLineLength) { maxLineLength = currentLineLength; }
+      if (limits.maxLineLength > 0 && currentLineLength > limits.maxLineLength) {
+        return `line length ${currentLineLength} > ${limits.maxLineLength}`;
+      }
+      lineCount += 1;
+      if (limits.maxLinesPerFile > 0 && lineCount > limits.maxLinesPerFile) {
+        return `line count ${lineCount} > ${limits.maxLinesPerFile}`;
+      }
+      currentLineLength = 0;
+      continue;
+    }
+    currentLineLength += 1;
+  }
+  if (currentLineLength > maxLineLength) { maxLineLength = currentLineLength; }
+  if (limits.maxLineLength > 0 && maxLineLength > limits.maxLineLength) {
+    return `line length ${maxLineLength} > ${limits.maxLineLength}`;
+  }
+  return undefined;
 }
 
 function isSupportedSourceUri(uri: vscode.Uri): boolean {
@@ -2631,7 +3062,13 @@ async function buildSnapshotFromFileRecords(input: {
   };
 }
 
-function parsePythonFile(language: CallGraphLanguage, uri: vscode.Uri, relPath: string, text: string): ParsedFile {
+function parsePythonFile(
+  language: CallGraphLanguage,
+  uri: vscode.Uri,
+  relPath: string,
+  text: string,
+  limits: CallGraphParseLimits,
+): ParsedFile {
   const lines = text.split(/\r?\n/);
   const symbols: MutableSymbol[] = [];
   const warnings: string[] = [];
@@ -2700,11 +3137,17 @@ function parsePythonFile(language: CallGraphLanguage, uri: vscode.Uri, relPath: 
   symbols.push(...extractPythonConstants(lines, symbols, uri, relPath, language));
   const calls = extractCalls(lines, symbols, uri, relPath, language);
   const bindings = extractVariableBindings(lines, symbols, language);
-  const referenceCandidates = extractReferenceCandidates(lines, symbols, uri, relPath, language);
+  const referenceCandidates = extractReferenceCandidates(lines, symbols, uri, relPath, language, warnings, limits);
   return { symbols, calls, bindings, referenceCandidates, warnings };
 }
 
-function parseBraceFile(language: CallGraphLanguage, uri: vscode.Uri, relPath: string, text: string): ParsedFile {
+function parseBraceFile(
+  language: CallGraphLanguage,
+  uri: vscode.Uri,
+  relPath: string,
+  text: string,
+  limits: CallGraphParseLimits,
+): ParsedFile {
   const lines = text.split(/\r?\n/);
   const symbols: MutableSymbol[] = [];
   const warnings: string[] = [];
@@ -2781,7 +3224,7 @@ function parseBraceFile(language: CallGraphLanguage, uri: vscode.Uri, relPath: s
   symbols.push(...extractBraceConstants(language, lines, symbols, uri, relPath, packageName));
   const calls = extractCalls(lines, symbols, uri, relPath, language);
   const bindings = extractVariableBindings(lines, symbols, language);
-  const referenceCandidates = extractReferenceCandidates(lines, symbols, uri, relPath, language);
+  const referenceCandidates = extractReferenceCandidates(lines, symbols, uri, relPath, language, warnings, limits);
   return { symbols, calls, bindings, referenceCandidates, warnings };
 }
 
@@ -3021,21 +3464,33 @@ function extractReferenceCandidates(
   uri: vscode.Uri,
   relPath: string,
   language: CallGraphLanguage,
+  warnings: string[],
+  limits: CallGraphParseLimits,
 ): CallGraphReferenceCandidate[] {
   const references: CallGraphReferenceCandidate[] = [];
   const callContainers = symbols
     .filter(isCallableSymbol)
     .sort((a, b) => rangeSize(a.bodyRange) - rangeSize(b.bodyRange));
   const tokenRegex = /\b[A-Z][A-Za-z0-9_$]*\b/g;
-  const assignedFunctionNames = dedupeStrings(symbols
+  let assignedFunctionNames = dedupeStrings(symbols
     .filter(isAnonymousFunctionAssignmentSymbol)
     .map((symbol) => symbol.name));
+  if (limits.maxAssignedFunctionNamesPerFile > 0 &&
+      assignedFunctionNames.length > limits.maxAssignedFunctionNamesPerFile) {
+    warnings.push(
+      `limited assigned function usage scan in ${relPath}: ` +
+      `${assignedFunctionNames.length} names > ${limits.maxAssignedFunctionNamesPerFile}`,
+    );
+    assignedFunctionNames = assignedFunctionNames.slice(0, limits.maxAssignedFunctionNamesPerFile);
+  }
   references.push(...extractExportedApiReferenceCandidates(lines, symbols, uri, relPath, language));
   for (let lineNo = 0; lineNo < lines.length; lineNo++) {
+    if (isReferenceCandidateLimitReached(references, limits, warnings, relPath)) { break; }
     const rawLine = lines[lineNo];
     const line = stripInlineCommentsAndStrings(rawLine, language);
     const enclosing = innermostCallableAt(callContainers, lineNo);
     references.push(...findExternalReferenceCandidatesInLine(line, rawLine, lineNo, uri, relPath, language));
+    if (isReferenceCandidateLimitReached(references, limits, warnings, relPath)) { break; }
     for (const match of line.matchAll(tokenRegex)) {
       const name = match[0];
       const start = match.index ?? 0;
@@ -3049,7 +3504,9 @@ function extractReferenceCandidates(
         enclosingSymbolId: enclosing?.id,
         receiver: readReferenceReceiver(line, start),
       });
+      if (isReferenceCandidateLimitReached(references, limits, warnings, relPath)) { break; }
     }
+    if (isReferenceCandidateLimitReached(references, limits, warnings, relPath)) { break; }
     for (const name of assignedFunctionNames) {
       if (/^[A-Z][A-Za-z0-9_$]*$/.test(name)) { continue; }
       for (const start of findIdentifierOccurrences(line, name)) {
@@ -3063,7 +3520,9 @@ function extractReferenceCandidates(
           enclosingSymbolId: enclosing?.id,
           receiver: readReferenceReceiver(line, start),
         });
+        if (isReferenceCandidateLimitReached(references, limits, warnings, relPath)) { break; }
       }
+      if (isReferenceCandidateLimitReached(references, limits, warnings, relPath)) { break; }
     }
   }
   return references;
@@ -3094,6 +3553,20 @@ function extractExportedApiReferenceCandidates(
     references.push(...findPythonAllReferenceCandidates(lines, uri, relPath));
   }
   return references;
+}
+
+function isReferenceCandidateLimitReached(
+  references: readonly CallGraphReferenceCandidate[],
+  limits: CallGraphParseLimits,
+  warnings: string[],
+  relPath: string,
+): boolean {
+  if (limits.maxReferenceCandidatesPerFile <= 0) { return false; }
+  if (references.length < limits.maxReferenceCandidatesPerFile) { return false; }
+  if (!warnings.some((warning) => warning.includes(`limited reference candidates in ${relPath}:`))) {
+    warnings.push(`limited reference candidates in ${relPath}: reached ${limits.maxReferenceCandidatesPerFile}`);
+  }
+  return true;
 }
 
 function findExternalReferenceCandidatesInLine(
@@ -4890,9 +5363,28 @@ function normalizeReceiver(value: string): string {
 }
 
 function readReferenceReceiver(line: string, tokenStart: number): string | undefined {
-  const prefix = line.slice(0, tokenStart);
-  const match = /([A-Za-z_$][\w$]*)\s*\.\s*$/.exec(prefix);
-  return match ? normalizeReceiver(match[1]) : undefined;
+  let i = tokenStart - 1;
+  while (i >= 0 && isFastWhitespace(line.charCodeAt(i))) { i -= 1; }
+  if (i < 0 || line.charCodeAt(i) !== 46 /* . */) { return undefined; }
+  i -= 1;
+  while (i >= 0 && isFastWhitespace(line.charCodeAt(i))) { i -= 1; }
+  const end = i + 1;
+  while (i >= 0 && isFastIdentifierPart(line.charCodeAt(i))) { i -= 1; }
+  const start = i + 1;
+  if (start >= end || !isFastIdentifierStart(line.charCodeAt(start))) { return undefined; }
+  return line.slice(start, end);
+}
+
+function isFastWhitespace(code: number): boolean {
+  return code === 32 || code === 9 || code === 10 || code === 13 || code === 12 || code === 11;
+}
+
+function isFastIdentifierStart(code: number): boolean {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95 || code === 36;
+}
+
+function isFastIdentifierPart(code: number): boolean {
+  return isFastIdentifierStart(code) || (code >= 48 && code <= 57);
 }
 
 function readParameterList(signature: string): string | undefined {
@@ -5143,6 +5635,132 @@ function getConfiguredCallGraphResolveOptions(
   };
 }
 
+function getConfiguredCallGraphParseLimits(
+  cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
+): CallGraphParseLimits {
+  return {
+    maxLineLength: getBoundedIntegerSetting(
+      cfg,
+      'callGraphMaxLineLength',
+      DEFAULT_CALL_GRAPH_PARSE_LIMITS.maxLineLength,
+      0,
+      1_000_000,
+    ),
+    maxLinesPerFile: getBoundedIntegerSetting(
+      cfg,
+      'callGraphMaxLinesPerFile',
+      DEFAULT_CALL_GRAPH_PARSE_LIMITS.maxLinesPerFile,
+      0,
+      2_000_000,
+    ),
+    maxReferenceCandidatesPerFile: getBoundedIntegerSetting(
+      cfg,
+      'callGraphMaxReferenceCandidatesPerFile',
+      DEFAULT_CALL_GRAPH_PARSE_LIMITS.maxReferenceCandidatesPerFile,
+      0,
+      2_000_000,
+    ),
+    maxAssignedFunctionNamesPerFile: getBoundedIntegerSetting(
+      cfg,
+      'callGraphMaxAssignedFunctionNamesPerFile',
+      DEFAULT_CALL_GRAPH_PARSE_LIMITS.maxAssignedFunctionNamesPerFile,
+      0,
+      100_000,
+    ),
+  };
+}
+
+function getConfiguredCallGraphCpuBudget(
+  cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
+): CallGraphCpuBudget {
+  return {
+    percent: getBoundedIntegerSetting(cfg, 'callGraphCpuBudgetPercent', 35, 1, 100),
+    maxPauseMs: getBoundedIntegerSetting(cfg, 'callGraphMaxParserPauseMs', 2_000, 0, 60_000),
+  };
+}
+
+function getBoundedIntegerSetting(
+  cfg: vscode.WorkspaceConfiguration,
+  key: string,
+  defaultValue: number,
+  min: number,
+  max: number,
+): number {
+  const raw = cfg.get<number>(key, defaultValue);
+  if (!Number.isFinite(raw)) { return defaultValue; }
+  return Math.max(min, Math.min(Math.floor(raw), max));
+}
+
+async function applyCallGraphCpuBudget(
+  activeMs: number,
+  budget: CallGraphCpuBudget,
+  token?: vscode.CancellationToken,
+): Promise<void> {
+  if (!Number.isFinite(activeMs) || activeMs < 10 || budget.percent >= 100) { return; }
+  const pauseMs = Math.ceil((activeMs * (100 - budget.percent)) / budget.percent);
+  const boundedPauseMs = budget.maxPauseMs > 0 ? Math.min(pauseMs, budget.maxPauseMs) : pauseMs;
+  if (boundedPauseMs <= 0) { return; }
+  await delayWithCancellation(boundedPauseMs, token);
+}
+
+function delayWithCancellation(ms: number, token?: vscode.CancellationToken): Promise<void> {
+  if (token?.isCancellationRequested) {
+    return Promise.reject(new CallGraphRebuildCancelledError());
+  }
+  return new Promise((resolve, reject) => {
+    let subscription: vscode.Disposable | undefined;
+    const timer = setTimeout(() => {
+      subscription?.dispose();
+      resolve();
+    }, ms);
+    subscription = token?.onCancellationRequested(() => {
+      clearTimeout(timer);
+      subscription?.dispose();
+      reject(new CallGraphRebuildCancelledError());
+    });
+  });
+}
+
+function buildRecordIndexFromRecords(records: readonly CallGraphFileRecord[]): CallGraphRecordIndexEntry[] {
+  return records
+    .map((record) => ({
+      uri: record.uri,
+      relPath: record.relPath,
+      language: record.language,
+      mtime: record.mtime,
+      size: record.size,
+    }))
+    .sort((a, b) => a.relPath.localeCompare(b.relPath));
+}
+
+function applyRecordOverridesToRecordIndex(
+  recordIndex: readonly CallGraphRecordIndexEntry[],
+  overrides: readonly CallGraphRecordOverride[],
+): CallGraphRecordIndexEntry[] {
+  const byUri = new Map(recordIndex.map((entry) => [entry.uri, entry]));
+  for (const override of overrides) {
+    if (override.deleted || !override.record) {
+      byUri.delete(override.uri);
+      continue;
+    }
+    byUri.set(override.uri, {
+      uri: override.record.uri,
+      relPath: override.record.relPath,
+      language: override.record.language,
+      mtime: override.record.mtime,
+      size: override.record.size,
+    });
+  }
+  return [...byUri.values()].sort((a, b) => a.relPath.localeCompare(b.relPath));
+}
+
+function fileMetadataMatches(
+  entry: Pick<CallGraphRecordIndexEntry, 'mtime' | 'size'>,
+  stat: vscode.FileStat,
+): boolean {
+  return entry.size === stat.size && entry.mtime === stat.mtime;
+}
+
 function getCallGraphConfigSignature(
   cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
 ): string {
@@ -5169,6 +5787,9 @@ async function mapWithConcurrency<T, R>(
       next += 1;
       if (index >= items.length) { return; }
       results[index] = await worker(items[index], index);
+      if ((index & 31) === 31) {
+        await yieldToExtensionHost();
+      }
     }
   }));
   return results;

@@ -1,10 +1,10 @@
-export const RENDERER_PATCH_VERSION = 99;
+export const RENDERER_PATCH_VERSION = 107;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
   enablePerfDiagnostics = false,
   suspendIntelliSenseRecursionCapture = true,
-  enableRendererInlayClickHook = false,
+  enableRendererInlayClickHook = true,
   disposeRendererPatchOnHide = true,
 ): string {
   const enableMonacoPreviewCaptureLiteral = enableMonacoPreviewCapture ? 'true' : 'false';
@@ -25,7 +25,7 @@ export function getRendererPatchScript(
       window.__ijFindDisposeSearchUi('patch-upgrade');
     }
   } catch (eDisposePrevious) {}
-  if (window.__ijFindPatchVersion === __ijFindPatchVersion && window.__ijFindPatchedV99) {
+  if (window.__ijFindPatchVersion === __ijFindPatchVersion && window.__ijFindPatchedV100) {
     try { window.__ijFindDisableMonacoProbes = !__ijFindEnableMonacoPreviewCapture; } catch (eFlag) {}
     try { window.__ijFindPerfDiagnostics = !!__ijFindEnablePerfDiagnostics; } catch (ePerfFlag) {}
     try { window.__ijFindShouldSuspendIntelliSenseRecursionCapture = !!__ijFindShouldSuspendIntelliSenseRecursionCapture; } catch (eIrFlag) {}
@@ -44,7 +44,8 @@ export function getRendererPatchScript(
   try { window.__ijFindPatchedV96 = false; } catch (eOldFlag96) {}
   try { window.__ijFindPatchedV97 = false; } catch (eOldFlag97) {}
   try { window.__ijFindPatchedV98 = false; } catch (eOldFlag98) {}
-  window.__ijFindPatchedV99 = true;
+  try { window.__ijFindPatchedV99 = false; } catch (eOldFlag99) {}
+  window.__ijFindPatchedV100 = true;
   window.__ijFindPatchVersion = __ijFindPatchVersion;
   window.__ijFindPerfDiagnostics = !!__ijFindEnablePerfDiagnostics;
   window.__ijFindShouldSuspendIntelliSenseRecursionCapture = !!__ijFindShouldSuspendIntelliSenseRecursionCapture;
@@ -124,6 +125,22 @@ export function getRendererPatchScript(
       }
     } catch (e) {}
   }
+  function sendPersistent(payload) {
+    try {
+      if (payload && payload.type === 'log' && !window.__ijFindDebugRendererLogs) {
+        var logMsg = String(payload.msg || '');
+        if (logMsg.indexOf('__ij-bridge-ping-') !== 0) { return; }
+      }
+      payload.__seq = ++__ijFindSeq;
+      payload.__src = __ijFindInstanceId;
+      var raw = JSON.stringify(payload);
+      if (typeof globalThis.irSearchEvent === 'function') {
+        globalThis.irSearchEvent(raw);
+      } else {
+        console.info(__ijFindConsoleBridgePrefix + raw);
+      }
+    } catch (e) {}
+  }
 
   var __ijFindDisposers = [];
   var __ijFindDisposed = false;
@@ -188,7 +205,7 @@ export function getRendererPatchScript(
       }
     } catch (eOverflowDetach) {}
     try { setIntelliSenseRecursionCaptureSuspended(false, 'dispose:' + (reason || 'unknown')); } catch (eIrDispose) {}
-    try { window.__ijFindPatchedV99 = false; } catch (ePatchFlag) {}
+    try { window.__ijFindPatchedV100 = false; } catch (ePatchFlag) {}
     try {
       if (window.__ijFindPatchVersion === __ijFindPatchVersion) {
         window.__ijFindPatchVersion = 0;
@@ -1147,6 +1164,16 @@ export function getRendererPatchScript(
     '  isolation: isolate;',
     '}',
     '.ij-find-overlay.visible { display: flex; }',
+    '.ij-find-overlay.ij-find-shell {',
+    '  height: auto;',
+    '  min-height: 0;',
+    '  max-height: calc(100vh - 100px);',
+    '}',
+    '.ij-find-overlay.ij-find-shell .ij-find-results,',
+    '.ij-find-overlay.ij-find-shell .ij-find-splitter,',
+    '.ij-find-overlay.ij-find-shell .ij-find-preview {',
+    '  display: none;',
+    '}',
     '.ij-find-resizer {',
     '  position: absolute; bottom: 0; right: 0;',
     '  width: 16px; height: 16px;',
@@ -1750,12 +1777,12 @@ export function getRendererPatchScript(
     children: [$header, $toolbar, $results, $splitter, $preview, $resizer],
   });
   markSearchUiRoot(panel);
-  ensureSearchUiMounted(panel);
-  syncPreviewOverflowTheme(panel);
 
   var $hoverTooltip = el('div', { className: 'ij-find-hover-tooltip' });
   markSearchUiRoot($hoverTooltip);
-  syncPreviewOverflowTheme($hoverTooltip);
+  if (isDomPreviewHoverEnabled()) {
+    syncPreviewOverflowTheme($hoverTooltip);
+  }
 
   // When the preview pane is resized (panel corner drag or splitter), relayout
   // any stolen Monaco editor so it re-fits the available area.
@@ -1938,6 +1965,261 @@ export function getRendererPatchScript(
       return { error: String(eDom && eDom.message || eDom).slice(0, 120) };
     }
   }
+  function eventDelayMs(evt) {
+    try {
+      if (!evt || typeof evt.timeStamp !== 'number') { return null; }
+      var nowPerf = perfNow();
+      var ts = evt.timeStamp;
+      // DOMHighResTimeStamp is relative to navigationStart; old epoch-based
+      // events are relative to Date.now().
+      var delay = ts > 1000000000 ? (Date.now() - ts) : (nowPerf - ts);
+      if (!isFinite(delay)) { return null; }
+      return Math.max(0, Math.round(delay));
+    } catch (eDelay) { return null; }
+  }
+  function compactEventTarget(target) {
+    try {
+      if (!target || !target.tagName) { return { tag: '', inPanel: false, role: '' }; }
+      var cls = typeof target.className === 'string' ? target.className : '';
+      var role = '';
+      if (target === $q) { role = 'query'; }
+      else if (target === $scope) { role = 'scope'; }
+      else if (target === $refresh) { role = 'run'; }
+      else if (target === $close) { role = 'close'; }
+      return {
+        tag: String(target.tagName || '').toLowerCase(),
+        id: target.id ? String(target.id).slice(0, 60) : '',
+        cls: cls ? cls.slice(0, 100) : '',
+        role: role,
+        inPanel: !!(panel && panel.contains && panel.contains(target)),
+      };
+    } catch (eTarget) {
+      return { tag: 'err', inPanel: false, role: '' };
+    }
+  }
+  var __ijPanelDiag = {
+    active: false,
+    reason: '',
+    startedAt: 0,
+    lastFrameAt: 0,
+    rafId: 0,
+    flushTimer: 0,
+    removeListeners: [],
+    frameGaps: [],
+    slowFrames: [],
+    events: [],
+    eventTimings: [],
+    longTasks: [],
+    longAnimationFrames: [],
+    marks: [],
+    framesTotal: 0,
+    maxGapMs: 0,
+    flushSeq: 0,
+    lastHealthyFlushAt: 0,
+  };
+  function diagPush(listName, item, limit) {
+    try {
+      var list = __ijPanelDiag[listName];
+      if (!Array.isArray(list)) { return; }
+      list.push(item);
+      var max = typeof limit === 'number' ? limit : 240;
+      if (list.length > max) { list.splice(0, list.length - max); }
+    } catch (ePush) {}
+  }
+  function panelDiagMark(name, data) {
+    try {
+      if (!__ijPanelDiag.active) { return; }
+      diagPush('marks', {
+        at: Math.round(perfNow() - __ijPanelDiag.startedAt),
+        name: String(name || ''),
+        data: data || {},
+      }, 80);
+    } catch (eMark) {}
+  }
+  function percentile(values, p) {
+    try {
+      if (!values || values.length === 0) { return 0; }
+      var sorted = values.slice().sort(function (a, b) { return a - b; });
+      var idx = Math.max(0, Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p)));
+      return Math.round(sorted[idx]);
+    } catch (ePct) { return 0; }
+  }
+  function flushPanelDiagnostics(reason, finalFlush) {
+    try {
+      if (!isRendererDiagnosticsEnabled()) { return; }
+      if (!__ijPanelDiag.active && !finalFlush) { return; }
+      var now = perfNow();
+      var frameGaps = __ijPanelDiag.frameGaps.splice(0, __ijPanelDiag.frameGaps.length);
+      var slowFrames = __ijPanelDiag.slowFrames.splice(0, __ijPanelDiag.slowFrames.length);
+      var events = __ijPanelDiag.events.splice(0, __ijPanelDiag.events.length);
+      var eventTimings = __ijPanelDiag.eventTimings.splice(0, __ijPanelDiag.eventTimings.length);
+      var longTasks = __ijPanelDiag.longTasks.splice(0, __ijPanelDiag.longTasks.length);
+      var loafs = __ijPanelDiag.longAnimationFrames.splice(0, __ijPanelDiag.longAnimationFrames.length);
+      var marks = __ijPanelDiag.marks.splice(0, __ijPanelDiag.marks.length);
+      if (!finalFlush && frameGaps.length === 0 && events.length === 0 &&
+          eventTimings.length === 0 && longTasks.length === 0 && loafs.length === 0 && marks.length === 0) {
+        return;
+      }
+      var sum = 0;
+      for (var i = 0; i < frameGaps.length; i++) { sum += frameGaps[i]; }
+      var frameMax = frameGaps.length ? Math.max.apply(Math, frameGaps) : 0;
+      var frameP95 = percentile(frameGaps, 0.95);
+      var hasAnomaly = slowFrames.length > 0 || eventTimings.length > 0 || longTasks.length > 0 || loafs.length > 0 || frameMax >= 32;
+      var hasMarks = marks.length > 0;
+      var verbose = window.__ijFindPerfVerbose === true;
+      var healthyDue = now - (__ijPanelDiag.lastHealthyFlushAt || 0) >= 5000;
+      if (!finalFlush && !hasAnomaly && !hasMarks && !verbose && !healthyDue) { return; }
+      if (!finalFlush && !hasAnomaly && !hasMarks && !verbose) {
+        __ijPanelDiag.lastHealthyFlushAt = now;
+      }
+      send({
+        type: 'trace',
+        phase: 'paneldiag:flush',
+        perf: Math.round(now),
+        data: {
+          reason: reason || '',
+          final: !!finalFlush,
+          seq: ++__ijPanelDiag.flushSeq,
+          healthy: !hasAnomaly,
+          elapsedMs: Math.round(now - (__ijPanelDiag.startedAt || now)),
+          visible: isPanelVisibleForPerf(),
+          frameCount: frameGaps.length,
+          frameGapsMs: (finalFlush || hasAnomaly || verbose) ? frameGaps : [],
+          frameAvgMs: frameGaps.length ? Math.round(sum / frameGaps.length) : 0,
+          frameP95Ms: frameP95,
+          frameMaxMs: frameMax,
+          framesTotal: __ijPanelDiag.framesTotal,
+          maxGapSinceStartMs: Math.round(__ijPanelDiag.maxGapMs || 0),
+          slowFrames: slowFrames,
+          events: events,
+          eventTimings: eventTimings,
+          longTasks: longTasks,
+          longAnimationFrames: loafs,
+          marks: marks,
+          memory: perfMemorySnapshot(),
+          dom: perfDomSnapshot(),
+          light: lightStatusObject(),
+          ir: irLightStatus(),
+        },
+      });
+    } catch (eFlushDiag) {}
+  }
+  function panelDiagEventListener(evt) {
+    try {
+      if (!__ijPanelDiag.active) { return; }
+      var now = perfNow();
+      var item = {
+        at: Math.round(now - __ijPanelDiag.startedAt),
+        type: evt.type || '',
+        delayMs: eventDelayMs(evt),
+        target: compactEventTarget(evt.target),
+        key: evt.key ? String(evt.key).slice(0, 24) : '',
+        button: typeof evt.button === 'number' ? evt.button : undefined,
+        mods: (evt.metaKey ? 'M' : '') + (evt.ctrlKey ? 'C' : '') + (evt.altKey ? 'A' : '') + (evt.shiftKey ? 'S' : ''),
+        defaultPrevented: !!evt.defaultPrevented,
+      };
+      if (!/^(input|keydown|keyup|focusin|focusout|pointerdown|mousedown|click|dblclick)$/.test(item.type || '') &&
+          !(typeof item.delayMs === 'number' && item.delayMs >= 32)) {
+        return;
+      }
+      if ((item.type === 'pointerdown' || item.type === 'mousedown' || item.type === 'click') &&
+          typeof item.delayMs === 'number' && item.delayMs < 16 &&
+          item.target && item.target.inPanel === false &&
+          !window.__ijFindPerfVerbose) {
+        return;
+      }
+      diagPush('events', item, 260);
+    } catch (eEvtDiag) {}
+  }
+  function startPanelDiagnostics(reason, durationMs) {
+    try {
+      if (!isRendererDiagnosticsEnabled()) { return; }
+      var now = perfNow();
+      if (__ijPanelDiag.active) {
+        __ijPanelDiag.reason += ',' + String(reason || 'show');
+        panelDiagMark('diag:extend', { reason: reason || '', durationMs: durationMs || 0 });
+        return;
+      }
+      __ijPanelDiag.active = true;
+      __ijPanelDiag.reason = String(reason || 'show');
+      __ijPanelDiag.startedAt = now;
+      __ijPanelDiag.lastFrameAt = 0;
+      __ijPanelDiag.frameGaps = [];
+      __ijPanelDiag.slowFrames = [];
+      __ijPanelDiag.events = [];
+      __ijPanelDiag.eventTimings = [];
+      __ijPanelDiag.longTasks = [];
+      __ijPanelDiag.longAnimationFrames = [];
+      __ijPanelDiag.marks = [];
+      __ijPanelDiag.framesTotal = 0;
+      __ijPanelDiag.maxGapMs = 0;
+      __ijPanelDiag.flushSeq = 0;
+      __ijPanelDiag.lastHealthyFlushAt = 0;
+      var eventTypes = ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'keydown', 'keyup', 'input', 'wheel', 'focusin', 'focusout'];
+      var opts = { capture: true, passive: true };
+      __ijPanelDiag.removeListeners = [];
+      for (var et = 0; et < eventTypes.length; et++) {
+        try {
+          document.addEventListener(eventTypes[et], panelDiagEventListener, opts);
+          (function (type) {
+            __ijPanelDiag.removeListeners.push(function () {
+              try { document.removeEventListener(type, panelDiagEventListener, opts); } catch (eRemoveEvt) {}
+            });
+          })(eventTypes[et]);
+        } catch (eAddEvt) {}
+      }
+      var tick = function (ts) {
+        if (!__ijPanelDiag.active) { return; }
+        var frameAt = typeof ts === 'number' ? ts : perfNow();
+        if (__ijPanelDiag.lastFrameAt > 0) {
+          var gap = frameAt - __ijPanelDiag.lastFrameAt;
+          var rounded = Math.max(0, Math.round(gap));
+          __ijPanelDiag.framesTotal++;
+          __ijPanelDiag.frameGaps.push(rounded);
+          if (__ijPanelDiag.frameGaps.length > 180) { __ijPanelDiag.frameGaps.splice(0, __ijPanelDiag.frameGaps.length - 180); }
+          if (gap > __ijPanelDiag.maxGapMs) { __ijPanelDiag.maxGapMs = gap; }
+          if (gap >= 32) {
+            diagPush('slowFrames', {
+              at: Math.round(frameAt - __ijPanelDiag.startedAt),
+              gapMs: rounded,
+              visible: isPanelVisibleForPerf(),
+              activeTag: document.activeElement && document.activeElement.tagName ? String(document.activeElement.tagName).toLowerCase() : '',
+            }, 80);
+          }
+        }
+        __ijPanelDiag.lastFrameAt = frameAt;
+        if (isPanelVisibleForPerf()) {
+          __ijPanelDiag.rafId = requestAnimationFrame(tick);
+        }
+      };
+      if (typeof requestAnimationFrame === 'function') {
+        __ijPanelDiag.rafId = requestAnimationFrame(tick);
+      }
+      __ijPanelDiag.flushTimer = setInterval(function () {
+        flushPanelDiagnostics('interval', false);
+      }, 1000);
+      panelDiagMark('diag:start', { reason: reason || '', durationMs: durationMs || 0 });
+    } catch (eStartDiag) {}
+  }
+  function stopPanelDiagnostics(reason) {
+    try {
+      if (!__ijPanelDiag.active) { return; }
+      panelDiagMark('diag:stop', { reason: reason || '' });
+      __ijPanelDiag.active = false;
+      if (__ijPanelDiag.rafId && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(__ijPanelDiag.rafId);
+      }
+      __ijPanelDiag.rafId = 0;
+      if (__ijPanelDiag.flushTimer) { clearInterval(__ijPanelDiag.flushTimer); }
+      __ijPanelDiag.flushTimer = 0;
+      var removers = __ijPanelDiag.removeListeners || [];
+      __ijPanelDiag.removeListeners = [];
+      for (var i = 0; i < removers.length; i++) {
+        try { removers[i](); } catch (eRemoveDiag) {}
+      }
+      flushPanelDiagnostics(reason || 'stop', true);
+    } catch (eStopDiag) {}
+  }
   function longTaskAttribution(entry) {
     var out = [];
     try {
@@ -2081,6 +2363,14 @@ export function getRendererPatchScript(
           var duration = entry && entry.duration ? entry.duration : 0;
           if (duration < 50) { continue; }
           __ijPerfWatch.longTaskEvents++;
+          diagPush('longTasks', {
+            at: Math.round(perfNow() - (__ijPanelDiag.startedAt || perfNow())),
+            durationMs: Math.round(duration),
+            startTimeMs: Math.round(entry.startTime || 0),
+            name: entry.name || '',
+            entryType: entry.entryType || '',
+            attribution: longTaskAttribution(entry),
+          }, 80);
           trace('perf:longtask', {
             durationMs: Math.round(duration),
             startTimeMs: Math.round(entry.startTime || 0),
@@ -2097,6 +2387,80 @@ export function getRendererPatchScript(
       trace('perf:longtask-observer', { supported: true, entryTypes: supported.slice ? supported.slice(0, 40) : [] });
     } catch (eLongTask) {
       trace('perf:longtask-observer', { supported: false, reason: String(eLongTask && eLongTask.message || eLongTask).slice(0, 160) });
+    }
+  })();
+  (function installEventTimingObserver() {
+    try {
+      if (!isRendererDiagnosticsEnabled()) { return; }
+      if (typeof PerformanceObserver !== 'function') { return; }
+      var supported = PerformanceObserver.supportedEntryTypes || [];
+      if (!supported.indexOf || supported.indexOf('event') < 0) {
+        trace('perf:event-observer', { supported: false });
+        return;
+      }
+      var observer = new PerformanceObserver(function (list) {
+        if (!isPanelVisibleForPerf() && !__ijPanelDiag.active) { return; }
+        var entries = list.getEntries ? list.getEntries() : [];
+        for (var i = 0; i < entries.length && i < 60; i++) {
+          var entry = entries[i];
+          var duration = Math.round(entry.duration || 0);
+          var delay = Math.round((entry.processingStart || 0) - (entry.startTime || 0));
+          var processing = Math.round((entry.processingEnd || 0) - (entry.processingStart || 0));
+          if (!window.__ijFindPerfVerbose && !/^(click|dblclick|mousedown|mouseup|pointerdown|pointerup|keydown|keyup|input|wheel)$/.test(entry.name || '')) {
+            if (duration < 80 && delay < 40 && processing < 16) { continue; }
+          }
+          if (duration < 80 && delay < 40 && processing < 16 && !window.__ijFindPerfVerbose) { continue; }
+          diagPush('eventTimings', {
+            at: Math.round(perfNow() - (__ijPanelDiag.startedAt || perfNow())),
+            name: entry.name || '',
+            durationMs: duration,
+            delayMs: delay,
+            processingMs: processing,
+            cancelable: !!entry.cancelable,
+          }, 120);
+        }
+      });
+      try {
+        observer.observe({ type: 'event', buffered: true, durationThreshold: 16 });
+      } catch (eTypedEvent) {
+        observer.observe({ entryTypes: ['event'] });
+      }
+      addDisposer(function () { try { observer.disconnect(); } catch (eDisconnectEvent) {} });
+      trace('perf:event-observer', { supported: true });
+    } catch (eEventObs) {
+      trace('perf:event-observer', { supported: false, reason: String(eEventObs && eEventObs.message || eEventObs).slice(0, 160) });
+    }
+  })();
+  (function installLongAnimationFrameObserver() {
+    try {
+      if (!isRendererDiagnosticsEnabled()) { return; }
+      if (typeof PerformanceObserver !== 'function') { return; }
+      var supported = PerformanceObserver.supportedEntryTypes || [];
+      if (!supported.indexOf || supported.indexOf('long-animation-frame') < 0) {
+        trace('perf:loaf-observer', { supported: false });
+        return;
+      }
+      var observer = new PerformanceObserver(function (list) {
+        if (!isPanelVisibleForPerf() && !__ijPanelDiag.active) { return; }
+        var entries = list.getEntries ? list.getEntries() : [];
+        for (var i = 0; i < entries.length && i < 40; i++) {
+          var entry = entries[i];
+          diagPush('longAnimationFrames', {
+            at: Math.round(perfNow() - (__ijPanelDiag.startedAt || perfNow())),
+            durationMs: Math.round(entry.duration || 0),
+            startTimeMs: Math.round(entry.startTime || 0),
+            blockingDurationMs: Math.round(entry.blockingDuration || 0),
+            renderStartMs: Math.round(entry.renderStart || 0),
+            styleAndLayoutStartMs: Math.round(entry.styleAndLayoutStart || 0),
+            scripts: entry.scripts && typeof entry.scripts.length === 'number' ? entry.scripts.length : 0,
+          }, 80);
+        }
+      });
+      observer.observe({ entryTypes: ['long-animation-frame'] });
+      addDisposer(function () { try { observer.disconnect(); } catch (eDisconnectLoaf) {} });
+      trace('perf:loaf-observer', { supported: true });
+    } catch (eLoafObs) {
+      trace('perf:loaf-observer', { supported: false, reason: String(eLoafObs && eLoafObs.message || eLoafObs).slice(0, 160) });
     }
   })();
   (function installGcObserver() {
@@ -2159,6 +2523,31 @@ export function getRendererPatchScript(
   function syncRegexMultilineUi() {
     var enabled = !!state.options.useRegex;
     $optRegexMultiline.setAttribute('aria-disabled', enabled ? 'false' : 'true');
+  }
+
+  function setShellMode(active) {
+    try {
+      var beforeChildren = panel ? panel.children.length : -1;
+      panel.classList.toggle('ij-find-shell', !!active);
+      if (active) {
+        if ($results.parentElement === panel) { panel.removeChild($results); }
+        if ($splitter.parentElement === panel) { panel.removeChild($splitter); }
+        if ($preview.parentElement === panel) { panel.removeChild($preview); }
+        if ($resizer.parentElement === panel) { panel.removeChild($resizer); }
+      } else {
+        if ($results.parentElement !== panel) { panel.appendChild($results); }
+        if ($splitter.parentElement !== panel) { panel.appendChild($splitter); }
+        if ($preview.parentElement !== panel) { panel.appendChild($preview); }
+        if ($resizer.parentElement !== panel) { panel.appendChild($resizer); }
+      }
+      panelDiagMark('shellMode', {
+        active: !!active,
+        beforeChildren: beforeChildren,
+        afterChildren: panel ? panel.children.length : -1,
+        resultsAttached: $results.parentElement === panel,
+        previewAttached: $preview.parentElement === panel,
+      });
+    } catch (eShell) {}
   }
 
   // Render elapsed time as ' (N.Ns)' or ' (Nms)' — appended to status
@@ -2713,6 +3102,7 @@ export function getRendererPatchScript(
 	    var scopePatterns = parseScopeInput(scopeRaw);
     clearPreview();
     if (!q) {
+      setShellMode(true);
       state.files = []; state.flat = []; state.activeIndex = -1; state.searching = false;
       state.rgQuery = ''; state.filterQuery = ''; state.rgScope = '';
       state.hasMoreResults = false; state.loadingMore = false;
@@ -2722,6 +3112,7 @@ export function getRendererPatchScript(
       send({ type: 'cancel' });
       return;
     }
+    setShellMode(false);
     // Smart search-cancellation policy (preserves accuracy):
     //   - Extension (new strictly extends old): the in-flight/finished rg has
     //     the SUPERSET of matches we need. Don't cancel — just re-filter
@@ -4058,6 +4449,44 @@ export function getRendererPatchScript(
     }
   }
 
+  function classTextOf(el) {
+    try {
+      if (!el) { return ''; }
+      if (typeof el.className === 'string') { return el.className; }
+      if (el.getAttribute) { return el.getAttribute('class') || ''; }
+    } catch (eClassText) {}
+    return '';
+  }
+
+  function isCallGraphInlayishElement(el) {
+    try {
+      if (!el || !el.tagName) { return false; }
+      var cls = classTextOf(el);
+      if (/\\b(?:ijss-callgraph|callgraph|inlay|inline-hint|inlineHints|codelens|codicon)\\b/i.test(cls)) {
+        return true;
+      }
+      var role = el.getAttribute && String(el.getAttribute('role') || '');
+      if (/button|link/i.test(role) && callGraphInlayLabelKindForElement(el)) { return true; }
+    } catch (eInlayish) {}
+    return false;
+  }
+
+  function callGraphInlayTargetGate(start) {
+    try {
+      var el = start && start.nodeType === 3 ? start.parentElement : start;
+      for (var depth = 0; el && depth < 8; depth++, el = el.parentElement) {
+        if (!el || el === document.body) { break; }
+        if (el.classList && (el.classList.contains('view-line') || el.classList.contains('view-lines') || el.classList.contains('monaco-editor'))) {
+          break;
+        }
+        var kind = callGraphInlayLabelKindForElement(el);
+        if (kind) { return { element: el, kind: kind, reason: 'label' }; }
+        if (isCallGraphInlayishElement(el)) { return { element: el, kind: '', reason: 'inlayish' }; }
+      }
+    } catch (eGate) {}
+    return null;
+  }
+
   function closestCallGraphEditorLine(start) {
     var el = start && start.nodeType === 3 ? start.parentElement : start;
     for (var depth = 0; el && depth < 12; depth++, el = el.parentElement) {
@@ -4081,6 +4510,7 @@ export function getRendererPatchScript(
 
   function findCallGraphInlayChild(el, clientX, clientY) {
     if (!isSmallInlaySearchScope(el)) { return null; }
+    if (!isCallGraphInlayishElement(el) && !callGraphInlayLabelKindForElement(el)) { return null; }
     var children = el && el.querySelectorAll ? el.querySelectorAll('*') : [];
     for (var i = 0; i < children.length; i++) {
       var childKind = callGraphInlayLabelKindForElement(children[i]);
@@ -4100,9 +4530,6 @@ export function getRendererPatchScript(
     for (var depth = 0; el && depth < 8; depth++, el = el.parentElement) {
       if (!el || el === document.body) { break; }
       if (el.classList && (el.classList.contains('view-line') || el.classList.contains('monaco-editor'))) {
-        var line = el.classList.contains('view-line') ? el : closestCallGraphEditorLine(start);
-        var lineChildHit = line ? findCallGraphInlayChild(line, clientX, clientY) : null;
-        if (lineChildHit) { return lineChildHit; }
         break;
       }
       var childHit = findCallGraphInlayChild(el, clientX, clientY);
@@ -4120,17 +4547,27 @@ export function getRendererPatchScript(
 
   function findCallGraphInlayElement(start, clientX, clientY) {
     if (isSearchUiEventTarget(start)) { return null; }
+    var gate = callGraphInlayTargetGate(start);
+    if (!gate) { return null; }
+    if (gate.kind) {
+      try {
+        var gateRect = gate.element && gate.element.getBoundingClientRect && gate.element.getBoundingClientRect();
+        if (!gateRect || (clientX >= gateRect.left && clientX <= gateRect.right && clientY >= gateRect.top && clientY <= gateRect.bottom)) {
+          return { element: gate.element, kind: gate.kind };
+        }
+      } catch (eGateRect) {
+        return { element: gate.element, kind: gate.kind };
+      }
+    }
     var direct = findCallGraphInlayElementInAncestry(start, clientX, clientY);
     if (direct) { return direct; }
     try {
       var stack = document.elementsFromPoint ? document.elementsFromPoint(clientX, clientY) : [];
       for (var i = 0; i < stack.length; i++) {
         if (isSearchUiEventTarget(stack[i])) { continue; }
-        var line = closestCallGraphEditorLine(stack[i]);
-        var hit = findCallGraphInlayElementInAncestry(line || stack[i], clientX, clientY);
+        if (!callGraphInlayTargetGate(stack[i])) { continue; }
+        var hit = findCallGraphInlayElementInAncestry(stack[i], clientX, clientY);
         if (hit) { return hit; }
-        var childHit = line ? findCallGraphInlayChild(line, clientX, clientY) : null;
-        if (childHit) { return childHit; }
       }
     } catch (ePoint) {}
     return null;
@@ -4246,7 +4683,23 @@ export function getRendererPatchScript(
     }
   }
 
+  function reportCallGraphInlayHook(name, startedAt, event, hit, reason) {
+    try {
+      var elapsed = perfNow() - startedAt;
+      if (elapsed < 4 && !hit) { return; }
+      var payload = {
+        hit: !!hit,
+        reason: reason || '',
+        kind: hit && hit.kind || '',
+        target: compactEventTarget(event && event.target),
+      };
+      panelDiagMark('inlayHook:' + name, payload);
+      reportPerfPhase('inlayHook:' + name, startedAt, payload, 4);
+    } catch (eInlayHookReport) {}
+  }
+
   function handleCallGraphInlayMouseDown(event) {
+    var hookT0 = perfNow();
     if (!event || (typeof event.button === 'number' && event.button !== 0)) { return; }
     if (isSearchUiEventTarget(event.target)) { return; }
     if (event.type !== 'pointerdown' && matchesLastCallGraphInlayActivation(event)) {
@@ -4255,14 +4708,25 @@ export function getRendererPatchScript(
         event.stopPropagation();
         if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
       } catch (eStopDup) {}
+      reportCallGraphInlayHook('duplicate', hookT0, event, null, 'duplicate');
       return;
     }
     var hit = findCallGraphInlayElement(event.target, event.clientX, event.clientY);
-    if (!hit || !hit.kind) { return; }
+    if (!hit || !hit.kind) {
+      reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'miss');
+      return;
+    }
     var widget = findEditorWidgetForInlayElement(hit.element);
     var position = editorPositionFromInlayClick(widget, event);
     if (!position) {
-      send({ type: 'log', msg: 'call graph inlay click: hit but no editor position kind=' + hit.kind });
+      setTimeout(function () {
+        sendPersistent({
+          type: 'runCommand',
+          command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
+          args: [hit.kind, '', -1, -1],
+        });
+      }, 0);
+      reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'hit-no-position');
       return;
     }
     try {
@@ -4271,30 +4735,37 @@ export function getRendererPatchScript(
       if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
     } catch (eStop) {}
     rememberCallGraphInlayActivation(event, hit);
-    send({
+    sendPersistent({
       type: 'runCommand',
       command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
       args: [hit.kind, position.uri, position.line, position.column],
     });
+    reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'hit');
   }
 
   function suppressCallGraphInlayClick(event) {
+    var hookT0 = perfNow();
     if (matchesLastCallGraphInlayActivation(event)) {
       try {
         event.preventDefault();
         event.stopPropagation();
         if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
       } catch (eStopCached) {}
+      reportCallGraphInlayHook('click', hookT0, event, null, 'duplicate');
       return;
     }
     if (isSearchUiEventTarget(event.target)) { return; }
     var hit = findCallGraphInlayElement(event.target, event.clientX, event.clientY);
-    if (!hit) { return; }
+    if (!hit) {
+      reportCallGraphInlayHook('click', hookT0, event, hit, 'miss');
+      return;
+    }
     try {
       event.preventDefault();
       event.stopPropagation();
       if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
     } catch (eStop) {}
+    reportCallGraphInlayHook('click', hookT0, event, hit, 'hit');
   }
 
   function removePriorCallGraphInlayListeners() {
@@ -4327,11 +4798,11 @@ export function getRendererPatchScript(
   removePriorCallGraphInlayListeners();
   if (__ijFindEnableRendererInlayClickHook) {
     if (window.PointerEvent) {
-      on(document, 'pointerdown', handleCallGraphInlayMouseDown, true);
+      document.addEventListener('pointerdown', handleCallGraphInlayMouseDown, true);
     } else {
-      on(document, 'mousedown', handleCallGraphInlayMouseDown, true);
+      document.addEventListener('mousedown', handleCallGraphInlayMouseDown, true);
     }
-    on(document, 'click', suppressCallGraphInlayClick, true);
+    document.addEventListener('click', suppressCallGraphInlayClick, true);
     window.__ijFindCallGraphInlayListeners = {
       pointerdown: window.PointerEvent ? handleCallGraphInlayMouseDown : null,
       mousedown: window.PointerEvent ? null : handleCallGraphInlayMouseDown,
@@ -4743,6 +5214,11 @@ export function getRendererPatchScript(
   function renderPreviewDOM(msg) {
     var previewT0 = perfNow();
     startPerfWatch('preview:dom', 8000);
+    panelDiagMark('preview:dom:start', {
+      uri: msg && msg.uri ? String(msg.uri).slice(-120) : '',
+      lineCount: msg && msg.lines ? msg.lines.length : 0,
+      focusLine: msg ? msg.focusLine : undefined,
+    });
     trace('preview:dom:start', {
       uri: msg && msg.uri ? String(msg.uri).slice(-120) : '',
       lineCount: msg && msg.lines ? msg.lines.length : 0,
@@ -4798,6 +5274,12 @@ export function getRendererPatchScript(
       }, 0);
     }
     trace('preview:dom:end', {
+      renderedLines: bounded.lines.length,
+      omittedBefore: bounded.omittedBefore,
+      omittedAfter: bounded.omittedAfter,
+      durationMs: Math.round(perfNow() - previewT0),
+    });
+    panelDiagMark('preview:dom:end', {
       renderedLines: bounded.lines.length,
       omittedBefore: bounded.omittedBefore,
       omittedAfter: bounded.omittedAfter,
@@ -5213,14 +5695,23 @@ export function getRendererPatchScript(
 	    try {
 	      if (Date.now() < (state.recoveryUntil || 0)) { return 'suppressed:recovery'; }
 	      var wasVisible = panel.classList.contains('visible');
+	      var suppressSearch = !!(showOptions && showOptions.suppressSearch);
+	      var forceLiteral = !!(showOptions && showOptions.forceLiteral);
+      var shouldShell = suppressSearch || !(typeof initialQuery === 'string' && initialQuery.length > 0);
       setIntelliSenseRecursionCaptureSuspended(true, 'search-ui-visible');
       var showT0 = perfNow();
+      startPanelDiagnostics('show', 30000);
       startPerfWatch('show', 15000);
+      panelDiagMark('show:start', { queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0, suppressSearch: suppressSearch, shouldShell: shouldShell, wasVisible: !!wasVisible });
       trace('show:start', {
         queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0,
         hasNewline: typeof initialQuery === 'string' && initialQuery.indexOf('\\n') >= 0,
         wasVisible: !!wasVisible,
       });
+      var shellT0 = perfNow();
+      setShellMode(shouldShell);
+      reportPerfPhase('show:setShellMode', shellT0, { shouldShell: shouldShell }, 1);
+      var styleT0 = perfNow();
       panel.classList.add('visible');
       panel.style.setProperty('display', 'flex', 'important');
       panel.style.setProperty('visibility', 'visible', 'important');
@@ -5228,17 +5719,27 @@ export function getRendererPatchScript(
       panel.style.setProperty('pointer-events', 'auto', 'important');
       panel.style.setProperty('z-index', '10000', 'important');
       panel.style.setProperty('position', 'fixed', 'important');
-      syncPreviewOverflowTheme(panel);
-      if (isDomPreviewHoverEnabled()) {
+      reportPerfPhase('show:style', styleT0, { shouldShell: shouldShell }, 1);
+      var themeT0 = perfNow();
+      if (!shouldShell) {
+        syncPreviewOverflowTheme(panel);
+      }
+      if (!shouldShell && isDomPreviewHoverEnabled()) {
         syncPreviewOverflowTheme($hoverTooltip);
       }
+      reportPerfPhase('show:themeSync', themeT0, { shouldShell: shouldShell }, 1);
+      var mountT0 = perfNow();
       ensureSearchUiMounted(panel);
-      if (isDomPreviewHoverEnabled() && document.body.lastElementChild !== $hoverTooltip) {
+      reportPerfPhase('show:mount', mountT0, {
+        shouldShell: shouldShell,
+        parentTag: panel.parentElement && panel.parentElement.tagName ? String(panel.parentElement.tagName).toLowerCase() : '',
+      }, 1);
+      if (!shouldShell && isDomPreviewHoverEnabled() && document.body.lastElementChild !== $hoverTooltip) {
         document.body.appendChild($hoverTooltip);
       }
       try {
         var previewOverflowRoot = document.querySelector('.ij-find-preview-overflow-root');
-        if (previewOverflowRoot) {
+        if (previewOverflowRoot && !shouldShell) {
           document.body.appendChild(previewOverflowRoot);
           syncPreviewOverflowTheme(previewOverflowRoot);
         }
@@ -5248,8 +5749,6 @@ export function getRendererPatchScript(
       // processes our JS (send to extension → runRgSearch → network roundtrip)
       // inside the same microtask and the panel appears only after the first
       // results:start message lands. rAF guarantees one paint first.
-	      var suppressSearch = !!(showOptions && showOptions.suppressSearch);
-	      var forceLiteral = !!(showOptions && showOptions.forceLiteral);
       trace('show:options', { suppressSearch: suppressSearch, forceLiteral: forceLiteral });
       if (forceLiteral) {
         state.options.useRegex = false;
@@ -5259,6 +5758,7 @@ export function getRendererPatchScript(
         syncRegexMultilineUi();
       }
       if (typeof initialQuery === 'string' && (suppressSearch || (initialQuery && initialQuery !== $q.value))) {
+        panelDiagMark('show:setQuery', { len: initialQuery.length, suppressSearch: suppressSearch });
         var oldQ = state.rgQuery || '';
         var oldOpts = state.rgOptions;
         var oldScope = state.rgScope || '';
@@ -5280,13 +5780,28 @@ export function getRendererPatchScript(
         autosizeQuery();
         if (state.debounce) { clearTimeout(state.debounce); state.debounce = null; }
         if (suppressSearch) {
+          panelDiagMark('show:suppressSearch', { len: initialQuery.length });
+          cancelScheduledRender();
+          clearPreview();
+          state.files = [];
+          state.flat = [];
+          state.candidates = [];
+          state.candidateTotal = 0;
+          state.confirmedUris = {};
+          state.fileIndexByUri = {};
+          state.matchCount = 0;
+          state.activeIndex = -1;
+          state.searching = false;
+          state.loadingMore = false;
+          state.hasMoreResults = false;
           state.rgQuery = '';
           state.filterQuery = '';
           state.rgScope = '';
           if (state.debounce) { clearTimeout(state.debounce); state.debounce = null; }
-          setStatus('Loading results\u2026', true);
+          setStatus(initialQuery ? 'Press Enter or Run to search' : 'Type a query', false);
           render();
         } else if (extendsCurrent) {
+          panelDiagMark('show:extendsCurrent', { len: initialQuery.length });
           state.filterQuery = initialQuery;
           render();
           var visibleRows = 0;
@@ -5299,6 +5814,7 @@ export function getRendererPatchScript(
             setStatus(visibleRows + ' match' + (visibleRows === 1 ? '' : 'es'), false);
           }
         } else {
+          panelDiagMark('show:autoSearch', { len: initialQuery.length });
           setStatus('Searching\u2026', true);
           render();
           var showSearchFired = false;
@@ -5314,8 +5830,14 @@ export function getRendererPatchScript(
           setTimeout(fireShowSearch, 50);
         }
       }
-	      setTimeout(function () { try { $q.focus(); $q.select(); } catch (e) {} }, 0);
+	      setTimeout(function () {
+        var focusT0 = perfNow();
+        try { $q.focus(); $q.select(); } catch (e) {}
+        reportPerfPhase('show:focusSelect', focusT0, { activeTag: document.activeElement && document.activeElement.tagName ? String(document.activeElement.tagName).toLowerCase() : '' }, 1);
+        panelDiagMark('show:focusSelect', {});
+      }, 0);
       trace('show:end', { queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0, durationMs: Math.round(perfNow() - showT0) });
+      panelDiagMark('show:end', { durationMs: Math.round(perfNow() - showT0) });
       reportPerfPhase('show', showT0, {
         queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0,
         wasVisible: !!wasVisible,
@@ -5326,6 +5848,7 @@ export function getRendererPatchScript(
 	  window.__ijFindHide = function () {
 	    var wasVisible = panel.classList.contains('visible');
     trace('hide:start', { wasVisible: !!wasVisible });
+    panelDiagMark('hide:start', { wasVisible: !!wasVisible });
     stopPerfWatch('hide');
 	    panel.classList.remove('visible');
     panel.style.removeProperty('display');
@@ -5368,6 +5891,8 @@ export function getRendererPatchScript(
     }
     setIntelliSenseRecursionCaptureSuspended(false, 'search-ui-hidden');
     trace('hide:end', { wasVisible: !!wasVisible });
+    panelDiagMark('hide:end', { wasVisible: !!wasVisible });
+    stopPanelDiagnostics('hide');
     if (window.__ijFindDisposeRendererPatchOnHide) {
       setTimeout(function () {
         try {
@@ -5517,9 +6042,16 @@ export function getRendererPatchScript(
 	    }
 	    var msgSearchId = typeof msg.searchId === 'number' ? msg.searchId : null;
       var msgT0 = perfNow();
+      panelDiagMark('message:start', {
+        type: String(msg && msg.type || ''),
+        searchId: msgSearchId,
+        batch: msg && Array.isArray(msg.matches) ? msg.matches.length : undefined,
+      });
       try {
 	    switch (msg.type) {
 	      case 'results:start':
+        panelDiagMark('results:start', { searchId: msgSearchId });
+        setShellMode(false);
         startPerfWatch('results:start', 12000);
         trace('results:start', { searchId: msgSearchId });
 	        cancelScheduledRender();
@@ -5570,6 +6102,7 @@ export function getRendererPatchScript(
 	      case 'results:batch':
 	        if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
 	        var batch = Array.isArray(msg.matches) ? msg.matches : [];
+        panelDiagMark('results:batch', { searchId: msgSearchId, files: batch.length });
         startPerfWatch('results:batch', 8000);
         trace('results:batch', { searchId: msgSearchId, files: batch.length });
 	        var changed = false;
@@ -5580,6 +6113,11 @@ export function getRendererPatchScript(
 	        break;
 	      case 'results:done':
 	        if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
+        panelDiagMark('results:done:start', {
+          searchId: msgSearchId,
+          totalMatches: msg.totalMatches,
+          totalFiles: msg.totalFiles,
+        });
         startPerfWatch('results:done', 8000);
         trace('results:done:start', {
           searchId: msgSearchId,
@@ -5647,6 +6185,11 @@ export function getRendererPatchScript(
           flat: state.flat.length,
           activeIndex: state.activeIndex,
         });
+        panelDiagMark('results:done:end', {
+          searchId: msgSearchId,
+          flat: state.flat.length,
+          activeIndex: state.activeIndex,
+        });
 	        break;
       case 'results:error':
         if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
@@ -5666,6 +6209,10 @@ export function getRendererPatchScript(
         renderSearchHistory();
         break;
       case 'preview':
+        panelDiagMark('preview:message', {
+          uri: msg.uri ? String(msg.uri).slice(-120) : '',
+          lineCount: msg.lines && typeof msg.lines.length === 'number' ? msg.lines.length : 0,
+        });
         startPerfWatch('preview:message', 8000);
         renderPreview(msg);
         break;
