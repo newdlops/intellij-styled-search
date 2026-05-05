@@ -190,6 +190,97 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   // sluggish.
   void overlay.prewarm();
 
+  const runCallGraphRebuild = async (force: boolean): Promise<void> => {
+    overlay.logCommand(force ? 'forceRebuildCallGraph' : 'rebuildCallGraph');
+    const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    status.text = force ? '$(sync~spin) Call graph: force rebuild starting' : '$(sync~spin) Call graph: starting';
+    status.show();
+    callGraphLog.show(true);
+    callGraphLog.appendLine(force ? 'call graph force rebuild requested' : 'call graph rebuild requested');
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: force
+            ? 'IntelliJ Styled Search: force rebuilding call graph'
+            : 'IntelliJ Styled Search: rebuilding call graph',
+          cancellable: true,
+        },
+        async (ui, token) => {
+          ui.report({ increment: 0, message: 'starting; opening progress reporter' });
+          let lastPercent = 0;
+          let lastLogAt = 0;
+          let lastStage = '';
+          let latestMessage = 'starting; opening progress reporter';
+          let latestPercent = 0;
+          const heartbeat = setInterval(() => {
+            ui.report({ increment: 0, message: latestMessage });
+            status.text = `$(sync~spin) Call graph ${latestPercent}%`;
+          }, 1_000);
+          const zoektPause = overlay.pauseZoektFileUpdates(
+            force ? 'call graph force rebuild' : 'call graph rebuild',
+            { cancelIndexing: true },
+          );
+          try {
+            const snapshot = await callGraph.rebuild((progress) => {
+              const percent = progress.total > 0
+                ? Math.min(100, Math.round((progress.current / progress.total) * 100))
+                : 0;
+              const message = formatCallGraphProgressMessage(progress);
+              latestMessage = message;
+              latestPercent = percent;
+              const increment = Math.max(0, percent - lastPercent);
+              lastPercent = Math.max(lastPercent, percent);
+              ui.report({ message, increment });
+              status.text = `$(sync~spin) Call graph ${percent}% ${progress.current}/${progress.total}`;
+              const now = Date.now();
+              if (progress.stage !== lastStage || now - lastLogAt >= 1_000 || progress.stage === 'done') {
+                const heapInfo = progress.heapUsedMb !== undefined && progress.heapLimitMb !== undefined && progress.heapUsageRatio !== undefined
+                  ? ` heap=${progress.heapUsedMb}/${progress.heapLimitMb}MB(${Math.round(progress.heapUsageRatio * 100)}%) throttles=${progress.workerThrottleCount ?? 0}`
+                  : '';
+                callGraphLog.appendLine(
+                  `call graph progress: stage=${progress.stage} current=${progress.current}/${progress.total} ` +
+                  `parsed=${progress.parsedFiles} skipped=${progress.skippedFiles} warnings=${progress.warningCount} ` +
+                  `workers=${progress.concurrency}/${progress.maxConcurrency ?? progress.concurrency}${heapInfo} elapsed=${progress.elapsedMs}ms`,
+                );
+                lastLogAt = now;
+                lastStage = progress.stage;
+              }
+            }, token, { force });
+            ui.report({ increment: Math.max(0, 100 - lastPercent), message: 'done; writing summary' });
+            callGraphLog.appendLine(callGraph.formatInfoReport(snapshot));
+          } finally {
+            zoektPause.dispose();
+            clearInterval(heartbeat);
+          }
+        },
+      );
+      status.text = force ? '$(check) Call graph force rebuilt' : '$(check) Call graph rebuilt';
+      vscode.window.showInformationMessage(force
+        ? 'IntelliJ Styled Search: call graph force rebuilt.'
+        : 'IntelliJ Styled Search: call graph rebuilt.');
+    } catch (err) {
+      if (err instanceof CallGraphRebuildCancelledError) {
+        status.text = force ? '$(circle-slash) Call graph force rebuild cancelled' : '$(circle-slash) Call graph rebuild cancelled';
+        callGraphLog.appendLine(force ? 'call graph force rebuild cancelled' : 'call graph rebuild cancelled');
+        vscode.window.showWarningMessage(force
+          ? 'IntelliJ Styled Search: call graph force rebuild cancelled.'
+          : 'IntelliJ Styled Search: call graph rebuild cancelled.');
+        return;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      status.text = force ? '$(error) Call graph force rebuild failed' : '$(error) Call graph rebuild failed';
+      callGraphLog.appendLine(force
+        ? `call graph force rebuild failed: ${msg}`
+        : `call graph rebuild failed: ${msg}`);
+      vscode.window.showErrorMessage(force
+        ? `Call graph force rebuild failed: ${msg}`
+        : `Call graph rebuild failed: ${msg}`);
+    } finally {
+      setTimeout(() => status.dispose(), 4_000);
+    }
+  };
+
   context.subscriptions.push(
     vscode.commands.registerCommand('intellijStyledSearch.searchInProject', () => {
       overlay.logCommand('searchInProject');
@@ -298,79 +389,8 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       if (query === undefined) { return; }
       await overlay.diagnoseCurrentFile(query);
     }),
-    vscode.commands.registerCommand('intellijStyledSearch.rebuildCallGraph', async () => {
-      overlay.logCommand('rebuildCallGraph');
-      const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-      status.text = '$(sync~spin) Call graph: starting';
-      status.show();
-      callGraphLog.show(true);
-      callGraphLog.appendLine('call graph rebuild requested');
-      try {
-        await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: 'IntelliJ Styled Search: rebuilding call graph',
-            cancellable: true,
-          },
-          async (ui, token) => {
-            ui.report({ increment: 0, message: 'starting; opening progress reporter' });
-            let lastPercent = 0;
-            let lastLogAt = 0;
-            let lastStage = '';
-            let latestMessage = 'starting; opening progress reporter';
-            let latestPercent = 0;
-            const heartbeat = setInterval(() => {
-              ui.report({ increment: 0, message: latestMessage });
-              status.text = `$(sync~spin) Call graph ${latestPercent}%`;
-            }, 1_000);
-            const zoektPause = overlay.pauseZoektFileUpdates('call graph rebuild');
-            try {
-              const snapshot = await callGraph.rebuild((progress) => {
-                const percent = progress.total > 0
-                  ? Math.min(100, Math.round((progress.current / progress.total) * 100))
-                  : 0;
-                const message = formatCallGraphProgressMessage(progress);
-                latestMessage = message;
-                latestPercent = percent;
-                const increment = Math.max(0, percent - lastPercent);
-                lastPercent = Math.max(lastPercent, percent);
-                ui.report({ message, increment });
-                status.text = `$(sync~spin) Call graph ${percent}% ${progress.current}/${progress.total}`;
-                const now = Date.now();
-                if (progress.stage !== lastStage || now - lastLogAt >= 1_000 || progress.stage === 'done') {
-                  callGraphLog.appendLine(
-                    `call graph progress: stage=${progress.stage} current=${progress.current}/${progress.total} ` +
-                    `parsed=${progress.parsedFiles} skipped=${progress.skippedFiles} warnings=${progress.warningCount} ` +
-                    `workers=${progress.concurrency} elapsed=${progress.elapsedMs}ms`,
-                  );
-                  lastLogAt = now;
-                  lastStage = progress.stage;
-                }
-              }, token, { force: true });
-              ui.report({ increment: Math.max(0, 100 - lastPercent), message: 'done; writing summary' });
-              callGraphLog.appendLine(callGraph.formatInfoReport(snapshot));
-            } finally {
-              zoektPause.dispose();
-              clearInterval(heartbeat);
-            }
-          },
-        );
-        status.text = '$(check) Call graph rebuilt';
-        vscode.window.showInformationMessage('IntelliJ Styled Search: call graph rebuilt.');
-      } catch (err) {
-        if (err instanceof CallGraphRebuildCancelledError) {
-          status.text = '$(circle-slash) Call graph rebuild cancelled';
-          callGraphLog.appendLine('call graph rebuild cancelled');
-          vscode.window.showWarningMessage('IntelliJ Styled Search: call graph rebuild cancelled.');
-          return;
-        }
-        const msg = err instanceof Error ? err.message : String(err);
-        status.text = '$(error) Call graph rebuild failed';
-        vscode.window.showErrorMessage(`Call graph rebuild failed: ${msg}`);
-      } finally {
-        setTimeout(() => status.dispose(), 4_000);
-      }
-    }),
+    vscode.commands.registerCommand('intellijStyledSearch.rebuildCallGraph', () => runCallGraphRebuild(false)),
+    vscode.commands.registerCommand('intellijStyledSearch.forceRebuildCallGraph', () => runCallGraphRebuild(true)),
     vscode.commands.registerCommand('intellijStyledSearch.showCallGraphInfo', async () => {
       overlay.logCommand('showCallGraphInfo');
       try {
@@ -581,7 +601,7 @@ function resolveInlaySymbolAtLine(
   column: number,
 ): CallGraphSymbol | undefined {
   const range = new vscode.Range(new vscode.Position(line, 0), new vscode.Position(line + 1, 0));
-  const summaries = callGraph.getSnapshot()
+  const summaries = callGraph.getSnapshot() && !callGraph.isRustNativeIndexOnly()
     ? callGraph.getSymbolRelationSummariesForDocument(uri, range)
     : callGraph.getCachedSymbolRelationSummariesForDocument(uri, range);
   if (summaries.length === 0) {
@@ -719,6 +739,9 @@ async function showCallGraphQueryResult(
 async function getCallGraphQuery(callGraph: CallGraphService, title: string): Promise<string | undefined> {
   const editor = vscode.window.activeTextEditor;
   if (editor) {
+    if (callGraph.isRustNativeIndexOnly()) {
+      await callGraph.ensureDocumentSummariesRestored(editor.document.uri);
+    }
     const targets = callGraph.findTargetsAtPosition(editor.document.uri, editor.selection.active);
     if (targets.length === 1) { return targets[0].id; }
     if (targets.length > 1) {
@@ -857,8 +880,10 @@ async function showCallGraphUsageResult(
     if (!await ensureCallGraphReadyForUi(callGraph, title)) { return; }
     const query = explicitQuery ?? await getCallGraphQuery(callGraph, title);
     if (!query) { return; }
-    const targetSymbol = callGraph.resolveSymbols(query, 1)[0];
-    const usages = callGraph.findUsages(query);
+    const targetSymbol = (await callGraph.resolveSymbolsResolved(query, 1))[0];
+    const usages = targetSymbol && callGraph.isRustNativeIndexOnly()
+      ? await callGraph.findUsagesForSymbolIdFromCache(targetSymbol.id) ?? []
+      : callGraph.findUsages(query);
     await showCallGraphUsageMatches(
       overlay,
       callGraphLog,
@@ -1212,12 +1237,17 @@ function toVsCodeRange(range: CallGraphRange): vscode.Range {
 }
 
 export function formatCallGraphProgressMessage(progress: CallGraphRebuildProgress): string {
+  const heapInfo = progress.heapUsedMb !== undefined && progress.heapLimitMb !== undefined && progress.heapUsageRatio !== undefined
+    ? `heap=${progress.heapUsedMb}/${progress.heapLimitMb}MB(${Math.round(progress.heapUsageRatio * 100)}%)`
+    : '';
   return [
     progress.message,
     progress.total > 0 ? `${progress.current}/${progress.total}` : '',
     `parsed=${progress.parsedFiles}`,
     `skipped=${progress.skippedFiles}`,
-    `workers=${progress.concurrency}`,
+    `workers=${progress.concurrency}/${progress.maxConcurrency ?? progress.concurrency}`,
+    heapInfo,
+    progress.workerThrottleCount ? `throttles=${progress.workerThrottleCount}` : '',
     `${progress.elapsedMs}ms`,
   ].filter(Boolean).join(' ');
 }
@@ -1244,7 +1274,7 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
       this.registry.replaceRange(document.uri, range, []);
       return [];
     }
-    const hasSnapshot = !!this.callGraph.getSnapshot();
+    const hasSnapshot = !!this.callGraph.getSnapshot() && !this.callGraph.isRustNativeIndexOnly();
     if (!hasSnapshot) {
       const restored = await this.callGraph.ensureDocumentSummariesRestored(document.uri);
       if (token.isCancellationRequested) { return []; }
@@ -1254,7 +1284,7 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
       }
     }
     const showCalleeInlayHints = cfg.get<boolean>('callGraphShowCalleeInlayHints', false);
-    const summaries = this.callGraph.getSnapshot()
+    const summaries = hasSnapshot
       ? this.callGraph.getSymbolRelationSummariesForDocument(document.uri, range)
       : this.callGraph.getCachedSymbolRelationSummariesForDocument(document.uri, range);
     const hints: vscode.InlayHint[] = [];

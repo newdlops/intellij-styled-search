@@ -1,14 +1,17 @@
 import * as os from 'os';
 import * as path from 'path';
+import * as fs from 'fs';
+import { spawn, type ChildProcess } from 'child_process';
 import { promisify } from 'util';
+import * as v8 from 'v8';
+import { pathToFileURL } from 'url';
 import { gzip, gunzip } from 'zlib';
 import * as vscode from 'vscode';
-import { findWorkspaceFilesDirect } from './fileDiscovery';
 import { compilePathScopeMatcher } from './pathScope';
 import { decodeTextBytes, looksBinaryContent } from './textFiles';
 
-export type CallGraphLanguage = 'python' | 'java' | 'kotlin' | 'typescript' | 'javascript';
-export type CallGraphSymbolKind = 'class' | 'interface' | 'enum' | 'type' | 'struct' | 'function' | 'method' | 'constructor' | 'constant';
+export type CallGraphLanguage = 'python' | 'java' | 'kotlin' | 'typescript' | 'javascript' | 'graphql';
+export type CallGraphSymbolKind = 'class' | 'interface' | 'enum' | 'type' | 'struct' | 'function' | 'method' | 'constructor' | 'constant' | 'variable' | 'field' | 'property';
 export type CallGraphSymbolModifier = 'abstract' | 'interface' | 'property';
 export type CallGraphEdgeKind = 'direct' | 'method' | 'constructor' | 'static' | 'virtual' | 'dynamic';
 export type CallGraphConfidence = 'exact' | 'resolved' | 'possible' | 'unresolved';
@@ -89,6 +92,10 @@ export interface CallGraphStats {
   skippedUnresolvedEdgeCount: number;
   edgeLimitHit: boolean;
   referenceCount: number;
+  minParseConcurrency?: number;
+  workerThrottleCount?: number;
+  maxHeapUsedMb?: number;
+  maxHeapUsageRatio?: number;
 }
 
 export interface CallGraphSnapshot {
@@ -127,10 +134,56 @@ export interface CallGraphRebuildProgress {
   warningCount: number;
   elapsedMs: number;
   concurrency: number;
+  maxConcurrency?: number;
+  heapUsedMb?: number;
+  heapLimitMb?: number;
+  heapUsageRatio?: number;
+  workerThrottleCount?: number;
 }
 
 export interface CallGraphRebuildOptions {
   force?: boolean;
+}
+
+export interface CallGraphWorkerRebuildInput {
+  workspaceRoot: string;
+  cacheDirFsPath: string;
+  configSignature: string;
+  excludeGlobs: string[];
+  maxFileSize: number;
+  buildLimits: {
+    maxCallsites: number;
+    maxReferenceCandidates: number;
+    memoryBudgetMb: number;
+  };
+  parseConcurrency: number;
+  resolveOptions: {
+    includePossibleEdges: boolean;
+    includeUnresolvedEdges: boolean;
+    maxEdges?: number;
+    maxPossibleTargetsPerCall: number;
+  };
+  parseLimits: {
+    maxLineLength: number;
+    maxLinesPerFile: number;
+    maxReferenceCandidatesPerFile: number;
+    maxAssignedFunctionNamesPerFile: number;
+  };
+  cpuBudget: {
+    percent: number;
+    maxPauseMs: number;
+  };
+}
+
+export interface CallGraphWorkerRebuildResult {
+  builtAtUnixMs: number;
+  stats: CallGraphStats;
+  warnings: string[];
+  recordIndexCount: number;
+  snapshotChunkCount: number;
+  symbolRelationBucketCount: number;
+  documentSummaryBucketCount: number;
+  cacheBytes: number;
 }
 
 type CallGraphVariableBinding = {
@@ -246,6 +299,63 @@ type CallGraphDocumentSummaryFileChunk = CallGraphCacheChunk & {
   uriHash: string;
 };
 
+type RustGraphQueryReference = {
+  name: string;
+  rawText: string;
+  uri: string;
+  relPath: string;
+  range: CallGraphRange;
+  enclosingSymbolId?: string;
+};
+
+type RustGraphQueryResponse = {
+  type?: string;
+  ok?: boolean;
+  builtAtUnixMs?: number;
+  totalReferences?: number;
+  references?: RustGraphQueryReference[];
+  warnings?: string[];
+};
+
+type RustGraphIndexResponse = {
+  type?: string;
+  ok?: boolean;
+  builtAtUnixMs?: number;
+  fileCount?: number;
+  symbolCount?: number;
+  referenceCount?: number;
+  bytes?: number;
+  warnings?: string[];
+};
+
+type RustGraphSymbol = {
+  id?: string;
+  name?: string;
+  qualifiedName?: string;
+  kind?: string;
+  language?: string;
+  uri?: string;
+  relPath?: string;
+  range?: CallGraphRange;
+  bodyRange?: CallGraphRange;
+  containerId?: string;
+  containerName?: string;
+  packageName?: string;
+  extendsNames?: string[];
+  implementsNames?: string[];
+  usageCount?: number;
+  implementationCount?: number;
+};
+
+type RustGraphSymbolQueryResponse = {
+  type?: string;
+  ok?: boolean;
+  builtAtUnixMs?: number;
+  totalSymbols?: number;
+  symbols?: RustGraphSymbol[];
+  warnings?: string[];
+};
+
 type ParsedSourceFileResult = {
   record?: CallGraphFileRecord;
   skipped: boolean;
@@ -303,6 +413,63 @@ type CallGraphBuildBudgetState = {
   droppedReferenceCandidates: number;
   firstCallsiteLimitRelPath?: string;
   firstReferenceCandidateLimitRelPath?: string;
+};
+
+type CallGraphWorkerRuntime = {
+  command: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  source: string;
+};
+
+const CALL_GRAPH_HEAP_HIGH_WATERMARK_RATIO = 0.8;
+const CALL_GRAPH_HEAP_RESUME_RATIO = 0.72;
+const CALL_GRAPH_HEAP_CRITICAL_WATERMARK_RATIO = 0.92;
+const CALL_GRAPH_HEAP_THROTTLE_PAUSE_MS = 150;
+const CALL_GRAPH_HEAP_STALL_ABORT_MS = 10_000;
+
+type CallGraphHeapPressure = {
+  heapUsedBytes: number;
+  heapLimitBytes: number;
+  heapUsageRatio: number;
+  heapUsedMb: number;
+  heapLimitMb: number;
+};
+
+type CallGraphAdaptiveConcurrencySnapshot = {
+  currentConcurrency: number;
+  maxConcurrency: number;
+  active: number;
+  heapUsedMb: number;
+  heapLimitMb: number;
+  heapUsageRatio: number;
+  highWatermarkRatio: number;
+  resumeRatio: number;
+  throttleCount: number;
+  maxHeapUsedMb: number;
+  maxHeapUsageRatio: number;
+  minConcurrency: number;
+};
+
+type CallGraphAdaptiveConcurrencyStats = {
+  maxConcurrency: number;
+  maxObservedConcurrency: number;
+  minObservedConcurrency: number;
+  currentConcurrency: number;
+  throttleCount: number;
+  maxHeapUsedMb: number;
+  maxHeapUsageRatio: number;
+  heapLimitMb: number;
+};
+
+type CallGraphAdaptiveConcurrencyOptions = {
+  token?: vscode.CancellationToken;
+  highWatermarkRatio?: number;
+  resumeRatio?: number;
+  criticalWatermarkRatio?: number;
+  pauseMs?: number;
+  stallAbortMs?: number;
+  onStateChange?: (state: CallGraphAdaptiveConcurrencySnapshot) => void;
 };
 
 type ResolvedCallTarget = {
@@ -387,6 +554,8 @@ const LANGUAGE_BY_EXTENSION = new Map<string, CallGraphLanguage>([
   ['.jsx', 'javascript'],
   ['.mjs', 'javascript'],
   ['.cjs', 'javascript'],
+  ['.graphql', 'graphql'],
+  ['.gql', 'graphql'],
 ]);
 
 const CALL_KEYWORDS = new Set([
@@ -446,26 +615,53 @@ const VALUE_BINDING_TYPE_NAMES = new Set([
   'Void',
 ]);
 
-const MAX_CALL_GRAPH_CONCURRENCY = 32;
+const MAX_CALL_GRAPH_CONCURRENCY = 64;
 const MAX_POSSIBLE_EDGES_PER_CALL = 40;
 const DEFAULT_CALL_GRAPH_CONCURRENCY = getDefaultCallGraphConcurrency();
 const DEFAULT_CALL_GRAPH_MAX_EDGES = 0;
 const DEFAULT_CALL_GRAPH_MAX_CALLSITES = 0;
 const DEFAULT_CALL_GRAPH_MAX_REFERENCE_CANDIDATES = 0;
-const DEFAULT_CALL_GRAPH_MEMORY_BUDGET_MB = 1_024;
+const DEFAULT_CALL_GRAPH_MEMORY_BUDGET_MB = 8_192;
 const CALL_GRAPH_SOURCE_GLOB = '**/*.{py,java,kt,kts,ts,tsx,js,jsx,mjs,cjs}';
 const CALL_GRAPH_CACHE_VERSION = 14;
-const CALL_GRAPH_INCREMENTAL_DEBOUNCE_MS = 1_500;
-const CALL_GRAPH_CACHE_RECORDS_PER_CHUNK = 1_000;
+const CALL_GRAPH_EXTERNAL_INCREMENTAL_DEBOUNCE_MS = 1_500;
+const CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS = 75;
 const CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK = 50_000;
 const CALL_GRAPH_SYMBOL_RELATION_BUCKETS = 256;
 const CALL_GRAPH_DOCUMENT_SUMMARY_BUCKETS = 256;
+const RUST_GRAPH_QUERY_TIMEOUT_MS = 30_000;
+const RUST_GRAPH_PROCESS_KILL_TIMEOUT_MS = 2_000;
 const INTERNAL_CALL_GRAPH_EXCLUDE_GLOBS = [
   '**/.zoek-rs/**',
   '**/.zoekt-rs/**',
 ];
 const gzipAsync = promisify(gzip);
 const gunzipAsync = promisify(gunzip);
+
+type RustGraphProcessKind =
+  | 'build'
+  | 'graph-rebuild'
+  | 'graph-update'
+  | 'graph-index'
+  | 'graph-query'
+  | 'graph-symbol-query'
+  | 'other';
+
+type RustGraphTrackedChild = {
+  id: number;
+  child: ChildProcess;
+  label: string;
+  kind: RustGraphProcessKind;
+  cancelled: boolean;
+  killTimer: ReturnType<typeof setTimeout> | undefined;
+};
+
+type RustGraphInvokeOptions = {
+  onStderrLine?: (line: string) => void;
+  token?: vscode.CancellationToken;
+  timeoutMs?: number;
+  cancelError?: Error;
+};
 
 export class CallGraphService implements vscode.Disposable {
   private snapshot: CallGraphSnapshot | undefined;
@@ -480,8 +676,11 @@ export class CallGraphService implements vscode.Disposable {
   private restorePromise: Promise<void> | undefined;
   private snapshotRestorePromise: Promise<void> | undefined;
   private incrementalTimer: ReturnType<typeof setTimeout> | undefined;
+  private incrementalFlushAt = 0;
+  private incrementalReason = '';
   private incrementalPromise: Promise<void> | undefined;
   private cacheWritePromise: Promise<void> = Promise.resolve();
+  private rustGraphBuildPromise: Promise<string | undefined> | undefined;
   private cacheConfigSignature: string | undefined;
   private cacheManifest: CallGraphCacheManifest | undefined;
   private cacheRecordsLoaded = false;
@@ -491,8 +690,14 @@ export class CallGraphService implements vscode.Disposable {
   private readonly documentSummaryBucketsByIndex = new Map<number, Map<string, CallGraphDocumentSummaryRecord>>();
   private readonly documentSummaryLoadedBuckets = new Set<number>();
   private readonly documentSummaryBucketPromises = new Map<number, Promise<void>>();
+  private readonly rustSymbolQueryCache = new Map<string, { builtAtUnixMs: number; symbols: CallGraphSymbol[] }>();
+  private readonly rustDocumentSummaryPromises = new Map<string, Promise<boolean>>();
+  private readonly rustNativeDocumentSummaryUris = new Set<string>();
+  private readonly rustNativeDirtySummaryUris = new Set<string>();
+  private readonly rustGraphChildren = new Map<number, RustGraphTrackedChild>();
   private documentSummaryMigrationPromise: Promise<boolean> | undefined;
   private readonly documentSummaryFilePromises = new Map<string, Promise<boolean>>();
+  private nextRustGraphChildId = 1;
 
   readonly onDidChangeSnapshot = this.onDidChangeSnapshotEmitter.event;
 
@@ -532,7 +737,7 @@ export class CallGraphService implements vscode.Disposable {
         }
       }),
       vscode.workspace.onDidSaveTextDocument((document) => {
-        this.scheduleIncrementalRefreshIfSupported(document.uri, 'saved');
+        this.scheduleIncrementalRefreshIfSupported(document.uri, 'saved', CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS);
       }),
     );
     context.subscriptions.push(
@@ -547,12 +752,23 @@ export class CallGraphService implements vscode.Disposable {
       clearTimeout(this.incrementalTimer);
       this.incrementalTimer = undefined;
     }
+    this.incrementalFlushAt = 0;
+    this.incrementalReason = '';
+    this.cancelRustGraphProcesses('call graph disposed');
     this.watcher?.dispose();
     this.onDidChangeSnapshotEmitter.dispose();
   }
 
   getSnapshot(): CallGraphSnapshot | undefined {
     return this.snapshot;
+  }
+
+  isRustNativeIndexOnly(snapshot = this.snapshot): boolean {
+    return isRustNativeIndexOnlySnapshot(snapshot);
+  }
+
+  private hasRustNativePrimaryGraph(): boolean {
+    return this.isRustNativeIndexOnly() || isRustNativeGraphManifest(this.cacheManifest);
   }
 
   async ensureBuilt(): Promise<CallGraphSnapshot> {
@@ -577,13 +793,16 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   async ensureDocumentSummariesRestored(uri?: vscode.Uri): Promise<boolean> {
-    if (this.snapshot) { return true; }
+    if (this.snapshot && !this.isRustNativeIndexOnly()) { return true; }
     if (this.restorePromise) {
       await this.restorePromise;
-      if (this.snapshot) { return true; }
+      if (this.snapshot && !this.isRustNativeIndexOnly()) { return true; }
     }
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
+    if (uri && folder && manifest && this.hasRustNativePrimaryGraph()) {
+      return this.ensureRustNativeDocumentSummary(uri);
+    }
     if (uri && this.getCachedDocumentSummaryRecord(uri.toString())) { return true; }
     if (folder && manifest && uri) {
       const fileChunk = findDocumentSummaryFileChunk(manifest, uri.toString());
@@ -625,8 +844,12 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   resolveSymbols(query: string, limit = 20): CallGraphSymbol[] {
+    if (!query.trim()) { return []; }
+    if (this.isRustNativeIndexOnly()) {
+      return this.resolveCachedRustSymbols(query, limit);
+    }
     const snapshot = this.snapshot;
-    if (!snapshot || !query.trim()) { return []; }
+    if (!snapshot) { return []; }
     const normalized = query.trim();
     const lower = normalized.toLowerCase();
     const scored = snapshot.symbols
@@ -636,7 +859,33 @@ export class CallGraphService implements vscode.Disposable {
     return scored.slice(0, limit).map((entry) => entry.symbol);
   }
 
+  async resolveSymbolsResolved(query: string, limit = 20): Promise<CallGraphSymbol[]> {
+    const cached = this.resolveSymbols(query, limit);
+    if (cached.length > 0 || !this.isRustNativeIndexOnly() || !query.trim()) { return cached; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const manifest = this.cacheManifest;
+    if (!folder || !manifest?.builtAtUnixMs) { return cached; }
+    const symbols = await this.queryRustGraphSymbolIndex(
+      folder.uri.fsPath,
+      { query: query.trim(), limit },
+      manifest.builtAtUnixMs,
+    );
+    if (!symbols) { return cached; }
+    if (this.cacheManifest?.builtAtUnixMs !== manifest.builtAtUnixMs) { return cached; }
+    this.rustSymbolQueryCache.set(rustSymbolQueryCacheKey(query, limit), {
+      builtAtUnixMs: manifest.builtAtUnixMs,
+      symbols,
+    });
+    return symbols;
+  }
+
   findEnclosingSymbol(uri: vscode.Uri, position: vscode.Position): CallGraphSymbol | undefined {
+    if (this.isRustNativeIndexOnly()) {
+      const symbols = this.getCachedDocumentSymbols(uri.toString())
+        .filter((symbol) => rangeContainsPosition(symbol.bodyRange, position))
+        .sort((a, b) => rangeSize(a.bodyRange) - rangeSize(b.bodyRange));
+      return symbols.find((symbol) => symbol.kind === 'method' || symbol.kind === 'function') ?? symbols[0];
+    }
     const snapshot = this.snapshot;
     if (!snapshot) { return undefined; }
     const symbols = snapshot.symbols
@@ -646,6 +895,11 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   findDeclarationSymbolsAtPosition(uri: vscode.Uri, position: vscode.Position): CallGraphSymbol[] {
+    if (this.isRustNativeIndexOnly()) {
+      return this.getCachedDocumentSymbols(uri.toString())
+        .filter((symbol) => rangeContainsPosition(symbol.range, position))
+        .sort((a, b) => rangeSize(a.range) - rangeSize(b.range));
+    }
     const snapshot = this.snapshot;
     if (!snapshot) { return []; }
     return snapshot.symbols
@@ -743,6 +997,48 @@ export class CallGraphService implements vscode.Disposable {
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
     const started = Date.now();
+    if (folder && manifest?.snapshot && symbolId) {
+      const rustUsages = await this.queryRustGraphUsageIndex(
+        folder.uri.fsPath,
+        symbolId,
+        limit,
+        manifest.builtAtUnixMs,
+      );
+      if (rustUsages) {
+        if (isRustNativeGraphManifest(manifest)) {
+          const usages = rustUsages.slice(0, limit);
+          this.log.appendLine(
+            `call graph cached usage query: source=rust-native graph-index symbolId=${JSON.stringify(symbolId)} ` +
+            `matches=${usages.length} elapsed=${Date.now() - started}ms`,
+          );
+          return usages;
+        }
+        const overrides = await this.loadRecordOverrides(folder.uri.fsPath, manifest);
+        const overriddenUris = new Set(overrides.map((override) => override.uri));
+        const relationIndex: RelationSummaryIndex = {
+          callersBySymbolId: new Map(),
+          calleesBySymbolId: new Map(),
+          usagesBySymbolId: new Map([[
+            symbolId,
+            rustUsages.filter((reference) => !overriddenUris.has(reference.uri)).slice(0, limit),
+          ]]),
+        };
+        if (overrides.length > 0) {
+          await this.mergeRecordOverrideRelationsForSymbolIds(
+            folder.uri.fsPath,
+            manifest,
+            new Set([symbolId]),
+            relationIndex,
+          );
+        }
+        const usages = (relationIndex.usagesBySymbolId.get(symbolId) ?? []).slice(0, limit);
+        this.log.appendLine(
+          `call graph cached usage query: source=rust-graph-index symbolId=${JSON.stringify(symbolId)} ` +
+          `matches=${usages.length} elapsed=${Date.now() - started}ms`,
+        );
+        return usages;
+      }
+    }
     if (folder && manifest?.snapshot && symbolId && Array.isArray(manifest.symbolRelations)) {
       let baseUsages: CallGraphReference[] = [];
       if (manifest.symbolRelations.length > 0) {
@@ -814,6 +1110,9 @@ export class CallGraphService implements vscode.Disposable {
     range?: vscode.Range,
     limit = 500,
   ): CallGraphSymbolRelationSummary[] {
+    if (this.isRustNativeIndexOnly()) {
+      return this.getCachedSymbolRelationSummariesForDocument(uri, range, limit);
+    }
     const snapshot = this.snapshot;
     if (!snapshot) { return []; }
     const uriString = uri.toString();
@@ -850,7 +1149,7 @@ export class CallGraphService implements vscode.Disposable {
     range?: vscode.Range,
     limit = 500,
   ): CallGraphSymbolRelationSummary[] {
-    if (this.snapshot) {
+    if (this.snapshot && !this.isRustNativeIndexOnly()) {
       return this.getSymbolRelationSummariesForDocument(uri, range, limit);
     }
     const uriString = uri.toString();
@@ -869,6 +1168,37 @@ export class CallGraphService implements vscode.Disposable {
         usageCount: summary.usageCount,
         usages: [],
       }));
+  }
+
+  private getCachedDocumentSymbols(uriString: string): CallGraphSymbol[] {
+    const bucket = documentSummaryBucketForUri(uriString);
+    const record = this.documentSummaryBucketsByIndex.get(bucket)?.get(uriString);
+    return record?.symbols.map((summary) => summary.symbol) ?? [];
+  }
+
+  private resolveCachedRustSymbols(query: string, limit: number): CallGraphSymbol[] {
+    const normalized = query.trim();
+    const manifestBuiltAt = this.cacheManifest?.builtAtUnixMs;
+    const cached = this.rustSymbolQueryCache.get(rustSymbolQueryCacheKey(normalized, limit));
+    if (cached && cached.builtAtUnixMs === manifestBuiltAt) {
+      return cached.symbols.slice(0, limit);
+    }
+    const lower = normalized.toLowerCase();
+    const symbols: CallGraphSymbol[] = [];
+    for (const bucket of this.documentSummaryBucketsByIndex.values()) {
+      for (const record of bucket.values()) {
+        for (const summary of record.symbols) {
+          if (scoreSymbolMatch(summary.symbol, normalized, lower) > 0) {
+            symbols.push(summary.symbol);
+          }
+        }
+      }
+    }
+    return symbols
+      .sort((a, b) =>
+        scoreSymbolMatch(b, normalized, lower) - scoreSymbolMatch(a, normalized, lower) ||
+        a.qualifiedName.localeCompare(b.qualifiedName))
+      .slice(0, limit);
   }
 
   async getContextBundleResolved(symbolOrQuery: string, budget = 12_000): Promise<string> {
@@ -934,8 +1264,14 @@ export class CallGraphService implements vscode.Disposable {
       `skippedEdges: possible=${snapshot.stats.skippedPossibleEdgeCount} unresolved=${snapshot.stats.skippedUnresolvedEdgeCount} limitHit=${snapshot.stats.edgeLimitHit}`,
       `languages: ${Object.entries(snapshot.stats.languageCounts).map(([k, v]) => `${k}=${v}`).join(' ')}`,
       `parseConcurrency: ${snapshot.stats.parseConcurrency}`,
+      snapshot.stats.minParseConcurrency !== undefined
+        ? `parseConcurrencyRange: ${snapshot.stats.minParseConcurrency}-${snapshot.stats.parseConcurrency}`
+        : '',
+      snapshot.stats.maxHeapUsedMb !== undefined && snapshot.stats.maxHeapUsageRatio !== undefined
+        ? `parseHeapMax: ${snapshot.stats.maxHeapUsedMb}MB (${formatHeapUsagePercent(snapshot.stats.maxHeapUsageRatio)}) throttles=${snapshot.stats.workerThrottleCount ?? 0}`
+        : '',
       `elapsedMs: ${snapshot.stats.elapsedMs}`,
-    ];
+    ].filter(Boolean);
     for (const warning of snapshot.warnings.slice(0, 30)) {
       lines.push(`warning: ${warning}`);
     }
@@ -987,24 +1323,94 @@ export class CallGraphService implements vscode.Disposable {
     return results.some(Boolean);
   }
 
-  private scheduleIncrementalRefresh(uri: vscode.Uri, reason: string): void {
+  private async ensureRustNativeDocumentSummary(
+    uri: vscode.Uri,
+    options: { force?: boolean } = {},
+  ): Promise<boolean> {
+    const uriString = uri.toString();
+    if (
+      !options.force &&
+      !this.rustNativeDirtySummaryUris.has(uriString) &&
+      this.rustNativeDocumentSummaryUris.has(uriString) &&
+      this.getCachedDocumentSummaryRecord(uriString)
+    ) {
+      return true;
+    }
+    const existing = this.rustDocumentSummaryPromises.get(uriString);
+    if (existing) { return existing; }
+    const promise = this.doEnsureRustNativeDocumentSummary(uri).finally(() => {
+      this.rustDocumentSummaryPromises.delete(uriString);
+    });
+    this.rustDocumentSummaryPromises.set(uriString, promise);
+    return promise;
+  }
+
+  private async doEnsureRustNativeDocumentSummary(uri: vscode.Uri): Promise<boolean> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const manifest = this.cacheManifest;
+    if (!folder || !manifest?.builtAtUnixMs) { return false; }
+    const uriString = uri.toString();
+    const symbols = await this.queryRustGraphSymbolIndex(
+      folder.uri.fsPath,
+      { uri: uriString, limit: 10_000 },
+      manifest.builtAtUnixMs,
+    );
+    if (!symbols) { return false; }
+    if (this.cacheManifest?.builtAtUnixMs !== manifest.builtAtUnixMs) { return false; }
+    const record: CallGraphDocumentSummaryRecord = {
+      uri: uri.toString(),
+      relPath: symbols[0]?.relPath ?? vscode.workspace.asRelativePath(uri, false),
+      symbols: symbols.map((symbol) => ({
+        symbol,
+        callerCount: 0,
+        calleeCount: 0,
+        implementationCount: Math.max(0, Math.floor(symbol.implementationCount ?? 0)),
+        usageCount: Math.max(0, Math.floor(symbol.usageCount ?? 0)),
+      })),
+    };
+    this.putDocumentSummaryRecord(record, 'rust-native');
+    this.rustNativeDirtySummaryUris.delete(uriString);
+    this.log.appendLine(
+      `call graph rust-native document summary loaded: file=${record.relPath} ` +
+      `symbols=${record.symbols.length}`,
+    );
+    return true;
+  }
+
+  private scheduleIncrementalRefresh(
+    uri: vscode.Uri,
+    reason: string,
+    delayMs = CALL_GRAPH_EXTERNAL_INCREMENTAL_DEBOUNCE_MS,
+  ): void {
     if (this.disposed || isCallGraphExcludedUri(uri)) { return; }
     this.pendingChangedUris.add(uri.toString());
+    if (!this.incrementalReason || reason === 'saved' || this.incrementalReason.startsWith('external-')) {
+      this.incrementalReason = reason;
+    }
+    const normalizedDelayMs = Math.max(0, delayMs);
+    const flushAt = Date.now() + normalizedDelayMs;
+    if (this.incrementalTimer && this.incrementalFlushAt > 0 && this.incrementalFlushAt <= flushAt) {
+      return;
+    }
     if (this.incrementalTimer) {
       clearTimeout(this.incrementalTimer);
     }
+    this.incrementalFlushAt = flushAt;
     this.incrementalTimer = setTimeout(() => {
       this.incrementalTimer = undefined;
+      this.incrementalFlushAt = 0;
       const uriStrings = Array.from(this.pendingChangedUris);
       this.pendingChangedUris.clear();
-      void this.refreshChangedFiles(uriStrings.map((value) => vscode.Uri.parse(value)), reason)
+      const flushReason = this.incrementalReason || reason;
+      this.incrementalReason = '';
+      void this.refreshChangedFiles(uriStrings.map((value) => vscode.Uri.parse(value)), flushReason)
         .catch((err) => this.log.appendLine(`call graph incremental update failed: ${err instanceof Error ? err.message : err}`));
-    }, CALL_GRAPH_INCREMENTAL_DEBOUNCE_MS);
+    }, normalizedDelayMs);
   }
 
-  private scheduleIncrementalRefreshIfSupported(uri: vscode.Uri, reason: string): void {
+  private scheduleIncrementalRefreshIfSupported(uri: vscode.Uri, reason: string, delayMs?: number): void {
     if (uri.scheme !== 'file' || !isSupportedSourceUri(uri) || isCallGraphExcludedUri(uri)) { return; }
-    this.scheduleIncrementalRefresh(uri, reason);
+    this.scheduleIncrementalRefresh(uri, reason, delayMs);
   }
 
   private shouldWatchExternalFileChanges(): boolean {
@@ -1020,6 +1426,16 @@ export class CallGraphService implements vscode.Disposable {
     if (this.restorePromise) {
       await this.restorePromise;
     }
+    if (this.hasRustNativePrimaryGraph()) {
+      if (this.incrementalPromise) {
+        await this.incrementalPromise;
+      }
+      this.incrementalPromise = this.refreshRustNativeChangedFiles(uris, reason).finally(() => {
+        this.incrementalPromise = undefined;
+      });
+      await this.incrementalPromise;
+      return;
+    }
     if (!this.snapshot) {
       await this.refreshChangedFilesWithoutSnapshot(uris, reason);
       return;
@@ -1033,11 +1449,112 @@ export class CallGraphService implements vscode.Disposable {
     await this.incrementalPromise;
   }
 
+  private async refreshRustNativeChangedFiles(uris: vscode.Uri[], reason: string): Promise<void> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const manifest = this.cacheManifest;
+    if (!folder || !manifest?.builtAtUnixMs) {
+      this.log.appendLine(`call graph rust-native incremental ${reason}: no cache metadata available; skipped`);
+      return;
+    }
+    const uniqueUris = dedupeStrings(uris.map((uri) => uri.toString()))
+      .map((value) => vscode.Uri.parse(value))
+      .filter((uri) => uri.scheme === 'file');
+    if (uniqueUris.length === 0) { return; }
+    const started = Date.now();
+    let updated = false;
+    try {
+      updated = await this.updateRustNativeGraphIndex(folder.uri.fsPath, manifest, uniqueUris, reason);
+    } catch (err) {
+      this.log.appendLine(`call graph rust-native incremental ${reason} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (!updated) {
+      this.log.appendLine(
+        `call graph rust-native incremental ${reason}: retained previous summaries for ${uniqueUris.length} changed file(s); ` +
+        'run full call graph rebuild if cross-file usage looks stale',
+      );
+      return;
+    }
+    for (const uri of uniqueUris) {
+      const uriString = uri.toString();
+      if (isSupportedSourceUri(uri) && fs.existsSync(uri.fsPath)) {
+        this.rustNativeDirtySummaryUris.add(uriString);
+      } else {
+        this.deleteDocumentSummaryRecord(uriString);
+        this.rustNativeDirtySummaryUris.delete(uriString);
+      }
+    }
+    this.rustSymbolQueryCache.clear();
+    for (const uri of uniqueUris) {
+      if (!isSupportedSourceUri(uri) || !fs.existsSync(uri.fsPath)) { continue; }
+      try {
+        await this.ensureRustNativeDocumentSummary(uri, { force: true });
+      } catch {}
+    }
+    this.onDidChangeSnapshotEmitter.fire();
+    this.log.appendLine(
+      `call graph rust-native incremental updated: reason=${reason} files=${uniqueUris.length} ` +
+      `elapsed=${Date.now() - started}ms`,
+    );
+  }
+
+  private async updateRustNativeGraphIndex(
+    workspaceRoot: string,
+    manifest: CallGraphCacheManifest,
+    uris: vscode.Uri[],
+    reason: string,
+  ): Promise<boolean> {
+    const binary = await this.resolveRustGraphBinary(true);
+    if (!binary) { return false; }
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const excludeMatcher = createCallGraphExcludeMatcher(cfg);
+    const changedPaths: string[] = [];
+    const deletedPaths: string[] = [];
+    for (const uri of uris) {
+      if (!isSupportedSourceUri(uri) || isUriExcludedFromCallGraph(uri, workspaceRoot, excludeMatcher) || !fs.existsSync(uri.fsPath)) {
+        deletedPaths.push(uri.fsPath);
+      } else {
+        changedPaths.push(uri.fsPath);
+      }
+    }
+    if (changedPaths.length === 0 && deletedPaths.length === 0) { return true; }
+    const args = [
+      binary,
+      'graph-update',
+      workspaceRoot,
+      '--built-at',
+      String(manifest.builtAtUnixMs),
+      '--max-file-size',
+      String(getConfiguredCallGraphMaxFileSize(cfg)),
+      '--workers',
+      String(getConfiguredCallGraphConcurrency(cfg)),
+      ...changedPaths,
+    ];
+    for (const deletedPath of deletedPaths) {
+      args.push('--delete', deletedPath);
+    }
+    this.log.appendLine(
+      `call graph rust-native incremental start: reason=${reason} changed=${changedPaths.length} deleted=${deletedPaths.length}`,
+    );
+    const response = await this.invokeRustGraphJson(args) as RustGraphIndexResponse;
+    if (response.type !== 'graph-index' || response.ok !== true || response.builtAtUnixMs !== manifest.builtAtUnixMs) {
+      this.log.appendLine('call graph rust-native incremental skipped: unexpected zoek-rs graph-update response');
+      return false;
+    }
+    for (const warning of response.warnings ?? []) {
+      this.log.appendLine(`call graph rust-native incremental warning: ${warning}`);
+    }
+    return true;
+  }
+
   private async refreshChangedFilesWithoutSnapshot(uris: vscode.Uri[], reason: string): Promise<void> {
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
     if (!folder || !manifest) {
       this.log.appendLine(`call graph incremental ${reason}: no cache metadata available; skipped cold update`);
+      return;
+    }
+    if (this.hasRustNativePrimaryGraph()) {
+      await this.refreshRustNativeChangedFiles(uris, reason);
       return;
     }
     const started = Date.now();
@@ -1182,6 +1699,7 @@ export class CallGraphService implements vscode.Disposable {
     warnings: string[];
     started: number;
     parseConcurrency: number;
+    adaptiveStats?: CallGraphAdaptiveConcurrencyStats;
     resolveOptions: CallGraphResolveOptions;
   }): Promise<{ snapshot: CallGraphSnapshot; index: SymbolIndex }> {
     const changedUris = new Set(input.overrides.map((override) => override.uri));
@@ -1222,6 +1740,7 @@ export class CallGraphService implements vscode.Disposable {
       kotlin: 0,
       typescript: 0,
       javascript: 0,
+      graphql: 0,
     };
     for (const symbol of symbols) {
       languageCounts[symbol.language] += 1;
@@ -1255,6 +1774,10 @@ export class CallGraphService implements vscode.Disposable {
         languageCounts,
         elapsedMs: Date.now() - input.started,
         parseConcurrency: input.parseConcurrency,
+        minParseConcurrency: input.adaptiveStats?.minObservedConcurrency,
+        workerThrottleCount: input.adaptiveStats?.throttleCount,
+        maxHeapUsedMb: input.adaptiveStats?.maxHeapUsedMb,
+        maxHeapUsageRatio: input.adaptiveStats?.maxHeapUsageRatio,
         skippedFileCount: input.baseSnapshot.stats.skippedFileCount + input.skippedFileCount,
         callsiteCount,
         skippedPossibleEdgeCount: input.baseSnapshot.stats.skippedPossibleEdgeCount + resolvedCalls.skippedPossibleEdgeCount,
@@ -1271,7 +1794,6 @@ export class CallGraphService implements vscode.Disposable {
     if (!folder) { return; }
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     const configSignature = getCallGraphConfigSignature(cfg);
-    await this.deleteLegacyCacheDirs(folder.uri.fsPath);
     try {
       const raw = await vscode.workspace.fs.readFile(this.cacheManifestUri(folder.uri.fsPath));
       const inflated = await gunzipAsync(Buffer.from(raw));
@@ -1282,19 +1804,15 @@ export class CallGraphService implements vscode.Disposable {
         manifest.configSignature !== configSignature ||
         !Array.isArray(manifest.chunks)
       ) {
-        this.log.appendLine('call graph cache deleted: version, workspace, or settings changed');
-        await this.deleteCacheDir(folder.uri.fsPath, CALL_GRAPH_CACHE_VERSION);
+        this.log.appendLine('call graph cache ignored: version, workspace, or settings changed; persisted files preserved until explicit rebuild');
         return;
       }
       if (!Array.isArray(manifest.recordIndex)) {
-        this.log.appendLine('call graph cache deleted: missing record index');
-        await this.deleteCacheDir(folder.uri.fsPath, CALL_GRAPH_CACHE_VERSION);
+        this.log.appendLine('call graph cache ignored: missing record index; persisted files preserved until explicit rebuild');
         return;
       }
       if (!Array.isArray(manifest.symbolRelations)) {
-        this.log.appendLine('call graph cache deleted: missing symbol relation index');
-        await this.deleteCacheDir(folder.uri.fsPath, CALL_GRAPH_CACHE_VERSION);
-        return;
+        this.log.appendLine('call graph cache metadata loaded without symbol relation buckets; derived relation cache will rebuild lazily');
       }
       this.cacheManifest = manifest as CallGraphCacheManifest;
       this.cacheConfigSignature = configSignature;
@@ -1427,6 +1945,14 @@ export class CallGraphService implements vscode.Disposable {
     workspaceRoot: string,
     manifest: CallGraphCacheManifest,
   ): Promise<{ snapshot: CallGraphSnapshot; index: SymbolIndex | undefined }> {
+    if (isRustNativeIndexOnlySnapshot(snapshot) || isRustNativeGraphManifest(manifest)) {
+      if ((manifest.recordOverrides?.length ?? 0) > 0) {
+        this.log.appendLine(
+          `call graph rust-native restore ignored JS record overrides: overrides=${manifest.recordOverrides?.length ?? 0}`,
+        );
+      }
+      return { snapshot, index: undefined };
+    }
     const overrides = await this.loadRecordOverrides(workspaceRoot, manifest);
     if (overrides.length === 0) {
       return { snapshot, index: undefined };
@@ -1564,7 +2090,9 @@ export class CallGraphService implements vscode.Disposable {
         this.documentSummaryBucketsByIndex.set(bucket, bucketRecords);
       }
       for (const record of records) {
+        if (this.rustNativeDirtySummaryUris.has(record.uri)) { continue; }
         bucketRecords.set(record.uri, record);
+        this.rustNativeDocumentSummaryUris.delete(record.uri);
       }
       this.documentSummaryLoadedBuckets.add(bucket);
       this.log.appendLine(
@@ -1601,6 +2129,10 @@ export class CallGraphService implements vscode.Disposable {
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
     if (!folder || !manifest) { return false; }
+    if (this.hasRustNativePrimaryGraph()) {
+      this.log.appendLine(`call graph document summary fast update skipped for rust-native graph: reason=${reason} file=${record.relPath}`);
+      return false;
+    }
     const started = Date.now();
     try {
       const existing = await this.loadDocumentSummaryRecordForUri(folder.uri.fsPath, manifest, record.uri);
@@ -1657,6 +2189,7 @@ export class CallGraphService implements vscode.Disposable {
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
     if (!folder || !manifest?.snapshot) { return false; }
+    if (isRustNativeGraphManifest(manifest)) { return false; }
     const uriString = uri.toString();
     const started = Date.now();
     this.log.appendLine(
@@ -1846,6 +2379,7 @@ export class CallGraphService implements vscode.Disposable {
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
     if (!folder || !manifest?.snapshot) { return false; }
+    if (isRustNativeGraphManifest(manifest)) { return false; }
     if (Array.isArray(manifest.documentSummaries) && manifest.documentSummaries.length > 0) { return true; }
     const started = Date.now();
     this.log.appendLine(
@@ -2020,62 +2554,43 @@ export class CallGraphService implements vscode.Disposable {
     this.documentSummaryLoadedBuckets.clear();
     this.documentSummaryBucketPromises.clear();
     this.documentSummaryFilePromises.clear();
+    this.rustDocumentSummaryPromises.clear();
+    this.rustSymbolQueryCache.clear();
+    this.rustNativeDocumentSummaryUris.clear();
+    this.rustNativeDirtySummaryUris.clear();
   }
 
-  private async persistCache(snapshot: CallGraphSnapshot): Promise<void> {
+  private async persistCache(
+    snapshot: CallGraphSnapshot,
+    recordIndex: CallGraphRecordIndexEntry[],
+  ): Promise<void> {
     const folder = vscode.workspace.workspaceFolders?.[0];
     if (!folder) { return; }
+    const workspaceRoot = folder.uri.fsPath;
     const configSignature = this.cacheConfigSignature ?? getCallGraphConfigSignature();
-    const records = Array.from(this.fileRecordsByUri.values()).sort((a, b) => a.relPath.localeCompare(b.relPath));
-    const recordIndex = buildRecordIndexFromRecords(records);
     const write = async () => {
       try {
-        const cacheDir = this.cacheDirUri(folder.uri.fsPath);
+        const cacheDir = this.cacheDirUri(workspaceRoot);
         await vscode.workspace.fs.createDirectory(cacheDir);
         const chunks: CallGraphCacheManifest['chunks'] = [];
         let totalBytes = 0;
-        chunks.push(...await this.writeCacheArrayChunks(
-          folder.uri.fsPath,
-          'records',
-          records,
-          CALL_GRAPH_CACHE_RECORDS_PER_CHUNK,
-          (bytes) => { totalBytes += bytes; },
-        ));
-        const summaryStarted = Date.now();
-        const relationIndex = this.getRelationSummaryIndex(snapshot);
-        const documentSummaryRecords = await buildDocumentSummaryRecords(
-          snapshot,
-          this.getIndex(snapshot),
-          relationIndex,
-        );
-        const documentSummaries = await this.writeDocumentSummaryBuckets(
-          folder.uri.fsPath,
-          documentSummaryRecords,
-          (bytes) => { totalBytes += bytes; },
-        );
-        const symbolRelationRecords = buildSymbolRelationRecords(relationIndex);
-        const symbolRelations = await this.writeSymbolRelationBuckets(
-          folder.uri.fsPath,
-          symbolRelationRecords,
-          (bytes) => { totalBytes += bytes; },
-        );
         const snapshotChunks = {
           symbols: await this.writeCacheArrayChunks(
-            folder.uri.fsPath,
+            workspaceRoot,
             'snapshot-symbols',
             snapshot.symbols,
             CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK,
             (bytes) => { totalBytes += bytes; },
           ),
           edges: await this.writeCacheArrayChunks(
-            folder.uri.fsPath,
+            workspaceRoot,
             'snapshot-edges',
             snapshot.edges,
             CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK,
             (bytes) => { totalBytes += bytes; },
           ),
           references: await this.writeCacheArrayChunks(
-            folder.uri.fsPath,
+            workspaceRoot,
             'snapshot-references',
             snapshot.references,
             CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK,
@@ -2084,13 +2599,11 @@ export class CallGraphService implements vscode.Disposable {
         };
         const manifest: CallGraphCacheManifest = {
           version: CALL_GRAPH_CACHE_VERSION,
-          workspaceRoot: folder.uri.fsPath,
+          workspaceRoot,
           configSignature,
           builtAtUnixMs: snapshot.builtAtUnixMs,
           chunks,
           recordIndex,
-          symbolRelations,
-          documentSummaries,
           snapshot: {
             builtAtUnixMs: snapshot.builtAtUnixMs,
             stats: snapshot.stats,
@@ -2100,22 +2613,499 @@ export class CallGraphService implements vscode.Disposable {
         };
         const encodedManifest = await gzipAsync(Buffer.from(JSON.stringify(manifest), 'utf8'));
         totalBytes += encodedManifest.byteLength;
-        await vscode.workspace.fs.writeFile(this.cacheManifestUri(folder.uri.fsPath), encodedManifest);
+        await vscode.workspace.fs.writeFile(this.cacheManifestUri(workspaceRoot), encodedManifest);
         this.cacheManifest = manifest;
-        this.cacheRecordsLoaded = true;
-        this.replaceDocumentSummaryCache(documentSummaryRecords);
+        this.cacheRecordsLoaded = false;
         this.log.appendLine(
-          `call graph cache saved: files=${records.length} recordChunks=${chunks.length} snapshotChunks=${countSnapshotChunks(manifest)} ` +
-          `symbolRelationBuckets=${symbolRelations.length} documentSummaryBuckets=${documentSummaries.length} ` +
-          `documentSummaryFiles=${documentSummaryRecords.length} ` +
-          `documentSummaryElapsed=${Date.now() - summaryStarted}ms bytes=${totalBytes}`,
+          `call graph symbol-first cache saved: files=${recordIndex.length} recordChunks=${chunks.length} ` +
+          `snapshotChunks=${countSnapshotChunks(manifest)} bytes=${totalBytes}; derived relation cache scheduled`,
         );
+        this.scheduleDerivedCallGraphCacheWrite(snapshot, workspaceRoot, configSignature, snapshot.builtAtUnixMs);
       } catch (err) {
         this.log.appendLine(`call graph cache save skipped: ${err instanceof Error ? err.message : String(err)}`);
       }
     };
-    this.cacheWritePromise = this.cacheWritePromise.then(write, write);
-    await this.cacheWritePromise;
+    const cacheWrite = this.cacheWritePromise.then(write, write);
+    this.cacheWritePromise = cacheWrite;
+    await cacheWrite;
+  }
+
+  private scheduleDerivedCallGraphCacheWrite(
+    snapshot: CallGraphSnapshot,
+    workspaceRoot: string,
+    configSignature: string,
+    builtAtUnixMs: number,
+  ): void {
+    const write = async () => {
+      const started = Date.now();
+      try {
+        const currentManifest = this.cacheManifest;
+        if (!currentManifest || currentManifest.configSignature !== configSignature || currentManifest.builtAtUnixMs !== builtAtUnixMs) {
+          this.log.appendLine('call graph derived cache skipped: cache manifest changed before start');
+          return;
+        }
+        let totalBytes = 0;
+        const relationIndex = buildRelationSummaryIndex(snapshot.edges, snapshot.references);
+        const index = this.indexCache?.snapshot === snapshot ? this.indexCache.index : buildSymbolIndex(snapshot.symbols);
+        const documentSummaryRecords = await buildDocumentSummaryRecords(snapshot, index, relationIndex);
+        const documentSummaries = await this.writeDocumentSummaryBuckets(
+          workspaceRoot,
+          documentSummaryRecords,
+          (bytes) => { totalBytes += bytes; },
+        );
+        const symbolRelationRecords = buildSymbolRelationRecords(relationIndex);
+        const symbolRelations = await this.writeSymbolRelationBuckets(
+          workspaceRoot,
+          symbolRelationRecords,
+          (bytes) => { totalBytes += bytes; },
+        );
+        const rustGraph = await this.writeRustGraphIndex(workspaceRoot, symbolRelationRecords, builtAtUnixMs);
+        const manifest = this.cacheManifest;
+        if (!manifest || manifest.configSignature !== configSignature || manifest.builtAtUnixMs !== builtAtUnixMs) {
+          this.log.appendLine('call graph derived cache skipped: cache manifest changed before commit');
+          return;
+        }
+        const updatedManifest: CallGraphCacheManifest = {
+          ...manifest,
+          symbolRelations,
+          documentSummaries,
+        };
+        const encodedManifest = await gzipAsync(Buffer.from(JSON.stringify(updatedManifest), 'utf8'));
+        totalBytes += encodedManifest.byteLength;
+        await vscode.workspace.fs.writeFile(this.cacheManifestUri(workspaceRoot), encodedManifest);
+        this.cacheManifest = updatedManifest;
+        if (this.snapshot === snapshot) {
+          this.relationSummaryCache = { snapshot, index: relationIndex };
+          this.replaceDocumentSummaryCache(documentSummaryRecords);
+          this.onDidChangeSnapshotEmitter.fire();
+        }
+        this.log.appendLine(
+          `call graph derived cache saved: symbolRelationBuckets=${symbolRelations.length} ` +
+          `documentSummaryBuckets=${documentSummaries.length} documentSummaryFiles=${documentSummaryRecords.length} ` +
+          `${rustGraph ? `rustGraphSymbols=${rustGraph.symbolCount} rustGraphRefs=${rustGraph.referenceCount} ` : ''}` +
+          `elapsed=${Date.now() - started}ms bytes=${totalBytes}`,
+        );
+      } catch (err) {
+        this.log.appendLine(`call graph derived cache save skipped: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+    const derivedWrite = this.cacheWritePromise.then(write, write);
+    this.cacheWritePromise = derivedWrite;
+    void derivedWrite.catch(() => undefined);
+  }
+
+  private async writeRustGraphIndex(
+    workspaceRoot: string,
+    records: CallGraphSymbolRelationRecord[],
+    builtAtUnixMs: number,
+  ): Promise<{ symbolCount: number; referenceCount: number; bytes: number } | undefined> {
+    const binary = await this.resolveRustGraphBinary(true);
+    if (!binary) {
+      this.log.appendLine('call graph rust graph index skipped: zoek-rs binary unavailable');
+      return undefined;
+    }
+    const cacheDir = this.cacheDirUri(workspaceRoot).fsPath;
+    const exportPath = path.join(cacheDir, `graph-relations-${builtAtUnixMs}.tsv`);
+    try {
+      await this.writeRustGraphRelationExport(exportPath, records);
+      const response = await this.invokeRustGraphJson([
+        binary,
+        'graph-index',
+        workspaceRoot,
+        '--input',
+        exportPath,
+        '--built-at',
+        String(builtAtUnixMs),
+      ]) as RustGraphIndexResponse;
+      if (response.type !== 'graph-index' || response.ok !== true || response.builtAtUnixMs !== builtAtUnixMs) {
+        this.log.appendLine('call graph rust graph index skipped: unexpected zoek-rs response');
+        return undefined;
+      }
+      for (const warning of response.warnings ?? []) {
+        this.log.appendLine(`call graph rust graph index warning: ${warning}`);
+      }
+      return {
+        symbolCount: response.symbolCount ?? 0,
+        referenceCount: response.referenceCount ?? 0,
+        bytes: response.bytes ?? 0,
+      };
+    } catch (err) {
+      this.log.appendLine(`call graph rust graph index skipped: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    } finally {
+      try { await vscode.workspace.fs.delete(vscode.Uri.file(exportPath), { useTrash: false }); } catch {}
+    }
+  }
+
+  private async queryRustGraphUsageIndex(
+    workspaceRoot: string,
+    symbolId: string,
+    limit: number,
+    builtAtUnixMs: number,
+  ): Promise<CallGraphReference[] | undefined> {
+    const binary = await this.resolveRustGraphBinary(false);
+    if (!binary) { return undefined; }
+    try {
+      const response = await this.invokeRustGraphJson([
+        binary,
+        'graph-query',
+        workspaceRoot,
+        '--symbol-id',
+        symbolId,
+        '--limit',
+        String(Math.max(1, Math.floor(limit))),
+      ]) as RustGraphQueryResponse;
+      if (
+        response.type !== 'graph-query' ||
+        response.ok !== true ||
+        response.builtAtUnixMs !== builtAtUnixMs ||
+        !Array.isArray(response.references)
+      ) {
+        return undefined;
+      }
+      for (const warning of response.warnings ?? []) {
+        this.log.appendLine(`call graph rust graph query warning: ${warning}`);
+      }
+      return response.references.map((reference) => ({
+        symbolId,
+        name: String(reference.name ?? ''),
+        rawText: String(reference.rawText ?? ''),
+        uri: String(reference.uri ?? ''),
+        relPath: String(reference.relPath ?? ''),
+        range: normalizeGraphRange(reference.range),
+        ...(reference.enclosingSymbolId ? { enclosingSymbolId: String(reference.enclosingSymbolId) } : {}),
+      }));
+    } catch (err) {
+      this.log.appendLine(`call graph rust graph query skipped: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  }
+
+  private async queryRustGraphSymbolIndex(
+    workspaceRoot: string,
+    input: { query?: string; uri?: string; limit: number },
+    builtAtUnixMs: number,
+  ): Promise<(CallGraphSymbol & { usageCount?: number; implementationCount?: number })[] | undefined> {
+    const binary = await this.resolveRustGraphBinary(false);
+    if (!binary) { return undefined; }
+    const args = [
+      binary,
+      'graph-symbol-query',
+      workspaceRoot,
+      '--limit',
+      String(Math.max(1, Math.floor(input.limit))),
+    ];
+    if (input.uri) {
+      args.push('--uri', input.uri);
+    } else {
+      args.push('--query', input.query ?? '');
+    }
+    try {
+      const response = await this.invokeRustGraphJson(args) as RustGraphSymbolQueryResponse;
+      if (
+        response.type !== 'graph-symbol-query' ||
+        response.ok !== true ||
+        response.builtAtUnixMs !== builtAtUnixMs ||
+        !Array.isArray(response.symbols)
+      ) {
+        return undefined;
+      }
+      for (const warning of response.warnings ?? []) {
+        this.log.appendLine(`call graph rust graph symbol query warning: ${warning}`);
+      }
+      return response.symbols.map(rustGraphSymbolToCallGraphSymbol);
+    } catch (err) {
+      this.log.appendLine(`call graph rust graph symbol query skipped: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  }
+
+  private async resolveRustGraphBinary(allowBuild: boolean): Promise<string | undefined> {
+    const existing = this.findRustGraphBinary();
+    if (existing || !allowBuild) { return existing; }
+    if (this.rustGraphBuildPromise) { return this.rustGraphBuildPromise; }
+    const cargoToml = path.join(this.context.extensionUri.fsPath, 'Cargo.toml');
+    if (!fs.existsSync(cargoToml)) { return undefined; }
+    this.rustGraphBuildPromise = (async () => {
+      try {
+        this.log.appendLine('call graph rust graph index: building zoek-rs binary');
+        await this.invokeRustGraphText(['cargo', 'build', '-q', '-p', 'zoek-rs']);
+        const binary = this.findRustGraphBinary();
+        if (binary) {
+          this.log.appendLine(`call graph rust graph index: zoek-rs binary ready: ${binary}`);
+        }
+        return binary;
+      } catch (err) {
+        this.log.appendLine(`call graph rust graph index build skipped: ${err instanceof Error ? err.message : String(err)}`);
+        return undefined;
+      } finally {
+        this.rustGraphBuildPromise = undefined;
+      }
+    })();
+    return this.rustGraphBuildPromise;
+  }
+
+  private findRustGraphBinary(): string | undefined {
+    const exeSuffix = process.platform === 'win32' ? '.exe' : '';
+    const extensionRoot = this.context.extensionUri.fsPath;
+    const candidates = [
+      path.join(extensionRoot, 'target', 'debug', `zoek-rs${exeSuffix}`),
+      path.join(extensionRoot, 'target', 'release', `zoek-rs${exeSuffix}`),
+    ];
+    return candidates.find((candidate) => fs.existsSync(candidate));
+  }
+
+  private invokeRustGraphJson(
+    args: string[],
+    options: RustGraphInvokeOptions = {},
+  ): Promise<unknown> {
+    return this.invokeRustGraphText(args, options).then((stdout) => {
+      try {
+        return JSON.parse(stdout.trim());
+      } catch (err) {
+        throw new Error(`failed to parse zoek-rs graph response: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    });
+  }
+
+  private invokeRustGraphText(
+    args: string[],
+    options: RustGraphInvokeOptions = {},
+  ): Promise<string> {
+    const [command, ...rest] = args;
+    const kind = this.classifyRustGraphProcess(rest);
+    const timeoutMs = options.timeoutMs ?? this.defaultRustGraphTimeoutMs(kind);
+    return new Promise((resolve, reject) => {
+      const child = spawn(command, rest, {
+        argv0: this.argv0ForRustGraphProcess(kind),
+        cwd: this.context.extensionUri.fsPath,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        detached: process.platform !== 'win32',
+      });
+      const tracked = this.trackRustGraphChild(
+        child,
+        [path.basename(command), ...rest.slice(0, 2)].join(' '),
+        kind,
+      );
+      let stdout = '';
+      let stderr = '';
+      let stderrLineBuffer = '';
+      let settled = false;
+      let forcedError: Error | undefined;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let tokenSub: { dispose(): void } = { dispose() {} };
+      const cleanup = () => {
+        if (timeout) {
+          clearTimeout(timeout);
+          timeout = undefined;
+        }
+        tokenSub.dispose();
+        if (tracked.killTimer) {
+          clearTimeout(tracked.killTimer);
+          tracked.killTimer = undefined;
+        }
+        this.rustGraphChildren.delete(tracked.id);
+      };
+      const finish = (fn: () => void) => {
+        if (settled) { return; }
+        settled = true;
+        cleanup();
+        fn();
+      };
+      const requestCancel = (reason: string, error: Error) => {
+        if (!forcedError) {
+          forcedError = error;
+        }
+        this.terminateRustGraphChild(tracked, reason);
+      };
+      tokenSub = options.token?.onCancellationRequested(() => {
+        requestCancel('request cancelled', options.cancelError ?? new Error('zoek-rs graph command cancelled'));
+      }) ?? { dispose() {} };
+      if (options.token?.isCancellationRequested) {
+        requestCancel('request cancelled', options.cancelError ?? new Error('zoek-rs graph command cancelled'));
+      }
+      if (timeoutMs > 0) {
+        timeout = setTimeout(() => {
+          requestCancel(
+            `timeout after ${timeoutMs}ms`,
+            new Error(`zoek-rs graph command timed out after ${timeoutMs}ms: ${tracked.label}`),
+          );
+        }, timeoutMs);
+      }
+      child.stdout?.setEncoding('utf8');
+      child.stderr?.setEncoding('utf8');
+      child.stdout?.on('data', (chunk) => { stdout += String(chunk); });
+      child.stderr?.on('data', (chunk) => {
+        const text = String(chunk);
+        stderr += text;
+        if (!options.onStderrLine) { return; }
+        stderrLineBuffer += text;
+        const lines = stderrLineBuffer.split(/\r?\n/);
+        stderrLineBuffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (line.trim()) { options.onStderrLine(line); }
+        }
+      });
+      child.on('error', (err) => {
+        finish(() => reject(err));
+      });
+      child.on('close', (code, signal) => {
+        if (options.onStderrLine && stderrLineBuffer.trim()) {
+          options.onStderrLine(stderrLineBuffer);
+          stderrLineBuffer = '';
+        }
+        if (forcedError) {
+          finish(() => reject(forcedError));
+          return;
+        }
+        if (code !== 0) {
+          finish(() => reject(new Error(
+            stderr.trim() ||
+            stdout.trim() ||
+            (signal ? `${command} terminated by ${signal}` : `${command} exited with code ${code}`),
+          )));
+          return;
+        }
+        try {
+          finish(() => resolve(stdout));
+        } catch (err) {
+          finish(() => reject(err));
+        }
+      });
+    });
+  }
+
+  private trackRustGraphChild(
+    child: ChildProcess,
+    label: string,
+    kind: RustGraphProcessKind,
+  ): RustGraphTrackedChild {
+    const tracked: RustGraphTrackedChild = {
+      id: this.nextRustGraphChildId++,
+      child,
+      label,
+      kind,
+      cancelled: false,
+      killTimer: undefined,
+    };
+    this.rustGraphChildren.set(tracked.id, tracked);
+    return tracked;
+  }
+
+  private classifyRustGraphProcess(rest: string[]): RustGraphProcessKind {
+    if (rest[0] === 'build') { return 'build'; }
+    switch (rest[0]) {
+      case 'graph-rebuild': return 'graph-rebuild';
+      case 'graph-update': return 'graph-update';
+      case 'graph-index': return 'graph-index';
+      case 'graph-query': return 'graph-query';
+      case 'graph-symbol-query': return 'graph-symbol-query';
+      default: return 'other';
+    }
+  }
+
+  private argv0ForRustGraphProcess(kind: RustGraphProcessKind): string | undefined {
+    switch (kind) {
+      case 'build': return 'ijss-rust-graph-build';
+      case 'graph-rebuild': return 'ijss-rust-graph-rebuild';
+      case 'graph-update': return 'ijss-rust-graph-update';
+      case 'graph-index': return 'ijss-rust-graph-index';
+      case 'graph-query': return 'ijss-rust-graph-query';
+      case 'graph-symbol-query': return 'ijss-rust-graph-symbol-query';
+      default: return undefined;
+    }
+  }
+
+  private defaultRustGraphTimeoutMs(kind: RustGraphProcessKind): number {
+    switch (kind) {
+      case 'graph-query':
+      case 'graph-symbol-query':
+        return RUST_GRAPH_QUERY_TIMEOUT_MS;
+      default:
+        return 0;
+    }
+  }
+
+  private cancelRustGraphProcesses(
+    reason: string,
+    options?: { kinds?: Iterable<RustGraphProcessKind> },
+  ): void {
+    const kinds = options?.kinds ? new Set(options.kinds) : undefined;
+    for (const tracked of this.rustGraphChildren.values()) {
+      if (kinds && !kinds.has(tracked.kind)) { continue; }
+      this.terminateRustGraphChild(tracked, reason);
+    }
+  }
+
+  private terminateRustGraphChild(tracked: RustGraphTrackedChild, reason: string): void {
+    if (tracked.cancelled) { return; }
+    tracked.cancelled = true;
+    const pid = tracked.child.pid;
+    this.log.appendLine(
+      `call graph rust process cancel: ${tracked.label}${typeof pid === 'number' ? ` pid=${pid}` : ''} ` +
+      `kind=${tracked.kind} (${reason})`,
+    );
+    try {
+      if (process.platform === 'win32') {
+        tracked.child.kill('SIGTERM');
+      } else if (typeof pid === 'number' && pid > 0) {
+        process.kill(-pid, 'SIGTERM');
+      } else {
+        tracked.child.kill('SIGTERM');
+      }
+    } catch {
+      try { tracked.child.kill('SIGTERM'); } catch {}
+    }
+    tracked.killTimer = setTimeout(() => {
+      try {
+        if (process.platform === 'win32') {
+          tracked.child.kill('SIGKILL');
+        } else if (typeof pid === 'number' && pid > 0) {
+          process.kill(-pid, 'SIGKILL');
+        } else {
+          tracked.child.kill('SIGKILL');
+        }
+      } catch {}
+    }, RUST_GRAPH_PROCESS_KILL_TIMEOUT_MS);
+  }
+
+  private async writeRustGraphRelationExport(
+    exportPath: string,
+    records: CallGraphSymbolRelationRecord[],
+  ): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const stream = fs.createWriteStream(exportPath, { encoding: 'utf8' });
+      let settled = false;
+      const fail = (err: unknown) => {
+        if (settled) { return; }
+        settled = true;
+        reject(err instanceof Error ? err : new Error(String(err)));
+      };
+      const done = () => {
+        if (settled) { return; }
+        settled = true;
+        resolve();
+      };
+      stream.on('error', fail);
+      stream.on('finish', done);
+      void (async () => {
+        try {
+          for (const record of records) {
+            for (const reference of record.usages) {
+              if (!stream.write(formatRustGraphReferenceTsvLine(record.symbolId, reference))) {
+                await new Promise<void>((resume) => stream.once('drain', resume));
+              }
+            }
+            await yieldToExtensionHost();
+          }
+          stream.end();
+        } catch (err) {
+          stream.destroy();
+          fail(err);
+        }
+      })();
+    });
   }
 
   private async persistRecordOverrides(overrides: CallGraphRecordOverride[]): Promise<void> {
@@ -2271,7 +3261,19 @@ export class CallGraphService implements vscode.Disposable {
     }
   }
 
-  private putDocumentSummaryRecord(record: CallGraphDocumentSummaryRecord): void {
+  private deleteDocumentSummaryRecord(uriString: string): void {
+    const bucket = documentSummaryBucketForUri(uriString);
+    this.documentSummaryBucketsByIndex.get(bucket)?.delete(uriString);
+    this.rustNativeDocumentSummaryUris.delete(uriString);
+  }
+
+  private putDocumentSummaryRecord(
+    record: CallGraphDocumentSummaryRecord,
+    source: 'cache' | 'rust-native' = 'cache',
+  ): void {
+    if (source !== 'rust-native' && this.rustNativeDirtySummaryUris.has(record.uri)) {
+      return;
+    }
     const bucket = documentSummaryBucketForUri(record.uri);
     let bucketRecords = this.documentSummaryBucketsByIndex.get(bucket);
     if (!bucketRecords) {
@@ -2279,6 +3281,11 @@ export class CallGraphService implements vscode.Disposable {
       this.documentSummaryBucketsByIndex.set(bucket, bucketRecords);
     }
     bucketRecords.set(record.uri, record);
+    if (source === 'rust-native') {
+      this.rustNativeDocumentSummaryUris.add(record.uri);
+    } else {
+      this.rustNativeDocumentSummaryUris.delete(record.uri);
+    }
   }
 
   private async writeCacheArrayChunks<T>(
@@ -2315,151 +3322,6 @@ export class CallGraphService implements vscode.Disposable {
 
   private cacheChunkUri(workspaceRoot: string, filename: string): vscode.Uri {
     return vscode.Uri.joinPath(this.cacheDirUri(workspaceRoot), filename);
-  }
-
-  private async tryRebuildFromIndexedCache(input: {
-    workspaceRoot: string;
-    sourceFiles: vscode.Uri[];
-    maxFileSize: number;
-    parseConcurrency: number;
-    parseLimits: CallGraphParseLimits;
-    cpuBudget: CallGraphCpuBudget;
-    resolveOptions: CallGraphResolveOptions;
-    configSignature: string;
-    started: number;
-    token?: vscode.CancellationToken;
-    onProgress?: (stage: 'checking' | 'parsing', current: number, total: number, message: string) => void;
-  }): Promise<CallGraphSnapshot | undefined> {
-    const manifest = this.cacheManifest;
-    const recordIndex = manifest?.recordIndex;
-    if (
-      !manifest?.snapshot ||
-      manifest.configSignature !== input.configSignature ||
-      !Array.isArray(recordIndex) ||
-      recordIndex.length === 0
-    ) {
-      return undefined;
-    }
-    if (!this.snapshot) {
-      await this.restorePersistedSnapshot();
-    }
-    const baseSnapshot = this.snapshot;
-    if (!baseSnapshot) { return undefined; }
-    const throwIfCancelled = () => {
-      if (input.token?.isCancellationRequested) {
-        throw new CallGraphRebuildCancelledError();
-      }
-    };
-    const indexedByUri = new Map(recordIndex.map((entry) => [entry.uri, entry]));
-    const sourceSet = new Set(input.sourceFiles.map((uri) => uri.toString()));
-    const statConcurrency = Math.min(64, Math.max(input.parseConcurrency, 8));
-    let checked = 0;
-    const statResults = await mapWithConcurrency<vscode.Uri, {
-      uri: vscode.Uri;
-      stat?: vscode.FileStat;
-      warning?: string;
-    }>(input.sourceFiles, statConcurrency, async (uri) => {
-      throwIfCancelled();
-      try {
-        const stat = await vscode.workspace.fs.stat(uri);
-        checked += 1;
-        input.onProgress?.('checking', checked, input.sourceFiles.length, `checked ${checked}/${input.sourceFiles.length} source files`);
-        return { uri, stat };
-      } catch (err) {
-        checked += 1;
-        input.onProgress?.('checking', checked, input.sourceFiles.length, `checked ${checked}/${input.sourceFiles.length} source files`);
-        return {
-          uri,
-          warning: `failed to stat ${uri.fsPath}: ${err instanceof Error ? err.message : String(err)}`,
-        };
-      }
-    });
-    const changedUris: vscode.Uri[] = [];
-    const warnings: string[] = [];
-    let reusedFiles = 0;
-    for (const result of statResults) {
-      if (result.warning || !result.stat) {
-        if (result.warning) { warnings.push(result.warning); }
-        changedUris.push(result.uri);
-        continue;
-      }
-      const cached = indexedByUri.get(result.uri.toString());
-      if (cached && fileMetadataMatches(cached, result.stat)) {
-        reusedFiles += 1;
-        continue;
-      }
-      changedUris.push(result.uri);
-    }
-    const deletedOverrides: CallGraphRecordOverride[] = [];
-    for (const entry of recordIndex) {
-      if (!sourceSet.has(entry.uri)) {
-        deletedOverrides.push({ uri: entry.uri, deleted: true, updatedAtUnixMs: Date.now() });
-      }
-    }
-    if (changedUris.length === 0 && deletedOverrides.length === 0) {
-      this.log.appendLine(
-        `call graph rebuild reused indexed cache: files=${baseSnapshot.stats.fileCount} checked=${input.sourceFiles.length} ` +
-        `reused=${reusedFiles} elapsed=${Date.now() - input.started}ms`,
-      );
-      return baseSnapshot;
-    }
-    let parsedCount = 0;
-    let skippedCount = 0;
-    const parsedResults = await mapWithConcurrency(changedUris, input.parseConcurrency, async (uri) => {
-      throwIfCancelled();
-      try {
-        const parseStarted = Date.now();
-        const parsed = await parseSourceFileRecord(uri, input.maxFileSize, input.parseLimits);
-        await applyCallGraphCpuBudget(Date.now() - parseStarted, input.cpuBudget, input.token);
-        parsedCount += 1;
-        if (!parsed.record) { skippedCount += 1; }
-        input.onProgress?.('parsing', parsedCount, changedUris.length, `parsed changed ${parsedCount}/${changedUris.length}`);
-        return parsed;
-      } catch (err) {
-        parsedCount += 1;
-        skippedCount += 1;
-        input.onProgress?.('parsing', parsedCount, changedUris.length, `parsed changed ${parsedCount}/${changedUris.length}`);
-        return {
-          record: undefined,
-          skipped: true,
-          warnings: [`failed to parse ${uri.fsPath}: ${err instanceof Error ? err.message : String(err)}`],
-        } satisfies ParsedSourceFileResult;
-      }
-    });
-    const overrides: CallGraphRecordOverride[] = [
-      ...deletedOverrides,
-      ...parsedResults.map((result, index) => {
-        const uriString = changedUris[index].toString();
-        return result.record
-          ? { uri: uriString, record: result.record, updatedAtUnixMs: Date.now() }
-          : { uri: uriString, deleted: true, updatedAtUnixMs: Date.now() };
-      }),
-    ];
-    warnings.push(...parsedResults.flatMap((result) => result.warnings));
-    this.applyRecordOverridesToLoadedRecords(overrides);
-    const { snapshot, index } = await this.buildIncrementalSnapshotFromOverrides({
-      baseSnapshot,
-      workspaceRoot: input.workspaceRoot,
-      overrides,
-      skippedFileCount: skippedCount,
-      warnings,
-      started: input.started,
-      parseConcurrency: input.parseConcurrency,
-      resolveOptions: input.resolveOptions,
-    });
-    this.applySnapshot(snapshot, index, undefined, input.configSignature, { preserveRecords: true });
-    await this.persistRecordOverrides(overrides);
-    await this.persistDocumentSummaryFilesForRecords(
-      parsedResults.map((result) => result.record).filter((record): record is CallGraphFileRecord => !!record),
-      snapshot,
-      index,
-    );
-    this.log.appendLine(
-      `call graph indexed rebuild updated: reused=${reusedFiles} changed=${changedUris.length} deleted=${deletedOverrides.length} ` +
-      `files=${snapshot.stats.fileCount} symbols=${snapshot.stats.symbolCount} edges=${snapshot.stats.edgeCount} ` +
-      `elapsed=${snapshot.stats.elapsedMs}ms`,
-    );
-    return snapshot;
   }
 
   private applyRecordOverridesToLoadedRecords(overrides: CallGraphRecordOverride[]): void {
@@ -2520,12 +3382,336 @@ export class CallGraphService implements vscode.Disposable {
     );
   }
 
+  private async rebuildInWorkerProcess(input: {
+    workspaceRoot: string;
+    excludeGlobs: string[];
+    maxFileSize: number;
+    buildLimits: CallGraphBuildLimits;
+    parseConcurrency: number;
+    resolveOptions: CallGraphResolveOptions;
+    parseLimits: CallGraphParseLimits;
+    cpuBudget: CallGraphCpuBudget;
+    configSignature: string;
+    nodePath: string;
+    report?: (progress: CallGraphRebuildProgress) => void;
+    token?: vscode.CancellationToken;
+  }): Promise<CallGraphSnapshot> {
+    const workerPath = path.join(this.context.extensionUri.fsPath, 'out', 'callGraphWorkerProcess.js');
+    if (!fs.existsSync(workerPath)) {
+      throw new Error(`call graph worker bundle is missing: ${workerPath}`);
+    }
+    const cacheDirFsPath = this.cacheDirUri(input.workspaceRoot).fsPath;
+    await fs.promises.mkdir(cacheDirFsPath, { recursive: true });
+    const heapMb = Math.max(512, Math.min(32_768, Math.floor(input.buildLimits.memoryBudgetMb)));
+    const runtime = resolveCallGraphWorkerRuntime(workerPath, heapMb, input.nodePath);
+    this.log.appendLine(
+      `call graph worker start: hostPid=${process.pid} heap=${heapMb}MB workers=${input.parseConcurrency} ` +
+      `runtime=${runtime.source} command=${runtime.command} args=${JSON.stringify(runtime.args)}`,
+    );
+    const result = await new Promise<CallGraphWorkerRebuildResult>((resolve, reject) => {
+      const child = spawn(runtime.command, runtime.args, {
+        argv0: 'ijss-callgraph-worker',
+        cwd: this.context.extensionUri.fsPath,
+        env: runtime.env,
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+        windowsHide: true,
+      });
+      this.log.appendLine(
+        `call graph worker spawned: hostPid=${process.pid} workerPid=${child.pid ?? 'unknown'} ` +
+        `argv0=ijss-callgraph-worker`,
+      );
+      let stderr = '';
+      let stdout = '';
+      let finished = false;
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = () => {
+        if (killTimer) {
+          clearTimeout(killTimer);
+          killTimer = undefined;
+        }
+        tokenSub.dispose();
+      };
+      const finish = (fn: () => void) => {
+        if (finished) { return; }
+        finished = true;
+        cleanup();
+        fn();
+      };
+      const terminate = () => {
+        if (child.killed) { return; }
+        try { child.kill('SIGTERM'); } catch {}
+        killTimer = setTimeout(() => {
+          try { child.kill('SIGKILL'); } catch {}
+        }, 2_000);
+      };
+      const tokenSub = input.token?.onCancellationRequested(() => {
+        terminate();
+        finish(() => reject(new CallGraphRebuildCancelledError()));
+      }) ?? { dispose() {} };
+      child.stdout?.setEncoding('utf8');
+      child.stderr?.setEncoding('utf8');
+      child.stdout?.on('data', (chunk) => {
+        stdout += String(chunk);
+      });
+      child.stderr?.on('data', (chunk) => {
+        const text = String(chunk);
+        stderr += text;
+        for (const line of text.split(/\r?\n/)) {
+          if (line.trim()) {
+            this.log.appendLine(`call graph worker stderr: ${line}`);
+          }
+        }
+      });
+      child.on('message', (message: unknown) => {
+        const msg = message as {
+          type?: string;
+          progress?: CallGraphRebuildProgress;
+          result?: CallGraphWorkerRebuildResult;
+          error?: string;
+          pid?: number;
+          ppid?: number;
+          title?: string;
+          argv0?: string;
+          execPath?: string;
+          execArgv?: string[];
+          heapLimitMb?: number;
+          heapUsedMb?: number;
+        };
+        if (msg.type === 'ready') {
+          this.log.appendLine(
+            `call graph worker ready: hostPid=${process.pid} workerPid=${msg.pid ?? 'unknown'} ` +
+            `workerPpid=${msg.ppid ?? 'unknown'} title=${JSON.stringify(msg.title ?? '')} ` +
+            `argv0=${JSON.stringify(msg.argv0 ?? '')} execPath=${JSON.stringify(msg.execPath ?? '')} ` +
+            `execArgv=${JSON.stringify(msg.execArgv ?? [])} heap=${msg.heapUsedMb ?? 'unknown'}/${msg.heapLimitMb ?? 'unknown'}MB`,
+          );
+          if (heapMb > 4_096 && Number.isFinite(msg.heapLimitMb) && (msg.heapLimitMb ?? 0) < heapMb * 0.8) {
+            terminate();
+            finish(() => reject(new Error(
+              `call graph worker heap flag was not applied: requested=${heapMb}MB actualLimit=${msg.heapLimitMb}MB ` +
+              `runtime=${runtime.source} command=${runtime.command}. Set intellijStyledSearch.callGraphNodePath to a real Node.js executable.`,
+            )));
+          }
+          return;
+        }
+        if (msg.type === 'progress' && msg.progress) {
+          input.report?.(msg.progress);
+          return;
+        }
+        if (msg.type === 'done' && msg.result) {
+          finish(() => resolve(msg.result!));
+          return;
+        }
+        if (msg.type === 'error') {
+          finish(() => reject(new Error(msg.error || 'call graph worker failed')));
+        }
+      });
+      child.on('error', (err) => {
+        finish(() => reject(err));
+      });
+      child.on('close', (code, signal) => {
+        if (finished) { return; }
+        const details = stderr.trim() || stdout.trim() || (signal ? `signal ${signal}` : `exit code ${code}`);
+        finish(() => reject(new Error(`call graph worker exited before completion: ${details}`)));
+      });
+      child.send?.({
+        type: 'rebuild',
+        input: {
+          workspaceRoot: input.workspaceRoot,
+          cacheDirFsPath,
+          configSignature: input.configSignature,
+          excludeGlobs: input.excludeGlobs,
+          maxFileSize: input.maxFileSize,
+          buildLimits: input.buildLimits,
+          parseConcurrency: input.parseConcurrency,
+          resolveOptions: input.resolveOptions,
+          parseLimits: input.parseLimits,
+          cpuBudget: input.cpuBudget,
+        } satisfies CallGraphWorkerRebuildInput,
+      });
+    });
+
+    this.log.appendLine(
+      `call graph worker done: files=${result.stats.fileCount} symbols=${result.stats.symbolCount} ` +
+      `edges=${result.stats.edgeCount} references=${result.stats.referenceCount} ` +
+      `recordIndex=${result.recordIndexCount} snapshotChunks=${result.snapshotChunkCount} ` +
+      `symbolRelationBuckets=${result.symbolRelationBucketCount} documentSummaryBuckets=${result.documentSummaryBucketCount} ` +
+      `cacheBytes=${result.cacheBytes} elapsed=${result.stats.elapsedMs}ms`,
+    );
+    this.snapshot = undefined;
+    this.indexCache = undefined;
+    this.relationSummaryCache = undefined;
+    this.fileRecordsByUri.clear();
+    this.cacheRecordsLoaded = false;
+    this.cacheManifest = undefined;
+    this.clearSymbolRelationCache();
+    this.clearDocumentSummaryCache();
+    await this.restorePersistedCacheManifest();
+    await this.restorePersistedSnapshot();
+    if (!this.snapshot) {
+      throw new Error('call graph worker completed but persisted snapshot could not be restored');
+    }
+    return this.snapshot;
+  }
+
+  private async rebuildInRustGraphProcess(input: {
+    workspaceRoot: string;
+    maxFileSize: number;
+    parseConcurrency: number;
+    configSignature: string;
+    token?: vscode.CancellationToken;
+    report?: (progress: CallGraphRebuildProgress) => void;
+  }): Promise<CallGraphSnapshot> {
+    const binary = await this.resolveRustGraphBinary(true);
+    if (!binary) {
+      throw new Error('zoek-rs binary is unavailable for rust-native call graph rebuild');
+    }
+    const started = Date.now();
+    const builtAtUnixMs = Date.now();
+    input.report?.({
+      stage: 'discovering',
+      message: 'rust graph rebuild starting',
+      current: 0,
+      total: 0,
+      parsedFiles: 0,
+      skippedFiles: 0,
+      warningCount: 0,
+      elapsedMs: 0,
+      concurrency: input.parseConcurrency,
+      maxConcurrency: input.parseConcurrency,
+    });
+    const args = [
+      binary,
+      'graph-rebuild',
+      input.workspaceRoot,
+      '--built-at',
+      String(builtAtUnixMs),
+      '--max-file-size',
+      String(Math.max(0, Math.floor(input.maxFileSize))),
+      '--workers',
+      String(Math.max(1, Math.min(MAX_CALL_GRAPH_CONCURRENCY, Math.floor(input.parseConcurrency)))),
+    ];
+    this.log.appendLine(`call graph rust-native rebuild start: binary=${binary} args=${JSON.stringify(args.slice(1))}`);
+    const response = await this.invokeRustGraphJson(args, {
+      token: input.token,
+      cancelError: new CallGraphRebuildCancelledError(),
+      onStderrLine: (line) => {
+        const progress = parseRustGraphRebuildProgressLine(line);
+        if (!progress) {
+          if (line.trim()) {
+            this.log.appendLine(`call graph rust-native stderr: ${line}`);
+          }
+          return;
+        }
+        input.report?.({
+          stage: progress.stage,
+          message: progress.message,
+          current: progress.current,
+          total: progress.total,
+          parsedFiles: progress.stage === 'parsing' ? progress.current : 0,
+          skippedFiles: 0,
+          warningCount: 0,
+          elapsedMs: Date.now() - started,
+          concurrency: input.parseConcurrency,
+          maxConcurrency: input.parseConcurrency,
+        });
+      },
+    }) as RustGraphIndexResponse;
+    if (response.type !== 'graph-index' || response.ok !== true) {
+      throw new Error('unexpected zoek-rs graph-rebuild response');
+    }
+    const warnings = [
+      ...(response.warnings ?? []),
+      'rust-native graph rebuild stores the primary graph in zoek-rs binary index; JS snapshot arrays are intentionally not materialized',
+    ];
+    const stats: CallGraphStats = {
+      fileCount: response.fileCount ?? 0,
+      symbolCount: response.symbolCount ?? 0,
+      edgeCount: 0,
+      exactEdgeCount: 0,
+      possibleEdgeCount: 0,
+      unresolvedEdgeCount: 0,
+      languageCounts: {
+        python: 0,
+        java: 0,
+        kotlin: 0,
+        typescript: 0,
+        javascript: 0,
+        graphql: 0,
+      },
+      elapsedMs: Date.now() - started,
+      parseConcurrency: input.parseConcurrency,
+      skippedFileCount: 0,
+      callsiteCount: 0,
+      skippedPossibleEdgeCount: 0,
+      skippedUnresolvedEdgeCount: 0,
+      edgeLimitHit: false,
+      referenceCount: response.referenceCount ?? 0,
+    };
+    const snapshot: CallGraphSnapshot = {
+      workspaceRoot: input.workspaceRoot,
+      builtAtUnixMs: response.builtAtUnixMs ?? builtAtUnixMs,
+      symbols: [],
+      edges: [],
+      references: [],
+      warnings,
+      stats,
+    };
+    await this.persistRustNativeGraphManifest(snapshot, input.configSignature);
+    this.applySnapshot(snapshot, undefined, undefined, input.configSignature);
+    this.cacheRecordsLoaded = false;
+    this.log.appendLine(
+      `call graph rust-native rebuild done: symbols=${stats.symbolCount} references=${stats.referenceCount} ` +
+      `bytes=${response.bytes ?? 0} elapsed=${stats.elapsedMs}ms`,
+    );
+    input.report?.({
+      stage: 'done',
+      message: `rust graph rebuild done in ${stats.elapsedMs}ms`,
+      current: stats.referenceCount,
+      total: stats.referenceCount,
+      parsedFiles: stats.fileCount,
+      skippedFiles: stats.skippedFileCount,
+      warningCount: warnings.length,
+      elapsedMs: stats.elapsedMs,
+      concurrency: input.parseConcurrency,
+      maxConcurrency: input.parseConcurrency,
+    });
+    return snapshot;
+  }
+
+  private async persistRustNativeGraphManifest(
+    snapshot: CallGraphSnapshot,
+    configSignature: string,
+  ): Promise<void> {
+    const manifest: CallGraphCacheManifest = {
+      version: CALL_GRAPH_CACHE_VERSION,
+      workspaceRoot: snapshot.workspaceRoot,
+      configSignature,
+      builtAtUnixMs: snapshot.builtAtUnixMs,
+      chunks: [],
+      recordIndex: [],
+      snapshot: {
+        builtAtUnixMs: snapshot.builtAtUnixMs,
+        stats: snapshot.stats,
+        warnings: snapshot.warnings,
+        symbols: [],
+        edges: [],
+        references: [],
+      },
+    };
+    const encodedManifest = await gzipAsync(Buffer.from(JSON.stringify(manifest), 'utf8'));
+    await vscode.workspace.fs.createDirectory(this.cacheDirUri(snapshot.workspaceRoot));
+    await vscode.workspace.fs.writeFile(this.cacheManifestUri(snapshot.workspaceRoot), encodedManifest);
+    this.cacheManifest = manifest;
+    this.cacheConfigSignature = configSignature;
+    this.clearSymbolRelationCache();
+    this.clearDocumentSummaryCache();
+  }
+
   private async doRebuild(
     report?: (progress: CallGraphRebuildProgress) => void,
     token?: vscode.CancellationToken,
     options: CallGraphRebuildOptions = {},
   ): Promise<CallGraphSnapshot> {
-    const started = Date.now();
     const folder = vscode.workspace.workspaceFolders?.[0];
     if (!folder) {
       throw new Error('No workspace folder is open.');
@@ -2534,299 +3720,26 @@ export class CallGraphService implements vscode.Disposable {
       await this.restorePromise;
     }
     const workspaceRoot = folder.uri.fsPath;
+    this.cancelRustGraphProcesses('call graph rebuild started', {
+      kinds: ['graph-query', 'graph-symbol-query', 'graph-index'],
+    });
+    this.rustSymbolQueryCache.clear();
+    this.rustDocumentSummaryPromises.clear();
     if (options.force) {
       await this.clearForForceRebuild(workspaceRoot);
     }
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-    const excludeGlobs = getConfiguredCallGraphExcludeGlobs(cfg);
     const maxFileSize = getConfiguredCallGraphMaxFileSize(cfg);
-    const buildLimits = getConfiguredCallGraphBuildLimits(cfg);
     const parseConcurrency = getConfiguredCallGraphConcurrency(cfg);
-    const resolveOptions = getConfiguredCallGraphResolveOptions(cfg);
-    const parseLimits = getConfiguredCallGraphParseLimits(cfg);
-    const cpuBudget = getConfiguredCallGraphCpuBudget(cfg);
     const configSignature = getCallGraphConfigSignature(cfg);
-    const progressState = {
-      current: 0,
-      total: 0,
-      parsedFiles: 0,
-      skippedFiles: 0,
-      warningCount: 0,
-      lastReportAt: 0,
-    };
-    const emitProgress = (
-      stage: CallGraphRebuildProgress['stage'],
-      message: string,
-      force = false,
-    ) => {
-      const now = Date.now();
-      if (!force && now - progressState.lastReportAt < 250) {
-        return;
-      }
-      progressState.lastReportAt = now;
-      report?.({
-        stage,
-        message,
-        current: progressState.current,
-        total: progressState.total,
-        parsedFiles: progressState.parsedFiles,
-        skippedFiles: progressState.skippedFiles,
-        warningCount: progressState.warningCount,
-        elapsedMs: now - started,
-        concurrency: parseConcurrency,
-      });
-    };
-    const throwIfCancelled = () => {
-      if (token?.isCancellationRequested) {
-        throw new CallGraphRebuildCancelledError();
-      }
-    };
-    throwIfCancelled();
-    emitProgress('discovering', 'discovering source files', true);
-    const files = await findWorkspaceFilesDirect({
-      workspaceFolders: [folder],
-      excludeGlobs,
-      extensions: SOURCE_EXTENSIONS,
-      maxResults: 200_000,
-      token,
-      onProgress: (count) => {
-        progressState.current = count;
-        emitProgress('discovering', `discovered ${count} source files`);
-      },
-    });
-    throwIfCancelled();
-    const warnings: string[] = [];
-    progressState.current = 0;
-    const sourceFiles = files.filter((uri) => {
-      const ext = path.extname(uri.fsPath).toLowerCase();
-      return SOURCE_EXTENSIONS.has(ext) && !uri.fsPath.endsWith('.d.ts');
-    });
-    progressState.total = sourceFiles.length;
-    progressState.current = 0;
-    emitProgress(options.force ? 'parsing' : 'indexing', options.force
-      ? 'forced rebuild requested; skipping cached record reuse'
-      : 'checking call graph cache metadata', true);
-    let cachedRecordsAvailable = false;
-    const fastSnapshot = options.force ? undefined : await this.tryRebuildFromIndexedCache({
+    return this.rebuildInRustGraphProcess({
       workspaceRoot,
-      sourceFiles,
       maxFileSize,
       parseConcurrency,
-      parseLimits,
-      cpuBudget,
-      resolveOptions,
       configSignature,
-      started,
       token,
-      onProgress: (stage, current, total, message) => {
-        progressState.current = current;
-        progressState.total = total;
-        emitProgress(stage === 'checking' ? 'indexing' : 'parsing', message);
-      },
+      report,
     });
-    if (fastSnapshot) {
-      progressState.current = progressState.total;
-      progressState.parsedFiles = fastSnapshot.stats.fileCount;
-      progressState.skippedFiles = fastSnapshot.stats.skippedFileCount;
-      progressState.warningCount = fastSnapshot.warnings.length;
-      emitProgress('done', `done in ${Date.now() - started}ms`, true);
-      return fastSnapshot;
-    }
-    if (!options.force && this.cacheManifest?.configSignature === configSignature) {
-      cachedRecordsAvailable = await this.ensureCachedRecordsLoaded();
-      if (cachedRecordsAvailable && await this.persistRecordIndexFromLoadedRecordsIfMissing()) {
-        progressState.current = 0;
-        progressState.total = sourceFiles.length;
-        const migratedFastSnapshot = await this.tryRebuildFromIndexedCache({
-          workspaceRoot,
-          sourceFiles,
-          maxFileSize,
-          parseConcurrency,
-          parseLimits,
-          cpuBudget,
-          resolveOptions,
-          configSignature,
-          started,
-          token,
-          onProgress: (stage, current, total, message) => {
-            progressState.current = current;
-            progressState.total = total;
-            emitProgress(stage === 'checking' ? 'indexing' : 'parsing', message);
-          },
-        });
-        if (migratedFastSnapshot) {
-          progressState.current = progressState.total;
-          progressState.parsedFiles = migratedFastSnapshot.stats.fileCount;
-          progressState.skippedFiles = migratedFastSnapshot.stats.skippedFileCount;
-          progressState.warningCount = migratedFastSnapshot.warnings.length;
-          emitProgress('done', `done in ${Date.now() - started}ms`, true);
-          return migratedFastSnapshot;
-        }
-      }
-    }
-    const cachedRecordsByUri = !options.force && cachedRecordsAvailable
-      ? new Map(this.fileRecordsByUri)
-      : new Map<string, CallGraphFileRecord>();
-    let reusedFiles = 0;
-    progressState.current = 0;
-    progressState.total = sourceFiles.length;
-    emitProgress(
-      'parsing',
-      `parsing ${sourceFiles.length} source files with ${parseConcurrency} workers`,
-      true,
-    );
-    const records: CallGraphFileRecord[] = [];
-    const buildBudgetState = createCallGraphBuildBudgetState();
-    await forEachWithConcurrency(sourceFiles, parseConcurrency, async (uri) => {
-      throwIfCancelled();
-      let result: ParsedSourceFileResult;
-      if (this.disposed) {
-        progressState.current += 1;
-        progressState.skippedFiles += 1;
-        emitProgress('parsing', `parsed ${progressState.current}/${progressState.total}`);
-        result = { record: undefined, warnings: [], skipped: true };
-      } else {
-        try {
-          const cachedRecord = cachedRecordsByUri.get(uri.toString());
-          if (cachedRecord) {
-            try {
-              const stat = await vscode.workspace.fs.stat(uri);
-              if (fileMetadataMatches(cachedRecord, stat)) {
-                progressState.current += 1;
-                progressState.parsedFiles += 1;
-                reusedFiles += 1;
-                emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`);
-                result = { record: cachedRecord, warnings: [], skipped: false, reused: true };
-                if (result.record) {
-                  applyCallGraphBuildBudgetsToRecord(result.record, buildLimits, buildBudgetState);
-                  records.push(result.record);
-                }
-                return;
-              }
-            } catch {
-              // Fall through to parsing; parseSourceFileRecord will surface a useful warning if the file vanished.
-            }
-          }
-          const parseStarted = Date.now();
-          result = await parseSourceFileRecord(uri, maxFileSize, parseLimits);
-          await applyCallGraphCpuBudget(Date.now() - parseStarted, cpuBudget, token);
-          throwIfCancelled();
-          progressState.current += 1;
-          if (result.record) {
-            progressState.parsedFiles += 1;
-          } else {
-            progressState.skippedFiles += 1;
-          }
-          progressState.warningCount += result.warnings.length;
-          emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`);
-        } catch (err) {
-          const warning = `failed to parse ${uri.fsPath}: ${err instanceof Error ? err.message : String(err)}`;
-          progressState.current += 1;
-          progressState.skippedFiles += 1;
-          progressState.warningCount += 1;
-          emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`);
-          result = { record: undefined, warnings: [warning], skipped: true };
-        }
-      }
-      if (result.record) {
-        applyCallGraphBuildBudgetsToRecord(result.record, buildLimits, buildBudgetState);
-        records.push(result.record);
-      }
-      if (result.warnings.length > 0) {
-        warnings.push(...result.warnings);
-      }
-    });
-    emitProgress('parsing', `reused ${reusedFiles}, parsed ${progressState.current}/${progressState.total}`, true);
-    appendCallGraphBuildBudgetWarnings(warnings, buildLimits, buildBudgetState);
-    const parsedWarnings = records.flatMap((record) => record.parsed.warnings);
-    warnings.push(...parsedWarnings);
-    progressState.warningCount = warnings.length;
-    progressState.current = 0;
-    progressState.total = records.reduce((sum, record) => sum + record.parsed.symbols.length, 0);
-    emitProgress('indexing', `indexing ${progressState.total} symbols`, true);
-    throwIfCancelled();
-    const symbols = records.flatMap((record) => record.parsed.symbols);
-    const bindings = records.flatMap((record) => record.parsed.bindings);
-    const index = buildSymbolIndex(symbols, bindings);
-    bindings.length = 0;
-    const referenceCandidates = records.flatMap((record) => record.parsed.referenceCandidates);
-    const references = resolveReferenceCandidates(
-      referenceCandidates,
-      symbols,
-      index,
-    );
-    referenceCandidates.length = 0;
-    const calls = records.flatMap((record) => record.parsed.calls);
-    const callsiteCount = calls.length;
-    progressState.current = 0;
-    progressState.total = callsiteCount;
-    emitProgress('resolving', `resolving ${callsiteCount} callsites`, true);
-    const resolvedCalls = await resolveCallsAsync(calls, index, {
-      token,
-      resolveOptions,
-      onProgress: (current, total) => {
-        progressState.current = current;
-        progressState.total = total;
-        emitProgress('resolving', `resolved ${current}/${total} callsites`);
-      },
-    });
-    calls.length = 0;
-    const edges = resolvedCalls.edges;
-    if (resolvedCalls.edgeLimitHit) {
-      warnings.push(`call graph unique edge limit reached at ${resolveOptions.maxEdges}; skipped additional materialized edges`);
-    }
-    if (!resolveOptions.includePossibleEdges && resolvedCalls.skippedPossibleEdgeCount > 0) {
-      warnings.push(`skipped ${resolvedCalls.skippedPossibleEdgeCount} possible edges; enable intellijStyledSearch.callGraphIncludePossibleEdges to materialize them`);
-    }
-    if (!resolveOptions.includeUnresolvedEdges && resolvedCalls.skippedUnresolvedEdgeCount > 0) {
-      warnings.push(`skipped ${resolvedCalls.skippedUnresolvedEdgeCount} unresolved callsites; enable intellijStyledSearch.callGraphIncludeUnresolvedEdges to materialize them`);
-    }
-    const languageCounts: Record<CallGraphLanguage, number> = {
-      python: 0,
-      java: 0,
-      kotlin: 0,
-      typescript: 0,
-      javascript: 0,
-    };
-    for (const symbol of symbols) {
-      languageCounts[symbol.language] += 1;
-    }
-    const snapshot: CallGraphSnapshot = {
-      workspaceRoot,
-      builtAtUnixMs: Date.now(),
-      symbols: symbols.map(stripMutableSymbol),
-      edges,
-      references,
-      warnings,
-      stats: {
-        fileCount: records.length,
-        symbolCount: symbols.length,
-        edgeCount: edges.length,
-        exactEdgeCount: edges.filter((edge) => edge.confidence === 'exact' || edge.confidence === 'resolved').length,
-        possibleEdgeCount: edges.filter((edge) => edge.confidence === 'possible').length,
-        unresolvedEdgeCount: edges.filter((edge) => edge.confidence === 'unresolved').length,
-        languageCounts,
-        elapsedMs: Date.now() - started,
-        parseConcurrency,
-        skippedFileCount: progressState.skippedFiles,
-        callsiteCount,
-        skippedPossibleEdgeCount: resolvedCalls.skippedPossibleEdgeCount,
-        skippedUnresolvedEdgeCount: resolvedCalls.skippedUnresolvedEdgeCount,
-        edgeLimitHit: resolvedCalls.edgeLimitHit,
-        referenceCount: references.length,
-      },
-    };
-    this.applySnapshot(snapshot, index, records, configSignature);
-    await this.persistCache(snapshot);
-    this.log.appendLine(
-      `call graph rebuilt: files=${snapshot.stats.fileCount} skipped=${snapshot.stats.skippedFileCount} reused=${reusedFiles} symbols=${snapshot.stats.symbolCount} edges=${snapshot.stats.edgeCount} references=${snapshot.stats.referenceCount} workers=${snapshot.stats.parseConcurrency} elapsed=${snapshot.stats.elapsedMs}ms`,
-    );
-    progressState.current = progressState.total;
-    progressState.parsedFiles = snapshot.stats.fileCount;
-    progressState.skippedFiles = snapshot.stats.skippedFileCount;
-    progressState.warningCount = snapshot.warnings.length;
-    emitProgress('done', `done in ${snapshot.stats.elapsedMs}ms`, true);
-    return snapshot;
   }
 
   private resolveInputSymbols(symbolOrQuery: string): CallGraphSymbol[] {
@@ -3008,6 +3921,140 @@ function buildSymbolRelationRecords(relationIndex: RelationSummaryIndex): CallGr
   return records.sort((a, b) => a.symbolId.localeCompare(b.symbolId));
 }
 
+function formatRustGraphReferenceTsvLine(symbolId: string, reference: CallGraphReference): string {
+  return [
+    'U',
+    encodeRustGraphTsvField(symbolId),
+    encodeRustGraphTsvField(reference.name),
+    encodeRustGraphTsvField(reference.rawText),
+    encodeRustGraphTsvField(reference.uri),
+    encodeRustGraphTsvField(reference.relPath),
+    safeGraphRangeNumber(reference.range.startLine),
+    safeGraphRangeNumber(reference.range.startColumn),
+    safeGraphRangeNumber(reference.range.endLine),
+    safeGraphRangeNumber(reference.range.endColumn),
+    encodeRustGraphTsvField(reference.enclosingSymbolId ?? ''),
+  ].join('\t') + '\n';
+}
+
+function encodeRustGraphTsvField(value: string): string {
+  return encodeURIComponent(value);
+}
+
+function normalizeGraphRange(range: CallGraphRange | undefined): CallGraphRange {
+  return {
+    startLine: safeGraphRangeNumber(range?.startLine),
+    startColumn: safeGraphRangeNumber(range?.startColumn),
+    endLine: safeGraphRangeNumber(range?.endLine),
+    endColumn: safeGraphRangeNumber(range?.endColumn),
+  };
+}
+
+function rustGraphSymbolToCallGraphSymbol(symbol: RustGraphSymbol): CallGraphSymbol & { usageCount?: number; implementationCount?: number } {
+  const range = normalizeGraphRange(symbol.range);
+  const bodyRange = normalizeGraphRange(symbol.bodyRange ?? symbol.range);
+  return {
+    id: String(symbol.id ?? ''),
+    name: String(symbol.name ?? ''),
+    qualifiedName: String(symbol.qualifiedName ?? symbol.name ?? ''),
+    kind: normalizeCallGraphSymbolKind(symbol.kind),
+    language: normalizeCallGraphLanguage(symbol.language),
+    uri: String(symbol.uri ?? ''),
+    relPath: String(symbol.relPath ?? ''),
+    range,
+    bodyRange,
+    ...(symbol.containerId ? { containerId: String(symbol.containerId) } : {}),
+    ...(symbol.containerName ? { containerName: String(symbol.containerName) } : {}),
+    ...(symbol.packageName ? { packageName: String(symbol.packageName) } : {}),
+    ...(Array.isArray(symbol.extendsNames) ? { extendsNames: symbol.extendsNames.map(String).filter(Boolean) } : {}),
+    ...(Array.isArray(symbol.implementsNames) ? { implementsNames: symbol.implementsNames.map(String).filter(Boolean) } : {}),
+    ...(Number.isFinite(symbol.usageCount) ? { usageCount: Math.max(0, Math.floor(symbol.usageCount as number)) } : {}),
+    ...(Number.isFinite(symbol.implementationCount) ? { implementationCount: Math.max(0, Math.floor(symbol.implementationCount as number)) } : {}),
+  };
+}
+
+function normalizeCallGraphLanguage(value: unknown): CallGraphLanguage {
+  const language = String(value ?? '');
+  if (language === 'python' || language === 'java' || language === 'kotlin' || language === 'typescript' || language === 'javascript' || language === 'graphql') {
+    return language;
+  }
+  return 'javascript';
+}
+
+function normalizeCallGraphSymbolKind(value: unknown): CallGraphSymbolKind {
+  const kind = String(value ?? '');
+  if (
+    kind === 'class' ||
+    kind === 'interface' ||
+    kind === 'enum' ||
+    kind === 'type' ||
+    kind === 'struct' ||
+    kind === 'function' ||
+    kind === 'method' ||
+    kind === 'constructor' ||
+    kind === 'constant' ||
+    kind === 'variable' ||
+    kind === 'field' ||
+    kind === 'property'
+  ) {
+    return kind;
+  }
+  return 'function';
+}
+
+function rustSymbolQueryCacheKey(query: string, limit: number): string {
+  return `${query.trim()}\n${Math.max(1, Math.floor(limit))}`;
+}
+
+function parseRustGraphRebuildProgressLine(line: string): {
+  stage: CallGraphRebuildProgress['stage'];
+  current: number;
+  total: number;
+  message: string;
+} | undefined {
+  const match = /^graph-rebuild progress: stage=(\S+) current=(\d+) total=(\d+) message=(.*)$/.exec(line.trim());
+  if (!match) { return undefined; }
+  const stage = normalizeRustGraphProgressStage(match[1]);
+  if (!stage) { return undefined; }
+  return {
+    stage,
+    current: Math.max(0, Number.parseInt(match[2], 10) || 0),
+    total: Math.max(0, Number.parseInt(match[3], 10) || 0),
+    message: match[4] || stage,
+  };
+}
+
+function normalizeRustGraphProgressStage(stage: string): CallGraphRebuildProgress['stage'] | undefined {
+  if (
+    stage === 'discovering' ||
+    stage === 'parsing' ||
+    stage === 'indexing' ||
+    stage === 'resolving' ||
+    stage === 'deduping' ||
+    stage === 'done'
+  ) {
+    return stage;
+  }
+  return undefined;
+}
+
+function isRustNativeIndexOnlySnapshot(snapshot: CallGraphSnapshot | undefined): boolean {
+  if (!snapshot) { return false; }
+  return snapshot.symbols.length === 0 &&
+    snapshot.edges.length === 0 &&
+    snapshot.references.length === 0 &&
+    snapshot.warnings.some((warning) => warning.includes('rust-native graph rebuild'));
+}
+
+function isRustNativeGraphManifest(manifest: CallGraphCacheManifest | undefined): boolean {
+  return !!manifest?.snapshot?.warnings?.some((warning) => warning.includes('rust-native graph rebuild'));
+}
+
+function safeGraphRangeNumber(value: unknown): number {
+  if (!Number.isFinite(value)) { return 0; }
+  return Math.max(0, Math.floor(value as number));
+}
+
 async function buildDocumentSummaryRecords(
   snapshot: CallGraphSnapshot,
   index: SymbolIndex,
@@ -3172,6 +4219,8 @@ function parseFile(
     case 'typescript':
     case 'javascript':
       return parseBraceFile(language, uri, relPath, text, limits);
+    case 'graphql':
+      return { symbols: [], calls: [], bindings: [], referenceCandidates: [], warnings: [] };
   }
 }
 
@@ -3266,24 +4315,41 @@ async function buildSnapshotFromFileRecords(input: {
   resolveOptions: CallGraphResolveOptions;
   token?: vscode.CancellationToken;
   onResolveProgress?: (current: number, total: number) => void;
+  consumeRecords?: boolean;
 }): Promise<{ snapshot: CallGraphSnapshot; index: SymbolIndex }> {
-  const symbols = input.records.flatMap((record) => record.parsed.symbols);
-  const index = buildSymbolIndex(symbols, input.records.flatMap((record) => record.parsed.bindings));
+  const fileCount = input.records.length;
+  const symbols: CallGraphSymbol[] = [];
+  const bindings: CallGraphVariableBinding[] = [];
+  const referenceCandidates: CallGraphReferenceCandidate[] = [];
+  const calls: CallGraphCallSite[] = [];
+  const warnings = [...input.warnings];
+  for (const record of input.records) {
+    for (const symbol of record.parsed.symbols) {
+      symbols.push(stripMutableSymbol(symbol));
+    }
+    bindings.push(...record.parsed.bindings);
+    referenceCandidates.push(...record.parsed.referenceCandidates);
+    calls.push(...record.parsed.calls);
+    warnings.push(...record.parsed.warnings);
+    if (input.consumeRecords) {
+      clearParsedFileRecord(record);
+    }
+  }
+  const index = buildSymbolIndex(symbols, bindings);
+  bindings.length = 0;
   const references = resolveReferenceCandidates(
-    input.records.flatMap((record) => record.parsed.referenceCandidates),
+    referenceCandidates,
     symbols,
     index,
   );
-  const calls = input.records.flatMap((record) => record.parsed.calls);
+  referenceCandidates.length = 0;
+  const callsiteCount = calls.length;
   const resolvedCalls = await resolveCallsAsync(calls, index, {
     token: input.token,
     resolveOptions: input.resolveOptions,
     onProgress: input.onResolveProgress,
   });
-  const warnings = [
-    ...input.warnings,
-    ...input.records.flatMap((record) => record.parsed.warnings),
-  ];
+  calls.length = 0;
   if (resolvedCalls.edgeLimitHit) {
     warnings.push(`call graph unique edge limit reached at ${input.resolveOptions.maxEdges}; skipped additional materialized edges`);
   }
@@ -3299,6 +4365,7 @@ async function buildSnapshotFromFileRecords(input: {
     kotlin: 0,
     typescript: 0,
     javascript: 0,
+    graphql: 0,
   };
   for (const symbol of symbols) {
     languageCounts[symbol.language] += 1;
@@ -3309,12 +4376,12 @@ async function buildSnapshotFromFileRecords(input: {
     snapshot: {
       workspaceRoot: input.workspaceRoot,
       builtAtUnixMs: Date.now(),
-      symbols: symbols.map(stripMutableSymbol),
+      symbols,
       edges,
       references,
       warnings,
       stats: {
-        fileCount: input.records.length,
+        fileCount,
         symbolCount: symbols.length,
         edgeCount: edges.length,
         exactEdgeCount: edges.filter((edge) => edge.confidence === 'exact' || edge.confidence === 'resolved').length,
@@ -3324,13 +4391,495 @@ async function buildSnapshotFromFileRecords(input: {
         elapsedMs: Date.now() - input.started,
         parseConcurrency: input.parseConcurrency,
         skippedFileCount: input.skippedFileCount,
-        callsiteCount: calls.length,
+        callsiteCount,
         skippedPossibleEdgeCount: resolvedCalls.skippedPossibleEdgeCount,
         skippedUnresolvedEdgeCount: resolvedCalls.skippedUnresolvedEdgeCount,
         edgeLimitHit: resolvedCalls.edgeLimitHit,
         referenceCount: references.length,
       },
     },
+  };
+}
+
+function clearParsedFileRecord(record: CallGraphFileRecord): void {
+  record.parsed.symbols.length = 0;
+  record.parsed.calls.length = 0;
+  record.parsed.bindings.length = 0;
+  record.parsed.referenceCandidates.length = 0;
+  record.parsed.warnings.length = 0;
+}
+
+function clearSymbolIndex(index: SymbolIndex | undefined): void {
+  if (!index) { return; }
+  index.byId.clear();
+  index.byName.clear();
+  index.byQualifiedName.clear();
+  index.byClassName.clear();
+  index.methodsByName.clear();
+  index.methodsByClassName.clear();
+  index.symbolsByFile.clear();
+  index.bindingsBySymbolId.clear();
+  index.typesByReferencedName.clear();
+}
+
+function clearRelationSummaryIndex(index: RelationSummaryIndex | undefined): void {
+  if (!index) { return; }
+  index.callersBySymbolId.clear();
+  index.calleesBySymbolId.clear();
+  index.usagesBySymbolId.clear();
+}
+
+function clearCallGraphSnapshotPayload(snapshot: CallGraphSnapshot): void {
+  snapshot.symbols.length = 0;
+  snapshot.edges.length = 0;
+  snapshot.references.length = 0;
+  snapshot.warnings.length = 0;
+}
+
+type NodeFileUri = {
+  scheme: 'file';
+  fsPath: string;
+  toString(): string;
+};
+
+export async function rebuildCallGraphWorker(
+  input: CallGraphWorkerRebuildInput,
+  report: (progress: CallGraphRebuildProgress) => void = () => undefined,
+): Promise<CallGraphWorkerRebuildResult> {
+  const started = Date.now();
+  const adaptiveMemoryOptions = getCallGraphAdaptiveMemoryOptions(input.buildLimits.memoryBudgetMb);
+  const initialHeapPressure = getCallGraphHeapPressure();
+  const progressState = {
+    current: 0,
+    total: 0,
+    parsedFiles: 0,
+    skippedFiles: 0,
+    warningCount: 0,
+    lastReportAt: 0,
+    currentConcurrency: input.parseConcurrency,
+    maxConcurrency: input.parseConcurrency,
+    heapUsedMb: initialHeapPressure.heapUsedMb,
+    heapLimitMb: initialHeapPressure.heapLimitMb,
+    heapUsageRatio: initialHeapPressure.heapUsageRatio,
+    workerThrottleCount: 0,
+  };
+  const applyAdaptiveProgressState = (state?: CallGraphAdaptiveConcurrencySnapshot) => {
+    if (!state) { return; }
+    progressState.currentConcurrency = state.currentConcurrency;
+    progressState.maxConcurrency = state.maxConcurrency;
+    progressState.heapUsedMb = state.heapUsedMb;
+    progressState.heapLimitMb = state.heapLimitMb;
+    progressState.heapUsageRatio = state.heapUsageRatio;
+    progressState.workerThrottleCount = state.throttleCount;
+  };
+  const refreshHeapProgressState = () => {
+    const pressure = getCallGraphHeapPressure();
+    progressState.heapUsedMb = pressure.heapUsedMb;
+    progressState.heapLimitMb = pressure.heapLimitMb;
+    progressState.heapUsageRatio = pressure.heapUsageRatio;
+  };
+  const emitProgress = (
+    stage: CallGraphRebuildProgress['stage'],
+    message: string,
+    force = false,
+  ) => {
+    const now = Date.now();
+    if (!force && now - progressState.lastReportAt < 250) {
+      return;
+    }
+    progressState.lastReportAt = now;
+    report({
+      stage,
+      message,
+      current: progressState.current,
+      total: progressState.total,
+      parsedFiles: progressState.parsedFiles,
+      skippedFiles: progressState.skippedFiles,
+      warningCount: progressState.warningCount,
+      elapsedMs: now - started,
+      concurrency: progressState.currentConcurrency,
+      maxConcurrency: progressState.maxConcurrency,
+      heapUsedMb: progressState.heapUsedMb,
+      heapLimitMb: progressState.heapLimitMb,
+      heapUsageRatio: progressState.heapUsageRatio,
+      workerThrottleCount: progressState.workerThrottleCount,
+    });
+  };
+
+  emitProgress('discovering', 'worker discovering source files', true);
+  const sourceFiles = await findCallGraphSourceFilesNode(input.workspaceRoot, input.excludeGlobs, (count) => {
+    progressState.current = count;
+    emitProgress('discovering', `worker discovered ${count} source files`);
+  });
+  const warnings: string[] = [];
+  const records: CallGraphFileRecord[] = [];
+  const buildBudgetState = createCallGraphBuildBudgetState();
+  progressState.current = 0;
+  progressState.total = sourceFiles.length;
+  emitProgress(
+    'parsing',
+    `worker parsing ${sourceFiles.length} source files with up to ${input.parseConcurrency} workers`,
+    true,
+  );
+  const parseStats = await forEachWithAdaptiveConcurrency(sourceFiles, input.parseConcurrency, async (uri) => {
+    let result: ParsedSourceFileResult;
+    try {
+      const parseStarted = Date.now();
+      result = await parseSourceFileRecordFromFs(uri, input.workspaceRoot, input.maxFileSize, input.parseLimits);
+      await applyCallGraphCpuBudget(Date.now() - parseStarted, input.cpuBudget);
+      progressState.current += 1;
+      if (result.record) {
+        progressState.parsedFiles += 1;
+      } else {
+        progressState.skippedFiles += 1;
+      }
+      progressState.warningCount += result.warnings.length;
+      emitProgress('parsing', `worker parsed ${progressState.current}/${progressState.total}`);
+    } catch (err) {
+      const warning = `failed to parse ${uri.fsPath}: ${err instanceof Error ? err.message : String(err)}`;
+      progressState.current += 1;
+      progressState.skippedFiles += 1;
+      progressState.warningCount += 1;
+      emitProgress('parsing', `worker parsed ${progressState.current}/${progressState.total}`);
+      result = { record: undefined, warnings: [warning], skipped: true };
+    }
+    if (result.record) {
+      applyCallGraphBuildBudgetsToRecord(result.record, input.buildLimits, buildBudgetState);
+      records.push(result.record);
+    }
+    if (result.warnings.length > 0) {
+      warnings.push(...result.warnings);
+    }
+  }, {
+    ...adaptiveMemoryOptions,
+    onStateChange: (state) => {
+      applyAdaptiveProgressState(state);
+      emitProgress('parsing', `worker parsed ${progressState.current}/${progressState.total}`);
+    },
+  });
+  emitProgress('parsing', `worker parsed ${progressState.current}/${progressState.total}`, true);
+  sourceFiles.length = 0;
+  appendCallGraphBuildBudgetWarnings(warnings, input.buildLimits, buildBudgetState);
+  progressState.warningCount = warnings.length;
+  progressState.current = 0;
+  progressState.total = records.reduce((sum, record) => sum + record.parsed.symbols.length, 0);
+  emitProgress('indexing', `worker indexing ${progressState.total} symbols`, true);
+  const recordIndex = buildRecordIndexFromRecords(records);
+  const snapshotBuild = await buildSnapshotFromFileRecords({
+    workspaceRoot: input.workspaceRoot,
+    records,
+    skippedFileCount: progressState.skippedFiles,
+    warnings,
+    started,
+    parseConcurrency: input.parseConcurrency,
+    resolveOptions: input.resolveOptions,
+    onResolveProgress: (current, total) => {
+      progressState.current = current;
+      progressState.total = total;
+      emitProgress('resolving', `worker resolved ${current}/${total} callsites`);
+    },
+    consumeRecords: true,
+  });
+  const snapshot = snapshotBuild.snapshot;
+  snapshot.stats.minParseConcurrency = parseStats.minObservedConcurrency;
+  snapshot.stats.workerThrottleCount = parseStats.throttleCount;
+  snapshot.stats.maxHeapUsedMb = parseStats.maxHeapUsedMb;
+  snapshot.stats.maxHeapUsageRatio = parseStats.maxHeapUsageRatio;
+  records.length = 0;
+  maybeRunGarbageCollection();
+  refreshHeapProgressState();
+  emitProgress('indexing', 'worker released parsed file records', true);
+  emitProgress('indexing', 'worker writing call graph cache', true);
+  const cacheResult = await writeCallGraphWorkerCache({
+    cacheDirFsPath: input.cacheDirFsPath,
+    workspaceRoot: input.workspaceRoot,
+    configSignature: input.configSignature,
+    snapshot,
+    recordIndex,
+    index: snapshotBuild.index,
+  });
+  const resultBuiltAtUnixMs = snapshot.builtAtUnixMs;
+  const resultStats: CallGraphStats = {
+    ...snapshot.stats,
+    languageCounts: { ...snapshot.stats.languageCounts },
+  };
+  const resultWarnings = [...snapshot.warnings];
+  const recordIndexCount = recordIndex.length;
+  clearCallGraphSnapshotPayload(snapshot);
+  recordIndex.length = 0;
+  warnings.length = 0;
+  maybeRunGarbageCollection();
+  refreshHeapProgressState();
+  progressState.current = progressState.total;
+  progressState.parsedFiles = resultStats.fileCount;
+  progressState.skippedFiles = resultStats.skippedFileCount;
+  progressState.warningCount = resultWarnings.length;
+  emitProgress('done', `worker done in ${resultStats.elapsedMs}ms`, true);
+  return {
+    builtAtUnixMs: resultBuiltAtUnixMs,
+    stats: resultStats,
+    warnings: resultWarnings,
+    recordIndexCount,
+    snapshotChunkCount: cacheResult.snapshotChunkCount,
+    symbolRelationBucketCount: cacheResult.symbolRelationBucketCount,
+    documentSummaryBucketCount: cacheResult.documentSummaryBucketCount,
+    cacheBytes: cacheResult.cacheBytes,
+  };
+}
+
+async function findCallGraphSourceFilesNode(
+  workspaceRoot: string,
+  excludeGlobs: string[],
+  onProgress: (count: number) => void,
+): Promise<NodeFileUri[]> {
+  const out: NodeFileUri[] = [];
+  const excludeMatcher = compilePathScopeMatcher(undefined, excludeGlobs);
+  await walkCallGraphSourceFilesNode(workspaceRoot, '', out, excludeMatcher, onProgress);
+  return out;
+}
+
+async function walkCallGraphSourceFilesNode(
+  workspaceRoot: string,
+  relDir: string,
+  out: NodeFileUri[],
+  excludeMatcher: ((relPath: string) => boolean) | null,
+  onProgress: (count: number) => void,
+): Promise<void> {
+  const absDir = relDir ? path.join(workspaceRoot, relDir) : workspaceRoot;
+  let dir: fs.Dir;
+  try {
+    dir = await fs.promises.opendir(absDir);
+  } catch {
+    return;
+  }
+  try {
+    for await (const entry of dir) {
+      if (entry.name === '.' || entry.name === '..') { continue; }
+      const relPath = (relDir ? path.join(relDir, entry.name) : entry.name).replace(/\\/g, '/');
+      if (entry.isDirectory()) {
+        if (excludeMatcher && !excludeMatcher(`${relPath}/__ijss_probe__`)) { continue; }
+        await walkCallGraphSourceFilesNode(workspaceRoot, relPath, out, excludeMatcher, onProgress);
+        continue;
+      }
+      if (!entry.isFile()) { continue; }
+      const ext = path.extname(entry.name).toLowerCase();
+      if (!SOURCE_EXTENSIONS.has(ext) || entry.name.endsWith('.d.ts')) { continue; }
+      if (excludeMatcher && !excludeMatcher(relPath)) { continue; }
+      out.push(nodeFileUri(path.join(workspaceRoot, relPath)));
+      onProgress(out.length);
+    }
+  } finally {
+    try { await dir.close(); } catch {}
+  }
+}
+
+async function parseSourceFileRecordFromFs(
+  uri: NodeFileUri,
+  workspaceRoot: string,
+  maxFileSize: number,
+  limits: CallGraphParseLimits,
+): Promise<ParsedSourceFileResult> {
+  const stat = await fs.promises.stat(uri.fsPath);
+  if (stat.isDirectory()) {
+    return { skipped: true, warnings: [] };
+  }
+  if (maxFileSize > 0 && stat.size > maxFileSize) {
+    return { skipped: true, warnings: [] };
+  }
+  const language = LANGUAGE_BY_EXTENSION.get(path.extname(uri.fsPath).toLowerCase());
+  if (!language) {
+    return { skipped: true, warnings: [] };
+  }
+  const bytes = await fs.promises.readFile(uri.fsPath);
+  if (looksBinaryContent(bytes)) {
+    return { skipped: true, warnings: [] };
+  }
+  const text = decodeTextBytes(bytes);
+  const relPath = path.relative(workspaceRoot, uri.fsPath).replace(/\\/g, '/');
+  const lineCheck = checkParseLineLimits(text, limits);
+  if (lineCheck) {
+    return { skipped: true, warnings: [`skipped call graph parse for ${relPath}: ${lineCheck}`] };
+  }
+  const parseStarted = Date.now();
+  const parsed = parseFile(language, uri as unknown as vscode.Uri, relPath, text, limits);
+  const parseElapsed = Date.now() - parseStarted;
+  const warnings = parseElapsed > 2_500
+    ? [`slow call graph parse: ${relPath} ${parseElapsed}ms size=${stat.size}`]
+    : [];
+  return {
+    skipped: false,
+    warnings,
+    record: {
+      uri: uri.toString(),
+      relPath,
+      language,
+      mtime: Math.trunc(stat.mtimeMs),
+      size: stat.size,
+      parsed,
+    },
+  };
+}
+
+async function writeCallGraphWorkerCache(input: {
+  cacheDirFsPath: string;
+  workspaceRoot: string;
+  configSignature: string;
+  snapshot: CallGraphSnapshot;
+  recordIndex: CallGraphRecordIndexEntry[];
+  index: SymbolIndex;
+}): Promise<{
+  snapshotChunkCount: number;
+  symbolRelationBucketCount: number;
+  documentSummaryBucketCount: number;
+  cacheBytes: number;
+}> {
+  await fs.promises.mkdir(input.cacheDirFsPath, { recursive: true });
+  let totalBytes = 0;
+  const snapshotChunks = {
+    symbols: await writeCacheArrayChunksNode(
+      input.cacheDirFsPath,
+      'snapshot-symbols',
+      input.snapshot.symbols,
+      CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK,
+      (bytes) => { totalBytes += bytes; },
+    ),
+    edges: await writeCacheArrayChunksNode(
+      input.cacheDirFsPath,
+      'snapshot-edges',
+      input.snapshot.edges,
+      CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK,
+      (bytes) => { totalBytes += bytes; },
+    ),
+    references: await writeCacheArrayChunksNode(
+      input.cacheDirFsPath,
+      'snapshot-references',
+      input.snapshot.references,
+      CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK,
+      (bytes) => { totalBytes += bytes; },
+    ),
+  };
+  const relationIndex = buildRelationSummaryIndex(input.snapshot.edges, input.snapshot.references);
+  const documentSummaryRecords = await buildDocumentSummaryRecords(input.snapshot, input.index, relationIndex);
+  clearSymbolIndex(input.index);
+  const documentSummaries = await writeDocumentSummaryBucketsNode(
+    input.cacheDirFsPath,
+    documentSummaryRecords,
+    (bytes) => { totalBytes += bytes; },
+  );
+  documentSummaryRecords.length = 0;
+  maybeRunGarbageCollection();
+  const symbolRelationRecords = buildSymbolRelationRecords(relationIndex);
+  const symbolRelations = await writeSymbolRelationBucketsNode(
+    input.cacheDirFsPath,
+    symbolRelationRecords,
+    (bytes) => { totalBytes += bytes; },
+  );
+  symbolRelationRecords.length = 0;
+  clearRelationSummaryIndex(relationIndex);
+  maybeRunGarbageCollection();
+  const manifest: CallGraphCacheManifest = {
+    version: CALL_GRAPH_CACHE_VERSION,
+    workspaceRoot: input.workspaceRoot,
+    configSignature: input.configSignature,
+    builtAtUnixMs: input.snapshot.builtAtUnixMs,
+    chunks: [],
+    recordIndex: input.recordIndex,
+    symbolRelations,
+    documentSummaries,
+    snapshot: {
+      builtAtUnixMs: input.snapshot.builtAtUnixMs,
+      stats: input.snapshot.stats,
+      warnings: input.snapshot.warnings,
+      ...snapshotChunks,
+    },
+  };
+  const encodedManifest = await gzipAsync(Buffer.from(JSON.stringify(manifest), 'utf8'));
+  totalBytes += encodedManifest.byteLength;
+  await fs.promises.writeFile(path.join(input.cacheDirFsPath, 'manifest.json.gz'), encodedManifest);
+  return {
+    snapshotChunkCount: countSnapshotChunks(manifest),
+    symbolRelationBucketCount: symbolRelations.length,
+    documentSummaryBucketCount: documentSummaries.length,
+    cacheBytes: totalBytes,
+  };
+}
+
+async function writeCacheArrayChunksNode<T>(
+  cacheDirFsPath: string,
+  prefix: string,
+  items: T[],
+  chunkSize: number,
+  onBytes: (bytes: number) => void,
+): Promise<CallGraphCacheChunk[]> {
+  const chunks: CallGraphCacheChunk[] = [];
+  for (let offset = 0; offset < items.length; offset += chunkSize) {
+    const chunk = items.slice(offset, offset + chunkSize);
+    const file = `${prefix}-${Math.floor(offset / chunkSize)}.json.gz`;
+    const encoded = await gzipAsync(Buffer.from(JSON.stringify(chunk), 'utf8'));
+    onBytes(encoded.byteLength);
+    await fs.promises.writeFile(path.join(cacheDirFsPath, file), encoded);
+    chunks.push({ file, count: chunk.length });
+    await yieldToExtensionHost();
+  }
+  return chunks;
+}
+
+async function writeSymbolRelationBucketsNode(
+  cacheDirFsPath: string,
+  records: CallGraphSymbolRelationRecord[],
+  onBytes: (bytes: number) => void,
+): Promise<CallGraphSymbolRelationChunk[]> {
+  const buckets = new Map<number, CallGraphSymbolRelationRecord[]>();
+  for (const record of records) {
+    const bucket = symbolRelationBucketForSymbolId(record.symbolId);
+    const bucketRecords = buckets.get(bucket) ?? [];
+    bucketRecords.push(record);
+    buckets.set(bucket, bucketRecords);
+  }
+  const chunks: CallGraphSymbolRelationChunk[] = [];
+  for (const [bucket, bucketRecords] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
+    bucketRecords.sort((a, b) => a.symbolId.localeCompare(b.symbolId));
+    const file = `symbol-relations-${bucket}.json.gz`;
+    const encoded = await gzipAsync(Buffer.from(JSON.stringify(bucketRecords), 'utf8'));
+    onBytes(encoded.byteLength);
+    await fs.promises.writeFile(path.join(cacheDirFsPath, file), encoded);
+    chunks.push({ bucket, file, count: bucketRecords.length });
+    await yieldToExtensionHost();
+  }
+  return chunks;
+}
+
+async function writeDocumentSummaryBucketsNode(
+  cacheDirFsPath: string,
+  records: CallGraphDocumentSummaryRecord[],
+  onBytes: (bytes: number) => void,
+): Promise<CallGraphDocumentSummaryChunk[]> {
+  const buckets = new Map<number, CallGraphDocumentSummaryRecord[]>();
+  for (const record of records) {
+    const bucket = documentSummaryBucketForUri(record.uri);
+    const bucketRecords = buckets.get(bucket) ?? [];
+    bucketRecords.push(record);
+    buckets.set(bucket, bucketRecords);
+  }
+  const chunks: CallGraphDocumentSummaryChunk[] = [];
+  for (const [bucket, bucketRecords] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
+    bucketRecords.sort((a, b) => a.relPath.localeCompare(b.relPath));
+    const file = `document-summaries-${bucket}.json.gz`;
+    const encoded = await gzipAsync(Buffer.from(JSON.stringify(bucketRecords), 'utf8'));
+    onBytes(encoded.byteLength);
+    await fs.promises.writeFile(path.join(cacheDirFsPath, file), encoded);
+    chunks.push({ bucket, file, count: bucketRecords.length });
+    await yieldToExtensionHost();
+  }
+  return chunks;
+}
+
+function nodeFileUri(fsPath: string): NodeFileUri {
+  const normalized = path.resolve(fsPath);
+  return {
+    scheme: 'file',
+    fsPath: normalized,
+    toString: () => pathToFileURL(normalized).toString(),
   };
 }
 
@@ -3858,6 +5407,8 @@ function findExternalReferenceCandidatesInLine(
     case 'java':
     case 'kotlin':
       return findStaticImportReferenceCandidates(line, rawLine, lineNo, uri, relPath);
+    case 'graphql':
+      return [];
   }
 }
 
@@ -4398,6 +5949,8 @@ function resolveReferenceTarget(
   }
   if (sameFile.length === 1) { return sameFile[0]; }
   const global = symbolsByName.get(candidate.name) ?? [];
+  const sameLanguage = global.filter((symbol) => symbol.language === languageFromRelPath(candidate.relPath));
+  if (sameLanguage.length === 1) { return sameLanguage[0]; }
   return global.length === 1 ? global[0] : undefined;
 }
 
@@ -5527,12 +7080,17 @@ function isCallableSymbol(symbol: CallGraphSymbol): boolean {
 }
 
 function isReferenceableSymbol(symbol: CallGraphSymbol): boolean {
-  return isTypeSymbol(symbol) || symbol.kind === 'constant' || isAnonymousFunctionAssignmentSymbol(symbol);
+  return isTypeSymbol(symbol) ||
+    symbol.kind === 'constant' ||
+    symbol.kind === 'variable' ||
+    symbol.kind === 'field' ||
+    symbol.kind === 'property' ||
+    isAnonymousFunctionAssignmentSymbol(symbol);
 }
 
 function isExternalApiSymbol(symbol: CallGraphSymbol): boolean {
   if (symbol.containerId) { return false; }
-  if (!isCallableSymbol(symbol) && !isTypeSymbol(symbol) && symbol.kind !== 'constant') { return false; }
+  if (!isCallableSymbol(symbol) && !isTypeSymbol(symbol) && !isReferenceableSymbol(symbol)) { return false; }
   const signature = symbol.signature?.trim() ?? '';
   if (symbol.language === 'typescript' || symbol.language === 'javascript') {
     return /^(?:export\s+|export\s+default\s+)/.test(signature);
@@ -5870,12 +7428,13 @@ function languageFromUri(uri: vscode.Uri): CallGraphLanguage {
   return LANGUAGE_BY_EXTENSION.get(ext) ?? 'javascript';
 }
 
+function languageFromRelPath(relPath: string): CallGraphLanguage {
+  const ext = path.extname(relPath).toLowerCase();
+  return LANGUAGE_BY_EXTENSION.get(ext) ?? 'javascript';
+}
+
 function getDefaultCallGraphConcurrency(): number {
-  const availableParallelism = (os as typeof os & { availableParallelism?: () => number }).availableParallelism?.();
-  const cpuCount = Number.isFinite(availableParallelism) && availableParallelism && availableParallelism > 0
-    ? availableParallelism
-    : os.cpus().length || 4;
-  return Math.max(2, Math.min(8, Math.ceil(cpuCount / 2)));
+  return MAX_CALL_GRAPH_CONCURRENCY;
 }
 
 function getConfiguredCallGraphConcurrency(
@@ -5897,7 +7456,9 @@ function capCallGraphConcurrencyForMemoryBudget(concurrency: number, memoryBudge
         ? 8
         : memoryBudgetMb < 4_096
           ? 12
-          : 16;
+          : memoryBudgetMb < 8_192
+            ? 16
+            : 64;
   return Math.max(1, Math.min(concurrency, memoryCap, MAX_CALL_GRAPH_CONCURRENCY));
 }
 
@@ -5905,7 +7466,7 @@ function getConfiguredCallGraphResolveOptions(
   cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
 ): CallGraphResolveOptions {
   const includePossibleEdges = cfg.get<boolean>('callGraphIncludePossibleEdges', false);
-  const includeUnresolvedEdges = cfg.get<boolean>('callGraphIncludeUnresolvedEdges', true);
+  const includeUnresolvedEdges = cfg.get<boolean>('callGraphIncludeUnresolvedEdges', false);
   const rawMaxEdges = cfg.get<number>('callGraphMaxEdges', DEFAULT_CALL_GRAPH_MAX_EDGES);
   const rawMaxPossibleTargets = cfg.get<number>('callGraphMaxPossibleTargetsPerCall', 8);
   const maxEdges = Number.isFinite(rawMaxEdges) && rawMaxEdges > 0
@@ -5945,9 +7506,152 @@ function getConfiguredCallGraphBuildLimits(
       'callGraphMemoryBudgetMb',
       DEFAULT_CALL_GRAPH_MEMORY_BUDGET_MB,
       256,
-      16_384,
+      32_768,
     ),
   };
+}
+
+function getConfiguredCallGraphNodePath(
+  cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
+): string {
+  return (cfg.get<string>('callGraphNodePath', '') ?? '').trim();
+}
+
+function resolveCallGraphWorkerRuntime(
+  workerPath: string,
+  heapMb: number,
+  configuredNodePath: string,
+): CallGraphWorkerRuntime {
+  const node = findCallGraphNodeExecutable(configuredNodePath);
+  if (!node) {
+    throw new Error(
+      `call graph rebuild requires a real Node.js executable for an ${heapMb}MB worker heap. ` +
+      `VS Code's Electron helper ignores --max-old-space-size above its built-in limit. ` +
+      `Set intellijStyledSearch.callGraphNodePath to your Node.js binary path.`,
+    );
+  }
+  return {
+    command: node.path,
+    args: [`--max-old-space-size=${heapMb}`, '--expose-gc', workerPath],
+    env: { ...process.env, IJSS_CALL_GRAPH_WORKER: '1' },
+    source: node.source,
+  };
+}
+
+function findCallGraphNodeExecutable(configuredNodePath: string): { path: string; source: string } | undefined {
+  const candidates: Array<{ path: string; source: string }> = [];
+  if (configuredNodePath) {
+    candidates.push({ path: configuredNodePath, source: 'setting:intellijStyledSearch.callGraphNodePath' });
+  }
+  if (process.env.IJSS_CALL_GRAPH_NODE) {
+    candidates.push({ path: process.env.IJSS_CALL_GRAPH_NODE, source: 'env:IJSS_CALL_GRAPH_NODE' });
+  }
+  if (process.env.npm_node_execpath) {
+    candidates.push({ path: process.env.npm_node_execpath, source: 'env:npm_node_execpath' });
+  }
+  if (process.execPath && !looksLikeElectronExecutable(process.execPath)) {
+    candidates.push({ path: process.execPath, source: 'process.execPath' });
+  }
+  const pathNode = findExecutableOnPath(process.platform === 'win32' ? 'node.exe' : 'node');
+  if (pathNode) {
+    candidates.push({ path: pathNode, source: 'PATH' });
+  }
+  candidates.push(...collectCommonNodeExecutables());
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const normalized = path.resolve(candidate.path);
+    const key = process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+    if (seen.has(key)) { continue; }
+    seen.add(key);
+    if (looksLikeElectronExecutable(normalized) || !isExecutableFile(normalized)) { continue; }
+    return { path: normalized, source: candidate.source };
+  }
+  return undefined;
+}
+
+function collectCommonNodeExecutables(): Array<{ path: string; source: string }> {
+  const out: Array<{ path: string; source: string }> = [];
+  const home = os.homedir();
+  if (home) {
+    out.push(
+      { path: path.join(home, '.volta', 'bin', process.platform === 'win32' ? 'node.exe' : 'node'), source: 'volta' },
+      { path: path.join(home, '.asdf', 'shims', process.platform === 'win32' ? 'node.exe' : 'node'), source: 'asdf-shim' },
+      ...collectVersionedNodeExecutables(path.join(home, '.nvm', 'versions', 'node'), 'nvm'),
+      ...collectVersionedNodeExecutables(path.join(home, '.asdf', 'installs', 'nodejs'), 'asdf-nodejs'),
+      ...collectVersionedNodeExecutables(path.join(home, '.fnm', 'node-versions'), 'fnm'),
+    );
+  }
+  out.push(
+    { path: '/opt/homebrew/bin/node', source: 'homebrew-arm64' },
+    { path: '/usr/local/bin/node', source: 'homebrew-x64' },
+    { path: '/usr/bin/node', source: 'system' },
+  );
+  return out;
+}
+
+function collectVersionedNodeExecutables(root: string, source: string): Array<{ path: string; source: string }> {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(root);
+  } catch {
+    return [];
+  }
+  return entries
+    .sort(compareNodeVersionDirDesc)
+    .map((entry) => ({
+      path: path.join(root, entry, 'bin', process.platform === 'win32' ? 'node.exe' : 'node'),
+      source,
+    }));
+}
+
+function compareNodeVersionDirDesc(a: string, b: string): number {
+  const left = parseNodeVersionDir(a);
+  const right = parseNodeVersionDir(b);
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    const delta = (right[i] ?? 0) - (left[i] ?? 0);
+    if (delta !== 0) { return delta; }
+  }
+  return b.localeCompare(a);
+}
+
+function parseNodeVersionDir(value: string): number[] {
+  return value.replace(/^v/, '').split('.').map((part) => {
+    const parsed = Number.parseInt(part, 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  });
+}
+
+function findExecutableOnPath(name: string): string | undefined {
+  const pathValue = process.env.PATH ?? '';
+  const dirs = pathValue.split(path.delimiter).filter(Boolean);
+  const names = process.platform === 'win32' && !/\.(?:exe|cmd|bat)$/i.test(name)
+    ? [`${name}.exe`, `${name}.cmd`, `${name}.bat`, name]
+    : [name];
+  for (const dir of dirs) {
+    for (const entry of names) {
+      const candidate = path.join(dir, entry);
+      if (isExecutableFile(candidate)) { return candidate; }
+    }
+  }
+  return undefined;
+}
+
+function isExecutableFile(filePath: string): boolean {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) { return false; }
+    if (process.platform === 'win32') { return true; }
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function looksLikeElectronExecutable(filePath: string): boolean {
+  const normalized = filePath.toLowerCase();
+  const base = path.basename(normalized);
+  return base.includes('electron') || base.includes('code helper');
 }
 
 function getConfiguredCallGraphParseLimits(
@@ -6200,6 +7904,262 @@ function isUriExcludedFromCallGraph(
   return !excludeMatcher(relPath);
 }
 
+function getCallGraphHeapPressure(): CallGraphHeapPressure {
+  const memory = process.memoryUsage();
+  const heapStats = v8.getHeapStatistics();
+  const heapLimitBytes = Math.max(1, heapStats.heap_size_limit);
+  const heapUsedBytes = Math.max(0, memory.heapUsed);
+  return {
+    heapUsedBytes,
+    heapLimitBytes,
+    heapUsageRatio: heapUsedBytes / heapLimitBytes,
+    heapUsedMb: bytesToWholeMb(heapUsedBytes),
+    heapLimitMb: bytesToWholeMb(heapLimitBytes),
+  };
+}
+
+function getCallGraphAdaptiveMemoryOptions(
+  memoryBudgetMb: number,
+): Pick<CallGraphAdaptiveConcurrencyOptions, 'highWatermarkRatio' | 'resumeRatio' | 'criticalWatermarkRatio'> {
+  const pressure = getCallGraphHeapPressure();
+  const heapLimitMb = Math.max(1, pressure.heapLimitMb);
+  const budgetMb = Number.isFinite(memoryBudgetMb) && memoryBudgetMb > 0
+    ? memoryBudgetMb
+    : DEFAULT_CALL_GRAPH_MEMORY_BUDGET_MB;
+  const highWatermarkRatio = Math.min(
+    CALL_GRAPH_HEAP_HIGH_WATERMARK_RATIO,
+    Math.max(0.01, budgetMb / heapLimitMb),
+  );
+  const resumeRatio = Math.min(
+    highWatermarkRatio,
+    Math.max(0.005, (budgetMb * 0.8) / heapLimitMb),
+  );
+  const criticalWatermarkRatio = Math.min(
+    CALL_GRAPH_HEAP_CRITICAL_WATERMARK_RATIO,
+    Math.max(highWatermarkRatio + 0.01, (budgetMb * 1.5) / heapLimitMb),
+  );
+  return { highWatermarkRatio, resumeRatio, criticalWatermarkRatio };
+}
+
+function bytesToWholeMb(bytes: number): number {
+  return Math.round(bytes / (1024 * 1024));
+}
+
+function formatHeapUsagePercent(ratio: number): string {
+  return `${Math.round(ratio * 100)}%`;
+}
+
+function maybeRunGarbageCollection(): void {
+  const maybeGc = (globalThis as typeof globalThis & { gc?: () => void }).gc;
+  if (typeof maybeGc !== 'function') { return; }
+  try { maybeGc(); } catch {}
+}
+
+function createAdaptiveConcurrencySnapshot(input: {
+  currentConcurrency: number;
+  maxConcurrency: number;
+  active: number;
+  pressure: CallGraphHeapPressure;
+  highWatermarkRatio: number;
+  resumeRatio: number;
+  throttleCount: number;
+  maxHeapUsedMb: number;
+  maxHeapUsageRatio: number;
+  minConcurrency: number;
+}): CallGraphAdaptiveConcurrencySnapshot {
+  return {
+    currentConcurrency: input.currentConcurrency,
+    maxConcurrency: input.maxConcurrency,
+    active: input.active,
+    heapUsedMb: input.pressure.heapUsedMb,
+    heapLimitMb: input.pressure.heapLimitMb,
+    heapUsageRatio: input.pressure.heapUsageRatio,
+    highWatermarkRatio: input.highWatermarkRatio,
+    resumeRatio: input.resumeRatio,
+    throttleCount: input.throttleCount,
+    maxHeapUsedMb: input.maxHeapUsedMb,
+    maxHeapUsageRatio: input.maxHeapUsageRatio,
+    minConcurrency: input.minConcurrency,
+  };
+}
+
+async function mapWithAdaptiveConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+  options: CallGraphAdaptiveConcurrencyOptions = {},
+): Promise<{ results: R[]; stats: CallGraphAdaptiveConcurrencyStats }> {
+  const results = new Array<R>(items.length);
+  const stats = await forEachWithAdaptiveConcurrency(items, concurrency, async (item, index) => {
+    results[index] = await worker(item, index);
+  }, options);
+  return { results, stats };
+}
+
+async function forEachWithAdaptiveConcurrency<T>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>,
+  options: CallGraphAdaptiveConcurrencyOptions = {},
+): Promise<CallGraphAdaptiveConcurrencyStats> {
+  const maxConcurrency = Math.min(Math.max(1, Math.floor(concurrency) || 1), items.length || 1);
+  const highWatermarkRatio = options.highWatermarkRatio ?? CALL_GRAPH_HEAP_HIGH_WATERMARK_RATIO;
+  const resumeRatio = Math.min(highWatermarkRatio, options.resumeRatio ?? CALL_GRAPH_HEAP_RESUME_RATIO);
+  const criticalWatermarkRatio = Math.max(
+    highWatermarkRatio,
+    options.criticalWatermarkRatio ?? CALL_GRAPH_HEAP_CRITICAL_WATERMARK_RATIO,
+  );
+  const pauseMs = options.pauseMs ?? CALL_GRAPH_HEAP_THROTTLE_PAUSE_MS;
+  const stallAbortMs = options.stallAbortMs ?? CALL_GRAPH_HEAP_STALL_ABORT_MS;
+  const running = new Set<Promise<void>>();
+  let next = 0;
+  let completed = 0;
+  let currentConcurrency = maxConcurrency;
+  let maxObservedConcurrency = 0;
+  let minObservedConcurrency = maxConcurrency;
+  let throttleCount = 0;
+  let maxHeapUsedMb = 0;
+  let maxHeapUsageRatio = 0;
+  let heapLimitMb = 0;
+  let highPressureSince = 0;
+  let lastReportAt = 0;
+
+  const throwIfCancelled = () => {
+    if (options.token?.isCancellationRequested) {
+      throw new CallGraphRebuildCancelledError();
+    }
+  };
+  const updatePressure = () => {
+    const pressure = getCallGraphHeapPressure();
+    heapLimitMb = pressure.heapLimitMb;
+    maxHeapUsedMb = Math.max(maxHeapUsedMb, pressure.heapUsedMb);
+    maxHeapUsageRatio = Math.max(maxHeapUsageRatio, pressure.heapUsageRatio);
+    return pressure;
+  };
+  const reportState = (pressure: CallGraphHeapPressure, force = false) => {
+    const now = Date.now();
+    if (!force && now - lastReportAt < 250) { return; }
+    lastReportAt = now;
+    options.onStateChange?.(createAdaptiveConcurrencySnapshot({
+      currentConcurrency,
+      maxConcurrency,
+      active: running.size,
+      pressure,
+      highWatermarkRatio,
+      resumeRatio,
+      throttleCount,
+      maxHeapUsedMb,
+      maxHeapUsageRatio,
+      minConcurrency: minObservedConcurrency,
+    }));
+  };
+
+  if (items.length === 0) {
+    const pressure = updatePressure();
+    reportState(pressure, true);
+    return {
+      maxConcurrency,
+      maxObservedConcurrency: maxConcurrency,
+      minObservedConcurrency: maxConcurrency,
+      currentConcurrency,
+      throttleCount,
+      maxHeapUsedMb,
+      maxHeapUsageRatio,
+      heapLimitMb,
+    };
+  }
+
+  while (next < items.length || running.size > 0) {
+    throwIfCancelled();
+    const pressure = updatePressure();
+    if (pressure.heapUsageRatio >= highWatermarkRatio) {
+      maybeRunGarbageCollection();
+      const reducedConcurrency = Math.max(1, Math.floor(currentConcurrency / 2));
+      throttleCount += 1;
+      if (reducedConcurrency < currentConcurrency) {
+        currentConcurrency = reducedConcurrency;
+        minObservedConcurrency = Math.min(minObservedConcurrency, currentConcurrency);
+      }
+      reportState(updatePressure(), true);
+      if (running.size > 0) {
+        await Promise.race(running);
+        continue;
+      }
+      const latest = updatePressure();
+      if (latest.heapUsageRatio >= criticalWatermarkRatio) {
+        highPressureSince = highPressureSince || Date.now();
+        if (Date.now() - highPressureSince < stallAbortMs) {
+          await delay(pauseMs);
+          continue;
+        }
+        throw new Error(
+          `call graph rebuild stopped to avoid OOM: V8 heap ` +
+          `${latest.heapUsedMb}/${latest.heapLimitMb}MB (${formatHeapUsagePercent(latest.heapUsageRatio)}) ` +
+          `stayed above ${formatHeapUsagePercent(criticalWatermarkRatio)} ` +
+          `with workers=${currentConcurrency}/${maxConcurrency}`,
+        );
+      }
+      highPressureSince = 0;
+      if (currentConcurrency > 1) {
+        currentConcurrency = 1;
+        minObservedConcurrency = Math.min(minObservedConcurrency, currentConcurrency);
+      }
+      await delay(pauseMs);
+    }
+    highPressureSince = 0;
+    if (
+      pressure.heapUsageRatio < resumeRatio &&
+      currentConcurrency < maxConcurrency &&
+      completed > 0 &&
+      completed % Math.max(1, currentConcurrency) === 0
+    ) {
+      currentConcurrency += 1;
+      reportState(pressure, true);
+    }
+
+    let dispatched = false;
+    while (next < items.length && running.size < currentConcurrency) {
+      const index = next;
+      next += 1;
+      maxObservedConcurrency = Math.max(maxObservedConcurrency, running.size + 1);
+      const task = (async () => {
+        try {
+          await worker(items[index], index);
+        } finally {
+          completed += 1;
+          if ((completed & 31) === 31) {
+            await yieldToExtensionHost();
+          }
+        }
+      })();
+      const tracked = task.finally(() => {
+        running.delete(tracked);
+      });
+      running.add(tracked);
+      dispatched = true;
+    }
+    reportState(updatePressure(), dispatched);
+    if (running.size > 0) {
+      await Promise.race(running);
+    } else if (next < items.length) {
+      await yieldToExtensionHost();
+    }
+  }
+
+  const pressure = updatePressure();
+  reportState(pressure, true);
+  return {
+    maxConcurrency,
+    maxObservedConcurrency: Math.max(1, maxObservedConcurrency),
+    minObservedConcurrency,
+    currentConcurrency,
+    throttleCount,
+    maxHeapUsedMb,
+    maxHeapUsageRatio,
+    heapLimitMb,
+  };
+}
+
 async function mapWithConcurrency<T, R>(
   items: readonly T[],
   concurrency: number,
@@ -6244,6 +8204,10 @@ async function forEachWithConcurrency<T>(
 
 function yieldToExtensionHost(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 }
 
 function stableHash(value: string): string {

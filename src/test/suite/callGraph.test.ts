@@ -347,9 +347,16 @@ suite('Call graph', () => {
         warningCount: 0,
         elapsedMs: 123,
         concurrency: 8,
+        maxConcurrency: 12,
+        heapUsedMb: 256,
+        heapLimitMb: 1024,
+        heapUsageRatio: 0.25,
+        workerThrottleCount: 2,
       });
       assert.ok(progressMessage.includes('3/10'), 'expected progress message to include count');
-      assert.ok(progressMessage.includes('workers=8'), 'expected progress message to include worker count');
+      assert.ok(progressMessage.includes('workers=8/12'), 'expected progress message to include worker count');
+      assert.ok(progressMessage.includes('heap=256/1024MB(25%)'), 'expected progress message to include heap usage');
+      assert.ok(progressMessage.includes('throttles=2'), 'expected progress message to include throttle count');
       const names = snapshot.symbols.map((symbol) => symbol.qualifiedName);
       assert.ok(names.includes('GraphPy.root'), 'expected Python method symbol');
       assert.ok(!names.includes('BinaryNoise'), 'expected binary-looking source file to be skipped');

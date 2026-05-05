@@ -33,6 +33,7 @@ suite('Activation', () => {
       'intellijStyledSearch.explainZoektQuery',
       'intellijStyledSearch.diagnoseFileInIndex',
       'intellijStyledSearch.rebuildCallGraph',
+      'intellijStyledSearch.forceRebuildCallGraph',
       'intellijStyledSearch.showCallGraphInfo',
       'intellijStyledSearch.findCallers',
       'intellijStyledSearch.findCallees',
@@ -98,6 +99,26 @@ suite('Activation', () => {
         __seq: 1,
       }));
       assert.strictEqual(cancelled, false, 'cancel should not stop background zoekt indexing');
+    } finally {
+      runtime.cancelRunningProcesses = original;
+    }
+  });
+
+  test('call graph pause cancels in-flight zoekt indexing', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const original = runtime.cancelRunningProcesses.bind(runtime);
+    const calls: Array<{ reason: string; kinds?: string[] }> = [];
+    runtime.cancelRunningProcesses = (reason: string, options?: { kinds?: string[] }) => {
+      calls.push({ reason, kinds: options?.kinds });
+    };
+    try {
+      const pause = runtime.pauseFileUpdates('call graph rebuild', { cancelIndexing: true });
+      pause.dispose();
+      assert.deepStrictEqual(calls, [{
+        reason: 'paused file updates: call graph rebuild',
+        kinds: ['update', 'index', 'rebuild'],
+      }]);
     } finally {
       runtime.cancelRunningProcesses = original;
     }
@@ -279,6 +300,15 @@ suite('Activation', () => {
     const runtime = (overlay as any).zoektRuntime as any;
     assert.strictEqual(runtime.classifyChild('/tmp/ijss-rebuild', []), 'rebuild');
     assert.strictEqual(runtime.argv0ForKind('rebuild'), 'ijss-rebuild');
+  });
+
+  test('call graph rust queries use tracked process metadata and timeouts', async () => {
+    const { callGraph } = await getApi();
+    const service = callGraph as any;
+    assert.strictEqual(service.classifyRustGraphProcess(['graph-symbol-query']), 'graph-symbol-query');
+    assert.strictEqual(service.argv0ForRustGraphProcess('graph-symbol-query'), 'ijss-rust-graph-symbol-query');
+    assert.strictEqual(service.defaultRustGraphTimeoutMs('graph-symbol-query'), 30_000);
+    assert.strictEqual(service.defaultRustGraphTimeoutMs('graph-rebuild'), 0);
   });
 
   test('parseIndexProgressLine reads stderr progress events', async () => {

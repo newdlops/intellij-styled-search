@@ -215,14 +215,17 @@ export class ZoektRuntime implements vscode.Disposable {
     void this.sweepExternalZoektProcesses(reason, options?.sweepPatterns ?? this.sweepPatternsForKinds(kinds));
   }
 
-  pauseFileUpdates(reason: string): vscode.Disposable {
+  pauseFileUpdates(reason: string, options?: { cancelIndexing?: boolean }): vscode.Disposable {
     this.updatePauseDepth += 1;
     this.updatePausedReason = reason;
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
     }
-    this.cancelRunningProcesses(`paused file updates: ${reason}`, { kinds: ['update'] });
+    const cancelKinds: ProcessKind[] = options?.cancelIndexing
+      ? ['update', 'index', 'rebuild']
+      : ['update'];
+    this.cancelRunningProcesses(`paused file updates: ${reason}`, { kinds: cancelKinds });
     this.log.appendLine(`zoek-rs updates paused: ${reason}`);
     let disposed = false;
     return new vscode.Disposable(() => {

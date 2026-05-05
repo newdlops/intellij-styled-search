@@ -262,18 +262,14 @@ export class OverlayPanel {
     if (initialEngine === 'codesearch') {
       this.startTrigramIndexInit('activation');
     } else {
-      void this.trigramIndex.clear('zoekt selected on activation').catch((err) => {
-        this.log.appendLine(`TrigramIndex clear failed: ${err instanceof Error ? err.message : err}`);
-      });
+      this.log.appendLine('zoekt selected on activation; preserving existing codesearch trigram cache.');
     }
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('intellijStyledSearch.engine')) {
         const engine = getConfiguredSearchEngine();
         this.log.appendLine(`search engine changed: ${engine}`);
         if (engine === 'zoekt') {
-          void this.trigramIndex.clear('zoekt selected in settings').catch((err) => {
-            this.log.appendLine(`TrigramIndex clear failed: ${err instanceof Error ? err.message : err}`);
-          });
+          this.log.appendLine('zoekt selected in settings; preserving existing codesearch trigram cache.');
         } else {
           this.zoektRuntime.cancelRunningProcesses('engine switched to codesearch');
           this.startTrigramIndexInit('engine switch');
@@ -371,8 +367,8 @@ export class OverlayPanel {
     }
   }
 
-  pauseZoektFileUpdates(reason: string): vscode.Disposable {
-    return this.zoektRuntime.pauseFileUpdates(reason);
+  pauseZoektFileUpdates(reason: string, options?: { cancelIndexing?: boolean }): vscode.Disposable {
+    return this.zoektRuntime.pauseFileUpdates(reason, options);
   }
 
   private lastCaptureAttemptAt = 0;

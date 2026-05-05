@@ -1,6 +1,7 @@
 pub mod config;
 pub mod corpus;
 pub mod gram;
+pub mod graph;
 pub mod indexer;
 pub mod mmap_store;
 pub mod ops;

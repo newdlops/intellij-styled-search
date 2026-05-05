@@ -112,43 +112,19 @@ where
 
     let fingerprint = fingerprint_documents(&indexed_docs);
     let shards = partition_documents(&indexed_docs, config);
-    let mut shard_artifacts = Vec::with_capacity(shards.len());
-    let mut total_grams = 0usize;
-    let mut total_source_bytes = 0u64;
-    let mut total_shard_bytes = 0u64;
-
-    let total_shards = shards.len();
-    for (shard_id, docs) in shards.iter().enumerate() {
-        let shard_id = shard_id as u32;
-        let build = build_shard_bytes(shard_id, now, docs)?;
-        let path = layout.shard_path(shard_id);
-        write_atomically(&path, &build.bytes)?;
-        let reader = ShardReader::open(&path)?;
-        let header = reader.header().clone();
-        total_grams += header.gram_count;
-        total_source_bytes += build.source_bytes;
-        total_shard_bytes += build.bytes.len() as u64;
-        shard_artifacts.push(ShardArtifact {
-            shard_id,
-            file_name: layout.shard_file_name(shard_id),
-            path,
-            doc_count: header.doc_count,
-            gram_count: header.gram_count,
-            file_bytes: build.bytes.len() as u64,
-            source_bytes: build.source_bytes,
-        });
-        progress(IndexProgress {
-            phase: "write",
-            current: shard_artifacts.len(),
-            total: total_shards.max(1),
-            percent: weighted_percent(shard_artifacts.len(), total_shards, 90, 10),
-            detail: format!(
-                "writing shards {}/{}",
-                shard_artifacts.len(),
-                total_shards.max(1)
-            ),
-        });
-    }
+    let shard_artifacts = write_base_shards_parallel(&layout, &shards, now, progress)?;
+    let total_grams = shard_artifacts
+        .iter()
+        .map(|artifact| artifact.gram_count)
+        .sum();
+    let total_source_bytes = shard_artifacts
+        .iter()
+        .map(|artifact| artifact.source_bytes)
+        .sum();
+    let total_shard_bytes = shard_artifacts
+        .iter()
+        .map(|artifact| artifact.file_bytes)
+        .sum();
 
     let overlay = OverlayManifest::empty();
     write_atomically(&layout.overlay_path, overlay.to_json().as_bytes())?;
@@ -193,6 +169,78 @@ where
         },
         shards: shard_artifacts,
         fingerprint,
+    })
+}
+
+fn write_base_shards_parallel<F>(
+    layout: &StoreLayout,
+    shards: &[&[IndexedDocument]],
+    now: u64,
+    progress: &mut F,
+) -> io::Result<Vec<ShardArtifact>>
+where
+    F: FnMut(IndexProgress),
+{
+    let total_shards = shards.len();
+    if total_shards == 0 {
+        return Ok(Vec::new());
+    }
+    let mut artifacts = vec![None; total_shards];
+    thread::scope(|scope| -> io::Result<()> {
+        let mut handles = Vec::with_capacity(total_shards);
+        for (shard_id, docs) in shards.iter().copied().enumerate() {
+            handles.push(scope.spawn(move || write_base_shard(layout, shard_id as u32, now, docs)));
+        }
+        let mut completed = 0usize;
+        for (idx, handle) in handles.into_iter().enumerate() {
+            let artifact = handle.join().map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "base shard writer panicked")
+            })??;
+            completed += 1;
+            artifacts[idx] = Some(artifact);
+            progress(IndexProgress {
+                phase: "write",
+                current: completed,
+                total: total_shards.max(1),
+                percent: weighted_percent(completed, total_shards, 90, 10),
+                detail: format!("writing shards {}/{}", completed, total_shards.max(1)),
+            });
+        }
+        Ok(())
+    })?;
+
+    artifacts
+        .into_iter()
+        .map(|artifact| {
+            artifact.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "base shard writer did not return every shard",
+                )
+            })
+        })
+        .collect()
+}
+
+fn write_base_shard(
+    layout: &StoreLayout,
+    shard_id: u32,
+    now: u64,
+    docs: &[IndexedDocument],
+) -> io::Result<ShardArtifact> {
+    let build = build_shard_bytes(shard_id, now, docs)?;
+    let path = layout.shard_path(shard_id);
+    write_atomically(&path, &build.bytes)?;
+    let reader = ShardReader::open(&path)?;
+    let header = reader.header().clone();
+    Ok(ShardArtifact {
+        shard_id,
+        file_name: layout.shard_file_name(shard_id),
+        path,
+        doc_count: header.doc_count,
+        gram_count: header.gram_count,
+        file_bytes: build.bytes.len() as u64,
+        source_bytes: build.source_bytes,
     })
 }
 

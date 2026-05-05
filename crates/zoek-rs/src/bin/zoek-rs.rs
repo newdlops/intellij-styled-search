@@ -3,13 +3,19 @@ use std::fs;
 use std::path::PathBuf;
 
 use zoek_rs::config::EngineConfig;
+use zoek_rs::graph::{
+    index_graph_from_tsv, query_graph, query_graph_document_symbols, query_graph_symbols,
+    rebuild_graph_native, update_graph_native, GraphSymbol,
+};
 use zoek_rs::indexer::index_directory_with_progress;
 use zoek_rs::mmap_store::StoreLayout;
 use zoek_rs::ops::{benchmark_workspaces, collect_info, diagnose_query};
 use zoek_rs::overlay::{apply_change_batch, load_overlay_with_recovery};
 use zoek_rs::protocol::{
-    BenchmarkResponse, DiagnoseResponse, EngineInfo, EngineResponse, ErrorResponse, IndexRequest,
-    IndexResponse, IndexStats, InfoResponse, OverlayUpdateResponse, SearchRequest,
+    BenchmarkResponse, DiagnoseResponse, EngineInfo, EngineResponse, ErrorResponse,
+    GraphIndexResponse, GraphQueryReference, GraphQueryResponse, GraphSymbolQueryResponse,
+    GraphSymbolResponse, IndexRequest, IndexResponse, IndexStats, InfoResponse,
+    OverlayUpdateResponse, SearchRequest,
 };
 use zoek_rs::searcher::search_workspace;
 use zoek_rs::watcher::build_change_batch;
@@ -38,6 +44,11 @@ fn run(args: Vec<String>) -> Result<EngineResponse, String> {
         "info" => run_info(&args[1..]),
         "diagnose" => run_diagnose(&args[1..]),
         "benchmark" => run_benchmark(&args[1..]),
+        "graph-rebuild" => run_graph_rebuild(&args[1..]),
+        "graph-index" => run_graph_index(&args[1..]),
+        "graph-update" => run_graph_update(&args[1..]),
+        "graph-query" => run_graph_query(&args[1..]),
+        "graph-symbol-query" => run_graph_symbol_query(&args[1..]),
         _ => Err(usage()),
     }
 }
@@ -357,6 +368,390 @@ fn run_benchmark(args: &[String]) -> Result<EngineResponse, String> {
     Ok(EngineResponse::Benchmark(response))
 }
 
+fn run_graph_index(args: &[String]) -> Result<EngineResponse, String> {
+    let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
+    let mut input_path: Option<PathBuf> = None;
+    let mut built_at_unix_ms = 0u64;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--input" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--input requires a path".to_string())?;
+                input_path = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            "--built-at" => {
+                built_at_unix_ms = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--built-at requires a value".to_string())?
+                    .parse::<u64>()
+                    .map_err(|_| "--built-at must be an integer".to_string())?;
+                idx += 2;
+            }
+            other => return Err(format!("unknown graph-index flag: {other}")),
+        }
+    }
+    let input_path = input_path.ok_or_else(|| "--input requires a path".to_string())?;
+    let summary = index_graph_from_tsv(
+        &workspace_root,
+        &input_path,
+        built_at_unix_ms,
+        &EngineConfig::default(),
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(EngineResponse::GraphIndex(GraphIndexResponse {
+        ok: true,
+        engine: EngineInfo::current(),
+        workspace_root: summary.workspace_root,
+        index_path: summary.index_path,
+        indexed_at_unix_secs: summary.indexed_at_unix_secs,
+        built_at_unix_ms: summary.built_at_unix_ms,
+        file_count: summary.file_count,
+        symbol_count: summary.symbol_count,
+        reference_count: summary.reference_count,
+        bytes: summary.bytes,
+        warnings: Vec::new(),
+    }))
+}
+
+fn run_graph_rebuild(args: &[String]) -> Result<EngineResponse, String> {
+    let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
+    let mut built_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0);
+    let mut config = EngineConfig::default();
+    let mut worker_count = 64usize;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--built-at" => {
+                built_at_unix_ms = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--built-at requires a value".to_string())?
+                    .parse::<u64>()
+                    .map_err(|_| "--built-at must be an integer".to_string())?;
+                idx += 2;
+            }
+            "--max-file-size" => {
+                config.max_file_size_bytes = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--max-file-size requires a value".to_string())?
+                    .parse::<u64>()
+                    .map_err(|_| "--max-file-size must be an integer".to_string())?;
+                if config.max_file_size_bytes == 0 {
+                    config.max_file_size_bytes = u64::MAX;
+                }
+                idx += 2;
+            }
+            "--workers" => {
+                worker_count = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--workers requires a value".to_string())?
+                    .parse::<usize>()
+                    .map_err(|_| "--workers must be an integer".to_string())?
+                    .max(1)
+                    .min(64);
+                idx += 2;
+            }
+            other => return Err(format!("unknown graph-rebuild flag: {other}")),
+        }
+    }
+    let summary = rebuild_graph_native(
+        &workspace_root,
+        built_at_unix_ms,
+        &config,
+        worker_count,
+        &mut |progress| {
+            eprintln!(
+                "graph-rebuild progress: stage={} current={} total={} message={}",
+                progress.stage, progress.current, progress.total, progress.message
+            );
+        },
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(EngineResponse::GraphIndex(GraphIndexResponse {
+        ok: true,
+        engine: EngineInfo::current(),
+        workspace_root: summary.workspace_root,
+        index_path: summary.index_path,
+        indexed_at_unix_secs: summary.indexed_at_unix_secs,
+        built_at_unix_ms: summary.built_at_unix_ms,
+        file_count: summary.file_count,
+        symbol_count: summary.symbol_count,
+        reference_count: summary.reference_count,
+        bytes: summary.bytes,
+        warnings: vec!["built by rust-native graph-rebuild".to_string()],
+    }))
+}
+
+fn run_graph_update(args: &[String]) -> Result<EngineResponse, String> {
+    let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
+    let mut config = EngineConfig::default();
+    let mut built_at_unix_ms = 0u64;
+    let mut max_file_size: Option<u64> = None;
+    let mut workers = 0usize;
+    let mut changed_paths = Vec::new();
+    let mut deleted_paths = Vec::new();
+    let mut idx = 1;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--built-at" => {
+                built_at_unix_ms = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--built-at requires a value".to_string())?
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid --built-at: {err}"))?;
+                idx += 2;
+            }
+            "--max-file-size" => {
+                max_file_size = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "--max-file-size requires a value".to_string())?
+                        .parse::<u64>()
+                        .map_err(|err| format!("invalid --max-file-size: {err}"))?,
+                );
+                idx += 2;
+            }
+            "--workers" => {
+                workers = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--workers requires a value".to_string())?
+                    .parse::<usize>()
+                    .map_err(|err| format!("invalid --workers: {err}"))?;
+                idx += 2;
+            }
+            "--delete" => {
+                deleted_paths.push(PathBuf::from(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "--delete requires a path".to_string())?,
+                ));
+                idx += 2;
+            }
+            other => {
+                changed_paths.push(PathBuf::from(other));
+                idx += 1;
+            }
+        }
+    }
+    if let Some(limit) = max_file_size {
+        config.max_file_size_bytes = if limit == 0 { u64::MAX } else { limit };
+    }
+    let summary = update_graph_native(
+        &workspace_root,
+        &changed_paths,
+        &deleted_paths,
+        built_at_unix_ms,
+        &config,
+        workers,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(EngineResponse::GraphIndex(GraphIndexResponse {
+        ok: true,
+        engine: EngineInfo::current(),
+        workspace_root: summary.workspace_root,
+        index_path: summary.index_path,
+        indexed_at_unix_secs: summary.indexed_at_unix_secs,
+        built_at_unix_ms: summary.built_at_unix_ms,
+        file_count: summary.file_count,
+        symbol_count: summary.symbol_count,
+        reference_count: summary.reference_count,
+        bytes: summary.bytes,
+        warnings: vec!["updated by rust-native graph-update".to_string()],
+    }))
+}
+
+fn run_graph_query(args: &[String]) -> Result<EngineResponse, String> {
+    let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
+    let mut symbol_id: Option<String> = None;
+    let mut limit = 500usize;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--symbol-id" => {
+                symbol_id = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "--symbol-id requires a value".to_string())?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            "--limit" => {
+                limit = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--limit requires a value".to_string())?
+                    .parse::<usize>()
+                    .map_err(|_| "--limit must be an integer".to_string())?
+                    .max(1);
+                idx += 2;
+            }
+            other => return Err(format!("unknown graph-query flag: {other}")),
+        }
+    }
+    let symbol_id = symbol_id.ok_or_else(|| "--symbol-id requires a value".to_string())?;
+    let result = query_graph(&workspace_root, &symbol_id, limit, &EngineConfig::default())
+        .map_err(|err| err.to_string())?;
+    let Some(result) = result else {
+        return Ok(EngineResponse::GraphQuery(GraphQueryResponse {
+            ok: true,
+            engine: EngineInfo::current(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            symbol_id,
+            built_at_unix_ms: 0,
+            total_references: 0,
+            references: Vec::new(),
+            warnings: vec!["call graph binary index missing".to_string()],
+        }));
+    };
+    Ok(EngineResponse::GraphQuery(GraphQueryResponse {
+        ok: true,
+        engine: EngineInfo::current(),
+        workspace_root: result.workspace_root,
+        symbol_id: result.symbol_id,
+        built_at_unix_ms: result.built_at_unix_ms,
+        total_references: result.total_references,
+        references: result
+            .references
+            .into_iter()
+            .map(|reference| GraphQueryReference {
+                name: reference.name,
+                raw_text: reference.raw_text,
+                uri: reference.uri,
+                rel_path: reference.rel_path,
+                start_line: reference.start_line,
+                start_column: reference.start_column,
+                end_line: reference.end_line,
+                end_column: reference.end_column,
+                enclosing_symbol_id: reference.enclosing_symbol_id,
+            })
+            .collect(),
+        warnings: Vec::new(),
+    }))
+}
+
+fn run_graph_symbol_query(args: &[String]) -> Result<EngineResponse, String> {
+    let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
+    let mut query = String::new();
+    let mut uri: Option<String> = None;
+    let mut start_line: Option<u32> = None;
+    let mut end_line: Option<u32> = None;
+    let mut limit = 200usize;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--query" => {
+                query = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--query requires a value".to_string())?
+                    .clone();
+                idx += 2;
+            }
+            "--uri" => {
+                uri = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "--uri requires a value".to_string())?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            "--start-line" => {
+                start_line = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "--start-line requires a value".to_string())?
+                        .parse::<u32>()
+                        .map_err(|_| "--start-line must be an integer".to_string())?,
+                );
+                idx += 2;
+            }
+            "--end-line" => {
+                end_line = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "--end-line requires a value".to_string())?
+                        .parse::<u32>()
+                        .map_err(|_| "--end-line must be an integer".to_string())?,
+                );
+                idx += 2;
+            }
+            "--limit" => {
+                limit = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--limit requires a value".to_string())?
+                    .parse::<usize>()
+                    .map_err(|_| "--limit must be an integer".to_string())?
+                    .max(1);
+                idx += 2;
+            }
+            other => return Err(format!("unknown graph-symbol-query flag: {other}")),
+        }
+    }
+    let result = if let Some(uri) = uri {
+        query_graph_document_symbols(
+            &workspace_root,
+            &uri,
+            start_line,
+            end_line,
+            limit,
+            &EngineConfig::default(),
+        )
+    } else {
+        query_graph_symbols(&workspace_root, &query, limit, &EngineConfig::default())
+    }
+    .map_err(|err| err.to_string())?;
+    let Some(result) = result else {
+        return Ok(EngineResponse::GraphSymbolQuery(GraphSymbolQueryResponse {
+            ok: true,
+            engine: EngineInfo::current(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            built_at_unix_ms: 0,
+            total_symbols: 0,
+            symbols: Vec::new(),
+            warnings: vec!["call graph symbol index missing".to_string()],
+        }));
+    };
+    Ok(EngineResponse::GraphSymbolQuery(GraphSymbolQueryResponse {
+        ok: true,
+        engine: EngineInfo::current(),
+        workspace_root: result.workspace_root,
+        built_at_unix_ms: result.built_at_unix_ms,
+        total_symbols: result.total_symbols,
+        symbols: result
+            .symbols
+            .into_iter()
+            .map(graph_symbol_response_from_symbol)
+            .collect(),
+        warnings: Vec::new(),
+    }))
+}
+
+fn graph_symbol_response_from_symbol(symbol: GraphSymbol) -> GraphSymbolResponse {
+    GraphSymbolResponse {
+        id: symbol.id,
+        name: symbol.name,
+        qualified_name: symbol.qualified_name,
+        kind: symbol.kind,
+        language: symbol.language,
+        uri: symbol.uri,
+        rel_path: symbol.rel_path,
+        start_line: symbol.start_line,
+        start_column: symbol.start_column,
+        end_line: symbol.end_line,
+        end_column: symbol.end_column,
+        body_start_line: symbol.body_start_line,
+        body_start_column: symbol.body_start_column,
+        body_end_line: symbol.body_end_line,
+        body_end_column: symbol.body_end_column,
+        container_id: symbol.container_id,
+        container_name: symbol.container_name,
+        package_name: symbol.package_name,
+        extends_names: symbol.extends_names,
+        implements_names: symbol.implements_names,
+        usage_count: symbol.usage_count,
+        implementation_count: symbol.implementation_count,
+    }
+}
+
 fn usage() -> String {
-    "usage: zoek-rs <index|compact|update|search|info|diagnose|benchmark> ...".to_string()
+    "usage: zoek-rs <index|compact|update|search|info|diagnose|benchmark|graph-rebuild|graph-index|graph-update|graph-query|graph-symbol-query> ...".to_string()
 }

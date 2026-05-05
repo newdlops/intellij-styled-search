@@ -195,6 +195,83 @@ pub struct BenchmarkResponse {
 }
 
 #[derive(Clone, Debug)]
+pub struct GraphIndexResponse {
+    pub ok: bool,
+    pub engine: EngineInfo,
+    pub workspace_root: String,
+    pub index_path: String,
+    pub indexed_at_unix_secs: u64,
+    pub built_at_unix_ms: u64,
+    pub file_count: usize,
+    pub symbol_count: usize,
+    pub reference_count: usize,
+    pub bytes: u64,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphQueryReference {
+    pub name: String,
+    pub raw_text: String,
+    pub uri: String,
+    pub rel_path: String,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    pub enclosing_symbol_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphQueryResponse {
+    pub ok: bool,
+    pub engine: EngineInfo,
+    pub workspace_root: String,
+    pub symbol_id: String,
+    pub built_at_unix_ms: u64,
+    pub total_references: usize,
+    pub references: Vec<GraphQueryReference>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphSymbolResponse {
+    pub id: String,
+    pub name: String,
+    pub qualified_name: String,
+    pub kind: String,
+    pub language: String,
+    pub uri: String,
+    pub rel_path: String,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    pub body_start_line: u32,
+    pub body_start_column: u32,
+    pub body_end_line: u32,
+    pub body_end_column: u32,
+    pub container_id: Option<String>,
+    pub container_name: Option<String>,
+    pub package_name: Option<String>,
+    pub extends_names: Vec<String>,
+    pub implements_names: Vec<String>,
+    pub usage_count: Option<usize>,
+    pub implementation_count: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphSymbolQueryResponse {
+    pub ok: bool,
+    pub engine: EngineInfo,
+    pub workspace_root: String,
+    pub built_at_unix_ms: u64,
+    pub total_symbols: usize,
+    pub symbols: Vec<GraphSymbolResponse>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ErrorResponse {
     pub ok: bool,
     pub engine: EngineInfo,
@@ -209,6 +286,9 @@ pub enum EngineResponse {
     Diagnose(DiagnoseResponse),
     Update(OverlayUpdateResponse),
     Benchmark(BenchmarkResponse),
+    GraphIndex(GraphIndexResponse),
+    GraphQuery(GraphQueryResponse),
+    GraphSymbolQuery(GraphSymbolQueryResponse),
     Error(ErrorResponse),
 }
 
@@ -240,6 +320,9 @@ impl EngineResponse {
             EngineResponse::Diagnose(response) => response.to_json(),
             EngineResponse::Update(response) => response.to_json(),
             EngineResponse::Benchmark(response) => response.to_json(),
+            EngineResponse::GraphIndex(response) => response.to_json(),
+            EngineResponse::GraphQuery(response) => response.to_json(),
+            EngineResponse::GraphSymbolQuery(response) => response.to_json(),
             EngineResponse::Error(response) => response.to_json(),
         }
     }
@@ -433,6 +516,152 @@ impl BenchmarkResponse {
                 .map(BenchmarkCase::to_json)
                 .collect::<Vec<_>>()
                 .join(",")
+        )
+    }
+}
+
+impl GraphIndexResponse {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"type\":\"graph-index\",\"ok\":{},\"engine\":{},\"workspaceRoot\":{},\"indexPath\":{},\"indexedAtUnixSecs\":{},\"builtAtUnixMs\":{},\"fileCount\":{},\"symbolCount\":{},\"referenceCount\":{},\"bytes\":{},\"warnings\":[{}]}}",
+            self.ok,
+            self.engine.to_json(),
+            json_string(&self.workspace_root),
+            json_string(&self.index_path),
+            self.indexed_at_unix_secs,
+            self.built_at_unix_ms,
+            self.file_count,
+            self.symbol_count,
+            self.reference_count,
+            self.bytes,
+            json_string_vec(&self.warnings)
+        )
+    }
+}
+
+impl GraphQueryReference {
+    pub fn to_json(&self) -> String {
+        let enclosing = self
+            .enclosing_symbol_id
+            .as_ref()
+            .map(|value| format!(",\"enclosingSymbolId\":{}", json_string(value)))
+            .unwrap_or_default();
+        format!(
+            "{{\"name\":{},\"rawText\":{},\"uri\":{},\"relPath\":{},\"range\":{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}}}{}}}",
+            json_string(&self.name),
+            json_string(&self.raw_text),
+            json_string(&self.uri),
+            json_string(&self.rel_path),
+            self.start_line,
+            self.start_column,
+            self.end_line,
+            self.end_column,
+            enclosing
+        )
+    }
+}
+
+impl GraphQueryResponse {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"type\":\"graph-query\",\"ok\":{},\"engine\":{},\"workspaceRoot\":{},\"symbolId\":{},\"builtAtUnixMs\":{},\"totalReferences\":{},\"references\":[{}],\"warnings\":[{}]}}",
+            self.ok,
+            self.engine.to_json(),
+            json_string(&self.workspace_root),
+            json_string(&self.symbol_id),
+            self.built_at_unix_ms,
+            self.total_references,
+            self.references
+                .iter()
+                .map(GraphQueryReference::to_json)
+                .collect::<Vec<_>>()
+                .join(","),
+            json_string_vec(&self.warnings)
+        )
+    }
+}
+
+impl GraphSymbolResponse {
+    pub fn to_json(&self) -> String {
+        let container_id = self
+            .container_id
+            .as_ref()
+            .map(|value| format!(",\"containerId\":{}", json_string(value)))
+            .unwrap_or_default();
+        let container_name = self
+            .container_name
+            .as_ref()
+            .map(|value| format!(",\"containerName\":{}", json_string(value)))
+            .unwrap_or_default();
+        let package_name = self
+            .package_name
+            .as_ref()
+            .map(|value| format!(",\"packageName\":{}", json_string(value)))
+            .unwrap_or_default();
+        let usage_count = self
+            .usage_count
+            .map(|value| format!(",\"usageCount\":{value}"))
+            .unwrap_or_default();
+        let implementation_count = self
+            .implementation_count
+            .map(|value| format!(",\"implementationCount\":{value}"))
+            .unwrap_or_default();
+        let extends_names = if self.extends_names.is_empty() {
+            String::new()
+        } else {
+            format!(",\"extendsNames\":{}", json_string_vec(&self.extends_names))
+        };
+        let implements_names = if self.implements_names.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ",\"implementsNames\":{}",
+                json_string_vec(&self.implements_names)
+            )
+        };
+        format!(
+            "{{\"id\":{},\"name\":{},\"qualifiedName\":{},\"kind\":{},\"language\":{},\"uri\":{},\"relPath\":{},\"range\":{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}}},\"bodyRange\":{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}}}{}{}{}{}{}{}{}}}",
+            json_string(&self.id),
+            json_string(&self.name),
+            json_string(&self.qualified_name),
+            json_string(&self.kind),
+            json_string(&self.language),
+            json_string(&self.uri),
+            json_string(&self.rel_path),
+            self.start_line,
+            self.start_column,
+            self.end_line,
+            self.end_column,
+            self.body_start_line,
+            self.body_start_column,
+            self.body_end_line,
+            self.body_end_column,
+            container_id,
+            container_name,
+            package_name,
+            extends_names,
+            implements_names,
+            usage_count,
+            implementation_count
+        )
+    }
+}
+
+impl GraphSymbolQueryResponse {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"type\":\"graph-symbol-query\",\"ok\":{},\"engine\":{},\"workspaceRoot\":{},\"builtAtUnixMs\":{},\"totalSymbols\":{},\"symbols\":[{}],\"warnings\":[{}]}}",
+            self.ok,
+            self.engine.to_json(),
+            json_string(&self.workspace_root),
+            self.built_at_unix_ms,
+            self.total_symbols,
+            self.symbols
+                .iter()
+                .map(GraphSymbolResponse::to_json)
+                .collect::<Vec<_>>()
+                .join(","),
+            json_string_vec(&self.warnings)
         )
     }
 }

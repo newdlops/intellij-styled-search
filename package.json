@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.658",
+  "version": "0.1.679",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -86,6 +86,11 @@
       {
         "command": "intellijStyledSearch.rebuildCallGraph",
         "title": "Rebuild Call Graph",
+        "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.forceRebuildCallGraph",
+        "title": "Force Rebuild Call Graph",
         "category": "IntelliJ Search"
       },
       {
@@ -183,8 +188,12 @@
           "group": "2_callGraph@5"
         },
         {
-          "command": "intellijStyledSearch.showCallGraphInfo",
+          "command": "intellijStyledSearch.forceRebuildCallGraph",
           "group": "2_callGraph@6"
+        },
+        {
+          "command": "intellijStyledSearch.showCallGraphInfo",
+          "group": "2_callGraph@7"
         },
         {
           "command": "intellijStyledSearch.startMcpServer",
@@ -384,17 +393,17 @@
         },
         "intellijStyledSearch.callGraphConcurrency": {
           "type": "number",
-          "default": 0,
+          "default": 64,
           "minimum": 0,
-          "maximum": 32,
-          "description": "Maximum number of source files parsed concurrently when rebuilding the call graph. Set to 0 to auto-size from system parallelism. The effective worker count is also capped by intellijStyledSearch.callGraphMemoryBudgetMb."
+          "maximum": 64,
+          "description": "Maximum number of source files parsed concurrently when rebuilding the call graph. Defaults to 64 for the Rust native graph indexer. Set to 0 to auto-size from system parallelism. The effective worker count is also capped by intellijStyledSearch.callGraphMemoryBudgetMb."
         },
         "intellijStyledSearch.callGraphCpuBudgetPercent": {
           "type": "number",
           "default": 35,
           "minimum": 5,
           "maximum": 100,
-          "description": "Approximate extension-host CPU duty cycle used by call graph parsing. Lower values insert more idle time between parsed files so VS Code remains responsive during rebuild."
+          "description": "Approximate call graph worker CPU duty cycle used by parsing. Lower values insert more idle time between parsed files so VS Code remains responsive during rebuild."
         },
         "intellijStyledSearch.callGraphMaxParserPauseMs": {
           "type": "number",
@@ -447,10 +456,15 @@
         },
         "intellijStyledSearch.callGraphMemoryBudgetMb": {
           "type": "number",
-          "default": 1024,
+          "default": 8192,
           "minimum": 256,
-          "maximum": 16384,
-          "description": "Approximate call graph rebuild memory budget in MB. This caps parser concurrency so large repositories do not start too many parser workers for the extension host heap."
+          "maximum": 32768,
+          "description": "Approximate call graph rebuild memory budget in MB. Full rebuilds run in a separate worker process launched with this V8 max-old-space-size; the default is 8192MB and the worker can be raised up to 32768MB."
+        },
+        "intellijStyledSearch.callGraphNodePath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path to a real Node.js executable used for call graph rebuild workers. Leave empty to auto-detect Node from PATH and common version-manager locations."
         },
         "intellijStyledSearch.callGraphMaxAssignedFunctionNamesPerFile": {
           "type": "number",
@@ -486,8 +500,8 @@
         },
         "intellijStyledSearch.callGraphIncludeUnresolvedEdges": {
           "type": "boolean",
-          "default": true,
-          "description": "Materialize unresolved, dynamic, and external callsites as one dynamic edge per callsite. Disable only when intentionally reducing graph size for dependency-heavy repositories."
+          "default": false,
+          "description": "Materialize unresolved, dynamic, and external callsites as one dynamic edge per callsite. Disabled by default to keep large-repository graph indexes bounded."
         },
         "intellijStyledSearch.callGraphMaxEdges": {
           "type": "number",
@@ -508,8 +522,9 @@
   },
   "scripts": {
     "bundle:monaco": "node scripts/bundleMonaco.js",
+    "bundle:callgraph-worker": "node scripts/bundleCallGraphWorker.js",
     "bench:zoekt": "node scripts/runZoektBenchmark.js",
-    "compile": "npm run bundle:monaco && tsc -p ./",
+    "compile": "npm run bundle:monaco && tsc -p ./ && npm run bundle:callgraph-worker",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile",
     "pretest": "npm run compile",

@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 117;
+export const RENDERER_PATCH_VERSION = 118;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -754,7 +754,13 @@ export function getRendererPatchScript(
     };
   }
 
-  window.__ijFindCreatePreviewEditor = function (host) {
+  function previewInlayHintsOptions() {
+    return {
+      enabled: 'on',
+    };
+  }
+
+  function createPreviewEditor(host) {
     var m = window.__ijFindMonaco;
     if (!m || !m.ctor) { return null; }
     var overflowHost = getOrCreatePreviewOverflowHost();
@@ -767,6 +773,7 @@ export function getRendererPatchScript(
       fixedOverflowWidgets: true,
       overflowWidgetsDomNode: overflowHost,
       hover: previewHoverOptions(),
+      inlayHints: previewInlayHintsOptions(),
       // Sticky scroll (the header that pins the current function/class
       // as you scroll) adds visual noise to a read-mostly preview.
       stickyScroll: { enabled: false },
@@ -808,7 +815,8 @@ export function getRendererPatchScript(
       try { window.__ijFindMonaco = null; } catch (eClear) {}
     }
     return null;
-  };
+  }
+  window.__ijFindCreatePreviewEditor = createPreviewEditor;
   // Look up an existing TextModel in VSCode's ModelService by URI string.
   // When a file is open in VSCode (or has been touched via
   // vscode.workspace.openTextDocument), its model is registered here and
@@ -888,7 +896,7 @@ export function getRendererPatchScript(
     return isolated;
   }
 
-  window.__ijFindSetPreviewContent = function (editor, content, languageId, uriStr, fullFile) {
+  function setPreviewContent(editor, content, languageId, uriStr, fullFile) {
     var m = window.__ijFindMonaco;
     if (!m || !editor) { return false; }
     if (!m.modelSvc || validateModelService(m.modelSvc)) {
@@ -929,7 +937,8 @@ export function getRendererPatchScript(
       send({ type: 'log', msg: 'setPreviewContent err: ' + msg });
       return false;
     }
-  };
+  }
+  window.__ijFindSetPreviewContent = setPreviewContent;
 
   function findRealWidgetCtor(widget, report) {
     if (!widget) { return null; }
@@ -4780,7 +4789,7 @@ export function getRendererPatchScript(
     send({ type: 'log', msg: 'monacoReal lines=' + (msg.lines ? msg.lines.length : 0) + ' lang=' + lang + ' reuse=' + !!(state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody) });
     // Reuse existing widget if it's still mounted in our preview body.
     if (state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody) {
-      var ok = window.__ijFindSetPreviewContent(state.previewMonacoEditor, fullText, lang, msg.uri, state.previewFullFile);
+      var ok = setPreviewContent(state.previewMonacoEditor, fullText, lang, msg.uri, state.previewFullFile);
       send({ type: 'log', msg: 'monacoReal reuse setModel=' + ok });
       if (ok) {
         try {
@@ -4803,7 +4812,7 @@ export function getRendererPatchScript(
     $previewBody.appendChild(host);
     var hostRect = host.getBoundingClientRect();
     send({ type: 'log', msg: 'monacoReal host rect=' + Math.round(hostRect.width) + 'x' + Math.round(hostRect.height) });
-    var editor = window.__ijFindCreatePreviewEditor(host);
+    var editor = createPreviewEditor(host);
     send({ type: 'log', msg: 'monacoReal createPreviewEditor → ' + (editor ? 'OK ' + (editor.constructor && editor.constructor.name) : 'null') });
     if (!editor) {
       try { $previewBody.removeChild(host); } catch (e) {}
@@ -4814,7 +4823,7 @@ export function getRendererPatchScript(
     state.previewMonacoEditor = editor;
     state.previewMonacoHost = host;
     state.previewMode = 'monaco';
-    var setOk = window.__ijFindSetPreviewContent(editor, fullText, lang, msg.uri, state.previewFullFile);
+    var setOk = setPreviewContent(editor, fullText, lang, msg.uri, state.previewFullFile);
     send({ type: 'log', msg: 'monacoReal setPreviewContent=' + setOk });
     wirePreviewMonacoEditor(editor);
     try {
@@ -4895,6 +4904,18 @@ export function getRendererPatchScript(
 
   function wirePreviewMonacoEditor(editor) {
     registerPreviewSaveKeybinding(editor);
+    try {
+      if (editor && typeof editor.updateOptions === 'function') {
+        editor.updateOptions({
+          fixedOverflowWidgets: true,
+          overflowWidgetsDomNode: getOrCreatePreviewOverflowHost(),
+          hover: previewHoverOptions(),
+          inlayHints: previewInlayHintsOptions(),
+        });
+      }
+    } catch (eOptions) {
+      send({ type: 'log', msg: 'preview editor option refresh failed: ' + (eOptions && eOptions.message) });
+    }
     try {
       if (state.monacoChangeListener && state.monacoChangeListener.dispose) {
         state.monacoChangeListener.dispose();
@@ -6069,6 +6090,7 @@ export function getRendererPatchScript(
         fixedOverflowWidgets: true,
         overflowWidgetsDomNode: getOrCreatePreviewOverflowHost(),
         hover: previewHoverOptions(),
+        inlayHints: previewInlayHintsOptions(),
         overviewRulerLanes: 3,
         hideCursorInOverviewRuler: false,
       });
