@@ -5,4 +5,7 @@ node_modules/
 resources/monaco.bundle.js
 target/
 .zoek-rs/
+.codeidx/
 artifacts/benchmarks/
+.lh
+.vscode/**

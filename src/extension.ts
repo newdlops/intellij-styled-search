@@ -161,7 +161,7 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   const callGraphLog = overlay.getLogChannel();
   const callGraph = new CallGraphService(context, callGraphLog);
   const callGraphInlayRegistry = new CallGraphInlayRegistry();
-  const mcpServer = new CallGraphMcpServer(callGraph, callGraphLog);
+  const mcpServer = new CallGraphMcpServer(callGraph, callGraphLog, overlay);
   context.subscriptions.push(callGraph, mcpServer);
   context.subscriptions.push(
     vscode.workspace.onDidChangeTextDocument((event) => {

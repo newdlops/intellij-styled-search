@@ -1,5 +1,7 @@
 import * as assert from 'assert';
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import * as http from 'http';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import {
   buildCallGraphEdgeFileMatches,
@@ -976,25 +978,160 @@ suite('Call graph', () => {
     }
   });
 
-  test('serves MCP tools/list over the local JSON-RPC endpoint', async function () {
+  test('serves codeidx MCP tools, resources, and prompts over the local JSON-RPC endpoint', async function () {
     this.timeout(10_000);
     const api = await getApi();
     try {
       const url = await api.mcpServer.start(0);
-      const response = await postJson(url, {
+      const init = await postJson(url, {
         jsonrpc: '2.0',
         id: 1,
+        method: 'initialize',
+        params: { protocolVersion: '2025-11-25' },
+      });
+      assert.strictEqual(init.result?.protocolVersion, '2025-11-25');
+      assert.strictEqual(init.result?.serverInfo?.name, 'codeidx-mcp');
+      assert.ok(init.result?.capabilities?.resources, 'expected resources capability');
+      assert.ok(init.result?.capabilities?.prompts, 'expected prompts capability');
+      const compatInit = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'initialize',
+        params: { protocolVersion: '2025-06-18' },
+      });
+      assert.strictEqual(compatInit.result?.protocolVersion, '2025-06-18');
+      await postJsonMaybeEmpty(url, {
+        jsonrpc: '2.0',
+        method: 'notifications/initialized',
+        params: {},
+      });
+      const response = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 2,
         method: 'tools/list',
         params: {},
       });
       assert.strictEqual(response.jsonrpc, '2.0');
-      assert.strictEqual(response.id, 1);
+      assert.strictEqual(response.id, 2);
       const tools = response.result?.tools;
       assert.ok(Array.isArray(tools), 'expected tools/list to return a tools array');
-      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'get_callers'), 'expected get_callers tool');
-      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'get_implementations'), 'expected get_implementations tool');
-      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'get_usages'), 'expected get_usages tool');
-      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'get_context_bundle'), 'expected get_context_bundle tool');
+      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_search_code'), 'expected codeidx_search_code tool');
+      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_search_symbols'), 'expected codeidx_search_symbols tool');
+      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_find_references'), 'expected codeidx_find_references tool');
+      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_find_implementations'), 'expected codeidx_find_implementations tool');
+      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_get_context_bundle'), 'expected codeidx_get_context_bundle tool');
+      const resources = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'resources/templates/list',
+        params: {},
+      });
+      assert.ok(
+        resources.result?.resourceTemplates?.some((resource: { uriTemplate?: string }) => resource.uriTemplate === 'codeidx://snippet/{snippet_ref}'),
+        'expected snippet resource template',
+      );
+      const prompts = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 4,
+        method: 'prompts/list',
+        params: {},
+      });
+      assert.ok(
+        prompts.result?.prompts?.some((prompt: { name?: string }) => prompt.name === 'codeidx_change_impact'),
+        'expected codeidx_change_impact prompt',
+      );
+      const prompt = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 8,
+        method: 'prompts/get',
+        params: {
+          name: 'codeidx_change_impact',
+          arguments: { target: 'GraphPy.root', change: 'smoke test' },
+        },
+      });
+      assert.ok(
+        prompt.result?.messages?.[0]?.content?.text?.includes('codeidx_search_symbols'),
+        'expected prompt to guide clients toward codeidx tools',
+      );
+      const overview = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 5,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_workspace_overview',
+          arguments: { include_examples: false },
+        },
+      });
+      assert.strictEqual(overview.result?.isError, false);
+      assert.strictEqual(overview.result?.structuredContent?.schema_version, 'codeidx.mcp/0.1');
+      assert.strictEqual(overview.result?.structuredContent?.ok, true);
+      assert.ok(
+        typeof overview.result?.content?.[0]?.text === 'string' &&
+          overview.result.content[0].text.includes('"schema_version"'),
+        'expected MCP text content alongside structuredContent for client compatibility',
+      );
+      const queryExplain = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 9,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_explain_search_query',
+          arguments: { query: 'GraphPy', query_kind: 'literal' },
+        },
+      });
+      assert.strictEqual(queryExplain.result?.isError, false);
+      assert.strictEqual(queryExplain.result?.structuredContent?.query_diagnostics?.parsed, true);
+      const listedResources = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 6,
+        method: 'resources/list',
+        params: {},
+      });
+      assert.ok(
+        listedResources.result?.resources?.some((resource: { uri?: string }) => resource.uri?.includes('/overview')),
+        'expected workspace overview resource',
+      );
+      const overviewResource = listedResources.result.resources.find((resource: { uri?: string }) => resource.uri?.includes('/overview'));
+      const readOverview = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 10,
+        method: 'resources/read',
+        params: { uri: overviewResource.uri },
+      });
+      assert.ok(
+        readOverview.result?.contents?.[0]?.text?.includes('"schema_version"'),
+        'expected resources/read to return JSON text content',
+      );
+      const cliPath = path.resolve(__dirname, '..', '..', 'codeidxMcpCli.js');
+      const stdioProxy = spawn(process.execPath, [cliPath, 'stdio', '--url', url], {
+        cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+        stdio: 'pipe',
+      });
+      let stdioStderr = '';
+      stdioProxy.stderr.on('data', (chunk: Buffer) => {
+        stdioStderr += chunk.toString('utf8');
+      });
+      try {
+        const stdioInit = await sendStdioJson(stdioProxy, {
+          jsonrpc: '2.0',
+          id: 11,
+          method: 'initialize',
+          params: { protocolVersion: '2025-11-25' },
+        });
+        assert.strictEqual(stdioInit.result?.serverInfo?.name, 'codeidx-mcp');
+        const stdioTools = await sendStdioJson(stdioProxy, {
+          jsonrpc: '2.0',
+          id: 12,
+          method: 'tools/list',
+          params: {},
+        });
+        assert.ok(
+          stdioTools.result?.tools?.some((tool: { name?: string }) => tool.name === 'codeidx_search_code'),
+          `expected stdio proxy to return tools/list; stderr=${stdioStderr}`,
+        );
+      } finally {
+        await stopChild(stdioProxy);
+      }
     } finally {
       api.mcpServer.stop();
     }
@@ -1028,5 +1165,93 @@ function postJson(url: string, payload: unknown): Promise<any> {
     req.on('error', reject);
     req.write(body);
     req.end();
+  });
+}
+
+function postJsonMaybeEmpty(url: string, payload: unknown): Promise<any | undefined> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const body = JSON.stringify(payload);
+    const req = http.request({
+      hostname: target.hostname,
+      port: target.port,
+      path: target.pathname,
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      },
+    }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        if (!text) {
+          resolve(undefined);
+          return;
+        }
+        try {
+          resolve(JSON.parse(text));
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function sendStdioJson(child: ChildProcessWithoutNullStreams, payload: unknown): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let buffer = '';
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('timed out waiting for stdio MCP response'));
+    }, 5_000);
+    const onData = (chunk: Buffer) => {
+      buffer += chunk.toString('utf8');
+      const idx = buffer.indexOf('\n');
+      if (idx === -1) { return; }
+      const line = buffer.slice(0, idx);
+      cleanup();
+      try {
+        resolve(JSON.parse(line));
+      } catch (err) {
+        reject(err);
+      }
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(new Error(`stdio MCP proxy exited before response: code=${code} signal=${signal}`));
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.stdout.off('data', onData);
+      child.off('exit', onExit);
+    };
+    child.stdout.on('data', onData);
+    child.once('exit', onExit);
+    child.stdin.write(JSON.stringify(payload) + '\n');
+  });
+}
+
+function stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.killed) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch {}
+      resolve();
+    }, 2_000);
+    child.once('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    try { child.stdin.end(); } catch {}
+    try { child.kill('SIGTERM'); } catch {}
   });
 }

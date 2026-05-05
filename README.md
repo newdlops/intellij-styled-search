@@ -25,6 +25,40 @@ IntelliJ Styled Search adds an IntelliJ IDEA-like project search panel to VS Cod
 | `IntelliJ Search: Show Zoekt Diagnostics` | Print shard, overlay, journal, and process stats for the Rust engine. |
 | `IntelliJ Search: Explain Query With Zoekt` | Print the Rust engine's candidate plan for a query. |
 | `IntelliJ Search: Diagnose Active File in Search Index` | Inspect why the active file may not be in the index. |
+| `IntelliJ Search: Start Codeidx MCP Server` | Start the local Codeidx MCP endpoint for Codex, Claude, and other MCP clients. |
+| `IntelliJ Search: Stop Codeidx MCP Server` | Stop the local Codeidx MCP endpoint. |
+
+## MCP Usage
+
+Start `IntelliJ Search: Start Codeidx MCP Server` in VS Code, then connect Codex or Claude through the stdio proxy:
+
+```bash
+codeidx-mcp stdio --workspace .
+```
+
+From a development checkout without `npm link`, use the compiled entrypoint directly:
+
+```bash
+node out/codeidxMcpCli.js stdio --workspace .
+```
+
+The proxy discovers the VS Code endpoint from `.codeidx/mcp-server.json`. You can also pass the URL explicitly:
+
+```bash
+codeidx-mcp stdio --url http://127.0.0.1:8765/mcp
+```
+
+Codex example:
+
+```bash
+codex mcp add codeidx -- codeidx-mcp stdio --workspace .
+```
+
+Claude Code example:
+
+```bash
+claude mcp add --transport stdio codeidx -- codeidx-mcp stdio --workspace .
+```
 
 ## Keybindings
 

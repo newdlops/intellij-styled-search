@@ -17,6 +17,9 @@
   "engines": {
     "vscode": "^1.75.0"
   },
+  "bin": {
+    "codeidx-mcp": "./out/codeidxMcpCli.js"
+  },
   "categories": [
     "Other"
   ],
@@ -120,12 +123,12 @@
       },
       {
         "command": "intellijStyledSearch.startMcpServer",
-        "title": "Start Call Graph MCP Server",
+        "title": "Start Codeidx MCP Server",
         "category": "IntelliJ Search"
       },
       {
         "command": "intellijStyledSearch.stopMcpServer",
-        "title": "Stop Call Graph MCP Server",
+        "title": "Stop Codeidx MCP Server",
         "category": "IntelliJ Search"
       }
     ],
@@ -384,7 +387,7 @@
         "intellijStyledSearch.mcpPort": {
           "type": "number",
           "default": 8765,
-          "description": "Localhost port used by the call graph MCP JSON-RPC endpoint when `Start Call Graph MCP Server` is run. Set to 0 to let the OS choose a free port."
+          "description": "Localhost port used by the codeidx MCP JSON-RPC endpoint when `Start Codeidx MCP Server` is run. Set to 0 to let the OS choose a free port."
         },
         "intellijStyledSearch.callGraphWatchExternalFileChanges": {
           "type": "boolean",
