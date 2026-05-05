@@ -84,12 +84,14 @@ type SearchSession = {
   hasMore: boolean;
   orderedCandidatePaths: string[] | null;
   scopedCandidateUris: Set<string> | null;
+  rendererSrc?: string;
 };
 
 export interface ShowOptions {
   forceLiteral?: boolean;
   suppressSearch?: boolean;
   preferredWindowId?: number;
+  spawn?: boolean;
   statusText?: string;
   loading?: boolean;
 }
@@ -117,6 +119,7 @@ type CaptureDiagnosticOptions = {
 
 type PatchScriptOptions = {
   ignoreTargetMarker?: boolean;
+  additionalInstance?: boolean;
 };
 
 const BRIDGE_BINDING = 'irSearchMainBridge';
@@ -187,6 +190,10 @@ export class OverlayPanel {
   private staticResultsRequestSeq = 0;
   private staticResultsChain: Promise<void> = Promise.resolve();
   private rendererCommandWindowId: number | undefined;
+  private rendererCommandPendingPanelWindowId: number | undefined;
+  private rendererCommandPendingPanelExpiresAt = 0;
+  private activeRendererSrc: string | undefined;
+  private currentSearchRendererSrc: string | undefined;
   // Per-source lastSeenSeq: each renderer patch install has its own instance
   // id (`__src`) and monotonic `__seq`. We dedup duplicates delivered by
   // accumulated CDP `message` listeners *within the same source*, but never
@@ -207,6 +214,36 @@ export class OverlayPanel {
 
   getLogChannel(): vscode.OutputChannel {
     return this.log;
+  }
+
+  getRendererCommandWindowIdForShow(): number | undefined {
+    return this.rendererCommandWindowId;
+  }
+
+  markRendererCommandPendingPanel(windowId: number | undefined): void {
+    if (windowId === undefined) { return; }
+    this.rendererCommandPendingPanelWindowId = windowId;
+    this.rendererCommandPendingPanelExpiresAt = Date.now() + 30_000;
+  }
+
+  async getSearchSelectionShowContext(): Promise<Pick<ShowOptions, 'preferredWindowId' | 'spawn'>> {
+    const windowId = this.rendererCommandWindowId ?? this.activeWindowId;
+    if (windowId === undefined) { return {}; }
+    try {
+      await this.ensureRendererPatchAlive(windowId, 'search-selection-context');
+      const result = await this.evalInWindow(
+        windowId,
+        `(function(){try{return window.__ijFindShouldSpawnSearchSelection?window.__ijFindShouldSpawnSearchSelection():''}catch(e){return 'err:'+(e&&e.message)}})()`,
+        1000,
+      );
+      if (result === 'preview') {
+        this.log.appendLine(`searchSelection source: preview editor in search UI win=${windowId}; spawning new panel`);
+        return { preferredWindowId: windowId, spawn: true };
+      }
+    } catch (err) {
+      this.log.appendLine(`searchSelection source probe skipped: ${err instanceof Error ? err.message : err}`);
+    }
+    return {};
   }
 
   private constructor(private readonly context: vscode.ExtensionContext) {
@@ -1845,7 +1882,19 @@ export class OverlayPanel {
     if (requestId !== this.staticResultsRequestSeq) { return; }
     this.cancelActive();
     this.currentSearchSession = undefined;
-    await this.show(initialQuery, { forceLiteral: true, suppressSearch: true, preferredWindowId: sourceWindowId });
+    const reusePendingPanel = sourceWindowId !== undefined &&
+      this.rendererCommandPendingPanelWindowId === sourceWindowId &&
+      Date.now() <= this.rendererCommandPendingPanelExpiresAt;
+    if (reusePendingPanel) {
+      this.rendererCommandPendingPanelWindowId = undefined;
+      this.rendererCommandPendingPanelExpiresAt = 0;
+    }
+    await this.show(initialQuery, {
+      forceLiteral: true,
+      suppressSearch: true,
+      preferredWindowId: sourceWindowId,
+      spawn: sourceWindowId !== undefined && !reusePendingPanel,
+    });
     if (requestId !== this.staticResultsRequestSeq) { return; }
     const searchId = ++this.searchSeq;
     const totalMatches = matches.reduce((sum, match) => sum + match.matches.length, 0);
@@ -1915,6 +1964,10 @@ export class OverlayPanel {
         return;
       }
       this.activeWindowId = v.fid;
+      const shownRendererSrc = this.extractRendererSource(v.result);
+      if (shownRendererSrc) {
+        this.activeRendererSrc = shownRendererSrc;
+      }
       this.cdpCloseDeferredReasons.clear();
       this.cancelCdpIdleClose();
       const tRendered = Date.now();
@@ -2044,10 +2097,26 @@ export class OverlayPanel {
     initialQuery: string,
     options: ShowOptions,
   ): Promise<{ fid: number; result: string } | undefined> {
+    if (options.spawn) {
+      try {
+        const report = await this.runPatchScript(windowId, {
+          additionalInstance: true,
+          ignoreTargetMarker: true,
+        });
+        this.log.appendLine(`Spawn instance injection(win=${windowId}): ${report}`);
+      } catch (err) {
+        this.log.appendLine(`Spawn instance injection failed(win=${windowId}): ${err instanceof Error ? err.message : err}`);
+      }
+    }
     const showExpr = `(function(){ try { return window.__ijFindShow ? window.__ijFindShow(${JSON.stringify(initialQuery)}, ${JSON.stringify(options)}) : 'no-show-fn'; } catch (e) { return 'show-throw:' + (e && e.message); } })()`;
     const result = await this.evalInWindow(windowId, showExpr);
     if (/^no-window:/.test(result)) { return undefined; }
     return { fid: windowId, result: result || 'ok' };
+  }
+
+  private extractRendererSource(result: string | undefined): string | undefined {
+    const match = /\bsrc=([A-Za-z0-9._:-]+)/.exec(String(result ?? ''));
+    return match?.[1];
   }
 
   private scheduleBridgeRepairAfterVisible(
@@ -2534,6 +2603,7 @@ export class OverlayPanel {
       this.shouldSuspendIntelliSenseRecursionCapture(),
       this.shouldEnableRendererInlayClickHook(),
       this.shouldDisposeRendererPatchOnHide(),
+      !!options.additionalInstance,
     );
     const rendererReadyExpr =
       `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&` +
@@ -2554,6 +2624,7 @@ export class OverlayPanel {
         var localBridgeToken = ${JSON.stringify(localBridge.token)};
         var closeMainInspector = ${JSON.stringify(this.shouldCloseMainInspector())};
         var keepConsoleBridgeForInlay = ${JSON.stringify(this.shouldEnableRendererInlayClickHook())};
+        var forcePatchInstall = ${JSON.stringify(!!options.additionalInstance)};
         var targetWindowId = ${targetWindowId === undefined ? 'undefined' : JSON.stringify(targetWindowId)};
         var expectedWorkspaceName = ${JSON.stringify(workspaceName)};
         var expectedWorkspaceNameLower = expectedWorkspaceName.toLowerCase();
@@ -2693,7 +2764,7 @@ export class OverlayPanel {
             installConsoleBridge(w);
             var status = 'missing';
             try { status = await w.webContents.executeJavaScript(rendererReadyExpr, true); } catch (eStatus) { status = 'status-err:' + eStatus.message; }
-            var val = status === 'ready'
+            var val = status === 'ready' && !forcePatchInstall
               ? 'already patched:fast'
               : await w.webContents.executeJavaScript(patchExpr, true);
             if (val === 'ij-find patch installed' || String(val).indexOf('already patched') === 0) {
@@ -2800,6 +2871,13 @@ export class OverlayPanel {
 	    }
     switch (evt.type) {
       case 'search':
+        if (evt.__src) {
+          this.activeRendererSrc = evt.__src;
+          this.currentSearchRendererSrc = evt.__src;
+        }
+        if (typeof evt.__win === 'number') {
+          this.activeWindowId = evt.__win;
+        }
         if (evt.recordHistory) {
           void this.recordSearchHistory(evt.options.query).catch((err) => {
             this.log.appendLine(`record search history failed: ${err instanceof Error ? err.message : err}`);
@@ -2807,14 +2885,27 @@ export class OverlayPanel {
         }
         void this.runSearch(evt.options);
         break;
-      case 'loadMore': void this.loadMoreSearch(); break;
+      case 'loadMore':
+        if (evt.__src) { this.activeRendererSrc = evt.__src; }
+        if (typeof evt.__win === 'number') { this.activeWindowId = evt.__win; }
+        void this.loadMoreSearch();
+        break;
       case 'cancel':
-        this.currentSearchSession = undefined;
-        this.cancelActive();
+        if (!evt.__src || !this.currentSearchRendererSrc || evt.__src === this.currentSearchRendererSrc) {
+          this.currentSearchSession = undefined;
+          this.currentSearchRendererSrc = undefined;
+          this.cancelActive();
+        }
         break;
       case 'panelHidden':
-        this.currentSearchSession = undefined;
-        this.cancelActive();
+        if (!evt.__src || !this.currentSearchRendererSrc || evt.__src === this.currentSearchRendererSrc) {
+          this.currentSearchSession = undefined;
+          this.currentSearchRendererSrc = undefined;
+          this.cancelActive();
+        }
+        if (evt.__src && this.activeRendererSrc === evt.__src) {
+          this.activeRendererSrc = undefined;
+        }
         if (this.shouldDisposeRendererPatchOnHide() && !this.shouldEnableRendererInlayClickHook()) {
           this.invalidateRendererInlayClickHookReady('panel hidden');
         }
@@ -2824,11 +2915,19 @@ export class OverlayPanel {
         break;
       case 'openFile': void this.openFile(evt.uri, evt.line, evt.column, false); break;
       case 'previewFile': void this.openFile(evt.uri, evt.line, evt.column, true); break;
-      case 'requestPreview': void this.handlePreviewRequest(evt); break;
+      case 'requestPreview':
+        if (evt.__src) { this.activeRendererSrc = evt.__src; }
+        if (typeof evt.__win === 'number') { this.activeWindowId = evt.__win; }
+        void this.handlePreviewRequest(evt);
+        break;
       case 'revealFile': void this.revealFile(evt.uri); break;
       case 'openInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, true, true); break;
       case 'pinInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, false, false); break;
-	      case 'requestHover': void this.sendHover(evt.reqId, evt.uri, evt.line, evt.column, evt.x, evt.y); break;
+	      case 'requestHover':
+	        if (evt.__src) { this.activeRendererSrc = evt.__src; }
+	        if (typeof evt.__win === 'number') { this.activeWindowId = evt.__win; }
+	        void this.sendHover(evt.reqId, evt.uri, evt.line, evt.column, evt.x, evt.y);
+	        break;
 	      case 'runCommand': void this.runHoverCommand(evt.command, evt.args, evt.__win); break;
 	      case 'saveFile': void this.saveFile(evt.uri, evt.content); break;
 	      case 'trace':
@@ -3074,6 +3173,8 @@ export class OverlayPanel {
   private async runSearch(options: SearchOptions) {
     this.cancelActive();
     const searchId = ++this.searchSeq;
+    const rendererSrc = this.activeRendererSrc;
+    this.currentSearchRendererSrc = rendererSrc;
     const requestedEngine = getConfiguredSearchEngine();
     const emptyPageSize = getConfiguredResultLimit();
     if (!options.query) {
@@ -3088,6 +3189,7 @@ export class OverlayPanel {
         hasMore: false,
         orderedCandidatePaths: null,
         scopedCandidateUris: null,
+        rendererSrc,
       };
       await this.postToRenderer({ type: 'results:start', searchId });
       await this.postToRenderer({
@@ -3130,6 +3232,7 @@ export class OverlayPanel {
       hasMore: false,
       orderedCandidatePaths: null,
       scopedCandidateUris: null,
+      rendererSrc,
     };
     this.currentSearchSession = session;
     await this.postToRenderer({ type: 'results:start', searchId });
@@ -3400,7 +3503,11 @@ export class OverlayPanel {
     if (this.activeWindowId === undefined) { return; }
     if (messages.length === 0) { return; }
     const windowId = this.activeWindowId;
-    const payload = JSON.stringify(messages);
+    const targetSrc = this.targetRendererSourceForMessages(messages);
+    const routedMessages = targetSrc
+      ? messages.map((msg) => ({ ...(msg as object), __targetSrc: targetSrc }))
+      : messages;
+    const payload = JSON.stringify(routedMessages);
     const js = `(function(){try{if(!window.__ijFindOnMessage){return 'missing-onmessage'};var msgs=${payload};for(var i=0;i<msgs.length;i++){window.__ijFindOnMessage(msgs[i]);}return 'ok'}catch(e){return 'err:'+(e&&e.message)}})()`;
     const deliver = async () => {
       try {
@@ -3423,6 +3530,17 @@ export class OverlayPanel {
     const next = this.rendererPostChain.then(deliver, deliver);
     this.rendererPostChain = next.then(() => undefined, () => undefined);
     await next;
+  }
+
+  private targetRendererSourceForMessages(messages: OverlayMessage[]): string | undefined {
+    for (const msg of messages) {
+      if ('searchId' in msg && typeof msg.searchId === 'number') {
+        if (this.currentSearchSession?.searchId === msg.searchId) {
+          return this.currentSearchSession.rendererSrc ?? this.currentSearchRendererSrc ?? this.activeRendererSrc;
+        }
+      }
+    }
+    return this.activeRendererSrc;
   }
 
   private async openFile(uriStr: string, line: number, column: number, preview: boolean) {

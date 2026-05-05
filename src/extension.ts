@@ -195,14 +195,19 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       overlay.logCommand('searchInProject');
       void overlay.show('');
     }),
-    vscode.commands.registerCommand('intellijStyledSearch.searchSelection', () => {
+    vscode.commands.registerCommand('intellijStyledSearch.searchSelection', async () => {
       overlay.logCommand('searchSelection');
       const initialQuery = getQueryFromActiveEditor();
       const searchOnOpen = vscode.workspace.getConfiguration('intellijStyledSearch')
         .get<boolean>('searchOnOpen', false);
+      const spawnContext = initialQuery
+        ? await overlay.getSearchSelectionShowContext()
+        : {};
       void overlay.show(initialQuery, {
         forceLiteral: true,
         suppressSearch: !!initialQuery && !searchOnOpen,
+        preferredWindowId: spawnContext.preferredWindowId,
+        spawn: spawnContext.spawn,
       });
     }),
     vscode.commands.registerCommand('intellijStyledSearch.reinject', async () => {
@@ -929,9 +934,13 @@ async function showCallGraphPendingPanel(
   title: string,
   label: string,
 ): Promise<void> {
+  const sourceWindowId = overlay.getRendererCommandWindowIdForShow();
+  overlay.markRendererCommandPendingPanel(sourceWindowId);
   await overlay.show(`${title}: ${label}`, {
     forceLiteral: true,
     suppressSearch: true,
+    preferredWindowId: sourceWindowId,
+    spawn: sourceWindowId !== undefined,
     statusText: 'Loading call graph results...',
     loading: true,
   });

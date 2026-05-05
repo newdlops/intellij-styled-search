@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 115;
+export const RENDERER_PATCH_VERSION = 117;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -6,12 +6,14 @@ export function getRendererPatchScript(
   suspendIntelliSenseRecursionCapture = true,
   enableRendererInlayClickHook = true,
   disposeRendererPatchOnHide = true,
+  installAdditionalSearchInstance = false,
 ): string {
   const enableMonacoPreviewCaptureLiteral = enableMonacoPreviewCapture ? 'true' : 'false';
   const enablePerfDiagnosticsLiteral = enablePerfDiagnostics ? 'true' : 'false';
   const suspendIntelliSenseRecursionCaptureLiteral = suspendIntelliSenseRecursionCapture ? 'true' : 'false';
   const enableRendererInlayClickHookLiteral = enableRendererInlayClickHook ? 'true' : 'false';
   const disposeRendererPatchOnHideLiteral = disposeRendererPatchOnHide ? 'true' : 'false';
+  const installAdditionalSearchInstanceLiteral = installAdditionalSearchInstance ? 'true' : 'false';
   return `
 (function () {
   var __ijFindPatchVersion = ${RENDERER_PATCH_VERSION};
@@ -20,12 +22,15 @@ export function getRendererPatchScript(
   var __ijFindShouldSuspendIntelliSenseRecursionCapture = ${suspendIntelliSenseRecursionCaptureLiteral};
   var __ijFindEnableRendererInlayClickHook = ${enableRendererInlayClickHookLiteral};
   var __ijFindDisposeRendererPatchOnHide = ${disposeRendererPatchOnHideLiteral};
+  var __ijFindInstallAdditionalInstance = ${installAdditionalSearchInstanceLiteral};
   try {
-    if (typeof window.__ijFindDisposeSearchUi === 'function') {
+    if (!__ijFindInstallAdditionalInstance && typeof window.__ijFindDisposeAllSearchUi === 'function') {
+      window.__ijFindDisposeAllSearchUi('patch-upgrade');
+    } else if (!__ijFindInstallAdditionalInstance && typeof window.__ijFindDisposeSearchUi === 'function') {
       window.__ijFindDisposeSearchUi('patch-upgrade');
     }
   } catch (eDisposePrevious) {}
-  if (window.__ijFindPatchVersion === __ijFindPatchVersion && window.__ijFindPatchedV100) {
+  if (!__ijFindInstallAdditionalInstance && window.__ijFindPatchVersion === __ijFindPatchVersion && window.__ijFindPatchedV100) {
     try { window.__ijFindDisableMonacoProbes = !__ijFindEnableMonacoPreviewCapture; } catch (eFlag) {}
     try { window.__ijFindPerfDiagnostics = !!__ijFindEnablePerfDiagnostics; } catch (ePerfFlag) {}
     try { window.__ijFindShouldSuspendIntelliSenseRecursionCapture = !!__ijFindShouldSuspendIntelliSenseRecursionCapture; } catch (eIrFlag) {}
@@ -164,10 +169,26 @@ export function getRendererPatchScript(
     }
     return observer;
   }
-  window.__ijFindDisposeSearchUi = function (reason) {
+  function disposeSearchUi(reason) {
     if (__ijFindDisposed) { return 'already-disposed'; }
     __ijFindDisposed = true;
     var out = [];
+    try {
+      var registry = window.__ijFindInstances || null;
+      if (registry && registry[__ijFindInstanceId]) {
+        delete registry[__ijFindInstanceId];
+        out.push('registry=removed');
+      }
+      if (window.__ijFindActiveInstanceId === __ijFindInstanceId) {
+        var nextActive = '';
+        if (registry) {
+          for (var rk in registry) {
+            if (Object.prototype.hasOwnProperty.call(registry, rk)) { nextActive = rk; break; }
+          }
+        }
+        window.__ijFindActiveInstanceId = nextActive;
+      }
+    } catch (eRegistryDispose) {}
     try { cancelScheduledRender(); out.push('render=cancelled'); } catch (eRender) {}
     try { if (typeof state !== 'undefined' && state && state.searchTicker) { clearInterval(state.searchTicker); state.searchTicker = null; out.push('ticker=cleared'); } } catch (eTicker) {}
     try { if (typeof state !== 'undefined' && state && state.debounce) { clearTimeout(state.debounce); state.debounce = null; out.push('debounce=cleared'); } } catch (eDebounce) {}
@@ -198,33 +219,50 @@ export function getRendererPatchScript(
     try { if (typeof panel !== 'undefined' && panel && panel.parentElement) { panel.parentElement.removeChild(panel); out.push('panel=detached'); } } catch (ePanelDetach) {}
     try { if (typeof $hoverTooltip !== 'undefined' && $hoverTooltip && $hoverTooltip.parentElement) { $hoverTooltip.parentElement.removeChild($hoverTooltip); out.push('hover=detached'); } } catch (eHoverDetach) {}
     try {
-      var previewOverflowRoot = document.querySelector('.ij-find-preview-overflow-root');
+      var previewOverflowRoot = findPreviewOverflowRootForInstance();
       if (previewOverflowRoot && previewOverflowRoot.parentElement) {
         previewOverflowRoot.parentElement.removeChild(previewOverflowRoot);
         out.push('overflow=detached');
       }
     } catch (eOverflowDetach) {}
     try { setIntelliSenseRecursionCaptureSuspended(false, 'dispose:' + (reason || 'unknown')); } catch (eIrDispose) {}
-    try { window.__ijFindPatchedV100 = false; } catch (ePatchFlag) {}
     try {
-      if (window.__ijFindPatchVersion === __ijFindPatchVersion) {
+      var remainingInstances = false;
+      var remainingRegistry = window.__ijFindInstances || null;
+      if (remainingRegistry) {
+        for (var rr in remainingRegistry) {
+          if (Object.prototype.hasOwnProperty.call(remainingRegistry, rr)) { remainingInstances = true; break; }
+        }
+      }
+      if (!remainingInstances) { window.__ijFindPatchedV100 = false; }
+    } catch (ePatchFlag) {}
+    try {
+      var hasInstancesForVersion = false;
+      var versionRegistry = window.__ijFindInstances || null;
+      if (versionRegistry) {
+        for (var vr in versionRegistry) {
+          if (Object.prototype.hasOwnProperty.call(versionRegistry, vr)) { hasInstancesForVersion = true; break; }
+        }
+      }
+      if (!hasInstancesForVersion && window.__ijFindPatchVersion === __ijFindPatchVersion) {
         window.__ijFindPatchVersion = 0;
       }
     } catch (ePatchVersion) {}
     return out.join(',') || 'disposed';
-  };
+  }
+  window.__ijFindDisposeSearchUi = disposeSearchUi;
 
   // Remove overlay/hover DOM left behind by a previous patch version so
   // the new install is the ONLY instance in the page. Without this, older
   // V50 panels accumulate after an extension upgrade and querySelector
   // calls (including test probes) may hit stale nodes whose state the new
   // closure no longer owns.
-  try {
+  if (!__ijFindInstallAdditionalInstance) { try {
     var stale = document.querySelectorAll('.ij-find-overlay, .ij-find-panel, .ij-find-hover-tooltip, .ij-find-preview-overflow-root, .ij-find-preview-overflow');
     for (var si = 0; si < stale.length; si++) {
       try { stale[si].parentElement && stale[si].parentElement.removeChild(stale[si]); } catch (eRm) {}
     }
-  } catch (eClean) {}
+  } catch (eClean) {} }
   // If an older renderer patch left prototype capture active, undo it before
   // installing this version. A live Array/Map/Reflect hook can slow the whole
   // VSCode renderer, not just this extension.
@@ -430,12 +468,25 @@ export function getRendererPatchScript(
       root.style.setProperty('font-size', cs.getPropertyValue('--vscode-font-size') || cs.fontSize || 'inherit');
     } catch (e) {}
   }
+  function findPreviewOverflowRootForInstance() {
+    try {
+      var roots = document.querySelectorAll('.ij-find-preview-overflow-root');
+      for (var i = 0; i < roots.length; i++) {
+        if (roots[i] && roots[i].getAttribute && roots[i].getAttribute('data-ij-find-src') === __ijFindInstanceId) {
+          return roots[i];
+        }
+      }
+    } catch (eFindOverflowRoot) {}
+    return null;
+  }
   function getOrCreatePreviewOverflowHost() {
-    var root = document.querySelector('.ij-find-preview-overflow-root');
+    var root = findPreviewOverflowRootForInstance();
     var existing = root && root.querySelector('.ij-find-preview-overflow');
     if (existing && existing.parentElement) {
       markSearchUiRoot(root);
       markSearchUiRoot(existing);
+      try { root.setAttribute('data-ij-find-src', __ijFindInstanceId); } catch (eRootSrcExisting) {}
+      try { existing.setAttribute('data-ij-find-src', __ijFindInstanceId); } catch (eNodeSrcExisting) {}
       if (root.parentElement !== document.body) { document.body.appendChild(root); }
       syncPreviewOverflowTheme(root);
       return existing;
@@ -443,6 +494,7 @@ export function getRendererPatchScript(
     root = document.createElement('div');
     root.className = 'monaco-workbench ij-find-preview-overflow-root';
     markSearchUiRoot(root);
+    try { root.setAttribute('data-ij-find-src', __ijFindInstanceId); } catch (eRootSrc) {}
     root.style.cssText = [
       'position:fixed',
       'top:0',
@@ -456,6 +508,7 @@ export function getRendererPatchScript(
     var node = document.createElement('div');
     node.className = 'monaco-editor ij-find-preview-overflow';
     markSearchUiRoot(node);
+    try { node.setAttribute('data-ij-find-src', __ijFindInstanceId); } catch (eNodeSrc) {}
     node.style.cssText = [
       'position:fixed',
       'top:0',
@@ -1339,6 +1392,66 @@ export function getRendererPatchScript(
     '  isolation: isolate;',
     '}',
     '.ij-find-overlay.visible { display: flex; }',
+    '.ij-find-overlay.ij-find-focused {',
+    '  border-color: var(--vscode-focusBorder, var(--vscode-widget-border, #007acc));',
+    '}',
+    '.ij-find-overlay.ij-find-minimized {',
+    '  min-width: 240px !important;',
+    '  min-height: 0 !important;',
+    '  width: min(320px, calc(100vw - 16px)) !important;',
+    '  height: 30px !important;',
+    '  max-width: calc(100vw - 16px) !important;',
+    '  max-height: 30px !important;',
+    '  overflow: hidden !important;',
+    '}',
+    '.ij-find-overlay.ij-find-minimized .ij-find-header {',
+    '  min-height: 30px;',
+    '  padding: 3px 8px;',
+    '  border-bottom: none;',
+    '}',
+    '.ij-find-overlay.ij-find-minimized .ij-find-title,',
+    '.ij-find-overlay.ij-find-minimized .ij-find-summary {',
+    '  white-space: nowrap;',
+    '  overflow: hidden;',
+    '  text-overflow: ellipsis;',
+    '}',
+    '.ij-find-overlay.ij-find-minimized .ij-find-toolbar,',
+    '.ij-find-overlay.ij-find-minimized .ij-find-results,',
+    '.ij-find-overlay.ij-find-minimized .ij-find-splitter,',
+    '.ij-find-overlay.ij-find-minimized .ij-find-preview,',
+    '.ij-find-overlay.ij-find-minimized .ij-find-resizer {',
+    '  display: none !important;',
+    '}',
+    '.ij-find-overlay.ij-find-detached {',
+    '  box-shadow: 0 8px 24px rgba(0,0,0,0.28);',
+    '}',
+    '.ij-find-overlay.ij-find-detached .ij-find-preview-body.ij-find-detached-preview-snapshot {',
+    '  padding: 4px 0;',
+    '  overflow: auto;',
+    '  font-family: var(--vscode-editor-font-family, monospace);',
+    '  font-size: 12px;',
+    '  line-height: 18px;',
+    '  color: var(--vscode-editor-foreground, #d4d4d4);',
+    '  scrollbar-gutter: stable both-edges;',
+    '  user-select: text;',
+    '}',
+    '.ij-find-overlay.ij-find-detached .ij-find-preview-body.ij-find-detached-preview-snapshot * {',
+    '  user-select: text;',
+    '}',
+    '.ij-find-overlay.ij-find-detached .ij-find-preview-body.ij-find-detached-preview-snapshot .ij-find-preview-lineno {',
+    '  user-select: none;',
+    '}',
+    '.ij-find-overlay.ij-find-detached .ij-find-query,',
+    '.ij-find-overlay.ij-find-detached .ij-find-scope {',
+    '  cursor: default;',
+    '}',
+    '.ij-find-overlay.ij-find-detached .ij-find-opt,',
+    '.ij-find-overlay.ij-find-detached .ij-find-refresh,',
+    '.ij-find-overlay.ij-find-detached .ij-find-history,',
+    '.ij-find-overlay.ij-find-detached .ij-find-minimap-toggle {',
+    '  pointer-events: none !important;',
+    '  opacity: 0.62;',
+    '}',
     '.ij-find-overlay.ij-find-shell {',
     '  height: auto;',
     '  min-height: 0;',
@@ -1375,11 +1488,15 @@ export function getRendererPatchScript(
     '}',
     '.ij-find-title { font-size: 12px; font-weight: 500; }',
     '.ij-find-summary { flex: 1; font-size: 11px; color: var(--vscode-descriptionForeground, #9d9d9d); }',
+    '.ij-find-minimize,',
     '.ij-find-close {',
     '  background: transparent; border: none; color: inherit;',
-    '  cursor: pointer; font-size: 16px; line-height: 1; padding: 2px 8px;',
+    '  cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 8px;',
+    '  min-width: 24px; height: 22px;',
     '  border-radius: 3px;',
     '}',
+    '.ij-find-close { font-size: 16px; }',
+    '.ij-find-minimize:hover,',
     '.ij-find-close:hover { background: rgba(255,255,255,0.12); }',
 
     '.ij-find-toolbar {',
@@ -1719,7 +1836,7 @@ export function getRendererPatchScript(
     '.ij-find-monaco-preview-host .monaco-editor .minimap .minimap-slider {',
     '  opacity: 1 !important;',
     '  z-index: 30 !important;',
-    '  pointer-events: auto;',
+    '  pointer-events: auto !important;',
     '}',
     '.ij-find-monaco-host .monaco-editor .minimap-slider .minimap-slider-horizontal,',
     '.ij-find-monaco-preview-host .monaco-editor .minimap-slider .minimap-slider-horizontal {',
@@ -1850,26 +1967,31 @@ export function getRendererPatchScript(
     '  width: 0 !important; height: 0 !important;',
     '  overflow: visible !important;',
     '  z-index: 10020 !important;',
-    '  pointer-events: none;',
+    '  pointer-events: none !important;',
     '}',
-    '.ij-find-preview-overflow,',
     '.ij-find-preview-overflow * {',
     '  z-index: 10021 !important;',
     '}',
     '.ij-find-preview-overflow .monaco-hover,',
+    '.ij-find-preview-overflow .monaco-hover *,',
     '.ij-find-preview-overflow .suggest-widget,',
+    '.ij-find-preview-overflow .suggest-widget *,',
     '.ij-find-preview-overflow .parameter-hints-widget,',
+    '.ij-find-preview-overflow .parameter-hints-widget *,',
     '.ij-find-preview-overflow .monaco-menu,',
-    '.ij-find-preview-overflow .context-view {',
-    '  pointer-events: auto;',
+    '.ij-find-preview-overflow .monaco-menu *,',
+    '.ij-find-preview-overflow .context-view,',
+    '.ij-find-preview-overflow .context-view * {',
+    '  pointer-events: auto !important;',
     '}',
   ].join('\\n');
   document.head.appendChild(style);
 
   var $title = el('span', { className: 'ij-find-title', text: 'Find in Files' });
   var $summary = el('span', { className: 'ij-find-summary', text: '' });
+  var $minimize = el('button', { className: 'ij-find-minimize', title: 'Minimize panel', text: '\\u2212', attrs: { type: 'button', 'aria-label': 'Minimize panel', 'aria-pressed': 'false' } });
   var $close = el('button', { className: 'ij-find-close', title: 'Close (Esc)', text: '\\u00D7' });
-  var $header = el('div', { className: 'ij-find-header', children: [$title, $summary, $close] });
+  var $header = el('div', { className: 'ij-find-header', children: [$title, $summary, $minimize, $close] });
 
   var $q = el('textarea', {
     className: 'ij-find-query',
@@ -1952,6 +2074,8 @@ export function getRendererPatchScript(
     children: [$header, $toolbar, $results, $splitter, $preview, $resizer],
   });
   markSearchUiRoot(panel);
+  try { panel.setAttribute('data-ij-find-src', __ijFindInstanceId); } catch (ePanelSrcAttr) {}
+  wireSearchPanelFocus(panel);
 
   var $hoverTooltip = el('div', { className: 'ij-find-hover-tooltip' });
   markSearchUiRoot($hoverTooltip);
@@ -1999,6 +2123,8 @@ export function getRendererPatchScript(
     monacoHost: null,          // div hosting the editor
     monacoChangeListener: null,
     minimapEnabled: true,      // persisted via $minimapToggle; every new preview editor honours it
+    minimized: false,
+    minimizedLayout: null,
     searchStartTs: 0,          // ms timestamp when results:start arrived; feeds the elapsed-time counter
     searchTicker: null,        // setInterval handle refreshing the status with live elapsed time
     previewMode: '',           // 'monaco' | 'stolen' | 'dom'
@@ -2062,6 +2188,7 @@ export function getRendererPatchScript(
       loadingMore: false,
       hasMoreResults: false,
       activeIndex: -1,
+      minimized: false,
       previewMode: '',
       previewUri: '',
       hasDebounce: false,
@@ -2086,6 +2213,7 @@ export function getRendererPatchScript(
       out.loadingMore = !!state.loadingMore;
       out.hasMoreResults = !!state.hasMoreResults;
       out.activeIndex = typeof state.activeIndex === 'number' ? state.activeIndex : -1;
+      out.minimized = !!state.minimized;
       out.previewMode = state.previewMode || '';
       out.previewUri = state.previewUri || '';
       out.hasDebounce = !!state.debounce;
@@ -2716,6 +2844,437 @@ export function getRendererPatchScript(
     $optCase.setAttribute('aria-pressed', String(!!state.options.caseSensitive));
   }
 
+  var detachedPanelSeq = 0;
+  try {
+    if (typeof window.__ijFindPanelZSeq !== 'number') { window.__ijFindPanelZSeq = 10000; }
+  } catch (ePanelZInit) {}
+
+  function getFocusedSearchPanel() {
+    try { return window.__ijFindFocusedSearchPanel || null; } catch (eFocusedGet) { return null; }
+  }
+
+  function setFocusedSearchPanel(root) {
+    try { window.__ijFindFocusedSearchPanel = root || null; } catch (eFocusedSet) {}
+  }
+
+  function capturePanelInlineLayout() {
+    var names = ['left', 'top', 'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height', 'transform'];
+    var out = {};
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i];
+      try {
+        var value = panel.style.getPropertyValue(name);
+        var priority = panel.style.getPropertyPriority(name);
+        out[name] = {
+          value: value,
+          priority: priority,
+          had: value !== '' || priority !== '',
+        };
+      } catch (eCaptureStyle) {}
+    }
+    return out;
+  }
+
+  function restorePanelInlineLayout(layout) {
+    if (!layout) { return; }
+    var names = ['left', 'top', 'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height', 'transform'];
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i];
+      var entry = layout[name];
+      try {
+        if (entry && entry.had) {
+          panel.style.setProperty(name, entry.value || '', entry.priority || '');
+        } else {
+          panel.style.removeProperty(name);
+        }
+      } catch (eRestoreStyle) {}
+    }
+  }
+
+  function setPreviewOverflowHidden(hidden) {
+    try {
+      var overflowRoot = findPreviewOverflowRootForInstance();
+      if (overflowRoot) {
+        if (hidden) { overflowRoot.style.setProperty('display', 'none', 'important'); }
+        else { overflowRoot.style.removeProperty('display'); }
+      }
+    } catch (eOverflowHidden) {}
+  }
+
+  function relayoutHostedPreviewEditorSoon() {
+    setTimeout(function () {
+      try {
+        var ed = state.previewMonacoEditor || state.monacoEditor;
+        var host = state.previewMonacoHost || state.monacoHost;
+        if (ed && host && host.parentElement && typeof ed.layout === 'function') {
+          var rect = host.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            ed.layout({ width: Math.floor(rect.width), height: Math.floor(rect.height) });
+          }
+        }
+      } catch (ePreviewLayout) {}
+      try { if (state.stolenEditor) { layoutStolenEditor(); } } catch (eStolenLayout) {}
+    }, 0);
+  }
+
+  function syncMinimizeButton() {
+    try {
+      var minimized = !!state.minimized;
+      $minimize.textContent = minimized ? '\\u25A1' : '\\u2212';
+      $minimize.title = minimized ? 'Restore panel' : 'Minimize panel';
+      $minimize.setAttribute('aria-label', minimized ? 'Restore panel' : 'Minimize panel');
+      $minimize.setAttribute('aria-pressed', minimized ? 'true' : 'false');
+    } catch (eMinButton) {}
+  }
+
+  function minimizeSearchPanel() {
+    if (state.minimized) { return; }
+    var rect = panel.getBoundingClientRect();
+    state.minimizedLayout = capturePanelInlineLayout();
+    state.minimized = true;
+    try { hideHover(); } catch (eHideHoverForMinimize) {}
+    if (state.hoverTimer) { clearTimeout(state.hoverTimer); state.hoverTimer = null; }
+    setPreviewOverflowHidden(true);
+    panel.classList.add('ij-find-minimized');
+    var compactW = Math.max(240, Math.min(320, window.innerWidth - 16));
+    var compactH = 30;
+    var left = Math.max(8, Math.min(Math.max(8, window.innerWidth - compactW - 8), Math.round(rect.left)));
+    var top = Math.max(8, Math.min(Math.max(8, window.innerHeight - compactH - 8), Math.round(rect.top)));
+    panel.style.setProperty('left', left + 'px', 'important');
+    panel.style.setProperty('top', top + 'px', 'important');
+    panel.style.setProperty('width', compactW + 'px', 'important');
+    panel.style.setProperty('height', compactH + 'px', 'important');
+    panel.style.setProperty('min-width', '240px', 'important');
+    panel.style.setProperty('min-height', '0', 'important');
+    panel.style.setProperty('max-width', 'calc(100vw - 16px)', 'important');
+    panel.style.setProperty('max-height', compactH + 'px', 'important');
+    panel.style.setProperty('transform', 'none', 'important');
+    syncMinimizeButton();
+    panelDiagMark('minimize', { active: true, width: compactW, height: compactH });
+    trace('minimize', { active: true });
+  }
+
+  function restoreSearchPanelFromMinimized(silent) {
+    if (!state.minimized) { return; }
+    var layout = state.minimizedLayout;
+    state.minimized = false;
+    state.minimizedLayout = null;
+    panel.classList.remove('ij-find-minimized');
+    restorePanelInlineLayout(layout);
+    setPreviewOverflowHidden(false);
+    syncMinimizeButton();
+    relayoutHostedPreviewEditorSoon();
+    if (!silent) {
+      bringSearchPanelToFront(panel);
+      panelDiagMark('minimize', { active: false });
+      trace('minimize', { active: false });
+    }
+  }
+
+  function toggleSearchPanelMinimized() {
+    if (state.minimized) { restoreSearchPanelFromMinimized(false); }
+    else { minimizeSearchPanel(); }
+  }
+
+  function bringSearchPanelToFront(root) {
+      if (!root || !root.classList || !root.classList.contains('ij-find-overlay')) { return; }
+      try {
+      window.__ijFindPanelZSeq = (typeof window.__ijFindPanelZSeq === 'number' ? window.__ijFindPanelZSeq : 10000) + 1;
+      root.style.setProperty('z-index', String(window.__ijFindPanelZSeq), 'important');
+      setFocusedSearchPanel(root);
+      if (root === panel) {
+        window.__ijFindActiveInstanceId = __ijFindInstanceId;
+        var overflowRoot = findPreviewOverflowRootForInstance();
+        if (overflowRoot) {
+          overflowRoot.style.setProperty('z-index', String(window.__ijFindPanelZSeq + 20), 'important');
+        }
+      }
+      var overlays = document.querySelectorAll('.ij-find-overlay.ij-find-focused');
+      for (var i = 0; i < overlays.length; i++) {
+        if (overlays[i] !== root) { overlays[i].classList.remove('ij-find-focused'); }
+      }
+      root.classList.add('ij-find-focused');
+    } catch (eBring) {}
+  }
+
+  function wireSearchPanelFocus(root) {
+    try {
+      root.addEventListener('pointerdown', function () { bringSearchPanelToFront(root); }, true);
+      root.addEventListener('mousedown', function () { bringSearchPanelToFront(root); }, true);
+      root.addEventListener('focusin', function () { bringSearchPanelToFront(root); }, true);
+    } catch (eFocusWire) {}
+  }
+
+  function hasVisibleSearchPanelExcept(root) {
+    try {
+      var overlays = document.querySelectorAll('.ij-find-overlay.visible');
+      for (var i = 0; i < overlays.length; i++) {
+        if (overlays[i] !== root) { return true; }
+      }
+    } catch (eVisiblePanels) {}
+    return false;
+  }
+
+  function noteSearchPanelClosed(root) {
+    try {
+      if (getFocusedSearchPanel() === root) { setFocusedSearchPanel(null); }
+      if (root && root.classList) { root.classList.remove('ij-find-focused'); }
+      if (!hasVisibleSearchPanelExcept(root)) {
+        setIntelliSenseRecursionCaptureSuspended(false, 'search-ui-hidden');
+        sendPersistent({ type: 'panelHidden' });
+      }
+    } catch (ePanelClosed) {}
+  }
+
+  function closeDetachedSearchPanel(root) {
+    try {
+      if (!root || !root.classList || !root.classList.contains('ij-find-detached')) { return false; }
+      root.classList.remove('visible');
+      try { root.remove(); } catch (eRemoveDetached) {}
+      noteSearchPanelClosed(root);
+      return true;
+    } catch (eCloseDetached) {
+      return false;
+    }
+  }
+
+  function rectForSpawnBase() {
+    try {
+      if (
+        getFocusedSearchPanel() &&
+        getFocusedSearchPanel().classList &&
+        getFocusedSearchPanel().classList.contains('visible') &&
+        document.body.contains(getFocusedSearchPanel())
+      ) {
+        var focusedRect = getFocusedSearchPanel().getBoundingClientRect();
+        if (focusedRect && focusedRect.width > 0 && focusedRect.height > 0) { return focusedRect; }
+      }
+    } catch (eFocusedRect) {}
+    try { return panel.getBoundingClientRect(); } catch (ePanelRect) { return null; }
+  }
+
+  function offsetPanelPosition(baseRect, width, height) {
+    var offset = 36;
+    var maxLeft = Math.max(8, window.innerWidth - Math.min(width, window.innerWidth - 20));
+    var maxTop = Math.max(8, window.innerHeight - Math.min(height, window.innerHeight - 20));
+    var left = Math.round((baseRect ? baseRect.left : 80) + offset);
+    var top = Math.round((baseRect ? baseRect.top : 80) + offset);
+    if (left > maxLeft) { left = Math.max(8, Math.round((baseRect ? baseRect.left : maxLeft) - offset)); }
+    if (top > maxTop) { top = Math.max(8, Math.round((baseRect ? baseRect.top : maxTop) - offset)); }
+    return {
+      left: Math.max(8, Math.min(maxLeft, left)),
+      top: Math.max(8, Math.min(maxTop, top)),
+    };
+  }
+
+  function makeDetachedPanelDraggable(root) {
+    try {
+      var header = root.querySelector('.ij-find-header');
+      if (!header) { return; }
+      var dragging = false;
+      var startX = 0, startY = 0, origX = 0, origY = 0;
+      function move(e) {
+        if (!dragging) { return; }
+        var nx = origX + (e.clientX - startX);
+        var ny = origY + (e.clientY - startY);
+        nx = Math.max(0, Math.min(window.innerWidth - 120, nx));
+        ny = Math.max(0, Math.min(window.innerHeight - 40, ny));
+        root.style.left = nx + 'px';
+        root.style.top = ny + 'px';
+      }
+      function up() {
+        dragging = false;
+        try { document.removeEventListener('mousemove', move, true); } catch (eMoveRemove) {}
+        try { document.removeEventListener('mouseup', up, true); } catch (eUpRemove) {}
+      }
+      header.addEventListener('mousedown', function (e) {
+        if (e.target && e.target.closest && e.target.closest('.ij-find-minimize, .ij-find-close')) { return; }
+        bringSearchPanelToFront(root);
+        var rect = root.getBoundingClientRect();
+        dragging = true;
+        startX = e.clientX; startY = e.clientY;
+        origX = rect.left; origY = rect.top;
+        try { document.addEventListener('mousemove', move, true); } catch (eMoveAdd) {}
+        try { document.addEventListener('mouseup', up, true); } catch (eUpAdd) {}
+        e.preventDefault();
+      });
+    } catch (eDragDetached) {}
+  }
+
+  function makeDetachedPanelRowsInteractive(root) {
+    try {
+      root.addEventListener('click', function (e) {
+        var close = e.target instanceof HTMLElement ? e.target.closest('.ij-find-close') : null;
+        if (close) {
+          e.preventDefault();
+          e.stopPropagation();
+          closeDetachedSearchPanel(root);
+          return;
+        }
+        var actionBtn = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row-action') : null;
+        var row = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row') : null;
+        if (!row) { return; }
+        var uri = row.getAttribute('data-uri') || '';
+        if (!uri) { return; }
+        var line = parseInt(row.getAttribute('data-line') || '0', 10);
+        var column = parseInt(row.getAttribute('data-column') || '0', 10);
+        if (actionBtn) {
+          e.preventDefault();
+          e.stopPropagation();
+          var action = actionBtn.getAttribute('data-action') || '';
+          if (action === 'reveal') {
+            sendPersistent({ type: 'revealFile', uri: uri });
+          } else if (action === 'open') {
+            sendPersistent({ type: 'pinInSideEditor', uri: uri, line: line || 0, column: column || 0 });
+          }
+        }
+      }, true);
+      root.addEventListener('dblclick', function (e) {
+        var row = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row') : null;
+        if (!row) { return; }
+        var uri = row.getAttribute('data-uri') || '';
+        if (!uri) { return; }
+        var line = parseInt(row.getAttribute('data-line') || '0', 10);
+        var column = parseInt(row.getAttribute('data-column') || '0', 10);
+        e.preventDefault();
+        e.stopPropagation();
+        sendPersistent({ type: 'pinInSideEditor', uri: uri, line: line || 0, column: column || 0 });
+      }, true);
+    } catch (eRowsDetached) {}
+  }
+
+  function renderDetachedPreviewSnapshot(root) {
+    try {
+      var body = root && root.querySelector ? root.querySelector('.ij-find-preview-body') : null;
+      if (!body) { return; }
+      body.classList.remove('ij-find-editor-mounted');
+      body.classList.remove('ij-find-stolen');
+      body.classList.add('ij-find-detached-preview-snapshot');
+      body.style.removeProperty('font-family');
+      body.style.removeProperty('font-size');
+      body.style.removeProperty('line-height');
+      clearChildren(body);
+      var msg = state.lastPreviewMsg;
+      if (!msg || !Array.isArray(msg.lines) || msg.lines.length === 0) {
+        body.appendChild(el('div', {
+          className: 'ij-find-preview-content',
+          children: [
+            el('div', {
+              className: 'ij-find-preview-line ij-find-preview-truncated',
+              text: 'Preview snapshot unavailable',
+            }),
+          ],
+        }));
+        return;
+      }
+      var bounded = boundedPreviewLines(msg);
+      var contentEl = el('div', { className: 'ij-find-preview-content' });
+      var frag = document.createDocumentFragment();
+      var focusEl = null;
+      if (bounded.omittedBefore > 0) {
+        frag.appendChild(el('div', {
+          className: 'ij-find-preview-line ij-find-preview-truncated',
+          text: '... ' + bounded.omittedBefore + ' earlier line(s) omitted',
+        }));
+      }
+      for (var i = 0; i < bounded.lines.length; i++) {
+        var line = bounded.lines[i];
+        var isFocus = line.lineNumber === msg.focusLine;
+        var lineEl = el('div', {
+          className: 'ij-find-preview-line' + (isFocus ? ' focus' : ''),
+          attrs: { 'data-line': String(line.lineNumber) },
+        });
+        lineEl.appendChild(el('span', {
+          className: 'ij-find-preview-lineno',
+          text: String(line.lineNumber + 1),
+        }));
+        var textSpan = el('span', { className: 'ij-find-preview-text' });
+        if (isFocus && msg.ranges && msg.ranges.length > 0) {
+          appendHighlightedInto(textSpan, line.text, msg.ranges);
+        } else if (!fallbackHighlight(textSpan, line.text, msg.languageId || state.previewLanguageId || '')) {
+          textSpan.textContent = line.text;
+        }
+        lineEl.appendChild(textSpan);
+        frag.appendChild(lineEl);
+        if (isFocus) { focusEl = lineEl; }
+      }
+      if (bounded.omittedAfter > 0) {
+        frag.appendChild(el('div', {
+          className: 'ij-find-preview-line ij-find-preview-truncated',
+          text: '... ' + bounded.omittedAfter + ' later line(s) omitted',
+        }));
+      }
+      contentEl.appendChild(frag);
+      body.appendChild(contentEl);
+      if (focusEl) {
+        setTimeout(function () {
+          try { focusEl.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (eScrollDetachedPreview) {}
+        }, 0);
+      }
+    } catch (eDetachedPreview) {}
+  }
+
+  on(document, 'click', function (e) {
+    try {
+      var target = e.target instanceof HTMLElement ? e.target : null;
+      var close = target && target.closest ? target.closest('.ij-find-close') : null;
+      var root = close && close.closest ? close.closest('.ij-find-overlay.ij-find-detached') : null;
+      if (!root) { return; }
+      e.preventDefault();
+      e.stopPropagation();
+      closeDetachedSearchPanel(root);
+    } catch (eDetachedDocClose) {}
+  }, true);
+
+  function detachCurrentPanelForSpawn() {
+    if (!panel.classList.contains('visible')) { return false; }
+    try {
+      var rect = panel.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) { return false; }
+      detachedPanelSeq += 1;
+      var clone = panel.cloneNode(true);
+      clone.classList.add('ij-find-detached');
+      clone.setAttribute('data-ij-find-detached', String(detachedPanelSeq));
+      clone.style.left = Math.round(rect.left) + 'px';
+      clone.style.top = Math.round(rect.top) + 'px';
+      clone.style.width = Math.round(rect.width) + 'px';
+      clone.style.height = Math.round(rect.height) + 'px';
+      clone.style.maxWidth = 'none';
+      clone.style.maxHeight = 'none';
+      clone.style.transform = 'none';
+      clone.style.display = 'flex';
+      clone.style.visibility = 'visible';
+      clone.style.opacity = '1';
+      clone.style.pointerEvents = 'auto';
+      clone.style.position = 'fixed';
+      clone.style.zIndex = String(9990 + detachedPanelSeq);
+      var title = clone.querySelector('.ij-find-title');
+      if (title && title.textContent) { title.textContent = title.textContent + ' \u00b7 detached'; }
+      var fields = clone.querySelectorAll('textarea, input');
+      for (var i = 0; i < fields.length; i++) {
+        try { fields[i].readOnly = true; fields[i].setAttribute('tabindex', '-1'); } catch (eField) {}
+      }
+      renderDetachedPreviewSnapshot(clone);
+      makeDetachedPanelDraggable(clone);
+      makeDetachedPanelRowsInteractive(clone);
+      wireSearchPanelFocus(clone);
+      if (panel.parentElement) { panel.parentElement.appendChild(clone); }
+      var spawnBaseRect = rectForSpawnBase() || rect;
+      var nextPos = offsetPanelPosition(spawnBaseRect, rect.width, rect.height);
+      panel.style.left = nextPos.left + 'px';
+      panel.style.top = nextPos.top + 'px';
+      panel.style.width = Math.round(rect.width) + 'px';
+      panel.style.height = Math.round(rect.height) + 'px';
+      panel.style.maxWidth = 'none';
+      panel.style.maxHeight = 'none';
+      panel.style.transform = 'none';
+      bringSearchPanelToFront(panel);
+      return true;
+    } catch (eDetach) {
+      return false;
+    }
+  }
+
   function setShellMode(active) {
     try {
       var beforeChildren = panel ? panel.children.length : -1;
@@ -3043,7 +3602,13 @@ export function getRendererPatchScript(
       var cName = cSlash >= 0 ? cPath.slice(cSlash + 1) : cPath;
       row = el('div', {
         className: 'ij-find-row ij-find-row-pending' + (flatIdx === state.activeIndex ? ' active' : ''),
-        attrs: { 'data-flat': String(flatIdx), title: cPath },
+        attrs: {
+          'data-flat': String(flatIdx),
+          'data-uri': item.pendingUri,
+          'data-line': '0',
+          'data-column': '0',
+          title: cPath,
+        },
         children: [
           el('span', { className: 'ij-find-row-text', text: '\u2026 scanning' }),
           el('span', { className: 'ij-find-row-loc', text: cName }),
@@ -3056,12 +3621,19 @@ export function getRendererPatchScript(
     var m = f.matches[item.mi];
     var textEl = el('span', { className: 'ij-find-row-text' });
     appendHighlightedInto(textEl, normalizeResultPreview(m.preview), rangesForCurrentQuery(m));
+    var targetRanges = rangesForCurrentQuery(m);
+    var targetColumn = (targetRanges && targetRanges[0]) ? targetRanges[0].start : 0;
     var slashIdx = f.relPath.lastIndexOf('/');
     var fileName = slashIdx >= 0 ? f.relPath.slice(slashIdx + 1) : f.relPath;
     var locText = fileName + ':' + (m.line + 1);
     return el('div', {
       className: 'ij-find-row' + (flatIdx === state.activeIndex ? ' active' : ''),
-      attrs: { 'data-flat': String(flatIdx) },
+      attrs: {
+        'data-flat': String(flatIdx),
+        'data-uri': f.uri,
+        'data-line': String(m.line),
+        'data-column': String(targetColumn),
+      },
       children: [
         textEl,
         el('span', {
@@ -3552,7 +4124,7 @@ export function getRendererPatchScript(
     else if (e.key === 'ArrowUp' && !e.shiftKey) { e.preventDefault(); moveActive(-1); }
     else if (e.key === 'PageDown') { e.preventDefault(); moveActive(10); }
     else if (e.key === 'PageUp') { e.preventDefault(); moveActive(-10); }
-    else if (e.key === 'Escape') { e.preventDefault(); window.__ijFindHide(); }
+    else if (e.key === 'Escape') { e.preventDefault(); hideSearchPanel(); }
   });
   on($scope, 'keydown', function (e) {
     if (e.key === 'Enter') {
@@ -3561,7 +4133,7 @@ export function getRendererPatchScript(
       refreshSearch();
     } else if (e.key === 'ArrowDown') { e.preventDefault(); moveActive(1); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); moveActive(-1); }
-    else if (e.key === 'Escape') { e.preventDefault(); window.__ijFindHide(); }
+    else if (e.key === 'Escape') { e.preventDefault(); hideSearchPanel(); }
   });
   on($optCase, 'click', function () { toggleOpt('caseSensitive', $optCase); });
   on($optWord, 'click', function () { toggleOpt('wholeWord', $optWord); });
@@ -3585,7 +4157,12 @@ export function getRendererPatchScript(
     var ed = state.previewMonacoEditor || state.monacoEditor;
     if (ed && typeof ed.focus === 'function') { try { ed.focus(); } catch (eF) {} }
   });
-  on($close, 'click', function () { window.__ijFindHide(); });
+  on($minimize, 'click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    toggleSearchPanelMinimized();
+  });
+  on($close, 'click', function () { hideSearchPanel(); });
   syncCaseUi();
   syncRegexMultilineUi();
   renderSearchHistory();
@@ -3660,7 +4237,7 @@ export function getRendererPatchScript(
       dragging = false;
     }
     on($header, 'mousedown', function (e) {
-      if (e.target && e.target.closest && e.target.closest('.ij-find-close')) { return; }
+      if (e.target && e.target.closest && e.target.closest('.ij-find-minimize, .ij-find-close')) { return; }
       dragging = true;
       var rect = panel.getBoundingClientRect();
       panel.style.left = rect.left + 'px';
@@ -3688,6 +4265,7 @@ export function getRendererPatchScript(
       resizing = false;
     }
     on($resizer, 'mousedown', function (e) {
+      if (state.minimized) { return; }
       e.preventDefault(); e.stopPropagation();
       var rect = panel.getBoundingClientRect();
       panel.style.left = rect.left + 'px';
@@ -4563,6 +5141,7 @@ export function getRendererPatchScript(
     try { setStatus('Recovered renderer UI', false); } catch (eStatus) {}
     try {
       panel.classList.remove('visible');
+      if (state.minimized) { restoreSearchPanelFromMinimized(true); }
       panel.style.removeProperty('display');
       panel.style.removeProperty('visibility');
       panel.style.removeProperty('opacity');
@@ -4574,7 +5153,7 @@ export function getRendererPatchScript(
     try { if (panel.parentElement) { panel.parentElement.removeChild(panel); out.push('panel=detached'); } } catch (ePanelDetach) {}
     try { if ($hoverTooltip.parentElement) { $hoverTooltip.parentElement.removeChild($hoverTooltip); out.push('hover=detached'); } } catch (eHoverDetach) {}
     try {
-      var previewOverflowRoot = document.querySelector('.ij-find-preview-overflow-root');
+      var previewOverflowRoot = findPreviewOverflowRootForInstance();
       if (previewOverflowRoot && previewOverflowRoot.parentElement) {
         previewOverflowRoot.parentElement.removeChild(previewOverflowRoot);
         out.push('overflow=detached');
@@ -4795,6 +5374,32 @@ export function getRendererPatchScript(
     }
   }
 
+  function isSearchPreviewEditorTarget(target) {
+    try {
+      var el = target && target.nodeType === 3 ? target.parentElement : target;
+      if (!el || !el.closest || el.closest('.ij-find-detached')) { return false; }
+      return !!el.closest('.ij-find-preview-body .monaco-editor');
+    } catch (ePreviewTarget) {
+      return false;
+    }
+  }
+
+  function isActiveSelectionInSearchPreviewEditor() {
+    try {
+      if (isSearchPreviewEditorTarget(document.activeElement)) { return true; }
+      var sel = window.getSelection ? window.getSelection() : null;
+      if (sel) {
+        if (isSearchPreviewEditorTarget(sel.anchorNode)) { return true; }
+        if (isSearchPreviewEditorTarget(sel.focusNode)) { return true; }
+      }
+    } catch (eActivePreview) {}
+    return false;
+  }
+
+  window.__ijFindShouldSpawnSearchSelection = function () {
+    return isActiveSelectionInSearchPreviewEditor() ? 'preview' : '';
+  };
+
   function isPotentialCallGraphInlayClickTarget(start) {
     try {
       var el = start && start.nodeType === 3 ? start.parentElement : start;
@@ -4902,7 +5507,7 @@ export function getRendererPatchScript(
   }
 
   function findCallGraphInlayElement(start, clientX, clientY) {
-    if (isSearchUiEventTarget(start)) { return null; }
+    if (isSearchUiEventTarget(start) && !isSearchPreviewEditorTarget(start)) { return null; }
     if (!isPotentialCallGraphInlayClickTarget(start)) { return null; }
     var gate = callGraphInlayTargetGate(start);
     if (!gate) { return null; }
@@ -4921,7 +5526,7 @@ export function getRendererPatchScript(
     try {
       var stack = document.elementsFromPoint ? document.elementsFromPoint(clientX, clientY) : [];
       for (var i = 0; i < stack.length; i++) {
-        if (isSearchUiEventTarget(stack[i])) { continue; }
+        if (isSearchUiEventTarget(stack[i]) && !isSearchPreviewEditorTarget(stack[i])) { continue; }
         if (!callGraphInlayTargetGate(stack[i])) { continue; }
         var hit = findCallGraphInlayElementInAncestry(stack[i], clientX, clientY);
         if (hit) { return hit; }
@@ -5080,7 +5685,12 @@ export function getRendererPatchScript(
   function handleCallGraphInlayMouseDown(event) {
     var hookT0 = perfNow();
     if (!event || (typeof event.button === 'number' && event.button !== 0)) { return; }
-    if (isSearchUiEventTarget(event.target)) { return; }
+    var fromPreviewEditor = isSearchPreviewEditorTarget(event.target);
+    if (isSearchUiEventTarget(event.target) && !fromPreviewEditor) { return; }
+    if (fromPreviewEditor) {
+      var previewRoot = event.target && event.target.closest ? event.target.closest('.ij-find-overlay') : null;
+      bringSearchPanelToFront(previewRoot || panel);
+    }
     if (event.type !== 'pointerdown' && matchesLastCallGraphInlayActivation(event)) {
       try {
         event.preventDefault();
@@ -5146,7 +5756,7 @@ export function getRendererPatchScript(
       reportCallGraphInlayHook('click', hookT0, event, null, 'duplicate');
       return;
     }
-    if (isSearchUiEventTarget(event.target)) { return; }
+    if (isSearchUiEventTarget(event.target) && !isSearchPreviewEditorTarget(event.target)) { return; }
     var hit = findCallGraphInlayElement(event.target, event.clientX, event.clientY);
     if (!hit) {
       reportCallGraphInlayHook('click', hookT0, event, hit, 'miss');
@@ -5456,6 +6066,8 @@ export function getRendererPatchScript(
         fontSize: 12,
         renderLineHighlight: 'all',
         occurrencesHighlight: true,
+        fixedOverflowWidgets: true,
+        overflowWidgetsDomNode: getOrCreatePreviewOverflowHost(),
         hover: previewHoverOptions(),
         overviewRulerLanes: 3,
         hideCursorInOverviewRuler: false,
@@ -6084,37 +6696,53 @@ export function getRendererPatchScript(
   on($hoverTooltip, 'mouseenter', cancelHoverHide);
   on($hoverTooltip, 'mouseleave', function () { scheduleHoverHide(180); });
 
-	  window.__ijFindShow = function (initialQuery, showOptions) {
+	  function showSearchPanel(initialQuery, showOptions) {
 	    try {
 	      if (Date.now() < (state.recoveryUntil || 0)) { return 'suppressed:recovery'; }
 	      var wasVisible = panel.classList.contains('visible');
 	      var suppressSearch = !!(showOptions && showOptions.suppressSearch);
 	      var forceLiteral = !!(showOptions && showOptions.forceLiteral);
+      var spawnPanel = !!(showOptions && showOptions.spawn);
       var showStatusText = showOptions && typeof showOptions.statusText === 'string' ? showOptions.statusText : '';
       var showLoading = !!(showOptions && showOptions.loading);
       var shellRequested = suppressSearch || !(typeof initialQuery === 'string' && initialQuery.length > 0);
       var shouldShell = false;
+      try { window.__ijFindActiveInstanceId = __ijFindInstanceId; } catch (eActiveShow) {}
       setIntelliSenseRecursionCaptureSuspended(true, 'search-ui-visible');
       var showT0 = perfNow();
       startPanelDiagnostics('show', 30000);
       startPerfWatch('show', 15000);
-      panelDiagMark('show:start', { queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0, suppressSearch: suppressSearch, shellRequested: shellRequested, shouldShell: shouldShell, wasVisible: !!wasVisible });
+      panelDiagMark('show:start', { queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0, suppressSearch: suppressSearch, shellRequested: shellRequested, shouldShell: shouldShell, wasVisible: !!wasVisible, spawn: spawnPanel });
       trace('show:start', {
         queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0,
         hasNewline: typeof initialQuery === 'string' && initialQuery.indexOf('\\n') >= 0,
         wasVisible: !!wasVisible,
+        spawn: spawnPanel,
       });
+      if (state.minimized) { restoreSearchPanelFromMinimized(true); }
       var shellT0 = perfNow();
       setShellMode(shouldShell);
       reportPerfPhase('show:setShellMode', shellT0, { shouldShell: shouldShell }, 1);
       var styleT0 = perfNow();
+      var spawnBaseRect = spawnPanel ? rectForSpawnBase() : null;
+      if (spawnBaseRect && !wasVisible) {
+        var spawnPos = offsetPanelPosition(spawnBaseRect, spawnBaseRect.width || 640, spawnBaseRect.height || 420);
+        panel.style.left = spawnPos.left + 'px';
+        panel.style.top = spawnPos.top + 'px';
+        panel.style.width = Math.round(spawnBaseRect.width || 640) + 'px';
+        panel.style.height = Math.round(spawnBaseRect.height || 420) + 'px';
+        panel.style.maxWidth = 'none';
+        panel.style.maxHeight = 'none';
+        panel.style.transform = 'none';
+      }
       panel.classList.add('visible');
       panel.style.setProperty('display', 'flex', 'important');
       panel.style.setProperty('visibility', 'visible', 'important');
       panel.style.setProperty('opacity', '1', 'important');
       panel.style.setProperty('pointer-events', 'auto', 'important');
-      panel.style.setProperty('z-index', '10000', 'important');
+      panel.style.setProperty('z-index', String(10000 + detachedPanelSeq), 'important');
       panel.style.setProperty('position', 'fixed', 'important');
+      bringSearchPanelToFront(panel);
       reportPerfPhase('show:style', styleT0, { shouldShell: shouldShell }, 1);
       var themeT0 = perfNow();
       if (!shouldShell) {
@@ -6134,7 +6762,7 @@ export function getRendererPatchScript(
         document.body.appendChild($hoverTooltip);
       }
       try {
-        var previewOverflowRoot = document.querySelector('.ij-find-preview-overflow-root');
+        var previewOverflowRoot = findPreviewOverflowRootForInstance();
         if (previewOverflowRoot && !shouldShell) {
           document.body.appendChild(previewOverflowRoot);
           syncPreviewOverflowTheme(previewOverflowRoot);
@@ -6153,7 +6781,7 @@ export function getRendererPatchScript(
         $optWord.setAttribute('aria-pressed', 'false');
         syncRegexMultilineUi();
       }
-      if (typeof initialQuery === 'string' && (suppressSearch || (initialQuery && initialQuery !== $q.value))) {
+      if (typeof initialQuery === 'string' && (suppressSearch || initialQuery !== $q.value)) {
         panelDiagMark('show:setQuery', { len: initialQuery.length, suppressSearch: suppressSearch });
         var oldQ = state.rgQuery || '';
         var oldOpts = state.rgOptions;
@@ -6175,7 +6803,7 @@ export function getRendererPatchScript(
         $q.value = initialQuery;
         autosizeQuery();
         if (state.debounce) { clearTimeout(state.debounce); state.debounce = null; }
-        if (suppressSearch) {
+        if (suppressSearch || !initialQuery) {
           panelDiagMark('show:suppressSearch', { len: initialQuery.length });
           cancelScheduledRender();
           clearPreview();
@@ -6238,25 +6866,37 @@ export function getRendererPatchScript(
         queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0,
         wasVisible: !!wasVisible,
       }, 10);
-	      return 'show ok';
+	      return 'show ok src=' + __ijFindInstanceId;
     } catch (e) { return 'show-err: ' + (e && e.message); }
-  };
-	  window.__ijFindHide = function () {
+  }
+	  function hideSearchPanel() {
 	    var wasVisible = panel.classList.contains('visible');
     trace('hide:start', { wasVisible: !!wasVisible });
     panelDiagMark('hide:start', { wasVisible: !!wasVisible });
     stopPerfWatch('hide');
 	    panel.classList.remove('visible');
+    if (state.minimized) { restoreSearchPanelFromMinimized(true); }
+    if (getFocusedSearchPanel() === panel) { setFocusedSearchPanel(null); }
+    panel.classList.remove('ij-find-focused');
     panel.style.removeProperty('display');
     panel.style.removeProperty('visibility');
     panel.style.removeProperty('opacity');
     panel.style.removeProperty('pointer-events');
     panel.style.removeProperty('z-index');
     panel.style.removeProperty('position');
+    try {
+      if (panel.parentElement) { panel.parentElement.removeChild(panel); }
+    } catch (eHideDetachPanel) {}
     // Return any stolen VSCode editor to its editor group.
     if (state.stolenEditor) { restoreStolenEditor(); }
     // Tear down preview monaco widget so its GPU/DOM resources are released.
     disposePreviewMonacoEditor();
+    try {
+      var previewOverflowRoot = findPreviewOverflowRootForInstance();
+      if (previewOverflowRoot && previewOverflowRoot.parentElement) {
+        previewOverflowRoot.parentElement.removeChild(previewOverflowRoot);
+      }
+    } catch (eHideOverflowDetach) {}
     cancelScheduledRender();
     if (state.searchTicker) { clearInterval(state.searchTicker); state.searchTicker = null; }
     if (state.debounce) { clearTimeout(state.debounce); state.debounce = null; }
@@ -6281,11 +6921,14 @@ export function getRendererPatchScript(
       $resultsInner.style.height = 'auto';
     } catch (eClearResults) {}
     hideHover();
+    var hasOtherVisibleSearchPanel = hasVisibleSearchPanelExcept(panel);
     if (wasVisible) {
       send({ type: 'cancel' });
-      send({ type: 'panelHidden' });
+      if (!hasOtherVisibleSearchPanel) { send({ type: 'panelHidden' }); }
     }
-    setIntelliSenseRecursionCaptureSuspended(false, 'search-ui-hidden');
+    if (!hasOtherVisibleSearchPanel) {
+      setIntelliSenseRecursionCaptureSuspended(false, 'search-ui-hidden');
+    }
     trace('hide:end', { wasVisible: !!wasVisible });
     panelDiagMark('hide:end', { wasVisible: !!wasVisible });
     stopPanelDiagnostics('hide');
@@ -6293,12 +6936,12 @@ export function getRendererPatchScript(
       setTimeout(function () {
         try {
           if (typeof window.__ijFindDisposeSearchUi === 'function') {
-            window.__ijFindDisposeSearchUi('hide');
+            disposeSearchUi('hide');
           }
         } catch (eDisposeOnHide) {}
       }, 0);
     }
-	  };
+	  }
   window.__ijFindStatus = function () {
     try {
       var r = panel.getBoundingClientRect();
@@ -6432,7 +7075,7 @@ export function getRendererPatchScript(
     }
   }
 
-	  window.__ijFindOnMessage = function (msg) {
+	  function onSearchMessage(msg) {
 	    if (__ijFindDisposed) { return 'disposed'; }
 	    if (Date.now() < (state.recoveryUntil || 0)) { return 'suppressed:recovery'; }
 	    if (!panel.classList.contains('visible') && msg && /^(results:|preview$|hover$)/.test(String(msg.type || ''))) {
@@ -6624,7 +7267,114 @@ export function getRendererPatchScript(
           searchId: msgSearchId,
         }, 8);
       }
-  };
+  }
+
+  function searchInstanceRegistry() {
+    try {
+      if (!window.__ijFindInstances || typeof window.__ijFindInstances !== 'object') {
+        window.__ijFindInstances = {};
+      }
+      return window.__ijFindInstances;
+    } catch (eRegistry) {
+      return {};
+    }
+  }
+
+  function findRegisteredSearchInstance(targetSrc) {
+    try {
+      var registry = searchInstanceRegistry();
+      if (targetSrc && registry[targetSrc]) { return registry[targetSrc]; }
+      var activeId = window.__ijFindActiveInstanceId || '';
+      if (activeId && registry[activeId]) { return registry[activeId]; }
+      if (registry[__ijFindInstanceId]) { return registry[__ijFindInstanceId]; }
+      for (var key in registry) {
+        if (Object.prototype.hasOwnProperty.call(registry, key)) { return registry[key]; }
+      }
+    } catch (eFindInstance) {}
+    return null;
+  }
+
+  function registerSearchInstance() {
+    try {
+      var registry = searchInstanceRegistry();
+      registry[__ijFindInstanceId] = {
+        id: __ijFindInstanceId,
+        panel: panel,
+        show: showSearchPanel,
+        hide: hideSearchPanel,
+        onMessage: onSearchMessage,
+        getSearchState: window.__ijFindGetSearchState,
+        refreshSearch: refreshSearch,
+        setScopeValue: window.__ijFindSetScopeValue,
+        getPreviewDecorations: window.__ijFindGetPreviewDecorations,
+        getPreviewOverflowHostForTests: getOrCreatePreviewOverflowHost,
+        dispose: disposeSearchUi,
+      };
+      window.__ijFindActiveInstanceId = __ijFindInstanceId;
+      window.__ijFindShow = function (initialQuery, showOptions) {
+        var targetSrc = showOptions && showOptions.__targetSrc ? String(showOptions.__targetSrc) : '';
+        var inst = findRegisteredSearchInstance(targetSrc);
+        if (inst && typeof inst.show === 'function') {
+          return inst.show(initialQuery, showOptions || {});
+        }
+        return showSearchPanel(initialQuery, showOptions || {});
+      };
+      window.__ijFindHide = function (targetSrc) {
+        var inst = findRegisteredSearchInstance(targetSrc ? String(targetSrc) : '');
+        if (inst && typeof inst.hide === 'function') { return inst.hide(); }
+        return hideSearchPanel();
+      };
+      window.__ijFindOnMessage = function (msg) {
+        var targetSrc = msg && msg.__targetSrc ? String(msg.__targetSrc) : '';
+        var inst = findRegisteredSearchInstance(targetSrc);
+        if (inst && typeof inst.onMessage === 'function') {
+          return inst.onMessage(msg || {});
+        }
+        return 'missing-instance:' + (targetSrc || 'active');
+      };
+      window.__ijFindGetSearchState = function (targetSrc) {
+        var inst = findRegisteredSearchInstance(targetSrc ? String(targetSrc) : '');
+        if (inst && typeof inst.getSearchState === 'function') { return inst.getSearchState(); }
+        return { err: 'missing-instance' };
+      };
+      window.__ijFindRefreshSearch = function (targetSrc) {
+        var inst = findRegisteredSearchInstance(targetSrc ? String(targetSrc) : '');
+        if (inst && typeof inst.refreshSearch === 'function') { return inst.refreshSearch(); }
+        return undefined;
+      };
+      window.__ijFindSetScopeValue = function (value, forceRestart, targetSrc) {
+        var inst = findRegisteredSearchInstance(targetSrc ? String(targetSrc) : '');
+        if (inst && typeof inst.setScopeValue === 'function') { return inst.setScopeValue(value, forceRestart); }
+        return { err: 'missing-instance' };
+      };
+      window.__ijFindGetPreviewDecorations = function (targetSrc) {
+        var inst = findRegisteredSearchInstance(targetSrc ? String(targetSrc) : '');
+        if (inst && typeof inst.getPreviewDecorations === 'function') { return inst.getPreviewDecorations(); }
+        return { editor: null, decorations: [] };
+      };
+      window.__ijFindDisposeAllSearchUi = function (reason) {
+        var out = [];
+        var all = searchInstanceRegistry();
+        var ids = [];
+        for (var id in all) {
+          if (Object.prototype.hasOwnProperty.call(all, id)) { ids.push(id); }
+        }
+        for (var i = 0; i < ids.length; i++) {
+          try {
+            var target = all[ids[i]];
+            if (target && typeof target.dispose === 'function') {
+              out.push(ids[i] + ':' + target.dispose(reason || 'dispose-all'));
+            }
+          } catch (eDisposeOne) {
+            out.push(ids[i] + ':err');
+          }
+        }
+        return out.join('|') || 'none';
+      };
+    } catch (eRegisterInstance) {}
+  }
+
+  registerSearchInstance();
 
   return 'ij-find patch installed';
 })()
