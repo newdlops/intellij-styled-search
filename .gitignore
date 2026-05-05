@@ -7,5 +7,5 @@ target/
 .zoek-rs/
 .codeidx/
 artifacts/benchmarks/
-.lh
-.vscode/**
+.lh/**/*.*
+.vscode/**/*.*
