@@ -690,6 +690,17 @@ export function getRendererPatchScript(
     };
   }
 
+  function previewHoverOptions() {
+    return {
+      enabled: true,
+      sticky: true,
+      // The preview editor renders hover widgets into a body-level overflow
+      // host. Give the pointer enough grace to travel from the symbol to that
+      // detached hover widget instead of hiding as soon as it leaves the token.
+      hidingDelay: 1200,
+    };
+  }
+
   window.__ijFindCreatePreviewEditor = function (host) {
     var m = window.__ijFindMonaco;
     if (!m || !m.ctor) { return null; }
@@ -702,6 +713,7 @@ export function getRendererPatchScript(
       renderLineHighlight: 'all',
       fixedOverflowWidgets: true,
       overflowWidgetsDomNode: overflowHost,
+      hover: previewHoverOptions(),
       // Sticky scroll (the header that pins the current function/class
       // as you scroll) adds visual noise to a read-mostly preview.
       stickyScroll: { enabled: false },
@@ -1892,7 +1904,7 @@ export function getRendererPatchScript(
     attrs: { role: 'listbox' },
   });
   var $historyWrap = el('div', { className: 'ij-find-history-wrap', children: [$history, $historyMenu] });
-  var $optCase = el('button', { className: 'ij-find-opt', title: 'Match Case (Alt+C)', text: 'Aa', attrs: { 'data-opt': 'caseSensitive', 'aria-pressed': 'false' } });
+  var $optCase = el('button', { className: 'ij-find-opt', title: 'Case Sensitive (Alt+C)', text: 'aA', attrs: { 'data-opt': 'caseSensitive', 'aria-pressed': 'false' } });
   var $optWord = el('button', { className: 'ij-find-opt', title: 'Whole Word (Alt+W)', text: 'W', attrs: { 'data-opt': 'wholeWord', 'aria-pressed': 'false' } });
   var $optRegex = el('button', { className: 'ij-find-opt', title: 'Regex (Alt+R)', text: '.*', attrs: { 'data-opt': 'useRegex', 'aria-pressed': 'false' } });
   var $optRegexMultiline = el('button', { className: 'ij-find-opt', title: 'Regex Multiline (Alt+M)', text: 'ML', attrs: { 'data-opt': 'regexMultiline', 'aria-pressed': 'true', 'aria-disabled': 'true' } });
@@ -2686,9 +2698,22 @@ export function getRendererPatchScript(
     return !!(opts && opts.useRegex && opts.regexMultiline !== false);
   }
 
+  function previewMinimapMatchOptions(active) {
+    return {
+      // Theme tokens can resolve too close to the minimap text color in some
+      // VS Code themes. Use an opaque orange so match marks remain visible.
+      color: active ? '#ff6a00' : '#ffb000',
+      position: 1, // MinimapPosition.Inline
+    };
+  }
+
   function syncRegexMultilineUi() {
     var enabled = !!state.options.useRegex;
     $optRegexMultiline.setAttribute('aria-disabled', enabled ? 'false' : 'true');
+  }
+
+  function syncCaseUi() {
+    $optCase.setAttribute('aria-pressed', String(!!state.options.caseSensitive));
   }
 
   function setShellMode(active) {
@@ -2878,7 +2903,14 @@ export function getRendererPatchScript(
       start = Math.max(0, Math.min(len, start));
       end = Math.max(0, Math.min(len, end));
       if (end <= start) { continue; }
-      out.push({ start: start, end: end });
+      var sanitized = { start: start, end: end };
+      if (typeof r.endLine === 'number' && isFinite(r.endLine)) {
+        sanitized.endLine = Math.max(0, Math.floor(r.endLine));
+        if (typeof r.endCol === 'number' && isFinite(r.endCol)) {
+          sanitized.endCol = Math.max(0, Math.floor(r.endCol));
+        }
+      }
+      out.push(sanitized);
     }
     return out;
   }
@@ -3390,10 +3422,57 @@ export function getRendererPatchScript(
 
   function toggleOpt(key, btn) {
     if (btn && btn.getAttribute && btn.getAttribute('aria-disabled') === 'true') { return; }
-    state.options[key] = !state.options[key];
-    btn.setAttribute('aria-pressed', String(state.options[key]));
+    if (key === 'caseSensitive') {
+      state.options.caseSensitive = !state.options.caseSensitive;
+      syncCaseUi();
+    } else {
+      state.options[key] = !state.options[key];
+      btn.setAttribute('aria-pressed', String(state.options[key]));
+    }
     if (key === 'useRegex') { syncRegexMultilineUi(); }
-    markSearchDirty(true);
+    if ($q.value) {
+      refreshSearch();
+    } else {
+      markSearchDirty(true);
+    }
+  }
+
+  function optionShortcutMatches(e, code, key) {
+    return e && (e.code === code || String(e.key || '').toLowerCase() === key);
+  }
+
+  function isPlainOptionKeyAllowed(e) {
+    if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) { return false; }
+    var target = e.target instanceof HTMLElement ? e.target : null;
+    return !!(target && target.closest('.ij-find-opts'));
+  }
+
+  function handleOptionShortcut(e) {
+    if (!panel.classList.contains('visible') || e.isComposing) { return false; }
+    var withModifier = !!e.altKey && !e.ctrlKey && !e.metaKey;
+    var plainFromOptions = isPlainOptionKeyAllowed(e);
+    if (!withModifier && !plainFromOptions) { return false; }
+    if (optionShortcutMatches(e, 'KeyC', 'c')) {
+      e.preventDefault();
+      toggleOpt('caseSensitive', $optCase);
+      return true;
+    }
+    if (optionShortcutMatches(e, 'KeyW', 'w')) {
+      e.preventDefault();
+      toggleOpt('wholeWord', $optWord);
+      return true;
+    }
+    if (optionShortcutMatches(e, 'KeyR', 'r')) {
+      e.preventDefault();
+      toggleOpt('useRegex', $optRegex);
+      return true;
+    }
+    if (optionShortcutMatches(e, 'KeyM', 'm')) {
+      e.preventDefault();
+      toggleOpt('regexMultiline', $optRegexMultiline);
+      return true;
+    }
+    return false;
   }
 
   function moveActive(delta) {
@@ -3507,6 +3586,7 @@ export function getRendererPatchScript(
     if (ed && typeof ed.focus === 'function') { try { ed.focus(); } catch (eF) {} }
   });
   on($close, 'click', function () { window.__ijFindHide(); });
+  syncCaseUi();
   syncRegexMultilineUi();
   renderSearchHistory();
 
@@ -3647,11 +3727,7 @@ export function getRendererPatchScript(
   })();
 
   on(document, 'keydown', function (e) {
-    if (!panel.classList.contains('visible')) { return; }
-    if (e.altKey && (e.key === 'c' || e.key === 'C')) { e.preventDefault(); toggleOpt('caseSensitive', $optCase); }
-    else if (e.altKey && (e.key === 'w' || e.key === 'W')) { e.preventDefault(); toggleOpt('wholeWord', $optWord); }
-    else if (e.altKey && (e.key === 'r' || e.key === 'R')) { e.preventDefault(); toggleOpt('useRegex', $optRegex); }
-    else if (e.altKey && (e.key === 'm' || e.key === 'M')) { e.preventDefault(); toggleOpt('regexMultiline', $optRegexMultiline); }
+    handleOptionShortcut(e);
   });
 
   // ── Monaco access (aggressive multi-path probe) ─────────────────────
@@ -4366,13 +4442,13 @@ export function getRendererPatchScript(
           });
         }
         for (var si = 0; si < sub.length; si++) {
-          // Only seed overview-ruler + minimap markers on the FIRST sub-
-          // range of each match — putting one per exploded line produces
-          // a dense streak on multi-line hits and drowns out the actual
-          // cursor marker. The first sub-range lands at the match's
-          // starting line, which is what the user wants to jump to.
+          // Keep overview-ruler markers limited to the match start so the
+          // scrollbar remains a jump target, but mirror every highlighted
+          // sub-range into the minimap so multi-line matches are visible
+          // there exactly where the text is highlighted.
           var addRulerMarker = si === 0;
           var opts = { inlineClassName: cls, isWholeLine: false };
+          opts.minimap = previewMinimapMatchOptions(matchIdx === 0);
           if (addRulerMarker) {
             // Theme color tokens — Monaco resolves these to the theme's
             // selection/find colors. Fallback literal is a
@@ -4382,12 +4458,6 @@ export function getRendererPatchScript(
                 ? { id: 'editor.findMatchHighlightBackground' }
                 : { id: 'editor.findMatchBackground' },
               position: 4, // OverviewRulerLane.Right
-            };
-            opts.minimap = {
-              color: matchIdx === 0
-                ? { id: 'minimap.findMatchHighlight' }
-                : { id: 'minimap.findMatchHighlight' },
-              position: 1, // MinimapPosition.Inline
             };
           }
           decos.push({ range: sub[si], options: opts });
@@ -5029,6 +5099,23 @@ export function getRendererPatchScript(
       reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-modifier');
       return;
     }
+    var widget = findEditorWidgetForInlayElement(hit.element);
+    var position = editorPositionFromInlayClick(widget, event);
+    if (position) {
+      try {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+      } catch (eStop) {}
+      rememberCallGraphInlayActivation(event, hit);
+      sendPersistent({
+        type: 'runCommand',
+        command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
+        args: [hit.kind, position.uri, position.line, position.column],
+      });
+      reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'hit-position');
+      return;
+    }
     var visibleLine = visibleLineOrdinalFromInlayDom(hit.element, event);
     if (visibleLine) {
       try {
@@ -5045,24 +5132,7 @@ export function getRendererPatchScript(
       reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'hit-visible-line');
       return;
     }
-    var widget = findEditorWidgetForInlayElement(hit.element);
-    var position = editorPositionFromInlayClick(widget, event);
-    if (!position) {
-      reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'hit-no-position');
-      return;
-    }
-    try {
-      event.preventDefault();
-      event.stopPropagation();
-      if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
-    } catch (eStop) {}
-    rememberCallGraphInlayActivation(event, hit);
-    sendPersistent({
-      type: 'runCommand',
-      command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
-      args: [hit.kind, position.uri, position.line, position.column],
-    });
-    reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'hit');
+    reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'hit-no-position');
   }
 
   function suppressCallGraphInlayClick(event) {
@@ -5386,6 +5456,7 @@ export function getRendererPatchScript(
         fontSize: 12,
         renderLineHighlight: 'all',
         occurrencesHighlight: true,
+        hover: previewHoverOptions(),
         overviewRulerLanes: 3,
         hideCursorInOverviewRuler: false,
       });
@@ -5496,6 +5567,7 @@ export function getRendererPatchScript(
             inlineClassName: idx === 0 && msg.ranges && msg.ranges.length > 0 ? 'findMatch currentFindMatch' : 'findMatch',
             className: 'rangeHighlight',
             isWholeLine: !(msg.ranges && msg.ranges.length > 0),
+            minimap: previewMinimapMatchOptions(idx === 0),
           },
         };
       }));
@@ -6328,6 +6400,8 @@ export function getRendererPatchScript(
           endLineNumber: d.range.endLineNumber,
           endColumn: d.range.endColumn,
           inlineClassName: inlineCls,
+          hasMinimap: !!(d.options && d.options.minimap),
+          minimapColor: d.options && d.options.minimap ? d.options.minimap.color : undefined,
         });
       }
       return { editor: 'ok', decorations: out, lineCount: model.getLineCount ? model.getLineCount() : -1 };

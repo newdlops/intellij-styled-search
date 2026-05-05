@@ -214,6 +214,110 @@ suite('Renderer — overlay UI probes', () => {
     assert.strictEqual(parsed.state.inputValue, query);
   });
 
+  test('option shortcuts use physical key code when Alt changes the typed character', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('');
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var query = document.querySelector('.ij-find-query');
+        var word = document.querySelector('[data-opt="wholeWord"]');
+        if (word && word.getAttribute('aria-pressed') === 'true') { word.click(); }
+        if (query && query.focus) { query.focus(); }
+        var ev = new KeyboardEvent('keydown', {
+          key: '∑',
+          code: 'KeyW',
+          altKey: true,
+          bubbles: true,
+          cancelable: true
+        });
+        var dispatched = query ? query.dispatchEvent(ev) : false;
+        return JSON.stringify({
+          dispatched: dispatched,
+          prevented: ev.defaultPrevented,
+          wordPressed: word ? word.getAttribute('aria-pressed') : null,
+          state: window.__ijFindGetSearchState()
+        });
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      dispatched: boolean;
+      prevented: boolean;
+      wordPressed: string | null;
+      state: { options?: { wholeWord: boolean } };
+    };
+    assert.strictEqual(parsed.dispatched, false, `Alt+W should be consumed by the option shortcut: ${raw}`);
+    assert.strictEqual(parsed.prevented, true, `Alt+W should prevent the typed Option-W character: ${raw}`);
+    assert.strictEqual(parsed.wordPressed, 'true', `whole-word button should be pressed after Alt+W: ${raw}`);
+    assert.strictEqual(parsed.state.options?.wholeWord, true, `renderer state should enable whole-word: ${raw}`);
+  });
+
+  test('option buttons restart search immediately with updated options', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('');
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var q = document.querySelector('.ij-find-query');
+        var word = document.querySelector('[data-opt="wholeWord"]');
+        var caseSensitive = document.querySelector('[data-opt="caseSensitive"]');
+        if (!q || !word || !caseSensitive) { return JSON.stringify({ err: 'missing controls' }); }
+        q.value = '';
+        if (word.getAttribute('aria-pressed') === 'true') { word.click(); }
+        if (caseSensitive.getAttribute('aria-pressed') === 'true') { caseSensitive.click(); }
+        q.value = 'Beta';
+        var oldBridge = globalThis.irSearchEvent;
+        var sent = [];
+        globalThis.irSearchEvent = function (payload) {
+          try { sent.push(JSON.parse(String(payload))); } catch (e) {}
+        };
+        word.click();
+        caseSensitive.click();
+        globalThis.irSearchEvent = oldBridge;
+        return JSON.stringify({
+          wordPressed: word.getAttribute('aria-pressed'),
+          caseSensitivePressed: caseSensitive.getAttribute('aria-pressed'),
+          caseSensitiveText: caseSensitive.textContent,
+          caseSensitiveTitle: caseSensitive.getAttribute('title'),
+          sent: sent,
+          state: window.__ijFindGetSearchState()
+        });
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      err?: string;
+      wordPressed?: string;
+      caseSensitivePressed?: string;
+      caseSensitiveText?: string;
+      caseSensitiveTitle?: string | null;
+      sent?: Array<{ type?: string; options?: { query?: string; wholeWord?: boolean; caseSensitive?: boolean } }>;
+      state?: { options?: { wholeWord: boolean; caseSensitive: boolean } };
+    };
+    assert.strictEqual(parsed.err, undefined, `expected search option controls: ${raw}`);
+    assert.strictEqual(parsed.wordPressed, 'true', `whole-word button should stay pressed: ${raw}`);
+    assert.strictEqual(parsed.caseSensitiveText, 'aA', `case-sensitive button should use its own icon text: ${raw}`);
+    assert.match(parsed.caseSensitiveTitle || '', /Case Sensitive/, `case-sensitive button should be labelled as Case Sensitive: ${raw}`);
+    assert.ok(
+      parsed.sent?.some((msg) => msg.type === 'search' &&
+        msg.options?.query === 'Beta' &&
+        msg.options.wholeWord === true &&
+        msg.options.caseSensitive === false),
+      `whole-word click should emit a fresh ignore-case search with updated options: ${raw}`,
+    );
+    assert.strictEqual(parsed.caseSensitivePressed, 'true', `case-sensitive button should toggle on after click: ${raw}`);
+    assert.ok(
+      parsed.sent?.some((msg) => msg.type === 'search' &&
+        msg.options?.query === 'Beta' &&
+        msg.options.wholeWord === true &&
+        msg.options.caseSensitive === true),
+      `case-sensitive click should emit a fresh case-sensitive search with updated options: ${raw}`,
+    );
+    assert.strictEqual(parsed.state?.options?.wholeWord, true, `renderer state should enable whole-word: ${raw}`);
+    assert.strictEqual(parsed.state?.options?.caseSensitive, true, `case-sensitive on should set caseSensitive=true: ${raw}`);
+  });
+
   test('suppressed initial search keeps the full panel layout mounted', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);

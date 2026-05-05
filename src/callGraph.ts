@@ -274,7 +274,7 @@ type SymbolIndex = {
 type CallGraphResolveOptions = {
   includePossibleEdges: boolean;
   includeUnresolvedEdges: boolean;
-  maxEdges: number;
+  maxEdges?: number;
   maxPossibleTargetsPerCall: number;
 };
 
@@ -370,10 +370,10 @@ const SOURCE_EXTENSIONS = new Set([
 ]);
 
 const DEFAULT_CALL_GRAPH_PARSE_LIMITS: CallGraphParseLimits = {
-  maxLineLength: 20_000,
-  maxLinesPerFile: 50_000,
-  maxReferenceCandidatesPerFile: 50_000,
-  maxAssignedFunctionNamesPerFile: 500,
+  maxLineLength: 0,
+  maxLinesPerFile: 0,
+  maxReferenceCandidatesPerFile: 0,
+  maxAssignedFunctionNamesPerFile: 0,
 };
 
 const LANGUAGE_BY_EXTENSION = new Map<string, CallGraphLanguage>([
@@ -449,9 +449,9 @@ const VALUE_BINDING_TYPE_NAMES = new Set([
 const MAX_CALL_GRAPH_CONCURRENCY = 32;
 const MAX_POSSIBLE_EDGES_PER_CALL = 40;
 const DEFAULT_CALL_GRAPH_CONCURRENCY = getDefaultCallGraphConcurrency();
-const DEFAULT_CALL_GRAPH_MAX_EDGES = 1_000_000;
-const DEFAULT_CALL_GRAPH_MAX_CALLSITES = 1_000_000;
-const DEFAULT_CALL_GRAPH_MAX_REFERENCE_CANDIDATES = 1_000_000;
+const DEFAULT_CALL_GRAPH_MAX_EDGES = 0;
+const DEFAULT_CALL_GRAPH_MAX_CALLSITES = 0;
+const DEFAULT_CALL_GRAPH_MAX_REFERENCE_CANDIDATES = 0;
 const DEFAULT_CALL_GRAPH_MEMORY_BUDGET_MB = 1_024;
 const CALL_GRAPH_SOURCE_GLOB = '**/*.{py,java,kt,kts,ts,tsx,js,jsx,mjs,cjs}';
 const CALL_GRAPH_CACHE_VERSION = 14;
@@ -1042,7 +1042,7 @@ export class CallGraphService implements vscode.Disposable {
     }
     const started = Date.now();
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-    const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
+    const maxFileSize = getConfiguredCallGraphMaxFileSize(cfg);
     const parseLimits = getConfiguredCallGraphParseLimits(cfg);
     const cpuBudget = getConfiguredCallGraphCpuBudget(cfg);
     const excludeMatcher = createCallGraphExcludeMatcher(cfg);
@@ -1103,7 +1103,7 @@ export class CallGraphService implements vscode.Disposable {
       return;
     }
     const started = Date.now();
-    const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
+    const maxFileSize = getConfiguredCallGraphMaxFileSize(cfg);
     const resolveOptions = getConfiguredCallGraphResolveOptions(cfg);
     const buildLimits = getConfiguredCallGraphBuildLimits(cfg);
     const parseConcurrency = getConfiguredCallGraphConcurrency(cfg);
@@ -1665,7 +1665,11 @@ export class CallGraphService implements vscode.Disposable {
     );
     try {
       const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-      const parsed = await parseSourceFileRecord(uri, cfg.get<number>('maxFileSize', 1_048_576));
+      const parsed = await parseSourceFileRecord(
+        uri,
+        getConfiguredCallGraphMaxFileSize(cfg),
+        getConfiguredCallGraphParseLimits(cfg),
+      );
       if (!parsed.record) { return false; }
       const symbols = parsed.record.parsed.symbols
         .filter((symbol) => isCallableSymbol(symbol) || isTypeSymbol(symbol) || isReferenceableSymbol(symbol))
@@ -2535,7 +2539,7 @@ export class CallGraphService implements vscode.Disposable {
     }
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     const excludeGlobs = getConfiguredCallGraphExcludeGlobs(cfg);
-    const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
+    const maxFileSize = getConfiguredCallGraphMaxFileSize(cfg);
     const buildLimits = getConfiguredCallGraphBuildLimits(cfg);
     const parseConcurrency = getConfiguredCallGraphConcurrency(cfg);
     const resolveOptions = getConfiguredCallGraphResolveOptions(cfg);
@@ -3183,7 +3187,7 @@ async function parseSourceFileRecord(
   if (stat.type === vscode.FileType.Directory) {
     return { skipped: true, warnings: [] };
   }
-  if (stat.size > maxFileSize) {
+  if (maxFileSize > 0 && stat.size > maxFileSize) {
     return { skipped: true, warnings: [] };
   }
   const language = LANGUAGE_BY_EXTENSION.get(path.extname(uri.fsPath).toLowerCase());
@@ -4415,7 +4419,7 @@ async function resolveCallsAsync(
   const pushEdge = (edge: CallGraphEdge): void => {
     const key = edgeIdentityKey(edge);
     if (edgeKeys.has(key)) { return; }
-    if (edgeKeys.size >= options.resolveOptions.maxEdges) {
+    if (options.resolveOptions.maxEdges !== undefined && edgeKeys.size >= options.resolveOptions.maxEdges) {
       edgeLimitHit = true;
       return;
     }
@@ -5901,12 +5905,12 @@ function getConfiguredCallGraphResolveOptions(
   cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
 ): CallGraphResolveOptions {
   const includePossibleEdges = cfg.get<boolean>('callGraphIncludePossibleEdges', false);
-  const includeUnresolvedEdges = cfg.get<boolean>('callGraphIncludeUnresolvedEdges', false);
+  const includeUnresolvedEdges = cfg.get<boolean>('callGraphIncludeUnresolvedEdges', true);
   const rawMaxEdges = cfg.get<number>('callGraphMaxEdges', DEFAULT_CALL_GRAPH_MAX_EDGES);
   const rawMaxPossibleTargets = cfg.get<number>('callGraphMaxPossibleTargetsPerCall', 8);
   const maxEdges = Number.isFinite(rawMaxEdges) && rawMaxEdges > 0
     ? Math.max(1_000, Math.floor(rawMaxEdges))
-    : DEFAULT_CALL_GRAPH_MAX_EDGES;
+    : undefined;
   const maxPossibleTargetsPerCall = Number.isFinite(rawMaxPossibleTargets) && rawMaxPossibleTargets > 0
     ? Math.max(1, Math.min(Math.floor(rawMaxPossibleTargets), MAX_POSSIBLE_EDGES_PER_CALL))
     : 8;
@@ -5927,14 +5931,14 @@ function getConfiguredCallGraphBuildLimits(
       'callGraphMaxCallsites',
       DEFAULT_CALL_GRAPH_MAX_CALLSITES,
       0,
-      10_000_000,
+      Number.MAX_SAFE_INTEGER,
     ),
     maxReferenceCandidates: getBoundedIntegerSetting(
       cfg,
       'callGraphMaxReferenceCandidates',
       DEFAULT_CALL_GRAPH_MAX_REFERENCE_CANDIDATES,
       0,
-      10_000_000,
+      Number.MAX_SAFE_INTEGER,
     ),
     memoryBudgetMb: getBoundedIntegerSetting(
       cfg,
@@ -5988,6 +5992,18 @@ function getConfiguredCallGraphCpuBudget(
     percent: getBoundedIntegerSetting(cfg, 'callGraphCpuBudgetPercent', 35, 1, 100),
     maxPauseMs: getBoundedIntegerSetting(cfg, 'callGraphMaxParserPauseMs', 2_000, 0, 60_000),
   };
+}
+
+function getConfiguredCallGraphMaxFileSize(
+  cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
+): number {
+  return getBoundedIntegerSetting(
+    cfg,
+    'callGraphMaxFileSize',
+    0,
+    0,
+    Number.MAX_SAFE_INTEGER,
+  );
 }
 
 function getBoundedIntegerSetting(
@@ -6135,7 +6151,7 @@ function getCallGraphConfigSignature(
 ): string {
   return JSON.stringify({
     version: CALL_GRAPH_CACHE_VERSION,
-    maxFileSize: cfg.get<number>('maxFileSize', 1_048_576),
+    maxFileSize: getConfiguredCallGraphMaxFileSize(cfg),
     excludeGlobs: getConfiguredCallGraphExcludeGlobs(cfg),
     parseLimits: getConfiguredCallGraphParseLimits(cfg),
     buildLimits: getConfiguredCallGraphBuildLimits(cfg),

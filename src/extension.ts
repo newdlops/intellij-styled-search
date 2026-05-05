@@ -115,6 +115,30 @@ class CallGraphInlayRegistry {
       return aDistance - bDistance || a.symbolId.localeCompare(b.symbolId);
     })[0];
   }
+
+  resolveNear(uri: vscode.Uri, line: number, kind: string, column?: number, radius = 6): CallGraphInlayRegistryEntry | undefined {
+    if (!Number.isFinite(line) || line < 0) { return undefined; }
+    const normalizedKind = normalizeCallGraphInlayKind(kind);
+    const byLine = this.entriesByUri.get(uri.toString());
+    if (!byLine) { return undefined; }
+    const safeLine = Math.max(0, Math.floor(line));
+    const safeColumn = Math.max(0, Math.floor(Number.isFinite(column) ? column ?? 0 : 0));
+    const maxDistance = Math.max(0, Math.floor(radius));
+    const candidates: CallGraphInlayRegistryEntry[] = [];
+    for (const [entryLine, entries] of byLine) {
+      if (Math.abs(entryLine - safeLine) > maxDistance) { continue; }
+      candidates.push(...entries.filter((entry) => entry.kind === normalizedKind));
+    }
+    return candidates.sort((a, b) => {
+      const aLineDistance = Math.abs(a.line - safeLine);
+      const bLineDistance = Math.abs(b.line - safeLine);
+      const aColumnDistance = Math.abs(a.hintColumn - safeColumn);
+      const bColumnDistance = Math.abs(b.hintColumn - safeColumn);
+      return aLineDistance - bLineDistance ||
+        aColumnDistance - bColumnDistance ||
+        a.symbolId.localeCompare(b.symbolId);
+    })[0];
+  }
 }
 
 function normalizeCallGraphInlayKind(kind: string): CallGraphInlayKind {
@@ -496,6 +520,11 @@ async function activateCallGraphInlayAtPosition(
   }
   const symbol = resolveInlaySymbolAtLine(callGraph, uri, safeLine, safeColumn);
   if (!symbol) {
+    const nearby = registry.resolveNear(uri, safeLine, normalizedKind, safeColumn);
+    if (nearby) {
+      await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, nearby, 'inlay registry nearby');
+      return;
+    }
     callGraphLog.appendLine(`call graph inlay click ignored: no symbol at ${uriString}:${safeLine + 1}`);
     return;
   }

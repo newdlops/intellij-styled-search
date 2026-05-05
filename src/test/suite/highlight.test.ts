@@ -28,6 +28,8 @@ interface PreviewDecoration {
   endLineNumber: number;
   endColumn: number;
   inlineClassName: string;
+  hasMinimap?: boolean;
+  minimapColor?: string;
 }
 interface PreviewDecorationsProbe {
   editor: string | null;
@@ -187,6 +189,21 @@ suite('Preview highlight — decoration regression', () => {
       assert.ok(
         lines.size >= 3,
         `decorations should cover ≥3 distinct lines, got ${lines.size} (lines=${Array.from(lines).join(',')})`,
+      );
+      const missingMinimap = probe.decorations!
+        .filter((d) => /findMatch/.test(d.inlineClassName) && !d.hasMinimap);
+      assert.strictEqual(
+        missingMinimap.length,
+        0,
+        `all preview findMatch decorations should be mirrored into the minimap. ` +
+        `Missing: ${JSON.stringify(missingMinimap)} Raw: ${JSON.stringify(probe.decorations)}`,
+      );
+      const minimapColors = probe.decorations!
+        .filter((d) => /findMatch/.test(d.inlineClassName))
+        .map((d) => d.minimapColor);
+      assert.ok(
+        minimapColors.every((color) => color === '#ff6a00' || color === '#ffb000'),
+        `preview minimap match colors should use strong explicit colors, got ${JSON.stringify(minimapColors)}`,
       );
     } finally {
       await api.overlay.evalInActiveWindowForTests(

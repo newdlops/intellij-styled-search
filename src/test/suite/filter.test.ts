@@ -80,7 +80,9 @@ suite('Extension-typing filter — client-side narrowing', () => {
         if (!q || !scope) { return 'no-query'; }
         q.value = '';
         scope.value = '';
-        ['caseSensitive', 'wholeWord', 'useRegex'].forEach(function (key) {
+        var caseSensitive = document.querySelector('[data-opt="caseSensitive"]');
+        if (caseSensitive && caseSensitive.getAttribute('aria-pressed') === 'true') { caseSensitive.click(); }
+        ['wholeWord', 'useRegex'].forEach(function (key) {
           var btn = document.querySelector('[data-opt="' + key + '"]');
           if (btn && btn.getAttribute('aria-pressed') === 'true') { btn.click(); }
         });

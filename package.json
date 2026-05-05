@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.642",
+  "version": "0.1.651",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -403,40 +403,47 @@
           "maximum": 10000,
           "description": "Maximum single cooldown pause inserted after a call graph parser slice. Set to 0 to disable the cap."
         },
+        "intellijStyledSearch.callGraphMaxFileSize": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Maximum file size in bytes to parse for the call graph. Set to 0 for unlimited parsing."
+        },
         "intellijStyledSearch.callGraphMaxLineLength": {
           "type": "number",
-          "default": 20000,
-          "minimum": 1000,
+          "default": 0,
+          "minimum": 0,
           "maximum": 1000000,
-          "description": "Skip call graph parsing for files that contain a line longer than this many characters. This protects the extension host from minified or generated files."
+          "description": "Skip call graph parsing for files that contain a line longer than this many characters. Set to 0 for unlimited parsing."
         },
         "intellijStyledSearch.callGraphMaxLinesPerFile": {
           "type": "number",
-          "default": 50000,
-          "minimum": 1000,
+          "default": 0,
+          "minimum": 0,
           "maximum": 1000000,
-          "description": "Skip call graph parsing for files with more lines than this limit. This protects rebuild from pathological generated files."
+          "description": "Skip call graph parsing for files with more lines than this limit. Set to 0 for unlimited parsing."
         },
         "intellijStyledSearch.callGraphMaxReferenceCandidatesPerFile": {
           "type": "number",
-          "default": 50000,
+          "default": 0,
           "minimum": 0,
           "maximum": 1000000,
           "description": "Maximum usage/reference candidates extracted from a single file. Set to 0 for unlimited extraction."
         },
         "intellijStyledSearch.callGraphMaxCallsites": {
           "type": "number",
-          "default": 1000000,
+          "default": 0,
           "minimum": 0,
-          "maximum": 10000000,
-          "description": "Maximum callsites kept across one call graph rebuild. Set to 0 for unlimited extraction. When the limit is reached, the rebuild finishes with a warning instead of growing until the extension host runs out of memory."
+          "maximum": 9007199254740991,
+          "description": "Maximum callsites kept across one call graph rebuild. Set to 0 for unlimited extraction. Positive values intentionally cap the index and may drop callsites."
         },
         "intellijStyledSearch.callGraphMaxReferenceCandidates": {
           "type": "number",
-          "default": 1000000,
+          "default": 0,
           "minimum": 0,
-          "maximum": 10000000,
-          "description": "Maximum usage/reference candidates kept across one call graph rebuild. Set to 0 for unlimited extraction. When the limit is reached, the rebuild finishes with a warning."
+          "maximum": 9007199254740991,
+          "description": "Maximum usage/reference candidates kept across one call graph rebuild. Set to 0 for unlimited extraction. Positive values intentionally cap the index and may drop references."
         },
         "intellijStyledSearch.callGraphMemoryBudgetMb": {
           "type": "number",
@@ -447,7 +454,7 @@
         },
         "intellijStyledSearch.callGraphMaxAssignedFunctionNamesPerFile": {
           "type": "number",
-          "default": 500,
+          "default": 0,
           "minimum": 0,
           "maximum": 100000,
           "description": "Maximum anonymous-assignment function names scanned per file for usage detection. Set to 0 for unlimited extraction."
@@ -479,14 +486,15 @@
         },
         "intellijStyledSearch.callGraphIncludeUnresolvedEdges": {
           "type": "boolean",
-          "default": false,
-          "description": "Materialize unresolved, dynamic, and external callsites as one dynamic edge per callsite. Disabled by default because unresolved callsites can number in the millions in generated or dependency-heavy repositories."
+          "default": true,
+          "description": "Materialize unresolved, dynamic, and external callsites as one dynamic edge per callsite. Disable only when intentionally reducing graph size for dependency-heavy repositories."
         },
         "intellijStyledSearch.callGraphMaxEdges": {
           "type": "number",
-          "default": 1000000,
-          "minimum": 1000,
-          "description": "Maximum unique materialized call graph edges stored in memory during a rebuild."
+          "default": 0,
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Maximum unique materialized call graph edges stored in memory during a rebuild. Set to 0 for unlimited materialization."
         },
         "intellijStyledSearch.callGraphMaxPossibleTargetsPerCall": {
           "type": "number",
