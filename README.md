@@ -30,7 +30,14 @@ IntelliJ Styled Search adds an IntelliJ IDEA-like project search panel to VS Cod
 
 ## MCP Usage
 
-Start `IntelliJ Search: Start Codeidx MCP Server` in VS Code, then connect Codex or Claude through the stdio proxy:
+This repository includes project MCP config files:
+
+- `.mcp.json` for Claude Code project-scoped MCP discovery.
+- `.codex/config.toml` for Codex project-scoped MCP configuration when supported by the installed Codex CLI.
+
+The MCP clients spawn a stdio proxy, but the proxy still needs the VS Code extension's localhost endpoint. In trusted workspaces the extension auto-starts that endpoint by default. Each VS Code window binds an OS-assigned free port and writes the actual URL to `.codeidx/mcp-server.json`, so multiple projects can run at the same time without sharing a fixed port.
+
+Manual stdio proxy command:
 
 ```bash
 codeidx-mcp stdio --workspace .
@@ -42,10 +49,10 @@ From a development checkout without `npm link`, use the compiled entrypoint dire
 node out/codeidxMcpCli.js stdio --workspace .
 ```
 
-The proxy discovers the VS Code endpoint from `.codeidx/mcp-server.json`. You can also pass the URL explicitly:
+The proxy discovers the VS Code endpoint from `.codeidx/mcp-server.json`. If you disable `intellijStyledSearch.mcpAutoStart`, run `IntelliJ Search: Start Codeidx MCP Server` in that VS Code window before starting Codex or Claude Code. You can also pass the URL explicitly:
 
 ```bash
-codeidx-mcp stdio --url http://127.0.0.1:8765/mcp
+codeidx-mcp stdio --url http://127.0.0.1:<port>/mcp
 ```
 
 Codex example:
@@ -54,10 +61,38 @@ Codex example:
 codex mcp add codeidx -- codeidx-mcp stdio --workspace .
 ```
 
+If your Codex CLI does not load project-scoped `.codex/config.toml`, run the `codex mcp add` command once to register it in your user config.
+
 Claude Code example:
 
 ```bash
 claude mcp add --transport stdio codeidx -- codeidx-mcp stdio --workspace .
+```
+
+Claude Code also auto-detects the checked-in `.mcp.json` after you approve the project-scoped MCP server.
+
+Useful MCP self-check tools:
+
+- `mcp_health`: verifies the MCP connection and reports endpoint, discovery file, capabilities, and index status.
+- `mcp_test`: compares `codeidx_search_code` against a bounded grep-like workspace scan and reports result overlap plus estimated token savings.
+
+By default, `codeidx_search_code` protects common dependency/generated/sensitive paths such as `node_modules/**`, `out/**`, `dist/**`, and `.env*`. To deliberately search a normally excluded path, pass a narrow include plus an exclude policy override:
+
+```json
+{
+  "query": "SomeGeneratedSymbol",
+  "include_globs": ["out/**/*.js"],
+  "exclude_policy": "custom_only"
+}
+```
+
+Use `exclude_policy: "none"` only when you intentionally want to ignore both default excludes and `exclude_globs`.
+Both override modes bypass `intellijStyledSearch.excludeGlobs` for that MCP request; keep `include_globs` narrow when searching dependency or generated trees.
+
+Example prompt for Codex or Claude:
+
+```text
+Use the codeidx MCP mcp_health tool, then run mcp_test with query "UserService".
 ```
 
 ## Keybindings

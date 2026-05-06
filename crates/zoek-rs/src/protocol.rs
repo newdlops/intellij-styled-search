@@ -87,6 +87,8 @@ pub struct SearchRequest {
     pub use_regex: bool,
     pub regex_multiline: bool,
     pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub path_regex: Option<String>,
     pub limit: usize,
     pub offset: usize,
 }
@@ -211,6 +213,8 @@ pub struct GraphIndexResponse {
 
 #[derive(Clone, Debug)]
 pub struct GraphQueryReference {
+    pub target_symbol_id: Option<String>,
+    pub edge_kind: String,
     pub name: String,
     pub raw_text: String,
     pub uri: String,
@@ -546,8 +550,14 @@ impl GraphQueryReference {
             .as_ref()
             .map(|value| format!(",\"enclosingSymbolId\":{}", json_string(value)))
             .unwrap_or_default();
+        let target = self
+            .target_symbol_id
+            .as_ref()
+            .map(|value| format!(",\"targetSymbolId\":{}", json_string(value)))
+            .unwrap_or_default();
         format!(
-            "{{\"name\":{},\"rawText\":{},\"uri\":{},\"relPath\":{},\"range\":{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}}}{}}}",
+            "{{\"edgeKind\":{},\"name\":{},\"rawText\":{},\"uri\":{},\"relPath\":{},\"range\":{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}}}{}{}}}",
+            json_string(&self.edge_kind),
             json_string(&self.name),
             json_string(&self.raw_text),
             json_string(&self.uri),
@@ -556,6 +566,7 @@ impl GraphQueryReference {
             self.start_column,
             self.end_line,
             self.end_column,
+            target,
             enclosing
         )
     }

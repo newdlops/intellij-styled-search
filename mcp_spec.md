@@ -1070,10 +1070,10 @@ symbol 이름, qualified name, kind, framework role로 symbol을 찾는다.
     "languages": { "type": "array", "items": { "type": "string" }, "default": [] },
     "frameworks": { "type": "array", "items": { "type": "string" }, "default": [] },
     "container": { "type": ["string", "null"], "default": null },
-    "include_counts": { "type": "boolean", "default": true },
+    "include_counts": { "type": "boolean", "default": false },
     "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 },
     "cursor": { "type": ["string", "null"], "default": null },
-    "max_chars": { "type": "integer", "minimum": 1000, "maximum": 100000, "default": 20000 }
+    "max_chars": { "type": "integer", "minimum": 1000, "maximum": 200000, "default": 100000 }
   },
   "required": ["query"],
   "additionalProperties": false
@@ -1188,7 +1188,7 @@ symbol 이름, qualified name, kind, framework role로 symbol을 찾는다.
 
 ### 목적
 
-symbol 하나의 정의, signature, doc/comment, counts, 관련 resource link를 가져온다.
+symbol 하나의 정의, signature, doc/comment, 관련 resource link를 가져온다. 대형 repo 지연을 줄이기 위해 counts와 related symbol 계산은 기본 비활성화하고 필요할 때 opt-in한다.
 
 ### Input schema
 
@@ -1200,9 +1200,9 @@ symbol 하나의 정의, signature, doc/comment, counts, 관련 resource link를
     "symbol_uri": { "type": ["string", "null"], "default": null },
     "include_definition_snippet": { "type": "boolean", "default": true },
     "include_doc": { "type": "boolean", "default": true },
-    "include_counts": { "type": "boolean", "default": true },
-    "include_related": { "type": "boolean", "default": true },
-    "max_chars": { "type": "integer", "minimum": 1000, "maximum": 100000, "default": 16000 }
+    "include_counts": { "type": "boolean", "default": false },
+    "include_related": { "type": "boolean", "default": false },
+    "max_chars": { "type": "integer", "minimum": 1000, "maximum": 200000, "default": 100000 }
   },
   "additionalProperties": false,
   "anyOf": [
@@ -1281,6 +1281,7 @@ symbol의 usage/reference edge를 조회한다.
       "default": "static-probable"
     },
     "include_runtime": { "type": "boolean", "default": true },
+    "include_provider_edges": { "type": "boolean", "default": false },
     "include_unresolved_dynamic": { "type": "boolean", "default": false },
     "group_by": {
       "type": "string",
@@ -1291,7 +1292,7 @@ symbol의 usage/reference edge를 조회한다.
     "context_lines": { "type": "integer", "minimum": 0, "maximum": 10, "default": 2 },
     "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 },
     "cursor": { "type": ["string", "null"], "default": null },
-    "max_chars": { "type": "integer", "minimum": 1000, "maximum": 200000, "default": 24000 }
+    "max_chars": { "type": "integer", "minimum": 1000, "maximum": 200000, "default": 100000 }
   },
   "additionalProperties": false,
   "anyOf": [
@@ -1440,8 +1441,9 @@ symbol 주변 graph를 작게 탐색한다. call graph, import graph, type hiera
     "depth": { "type": "integer", "minimum": 1, "maximum": 3, "default": 1 },
     "max_nodes": { "type": "integer", "minimum": 1, "maximum": 300, "default": 80 },
     "max_edges": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200 },
+    "include_provider_edges": { "type": "boolean", "default": false },
     "include_snippets": { "type": "boolean", "default": false },
-    "max_chars": { "type": "integer", "minimum": 1000, "maximum": 200000, "default": 24000 }
+    "max_chars": { "type": "integer", "minimum": 1000, "maximum": 200000, "default": 100000 }
   },
   "required": ["symbol_id"],
   "additionalProperties": false
@@ -3025,3 +3027,61 @@ https://github.com/sourcegraph/zoekt
 https://github.com/sourcegraph/zoekt/blob/main/doc/query_syntax.md
 https://github.com/sourcegraph/zoekt/blob/main/doc/design.md
 ```
+
+---
+
+## 27. 현재 평가 메모와 처리 상태
+
+작성일: 2026-05-06
+
+다음 항목은 별도 평가 중 확인한 결함/주의점과 처리 상태다.
+
+1. `call graph`가 `0 edges`인 상태에서 `codeidx_get_context_bundle`과 `codeidx_graph_neighbors`가 의미 있는 graph 탐색 결과를 주지 못하던 문제는 2026-05-07에 부분 수정했다. Rust native relation index가 reference마다 `enclosingSymbolId`, `targetSymbolId`, `edgeKind`를 노출하고, `codeidx_graph_neighbors`는 incoming/outgoing directed reference edge를 binary relation index에서 materialize한다. `edgeKind=call|construct`는 `Name(...)` 형태를 기준으로 한 정적 휴리스틱이며, `usage`는 type/import/reference usage가 섞일 수 있다.
+2. `codeidx_search_code(context_lines=N)`의 컨텍스트가 응답 `snippet`에 포함되지 않던 문제는 2026-05-06에 수정했다. 이제 반환 window의 각 result snippet에 주변 라인이 직접 들어가며, `codeidx_read_snippets` 2차 호출 없이 `rg -C N`과 비교할 수 있다.
+3. 구조화 JSON envelope의 고정 비용이 대략 400-800B 발생한다. 작은 쿼리일수록 이 비용 비율이 커지므로, cardinality 확인이나 간단한 probe에는 `codeidx_probe`, `codeidx_callers_summary` 같은 plain-text compact 응답 도구가 가장 효율적이다.
+4. `codeidx_outline`의 nested 처리에서 `class Meta:` 같은 내부 클래스나 함수 내부 `const`가 top-level처럼 카운트될 수 있다. outline 결과를 파일 구조의 절대 사실로 보지 말고, 편집 전에는 해당 범위를 `codeidx_read_snippets` 또는 실제 파일로 확인한다.
+5. regex dialect는 경로에 따라 JS regexp fallback이 사용될 수 있다. PCRE2 lookbehind 등 dialect-specific 문법은 `rg`/PCRE2와 결과가 달라질 수 있으므로, 고위험 검색에서는 `codeidx_explain_search_query`와 `rg` 교차검증을 병행한다.
+
+### 27.1 `rg` 대비 codeidx 토큰/정확도 평가 메모
+
+아래 표는 대형 repo 평가 중 확인한 운영상 비교 결과다. 수치는 특정 workspace/scope 기준의 관측값이며, scope 차이(`.git`, `.doc` 포함 여부 등)가 결과 차이를 만들 수 있다.
+
+| 작업 | `rg` | codeidx | 결과 정확도 | 토큰 승자 |
+|---|---:|---:|---|---|
+| 존재 여부 | 0B 또는 exit code | 1B `codeidx_exists` | 일치 | tie |
+| 매치/파일 카운트 요약 | 238B (`rg -c` + `wc`) | 22B `codeidx_probe` | codeidx가 +6 match (`.git`/`.doc` 포함) | codeidx 약 10x 감소 |
+| 첫 매치 | 236B | 약 200B `codeidx_first` | 일치 | tie |
+| 파일 리스트 200+ | 21,920B | 약 22,000B `codeidx_files` | codeidx가 +1 file (`.doc`) | tie |
+| 카운트 파일별 상세 | 22,326B | 약 50,000B `codeidx_count` | codeidx가 +1 file | `rg` 약 2x 유리 |
+| 컨텍스트 3줄 + 스니펫 3건 | 3,028B | JSON envelope + inline context snippet | 2026-05-06 이후 `context_lines=N`이 result snippet에 직접 포함됨 | case-by-case |
+| 정의 위치 1심볼 | 194B regex | 1,400B JSON | 일치 | `rg` 약 7x 유리 |
+| 참조 소형 2건 | 572B | 3,300B JSON | codeidx는 정의 라인 제외 | `rg` 약 5.7x 유리 |
+| Outline 작은 파일 | 54B | 900B | codeidx가 inner const까지 top-level 처리 | `rg` |
+| Outline 큰 파일 948줄/38 class | 1,639B | 5,800B | `rg` 쪽이 inner `class Meta:` 제외 기준에 더 부합 | `rg` |
+| Callers 요약 | 직접 조립 필요 | 89B TSV `codeidx_callers_summary` | codeidx 단발 | codeidx |
+| Context bundle | 수동 `rg` + file read | 3,300B이나 현재는 stub | 현재 0-edge 인덱스에서는 사실상 무효 | `rg` |
+| Regex JS dialect `class\s+\w+ListPage\b` in Python | 0 | 0 | 일치 | tie |
+
+운영 판단:
+
+1. 작은 단발 검색, 정의 위치, 소형 참조, outline은 JSON envelope와 snippet 재호출 비용 때문에 `rg`가 더 효율적일 수 있다.
+2. 존재 여부, 첫 매치, broad cardinality probe는 compact 도구(`codeidx_exists`, `codeidx_probe`, `codeidx_first`)가 경쟁력이 있다.
+3. `codeidx_count`는 상세 JSON이 커지므로 파일별 상세가 필요하면 `rg -c`가 나을 수 있다. 단순 카디널리티 확인은 `codeidx_probe`를 우선한다.
+4. `codeidx_callers_summary`처럼 agent가 직접 조립해야 하는 집계형 결과는 codeidx가 명확히 유리하다.
+5. `codeidx_get_context_bundle`과 graph 계열 도구는 provider call edge가 없더라도 Rust native directed reference edge를 사용할 수 있다. `edge_kinds=["call"]`/`["construct"]`는 call-like reference만 좁히고, `usage`는 type/import/reference usage가 섞일 수 있으므로 영향 분석에서는 `codeidx_find_references`와 snippet 확인을 병행한다.
+
+### 27.2 추가 결함 메모
+
+1. 동시 요청 안정성: 2026-05-06 수정. HTTP server listen backlog/timeout/clientError 처리를 보강했고, MCP 테스트에 12개 병렬 `mcp_health` POST 검증을 추가했다.
+2. `mcp_test` baseline 0 오판: 2026-05-06 수정. baseline은 동일 scope의 강제 full-scan 검색 백엔드로 측정한다.
+3. `codeidx_search_symbols(match: "exact")` 비정확: 2026-05-06 수정. exact name과 qualified/substring 매칭을 분리했다.
+4. 심볼 ID/범위 표현 불일치: 2026-05-06 수정. `codeidx_signature.signature.symbol_id`는 외부 `esy_...`를 반환하고 internal id는 별도 필드로 유지한다. range sentinel `4294967295`는 `null`로 정규화한다.
+5. `max_chars` truncation window 불일치: 2026-05-06 수정. `results`, `resource_links`, `result_window.returned`, `next_cursor`를 같은 window 기준으로 동기화하고, search result는 최소 1건을 유지한다.
+6. 대형 repo 심볼 계열 지연: 2026-05-06/2026-05-07 부분 수정. `search_symbols`/`symbol_details`의 counts/related 계산은 기본 비활성화하고, `callers_summary`/`find_references`/`graph_neighbors`의 provider edge 확장은 `include_provider_edges=true`일 때만 수행한다. `resolve_at`과 document symbol 조회는 단일 파일 local parse fast path를 먼저 사용해 Python 파일과 대형 repo에서 Rust CLI query 지연을 줄인다.
+
+### 27.3 2026-05-07 graph/Python/resolve_at 보강
+
+1. Rust native relation index reference에 `enclosingSymbolId`, `targetSymbolId`, `edgeKind`를 채운다. 이를 위해 brace 기반 언어는 function/method/class body range를 계산하고, Python은 기존 indent 기반 body range를 사용한다. Relation binary format version은 `2`로 올라갔으므로 기존 graph index는 재빌드가 필요하다.
+2. Rust CLI에 `graph-callees` 명령을 추가했다. 특정 caller/enclosing symbol id에서 발생한 outgoing references를 조회하고 각 reference에 `targetSymbolId`와 `edgeKind`를 붙인다.
+3. MCP `codeidx_graph_neighbors`는 Rust native snapshot edge가 비어 있어도 incoming/outgoing reference edge를 relation index에서 materialize한다. `find_references`와 `graph_neighbors`의 `edge_kinds` 필터는 `usage`, `call`, `construct`에 대해 실제 reference `edgeKind`를 사용한다.
+4. `resolve_at`/outline/signature류의 Python 신뢰도와 대형 repo latency를 위해 document symbol 조회 전에 단일 파일 local parse fast path를 사용한다. Rust CLI document query는 local parse가 실패하거나 비어 있을 때 fallback으로 남긴다.

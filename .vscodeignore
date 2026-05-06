@@ -1,9 +1,11 @@
 .vscode/**
 .zoek-rs/**
 .codeidx/**
+.codex/**
 .vscode-test/**
 .claude/**
 .lh/**
+.mcp.json
 artifacts/**
 scripts/**
 src/**

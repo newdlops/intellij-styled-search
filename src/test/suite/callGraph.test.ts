@@ -8,6 +8,7 @@ import {
   buildCallGraphImplementationFileMatches,
   buildCallGraphQuickPickItems,
   buildCallGraphUsageFileMatches,
+  estimateCallGraphOverallProgressPercent,
   formatCallGraphProgressMessage,
   type ExtensionTestApi,
 } from '../../extension';
@@ -39,9 +40,19 @@ function usageLocationKey(reference: { uri: string; range: { startLine: number; 
   return `${reference.uri}:${reference.range.startLine}:${reference.range.startColumn}`;
 }
 
+async function useCallGraphBackend(backend: 'rust-native' | 'javascript'): Promise<() => Promise<void>> {
+  const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+  const prior = cfg.inspect<string>('callGraphBackend');
+  await cfg.update('callGraphBackend', backend, vscode.ConfigurationTarget.Workspace);
+  return async () => {
+    await cfg.update('callGraphBackend', prior?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+  };
+}
+
 suite('Call graph', () => {
   test('indexes Python and JavaScript symbols with caller/callee edges', async function () {
     this.timeout(30_000);
+    const restoreBackend = await useCallGraphBackend('javascript');
     const api = await getApi();
     const folder = vscode.workspace.workspaceFolders?.[0];
     assert.ok(folder, 'expected fixture workspace folder');
@@ -356,8 +367,51 @@ suite('Call graph', () => {
         workerThrottleCount: 2,
       });
       assert.ok(progressMessage.includes('3/10'), 'expected progress message to include count');
+      assert.ok(progressMessage.includes('overall=17%'), 'expected progress message to include weighted overall percent');
       assert.ok(progressMessage.includes('workers=8/12'), 'expected progress message to include worker count');
       assert.ok(progressMessage.includes('heap=256/1024MB(25%)'), 'expected progress message to include heap usage');
+      assert.strictEqual(
+        estimateCallGraphOverallProgressPercent({
+          stage: 'parsing',
+          message: 'parsing files',
+          current: 10,
+          total: 10,
+          parsedFiles: 10,
+          skippedFiles: 0,
+          warningCount: 0,
+          elapsedMs: 100,
+          concurrency: 8,
+        }),
+        45,
+      );
+      assert.strictEqual(
+        estimateCallGraphOverallProgressPercent({
+          stage: 'resolving',
+          message: 'resolving references',
+          current: 0,
+          total: 10,
+          parsedFiles: 10,
+          skippedFiles: 0,
+          warningCount: 0,
+          elapsedMs: 100,
+          concurrency: 8,
+        }),
+        45,
+      );
+      assert.strictEqual(
+        estimateCallGraphOverallProgressPercent({
+          stage: 'indexing',
+          message: 'writing graph index',
+          current: 0,
+          total: 10,
+          parsedFiles: 10,
+          skippedFiles: 0,
+          warningCount: 0,
+          elapsedMs: 100,
+          concurrency: 8,
+        }),
+        80,
+      );
       assert.ok(progressMessage.includes('throttles=2'), 'expected progress message to include throttle count');
       const names = snapshot.symbols.map((symbol) => symbol.qualifiedName);
       assert.ok(names.includes('GraphPy.root'), 'expected Python method symbol');
@@ -718,12 +772,14 @@ suite('Call graph', () => {
       try { await vscode.workspace.fs.delete(binaryJs); } catch {}
       try { await vscode.workspace.fs.delete(java); } catch {}
       try { await vscode.workspace.fs.delete(kt); } catch {}
+      await restoreBackend();
       await api.callGraph.rebuild();
     }
   });
 
   test('counts exported API and import/export references as usages', async function () {
     this.timeout(10_000);
+    const restoreBackend = await useCallGraphBackend('javascript');
     const api = await getApi();
     const folder = vscode.workspace.workspaceFolders?.[0];
     assert.ok(folder, 'expected fixture workspace folder');
@@ -777,12 +833,14 @@ suite('Call graph', () => {
     } finally {
       try { await vscode.workspace.fs.delete(provider); } catch {}
       try { await vscode.workspace.fs.delete(consumer); } catch {}
+      await restoreBackend();
       await api.callGraph.rebuild();
     }
   });
 
   test('resolves Python service method usages through constructed receivers', async function () {
     this.timeout(10_000);
+    const restoreBackend = await useCallGraphBackend('javascript');
     const api = await getApi();
     const folder = vscode.workspace.workspaceFolders?.[0];
     assert.ok(folder, 'expected fixture workspace folder');
@@ -852,12 +910,14 @@ suite('Call graph', () => {
     } finally {
       try { await vscode.workspace.fs.delete(service); } catch {}
       try { await vscode.workspace.fs.delete(mutation); } catch {}
+      await restoreBackend();
       await api.callGraph.rebuild();
     }
   });
 
   test('links interface and abstract implementations', async function () {
     this.timeout(30_000);
+    const restoreBackend = await useCallGraphBackend('javascript');
     const api = await getApi();
     const folder = vscode.workspace.workspaceFolders?.[0];
     assert.ok(folder, 'expected fixture workspace folder');
@@ -974,14 +1034,65 @@ suite('Call graph', () => {
         vscode.ConfigurationTarget.Workspace,
       );
       try { await vscode.workspace.fs.delete(ts); } catch {}
+      await restoreBackend();
       await api.callGraph.rebuild();
     }
   });
 
   test('serves codeidx MCP tools, resources, and prompts over the local JSON-RPC endpoint', async function () {
-    this.timeout(10_000);
+    this.timeout(20_000);
     const api = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const mcpTarget = vscode.Uri.joinPath(folder.uri, 'mcp_graph_target.ts');
+    const mcpConsumer = vscode.Uri.joinPath(folder.uri, 'mcp_graph_consumer.ts');
+    const mcpLate = vscode.Uri.joinPath(folder.uri, 'mcp_late_symbol.ts');
+    const mcpPythonModel = vscode.Uri.joinPath(folder.uri, 'mcp_python_model.py');
+    const mcpExcludedDir = vscode.Uri.joinPath(folder.uri, 'out');
+    const mcpExcluded = vscode.Uri.joinPath(mcpExcludedDir, 'mcp_excluded_probe.js');
     try {
+      await vscode.workspace.fs.writeFile(mcpTarget, Buffer.from([
+        'export function mcpGraphTarget() {',
+        '  return 1;',
+        '}',
+        '',
+        'export class McpGraphBox {',
+        '  mcpGraphBoxReport() {',
+        '    return mcpGraphTarget();',
+        '  }',
+        '}',
+        '',
+      ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.writeFile(mcpConsumer, Buffer.from([
+        'import { mcpGraphTarget } from "./mcp_graph_target";',
+        '',
+        'export function mcpGraphConsumer(items: Array<{ id: string; kind: string }>) {',
+        '  const rendered = `expected ${items.map((edge) => `${edge.id}:${edge.kind}`).join(\', \')}`;',
+        '  return mcpGraphTarget();',
+        '}',
+        ...Array.from({ length: 30 }, (_, index) => `const mcpSearchCapNeedle${index} = "mcpSearchCapNeedle";`),
+        'const mcpDuplicateNeedle = "mcpDuplicateNeedle mcpDuplicateNeedle";',
+        '',
+      ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.writeFile(mcpPythonModel, Buffer.from([
+        'class TimestampedModel:',
+        '    pass',
+        '',
+        'class RightToConsentOrConsult(',
+        '    TimestampedModel,',
+        '):',
+        '    status = "open"',
+        '',
+        '    def label(self):',
+        '        return self.status',
+        '',
+      ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.createDirectory(mcpExcludedDir);
+      await vscode.workspace.fs.writeFile(mcpExcluded, Buffer.from([
+        'export const mcpExcludedNeedle = "mcpExcludedNeedle";',
+        '',
+      ].join('\n'), 'utf8'));
+      await api.callGraph.rebuild(undefined, undefined, { force: true });
       const url = await api.mcpServer.start(0);
       const init = await postJson(url, {
         jsonrpc: '2.0',
@@ -1016,10 +1127,31 @@ suite('Call graph', () => {
       const tools = response.result?.tools;
       assert.ok(Array.isArray(tools), 'expected tools/list to return a tools array');
       assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_search_code'), 'expected codeidx_search_code tool');
+      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_count'), 'expected codeidx_count tool');
+      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_probe'), 'expected codeidx_probe tool');
+      for (const name of [
+        'codeidx_exists',
+        'codeidx_files',
+        'codeidx_first',
+        'codeidx_top_files',
+        'codeidx_file_digest',
+        'codeidx_exports',
+        'codeidx_imports',
+        'codeidx_changed',
+        'codeidx_symbol_slice',
+        'codeidx_callers_summary',
+        'codeidx_errors',
+      ]) {
+        assert.ok(tools.some((tool: { name?: string }) => tool.name === name), `expected ${name} tool`);
+      }
       assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_search_symbols'), 'expected codeidx_search_symbols tool');
+      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_outline'), 'expected codeidx_outline tool');
+      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_signature'), 'expected codeidx_signature tool');
       assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_find_references'), 'expected codeidx_find_references tool');
       assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_find_implementations'), 'expected codeidx_find_implementations tool');
       assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_get_context_bundle'), 'expected codeidx_get_context_bundle tool');
+      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'mcp_health'), 'expected mcp_health tool');
+      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'mcp_test'), 'expected mcp_test tool');
       const resources = await postJson(url, {
         jsonrpc: '2.0',
         id: 3,
@@ -1081,6 +1213,1024 @@ suite('Call graph', () => {
       });
       assert.strictEqual(queryExplain.result?.isError, false);
       assert.strictEqual(queryExplain.result?.structuredContent?.query_diagnostics?.parsed, true);
+      const invalidRegexExplain = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 27,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_explain_search_query',
+          arguments: { query: '[unclosed', query_kind: 'regex' },
+        },
+      });
+      assert.strictEqual(invalidRegexExplain.result?.isError, true);
+      assert.strictEqual(invalidRegexExplain.result?.structuredContent?.error?.code, 'invalid_query');
+      const autoRegexSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 28,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpSearchCapNeedle\\d+',
+            query_kind: 'auto',
+            limit: 5,
+            max_chars: 20_000,
+          },
+        },
+      });
+      assert.strictEqual(autoRegexSearch.result?.isError, false);
+      assert.strictEqual(autoRegexSearch.result?.structuredContent?.query_diagnostics?.effective_query_kind, 'regex');
+      assert.ok(
+        autoRegexSearch.result?.structuredContent?.results?.length > 0,
+        `expected query_kind=auto to infer regex syntax, got ${JSON.stringify(autoRegexSearch.result?.structuredContent)}`,
+      );
+      const contextSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 61,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'return 1;',
+            query_kind: 'literal',
+            include_globs: ['mcp_graph_target.ts'],
+            context_lines: 1,
+            limit: 1,
+            max_chars: 20_000,
+          },
+        },
+      });
+      assert.strictEqual(contextSearch.result?.isError, false);
+      const contextSnippet = contextSearch.result?.structuredContent?.results?.[0]?.snippet ?? '';
+      assert.match(
+        contextSnippet,
+        /1 \| export function mcpGraphTarget\(\)/,
+        `expected search_code context_lines to inline surrounding snippet text, got ${JSON.stringify(contextSnippet)}`,
+      );
+      assert.match(contextSnippet, /2 \|   return 1;/);
+      const countOnly = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 36,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_count',
+          arguments: {
+            query: 'mcpSearchCapNeedle\\d+',
+            query_kind: 'auto',
+            max_matches: 100,
+            max_files: 10,
+          },
+        },
+      });
+      assert.strictEqual(countOnly.result?.isError, false);
+      assert.strictEqual(countOnly.result?.structuredContent?.count?.total_matches, 30);
+      assert.deepStrictEqual(
+        countOnly.result?.structuredContent?.count?.by_file,
+        [{ path: 'mcp_graph_consumer.ts', count: 30 }],
+        `expected codeidx_count to return compact file counts, got ${JSON.stringify(countOnly.result?.structuredContent?.count)}`,
+      );
+      assert.strictEqual(
+        countOnly.result?.structuredContent?.query_diagnostics?.scope?.default_exclude_patterns,
+        'default',
+        `expected compact scope diagnostics by default, got ${JSON.stringify(countOnly.result?.structuredContent?.query_diagnostics?.scope)}`,
+      );
+      const omittedCountOnly = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 57,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_count',
+          arguments: {
+            query: 'mcpGraphTarget',
+            query_kind: 'literal',
+            max_matches: 100,
+            max_files: 1,
+          },
+        },
+      });
+      assert.strictEqual(omittedCountOnly.result?.isError, false);
+      const omittedCount = omittedCountOnly.result?.structuredContent?.count;
+      const returnedByFileSum = (omittedCount?.by_file ?? [])
+        .reduce((sum: number, item: { count?: number }) => sum + (item.count ?? 0), 0);
+      assert.ok(
+        omittedCount?.total_matches > returnedByFileSum,
+        `expected codeidx_count total_matches to include omitted files, got ${JSON.stringify(omittedCount)}`,
+      );
+      assert.ok(
+        omittedCount?.omitted_files > 0 && omittedCount?.exact === true,
+        `expected max_files to omit only by_file details without making count inexact, got ${JSON.stringify(omittedCount)}`,
+      );
+      const duplicateCountOnly = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 39,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_count',
+          arguments: {
+            query: 'mcpDuplicateNeedle',
+            query_kind: 'literal',
+            max_matches: 10,
+            max_files: 10,
+          },
+        },
+      });
+      assert.strictEqual(duplicateCountOnly.result?.isError, false);
+      assert.strictEqual(
+        duplicateCountOnly.result?.structuredContent?.count?.total_matches,
+        3,
+        `expected codeidx_count to count duplicate occurrences on one line, got ${JSON.stringify(duplicateCountOnly.result?.structuredContent?.count)}`,
+      );
+      const duplicateProbe = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 41,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_probe',
+          arguments: {
+            query: 'mcpDuplicateNeedle',
+            query_kind: 'literal',
+            by_file_limit: 1,
+          },
+        },
+      });
+      assert.strictEqual(duplicateProbe.result?.isError, false);
+      assert.strictEqual(duplicateProbe.result?.structuredContent, undefined);
+      assert.match(
+        duplicateProbe.result?.content?.[0]?.text ?? '',
+        /^3\t1\texact\t(?:zoekt|codesearch)\nmcp_graph_consumer\.ts\t3$/,
+        `expected codeidx_probe to return ultra-compact text, got ${JSON.stringify(duplicateProbe.result?.content ?? [])}`,
+      );
+      const existsProbe = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 42,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_exists',
+          arguments: {
+            query: 'mcpDuplicateNeedle',
+            query_kind: 'literal',
+          },
+        },
+      });
+      assert.strictEqual(existsProbe.result?.isError, false);
+      assert.strictEqual(existsProbe.result?.content?.[0]?.text, '1');
+      const filesProbe = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 43,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_files',
+          arguments: {
+            query: 'mcpDuplicateNeedle',
+            query_kind: 'literal',
+            include_counts: true,
+          },
+        },
+      });
+      assert.strictEqual(filesProbe.result?.isError, false);
+      assert.match(filesProbe.result?.content?.[0]?.text ?? '', /^1\nmcp_graph_consumer\.ts\t3$/);
+      const firstProbe = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 44,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_first',
+          arguments: {
+            query: 'mcpDuplicateNeedle',
+            query_kind: 'literal',
+          },
+        },
+      });
+      assert.strictEqual(firstProbe.result?.isError, false);
+      assert.match(firstProbe.result?.content?.[0]?.text ?? '', /^mcp_graph_consumer\.ts:\d+\t/);
+      const topFilesProbe = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 45,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_top_files',
+          arguments: {
+            query: 'mcpDuplicateNeedle',
+            query_kind: 'literal',
+            limit: 2,
+          },
+        },
+      });
+      assert.strictEqual(topFilesProbe.result?.isError, false);
+      assert.match(topFilesProbe.result?.content?.[0]?.text ?? '', /^3\nmcp_graph_consumer\.ts\t3$/);
+      const fileDigest = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 46,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_file_digest',
+          arguments: {
+            path: 'mcp_graph_consumer.ts',
+            max_symbols: 5,
+          },
+        },
+      });
+      assert.strictEqual(fileDigest.result?.isError, false);
+      assert.match(fileDigest.result?.content?.[0]?.text ?? '', /^mcp_graph_consumer\.ts\ttypescript\t/);
+      assert.match(fileDigest.result?.content?.[0]?.text ?? '', /imports=1/);
+      const importsDigest = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 47,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_imports',
+          arguments: {
+            path: 'mcp_graph_consumer.ts',
+          },
+        },
+      });
+      assert.strictEqual(importsDigest.result?.isError, false);
+      assert.match(importsDigest.result?.content?.[0]?.text ?? '', /mcp_graph_consumer\.ts\t\.\/mcp_graph_target/);
+      const exportsDigest = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 48,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_exports',
+          arguments: {
+            path: 'mcp_graph_target.ts',
+          },
+        },
+      });
+      assert.strictEqual(exportsDigest.result?.isError, false);
+      assert.match(exportsDigest.result?.content?.[0]?.text ?? '', /mcp_graph_target\.ts:1\tfunction\tmcpGraphTarget/);
+      const changedDigest = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 49,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_changed',
+          arguments: {
+            max_files: 5,
+            include_outline: false,
+          },
+        },
+      });
+      assert.strictEqual(changedDigest.result?.isError, false);
+      assert.strictEqual(typeof changedDigest.result?.content?.[0]?.text, 'string');
+      const errorsDigest = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 50,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_errors',
+          arguments: {
+            file: 'mcp_graph_consumer.ts',
+            max_items: 5,
+          },
+        },
+      });
+      assert.strictEqual(errorsDigest.result?.isError, false);
+      assert.strictEqual(typeof errorsDigest.result?.content?.[0]?.text, 'string');
+      const zoektSubsetSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 29,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'f:mcp_graph_consumer\\.ts$ mcpGraphTarget',
+            query_kind: 'zoekt',
+            limit: 10,
+            max_chars: 20_000,
+          },
+        },
+      });
+      assert.strictEqual(zoektSubsetSearch.result?.isError, false);
+      assert.ok(
+        zoektSubsetSearch.result?.structuredContent?.results?.length > 0 &&
+          zoektSubsetSearch.result.structuredContent.results.every((item: { path?: string }) => item.path === 'mcp_graph_consumer.ts'),
+        `expected query_kind=zoekt f: path regex subset to restrict results, got ${JSON.stringify(zoektSubsetSearch.result?.structuredContent?.results ?? [])}`,
+      );
+      const mergedSnippets = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 30,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_read_snippets',
+          arguments: {
+            snippets: [
+              { file: 'mcp_graph_consumer.ts', start_line: 3, end_line: 4, context_lines: 0 },
+              { file: 'mcp_graph_consumer.ts', start_line: 4, end_line: 5, context_lines: 0 },
+            ],
+            merge_overlaps: true,
+          },
+        },
+      });
+      assert.strictEqual(mergedSnippets.result?.isError, false);
+      assert.strictEqual(
+        mergedSnippets.result?.structuredContent?.snippets?.length,
+        1,
+        `expected read_snippets merge_overlaps=true to merge intersecting ranges, got ${JSON.stringify(mergedSnippets.result?.structuredContent?.snippets ?? [])}`,
+      );
+      assert.deepStrictEqual(mergedSnippets.result?.structuredContent?.snippets?.[0]?.line_range, { start: 3, end: 5 });
+      const outline = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 37,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_outline',
+          arguments: {
+            path: 'mcp_graph_target.ts',
+            max_symbols: 20,
+          },
+        },
+      });
+      assert.strictEqual(outline.result?.isError, false);
+      const outlinedNames = outline.result?.structuredContent?.outline?.files?.[0]?.symbols
+        ?.map((item: { name?: string }) => item.name) ?? [];
+      assert.ok(
+        outlinedNames.includes('mcpGraphTarget') && outlinedNames.includes('McpGraphBox'),
+        `expected codeidx_outline to include top-level function and class, got ${JSON.stringify(outline.result?.structuredContent?.outline)}`,
+      );
+      assert.ok(
+        !outlinedNames.includes('mcpGraphBoxReport'),
+        `expected codeidx_outline default to omit nested methods, got ${JSON.stringify(outline.result?.structuredContent?.outline)}`,
+      );
+      const pythonDigest = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 59,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_file_digest',
+          arguments: {
+            path: 'mcp_python_model.py',
+            max_symbols: 10,
+          },
+        },
+      });
+      assert.strictEqual(pythonDigest.result?.isError, false);
+      assert.match(
+        pythonDigest.result?.content?.[0]?.text ?? '',
+        /class\tRightToConsentOrConsult\t4/,
+        `expected Python file_digest to include top-level Django-style class, got ${JSON.stringify(pythonDigest.result?.content ?? [])}`,
+      );
+      const pythonResolve = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 60,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_resolve_at',
+          arguments: {
+            file: 'mcp_python_model.py',
+            line: 4,
+            character_utf16: 8,
+          },
+        },
+      });
+      assert.strictEqual(pythonResolve.result?.isError, false);
+      assert.strictEqual(
+        pythonResolve.result?.structuredContent?.target_symbol?.name,
+        'RightToConsentOrConsult',
+        `expected Python resolve_at to resolve the class definition, got ${JSON.stringify(pythonResolve.result?.structuredContent)}`,
+      );
+      const cappedSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 20,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpSearchCapNeedle',
+            query_kind: 'literal',
+            limit: 200,
+            max_chars: 1000,
+          },
+        },
+      });
+      assert.strictEqual(cappedSearch.result?.isError, false);
+      assert.strictEqual(
+        cappedSearch.result?.structuredContent?.truncated,
+        true,
+        `expected capped search to truncate, got ${JSON.stringify(cappedSearch.result?.structuredContent)}`,
+      );
+      assert.ok(
+        typeof cappedSearch.result?.structuredContent?.next_cursor === 'string',
+        'expected capped search_code results to remain pageable with next_cursor',
+      );
+      const cappedResults = cappedSearch.result?.structuredContent?.results ?? [];
+      const cappedLinks = cappedSearch.result?.structuredContent?.resource_links ?? [];
+      assert.ok(
+        cappedResults.length > 0,
+        `expected capped search_code to keep at least one result, got ${JSON.stringify(cappedSearch.result?.structuredContent)}`,
+      );
+      assert.strictEqual(
+        cappedLinks.length,
+        cappedResults.length,
+        `expected capped search_code resource_links to match returned result window, got ${JSON.stringify(cappedSearch.result?.structuredContent)}`,
+      );
+      const excludedDefaultSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 24,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpExcludedNeedle',
+            query_kind: 'literal',
+            include_globs: ['out/**/*.js'],
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(excludedDefaultSearch.result?.isError, false);
+      assert.strictEqual(
+        excludedDefaultSearch.result?.structuredContent?.results?.length,
+        0,
+        `expected default MCP excludes to omit out/, got ${JSON.stringify(excludedDefaultSearch.result?.structuredContent?.results ?? [])}`,
+      );
+      const excludedOverrideSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 25,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpExcludedNeedle',
+            query_kind: 'literal',
+            include_globs: ['out/**/*.js'],
+            exclude_policy: 'custom_only',
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(excludedOverrideSearch.result?.isError, false);
+      assert.strictEqual(
+        excludedOverrideSearch.result?.structuredContent?.query_diagnostics?.scope?.exclude_policy,
+        'custom_only',
+      );
+      assert.ok(
+        excludedOverrideSearch.result?.structuredContent?.results?.some(
+          (item: { path?: string }) => item.path === 'out/mcp_excluded_probe.js',
+        ),
+        `expected exclude_policy=custom_only to search explicitly included out/ files, got ${JSON.stringify(excludedOverrideSearch.result?.structuredContent?.results ?? [])}`,
+      );
+      assert.strictEqual(
+        excludedOverrideSearch.result?.structuredContent?.query_diagnostics?.scope?.force_full_scan,
+        true,
+        'expected custom scope for out/ to force full scan because out/ is outside the Zoekt index',
+      );
+      const indexedCustomScopeSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 40,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpGraphTarget',
+            query_kind: 'literal',
+            include_globs: ['mcp_graph_consumer.ts'],
+            exclude_policy: 'custom_only',
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(indexedCustomScopeSearch.result?.isError, false);
+      assert.strictEqual(
+        indexedCustomScopeSearch.result?.structuredContent?.query_diagnostics?.scope?.force_full_scan,
+        false,
+        `expected indexed custom scope to keep Zoekt path, got ${JSON.stringify(indexedCustomScopeSearch.result?.structuredContent?.query_diagnostics)}`,
+      );
+      const health = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 13,
+        method: 'tools/call',
+        params: {
+          name: 'mcp_health',
+          arguments: { include_tools: true },
+        },
+      });
+      assert.strictEqual(health.result?.isError, false);
+      assert.strictEqual(health.result?.structuredContent?.health?.mcp_connection, 'ok');
+      assert.strictEqual(health.result?.structuredContent?.health?.endpoint, url);
+      assert.strictEqual(health.result?.structuredContent?.discovery?.exists, true);
+      assert.strictEqual(health.result?.structuredContent?.discovery?.matches_current_endpoint, true);
+      assert.ok(
+        health.result?.structuredContent?.tools?.includes('mcp_test'),
+        'expected health check to include mcp_test when include_tools=true',
+      );
+      const parallelHealth = await Promise.all(Array.from({ length: 12 }, (_, index) => postJson(url, {
+        jsonrpc: '2.0',
+        id: 70 + index,
+        method: 'tools/call',
+        params: {
+          name: 'mcp_health',
+          arguments: {},
+        },
+      })));
+      assert.ok(
+        parallelHealth.every((item) => item.result?.structuredContent?.health?.mcp_connection === 'ok'),
+        `expected parallel MCP health calls to stay stable, got ${JSON.stringify(parallelHealth.map((item) => item.error ?? item.result?.structuredContent?.health))}`,
+      );
+      const mcpTest = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 14,
+        method: 'tools/call',
+        params: {
+          name: 'mcp_test',
+          arguments: {
+            query: '한국어 지원',
+            query_kind: 'literal',
+            limit: 5,
+          },
+        },
+      });
+      assert.strictEqual(mcpTest.result?.isError, false);
+      assert.strictEqual(mcpTest.result?.structuredContent?.test?.accuracy?.missing_from_mcp?.length, 0);
+      assert.ok(
+        typeof mcpTest.result?.structuredContent?.test?.efficiency?.estimated_mcp_tokens === 'number',
+        'expected mcp_test to report token estimates',
+      );
+      const mcpBroadRecallTest = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 26,
+        method: 'tools/call',
+        params: {
+          name: 'mcp_test',
+          arguments: {
+            query: 'buildCallGraph',
+            query_kind: 'literal',
+            limit: 100,
+            max_chars: 100000,
+          },
+        },
+      });
+      assert.strictEqual(mcpBroadRecallTest.result?.isError, false);
+      assert.strictEqual(
+        mcpBroadRecallTest.result?.structuredContent?.test?.accuracy?.missing_from_mcp?.length,
+        0,
+        `expected broad mcp_test search to preserve recall, got ${JSON.stringify(mcpBroadRecallTest.result?.structuredContent?.test?.accuracy ?? {})}`,
+      );
+      const exactSymbolMiss = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 62,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_symbols',
+          arguments: {
+            query: 'mcpGraph',
+            match: 'exact',
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(exactSymbolMiss.result?.isError, false);
+      assert.strictEqual(
+        exactSymbolMiss.result?.structuredContent?.results?.length,
+        0,
+        `expected exact symbol search to reject prefix/substring matches, got ${JSON.stringify(exactSymbolMiss.result?.structuredContent?.results ?? [])}`,
+      );
+      const symbolSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 15,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_symbols',
+          arguments: {
+            query: 'mcpGraphTarget',
+            match: 'exact',
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(symbolSearch.result?.isError, false);
+      assert.ok(
+        (symbolSearch.result?.structuredContent?.results ?? []).every((item: { name?: string }) => item.name === 'mcpGraphTarget'),
+        `expected exact symbol search to return only exact names, got ${JSON.stringify(symbolSearch.result?.structuredContent?.results ?? [])}`,
+      );
+      const quickPickSymbol = symbolSearch.result?.structuredContent?.results?.find(
+        (item: { definition?: { file?: string }; symbol_id?: string; internal_symbol_id?: string }) =>
+          item.definition?.file === 'mcp_graph_target.ts',
+      );
+      assert.ok(
+        quickPickSymbol?.symbol_id,
+        `expected MCP symbol search to find mcpGraphTarget in mcp_graph_target.ts, got ${JSON.stringify(symbolSearch.result?.structuredContent?.results ?? [])}`,
+      );
+      assert.match(
+        quickPickSymbol.symbol_id,
+        /^esy_/,
+        `expected public symbol_id to be stable and line-free, got ${quickPickSymbol.symbol_id}`,
+      );
+      assert.match(
+        quickPickSymbol.internal_symbol_id ?? '',
+        /^typescript:mcp_graph_target\.ts:mcpGraphTarget:1$/,
+        `expected internal symbol id to remain available for diagnostics, got ${quickPickSymbol.internal_symbol_id}`,
+      );
+      const signature = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 38,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_signature',
+          arguments: {
+            symbol_id: quickPickSymbol.symbol_id,
+          },
+        },
+      });
+      assert.strictEqual(signature.result?.isError, false);
+      assert.ok(
+        typeof signature.result?.structuredContent?.signature?.text === 'string' &&
+          signature.result.structuredContent.signature.text.includes('mcpGraphTarget'),
+        `expected codeidx_signature to return a compact signature line, got ${JSON.stringify(signature.result?.structuredContent?.signature)}`,
+      );
+      assert.strictEqual(
+        signature.result?.structuredContent?.signature?.symbol_id,
+        quickPickSymbol.symbol_id,
+        `expected codeidx_signature to return the public esy_ symbol id, got ${JSON.stringify(signature.result?.structuredContent?.signature)}`,
+      );
+      assert.strictEqual(
+        signature.result?.structuredContent?.signature?.internal_symbol_id,
+        quickPickSymbol.internal_symbol_id,
+        `expected codeidx_signature to retain the internal id separately, got ${JSON.stringify(signature.result?.structuredContent?.signature)}`,
+      );
+      assert.ok(
+        !signature.result?.structuredContent?.signature?.text?.includes('return 1;'),
+        `expected codeidx_signature to omit function body, got ${JSON.stringify(signature.result?.structuredContent?.signature)}`,
+      );
+      const symbolDetails = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 63,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_symbol_details',
+          arguments: {
+            symbol_id: quickPickSymbol.symbol_id,
+            include_definition_snippet: false,
+          },
+        },
+      });
+      assert.strictEqual(symbolDetails.result?.isError, false);
+      assert.notStrictEqual(
+        symbolDetails.result?.structuredContent?.symbol?.body_range?.end_character_utf16,
+        4294967295,
+        `expected symbol_details to hide sentinel range characters, got ${JSON.stringify(symbolDetails.result?.structuredContent?.symbol?.body_range)}`,
+      );
+      assert.strictEqual(
+        symbolDetails.result?.structuredContent?.counts,
+        undefined,
+        `expected symbol_details counts to be opt-in for fast large-repo use, got ${JSON.stringify(symbolDetails.result?.structuredContent?.counts)}`,
+      );
+      const staleInternalId = String(quickPickSymbol.internal_symbol_id).replace(/:1$/, ':2');
+      const revivedSignature = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 53,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_signature',
+          arguments: {
+            symbol_id: staleInternalId,
+          },
+        },
+      });
+      assert.strictEqual(revivedSignature.result?.isError, false);
+      assert.strictEqual(
+        revivedSignature.result?.structuredContent?.signature?.name,
+        'mcpGraphTarget',
+        `expected stale internal symbol id ${staleInternalId} to revive to mcpGraphTarget, got ${JSON.stringify(revivedSignature.result?.structuredContent)}`,
+      );
+      const seededContextBundle = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 58,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_get_context_bundle',
+          arguments: {
+            task: 'inspect seeded MCP graph target',
+            seed_symbols: [quickPickSymbol.symbol_id],
+            token_budget: 2_000,
+          },
+        },
+      });
+      assert.strictEqual(seededContextBundle.result?.isError, false);
+      assert.ok(
+        seededContextBundle.result?.structuredContent?.entry_points?.some(
+          (entry: { label?: string; reason?: string }) =>
+            entry.label === 'mcpGraphTarget' && entry.reason === 'seed symbol',
+        ),
+        `expected get_context_bundle to resolve external seed symbol ids, got ${JSON.stringify(seededContextBundle.result?.structuredContent?.entry_points ?? [])}`,
+      );
+      const symbolSlice = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 51,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_symbol_slice',
+          arguments: {
+            symbol_id: quickPickSymbol.symbol_id,
+          },
+        },
+      });
+      assert.strictEqual(symbolSlice.result?.isError, false);
+      assert.match(symbolSlice.result?.content?.[0]?.text ?? '', /^mcp_graph_target\.ts:1-\d+\tfunction\tmcpGraphTarget\t/);
+      const symbolSliceFromSignatureTypePosition = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 54,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_symbol_slice',
+          arguments: {
+            file: 'mcp_graph_consumer.ts',
+            line: 3,
+            character_utf16: 43,
+          },
+        },
+      });
+      assert.strictEqual(symbolSliceFromSignatureTypePosition.result?.isError, false);
+      assert.match(
+        symbolSliceFromSignatureTypePosition.result?.content?.[0]?.text ?? '',
+        /^mcp_graph_consumer\.ts:3-\d+\tfunction\tmcpGraphConsumer\t/,
+        `expected file/line symbol_slice inside a signature type to prefer the enclosing function, got ${JSON.stringify(symbolSliceFromSignatureTypePosition.result?.content ?? [])}`,
+      );
+      const signatureFromSignatureTypePosition = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 56,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_signature',
+          arguments: {
+            file: 'mcp_graph_consumer.ts',
+            line: 3,
+            character_utf16: 43,
+          },
+        },
+      });
+      assert.strictEqual(signatureFromSignatureTypePosition.result?.isError, false);
+      assert.ok(
+        signatureFromSignatureTypePosition.result?.structuredContent?.signature?.text?.includes('mcpGraphConsumer'),
+        `expected file/line codeidx_signature to resolve the enclosing function, got ${JSON.stringify(signatureFromSignatureTypePosition.result?.structuredContent?.signature)}`,
+      );
+      assert.ok(
+        !signatureFromSignatureTypePosition.result?.structuredContent?.signature?.text?.includes('const rendered'),
+        `expected file/line codeidx_signature to omit function body, got ${JSON.stringify(signatureFromSignatureTypePosition.result?.structuredContent?.signature)}`,
+      );
+      const callersSummary = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 52,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_callers_summary',
+          arguments: {
+            symbol_id: quickPickSymbol.symbol_id,
+            limit: 20,
+          },
+        },
+      });
+      assert.strictEqual(callersSummary.result?.isError, false);
+      assert.match(callersSummary.result?.content?.[0]?.text ?? '', /^[1-9]\d*\t/);
+      const callersSummaryFromSignatureTypePosition = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 55,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_callers_summary',
+          arguments: {
+            file: 'mcp_graph_consumer.ts',
+            line: 3,
+            character_utf16: 43,
+          },
+        },
+      });
+      assert.strictEqual(callersSummaryFromSignatureTypePosition.result?.isError, false);
+      assert.match(
+        callersSummaryFromSignatureTypePosition.result?.content?.[0]?.text ?? '',
+        /\tmcpGraphConsumer(?:\n|$)/,
+        `expected file/line callers_summary inside a signature type to summarize the enclosing function, got ${JSON.stringify(callersSummaryFromSignatureTypePosition.result?.content ?? [])}`,
+      );
+      const containerSymbolSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 31,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_symbols',
+          arguments: {
+            query: 'mcpGraphBoxReport',
+            container: 'McpGraphBox',
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(containerSymbolSearch.result?.isError, false);
+      assert.ok(
+        containerSymbolSearch.result?.structuredContent?.results?.some(
+          (item: { definition?: { file?: string }; name?: string }) =>
+            item.name === 'mcpGraphBoxReport' && item.definition?.file === 'mcp_graph_target.ts',
+        ),
+        `expected search_symbols container filter to keep McpGraphBox.mcpGraphBoxReport, got ${JSON.stringify(containerSymbolSearch.result?.structuredContent?.results ?? [])}`,
+      );
+      const missingContainerSymbolSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 32,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_symbols',
+          arguments: {
+            query: 'mcpGraphBoxReport',
+            container: 'DoesNotExist',
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(missingContainerSymbolSearch.result?.isError, false);
+      assert.strictEqual(
+        missingContainerSymbolSearch.result?.structuredContent?.results?.length,
+        0,
+        `expected search_symbols container filter to exclude nonmatching containers, got ${JSON.stringify(missingContainerSymbolSearch.result?.structuredContent?.results ?? [])}`,
+      );
+      const missingFrameworkSymbolSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 33,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_symbols',
+          arguments: {
+            query: 'mcpGraphTarget',
+            frameworks: ['DoesNotExist'],
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(missingFrameworkSymbolSearch.result?.isError, false);
+      assert.strictEqual(
+        missingFrameworkSymbolSearch.result?.structuredContent?.results?.length,
+        0,
+        `expected search_symbols frameworks filter to exclude nonmatching frameworks, got ${JSON.stringify(missingFrameworkSymbolSearch.result?.structuredContent?.results ?? [])}`,
+      );
+      const references = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 16,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_find_references',
+          arguments: {
+            symbol_id: quickPickSymbol.symbol_id,
+            limit: 20,
+          },
+        },
+      });
+      assert.strictEqual(references.result?.isError, false);
+      const referenceLocations = references.result?.structuredContent?.groups
+        ?.flatMap((group: { references?: Array<{ location?: { file?: string; start_line?: number } }> }) => group.references ?? [])
+        .map((item: { location?: { file?: string; start_line?: number } }) => `${item.location?.file}:${item.location?.start_line}`) ?? [];
+      assert.ok(
+        referenceLocations.includes('mcp_graph_consumer.ts:1') &&
+          referenceLocations.includes('mcp_graph_consumer.ts:5'),
+        `expected MCP references to include imported callback fixture call sites, got ${referenceLocations.join(', ')}`,
+      );
+      const constructOnlyReferences = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 34,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_find_references',
+          arguments: {
+            symbol_id: quickPickSymbol.symbol_id,
+            edge_kinds: ['construct'],
+            limit: 20,
+          },
+        },
+      });
+      assert.strictEqual(constructOnlyReferences.result?.isError, false);
+      assert.strictEqual(
+        constructOnlyReferences.result?.structuredContent?.counts?.total,
+        0,
+        `expected find_references edge_kinds=['construct'] to filter usage/call edges, got ${JSON.stringify(constructOnlyReferences.result?.structuredContent)}`,
+      );
+      const resolveDefinition = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 17,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_resolve_at',
+          arguments: {
+            file: 'mcp_graph_target.ts',
+            line: 1,
+            character_utf16: 20,
+          },
+        },
+      });
+      assert.strictEqual(resolveDefinition.result?.isError, false);
+      assert.strictEqual(resolveDefinition.result?.structuredContent?.target_symbol?.symbol_id, quickPickSymbol.symbol_id);
+      const resolveCall = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 18,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_resolve_at',
+          arguments: {
+            file: 'mcp_graph_consumer.ts',
+            line: 5,
+            character_utf16: 12,
+          },
+        },
+      });
+      assert.strictEqual(resolveCall.result?.isError, false);
+      assert.strictEqual(resolveCall.result?.structuredContent?.target_symbol?.symbol_id, quickPickSymbol.symbol_id);
+      const resolveLocal = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 21,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_resolve_at',
+          arguments: {
+            file: 'mcp_graph_consumer.ts',
+            line: 4,
+            character_utf16: 10,
+          },
+        },
+      });
+      assert.strictEqual(resolveLocal.result?.isError, false);
+      assert.strictEqual(
+        resolveLocal.result?.structuredContent?.target_symbol,
+        null,
+        `expected local variable resolve_at to avoid global false positives, got ${JSON.stringify(resolveLocal.result?.structuredContent?.target_symbol)}`,
+      );
+      const resolveKeyword = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 22,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_resolve_at',
+          arguments: {
+            file: 'mcp_graph_consumer.ts',
+            line: 4,
+            character_utf16: 3,
+          },
+        },
+      });
+      assert.strictEqual(resolveKeyword.result?.isError, false);
+      assert.strictEqual(
+        resolveKeyword.result?.structuredContent?.target_symbol,
+        null,
+        `expected keyword resolve_at to avoid global false positives, got ${JSON.stringify(resolveKeyword.result?.structuredContent?.target_symbol)}`,
+      );
+      const graphNeighbors = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 19,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_graph_neighbors',
+          arguments: {
+            symbol_id: quickPickSymbol.symbol_id,
+            directions: ['incoming'],
+            max_edges: 20,
+          },
+        },
+      });
+      assert.strictEqual(graphNeighbors.result?.isError, false);
+      assert.ok(
+        graphNeighbors.result?.structuredContent?.edges?.length > 0,
+        'expected graph_neighbors to expose at least usage fallback edges for rust-native graph mode',
+      );
+      const constructOnlyGraphNeighbors = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 35,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_graph_neighbors',
+          arguments: {
+            symbol_id: quickPickSymbol.symbol_id,
+            directions: ['incoming'],
+            edge_kinds: ['construct'],
+            max_edges: 20,
+          },
+        },
+      });
+      assert.strictEqual(constructOnlyGraphNeighbors.result?.isError, false);
+      assert.strictEqual(
+        constructOnlyGraphNeighbors.result?.structuredContent?.edges?.length,
+        0,
+        `expected graph_neighbors edge_kinds=['construct'] to filter usage fallback edges, got ${JSON.stringify(constructOnlyGraphNeighbors.result?.structuredContent?.edges ?? [])}`,
+      );
+      await vscode.workspace.fs.writeFile(mcpLate, Buffer.from([
+        'export function mcpLateSymbol() {',
+        '  return 2;',
+        '}',
+        '',
+      ].join('\n'), 'utf8'));
+      const lateSymbolSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 23,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_symbols',
+          arguments: {
+            query: 'mcpLateSymbol',
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(lateSymbolSearch.result?.isError, false);
+      assert.ok(
+        lateSymbolSearch.result?.structuredContent?.results?.some(
+          (item: { definition?: { file?: string } }) => item.definition?.file === 'mcp_late_symbol.ts',
+        ),
+        `expected symbol search to opportunistically refresh a newly added file, got ${JSON.stringify(lateSymbolSearch.result?.structuredContent?.results ?? [])}`,
+      );
       const listedResources = await postJson(url, {
         jsonrpc: '2.0',
         id: 6,
@@ -1103,8 +2253,10 @@ suite('Call graph', () => {
         'expected resources/read to return JSON text content',
       );
       const cliPath = path.resolve(__dirname, '..', '..', 'codeidxMcpCli.js');
-      const stdioProxy = spawn(process.execPath, [cliPath, 'stdio', '--url', url], {
-        cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      assert.ok(workspaceRoot, 'expected test workspace root');
+      const stdioProxy = spawn(process.execPath, [cliPath, 'stdio', '--workspace', workspaceRoot], {
+        cwd: workspaceRoot,
         stdio: 'pipe',
       });
       let stdioStderr = '';
@@ -1134,6 +2286,11 @@ suite('Call graph', () => {
       }
     } finally {
       api.mcpServer.stop();
+      try { await vscode.workspace.fs.delete(mcpTarget); } catch {}
+      try { await vscode.workspace.fs.delete(mcpConsumer); } catch {}
+      try { await vscode.workspace.fs.delete(mcpLate); } catch {}
+      try { await vscode.workspace.fs.delete(mcpPythonModel); } catch {}
+      try { await vscode.workspace.fs.delete(mcpExcluded); } catch {}
     }
   });
 });

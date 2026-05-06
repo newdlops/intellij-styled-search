@@ -7,8 +7,9 @@ use crate::protocol::{SearchRequest, SearchResponse};
 use crate::scorer::score_file;
 use crate::shard::{ShardDocument, ShardReader};
 use crate::verifier::{
-    build_file_result, load_current_text, matches_include_filters, verify_literal, verify_regex,
+    build_file_result, load_current_text, matches_path_filters, verify_literal, verify_regex,
 };
+use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -23,6 +24,12 @@ pub fn search_workspace(
     config: &EngineConfig,
 ) -> Result<SearchResponse, String> {
     let plan = build_query_plan(request);
+    let path_regex = plan
+        .path_regex
+        .as_deref()
+        .map(Regex::new)
+        .transpose()
+        .map_err(|err| format!("invalid path regex: {err}"))?;
     let workspace_root = Path::new(&request.workspace_root);
     let layout = StoreLayout::for_workspace(workspace_root, config);
     let mut warnings = Vec::new();
@@ -59,6 +66,11 @@ pub fn search_workspace(
     let mut stopped_early = false;
 
     for candidate in candidates.values() {
+        if let Some(regex) = &path_regex {
+            if !regex.is_match(&candidate.rel_path) {
+                continue;
+            }
+        }
         if total_matches >= target_matches {
             stopped_early = true;
             break;
@@ -191,6 +203,12 @@ fn collect_index_candidates(
         }
     };
     let latest_overlay = overlay.latest_entries();
+    let path_regex = plan
+        .path_regex
+        .as_deref()
+        .map(Regex::new)
+        .transpose()
+        .map_err(|err| err.to_string())?;
 
     let mut candidates = BTreeMap::new();
     for shard_path in shard_paths {
@@ -201,8 +219,13 @@ fn collect_index_candidates(
             if latest_overlay.contains_key(&doc.rel_path) {
                 continue;
             }
-            if !matches_include_filters(&doc.rel_path, &plan.include) {
+            if !matches_path_filters(&doc.rel_path, &plan.include, &plan.exclude) {
                 continue;
+            }
+            if let Some(regex) = &path_regex {
+                if !regex.is_match(&doc.rel_path) {
+                    continue;
+                }
             }
             candidates.insert(
                 doc.rel_path.clone(),
@@ -219,8 +242,13 @@ fn collect_index_candidates(
         if overlay_entry.tombstone {
             continue;
         }
-        if !matches_include_filters(&overlay_entry.rel_path, &plan.include) {
+        if !matches_path_filters(&overlay_entry.rel_path, &plan.include, &plan.exclude) {
             continue;
+        }
+        if let Some(regex) = &path_regex {
+            if !regex.is_match(&overlay_entry.rel_path) {
+                continue;
+            }
         }
         if !overlay_matches_plan(overlay_entry, plan, config) {
             continue;
@@ -323,9 +351,21 @@ fn fallback_candidates(
 ) -> std::io::Result<BTreeMap<String, CandidateDocument>> {
     let (entries, _) = discover_text_files(workspace_root, &EngineConfig::default())?;
     warnings.push("search fallback scanned the current text corpus".to_string());
+    let path_regex = request
+        .path_regex
+        .as_deref()
+        .map(Regex::new)
+        .transpose()
+        .map_err(std::io::Error::other)?;
     Ok(entries
         .into_iter()
-        .filter(|entry| matches_include_filters(&entry.rel_path, &request.include))
+        .filter(|entry| matches_path_filters(&entry.rel_path, &request.include, &request.exclude))
+        .filter(|entry| {
+            path_regex
+                .as_ref()
+                .map(|regex| regex.is_match(&entry.rel_path))
+                .unwrap_or(true)
+        })
         .map(|entry| {
             (
                 entry.rel_path.clone(),
@@ -358,6 +398,7 @@ mod tests {
         fs::create_dir_all(root.join("src"))?;
         fs::write(root.join("src/a.rs"), "struct AlphaService {}\n")?;
         fs::write(root.join("src/b.rs"), "struct BetaService {}\n")?;
+        fs::write(root.join("src/generated.rs"), "struct AlphaService {}\n")?;
         index_directory(&root, &EngineConfig::default())?;
 
         let response = search_workspace(
@@ -369,6 +410,8 @@ mod tests {
                 use_regex: false,
                 regex_multiline: true,
                 include: vec!["src/*".to_string()],
+                exclude: vec!["src/generated.rs".to_string()],
+                path_regex: None,
                 limit: 10,
                 offset: 0,
             },
@@ -411,6 +454,8 @@ mod tests {
                 use_regex: false,
                 regex_multiline: true,
                 include: vec!["src/*".to_string()],
+                exclude: vec![],
+                path_regex: None,
                 limit: 10,
                 offset: 0,
             },
@@ -459,6 +504,8 @@ mod tests {
                 use_regex: false,
                 regex_multiline: true,
                 include: vec![],
+                exclude: vec![],
+                path_regex: None,
                 limit: 10,
                 offset: 0,
             },
@@ -487,6 +534,8 @@ mod tests {
                 use_regex: true,
                 regex_multiline: true,
                 include: vec![],
+                exclude: vec![],
+                path_regex: None,
                 limit: 10,
                 offset: 0,
             },
@@ -516,6 +565,8 @@ mod tests {
                 use_regex: true,
                 regex_multiline: false,
                 include: vec![],
+                exclude: vec![],
+                path_regex: None,
                 limit: 10,
                 offset: 0,
             },
@@ -550,6 +601,8 @@ mod tests {
                 use_regex: false,
                 regex_multiline: true,
                 include: vec![],
+                exclude: vec![],
+                path_regex: None,
                 limit: 10,
                 offset: 0,
             },
@@ -565,6 +618,8 @@ mod tests {
                 use_regex: false,
                 regex_multiline: true,
                 include: vec![],
+                exclude: vec![],
+                path_regex: None,
                 limit: 10,
                 offset: 0,
             },
@@ -600,6 +655,8 @@ mod tests {
                 use_regex: false,
                 regex_multiline: true,
                 include: vec![],
+                exclude: vec![],
+                path_regex: None,
                 limit: 10,
                 offset: 0,
             },
@@ -632,6 +689,8 @@ mod tests {
                 use_regex: false,
                 regex_multiline: true,
                 include: vec![],
+                exclude: vec![],
+                path_regex: None,
                 limit: 2,
                 offset: 2,
             },
@@ -672,6 +731,8 @@ mod tests {
                 use_regex: false,
                 regex_multiline: true,
                 include: vec!["src/*".to_string()],
+                exclude: vec![],
+                path_regex: None,
                 limit: 10,
                 offset: 0,
             },
@@ -717,6 +778,8 @@ mod tests {
                 use_regex: false,
                 regex_multiline: true,
                 include: vec!["src/*".to_string()],
+                exclude: vec![],
+                path_regex: None,
                 limit: 10,
                 offset: 0,
             },

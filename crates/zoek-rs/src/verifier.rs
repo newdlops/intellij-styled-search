@@ -163,6 +163,16 @@ pub fn matches_include_filters(rel_path: &str, include: &[String]) -> bool {
         .any(|pattern| wildcard_match(pattern, rel_path))
 }
 
+pub fn matches_exclude_filters(rel_path: &str, exclude: &[String]) -> bool {
+    !exclude
+        .iter()
+        .any(|pattern| wildcard_match(pattern, rel_path))
+}
+
+pub fn matches_path_filters(rel_path: &str, include: &[String], exclude: &[String]) -> bool {
+    matches_include_filters(rel_path, include) && matches_exclude_filters(rel_path, exclude)
+}
+
 fn build_match(text: &str, start: usize, end: usize) -> SearchMatch {
     let (line, start_column) = line_and_column(text, start);
     let (end_line_value, end_column) = line_and_column(text, end);

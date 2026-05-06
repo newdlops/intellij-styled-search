@@ -10,7 +10,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 const GRAPH_MAGIC: &[u8; 8] = b"IJSSGRF1";
-const GRAPH_VERSION: u32 = 1;
+const GRAPH_VERSION: u32 = 2;
 const GRAPH_HEADER_SIZE: usize = 40;
 const GRAPH_INDEX_ENTRY_SIZE: usize = 28;
 const GRAPH_FILE_NAME: &str = "callgraph-relations.ijg";
@@ -47,6 +47,8 @@ pub struct GraphRebuildProgress {
 
 #[derive(Clone, Debug)]
 pub struct GraphReference {
+    pub target_symbol_id: Option<String>,
+    pub edge_kind: String,
     pub name: String,
     pub raw_text: String,
     pub uri: String,
@@ -99,6 +101,21 @@ pub struct GraphSymbolQueryResult {
     pub built_at_unix_ms: u64,
     pub total_symbols: usize,
     pub symbols: Vec<GraphSymbol>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GraphSymbolQueryOptions {
+    pub include_usage_counts: bool,
+    pub include_implementation_counts: bool,
+}
+
+impl Default for GraphSymbolQueryOptions {
+    fn default() -> Self {
+        Self {
+            include_usage_counts: true,
+            include_implementation_counts: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -184,7 +201,7 @@ pub fn index_graph_from_tsv(
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 11 || fields[0] != "U" {
+        if !(fields.len() == 11 || fields.len() == 12) || fields[0] != "U" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid graph TSV row with {} fields", fields.len()),
@@ -201,6 +218,13 @@ pub fn index_graph_from_tsv(
             current_symbol = Some(symbol_id.clone());
         }
         current_refs.push(GraphReference {
+            target_symbol_id: Some(symbol_id.clone()),
+            edge_kind: fields
+                .get(11)
+                .map(|value| decode_field(value))
+                .transpose()?
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "usage".to_string()),
             name: decode_field(fields[2])?,
             raw_text: decode_field(fields[3])?,
             uri: decode_field(fields[4])?,
@@ -331,15 +355,28 @@ where
         total: references.len(),
         message: format!("rust graph writing {} references", references.len()),
     });
-    let pending = prepare_graph_relation_generation(
+    let pending = prepare_graph_relation_generation_with_progress(
         workspace_root,
         references,
         built_at_unix_ms,
         config,
         worker_count,
+        progress,
     )?;
-    write_symbol_index(workspace_root, &symbols, built_at_unix_ms, config)?;
+    write_symbol_index_with_progress(workspace_root, &symbols, built_at_unix_ms, config, progress)?;
+    progress(GraphRebuildProgress {
+        stage: "indexing",
+        current: 1,
+        total: 1,
+        message: "rust graph committing relation manifest".to_string(),
+    });
     let mut summary = commit_graph_relation_generation(pending)?;
+    progress(GraphRebuildProgress {
+        stage: "indexing",
+        current: 1,
+        total: 1,
+        message: "rust graph committed relation manifest".to_string(),
+    });
     summary.file_count = parsed_file_count;
     Ok(summary)
 }
@@ -627,6 +664,7 @@ fn serialize_graph_record(
             &mut bytes,
             reference.enclosing_symbol_id.as_deref().unwrap_or(""),
         )?;
+        put_string(&mut bytes, &reference.edge_kind)?;
     }
     let refs_len = checked_u32(bytes.len() - refs_offset, "reference payload length")?;
     Ok(SerializedGraphRecord {
@@ -679,24 +717,79 @@ fn prepare_graph_relation_generation(
     config: &EngineConfig,
     worker_count: usize,
 ) -> io::Result<PendingGraphRelationGeneration> {
+    let mut progress = |_progress: GraphRebuildProgress| {};
+    prepare_graph_relation_generation_with_progress(
+        workspace_root,
+        references,
+        built_at_unix_ms,
+        config,
+        worker_count,
+        &mut progress,
+    )
+}
+
+fn prepare_graph_relation_generation_with_progress<F>(
+    workspace_root: &Path,
+    references: Vec<(String, GraphReference)>,
+    built_at_unix_ms: u64,
+    config: &EngineConfig,
+    worker_count: usize,
+    progress: &mut F,
+) -> io::Result<PendingGraphRelationGeneration>
+where
+    F: FnMut(GraphRebuildProgress),
+{
     let layout_root = config.index_root(workspace_root);
     fs::create_dir_all(&layout_root)?;
     let mut grouped: BTreeMap<String, Vec<GraphReference>> = BTreeMap::new();
     let mut rel_paths = BTreeSet::new();
+    let total_references = references.len();
+    progress(GraphRebuildProgress {
+        stage: "indexing",
+        current: 0,
+        total: total_references,
+        message: format!("rust graph grouping {total_references} references"),
+    });
+    let mut grouped_references = 0usize;
     for (symbol_id, reference) in references {
+        grouped_references += 1;
         rel_paths.insert(reference.rel_path.clone());
         grouped.entry(symbol_id).or_default().push(reference);
+        if grouped_references == 1
+            || grouped_references % 50_000 == 0
+            || grouped_references == total_references
+        {
+            progress(GraphRebuildProgress {
+                stage: "indexing",
+                current: grouped_references,
+                total: total_references,
+                message: format!(
+                    "rust graph grouped {grouped_references}/{total_references} references"
+                ),
+            });
+        }
     }
     let symbol_count = grouped.len();
     let shard_count = graph_relation_shard_count(worker_count, symbol_count);
     let generation = next_graph_relation_generation(&layout_root, config, workspace_root);
-    let shard_summaries = write_graph_relation_shards_parallel(
+    progress(GraphRebuildProgress {
+        stage: "indexing",
+        current: 0,
+        total: shard_count.max(1),
+        message: format!(
+            "rust graph writing {} relation shards for {} symbols",
+            shard_count.max(1),
+            symbol_count
+        ),
+    });
+    let shard_summaries = write_graph_relation_shards_parallel_with_progress(
         &layout_root,
         grouped,
         built_at_unix_ms,
         generation,
         shard_count,
         worker_count,
+        progress,
     )?;
     let indexed_at_unix_secs = unix_secs_now();
     let reference_count: usize = shard_summaries
@@ -828,14 +921,18 @@ fn next_graph_relation_generation(
     }
 }
 
-fn write_graph_relation_shards_parallel(
+fn write_graph_relation_shards_parallel_with_progress<F>(
     layout_root: &Path,
     grouped: BTreeMap<String, Vec<GraphReference>>,
     built_at_unix_ms: u64,
     generation: u64,
     shard_count: usize,
     worker_count: usize,
-) -> io::Result<Vec<GraphRelationShardSummary>> {
+    progress: &mut F,
+) -> io::Result<Vec<GraphRelationShardSummary>>
+where
+    F: FnMut(GraphRebuildProgress),
+{
     let shard_count = shard_count.max(1);
     let mut shard_groups: Vec<Vec<(String, Vec<GraphReference>)>> =
         (0..shard_count).map(|_| Vec::new()).collect();
@@ -845,24 +942,34 @@ fn write_graph_relation_shards_parallel(
     }
     let workers = effective_graph_worker_count(worker_count, shard_count);
     if workers <= 1 || shard_count <= 1 {
-        return shard_groups
-            .into_iter()
-            .enumerate()
-            .map(|(shard_id, groups)| {
-                write_graph_relation_shard(
-                    layout_root,
-                    generation,
-                    shard_id,
-                    groups,
-                    built_at_unix_ms,
-                )
-            })
-            .collect();
+        let mut out = Vec::with_capacity(shard_count);
+        for (shard_id, groups) in shard_groups.into_iter().enumerate() {
+            let summary = write_graph_relation_shard(
+                layout_root,
+                generation,
+                shard_id,
+                groups,
+                built_at_unix_ms,
+            )?;
+            out.push(summary);
+            progress(GraphRebuildProgress {
+                stage: "indexing",
+                current: out.len(),
+                total: shard_count,
+                message: format!(
+                    "rust graph wrote relation shard {}/{}",
+                    out.len(),
+                    shard_count
+                ),
+            });
+        }
+        return Ok(out);
     }
 
     let chunk_size = shard_count.div_ceil(workers);
     let mut handles = Vec::new();
     let mut iter = shard_groups.into_iter().enumerate();
+    let (result_tx, result_rx) = mpsc::channel();
     loop {
         let chunk: Vec<(usize, Vec<(String, Vec<GraphReference>)>)> =
             iter.by_ref().take(chunk_size).collect();
@@ -870,33 +977,70 @@ fn write_graph_relation_shards_parallel(
             break;
         }
         let layout_root = layout_root.to_path_buf();
-        handles.push(thread::spawn(
-            move || -> io::Result<Vec<(usize, GraphRelationShardSummary)>> {
-                let mut out = Vec::with_capacity(chunk.len());
-                for (shard_id, groups) in chunk {
-                    let summary = write_graph_relation_shard(
-                        &layout_root,
-                        generation,
-                        shard_id,
-                        groups,
-                        built_at_unix_ms,
-                    )?;
-                    out.push((shard_id, summary));
+        let result_tx = result_tx.clone();
+        handles.push(thread::spawn(move || -> io::Result<()> {
+            for (shard_id, groups) in chunk {
+                let result = write_graph_relation_shard(
+                    &layout_root,
+                    generation,
+                    shard_id,
+                    groups,
+                    built_at_unix_ms,
+                )
+                .map(|summary| (shard_id, summary));
+                let failed = result.is_err();
+                if result_tx.send(result).is_err() || failed {
+                    break;
                 }
-                Ok(out)
-            },
-        ));
+            }
+            Ok(())
+        }));
     }
+    drop(result_tx);
 
     let mut ordered: Vec<Option<GraphRelationShardSummary>> =
         std::iter::repeat_with(|| None).take(shard_count).collect();
-    for handle in handles {
-        let summaries = handle
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "graph shard writer panicked"))??;
-        for (shard_id, summary) in summaries {
-            ordered[shard_id] = Some(summary);
+    let mut completed = 0usize;
+    let mut first_error: Option<io::Error> = None;
+    for result in result_rx {
+        match result {
+            Ok((shard_id, summary)) => {
+                completed += 1;
+                ordered[shard_id] = Some(summary);
+                progress(GraphRebuildProgress {
+                    stage: "indexing",
+                    current: completed,
+                    total: shard_count,
+                    message: format!("rust graph wrote relation shard {completed}/{shard_count}"),
+                });
+            }
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
         }
+    }
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+            Err(_) => {
+                if first_error.is_none() {
+                    first_error = Some(io::Error::new(
+                        io::ErrorKind::Other,
+                        "graph shard writer panicked",
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
     }
     ordered
         .into_iter()
@@ -1049,6 +1193,26 @@ fn write_symbol_index(
     built_at_unix_ms: u64,
     config: &EngineConfig,
 ) -> io::Result<u64> {
+    let mut progress = |_progress: GraphRebuildProgress| {};
+    write_symbol_index_with_progress(
+        workspace_root,
+        symbols,
+        built_at_unix_ms,
+        config,
+        &mut progress,
+    )
+}
+
+fn write_symbol_index_with_progress<F>(
+    workspace_root: &Path,
+    symbols: &[NativeGraphSymbol],
+    built_at_unix_ms: u64,
+    config: &EngineConfig,
+    progress: &mut F,
+) -> io::Result<u64>
+where
+    F: FnMut(GraphRebuildProgress),
+{
     let layout_root = config.index_root(workspace_root);
     fs::create_dir_all(&layout_root)?;
     let mut entries: Vec<SymbolEntry> = Vec::with_capacity(symbols.len());
@@ -1061,7 +1225,14 @@ fn write_symbol_index(
             .then(a.start_column.cmp(&b.start_column))
             .then(a.id.cmp(&b.id))
     });
-    for symbol in sorted {
+    let total_symbols = sorted.len();
+    progress(GraphRebuildProgress {
+        stage: "indexing",
+        current: 0,
+        total: total_symbols,
+        message: format!("rust graph writing symbol index for {total_symbols} symbols"),
+    });
+    for (idx, symbol) in sorted.into_iter().enumerate() {
         let graph_symbol = native_symbol_to_graph_symbol(symbol, None);
         let record_offset = data.len() as u64;
         write_graph_symbol_record(&mut data, &graph_symbol)?;
@@ -1070,6 +1241,15 @@ fn write_symbol_index(
             record_offset,
             record_len,
         });
+        let current = idx + 1;
+        if current == 1 || current % 4096 == 0 || current == total_symbols {
+            progress(GraphRebuildProgress {
+                stage: "indexing",
+                current,
+                total: total_symbols,
+                message: format!("rust graph encoded symbol index {current}/{total_symbols}"),
+            });
+        }
     }
 
     let index_offset = GRAPH_SYMBOL_HEADER_SIZE as u64;
@@ -1091,7 +1271,19 @@ fn write_symbol_index(
     }
     bytes.extend_from_slice(&data);
     let byte_len = bytes.len() as u64;
+    progress(GraphRebuildProgress {
+        stage: "indexing",
+        current: total_symbols,
+        total: total_symbols,
+        message: format!("rust graph flushing symbol index ({byte_len} bytes)"),
+    });
     write_atomically(&layout_root.join(GRAPH_SYMBOL_FILE_NAME), &bytes)?;
+    progress(GraphRebuildProgress {
+        stage: "indexing",
+        current: total_symbols,
+        total: total_symbols,
+        message: format!("rust graph wrote symbol index ({byte_len} bytes)"),
+    });
     Ok(byte_len)
 }
 
@@ -1101,13 +1293,30 @@ pub fn query_graph_symbols(
     limit: usize,
     config: &EngineConfig,
 ) -> io::Result<Option<GraphSymbolQueryResult>> {
+    query_graph_symbols_with_options(
+        workspace_root,
+        query,
+        limit,
+        config,
+        GraphSymbolQueryOptions::default(),
+    )
+}
+
+pub fn query_graph_symbols_with_options(
+    workspace_root: &Path,
+    query: &str,
+    limit: usize,
+    config: &EngineConfig,
+    options: GraphSymbolQueryOptions,
+) -> io::Result<Option<GraphSymbolQueryResult>> {
     let Some((built_at_unix_ms, symbols)) = read_symbol_index(workspace_root, config)? else {
         return Ok(None);
     };
     let normalized = query.trim();
     let lower = normalized.to_ascii_lowercase();
     let mut scored: Vec<(GraphSymbol, i32)> = symbols
-        .into_iter()
+        .iter()
+        .cloned()
         .filter_map(|symbol| {
             let score = if normalized.is_empty() {
                 1
@@ -1129,15 +1338,39 @@ pub fn query_graph_symbols(
             .then(a.start_line.cmp(&b.start_line))
     });
     let total_symbols = scored.len();
+    let mut implementation_index = if options.include_implementation_counts {
+        Some(GraphImplementationIndex::new(&symbols))
+    } else {
+        None
+    };
+    let mut relation_reader = if options.include_usage_counts {
+        GraphRelationReader::open(workspace_root, config)?
+    } else {
+        None
+    };
+    let mut id_to_idx = HashMap::new();
+    for (idx, symbol) in symbols.iter().enumerate() {
+        id_to_idx.insert(symbol.id.as_str(), idx);
+    }
+    let mut result_symbols = Vec::new();
+    for (mut symbol, _) in scored.into_iter().take(limit) {
+        symbol.usage_count = Some(if let Some(reader) = relation_reader.as_mut() {
+            reader.reference_count(&symbol.id)?
+        } else {
+            0
+        });
+        if let Some(idx) = id_to_idx.get(symbol.id.as_str()).copied() {
+            if let Some(index) = implementation_index.as_mut() {
+                symbol.implementation_count = Some(index.implementation_count_for_symbol_idx(idx));
+            }
+        }
+        result_symbols.push(symbol);
+    }
     Ok(Some(GraphSymbolQueryResult {
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         built_at_unix_ms,
         total_symbols,
-        symbols: scored
-            .into_iter()
-            .take(limit)
-            .map(|(symbol, _)| symbol)
-            .collect(),
+        symbols: result_symbols,
     }))
 }
 
@@ -1149,11 +1382,39 @@ pub fn query_graph_document_symbols(
     limit: usize,
     config: &EngineConfig,
 ) -> io::Result<Option<GraphSymbolQueryResult>> {
+    query_graph_document_symbols_with_options(
+        workspace_root,
+        uri,
+        start_line,
+        end_line,
+        limit,
+        config,
+        GraphSymbolQueryOptions::default(),
+    )
+}
+
+pub fn query_graph_document_symbols_with_options(
+    workspace_root: &Path,
+    uri: &str,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+    limit: usize,
+    config: &EngineConfig,
+    options: GraphSymbolQueryOptions,
+) -> io::Result<Option<GraphSymbolQueryResult>> {
     let Some((built_at_unix_ms, symbols)) = read_symbol_index(workspace_root, config)? else {
         return Ok(None);
     };
-    let mut implementation_index = GraphImplementationIndex::new(&symbols);
-    let mut relation_reader = GraphRelationReader::open(workspace_root, config)?;
+    let mut implementation_index = if options.include_implementation_counts {
+        Some(GraphImplementationIndex::new(&symbols))
+    } else {
+        None
+    };
+    let mut relation_reader = if options.include_usage_counts {
+        GraphRelationReader::open(workspace_root, config)?
+    } else {
+        None
+    };
     let mut matched = Vec::new();
     for (idx, symbol) in symbols
         .iter()
@@ -1176,8 +1437,9 @@ pub fn query_graph_document_symbols(
         } else {
             0
         });
-        symbol.implementation_count =
-            Some(implementation_index.implementation_count_for_symbol_idx(idx));
+        if let Some(index) = implementation_index.as_mut() {
+            symbol.implementation_count = Some(index.implementation_count_for_symbol_idx(idx));
+        }
         matched.push(symbol);
     }
     matched.sort_by(|a, b| {
@@ -1192,6 +1454,54 @@ pub fn query_graph_document_symbols(
         built_at_unix_ms,
         total_symbols,
         symbols: matched.into_iter().take(limit).collect(),
+    }))
+}
+
+pub fn query_graph_implementations(
+    workspace_root: &Path,
+    symbol_id: &str,
+    limit: usize,
+    config: &EngineConfig,
+) -> io::Result<Option<GraphSymbolQueryResult>> {
+    let Some((built_at_unix_ms, symbols)) = read_symbol_index(workspace_root, config)? else {
+        return Ok(None);
+    };
+    let Some(target_idx) = symbols.iter().position(|symbol| symbol.id == symbol_id) else {
+        return Ok(Some(GraphSymbolQueryResult {
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            built_at_unix_ms,
+            total_symbols: 0,
+            symbols: Vec::new(),
+        }));
+    };
+    let mut implementation_index = GraphImplementationIndex::new(&symbols);
+    let implementation_indices =
+        implementation_index.implementation_indices_for_symbol_idx(target_idx);
+    let total_symbols = implementation_indices.len();
+    let mut relation_reader = GraphRelationReader::open(workspace_root, config)?;
+    let mut matched = Vec::new();
+    for idx in implementation_indices.into_iter().take(limit) {
+        let mut symbol = symbols[idx].clone();
+        symbol.usage_count = Some(if let Some(reader) = relation_reader.as_mut() {
+            reader.reference_count(&symbol.id)?
+        } else {
+            0
+        });
+        symbol.implementation_count =
+            Some(implementation_index.implementation_count_for_symbol_idx(idx));
+        matched.push(symbol);
+    }
+    matched.sort_by(|a, b| {
+        a.qualified_name
+            .cmp(&b.qualified_name)
+            .then(a.rel_path.cmp(&b.rel_path))
+            .then(a.start_line.cmp(&b.start_line))
+    });
+    Ok(Some(GraphSymbolQueryResult {
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        built_at_unix_ms,
+        total_symbols,
+        symbols: matched,
     }))
 }
 
@@ -1216,7 +1526,10 @@ pub fn query_graph(
                 references: Vec::new(),
             }));
         };
-        let references = read_references(&bytes, &header, &entry, limit)?;
+        let mut references = read_references(&bytes, &header, &entry, limit)?;
+        for reference in &mut references {
+            reference.target_symbol_id = Some(symbol_id.to_string());
+        }
         return Ok(Some(GraphQueryResult {
             workspace_root: workspace_root.to_string_lossy().into_owned(),
             symbol_id: symbol_id.to_string(),
@@ -1240,12 +1553,47 @@ pub fn query_graph(
             references: Vec::new(),
         }));
     };
-    let references = read_references(&bytes, &header, &entry, limit)?;
+    let mut references = read_references(&bytes, &header, &entry, limit)?;
+    for reference in &mut references {
+        reference.target_symbol_id = Some(symbol_id.to_string());
+    }
     Ok(Some(GraphQueryResult {
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         symbol_id: symbol_id.to_string(),
         built_at_unix_ms: header.built_at_unix_ms,
         total_references: entry.ref_count as usize,
+        references,
+    }))
+}
+
+pub fn query_graph_callees(
+    workspace_root: &Path,
+    symbol_id: &str,
+    limit: usize,
+    config: &EngineConfig,
+) -> io::Result<Option<GraphQueryResult>> {
+    let Some((built_at_unix_ms, all_references)) =
+        read_all_graph_references(workspace_root, config)?
+    else {
+        return Ok(None);
+    };
+    let mut total_references = 0usize;
+    let mut references = Vec::new();
+    for (target_symbol_id, mut reference) in all_references {
+        if reference.enclosing_symbol_id.as_deref() != Some(symbol_id) {
+            continue;
+        }
+        total_references += 1;
+        if references.len() < limit {
+            reference.target_symbol_id = Some(target_symbol_id);
+            references.push(reference);
+        }
+    }
+    Ok(Some(GraphQueryResult {
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        symbol_id: symbol_id.to_string(),
+        built_at_unix_ms,
+        total_references,
         references,
     }))
 }
@@ -1357,8 +1705,8 @@ impl<'a> GraphImplementationIndex<'a> {
                 .iter()
                 .chain(symbol.implements_names.iter())
             {
-                if let Some(parent_idx) =
-                    choose_graph_type_symbol_index_by_name(parent_name, &type_by_name, symbols)
+                for parent_idx in
+                    graph_type_symbol_indices_by_name(parent_name, &type_by_name, symbols)
                 {
                     children_by_parent
                         .entry(symbols[parent_idx].id.clone())
@@ -1377,31 +1725,33 @@ impl<'a> GraphImplementationIndex<'a> {
     }
 
     fn implementation_count_for_symbol_idx(&mut self, idx: usize) -> usize {
+        self.implementation_indices_for_symbol_idx(idx)
+            .len()
+            .saturating_add(framework_impl_marker_count(&self.symbols[idx]))
+    }
+
+    fn implementation_indices_for_symbol_idx(&mut self, idx: usize) -> Vec<usize> {
         let symbol_kind = self.symbols[idx].kind.as_str();
-        let framework_count = framework_impl_marker_count(&self.symbols[idx]);
         if is_type_reference_symbol_kind(symbol_kind) {
-            return self
-                .descendant_type_indices_cached(idx)
-                .len()
-                .saturating_add(framework_count);
+            return self.descendant_type_indices_cached(idx);
         }
         if !matches!(symbol_kind, "function" | "method" | "constructor") {
-            return framework_count;
+            return Vec::new();
         }
-        let mut count = framework_count;
         let symbol_id = self.symbols[idx].id.clone();
         let symbol_name = self.symbols[idx].name.clone();
         let Some(container_name) = self.symbols[idx].container_name.clone() else {
-            return count;
+            return Vec::new();
         };
         let Some(container_idx) = choose_graph_type_symbol_index_by_name(
             &container_name,
             &self.type_by_name,
             self.symbols,
         ) else {
-            return count;
+            return Vec::new();
         };
         let mut impl_ids = HashSet::new();
+        let mut out = Vec::new();
         for child_idx in self.descendant_type_indices_cached(container_idx) {
             if let Some(methods) = self.members_by_container_name.get(&member_lookup_key(
                 &self.symbols[child_idx].qualified_name,
@@ -1414,13 +1764,14 @@ impl<'a> GraphImplementationIndex<'a> {
                             "method" | "constructor"
                         )
                     {
-                        impl_ids.insert(self.symbols[*method_idx].id.clone());
+                        if impl_ids.insert(self.symbols[*method_idx].id.clone()) {
+                            out.push(*method_idx);
+                        }
                     }
                 }
             }
         }
-        count = count.saturating_add(impl_ids.len());
-        count
+        out
     }
 
     fn descendant_type_indices_cached(&mut self, type_idx: usize) -> Vec<usize> {
@@ -1472,6 +1823,16 @@ fn choose_graph_type_symbol_index_by_name(
     type_by_name: &HashMap<String, Vec<usize>>,
     symbols: &[GraphSymbol],
 ) -> Option<usize> {
+    graph_type_symbol_indices_by_name(name, type_by_name, symbols)
+        .into_iter()
+        .next()
+}
+
+fn graph_type_symbol_indices_by_name(
+    name: &str,
+    type_by_name: &HashMap<String, Vec<usize>>,
+    symbols: &[GraphSymbol],
+) -> Vec<usize> {
     let mut candidates = Vec::new();
     for key in [name, last_qualified_part(name)] {
         if let Some(found) = type_by_name.get(key) {
@@ -1480,23 +1841,24 @@ fn choose_graph_type_symbol_index_by_name(
     }
     candidates.sort_unstable();
     candidates.dedup();
-    candidates
+    let exact_matches: Vec<usize> = candidates
         .iter()
         .copied()
-        .find(|idx| symbols[*idx].qualified_name == name)
-        .or_else(|| {
-            let simple = last_qualified_part(name);
-            let simple_matches: Vec<usize> = candidates
-                .iter()
-                .copied()
-                .filter(|idx| symbols[*idx].name == simple)
-                .collect();
-            if simple_matches.len() == 1 {
-                Some(simple_matches[0])
-            } else {
-                candidates.first().copied()
-            }
-        })
+        .filter(|idx| symbols[*idx].qualified_name == name)
+        .collect();
+    if !exact_matches.is_empty() {
+        return exact_matches;
+    }
+    let simple = last_qualified_part(name);
+    let simple_matches: Vec<usize> = candidates
+        .iter()
+        .copied()
+        .filter(|idx| symbols[*idx].name == simple)
+        .collect();
+    if !simple_matches.is_empty() {
+        return simple_matches;
+    }
+    candidates
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1543,6 +1905,7 @@ fn flush_record(
         put_u32(data, reference.end_line);
         put_u32(data, reference.end_column);
         put_string(data, reference.enclosing_symbol_id.as_deref().unwrap_or(""))?;
+        put_string(data, &reference.edge_kind)?;
     }
     let refs_len = checked_u32(
         data.len() - refs_offset as usize,
@@ -1589,6 +1952,7 @@ struct NativeGraphFile {
     rel_path: String,
     uri: String,
     text: String,
+    byte_len: u64,
     symbols: Vec<NativeGraphSymbol>,
     imports: HashMap<String, Vec<ImportTarget>>,
 }
@@ -1622,6 +1986,7 @@ struct IdentifierLexState {
     triple_quote: Option<char>,
     quote: Option<char>,
     template_expr_depth: usize,
+    template_quote_depth: usize,
     escaped: bool,
 }
 
@@ -1745,6 +2110,7 @@ fn parse_graph_source_file(
         rel_path,
         uri,
         text,
+        byte_len: bytes.len() as u64,
         symbols,
         imports,
     }))
@@ -1847,11 +2213,12 @@ fn parse_python_graph_symbols(
     rel_path: &str,
 ) -> Vec<NativeGraphSymbol> {
     let mut symbols = Vec::new();
-    let mut class_stack: Vec<(usize, String)> = Vec::new();
-    let mut function_stack: Vec<usize> = Vec::new();
+    let mut class_stack: Vec<(usize, String, usize)> = Vec::new();
+    let mut function_stack: Vec<(usize, usize)> = Vec::new();
     let mut pending_decorators: Vec<String> = Vec::new();
     let mut code_state = IdentifierLexState::default();
-    for (line_idx, line) in text.lines().enumerate() {
+    let lines: Vec<&str> = text.lines().collect();
+    for (line_idx, line) in lines.iter().copied().enumerate() {
         let code_line = sanitize_code_line(line, &mut code_state);
         let indent = line
             .chars()
@@ -1860,17 +2227,21 @@ fn parse_python_graph_symbols(
         let trimmed = code_line.trim_start();
         while function_stack
             .last()
-            .map(|function_indent| indent <= *function_indent && !trimmed.is_empty())
+            .map(|(function_indent, _)| indent <= *function_indent && !trimmed.is_empty())
             .unwrap_or(false)
         {
-            function_stack.pop();
+            if let Some((_, symbol_idx)) = function_stack.pop() {
+                close_native_symbol_body(&mut symbols, symbol_idx, line_idx);
+            }
         }
         while class_stack
             .last()
-            .map(|(class_indent, _)| indent <= *class_indent && !trimmed.is_empty())
+            .map(|(class_indent, _, _)| indent <= *class_indent && !trimmed.is_empty())
             .unwrap_or(false)
         {
-            class_stack.pop();
+            if let Some((_, _, symbol_idx)) = class_stack.pop() {
+                close_native_symbol_body(&mut symbols, symbol_idx, line_idx);
+            }
         }
         if trimmed.starts_with('@') {
             if let Some(name) = decorator_name_from_line(trimmed) {
@@ -1879,6 +2250,7 @@ fn parse_python_graph_symbols(
             continue;
         }
         if let Some(name) = identifier_after_keyword(trimmed, "class") {
+            let header = collect_python_class_header(&lines, line_idx);
             let column = find_column(line, &name);
             let qualified = name.clone();
             let mut symbol = make_native_graph_symbol(
@@ -1895,7 +2267,7 @@ fn parse_python_graph_symbols(
                 line_idx as u32,
                 column.saturating_add(name.len()) as u32,
             );
-            symbol.extends_names = python_class_bases_from_line(trimmed);
+            symbol.extends_names = python_class_bases_from_line(&header);
             symbol
                 .implements_names
                 .extend(framework_impl_markers_for_python_class(
@@ -1903,19 +2275,24 @@ fn parse_python_graph_symbols(
                     &pending_decorators,
                 ));
             pending_decorators.clear();
+            let symbol_idx = symbols.len();
             symbols.push(symbol);
-            class_stack.push((indent, qualified));
+            class_stack.push((indent, qualified, symbol_idx));
             continue;
         }
         if let Some(name) = python_function_name_from_line(trimmed) {
             let column = find_column(line, &name);
             let qualified = class_stack
                 .last()
-                .map(|(_, class_name)| format!("{class_name}.{name}"))
+                .map(|(_, class_name, _)| format!("{class_name}.{name}"))
                 .unwrap_or_else(|| name.clone());
             let container_name = class_stack
                 .last()
-                .map(|(_, class_name)| class_name.as_str());
+                .map(|(_, class_name, _)| class_name.as_str());
+            let container_id = class_stack
+                .last()
+                .and_then(|(_, _, symbol_idx)| symbols.get(*symbol_idx))
+                .map(|symbol| symbol.id.clone());
             let kind = if container_name.is_some() {
                 "method"
             } else {
@@ -1935,6 +2312,7 @@ fn parse_python_graph_symbols(
                 line_idx as u32,
                 column.saturating_add(name.len()) as u32,
             );
+            symbol.container_id = container_id;
             symbol
                 .implements_names
                 .extend(framework_impl_markers_for_annotations(
@@ -1943,19 +2321,23 @@ fn parse_python_graph_symbols(
                     kind,
                 ));
             pending_decorators.clear();
+            let symbol_idx = symbols.len();
             symbols.push(symbol);
-            function_stack.push(indent);
+            function_stack.push((indent, symbol_idx));
             continue;
         }
+        let current_class_scope = class_stack
+            .last()
+            .map(|(class_indent, class_name, _)| (*class_indent, class_name.clone()));
         if let Some((name, column, is_callable)) = python_assignment_symbol_from_line(
             &code_line,
             indent,
-            class_stack
+            current_class_scope.clone(),
+            function_stack
                 .last()
-                .map(|(class_indent, class_name)| (*class_indent, class_name.clone())),
-            function_stack.last().copied(),
+                .map(|(function_indent, _)| *function_indent),
         ) {
-            let container_name = python_assignment_container(&name, class_stack.last());
+            let container_name = python_assignment_container(&name, current_class_scope.as_ref());
             let local_name = name.rsplit('.').next().unwrap_or(&name).to_string();
             let qualified = container_name
                 .map(|container| format!("{container}.{local_name}"))
@@ -1993,7 +2375,29 @@ fn parse_python_graph_symbols(
             ));
         }
     }
+    let eof_line = lines.len();
+    while let Some((_, symbol_idx)) = function_stack.pop() {
+        close_native_symbol_body(&mut symbols, symbol_idx, eof_line);
+    }
+    while let Some((_, _, symbol_idx)) = class_stack.pop() {
+        close_native_symbol_body(&mut symbols, symbol_idx, eof_line);
+    }
     symbols
+}
+
+fn close_native_symbol_body(
+    symbols: &mut [NativeGraphSymbol],
+    symbol_idx: usize,
+    exclusive_end_line: usize,
+) {
+    let Some(symbol) = symbols.get_mut(symbol_idx) else {
+        return;
+    };
+    let end_line = exclusive_end_line.saturating_sub(1) as u32;
+    if end_line >= symbol.body_start_line {
+        symbol.body_end_line = end_line;
+        symbol.body_end_column = u32::MAX;
+    }
 }
 
 fn parse_graphql_graph_symbols(
@@ -2462,6 +2866,7 @@ fn resolve_graphql_schema_type_references(
     line_idx: usize,
     symbols: &[NativeGraphSymbol],
     maps: &GraphResolutionMaps,
+    enclosing_by_line: &[Option<String>],
     out: &mut Vec<(String, GraphReference)>,
     seen: &mut HashSet<(usize, usize, usize)>,
 ) {
@@ -2488,6 +2893,7 @@ fn resolve_graphql_schema_type_references(
                 start,
                 start + name.len(),
                 symbols,
+                enclosing_by_line,
                 out,
                 seen,
             );
@@ -2883,10 +3289,46 @@ fn parse_brace_graph_symbols(
             brace_depth = 0;
         }
     }
+    assign_brace_symbol_bodies(&mut symbols, &code_line_refs);
     if is_ts_like_language(language) {
         symbols.extend(parse_embedded_graphql_symbols(text, uri, rel_path));
     }
     symbols
+}
+
+fn assign_brace_symbol_bodies(symbols: &mut [NativeGraphSymbol], code_lines: &[&str]) {
+    for symbol in symbols.iter_mut() {
+        if !matches!(
+            symbol.kind.as_str(),
+            "function" | "method" | "constructor" | "class" | "interface" | "type" | "enum"
+        ) {
+            continue;
+        }
+        let start_line = symbol.start_line as usize;
+        let mut depth = 0i32;
+        let mut saw_body = false;
+        let mut end_line = symbol.declaration_end_line.max(symbol.start_line);
+        for (line_idx, line) in code_lines.iter().enumerate().skip(start_line) {
+            let opens = line.matches('{').count() as i32;
+            let closes = line.matches('}').count() as i32;
+            if !saw_body {
+                if opens == 0 {
+                    continue;
+                }
+                saw_body = true;
+            }
+            depth += opens;
+            depth -= closes;
+            end_line = line_idx as u32;
+            if saw_body && depth <= 0 {
+                break;
+            }
+        }
+        if saw_body && end_line >= symbol.body_start_line {
+            symbol.body_end_line = end_line;
+            symbol.body_end_column = u32::MAX;
+        }
+    }
 }
 
 fn parse_embedded_graphql_symbols(text: &str, uri: &str, rel_path: &str) -> Vec<NativeGraphSymbol> {
@@ -3016,9 +3458,11 @@ where
                 });
         }
     }
+    let total_bytes = files.iter().map(|file| file.byte_len).sum::<u64>();
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
     let mut processed = 0usize;
+    let mut processed_bytes = 0u64;
 
     let worker_count = worker_count.max(1).min(total.max(1));
     let mut chunks: Vec<Vec<NativeGraphFile>> = std::iter::repeat_with(Vec::new)
@@ -3035,9 +3479,10 @@ where
             let maps_ref = &maps;
             scope.spawn(move || {
                 for file in chunk {
+                    let byte_len = file.byte_len;
                     let references =
                         resolve_native_graph_references_for_file(file, symbols_ref, maps_ref);
-                    if tx.send(references).is_err() {
+                    if tx.send((references, byte_len)).is_err() {
                         break;
                     }
                 }
@@ -3045,8 +3490,9 @@ where
         }
         drop(tx);
 
-        for references in rx {
+        for (references, byte_len) in rx {
             processed += 1;
+            processed_bytes = processed_bytes.saturating_add(byte_len);
             out.extend(references);
             if processed == 1 || processed % 256 == 0 || processed == total {
                 progress(GraphRebuildProgress {
@@ -3054,7 +3500,7 @@ where
                     current: processed,
                     total,
                     message: format!(
-                        "rust graph resolved references {processed}/{total} with {worker_count} workers"
+                        "rust graph resolved references files={processed}/{total} bytes={processed_bytes}/{total_bytes} with {worker_count} workers"
                     ),
                 });
             }
@@ -3070,9 +3516,17 @@ fn resolve_native_graph_references_for_file(
 ) -> Vec<(String, GraphReference)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
+    let enclosing_by_line = enclosing_symbol_ids_by_line(&file);
     if is_graphql_rel_path(&file.rel_path) {
         resolve_graphql_references_for_text(
-            &file, &file.text, 0, symbols, maps, &mut out, &mut seen,
+            &file,
+            &file.text,
+            0,
+            symbols,
+            maps,
+            &enclosing_by_line,
+            &mut out,
+            &mut seen,
         );
         return out;
     }
@@ -3129,13 +3583,19 @@ fn resolve_native_graph_references_for_file(
             if should_skip_reference_for_symbol(line, start, end, &file.rel_path, symbol) {
                 continue;
             }
-            if !seen.insert((symbol_idx, line_idx, start)) {
-                continue;
-            }
-            out.push((
-                symbol.id.clone(),
-                make_graph_reference(&file, &name, line, line_idx, start, end),
-            ));
+            push_reference_to_symbol(
+                &file,
+                symbol_idx,
+                &name,
+                line,
+                line_idx,
+                start,
+                end,
+                symbols,
+                &enclosing_by_line,
+                &mut out,
+                &mut seen,
+            );
         }
         if file.rel_path.ends_with(".py") {
             resolve_python_reflection_references(
@@ -3146,6 +3606,7 @@ fn resolve_native_graph_references_for_file(
                 maps,
                 &receiver_bindings,
                 &class_by_line,
+                &enclosing_by_line,
                 &mut out,
                 &mut seen,
             );
@@ -3154,7 +3615,14 @@ fn resolve_native_graph_references_for_file(
     if is_ts_like_rel_path(&file.rel_path) {
         for (start_line, segment) in embedded_graphql_segments(&file.text) {
             resolve_graphql_references_for_text(
-                &file, &segment, start_line, symbols, maps, &mut out, &mut seen,
+                &file,
+                &segment,
+                start_line,
+                symbols,
+                maps,
+                &enclosing_by_line,
+                &mut out,
+                &mut seen,
             );
         }
     }
@@ -3170,6 +3638,8 @@ fn make_graph_reference(
     end: usize,
 ) -> GraphReference {
     GraphReference {
+        target_symbol_id: None,
+        edge_kind: "usage".to_string(),
         name: name.to_string(),
         raw_text: line[start..end].to_string(),
         uri: file.uri.clone(),
@@ -3191,6 +3661,7 @@ fn push_reference_to_symbol(
     start: usize,
     end: usize,
     symbols: &[NativeGraphSymbol],
+    enclosing_by_line: &[Option<String>],
     out: &mut Vec<(String, GraphReference)>,
     seen: &mut HashSet<(usize, usize, usize)>,
 ) {
@@ -3205,10 +3676,68 @@ fn push_reference_to_symbol(
     if !seen.insert((symbol_idx, line_idx, start)) {
         return;
     }
-    out.push((
-        symbol.id.clone(),
-        make_graph_reference(file, name, line, line_idx, start, end),
-    ));
+    let mut reference = make_graph_reference(file, name, line, line_idx, start, end);
+    reference.target_symbol_id = Some(symbol.id.clone());
+    reference.edge_kind = classify_reference_edge_kind(line, start, end, &symbol.kind);
+    reference.enclosing_symbol_id = enclosing_by_line.get(line_idx).cloned().flatten();
+    out.push((symbol.id.clone(), reference));
+}
+
+fn classify_reference_edge_kind(line: &str, start: usize, end: usize, target_kind: &str) -> String {
+    let next_non_ws = line
+        .get(end..)
+        .and_then(|suffix| suffix.chars().find(|ch| !ch.is_whitespace()));
+    if next_non_ws != Some('(') {
+        return "usage".to_string();
+    }
+    if target_kind == "class" && previous_identifier(line, start).as_deref() == Some("new") {
+        return "construct".to_string();
+    }
+    "call".to_string()
+}
+
+fn previous_identifier(line: &str, start: usize) -> Option<String> {
+    let prefix = line.get(..start)?.trim_end();
+    let ident: String = prefix
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '$')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if ident.is_empty() {
+        None
+    } else {
+        Some(ident)
+    }
+}
+
+fn enclosing_symbol_ids_by_line(file: &NativeGraphFile) -> Vec<Option<String>> {
+    let line_count = file.text.lines().count();
+    let mut out = vec![None; line_count];
+    let mut callable_symbols: Vec<&NativeGraphSymbol> = file
+        .symbols
+        .iter()
+        .filter(|symbol| matches!(symbol.kind.as_str(), "function" | "method" | "constructor"))
+        .collect();
+    callable_symbols.sort_by(|a, b| {
+        let a_size = a.body_end_line.saturating_sub(a.body_start_line);
+        let b_size = b.body_end_line.saturating_sub(b.body_start_line);
+        a_size
+            .cmp(&b_size)
+            .then(b.body_start_line.cmp(&a.body_start_line))
+    });
+    for symbol in callable_symbols {
+        let start = (symbol.body_start_line as usize).min(line_count);
+        let end = (symbol.body_end_line as usize).min(line_count.saturating_sub(1));
+        for slot in out.iter_mut().take(end.saturating_add(1)).skip(start) {
+            if slot.is_none() {
+                *slot = Some(symbol.id.clone());
+            }
+        }
+    }
+    out
 }
 
 fn resolve_graphql_references_for_text(
@@ -3217,6 +3746,7 @@ fn resolve_graphql_references_for_text(
     line_offset: usize,
     symbols: &[NativeGraphSymbol],
     maps: &GraphResolutionMaps,
+    enclosing_by_line: &[Option<String>],
     out: &mut Vec<(String, GraphReference)>,
     seen: &mut HashSet<(usize, usize, usize)>,
 ) {
@@ -3244,7 +3774,17 @@ fn resolve_graphql_references_for_text(
                 symbols,
             ) {
                 push_reference_to_symbol(
-                    file, symbol_idx, &directive, line, line_idx, start, end, symbols, out, seen,
+                    file,
+                    symbol_idx,
+                    &directive,
+                    line,
+                    line_idx,
+                    start,
+                    end,
+                    symbols,
+                    enclosing_by_line,
+                    out,
+                    seen,
                 );
             }
         }
@@ -3264,7 +3804,16 @@ fn resolve_graphql_references_for_text(
         {
             if let Some(type_idx) = choose_type_symbol_index_by_name(&type_name, maps, symbols) {
                 push_reference_to_symbol(
-                    file, type_idx, &type_name, line, line_idx, type_start, type_end, symbols, out,
+                    file,
+                    type_idx,
+                    &type_name,
+                    line,
+                    line_idx,
+                    type_start,
+                    type_end,
+                    symbols,
+                    enclosing_by_line,
+                    out,
                     seen,
                 );
             }
@@ -3291,6 +3840,7 @@ fn resolve_graphql_references_for_text(
                     start,
                     start + fragment_name.len(),
                     symbols,
+                    enclosing_by_line,
                     out,
                     seen,
                 );
@@ -3322,6 +3872,7 @@ fn resolve_graphql_references_for_text(
                     start,
                     end,
                     symbols,
+                    enclosing_by_line,
                     out,
                     seen,
                 );
@@ -3340,6 +3891,7 @@ fn resolve_graphql_references_for_text(
                         start,
                         end,
                         symbols,
+                        enclosing_by_line,
                         out,
                         seen,
                     );
@@ -3351,7 +3903,16 @@ fn resolve_graphql_references_for_text(
                 }
             }
         } else {
-            resolve_graphql_schema_type_references(file, line, line_idx, symbols, maps, out, seen);
+            resolve_graphql_schema_type_references(
+                file,
+                line,
+                line_idx,
+                symbols,
+                maps,
+                enclosing_by_line,
+                out,
+                seen,
+            );
         }
         brace_depth += line.matches('{').count() as i32;
         brace_depth -= line.matches('}').count() as i32;
@@ -3369,6 +3930,7 @@ fn resolve_python_reflection_references(
     maps: &GraphResolutionMaps,
     receiver_bindings: &HashMap<String, usize>,
     class_by_line: &[Option<String>],
+    enclosing_by_line: &[Option<String>],
     out: &mut Vec<(String, GraphReference)>,
     seen: &mut HashSet<(usize, usize, usize)>,
 ) {
@@ -3393,6 +3955,7 @@ fn resolve_python_reflection_references(
                 start,
                 end,
                 symbols,
+                enclosing_by_line,
                 out,
                 seen,
             );
@@ -3410,7 +3973,17 @@ fn resolve_python_reflection_references(
             symbols,
         ) {
             push_reference_to_symbol(
-                file, symbol_idx, &name, line, line_idx, start, end, symbols, out, seen,
+                file,
+                symbol_idx,
+                &name,
+                line,
+                line_idx,
+                start,
+                end,
+                symbols,
+                enclosing_by_line,
+                out,
+                seen,
             );
         }
     }
@@ -4594,6 +5167,35 @@ fn python_class_bases_from_line(line: &str) -> Vec<String> {
     parse_type_reference_list(line.get(open + 1..close).unwrap_or(""))
 }
 
+fn collect_python_class_header(lines: &[&str], start_line: usize) -> String {
+    let mut out = String::new();
+    let mut paren_depth = 0i32;
+    let mut saw_open = false;
+    for raw_line in lines.iter().skip(start_line).take(40) {
+        let trimmed = raw_line.trim();
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(trimmed);
+        for ch in trimmed.chars() {
+            match ch {
+                '(' => {
+                    saw_open = true;
+                    paren_depth += 1;
+                }
+                ')' => {
+                    paren_depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        if trimmed.ends_with(':') && (!saw_open || paren_depth <= 0) {
+            break;
+        }
+    }
+    out
+}
+
 fn parse_type_reference_list(value: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -5136,9 +5738,7 @@ fn callable_name_from_line(line: &str, language: &str) -> Option<String> {
         if let Some(name) = top_level_function_name_from_line(line) {
             return Some(name);
         }
-        if line.trim_end().ends_with(';') {
-            return None;
-        }
+        return None;
     }
     if !line.contains('(') || !(line.contains('{') || line.ends_with(';')) {
         return None;
@@ -5516,6 +6116,16 @@ fn sanitize_code_line(line: &str, state: &mut IdentifierLexState) -> String {
             continue;
         }
         if let Some(active_quote) = state.quote {
+            if active_quote == '`'
+                && ch == '$'
+                && iter.peek().map(|(_, next)| *next == '{').unwrap_or(false)
+            {
+                out.push(' ');
+                iter.next();
+                out.push(' ');
+                enter_template_expression(state);
+                continue;
+            }
             out.push(' ');
             if state.escaped {
                 state.escaped = false;
@@ -5529,6 +6139,14 @@ fn sanitize_code_line(line: &str, state: &mut IdentifierLexState) -> String {
                 state.quote = None;
             }
             continue;
+        }
+        if state.template_expr_depth > 0 {
+            if ch == '{' {
+                state.template_expr_depth += 1;
+            } else if ch == '}' && close_template_expression_if_needed(state) {
+                out.push(' ');
+                continue;
+            }
         }
         if (ch == '"' || ch == '\'') && line[idx..].starts_with(&format!("{ch}{ch}{ch}")) {
             out.push(' ');
@@ -5563,6 +6181,26 @@ fn sanitize_code_line(line: &str, state: &mut IdentifierLexState) -> String {
     out
 }
 
+fn enter_template_expression(state: &mut IdentifierLexState) {
+    state.quote = None;
+    state.template_expr_depth += 1;
+    state.template_quote_depth += 1;
+}
+
+fn close_template_expression_if_needed(state: &mut IdentifierLexState) -> bool {
+    if state.template_expr_depth == 0 {
+        return false;
+    }
+    state.template_expr_depth -= 1;
+    if state.template_expr_depth < state.template_quote_depth {
+        state.template_quote_depth = state.template_quote_depth.saturating_sub(1);
+        state.quote = Some('`');
+        state.escaped = false;
+        return true;
+    }
+    false
+}
+
 fn identifier_tokens_with_state(
     line: &str,
     state: &mut IdentifierLexState,
@@ -5592,8 +6230,7 @@ fn identifier_tokens_with_state(
                 && iter.peek().map(|(_, next)| *next == '{').unwrap_or(false)
             {
                 iter.next();
-                state.quote = None;
-                state.template_expr_depth = 1;
+                enter_template_expression(state);
                 continue;
             }
             if state.escaped {
@@ -5616,9 +6253,7 @@ fn identifier_tokens_with_state(
                 if let Some(s) = start.take() {
                     out.push((line[s..idx].to_string(), s, idx));
                 }
-                state.template_expr_depth -= 1;
-                if state.template_expr_depth == 0 {
-                    state.quote = Some('`');
+                if close_template_expression_if_needed(state) {
                     continue;
                 }
             }
@@ -6137,6 +6772,8 @@ fn append_all_graph_references_from_bytes(
         let entry = read_entry(&bytes, &header, idx)?;
         let symbol_id = read_symbol(&bytes, &header, &entry)?;
         for reference in read_references(&bytes, &header, &entry, usize::MAX)? {
+            let mut reference = reference;
+            reference.target_symbol_id = Some(symbol_id.clone());
             references.push((symbol_id.clone(), reference));
         }
     }
@@ -6421,8 +7058,11 @@ fn read_references(
             value if value.is_empty() => None,
             value => Some(value),
         };
+        let edge_kind = read_string(payload, &mut cursor)?;
         if idx < wanted {
             references.push(GraphReference {
+                target_symbol_id: None,
+                edge_kind,
                 name,
                 raw_text,
                 uri,
@@ -6703,9 +7343,44 @@ mod tests {
             "export function alpha() {\n  beta();\n}\nfunction beta() {\n  return alpha();\n}\nalpha();\n",
         )?;
         let config = EngineConfig::default();
-        let summary = rebuild_graph_native(&root, 84, &config, 4, &mut |_| {})?;
+        let mut progress_events = Vec::new();
+        let summary = rebuild_graph_native(&root, 84, &config, 4, &mut |progress| {
+            progress_events.push(progress);
+        })?;
         assert_eq!(summary.symbol_count, 2);
         assert_eq!(summary.reference_count, 3);
+        assert!(
+            progress_events
+                .iter()
+                .any(|progress| progress.stage == "resolving"
+                    && progress.message.contains("files=")
+                    && progress.message.contains("bytes=")),
+            "expected graph rebuild to report resolving progress with file and byte counts"
+        );
+        assert!(
+            progress_events
+                .iter()
+                .any(|progress| progress.message.contains("grouped")),
+            "expected graph rebuild to report reference grouping progress"
+        );
+        assert!(
+            progress_events
+                .iter()
+                .any(|progress| progress.message.contains("wrote relation shard")),
+            "expected graph rebuild to report relation shard write progress"
+        );
+        assert!(
+            progress_events
+                .iter()
+                .any(|progress| progress.message.contains("wrote symbol index")),
+            "expected graph rebuild to report symbol index write progress"
+        );
+        assert!(
+            progress_events
+                .iter()
+                .any(|progress| progress.message.contains("committed relation manifest")),
+            "expected graph rebuild to report relation manifest commit progress"
+        );
         let manifest = read_graph_relation_manifest(&root, &config)?.expect("sharded manifest");
         assert_eq!(manifest.built_at_unix_ms, 84);
         assert!(manifest.shard_count > 1);
@@ -6738,6 +7413,28 @@ mod tests {
         let references = query_graph(&root, "typescript:src/a.ts:alpha:1", 10, &config)?
             .expect("graph query result");
         assert_eq!(references.total_references, 2);
+        assert_eq!(
+            references.references[0].target_symbol_id.as_deref(),
+            Some("typescript:src/a.ts:alpha:1")
+        );
+        assert!(
+            references
+                .references
+                .iter()
+                .any(|reference| reference.enclosing_symbol_id.as_deref()
+                    == Some("typescript:src/a.ts:beta:4")
+                    && reference.edge_kind == "call"),
+            "expected references to carry enclosing function ids"
+        );
+        let beta_callees = query_graph_callees(&root, "typescript:src/a.ts:beta:4", 10, &config)?
+            .expect("callee query result");
+        assert!(
+            beta_callees.references.iter().any(|reference| {
+                reference.target_symbol_id.as_deref() == Some("typescript:src/a.ts:alpha:1")
+                    && reference.edge_kind == "call"
+            }),
+            "expected graph-callees to return alpha as an outgoing usage from beta"
+        );
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
@@ -7520,6 +8217,112 @@ export function execute(runnable: Runnable) {
     }
 
     #[test]
+    fn native_rebuild_resolves_imported_function_calls_inside_ts_callbacks() -> io::Result<()> {
+        let root = temp_dir("graph-ts-imported-callback-calls");
+        let src = root.join("src");
+        let suite = src.join("test").join("suite");
+        fs::create_dir_all(&suite)?;
+        fs::write(
+            src.join("extension.ts"),
+            r#"export function buildCallGraphQuickPickItems() {
+  return [];
+}
+"#,
+        )?;
+        fs::write(
+            suite.join("callGraph.test.ts"),
+            r#"import {
+  buildCallGraphQuickPickItems,
+  type ExtensionTestApi,
+} from "../../extension";
+
+suite("call graph", () => {
+  test("formats callers", async () => {
+    const originalPy = "class GraphPy: pass";
+    Buffer.from(`${originalPy}\ndef graph_py_top2():\n    return GraphPy()\n`, "utf8");
+    const callerItems = buildCallGraphQuickPickItems();
+    const calleeItems = buildCallGraphQuickPickItems();
+    return [callerItems, calleeItems];
+  });
+});
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let summary = rebuild_graph_native(&root, 546, &config, 8, &mut |_| {})?;
+        assert_eq!(summary.file_count, 2);
+        let symbol = query_graph_symbols(&root, "buildCallGraphQuickPickItems", 20, &config)?
+            .expect("symbol query result")
+            .symbols
+            .into_iter()
+            .find(|symbol| symbol.rel_path == "src/extension.ts")
+            .expect("extension function symbol");
+        let refs = query_graph(&root, &symbol.id, 20, &config)?
+            .expect("extension function references")
+            .references;
+        assert_eq!(
+            refs.len(),
+            3,
+            "named import and both callback call sites should reference the function: {refs:?}"
+        );
+        assert!(
+            refs.iter().any(
+                |reference| reference.rel_path == "src/test/suite/callGraph.test.ts"
+                    && reference.start_line == 9
+            ),
+            "first callback call site should be indexed: {refs:?}"
+        );
+        assert!(
+            refs.iter().any(
+                |reference| reference.rel_path == "src/test/suite/callGraph.test.ts"
+                    && reference.start_line == 10
+            ),
+            "second callback call site should be indexed: {refs:?}"
+        );
+        let callback_doc = query_graph_document_symbols(
+            &root,
+            &file_uri(&suite.join("callGraph.test.ts")),
+            None,
+            None,
+            100,
+            &config,
+        )?
+        .expect("callback test document symbols");
+        assert!(
+            callback_doc
+                .symbols
+                .iter()
+                .all(|symbol| symbol.name != "suite" && symbol.name != "test"),
+            "TS callback invocations should not be indexed as function declarations: {:?}",
+            callback_doc.symbols
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn identifier_lexer_recovers_after_nested_template_literals() {
+        let mut state = IdentifierLexState::default();
+        let first = identifier_tokens_with_state(
+            "assert.ok(false, `expected ${items.map((edge) => `${edge.id}:${edge.kind}`).join(', ')}`);",
+            &mut state,
+        );
+        assert!(
+            first.iter().any(|(name, _, _)| name == "items"),
+            "template expression identifiers should still be visible: {first:?}"
+        );
+        let second = identifier_tokens_with_state(
+            "const callerItems = buildCallGraphQuickPickItems(pyCallers, 'callers');",
+            &mut state,
+        );
+        assert!(
+            second
+                .iter()
+                .any(|(name, _, _)| name == "buildCallGraphQuickPickItems"),
+            "lexer should leave nested templates and recover on the next code line: {second:?}"
+        );
+    }
+
+    #[test]
     fn native_rebuild_indexes_embedded_graphql_and_keeps_template_interpolation_refs(
     ) -> io::Result<()> {
         let root = temp_dir("graph-ts-graphql");
@@ -7626,6 +8429,18 @@ class User(models.Model):
 
     def display_name(self):
         return self.name
+
+class TimestampedModel(models.Model):
+    class Meta:
+        abstract = True
+
+class Invoice(
+    TimestampedModel,
+):
+    pass
+
+class Receipt(TimestampedModel):
+    pass
 "#,
         )?;
         fs::write(
@@ -7702,6 +8517,66 @@ schema = graphene.Schema(query=Query)
             .into_iter()
             .find(|symbol| symbol.name == "User" && symbol.rel_path == "app/models.py")
             .expect("User model symbol");
+        let timestamped_model = query_graph_symbols(&root, "TimestampedModel", 20, &config)?
+            .expect("TimestampedModel symbol query")
+            .symbols
+            .into_iter()
+            .find(|symbol| symbol.name == "TimestampedModel" && symbol.rel_path == "app/models.py")
+            .expect("TimestampedModel model symbol");
+        let timestamped_implementations =
+            query_graph_implementations(&root, &timestamped_model.id, 20, &config)?
+                .expect("TimestampedModel implementations");
+        let timestamped_implementation_names: BTreeSet<String> = timestamped_implementations
+            .symbols
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect();
+        assert!(
+            timestamped_implementation_names.contains("Invoice")
+                && timestamped_implementation_names.contains("Receipt"),
+            "expected multiline and single-line TimestampedModel subclasses, got {timestamped_implementation_names:?}"
+        );
+        let fast_models_doc = query_graph_document_symbols_with_options(
+            &root,
+            &file_uri(&root.join("app/models.py")),
+            None,
+            None,
+            50,
+            &config,
+            GraphSymbolQueryOptions {
+                include_usage_counts: true,
+                include_implementation_counts: false,
+            },
+        )?
+        .expect("fast model document symbols");
+        let fast_timestamped = fast_models_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "TimestampedModel")
+            .expect("fast TimestampedModel symbol");
+        assert_eq!(
+            fast_timestamped.implementation_count, None,
+            "fast document symbol query should avoid implementation index construction"
+        );
+        let invoice = fast_models_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Invoice")
+            .expect("Invoice symbol");
+        assert!(
+            invoice.body_end_line > invoice.start_line,
+            "Python class body range should cover the block, got {invoice:?}"
+        );
+        let display_name = fast_models_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "display_name")
+            .expect("display_name method");
+        assert!(
+            display_name.container_id.is_some()
+                && display_name.container_name.as_deref() == Some("User"),
+            "Python methods should carry container metadata, got {display_name:?}"
+        );
         let user_refs = query_graph(&root, &user_model.id, 20, &config)?
             .expect("User model references")
             .references;

@@ -265,7 +265,13 @@ suite('Search — engine end-to-end against fixture workspace', () => {
       useRegex: false,
       excludePatterns: ['nested/'],
     });
-    assert.deepStrictEqual(relPaths(matches), ['alpha.py', 'beta.js', 'docs.md']);
+    assert.deepStrictEqual(relPaths(matches), [
+      'alpha.py',
+      'beta.js',
+      'callgraph_external_api.js',
+      'callgraph_external_consumer.js',
+      'docs.md',
+    ]);
   });
 
   test('UTF-8 / Korean literal hits docs.md', async () => {

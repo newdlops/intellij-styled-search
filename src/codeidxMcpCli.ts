@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as https from 'https';
@@ -23,7 +24,6 @@ type CliOptions = {
   timeoutMs: number;
 };
 
-const DEFAULT_PORT = 8765;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 void main().catch((err) => {
@@ -37,7 +37,7 @@ async function main(): Promise<void> {
     printUsage();
     return;
   }
-  const endpoint = resolveEndpoint(options);
+  const endpoint = await resolveEndpoint(options);
   if (options.command === 'health') {
     const health = await getHealth(endpoint, options.timeoutMs);
     process.stdout.write(health + '\n');
@@ -78,7 +78,7 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case '--port':
         requireValue(key, value);
-        options.port = parsePositiveInt(value, key);
+        options.port = parsePort(value, key);
         i += consumedValue ? 2 : 1;
         break;
       case '--discovery-file':
@@ -107,20 +107,44 @@ function readCommand(raw: string | undefined): CliOptions['command'] {
   throw new Error(`unknown command: ${raw}`);
 }
 
-function resolveEndpoint(options: CliOptions): URL {
+async function resolveEndpoint(options: CliOptions): Promise<URL> {
   const explicit = options.url ?? process.env.CODEIDX_MCP_URL;
   if (explicit) { return normalizeMcpUrl(explicit); }
 
-  const discovery = readDiscoveryFile(options.discoveryFile ?? path.join(options.workspace, '.codeidx', 'mcp-server.json'));
-  if (discovery?.url) { return normalizeMcpUrl(discovery.url); }
+  const discoveryPath = options.discoveryFile ?? path.join(options.workspace, '.codeidx', 'mcp-server.json');
+  const expectedWorkspaceId = workspaceIdFor(options.workspace);
+  const initialDiscovery = readDiscoveryFile(discoveryPath, expectedWorkspaceId);
+  if (initialDiscovery?.url) { return normalizeMcpUrl(initialDiscovery.url); }
 
-  return normalizeMcpUrl(`http://127.0.0.1:${options.port ?? DEFAULT_PORT}/mcp`);
+  if (options.port !== undefined) {
+    return normalizeMcpUrl(`http://127.0.0.1:${options.port}/mcp`);
+  }
+
+  const deadline = Date.now() + options.timeoutMs;
+  do {
+    const discovery = readDiscoveryFile(discoveryPath, expectedWorkspaceId);
+    if (discovery?.url) { return normalizeMcpUrl(discovery.url); }
+    if (Date.now() >= deadline) { break; }
+    await delay(200);
+  } while (true);
+
+  throw new Error(
+    `codeidx MCP endpoint was not discovered for workspace ${options.workspace}. ` +
+    `Start the VS Code Codeidx MCP server for this workspace, or pass --url/--port explicitly.`,
+  );
 }
 
-function readDiscoveryFile(filePath: string): { url?: string } | undefined {
+function readDiscoveryFile(filePath: string, expectedWorkspaceId: string): { url?: string } | undefined {
   try {
-    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as { url?: unknown; transport?: unknown };
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as {
+      url?: unknown;
+      transport?: unknown;
+      workspace_id?: unknown;
+    };
     if (typeof parsed.url === 'string' && (!parsed.transport || parsed.transport === 'http')) {
+      if (typeof parsed.workspace_id === 'string' && parsed.workspace_id !== expectedWorkspaceId) {
+        return undefined;
+      }
       return { url: parsed.url };
     }
   } catch {}
@@ -136,6 +160,14 @@ function normalizeMcpUrl(value: string): URL {
     url.pathname = '/mcp';
   }
   return url;
+}
+
+function workspaceIdFor(workspace: string): string {
+  return `ws_${stableHash(path.resolve(workspace)).slice(0, 12)}`;
+}
+
+function stableHash(value: string): string {
+  return crypto.createHash('sha256').update(value).digest('hex');
 }
 
 async function runStdioProxy(endpoint: URL, timeoutMs: number): Promise<void> {
@@ -278,6 +310,14 @@ function parsePositiveInt(value: string, key: string): number {
   return Math.floor(parsed);
 }
 
+function parsePort(value: string, key: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 65535) {
+    throw new Error(`${key} must be an integer between 1 and 65535`);
+  }
+  return Math.floor(parsed);
+}
+
 function looksJson(text: string): boolean {
   const trimmed = text.trimStart();
   return trimmed.startsWith('{') || trimmed.startsWith('[');
@@ -290,12 +330,18 @@ function log(message: string): void {
 function printUsage(): void {
   process.stderr.write([
     'Usage:',
-    '  codeidx-mcp stdio [--workspace <path>] [--url <http://127.0.0.1:8765/mcp>] [--port <port>]',
-    '  codeidx-mcp proxy --url <http://127.0.0.1:8765/mcp>',
-    '  codeidx-mcp health [--workspace <path>] [--url <http://127.0.0.1:8765/mcp>]',
+    '  codeidx-mcp stdio [--workspace <path>] [--url <http://127.0.0.1:<port>/mcp>] [--port <port>]',
+    '  codeidx-mcp proxy --url <http://127.0.0.1:<port>/mcp>',
+    '  codeidx-mcp health [--workspace <path>] [--url <http://127.0.0.1:<port>/mcp>]',
     '',
     'The stdio command forwards newline-delimited MCP JSON-RPC messages to the VSCode extension HTTP endpoint.',
-    'If --url is omitted, CODEIDX_MCP_URL, <workspace>/.codeidx/mcp-server.json, then port 8765 are tried.',
+    'If --url is omitted, CODEIDX_MCP_URL and <workspace>/.codeidx/mcp-server.json are tried.',
+    'The discovery file is waited for until --connect-timeout-ms elapses.',
+    '--port is only a manual fallback; automatic multi-window use should rely on workspace discovery.',
     '',
   ].join('\n'));
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

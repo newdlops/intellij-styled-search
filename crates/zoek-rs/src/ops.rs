@@ -9,7 +9,7 @@ use crate::protocol::{
 };
 use crate::searcher::search_workspace;
 use crate::shard::{ShardDocument, ShardReader};
-use crate::verifier::matches_include_filters;
+use crate::verifier::matches_path_filters;
 use crate::watcher::build_change_batch;
 use std::collections::BTreeSet;
 use std::fs;
@@ -182,7 +182,7 @@ pub fn diagnose_query(
                 if latest_overlay.contains_key(&doc.rel_path) {
                     continue;
                 }
-                if !matches_include_filters(&doc.rel_path, &plan.include) {
+                if !matches_path_filters(&doc.rel_path, &plan.include, &plan.exclude) {
                     continue;
                 }
                 final_candidates.insert(doc.rel_path.clone());
@@ -195,7 +195,7 @@ pub fn diagnose_query(
             final_candidates.remove(&overlay_entry.rel_path);
             continue;
         }
-        if !matches_include_filters(&overlay_entry.rel_path, &plan.include) {
+        if !matches_path_filters(&overlay_entry.rel_path, &plan.include, &plan.exclude) {
             continue;
         }
         if !overlay_matches_plan(overlay_entry, &plan) {
@@ -285,6 +285,8 @@ pub fn benchmark_workspaces(
                     use_regex: false,
                     regex_multiline: true,
                     include: vec![],
+                    exclude: vec![],
+                    path_regex: None,
                     limit: 32,
                     offset: 0,
                 },
@@ -569,6 +571,8 @@ mod tests {
                 use_regex: false,
                 regex_multiline: true,
                 include: vec![],
+                exclude: vec![],
+                path_regex: None,
                 limit: 10,
                 offset: 0,
             },

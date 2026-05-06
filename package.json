@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.679",
+  "version": "0.1.692",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -301,6 +301,11 @@
           "default": false,
           "description": "Watch external filesystem delete events for zoekt incremental updates. Disabled by default so the extension does not subscribe to every workspace file event; saved editor documents and VS Code delete/rename operations are still tracked."
         },
+        "intellijStyledSearch.zoektWatchExternalFileChanges": {
+          "type": "boolean",
+          "default": true,
+          "description": "Watch external filesystem create/change events for zoekt incremental updates. Enabled by default so MCP and search results see files modified by external agents without falling back to a full workspace scan."
+        },
         "intellijStyledSearch.zoektUpdateDebounceMs": {
           "type": "number",
           "default": 5000,
@@ -386,13 +391,27 @@
         },
         "intellijStyledSearch.mcpPort": {
           "type": "number",
-          "default": 8765,
-          "description": "Localhost port used by the codeidx MCP JSON-RPC endpoint when `Start Codeidx MCP Server` is run. Set to 0 to let the OS choose a free port."
+          "default": 0,
+          "description": "Localhost port used by the codeidx MCP JSON-RPC endpoint. The default 0 lets the OS choose a free per-window port and records it in the workspace discovery file."
+        },
+        "intellijStyledSearch.mcpAutoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the localhost codeidx MCP endpoint in trusted workspaces when the extension activates, so Codex and Claude can discover the project server without using the Start Codeidx MCP Server command."
         },
         "intellijStyledSearch.callGraphWatchExternalFileChanges": {
           "type": "boolean",
           "default": false,
           "description": "Watch external filesystem create/change/delete events for call graph incremental updates. Disabled by default so call graph updates only follow confirmed VS Code save/create/delete/rename operations."
+        },
+        "intellijStyledSearch.callGraphBackend": {
+          "type": "string",
+          "enum": [
+            "rust-native",
+            "javascript"
+          ],
+          "default": "rust-native",
+          "description": "Backend used for call graph rebuilds. rust-native stores the primary graph in the zoekt-rs index for low-token MCP lookups; javascript materializes the legacy full JS snapshot and is mainly used for semantic parity tests."
         },
         "intellijStyledSearch.callGraphConcurrency": {
           "type": "number",

@@ -163,6 +163,21 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   const callGraphInlayRegistry = new CallGraphInlayRegistry();
   const mcpServer = new CallGraphMcpServer(callGraph, callGraphLog, overlay);
   context.subscriptions.push(callGraph, mcpServer);
+  const mcpAutoStart = vscode.workspace.getConfiguration('intellijStyledSearch').get<boolean>('mcpAutoStart', true);
+  if (mcpAutoStart && vscode.workspace.isTrusted && vscode.workspace.workspaceFolders?.length) {
+    void (async () => {
+      try {
+        const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+        const port = cfg.get<number>('mcpPort', 0);
+        const url = await mcpServer.start(port);
+        callGraphLog.appendLine(`codeidx MCP auto-started: ${url}`);
+      } catch (err) {
+        callGraphLog.appendLine(`codeidx MCP auto-start failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    })();
+  } else if (mcpAutoStart && !vscode.workspace.isTrusted) {
+    callGraphLog.appendLine('codeidx MCP auto-start skipped: workspace is not trusted');
+  }
   context.subscriptions.push(
     vscode.workspace.onDidChangeTextDocument((event) => {
       callGraphInlayRegistry.invalidateDocument(event.document.uri);
@@ -223,16 +238,16 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
           );
           try {
             const snapshot = await callGraph.rebuild((progress) => {
-              const percent = progress.total > 0
-                ? Math.min(100, Math.round((progress.current / progress.total) * 100))
-                : 0;
+              const rawPercent = estimateCallGraphOverallProgressPercent(progress);
+              const percent = Math.max(lastPercent, rawPercent);
               const message = formatCallGraphProgressMessage(progress);
               latestMessage = message;
               latestPercent = percent;
               const increment = Math.max(0, percent - lastPercent);
               lastPercent = Math.max(lastPercent, percent);
               ui.report({ message, increment });
-              status.text = `$(sync~spin) Call graph ${percent}% ${progress.current}/${progress.total}`;
+              const byteInfo = formatCallGraphProgressBytes(progress);
+              status.text = `$(sync~spin) Call graph ${percent}% ${progress.stage} ${progress.current}/${progress.total}${byteInfo ? ` ${byteInfo}` : ''}`;
               const now = Date.now();
               if (progress.stage !== lastStage || now - lastLogAt >= 1_000 || progress.stage === 'done') {
                 const heapInfo = progress.heapUsedMb !== undefined && progress.heapLimitMb !== undefined && progress.heapUsageRatio !== undefined
@@ -240,6 +255,7 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
                   : '';
                 callGraphLog.appendLine(
                   `call graph progress: stage=${progress.stage} current=${progress.current}/${progress.total} ` +
+                  `${byteInfo ? `${byteInfo} ` : ''}` +
                   `parsed=${progress.parsedFiles} skipped=${progress.skippedFiles} warnings=${progress.warningCount} ` +
                   `workers=${progress.concurrency}/${progress.maxConcurrency ?? progress.concurrency}${heapInfo} elapsed=${progress.elapsedMs}ms`,
                 );
@@ -487,7 +503,7 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       overlay.logCommand('startMcpServer');
       try {
         const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-        const port = cfg.get<number>('mcpPort', 8765);
+        const port = cfg.get<number>('mcpPort', 0);
         const url = await mcpServer.start(port);
         vscode.window.showInformationMessage(`IntelliJ Styled Search MCP server: ${url}`);
       } catch (err) {
@@ -1240,9 +1256,13 @@ export function formatCallGraphProgressMessage(progress: CallGraphRebuildProgres
   const heapInfo = progress.heapUsedMb !== undefined && progress.heapLimitMb !== undefined && progress.heapUsageRatio !== undefined
     ? `heap=${progress.heapUsedMb}/${progress.heapLimitMb}MB(${Math.round(progress.heapUsageRatio * 100)}%)`
     : '';
+  const byteInfo = formatCallGraphProgressBytes(progress);
+  const overallPercent = estimateCallGraphOverallProgressPercent(progress);
   return [
     progress.message,
+    `overall=${overallPercent}%`,
     progress.total > 0 ? `${progress.current}/${progress.total}` : '',
+    byteInfo,
     `parsed=${progress.parsedFiles}`,
     `skipped=${progress.skippedFiles}`,
     `workers=${progress.concurrency}/${progress.maxConcurrency ?? progress.concurrency}`,
@@ -1250,6 +1270,35 @@ export function formatCallGraphProgressMessage(progress: CallGraphRebuildProgres
     progress.workerThrottleCount ? `throttles=${progress.workerThrottleCount}` : '',
     `${progress.elapsedMs}ms`,
   ].filter(Boolean).join(' ');
+}
+
+function formatCallGraphProgressBytes(progress: CallGraphRebuildProgress): string {
+  return progress.currentBytes !== undefined && progress.totalBytes !== undefined
+    ? `bytes=${progress.currentBytes}/${progress.totalBytes}`
+    : '';
+}
+
+export function estimateCallGraphOverallProgressPercent(progress: CallGraphRebuildProgress): number {
+  if (progress.stage === 'done') { return 100; }
+  const [start, end] = callGraphStageProgressRange(progress.stage);
+  const stageRatio = progress.totalBytes !== undefined && progress.totalBytes > 0 && progress.currentBytes !== undefined
+    ? Math.max(0, Math.min(1, progress.currentBytes / progress.totalBytes))
+    : progress.total > 0
+    ? Math.max(0, Math.min(1, progress.current / progress.total))
+    : 0;
+  return Math.max(0, Math.min(99, Math.round(start + (end - start) * stageRatio)));
+}
+
+function callGraphStageProgressRange(stage: CallGraphRebuildProgress['stage']): [number, number] {
+  switch (stage) {
+    case 'discovering': return [0, 5];
+    case 'parsing': return [5, 45];
+    case 'resolving': return [45, 80];
+    case 'indexing': return [80, 98];
+    case 'deduping': return [98, 99];
+    case 'done': return [100, 100];
+    default: return [0, 99];
+  }
 }
 
 class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {

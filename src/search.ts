@@ -11,6 +11,9 @@ export interface SearchOptions {
   regexMultiline?: boolean;
   includePatterns?: string[];
   excludePatterns?: string[];
+  pathRegex?: string;
+  forceFullScan?: boolean;
+  ignoreConfiguredExcludes?: boolean;
   resultOffset?: number;
   resultLimit?: number;
 }
@@ -203,11 +206,12 @@ export async function runSearch(
   }
 
   const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-  const excludeGlobs = cfg.get<string[]>('excludeGlobs', []);
+  const excludeGlobs = opts.ignoreConfiguredExcludes ? [] : cfg.get<string[]>('excludeGlobs', []);
   const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
   const resultLimit = getRequestedResultLimit(opts, cfg);
   const resultOffset = getRequestedResultOffset(opts);
   const pathScopeMatcher = compilePathScopeMatcher(opts.includePatterns, opts.excludePatterns);
+  const pathRegexMatcher = compileSearchPathRegex(opts.pathRegex);
 
   let files: vscode.Uri[];
   // Fast path: trigram index already told us exactly which files could
@@ -236,6 +240,13 @@ export async function runSearch(
 
   if (pathScopeMatcher) {
     files = files.filter((uri) => pathScopeMatcher(vscode.workspace.asRelativePath(uri, false)));
+    if (files.length === 0) {
+      progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
+      return;
+    }
+  }
+  if (pathRegexMatcher) {
+    files = files.filter((uri) => pathRegexMatcher(vscode.workspace.asRelativePath(uri, false)));
     if (files.length === 0) {
       progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
       return;
@@ -356,6 +367,16 @@ const LIBRARY_FILENAME_RE = /(?:^|\/)(?:yarn\.lock|package-lock\.json|pnpm-lock\
 
 export function isLibraryPath(rel: string): boolean {
   return LIBRARY_PATH_RE.test('/' + rel) || LIBRARY_FILENAME_RE.test('/' + rel);
+}
+
+export function compileSearchPathRegex(pattern: string | undefined): ((relPath: string) => boolean) | null {
+  if (!pattern) { return null; }
+  try {
+    const regex = new RegExp(pattern);
+    return (relPath: string) => regex.test(relPath.replace(/\\/g, '/'));
+  } catch {
+    return null;
+  }
 }
 
 export { collectOpenTabUris };

@@ -12,6 +12,7 @@ import {
   getRequestedResultLimit,
   getRequestedResultOffset,
   isRegexMultilineEnabled,
+  compileSearchPathRegex,
   FILE_MATCH_CHUNK_MATCH_LIMIT,
   FILE_MATCH_CHUNK_CHAR_LIMIT,
 } from './search';
@@ -341,11 +342,12 @@ export async function runRgSearch(
   }
 
   const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-  const excludeGlobs = cfg.get<string[]>('excludeGlobs', []);
+  const excludeGlobs = opts.ignoreConfiguredExcludes ? [] : cfg.get<string[]>('excludeGlobs', []);
   const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
   const resultLimit = getRequestedResultLimit(opts, cfg);
   const resultOffset = getRequestedResultOffset(opts);
   const pathScopeMatcher = compilePathScopeMatcher(opts.includePatterns, opts.excludePatterns);
+  const pathRegexMatcher = compileSearchPathRegex(opts.pathRegex);
   const includeGlobs = toRipgrepGlobs(opts.includePatterns);
   const scopeExcludeGlobs = toRipgrepGlobs(opts.excludePatterns);
 
@@ -383,8 +385,11 @@ export async function runRgSearch(
   // headroom for other args, 5000 paths is a safe ceiling before `spawn`
   // would start erroring with E2BIG.
   const MAX_POSITIONAL = 5000;
-  const narrowedFiles = candidateFiles && pathScopeMatcher
-    ? candidateFiles.filter((fsPath) => pathScopeMatcher(vscode.workspace.asRelativePath(vscode.Uri.file(fsPath), false)))
+  const narrowedFiles = candidateFiles && (pathScopeMatcher || pathRegexMatcher)
+    ? candidateFiles.filter((fsPath) => {
+        const relPath = vscode.workspace.asRelativePath(vscode.Uri.file(fsPath), false);
+        return (!pathScopeMatcher || pathScopeMatcher(relPath)) && (!pathRegexMatcher || pathRegexMatcher(relPath));
+      })
     : candidateFiles;
   if (candidateFiles && narrowedFiles && narrowedFiles.length === 0) {
     progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
@@ -487,6 +492,9 @@ export async function runRgSearch(
           approxChars: 0,
           emitted: false,
         };
+        if (pathRegexMatcher && !pathRegexMatcher(pendingFile.relPath)) {
+          pendingFile = null;
+        }
         break;
       }
       case 'match': {

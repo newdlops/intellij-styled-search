@@ -20,6 +20,8 @@ pub struct QueryPlan {
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub path_regex: Option<String>,
     pub required_literals: Vec<String>,
     pub required_grams: Vec<String>,
 }
@@ -78,6 +80,8 @@ pub fn build_query_plan(request: &SearchRequest) -> QueryPlan {
         case_sensitive: request.case_sensitive,
         whole_word: request.whole_word,
         include: request.include.clone(),
+        exclude: request.exclude.clone(),
+        path_regex: request.path_regex.clone(),
         required_literals,
         required_grams,
     }
@@ -118,6 +122,8 @@ mod tests {
             use_regex: false,
             regex_multiline: true,
             include: vec![],
+            exclude: vec![],
+            path_regex: None,
             limit: 10,
             offset: 0,
         });

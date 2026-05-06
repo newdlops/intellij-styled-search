@@ -79,6 +79,8 @@ export interface ZoektSearchRequest {
   useRegex: boolean;
   regexMultiline: boolean;
   include: string[];
+  exclude: string[];
+  pathRegex?: string;
   limit: number;
   offset: number;
 }

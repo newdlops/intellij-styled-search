@@ -4,8 +4,10 @@ use std::path::PathBuf;
 
 use zoek_rs::config::EngineConfig;
 use zoek_rs::graph::{
-    index_graph_from_tsv, query_graph, query_graph_document_symbols, query_graph_symbols,
-    rebuild_graph_native, update_graph_native, GraphSymbol,
+    index_graph_from_tsv, query_graph, query_graph_callees,
+    query_graph_document_symbols_with_options, query_graph_implementations,
+    query_graph_symbols_with_options, rebuild_graph_native, update_graph_native, GraphSymbol,
+    GraphSymbolQueryOptions,
 };
 use zoek_rs::indexer::index_directory_with_progress;
 use zoek_rs::mmap_store::StoreLayout;
@@ -48,7 +50,9 @@ fn run(args: Vec<String>) -> Result<EngineResponse, String> {
         "graph-index" => run_graph_index(&args[1..]),
         "graph-update" => run_graph_update(&args[1..]),
         "graph-query" => run_graph_query(&args[1..]),
+        "graph-callees" => run_graph_callees(&args[1..]),
         "graph-symbol-query" => run_graph_symbol_query(&args[1..]),
+        "graph-implementations" => run_graph_implementations(&args[1..]),
         _ => Err(usage()),
     }
 }
@@ -230,6 +234,8 @@ fn run_search(args: &[String]) -> Result<EngineResponse, String> {
         use_regex: false,
         regex_multiline: true,
         include: Vec::new(),
+        exclude: Vec::new(),
+        path_regex: None,
         limit: 200,
         offset: 0,
     };
@@ -258,6 +264,20 @@ fn run_search(args: &[String]) -> Result<EngineResponse, String> {
                     .get(idx + 1)
                     .ok_or_else(|| "--include requires a value".to_string())?;
                 request.include.push(value.clone());
+                idx += 2;
+            }
+            "--exclude" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--exclude requires a value".to_string())?;
+                request.exclude.push(value.clone());
+                idx += 2;
+            }
+            "--path-regex" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--path-regex requires a value".to_string())?;
+                request.path_regex = Some(value.clone());
                 idx += 2;
             }
             "--limit" => {
@@ -304,6 +324,8 @@ fn run_diagnose(args: &[String]) -> Result<EngineResponse, String> {
         use_regex: false,
         regex_multiline: true,
         include: Vec::new(),
+        exclude: Vec::new(),
+        path_regex: None,
         limit: 200,
         offset: 0,
     };
@@ -332,6 +354,20 @@ fn run_diagnose(args: &[String]) -> Result<EngineResponse, String> {
                     .get(idx + 1)
                     .ok_or_else(|| "--include requires a value".to_string())?;
                 request.include.push(value.clone());
+                idx += 2;
+            }
+            "--exclude" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--exclude requires a value".to_string())?;
+                request.exclude.push(value.clone());
+                idx += 2;
+            }
+            "--path-regex" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--path-regex requires a value".to_string())?;
+                request.path_regex = Some(value.clone());
                 idx += 2;
             }
             other => return Err(format!("unknown diagnose flag: {other}")),
@@ -616,6 +652,78 @@ fn run_graph_query(args: &[String]) -> Result<EngineResponse, String> {
             .references
             .into_iter()
             .map(|reference| GraphQueryReference {
+                target_symbol_id: reference.target_symbol_id,
+                edge_kind: reference.edge_kind,
+                name: reference.name,
+                raw_text: reference.raw_text,
+                uri: reference.uri,
+                rel_path: reference.rel_path,
+                start_line: reference.start_line,
+                start_column: reference.start_column,
+                end_line: reference.end_line,
+                end_column: reference.end_column,
+                enclosing_symbol_id: reference.enclosing_symbol_id,
+            })
+            .collect(),
+        warnings: Vec::new(),
+    }))
+}
+
+fn run_graph_callees(args: &[String]) -> Result<EngineResponse, String> {
+    let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
+    let mut symbol_id: Option<String> = None;
+    let mut limit = 500usize;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--symbol-id" => {
+                symbol_id = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "--symbol-id requires a value".to_string())?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            "--limit" => {
+                limit = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--limit requires a value".to_string())?
+                    .parse::<usize>()
+                    .map_err(|_| "--limit must be an integer".to_string())?
+                    .max(1);
+                idx += 2;
+            }
+            other => return Err(format!("unknown graph-callees flag: {other}")),
+        }
+    }
+    let symbol_id = symbol_id.ok_or_else(|| "--symbol-id requires a value".to_string())?;
+    let result = query_graph_callees(&workspace_root, &symbol_id, limit, &EngineConfig::default())
+        .map_err(|err| err.to_string())?;
+    let Some(result) = result else {
+        return Ok(EngineResponse::GraphQuery(GraphQueryResponse {
+            ok: true,
+            engine: EngineInfo::current(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            symbol_id,
+            built_at_unix_ms: 0,
+            total_references: 0,
+            references: Vec::new(),
+            warnings: vec!["call graph binary index missing".to_string()],
+        }));
+    };
+    Ok(EngineResponse::GraphQuery(GraphQueryResponse {
+        ok: true,
+        engine: EngineInfo::current(),
+        workspace_root: result.workspace_root,
+        symbol_id: result.symbol_id,
+        built_at_unix_ms: result.built_at_unix_ms,
+        total_references: result.total_references,
+        references: result
+            .references
+            .into_iter()
+            .map(|reference| GraphQueryReference {
+                target_symbol_id: reference.target_symbol_id,
+                edge_kind: reference.edge_kind,
                 name: reference.name,
                 raw_text: reference.raw_text,
                 uri: reference.uri,
@@ -638,6 +746,7 @@ fn run_graph_symbol_query(args: &[String]) -> Result<EngineResponse, String> {
     let mut start_line: Option<u32> = None;
     let mut end_line: Option<u32> = None;
     let mut limit = 200usize;
+    let mut options = GraphSymbolQueryOptions::default();
     let mut idx = 1usize;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -683,20 +792,35 @@ fn run_graph_symbol_query(args: &[String]) -> Result<EngineResponse, String> {
                     .max(1);
                 idx += 2;
             }
+            "--no-usage-counts" => {
+                options.include_usage_counts = false;
+                idx += 1;
+            }
+            "--no-implementation-counts" => {
+                options.include_implementation_counts = false;
+                idx += 1;
+            }
             other => return Err(format!("unknown graph-symbol-query flag: {other}")),
         }
     }
     let result = if let Some(uri) = uri {
-        query_graph_document_symbols(
+        query_graph_document_symbols_with_options(
             &workspace_root,
             &uri,
             start_line,
             end_line,
             limit,
             &EngineConfig::default(),
+            options,
         )
     } else {
-        query_graph_symbols(&workspace_root, &query, limit, &EngineConfig::default())
+        query_graph_symbols_with_options(
+            &workspace_root,
+            &query,
+            limit,
+            &EngineConfig::default(),
+            options,
+        )
     }
     .map_err(|err| err.to_string())?;
     let Some(result) = result else {
@@ -708,6 +832,63 @@ fn run_graph_symbol_query(args: &[String]) -> Result<EngineResponse, String> {
             total_symbols: 0,
             symbols: Vec::new(),
             warnings: vec!["call graph symbol index missing".to_string()],
+        }));
+    };
+    Ok(EngineResponse::GraphSymbolQuery(GraphSymbolQueryResponse {
+        ok: true,
+        engine: EngineInfo::current(),
+        workspace_root: result.workspace_root,
+        built_at_unix_ms: result.built_at_unix_ms,
+        total_symbols: result.total_symbols,
+        symbols: result
+            .symbols
+            .into_iter()
+            .map(graph_symbol_response_from_symbol)
+            .collect(),
+        warnings: Vec::new(),
+    }))
+}
+
+fn run_graph_implementations(args: &[String]) -> Result<EngineResponse, String> {
+    let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
+    let mut symbol_id: Option<String> = None;
+    let mut limit = 200usize;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--symbol-id" => {
+                symbol_id = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "--symbol-id requires a value".to_string())?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            "--limit" => {
+                limit = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--limit requires a value".to_string())?
+                    .parse::<usize>()
+                    .map_err(|_| "--limit must be an integer".to_string())?
+                    .max(1);
+                idx += 2;
+            }
+            other => return Err(format!("unknown graph-implementations flag: {other}")),
+        }
+    }
+    let symbol_id = symbol_id.ok_or_else(|| "--symbol-id requires a value".to_string())?;
+    let result =
+        query_graph_implementations(&workspace_root, &symbol_id, limit, &EngineConfig::default())
+            .map_err(|err| err.to_string())?;
+    let Some(result) = result else {
+        return Ok(EngineResponse::GraphSymbolQuery(GraphSymbolQueryResponse {
+            ok: true,
+            engine: EngineInfo::current(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            built_at_unix_ms: 0,
+            total_symbols: 0,
+            symbols: Vec::new(),
+            warnings: vec!["call graph implementation index missing".to_string()],
         }));
     };
     Ok(EngineResponse::GraphSymbolQuery(GraphSymbolQueryResponse {
@@ -753,5 +934,5 @@ fn graph_symbol_response_from_symbol(symbol: GraphSymbol) -> GraphSymbolResponse
 }
 
 fn usage() -> String {
-    "usage: zoek-rs <index|compact|update|search|info|diagnose|benchmark|graph-rebuild|graph-index|graph-update|graph-query|graph-symbol-query> ...".to_string()
+    "usage: zoek-rs <index|compact|update|search|info|diagnose|benchmark|graph-rebuild|graph-index|graph-update|graph-query|graph-callees|graph-symbol-query|graph-implementations> ...".to_string()
 }

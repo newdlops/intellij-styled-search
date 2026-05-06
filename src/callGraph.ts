@@ -68,6 +68,7 @@ export interface CallGraphEdge {
 
 export interface CallGraphReference {
   symbolId: string;
+  edgeKind?: string;
   name: string;
   rawText: string;
   uri: string;
@@ -135,6 +136,8 @@ export interface CallGraphRebuildProgress {
   elapsedMs: number;
   concurrency: number;
   maxConcurrency?: number;
+  currentBytes?: number;
+  totalBytes?: number;
   heapUsedMb?: number;
   heapLimitMb?: number;
   heapUsageRatio?: number;
@@ -300,6 +303,8 @@ type CallGraphDocumentSummaryFileChunk = CallGraphCacheChunk & {
 };
 
 type RustGraphQueryReference = {
+  targetSymbolId?: string;
+  edgeKind?: string;
   name: string;
   rawText: string;
   uri: string;
@@ -354,6 +359,19 @@ type RustGraphSymbolQueryResponse = {
   totalSymbols?: number;
   symbols?: RustGraphSymbol[];
   warnings?: string[];
+};
+
+type PositionIdentifier = {
+  name: string;
+  lineText: string;
+  start: number;
+  end: number;
+  documentText: string;
+};
+
+type ImportedSymbolTarget = {
+  relPath: string;
+  importedName: string;
 };
 
 type ParsedSourceFileResult = {
@@ -629,7 +647,9 @@ const CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS = 75;
 const CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK = 50_000;
 const CALL_GRAPH_SYMBOL_RELATION_BUCKETS = 256;
 const CALL_GRAPH_DOCUMENT_SUMMARY_BUCKETS = 256;
+const MODULE_IMPORT_TARGET = '*module*';
 const RUST_GRAPH_QUERY_TIMEOUT_MS = 30_000;
+const RUST_GRAPH_DOCUMENT_SYMBOL_QUERY_TIMEOUT_MS = 3_000;
 const RUST_GRAPH_PROCESS_KILL_TIMEOUT_MS = 2_000;
 const INTERNAL_CALL_GRAPH_EXCLUDE_GLOBS = [
   '**/.zoek-rs/**',
@@ -644,8 +664,11 @@ type RustGraphProcessKind =
   | 'graph-update'
   | 'graph-index'
   | 'graph-query'
+  | 'graph-callees'
   | 'graph-symbol-query'
   | 'other';
+
+type CallGraphBackend = 'rust-native' | 'javascript';
 
 type RustGraphTrackedChild = {
   id: number;
@@ -861,7 +884,7 @@ export class CallGraphService implements vscode.Disposable {
 
   async resolveSymbolsResolved(query: string, limit = 20): Promise<CallGraphSymbol[]> {
     const cached = this.resolveSymbols(query, limit);
-    if (cached.length > 0 || !this.isRustNativeIndexOnly() || !query.trim()) { return cached; }
+    if (!this.isRustNativeIndexOnly() || !query.trim()) { return cached; }
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
     if (!folder || !manifest?.builtAtUnixMs) { return cached; }
@@ -869,14 +892,96 @@ export class CallGraphService implements vscode.Disposable {
       folder.uri.fsPath,
       { query: query.trim(), limit },
       manifest.builtAtUnixMs,
+      { includeImplementationCounts: false },
     );
     if (!symbols) { return cached; }
     if (this.cacheManifest?.builtAtUnixMs !== manifest.builtAtUnixMs) { return cached; }
+    if (symbols.length === 0 && cached.length > 0) { return cached; }
     this.rustSymbolQueryCache.set(rustSymbolQueryCacheKey(query, limit), {
       builtAtUnixMs: manifest.builtAtUnixMs,
       symbols,
     });
     return symbols;
+  }
+
+  async findUsagesResolved(symbolOrQuery: string, limit = 500): Promise<CallGraphReference[]> {
+    const symbols = await this.resolveSymbolsResolved(symbolOrQuery, Math.min(Math.max(limit, 1), 200));
+    if (symbols.length === 0) { return []; }
+    const out: CallGraphReference[] = [];
+    const seen = new Set<string>();
+    for (const symbol of symbols) {
+      const usages = await this.findUsagesForSymbolIdFromCache(symbol.id, limit) ?? this.findUsages(symbol.id, limit);
+      for (const reference of usages) {
+        const key = referenceLocationKey(reference);
+        if (seen.has(key)) { continue; }
+        seen.add(key);
+        out.push(reference);
+        if (out.length >= limit) { return out; }
+      }
+    }
+    return out;
+  }
+
+  async findDeclarationSymbolsAtPositionResolved(uri: vscode.Uri, position: vscode.Position): Promise<CallGraphSymbol[]> {
+    const cached = this.findDeclarationSymbolsAtPosition(uri, position);
+    if (cached.length > 0) { return cached; }
+    if (!this.isRustNativeIndexOnly()) { return cached; }
+    const localSymbols = await this.getDocumentSymbolsFromLocalParse(uri, 'resolve-at-declaration-fast-path');
+    const localDeclarations = localSymbols
+      .filter((symbol) => symbol.uri === uri.toString() && rangeContainsPosition(symbol.range, position))
+      .sort((a, b) => rangeSize(a.range) - rangeSize(b.range));
+    if (localDeclarations.length > 0) { return dedupeSymbols(localDeclarations); }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const manifest = this.cacheManifest;
+    if (!folder || !manifest?.builtAtUnixMs) { return cached; }
+    const symbols = await this.queryRustGraphSymbolIndex(
+      folder.uri.fsPath,
+      {
+        uri: uri.toString(),
+        startLine: Math.max(0, position.line - 1),
+        endLine: position.line + 1,
+        limit: 200,
+      },
+      manifest.builtAtUnixMs,
+      {
+        includeImplementationCounts: false,
+        timeoutMs: RUST_GRAPH_DOCUMENT_SYMBOL_QUERY_TIMEOUT_MS,
+      },
+    );
+    if (!symbols || this.cacheManifest?.builtAtUnixMs !== manifest.builtAtUnixMs) { return cached; }
+    const declarations = symbols
+      .filter((symbol) => symbol.uri === uri.toString() && rangeContainsPosition(symbol.range, position))
+      .sort((a, b) => rangeSize(a.range) - rangeSize(b.range));
+    return declarations.length > 0 ? dedupeSymbols(declarations) : cached;
+  }
+
+  async findTargetsAtPositionResolved(uri: vscode.Uri, position: vscode.Position): Promise<CallGraphSymbol[]> {
+    const declarations = await this.findDeclarationSymbolsAtPositionResolved(uri, position);
+    if (declarations.length > 0) { return declarations; }
+    const cached = this.findTargetsAtPosition(uri, position);
+    if (!this.isRustNativeIndexOnly()) { return cached; }
+    if (cached.length > 0) { return cached; }
+    const token = await this.identifierAtPosition(uri, position);
+    if (!token || isCodeIdentifierKeyword(token.name) || isProbableLocalDeclarationIdentifier(token)) { return []; }
+    const sourceRelPath = workspaceRelativePathForUri(uri);
+    const importedTargets = importedTargetsForIdentifier(token.documentText, sourceRelPath, token.name);
+    const allowedRelPaths = new Set<string>([
+      ...(sourceRelPath ? [sourceRelPath] : []),
+      ...importedTargets.map((target) => target.relPath),
+    ]);
+    if (allowedRelPaths.size === 0) { return []; }
+    const resolved = await this.resolveSymbolsResolved(token.name, 50);
+    const exact = resolved.filter((symbol) => symbol.name === token.name || symbol.qualifiedName.endsWith(`.${token.name}`));
+    const candidates = (exact.length > 0 ? exact : resolved)
+      .filter((symbol) => !(symbol.uri === uri.toString() && rangeContainsPosition(symbol.range, position)))
+      .filter((symbol) => allowedRelPaths.has(symbol.relPath))
+      .filter((symbol) => sourceRelPath === symbol.relPath || importedTargets.some((target) =>
+        target.relPath === symbol.relPath &&
+        (target.importedName === MODULE_IMPORT_TARGET || symbol.name === target.importedName || symbol.qualifiedName.endsWith(`.${target.importedName}`))))
+      .sort((a, b) =>
+        scorePositionResolvedSymbol(b, token.name, uri) - scorePositionResolvedSymbol(a, token.name, uri) ||
+        a.qualifiedName.localeCompare(b.qualifiedName));
+    return dedupeSymbols(candidates).slice(0, 10);
   }
 
   findEnclosingSymbol(uri: vscode.Uri, position: vscode.Position): CallGraphSymbol | undefined {
@@ -927,6 +1032,16 @@ export class CallGraphService implements vscode.Disposable {
     if (edgeTargets.length > 0) { return dedupeSymbols(edgeTargets); }
     const enclosing = this.findEnclosingSymbol(uri, position);
     return enclosing ? [enclosing] : [];
+  }
+
+  private async identifierAtPosition(uri: vscode.Uri, position: vscode.Position): Promise<PositionIdentifier | undefined> {
+    try {
+      const document = await vscode.workspace.openTextDocument(uri);
+      if (position.line < 0 || position.line >= document.lineCount) { return undefined; }
+      return identifierAtLinePosition(document.lineAt(position.line).text, position.character, document.getText());
+    } catch {
+      return undefined;
+    }
   }
 
   getCallers(symbolOrQuery: string, limit = 200): CallGraphQueryResult[] {
@@ -1096,6 +1211,34 @@ export class CallGraphService implements vscode.Disposable {
     return dedupeSymbols(out).slice(0, limit);
   }
 
+  async findImplementationsResolved(symbolOrQuery: string, limit = 200): Promise<CallGraphSymbol[]> {
+    const symbols = await this.resolveSymbolsResolved(symbolOrQuery, Math.min(Math.max(limit, 1), 200));
+    if (symbols.length === 0) { return []; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const manifest = this.cacheManifest;
+    if (this.isRustNativeIndexOnly() && folder && manifest?.builtAtUnixMs) {
+      const out: CallGraphSymbol[] = [];
+      const seen = new Set<string>();
+      for (const symbol of symbols) {
+        const implementations = await this.queryRustGraphImplementationIndex(
+          folder.uri.fsPath,
+          symbol.id,
+          Math.max(1, limit - out.length),
+          manifest.builtAtUnixMs,
+        );
+        if (!implementations) { continue; }
+        for (const implementation of implementations) {
+          if (seen.has(implementation.id)) { continue; }
+          seen.add(implementation.id);
+          out.push(implementation);
+          if (out.length >= limit) { return out; }
+        }
+      }
+      return out;
+    }
+    return dedupeSymbols(symbols.flatMap((symbol) => this.findImplementations(symbol.id, limit))).slice(0, limit);
+  }
+
   findImplementationsAtPosition(uri: vscode.Uri, position: vscode.Position, limit = 200): CallGraphSymbol[] {
     const targets = this.findTargetsAtPosition(uri, position);
     if (targets.length === 0) { return []; }
@@ -1170,17 +1313,79 @@ export class CallGraphService implements vscode.Disposable {
       }));
   }
 
+  async getDocumentSymbolsResolved(uri: vscode.Uri, limit = 10_000): Promise<CallGraphSymbol[]> {
+    const snapshot = await this.ensureBuilt();
+    if (!this.isRustNativeIndexOnly()) {
+      return snapshot.symbols
+        .filter((symbol) => symbol.uri === uri.toString())
+        .sort((a, b) => a.range.startLine - b.range.startLine || a.name.localeCompare(b.name))
+        .slice(0, limit);
+    }
+    const uriString = uri.toString();
+    const cached = this.getCachedDocumentSymbols(uriString);
+    if (cached.length > 0 && !this.rustNativeDirtySummaryUris.has(uriString)) {
+      return cached
+        .sort((a, b) => a.range.startLine - b.range.startLine || a.name.localeCompare(b.name))
+        .slice(0, limit);
+    }
+    const local = await this.getDocumentSymbolsFromLocalParse(uri, 'rust-native-document-symbol-fast-path');
+    if (local.length > 0) {
+      return local
+        .sort((a, b) => a.range.startLine - b.range.startLine || a.name.localeCompare(b.name))
+        .slice(0, limit);
+    }
+    await this.ensureRustNativeDocumentSummary(uri, {
+      timeoutMs: RUST_GRAPH_DOCUMENT_SYMBOL_QUERY_TIMEOUT_MS,
+    });
+    let symbols = this.getCachedDocumentSymbols(uriString);
+    if (symbols.length === 0) {
+      symbols = await this.getDocumentSymbolsFromLocalParse(uri, 'rust-native-document-summary-miss');
+    }
+    return symbols
+      .sort((a, b) => a.range.startLine - b.range.startLine || a.name.localeCompare(b.name))
+      .slice(0, limit);
+  }
+
   private getCachedDocumentSymbols(uriString: string): CallGraphSymbol[] {
     const bucket = documentSummaryBucketForUri(uriString);
     const record = this.documentSummaryBucketsByIndex.get(bucket)?.get(uriString);
     return record?.symbols.map((summary) => summary.symbol) ?? [];
   }
 
+  private async getDocumentSymbolsFromLocalParse(uri: vscode.Uri, reason: string): Promise<CallGraphSymbol[]> {
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const parsed = await parseSourceFileRecord(
+      uri,
+      getConfiguredCallGraphMaxFileSize(cfg),
+      getConfiguredCallGraphParseLimits(cfg),
+    );
+    if (!parsed.record) { return []; }
+    const symbols = parsed.record.parsed.symbols
+      .filter((symbol) => isCallableSymbol(symbol) || isTypeSymbol(symbol) || isReferenceableSymbol(symbol))
+      .map(stripMutableSymbol);
+    const record: CallGraphDocumentSummaryRecord = {
+      uri: parsed.record.uri,
+      relPath: parsed.record.relPath,
+      symbols: symbols.map((symbol) => ({
+        symbol,
+        callerCount: 0,
+        calleeCount: 0,
+        implementationCount: 0,
+        usageCount: 0,
+      })),
+    };
+    this.putDocumentSummaryRecord(record);
+    this.log.appendLine(
+      `call graph local document summary parsed: reason=${reason} file=${record.relPath} symbols=${record.symbols.length}`,
+    );
+    return record.symbols.map((summary) => summary.symbol);
+  }
+
   private resolveCachedRustSymbols(query: string, limit: number): CallGraphSymbol[] {
     const normalized = query.trim();
     const manifestBuiltAt = this.cacheManifest?.builtAtUnixMs;
     const cached = this.rustSymbolQueryCache.get(rustSymbolQueryCacheKey(normalized, limit));
-    if (cached && cached.builtAtUnixMs === manifestBuiltAt) {
+    if (cached && cached.builtAtUnixMs === manifestBuiltAt && cached.symbols.length > 0) {
       return cached.symbols.slice(0, limit);
     }
     const lower = normalized.toLowerCase();
@@ -1325,7 +1530,7 @@ export class CallGraphService implements vscode.Disposable {
 
   private async ensureRustNativeDocumentSummary(
     uri: vscode.Uri,
-    options: { force?: boolean } = {},
+    options: { force?: boolean; timeoutMs?: number } = {},
   ): Promise<boolean> {
     const uriString = uri.toString();
     if (
@@ -1338,14 +1543,14 @@ export class CallGraphService implements vscode.Disposable {
     }
     const existing = this.rustDocumentSummaryPromises.get(uriString);
     if (existing) { return existing; }
-    const promise = this.doEnsureRustNativeDocumentSummary(uri).finally(() => {
+    const promise = this.doEnsureRustNativeDocumentSummary(uri, options.timeoutMs).finally(() => {
       this.rustDocumentSummaryPromises.delete(uriString);
     });
     this.rustDocumentSummaryPromises.set(uriString, promise);
     return promise;
   }
 
-  private async doEnsureRustNativeDocumentSummary(uri: vscode.Uri): Promise<boolean> {
+  private async doEnsureRustNativeDocumentSummary(uri: vscode.Uri, timeoutMs?: number): Promise<boolean> {
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
     if (!folder || !manifest?.builtAtUnixMs) { return false; }
@@ -1354,6 +1559,10 @@ export class CallGraphService implements vscode.Disposable {
       folder.uri.fsPath,
       { uri: uriString, limit: 10_000 },
       manifest.builtAtUnixMs,
+      {
+        includeImplementationCounts: false,
+        timeoutMs,
+      },
     );
     if (!symbols) { return false; }
     if (this.cacheManifest?.builtAtUnixMs !== manifest.builtAtUnixMs) { return false; }
@@ -2767,7 +2976,8 @@ export class CallGraphService implements vscode.Disposable {
         this.log.appendLine(`call graph rust graph query warning: ${warning}`);
       }
       return response.references.map((reference) => ({
-        symbolId,
+        symbolId: String(reference.targetSymbolId ?? symbolId),
+        ...(reference.edgeKind ? { edgeKind: String(reference.edgeKind) } : {}),
         name: String(reference.name ?? ''),
         rawText: String(reference.rawText ?? ''),
         uri: String(reference.uri ?? ''),
@@ -2781,10 +2991,71 @@ export class CallGraphService implements vscode.Disposable {
     }
   }
 
+  async findOutgoingUsagesResolved(symbolId: string, limit = 500): Promise<CallGraphReference[]> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const manifest = this.cacheManifest;
+    if (!this.isRustNativeIndexOnly() || !folder || !manifest?.builtAtUnixMs) {
+      return [];
+    }
+    const usages = await this.queryRustGraphOutgoingUsageIndex(
+      folder.uri.fsPath,
+      symbolId,
+      limit,
+      manifest.builtAtUnixMs,
+    );
+    return usages ?? [];
+  }
+
+  private async queryRustGraphOutgoingUsageIndex(
+    workspaceRoot: string,
+    symbolId: string,
+    limit: number,
+    builtAtUnixMs: number,
+  ): Promise<CallGraphReference[] | undefined> {
+    const binary = await this.resolveRustGraphBinary(false);
+    if (!binary) { return undefined; }
+    try {
+      const response = await this.invokeRustGraphJson([
+        binary,
+        'graph-callees',
+        workspaceRoot,
+        '--symbol-id',
+        symbolId,
+        '--limit',
+        String(Math.max(1, Math.floor(limit))),
+      ]) as RustGraphQueryResponse;
+      if (
+        response.type !== 'graph-query' ||
+        response.ok !== true ||
+        response.builtAtUnixMs !== builtAtUnixMs ||
+        !Array.isArray(response.references)
+      ) {
+        return undefined;
+      }
+      for (const warning of response.warnings ?? []) {
+        this.log.appendLine(`call graph rust graph callees query warning: ${warning}`);
+      }
+      return response.references.map((reference) => ({
+        symbolId: String(reference.targetSymbolId ?? ''),
+        ...(reference.edgeKind ? { edgeKind: String(reference.edgeKind) } : {}),
+        name: String(reference.name ?? ''),
+        rawText: String(reference.rawText ?? ''),
+        uri: String(reference.uri ?? ''),
+        relPath: String(reference.relPath ?? ''),
+        range: normalizeGraphRange(reference.range),
+        ...(reference.enclosingSymbolId ? { enclosingSymbolId: String(reference.enclosingSymbolId) } : {}),
+      })).filter((reference) => reference.symbolId.length > 0);
+    } catch (err) {
+      this.log.appendLine(`call graph rust graph callees query skipped: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  }
+
   private async queryRustGraphSymbolIndex(
     workspaceRoot: string,
-    input: { query?: string; uri?: string; limit: number },
+    input: { query?: string; uri?: string; startLine?: number; endLine?: number; limit: number },
     builtAtUnixMs: number,
+    options: { includeImplementationCounts?: boolean; includeUsageCounts?: boolean; timeoutMs?: number } = {},
   ): Promise<(CallGraphSymbol & { usageCount?: number; implementationCount?: number })[] | undefined> {
     const binary = await this.resolveRustGraphBinary(false);
     if (!binary) { return undefined; }
@@ -2797,11 +3068,25 @@ export class CallGraphService implements vscode.Disposable {
     ];
     if (input.uri) {
       args.push('--uri', input.uri);
+      if (input.startLine !== undefined) {
+        args.push('--start-line', String(Math.max(0, Math.floor(input.startLine))));
+      }
+      if (input.endLine !== undefined) {
+        args.push('--end-line', String(Math.max(0, Math.floor(input.endLine))));
+      }
     } else {
       args.push('--query', input.query ?? '');
     }
+    if (options.includeUsageCounts === false) {
+      args.push('--no-usage-counts');
+    }
+    if (options.includeImplementationCounts === false) {
+      args.push('--no-implementation-counts');
+    }
     try {
-      const response = await this.invokeRustGraphJson(args) as RustGraphSymbolQueryResponse;
+      const response = await this.invokeRustGraphJson(args, {
+        ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      }) as RustGraphSymbolQueryResponse;
       if (
         response.type !== 'graph-symbol-query' ||
         response.ok !== true ||
@@ -2816,6 +3101,42 @@ export class CallGraphService implements vscode.Disposable {
       return response.symbols.map(rustGraphSymbolToCallGraphSymbol);
     } catch (err) {
       this.log.appendLine(`call graph rust graph symbol query skipped: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  }
+
+  private async queryRustGraphImplementationIndex(
+    workspaceRoot: string,
+    symbolId: string,
+    limit: number,
+    builtAtUnixMs: number,
+  ): Promise<(CallGraphSymbol & { usageCount?: number; implementationCount?: number })[] | undefined> {
+    const binary = await this.resolveRustGraphBinary(false);
+    if (!binary) { return undefined; }
+    try {
+      const response = await this.invokeRustGraphJson([
+        binary,
+        'graph-implementations',
+        workspaceRoot,
+        '--symbol-id',
+        symbolId,
+        '--limit',
+        String(Math.max(1, Math.floor(limit))),
+      ]) as RustGraphSymbolQueryResponse;
+      if (
+        response.type !== 'graph-symbol-query' ||
+        response.ok !== true ||
+        response.builtAtUnixMs !== builtAtUnixMs ||
+        !Array.isArray(response.symbols)
+      ) {
+        return undefined;
+      }
+      for (const warning of response.warnings ?? []) {
+        this.log.appendLine(`call graph rust graph implementation query warning: ${warning}`);
+      }
+      return response.symbols.map(rustGraphSymbolToCallGraphSymbol);
+    } catch (err) {
+      this.log.appendLine(`call graph rust graph implementation query skipped: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
     }
   }
@@ -3000,6 +3321,7 @@ export class CallGraphService implements vscode.Disposable {
       case 'graph-update': return 'graph-update';
       case 'graph-index': return 'graph-index';
       case 'graph-query': return 'graph-query';
+      case 'graph-callees': return 'graph-callees';
       case 'graph-symbol-query': return 'graph-symbol-query';
       default: return 'other';
     }
@@ -3012,6 +3334,7 @@ export class CallGraphService implements vscode.Disposable {
       case 'graph-update': return 'ijss-rust-graph-update';
       case 'graph-index': return 'ijss-rust-graph-index';
       case 'graph-query': return 'ijss-rust-graph-query';
+      case 'graph-callees': return 'ijss-rust-graph-callees';
       case 'graph-symbol-query': return 'ijss-rust-graph-symbol-query';
       default: return undefined;
     }
@@ -3020,6 +3343,7 @@ export class CallGraphService implements vscode.Disposable {
   private defaultRustGraphTimeoutMs(kind: RustGraphProcessKind): number {
     switch (kind) {
       case 'graph-query':
+      case 'graph-callees':
       case 'graph-symbol-query':
         return RUST_GRAPH_QUERY_TIMEOUT_MS;
       default:
@@ -3613,6 +3937,8 @@ export class CallGraphService implements vscode.Disposable {
           elapsedMs: Date.now() - started,
           concurrency: input.parseConcurrency,
           maxConcurrency: input.parseConcurrency,
+          currentBytes: progress.currentBytes,
+          totalBytes: progress.totalBytes,
         });
       },
     }) as RustGraphIndexResponse;
@@ -3731,7 +4057,24 @@ export class CallGraphService implements vscode.Disposable {
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     const maxFileSize = getConfiguredCallGraphMaxFileSize(cfg);
     const parseConcurrency = getConfiguredCallGraphConcurrency(cfg);
+    const backend = getConfiguredCallGraphBackend(cfg);
     const configSignature = getCallGraphConfigSignature(cfg);
+    if (backend === 'javascript') {
+      return this.rebuildInWorkerProcess({
+        workspaceRoot,
+        excludeGlobs: getConfiguredCallGraphExcludeGlobs(cfg),
+        maxFileSize,
+        buildLimits: getConfiguredCallGraphBuildLimits(cfg),
+        parseConcurrency,
+        resolveOptions: getConfiguredCallGraphResolveOptions(cfg),
+        parseLimits: getConfiguredCallGraphParseLimits(cfg),
+        cpuBudget: getConfiguredCallGraphCpuBudget(cfg),
+        configSignature,
+        nodePath: getConfiguredCallGraphNodePath(cfg),
+        token,
+        report,
+      });
+    }
     return this.rebuildInRustGraphProcess({
       workspaceRoot,
       maxFileSize,
@@ -3934,6 +4277,7 @@ function formatRustGraphReferenceTsvLine(symbolId: string, reference: CallGraphR
     safeGraphRangeNumber(reference.range.endLine),
     safeGraphRangeNumber(reference.range.endColumn),
     encodeRustGraphTsvField(reference.enclosingSymbolId ?? ''),
+    encodeRustGraphTsvField(reference.edgeKind ?? 'usage'),
   ].join('\t') + '\n';
 }
 
@@ -4011,16 +4355,22 @@ function parseRustGraphRebuildProgressLine(line: string): {
   current: number;
   total: number;
   message: string;
+  currentBytes?: number;
+  totalBytes?: number;
 } | undefined {
   const match = /^graph-rebuild progress: stage=(\S+) current=(\d+) total=(\d+) message=(.*)$/.exec(line.trim());
   if (!match) { return undefined; }
   const stage = normalizeRustGraphProgressStage(match[1]);
   if (!stage) { return undefined; }
+  const message = match[4] || stage;
+  const bytes = /\bbytes=(\d+)\/(\d+)\b/.exec(message);
   return {
     stage,
     current: Math.max(0, Number.parseInt(match[2], 10) || 0),
     total: Math.max(0, Number.parseInt(match[3], 10) || 0),
-    message: match[4] || stage,
+    message,
+    currentBytes: bytes ? Math.max(0, Number.parseInt(bytes[1], 10) || 0) : undefined,
+    totalBytes: bytes ? Math.max(0, Number.parseInt(bytes[2], 10) || 0) : undefined,
   };
 }
 
@@ -5921,6 +6271,7 @@ function resolveReferenceCandidates(
     seen.add(key);
     references.push({
       symbolId: target.id,
+      ...(candidate.edgeKind ? { edgeKind: candidate.edgeKind } : {}),
       name: candidate.name,
       rawText: candidate.rawText,
       uri: candidate.uri,
@@ -6873,6 +7224,148 @@ function scoreSymbolMatch(symbol: CallGraphSymbol, query: string, lowerQuery: st
   return 0;
 }
 
+function scorePositionResolvedSymbol(symbol: CallGraphSymbol, token: string, sourceUri: vscode.Uri): number {
+  let score = scoreSymbolMatch(symbol, token, token.toLowerCase());
+  if (symbol.uri === sourceUri.toString()) { score += 120; }
+  if (!isGeneratedGraphRelPath(symbol.relPath)) { score += 80; }
+  if (sourceUri.fsPath.endsWith('.ts') && symbol.language === 'typescript') { score += 30; }
+  if (sourceUri.fsPath.endsWith('.tsx') && symbol.language === 'typescript') { score += 30; }
+  if (sourceUri.fsPath.endsWith('.js') && symbol.language === 'javascript') { score += 20; }
+  if (isGeneratedGraphRelPath(symbol.relPath)) { score -= 120; }
+  return score;
+}
+
+function isGeneratedGraphRelPath(relPath: string): boolean {
+  return /(^|\/)(out|dist|build|coverage|\.next|\.nuxt)\//.test(relPath) ||
+    /\.(min|bundle)\.[cm]?[jt]sx?$/.test(relPath);
+}
+
+function identifierAtLinePosition(line: string, character: number, documentText: string): PositionIdentifier | undefined {
+  if (!line) { return undefined; }
+  let cursor = Math.min(Math.max(0, Math.floor(character)), line.length);
+  if (!isIdentifierCharacter(line.charAt(cursor)) && cursor > 0 && isIdentifierCharacter(line.charAt(cursor - 1))) {
+    cursor -= 1;
+  }
+  if (!isIdentifierCharacter(line.charAt(cursor))) { return undefined; }
+  let start = cursor;
+  while (start > 0 && isIdentifierCharacter(line.charAt(start - 1))) {
+    start -= 1;
+  }
+  let end = cursor + 1;
+  while (end < line.length && isIdentifierCharacter(line.charAt(end))) {
+    end += 1;
+  }
+  const token = line.slice(start, end);
+  return token.length > 0 && /^[A-Za-z_$]/.test(token)
+    ? { name: token, lineText: line, start, end, documentText }
+    : undefined;
+}
+
+function isIdentifierCharacter(value: string): boolean {
+  return /^[A-Za-z0-9_$]$/.test(value);
+}
+
+function isCodeIdentifierKeyword(value: string): boolean {
+  return new Set([
+    'abstract', 'any', 'as', 'async', 'await', 'boolean', 'break', 'case', 'catch', 'class',
+    'const', 'constructor', 'continue', 'debugger', 'declare', 'default', 'delete', 'do', 'else',
+    'enum', 'export', 'extends', 'false', 'finally', 'for', 'from', 'function', 'get', 'if',
+    'implements', 'import', 'in', 'infer', 'instanceof', 'interface', 'keyof', 'let', 'module',
+    'namespace', 'never', 'new', 'null', 'number', 'object', 'of', 'override', 'private',
+    'protected', 'public', 'readonly', 'return', 'satisfies', 'set', 'static', 'string', 'super',
+    'switch', 'symbol', 'this', 'throw', 'true', 'try', 'type', 'typeof', 'undefined', 'unknown',
+    'var', 'void', 'while', 'with', 'yield',
+  ]).has(value);
+}
+
+function isProbableLocalDeclarationIdentifier(identifier: PositionIdentifier): boolean {
+  const before = identifier.lineText.slice(0, identifier.start).trimEnd();
+  if (/\b(const|let|var)\s*$/.test(before)) { return true; }
+  if (/\b(function|class|interface|type|enum)\s*$/.test(before)) { return true; }
+  if (/[,(]\s*$/.test(before)) {
+    const after = identifier.lineText.slice(identifier.end).trimStart();
+    if (after.startsWith(':') || after.startsWith('?') || after.startsWith('=')) { return true; }
+  }
+  return false;
+}
+
+function workspaceRelativePathForUri(uri: vscode.Uri): string | undefined {
+  const folder = vscode.workspace.getWorkspaceFolder(uri) ?? vscode.workspace.workspaceFolders?.[0];
+  if (!folder || uri.scheme !== 'file') { return undefined; }
+  const rel = path.relative(folder.uri.fsPath, uri.fsPath);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) { return undefined; }
+  return rel.replace(/\\/g, '/');
+}
+
+function importedTargetsForIdentifier(documentText: string, sourceRelPath: string | undefined, localName: string): ImportedSymbolTarget[] {
+  if (!sourceRelPath || !isTsLikeRelPath(sourceRelPath)) { return []; }
+  const out: ImportedSymbolTarget[] = [];
+  const importRegex = /\bimport\s+([\s\S]*?)\s+from\s+['"]([^'"]+)['"]/g;
+  for (const match of documentText.matchAll(importRegex)) {
+    const clause = match[1] ?? '';
+    const moduleSpecifier = match[2] ?? '';
+    const targetRelPaths = resolveRelativeModuleCandidates(sourceRelPath, moduleSpecifier);
+    if (targetRelPaths.length === 0) { continue; }
+    for (const importedName of importedNamesForLocalName(clause, localName)) {
+      for (const relPath of targetRelPaths) {
+        out.push({ relPath, importedName });
+      }
+    }
+  }
+  return dedupeImportedTargets(out);
+}
+
+function importedNamesForLocalName(importClause: string, localName: string): string[] {
+  const out: string[] = [];
+  const brace = /\{([\s\S]*?)\}/.exec(importClause);
+  if (brace) {
+    for (const rawItem of brace[1].split(',')) {
+      let item = rawItem.trim();
+      if (item.startsWith('type ')) { item = item.slice('type '.length).trimStart(); }
+      if (!item) { continue; }
+      const alias = /\s+as\s+/.test(item) ? item.split(/\s+as\s+/) : [item, item];
+      const imported = alias[0]?.trim();
+      const local = alias[1]?.trim();
+      if (local === localName && imported) { out.push(imported); }
+    }
+  }
+  const defaultPart = importClause.split('{')[0]?.split(',')[0]?.trim();
+  if (defaultPart === localName) { out.push(localName); }
+  const namespaceMatch = /\*\s+as\s+([A-Za-z_$][\w$]*)/.exec(importClause);
+  if (namespaceMatch?.[1] === localName) { out.push(MODULE_IMPORT_TARGET); }
+  return out;
+}
+
+function resolveRelativeModuleCandidates(sourceRelPath: string, moduleSpecifier: string): string[] {
+  if (!moduleSpecifier.startsWith('.')) { return []; }
+  const base = path.posix.normalize(path.posix.join(path.posix.dirname(sourceRelPath), moduleSpecifier));
+  if (path.posix.extname(base)) { return [base]; }
+  const out: string[] = [];
+  for (const ext of ['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs']) {
+    out.push(`${base}.${ext}`);
+  }
+  for (const ext of ['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs']) {
+    out.push(`${base}/index.${ext}`);
+  }
+  return out;
+}
+
+function isTsLikeRelPath(relPath: string): boolean {
+  return /\.(tsx?|jsx?|mjs|cjs)$/.test(relPath);
+}
+
+function dedupeImportedTargets(targets: ImportedSymbolTarget[]): ImportedSymbolTarget[] {
+  const seen = new Set<string>();
+  const out: ImportedSymbolTarget[] = [];
+  for (const target of targets) {
+    const key = `${target.relPath}\0${target.importedName}`;
+    if (seen.has(key)) { continue; }
+    seen.add(key);
+    out.push(target);
+  }
+  return out;
+}
+
 function rangeContainsPosition(range: CallGraphRange, position: vscode.Position): boolean {
   if (position.line < range.startLine || position.line > range.endLine) { return false; }
   if (position.line === range.startLine && position.character < range.startColumn) { return false; }
@@ -7447,6 +7940,14 @@ function getConfiguredCallGraphConcurrency(
   return capCallGraphConcurrencyForMemoryBudget(requested, getConfiguredCallGraphBuildLimits(cfg).memoryBudgetMb);
 }
 
+function getConfiguredCallGraphBackend(
+  cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
+): CallGraphBackend {
+  return cfg.get<string>('callGraphBackend', 'rust-native') === 'javascript'
+    ? 'javascript'
+    : 'rust-native';
+}
+
 function capCallGraphConcurrencyForMemoryBudget(concurrency: number, memoryBudgetMb: number): number {
   const memoryCap = memoryBudgetMb < 512
     ? 2
@@ -7855,6 +8356,7 @@ function getCallGraphConfigSignature(
 ): string {
   return JSON.stringify({
     version: CALL_GRAPH_CACHE_VERSION,
+    backend: getConfiguredCallGraphBackend(cfg),
     maxFileSize: getConfiguredCallGraphMaxFileSize(cfg),
     excludeGlobs: getConfiguredCallGraphExcludeGlobs(cfg),
     parseLimits: getConfiguredCallGraphParseLimits(cfg),

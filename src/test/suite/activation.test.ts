@@ -1,4 +1,5 @@
 import * as assert from 'assert';
+import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { ExtensionTestApi } from '../../extension';
@@ -212,6 +213,48 @@ suite('Activation', () => {
       runtime.getBinaryCandidates = originalCandidates;
       runtime.binaryPath = originalBinaryPath;
       runtime.buildPromise = originalBuildPromise;
+    }
+  });
+
+  test('resolveBinary skips stale zoek-rs binaries that do not support exclude flags', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+    const staleBinary = path.join(workspaceRoot, '.tmp-stale-zoek-rs');
+    const freshBinary = path.join(workspaceRoot, '.tmp-fresh-zoek-rs');
+    const originalInvokeText = runtime.invokeText.bind(runtime);
+    const originalCandidates = runtime.getBinaryCandidates.bind(runtime);
+    const originalBinaryPath = runtime.binaryPath;
+    const originalBuildPromise = runtime.buildPromise;
+
+    fs.writeFileSync(staleBinary, '');
+    fs.writeFileSync(freshBinary, '');
+    runtime.binaryPath = undefined;
+    runtime.buildPromise = undefined;
+    runtime.binaryCompatibility?.clear?.();
+    runtime.getBinaryCandidates = () => [staleBinary, freshBinary];
+    runtime.invokeText = async (args: string[]) => ({
+      stdout: args[0] === staleBinary
+        ? '{"type":"error","ok":false,"message":"unknown diagnose flag: --exclude"}'
+        : '{"type":"diagnose","ok":true}',
+      stderr: '',
+      code: 0,
+      signal: null,
+      cancelled: false,
+    });
+
+    try {
+      const binary = await runtime.resolveBinary(false);
+      assert.strictEqual(binary, freshBinary);
+    } finally {
+      runtime.invokeText = originalInvokeText;
+      runtime.getBinaryCandidates = originalCandidates;
+      runtime.binaryPath = originalBinaryPath;
+      runtime.buildPromise = originalBuildPromise;
+      runtime.binaryCompatibility?.clear?.();
+      try { fs.unlinkSync(staleBinary); } catch {}
+      try { fs.unlinkSync(freshBinary); } catch {}
     }
   });
 

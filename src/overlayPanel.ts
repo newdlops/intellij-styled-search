@@ -10,6 +10,7 @@ import {
   prioritizeFiles,
   mergeFileMatches,
   getConfiguredResultLimit,
+  getRequestedResultLimit,
   isRegexMultilineEnabled,
   getConfiguredSearchEngine,
   type SearchForTestsResult,
@@ -1281,32 +1282,30 @@ export class OverlayPanel {
     const matches: FileMatch[] = [];
     let effectiveEngine: SearchEngine = requestedEngine;
     let fallbackReason: string | undefined;
-    if (requestedEngine === 'zoekt') {
-      if (options.excludePatterns && options.excludePatterns.length > 0) {
-        effectiveEngine = 'codesearch';
-        fallbackReason = 'scope exclude patterns require codesearch';
-      } else {
-        const readiness = await this.zoektRuntime.runSearch(
-          options,
-          new vscode.CancellationTokenSource().token,
-          {
-            onFile: (m) => { matches.push(m); },
-            onDone: () => {},
-            onError: (err) => { throw err; },
-          },
-        );
-        if (readiness.ready) {
-          return {
-            matches: mergeFileMatches(matches),
-            requestedEngine,
-            effectiveEngine,
-          };
-        }
-        effectiveEngine = 'codesearch';
-        fallbackReason = readiness.reason;
+    if (requestedEngine === 'zoekt' && !options.forceFullScan) {
+      const readiness = await this.zoektRuntime.runSearch(
+        options,
+        new vscode.CancellationTokenSource().token,
+        {
+          onFile: (m) => { matches.push(m); },
+          onDone: () => {},
+          onError: (err) => { throw err; },
+        },
+      );
+      if (readiness.ready) {
+        return {
+          matches: mergeFileMatches(matches),
+          requestedEngine,
+          effectiveEngine,
+        };
       }
+      effectiveEngine = 'codesearch';
+      fallbackReason = readiness.reason;
+    } else if (requestedEngine === 'zoekt' && options.forceFullScan) {
+      effectiveEngine = 'codesearch';
+      fallbackReason = 'scope override requires full workspace scan';
     }
-    const { uris: candidates } = this.trigramIndex.candidatesFor(options.query, {
+    const { uris: candidates } = options.forceFullScan ? { uris: null } : this.trigramIndex.candidatesFor(options.query, {
       useRegex: options.useRegex,
       regexMultiline: options.regexMultiline,
       caseSensitive: options.caseSensitive,
@@ -1341,6 +1340,28 @@ export class OverlayPanel {
         paths,
       ).catch(reject);
     });
+    if (paths && countFileMatches(matches) < getRequestedResultLimit(options)) {
+      const verifiedMatches: FileMatch[] = [];
+      const verifyCts = new vscode.CancellationTokenSource();
+      await new Promise<void>((resolve, reject) => {
+        runRgSearch(
+          options,
+          verifyCts.token,
+          {
+            onFile: (m) => { verifiedMatches.push(m); },
+            onDone: () => { resolve(); },
+            onError: (err) => { reject(err); },
+          },
+          null,
+        ).catch(reject);
+      });
+      return {
+        matches: mergeFileMatches(verifiedMatches),
+        requestedEngine,
+        effectiveEngine,
+        fallbackReason: appendFallbackReason(fallbackReason, 'trigram candidate set underfilled; verified with full scan'),
+      };
+    }
     return {
       matches: mergeFileMatches(matches),
       requestedEngine,
@@ -3204,16 +3225,11 @@ export class OverlayPanel {
     let effectiveEngine: SearchEngine = requestedEngine;
     let fallbackReason: string | undefined;
     if (requestedEngine === 'zoekt') {
-      if (options.excludePatterns && options.excludePatterns.length > 0) {
+      const readiness = await this.zoektRuntime.getSearchReadiness();
+      if (!readiness.ready) {
         effectiveEngine = 'codesearch';
-        fallbackReason = 'scope exclude patterns require codesearch';
-      } else {
-        const readiness = await this.zoektRuntime.getSearchReadiness();
-        if (!readiness.ready) {
-          effectiveEngine = 'codesearch';
-          fallbackReason = readiness.reason;
-          this.maybePromptZoektIndexRecommendation(readiness.reason);
-        }
+        fallbackReason = readiness.reason;
+        this.maybePromptZoektIndexRecommendation(readiness.reason);
       }
     }
     const pageSize = getConfiguredResultLimit();
@@ -3863,6 +3879,14 @@ export class OverlayPanel {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function countFileMatches(matches: FileMatch[]): number {
+  return matches.reduce((sum, match) => sum + match.matches.length, 0);
+}
+
+function appendFallbackReason(existing: string | undefined, reason: string): string {
+  return existing ? `${existing}; ${reason}` : reason;
 }
 
 function fetchJson(url: string, timeoutMs = 2000): Promise<any> {
