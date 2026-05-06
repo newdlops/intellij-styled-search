@@ -3036,7 +3036,7 @@ https://github.com/sourcegraph/zoekt/blob/main/doc/design.md
 
 다음 항목은 별도 평가 중 확인한 결함/주의점과 처리 상태다.
 
-1. `call graph`가 `0 edges`인 상태에서 `codeidx_get_context_bundle`과 `codeidx_graph_neighbors`가 의미 있는 graph 탐색 결과를 주지 못하던 문제는 2026-05-07에 부분 수정했다. Rust native relation index가 reference마다 `enclosingSymbolId`, `targetSymbolId`, `edgeKind`를 노출하고, `codeidx_graph_neighbors`는 incoming/outgoing directed reference edge를 binary relation index에서 materialize한다. `edgeKind=call|construct`는 `Name(...)` 형태를 기준으로 한 정적 휴리스틱이며, `usage`는 type/import/reference usage가 섞일 수 있다.
+1. `call graph`가 `0 edges`인 상태에서 `codeidx_get_context_bundle`과 `codeidx_graph_neighbors`가 의미 있는 graph 탐색 결과를 주지 못하던 문제는 2026-05-07에 수정했다. Rust native relation index가 reference마다 `enclosingSymbolId`, `targetSymbolId`, `edgeKind`를 노출하고, `codeidx_graph_neighbors`는 incoming/outgoing directed reference edge를 binary relation index에서 materialize한다. `edgeKind=call|construct`는 resolved call expression에서만 나오며, 일반 symbol usage와 분리된다.
 2. `codeidx_search_code(context_lines=N)`의 컨텍스트가 응답 `snippet`에 포함되지 않던 문제는 2026-05-06에 수정했다. 이제 반환 window의 각 result snippet에 주변 라인이 직접 들어가며, `codeidx_read_snippets` 2차 호출 없이 `rg -C N`과 비교할 수 있다.
 3. 구조화 JSON envelope의 고정 비용이 대략 400-800B 발생한다. 작은 쿼리일수록 이 비용 비율이 커지므로, cardinality 확인이나 간단한 probe에는 `codeidx_probe`, `codeidx_callers_summary` 같은 plain-text compact 응답 도구가 가장 효율적이다.
 4. `codeidx_outline`의 nested 처리에서 `class Meta:` 같은 내부 클래스나 함수 내부 `const`가 top-level처럼 카운트될 수 있다. outline 결과를 파일 구조의 절대 사실로 보지 말고, 편집 전에는 해당 범위를 `codeidx_read_snippets` 또는 실제 파일로 확인한다.
@@ -3068,7 +3068,7 @@ https://github.com/sourcegraph/zoekt/blob/main/doc/design.md
 2. 존재 여부, 첫 매치, broad cardinality probe는 compact 도구(`codeidx_exists`, `codeidx_probe`, `codeidx_first`)가 경쟁력이 있다.
 3. `codeidx_count`는 상세 JSON이 커지므로 파일별 상세가 필요하면 `rg -c`가 나을 수 있다. 단순 카디널리티 확인은 `codeidx_probe`를 우선한다.
 4. `codeidx_callers_summary`처럼 agent가 직접 조립해야 하는 집계형 결과는 codeidx가 명확히 유리하다.
-5. `codeidx_get_context_bundle`과 graph 계열 도구는 provider call edge가 없더라도 Rust native directed reference edge를 사용할 수 있다. `edge_kinds=["call"]`/`["construct"]`는 call-like reference만 좁히고, `usage`는 type/import/reference usage가 섞일 수 있으므로 영향 분석에서는 `codeidx_find_references`와 snippet 확인을 병행한다.
+5. `codeidx_get_context_bundle`과 graph 계열 도구는 provider call edge가 없더라도 Rust native directed reference edge를 사용할 수 있다. `edge_kinds=["call"]`/`["construct"]`는 resolved call expression만 반환하고, `usage`는 type/import/reference usage를 포함하는 넓은 참조 edge로 취급한다.
 
 ### 27.2 추가 결함 메모
 
@@ -3081,7 +3081,7 @@ https://github.com/sourcegraph/zoekt/blob/main/doc/design.md
 
 ### 27.3 2026-05-07 graph/Python/resolve_at 보강
 
-1. Rust native relation index reference에 `enclosingSymbolId`, `targetSymbolId`, `edgeKind`를 채운다. 이를 위해 brace 기반 언어는 function/method/class body range를 계산하고, Python은 기존 indent 기반 body range를 사용한다. Relation binary format version은 `2`로 올라갔으므로 기존 graph index는 재빌드가 필요하다.
+1. Rust native relation index reference에 `enclosingSymbolId`, `targetSymbolId`, `edgeKind`를 채운다. 이를 위해 brace 기반 언어는 function/method/class body range를 계산하고, Python은 기존 indent 기반 body range를 사용한다. `call`/`construct`는 enclosing callable 내부에서 resolved call expression으로 확인된 relation에만 붙인다. Relation binary format version은 `2`로 올라갔으므로 기존 graph index는 재빌드가 필요하다.
 2. Rust CLI에 `graph-callees` 명령을 추가했다. 특정 caller/enclosing symbol id에서 발생한 outgoing references를 조회하고 각 reference에 `targetSymbolId`와 `edgeKind`를 붙인다.
 3. MCP `codeidx_graph_neighbors`는 Rust native snapshot edge가 비어 있어도 incoming/outgoing reference edge를 relation index에서 materialize한다. `find_references`와 `graph_neighbors`의 `edge_kinds` 필터는 `usage`, `call`, `construct`에 대해 실제 reference `edgeKind`를 사용한다.
 4. `resolve_at`/outline/signature류의 Python 신뢰도와 대형 repo latency를 위해 document symbol 조회 전에 단일 파일 local parse fast path를 사용한다. Rust CLI document query는 local parse가 실패하거나 비어 있을 때 fallback으로 남긴다.

@@ -958,9 +958,21 @@ export class CallGraphService implements vscode.Disposable {
   async findTargetsAtPositionResolved(uri: vscode.Uri, position: vscode.Position): Promise<CallGraphSymbol[]> {
     const declarations = await this.findDeclarationSymbolsAtPositionResolved(uri, position);
     if (declarations.length > 0) { return declarations; }
-    const cached = this.findTargetsAtPosition(uri, position);
-    if (!this.isRustNativeIndexOnly()) { return cached; }
-    if (cached.length > 0) { return cached; }
+    if (!this.isRustNativeIndexOnly()) { return this.findTargetsAtPosition(uri, position); }
+    const referenceTargets = await this.findReferenceTargetsAtPositionResolved(uri, position);
+    if (referenceTargets.length > 0) { return referenceTargets; }
+    const enclosing = this.findEnclosingSymbol(uri, position);
+    return enclosing ? [enclosing] : [];
+  }
+
+  async findReferenceTargetsAtPositionResolved(uri: vscode.Uri, position: vscode.Position): Promise<CallGraphSymbol[]> {
+    const snapshot = this.snapshot;
+    const edgeTargets = snapshot
+      ? this.findCallEdgesAtPosition(uri, position)
+        .map((edge) => edge.calleeId ? this.getIndex(snapshot).byId.get(edge.calleeId) : undefined)
+        .filter((symbol): symbol is CallGraphSymbol => !!symbol)
+      : [];
+    if (edgeTargets.length > 0) { return dedupeSymbols(edgeTargets); }
     const token = await this.identifierAtPosition(uri, position);
     if (!token || isCodeIdentifierKeyword(token.name) || isProbableLocalDeclarationIdentifier(token)) { return []; }
     const sourceRelPath = workspaceRelativePathForUri(uri);
@@ -1214,12 +1226,26 @@ export class CallGraphService implements vscode.Disposable {
   async findImplementationsResolved(symbolOrQuery: string, limit = 200): Promise<CallGraphSymbol[]> {
     const symbols = await this.resolveSymbolsResolved(symbolOrQuery, Math.min(Math.max(limit, 1), 200));
     if (symbols.length === 0) { return []; }
+    return this.findImplementationsForSymbolsResolved(symbols, limit);
+  }
+
+  async findImplementationsForSymbolResolved(symbol: CallGraphSymbol, limit = 200): Promise<CallGraphSymbol[]> {
+    return this.findImplementationsForSymbolsResolved([symbol], limit);
+  }
+
+  private async findImplementationsForSymbolsResolved(symbols: CallGraphSymbol[], limit = 200): Promise<CallGraphSymbol[]> {
+    const targetSymbols = symbols.filter((symbol) => {
+      if (!shouldCheckImplementationCount(symbol)) { return false; }
+      const count = (symbol as CallGraphSymbol & { implementationCount?: unknown }).implementationCount;
+      return !(typeof count === 'number' && Math.max(0, Math.floor(count)) === 0);
+    });
+    if (targetSymbols.length === 0) { return []; }
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
     if (this.isRustNativeIndexOnly() && folder && manifest?.builtAtUnixMs) {
       const out: CallGraphSymbol[] = [];
       const seen = new Set<string>();
-      for (const symbol of symbols) {
+      for (const symbol of targetSymbols) {
         const implementations = await this.queryRustGraphImplementationIndex(
           folder.uri.fsPath,
           symbol.id,
@@ -1236,7 +1262,7 @@ export class CallGraphService implements vscode.Disposable {
       }
       return out;
     }
-    return dedupeSymbols(symbols.flatMap((symbol) => this.findImplementations(symbol.id, limit))).slice(0, limit);
+    return dedupeSymbols(targetSymbols.flatMap((symbol) => this.findImplementations(symbol.id, limit))).slice(0, limit);
   }
 
   findImplementationsAtPosition(uri: vscode.Uri, position: vscode.Position, limit = 200): CallGraphSymbol[] {

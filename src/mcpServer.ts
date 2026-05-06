@@ -238,6 +238,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     this.server.keepAliveTimeout = 30_000;
     this.server.headersTimeout = 35_000;
     this.server.requestTimeout = 120_000;
+    this.server.maxConnections = 2_048;
     this.server.on('clientError', (err, socket) => {
       this.log.appendLine(`codeidx MCP client error: ${err.message}`);
       if (socket.writable) {
@@ -642,6 +643,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const maxChars = readIntArg(args, 'max_chars', DEFAULT_SEARCH_MAX_CHARS, 1_000, 200_000);
     const contextLines = readIntArg(args, 'context_lines', 3, 0, 20);
     const multiline = readBoolArg(args, 'multiline', false);
+    const allowExpensiveRegex = readBoolArg(args, 'allow_expensive_regex', false);
     const verboseScope = readBoolArg(args, 'verbose', false);
     const scope = readMcpSearchScope(args);
     const requestedEngine = this.searchBackend ? 'configured' : 'codesearch';
@@ -652,6 +654,24 @@ export class CallGraphMcpServer implements vscode.Disposable {
       return this.errorEnvelope('invalid_query', err instanceof Error ? err.message : String(err));
     }
     const warnings: string[] = [...searchScopeWarnings(scope), ...parsedQuery.warnings];
+    const regexRisk = regexRiskDiagnostics(parsedQuery, multiline, scope);
+    warnings.push(...regexRisk.warnings);
+    if (regexRisk.blocked && !allowExpensiveRegex) {
+      const payload = this.errorEnvelope('regex_too_expensive', regexRisk.message, false);
+      payload.query_diagnostics = {
+        query_kind: parsedQuery.queryKind,
+        effective_query_kind: 'regex',
+        required_literals: regexRisk.requiredLiteral ? [regexRisk.requiredLiteral] : [],
+        has_required_trigram: regexRisk.requiredLiteral.length >= 3,
+        suggested_fallback: 'rg',
+        suggestions: [
+          'Use rg for this complex multiline/alternation regex, or narrow codeidx with file_globs/path regex.',
+          'Pass allow_expensive_regex=true only when the scope is intentionally bounded.',
+        ],
+        warnings,
+      };
+      return payload;
+    }
     if (parsedQuery.useRegex && multiline) {
       warnings.push('Multiline regex line_range spans the full regex match; verify large ranges with snippet text before using them as edit ranges.');
     }
@@ -776,6 +796,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const queryKind = readEnumArg(args, 'query_kind', ['auto', 'literal', 'regex', 'zoekt'], 'auto');
     const caseMode = readEnumArg(args, 'case_sensitive', ['auto', 'yes', 'no'], 'auto');
     const multiline = readBoolArg(args, 'multiline', false);
+    const allowExpensiveRegex = readBoolArg(args, 'allow_expensive_regex', false);
     const maxMatches = readIntArg(args, 'max_matches', 5_000, 1, 50_000);
     const maxFiles = readIntArg(args, 'max_files', 100, 1, 5_000);
     const verboseScope = readBoolArg(args, 'verbose', false);
@@ -787,6 +808,25 @@ export class CallGraphMcpServer implements vscode.Disposable {
       return this.errorEnvelope('invalid_query', err instanceof Error ? err.message : String(err));
     }
     const forceFullScan = scopeOverrideRequiresFullScan(scope);
+    const warnings = [...searchScopeWarnings(scope), ...parsedQuery.warnings];
+    const regexRisk = regexRiskDiagnostics(parsedQuery, multiline, scope);
+    warnings.push(...regexRisk.warnings);
+    if (regexRisk.blocked && !allowExpensiveRegex) {
+      const payload = this.errorEnvelope('regex_too_expensive', regexRisk.message, false);
+      payload.query_diagnostics = {
+        query_kind: parsedQuery.queryKind,
+        effective_query_kind: 'regex',
+        required_literals: regexRisk.requiredLiteral ? [regexRisk.requiredLiteral] : [],
+        has_required_trigram: regexRisk.requiredLiteral.length >= 3,
+        suggested_fallback: 'rg',
+        suggestions: [
+          'Use rg for this complex multiline/alternation regex, or narrow codeidx with file_globs/path regex.',
+          'Pass allow_expensive_regex=true only when the scope is intentionally bounded.',
+        ],
+        warnings,
+      };
+      return payload;
+    }
     const options: SearchOptions = {
       query: parsedQuery.effectiveQuery,
       caseSensitive: caseMode === 'yes' || (caseMode === 'auto' && hasUppercase(parsedQuery.effectiveQuery)),
@@ -814,7 +854,6 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const totalMatches = truncated ? maxMatches : rawMatchCount;
     const returnedByFile = byFile.slice(0, maxFiles);
     const omittedFiles = Math.max(0, byFile.length - returnedByFile.length);
-    const warnings = [...searchScopeWarnings(scope), ...parsedQuery.warnings];
     if (truncated) {
       warnings.push(`count stopped after max_matches=${maxMatches}; raise max_matches for a larger bounded count.`);
     }
@@ -1425,11 +1464,18 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const includeCandidates = readBoolArg(args, 'include_candidates', true);
     const normalized = await this.normalizeWorkspacePath(file);
     const position = new vscode.Position(line - 1, character);
-    const targets = await this.callGraph.findTargetsAtPositionResolved(normalized.uri, position);
+    const referenceTargets = prefer === 'reference_target'
+      ? await this.callGraph.findReferenceTargetsAtPositionResolved(normalized.uri, position)
+      : [];
+    const targets = referenceTargets.length > 0
+      ? referenceTargets
+      : await this.callGraph.findTargetsAtPositionResolved(normalized.uri, position);
     const enclosing = await this.resolveEnclosingSymbolAtPosition(normalized, position);
     const edges = this.callGraph.findCallEdgesAtPosition(normalized.uri, position);
     const target = prefer === 'enclosing_symbol'
       ? enclosing ?? targets[0]
+      : prefer === 'reference_target'
+        ? referenceTargets[0] ?? targets[0]
       : targets[0];
     return {
       ...this.baseEnvelope(this.callGraph.getSnapshot(), target
@@ -1598,7 +1644,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     if (!target) {
       return this.errorEnvelope('symbol_not_found', 'No target symbol resolved for implementations.');
     }
-    const symbols = await this.callGraph.findImplementationsResolved(target.id, limit);
+    const symbols = await this.callGraph.findImplementationsForSymbolResolved(target, limit);
     const implementations = [];
     const warnings: string[] = [];
     for (const symbol of symbols) {
@@ -1781,9 +1827,11 @@ export class CallGraphMcpServer implements vscode.Disposable {
       ],
     };
     if (usedReferenceFallback) {
-      payload.warnings = [
-        'Rust-native graph returned directed reference-backed edges from the binary relation index. call/construct edges are heuristic call-like references; usage edges may include type/import/reference usages.',
-      ];
+      if (edgeKinds.has('usage')) {
+        payload.warnings = [
+          'Rust-native graph returned directed usage edges from the binary relation index. usage edges may include type/import/reference usages; call and construct edges are resolved call expressions.',
+        ];
+      }
     } else if (edges.length === 0 && this.callGraph.isRustNativeIndexOnly()) {
       payload.warnings = [
         'Rust-native graph mode has no matching directed usage/call edges for this query. Use codeidx_find_references or include edge_kinds=["usage"] for reference-backed graph expansion.',
@@ -2034,6 +2082,10 @@ export class CallGraphMcpServer implements vscode.Disposable {
     }
     const literal = estimateRequiredLiteral(parsedQuery.effectiveQuery);
     const warnings = [...parsedQuery.warnings];
+    const scope = readMcpSearchScope(args);
+    const multiline = readBoolArg(args, 'multiline', false);
+    const regexRisk = regexRiskDiagnostics(parsedQuery, multiline, scope);
+    warnings.push(...regexRisk.warnings);
     if (parsedQuery.useRegex && literal.length < 3) {
       warnings.push('regex has no selective literal; add language or file filters for better performance');
     }
@@ -2052,8 +2104,11 @@ export class CallGraphMcpServer implements vscode.Disposable {
         required_literals: literal ? [literal] : [],
         has_required_trigram: literal.length >= 3,
         estimated_candidate_files: null,
-        fallback_required: false,
-        suggestions: warnings.length > 0 ? ['Add languages or file_globs to reduce scan scope.'] : [],
+        fallback_required: regexRisk.blocked,
+        suggested_fallback: regexRisk.blocked ? 'rg' : null,
+        suggestions: regexRisk.blocked
+          ? ['Use rg for this complex regex, or add file_globs/path filters and pass allow_expensive_regex=true.']
+          : warnings.length > 0 ? ['Add languages or file_globs to reduce scan scope.'] : [],
         warnings,
       },
     };
@@ -3108,6 +3163,7 @@ function toolDefinitions(): ToolDefinition[] {
         include_dependencies: { type: 'boolean', default: false },
         include_sensitive: { type: 'boolean', default: false },
         multiline: { type: 'boolean', default: false },
+        allow_expensive_regex: { type: 'boolean', default: false, description: 'When false, broad multiline/alternation regexes are blocked and the response recommends rg or narrower file_globs.' },
         context_lines: { type: 'integer', minimum: 0, maximum: 20, default: 3 },
         limit: { type: 'integer', minimum: 1, maximum: 200, default: 20 },
         cursor: { type: ['string', 'null'], default: null },
@@ -3140,6 +3196,7 @@ function toolDefinitions(): ToolDefinition[] {
         include_dependencies: { type: 'boolean', default: false },
         include_sensitive: { type: 'boolean', default: false },
         multiline: { type: 'boolean', default: false },
+        allow_expensive_regex: { type: 'boolean', default: false, description: 'When false, broad multiline/alternation regexes are blocked and the response recommends rg or narrower file_globs.' },
         max_matches: { type: 'integer', minimum: 1, maximum: 50000, default: 5000 },
         max_files: { type: 'integer', minimum: 1, maximum: 5000, default: 100 },
         max_chars: { type: 'integer', minimum: 1000, maximum: 200000, default: DEFAULT_MCP_MAX_CHARS },
@@ -3515,6 +3572,7 @@ function toolDefinitions(): ToolDefinition[] {
         query_kind: { type: 'string', enum: ['auto', 'literal', 'regex', 'zoekt'], default: 'auto' },
         languages: { type: 'array', items: { type: 'string' }, default: [] },
         file_globs: { type: 'array', items: { type: 'string' }, default: [] },
+        multiline: { type: 'boolean', default: false },
       }, ['query']),
       annotations: readOnlyAnnotations(),
     },
@@ -3821,9 +3879,9 @@ function externalSymbolId(symbol: CallGraphSymbol, workspaceId: string): string 
   const fingerprint = [
     workspaceId,
     symbol.language,
+    symbol.kind,
     symbol.qualifiedName,
     symbol.containerName ?? '',
-    symbol.signature ?? '',
     symbol.relPath,
   ].join('\0');
   return `esy_${stableHash(fingerprint).slice(0, 32)}`;
@@ -4684,6 +4742,53 @@ function looksLikeRegexPattern(value: string): boolean {
 function estimateRequiredLiteral(query: string): string {
   const literals = query.match(/[A-Za-z0-9_./:-]{3,}/g) ?? [];
   return literals.sort((a, b) => b.length - a.length)[0] ?? '';
+}
+
+function regexRiskDiagnostics(
+  parsedQuery: ParsedMcpSearchQuery,
+  multiline: boolean,
+  scope: McpSearchScope,
+): { blocked: boolean; message: string; warnings: string[]; requiredLiteral: string } {
+  if (!parsedQuery.useRegex) {
+    return { blocked: false, message: '', warnings: [], requiredLiteral: '' };
+  }
+  const requiredLiteral = estimateRequiredLiteral(parsedQuery.effectiveQuery);
+  const scoped = scope.includePatterns.length > 0 || !!parsedQuery.pathRegex;
+  const alternationCount = countUnescapedRegexChar(parsedQuery.effectiveQuery, '|');
+  const hasMultilineWildcard = /\\s\\S|\\S\\s|\[\^][^\]]*\]|\.\*/.test(parsedQuery.effectiveQuery);
+  const complexAlternation = alternationCount >= 4 || /\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\|/.test(parsedQuery.effectiveQuery);
+  const broad = requiredLiteral.length < 3 && !scoped;
+  const blocked = (multiline && (broad || complexAlternation || hasMultilineWildcard)) ||
+    (complexAlternation && broad);
+  const warnings: string[] = [];
+  if (blocked) {
+    warnings.push('Complex broad regex is blocked by default because it can force slow verification; use rg or narrow the MCP scope.');
+  } else if (multiline && (complexAlternation || hasMultilineWildcard || requiredLiteral.length < 3)) {
+    warnings.push('Multiline regex may be expensive; prefer rg for complex alternation or narrow codeidx with file_globs.');
+  }
+  return {
+    blocked,
+    message: 'Complex multiline/alternation regex is better handled by rg unless the MCP search scope is narrow.',
+    warnings,
+    requiredLiteral,
+  };
+}
+
+function countUnescapedRegexChar(value: string, needle: string): number {
+  let count = 0;
+  let escaped = false;
+  for (const ch of value) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (ch === needle) { count += 1; }
+  }
+  return count;
 }
 
 function countTextSearchOccurrences(

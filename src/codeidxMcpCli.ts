@@ -114,7 +114,12 @@ async function resolveEndpoint(options: CliOptions): Promise<URL> {
   const discoveryPath = options.discoveryFile ?? path.join(options.workspace, '.codeidx', 'mcp-server.json');
   const expectedWorkspaceId = workspaceIdFor(options.workspace);
   const initialDiscovery = readDiscoveryFile(discoveryPath, expectedWorkspaceId);
-  if (initialDiscovery?.url) { return normalizeMcpUrl(initialDiscovery.url); }
+  if (initialDiscovery?.url) {
+    const endpoint = normalizeMcpUrl(initialDiscovery.url);
+    if (await isEndpointHealthy(endpoint, Math.min(1_000, options.timeoutMs))) {
+      return endpoint;
+    }
+  }
 
   if (options.port !== undefined) {
     return normalizeMcpUrl(`http://127.0.0.1:${options.port}/mcp`);
@@ -123,7 +128,12 @@ async function resolveEndpoint(options: CliOptions): Promise<URL> {
   const deadline = Date.now() + options.timeoutMs;
   do {
     const discovery = readDiscoveryFile(discoveryPath, expectedWorkspaceId);
-    if (discovery?.url) { return normalizeMcpUrl(discovery.url); }
+    if (discovery?.url) {
+      const endpoint = normalizeMcpUrl(discovery.url);
+      if (await isEndpointHealthy(endpoint, Math.min(1_000, Math.max(100, deadline - Date.now())))) {
+        return endpoint;
+      }
+    }
     if (Date.now() >= deadline) { break; }
     await delay(200);
   } while (true);
@@ -132,6 +142,16 @@ async function resolveEndpoint(options: CliOptions): Promise<URL> {
     `codeidx MCP endpoint was not discovered for workspace ${options.workspace}. ` +
     `Start the VS Code Codeidx MCP server for this workspace, or pass --url/--port explicitly.`,
   );
+}
+
+async function isEndpointHealthy(endpoint: URL, timeoutMs: number): Promise<boolean> {
+  try {
+    const raw = await getHealth(endpoint, timeoutMs);
+    const parsed = JSON.parse(raw) as { ok?: unknown; running?: unknown };
+    return parsed.ok === true || parsed.running === true;
+  } catch {
+    return false;
+  }
 }
 
 function readDiscoveryFile(filePath: string, expectedWorkspaceId: string): { url?: string } | undefined {

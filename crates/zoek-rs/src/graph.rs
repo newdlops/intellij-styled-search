@@ -1474,6 +1474,14 @@ pub fn query_graph_implementations(
             symbols: Vec::new(),
         }));
     };
+    if !graph_symbol_may_have_implementations(target_idx, &symbols) {
+        return Ok(Some(GraphSymbolQueryResult {
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            built_at_unix_ms,
+            total_symbols: 0,
+            symbols: Vec::new(),
+        }));
+    }
     let mut implementation_index = GraphImplementationIndex::new(&symbols);
     let implementation_indices =
         implementation_index.implementation_indices_for_symbol_idx(target_idx);
@@ -1791,6 +1799,44 @@ fn framework_impl_marker_count(symbol: &GraphSymbol) -> usize {
         .iter()
         .filter(|name| name.starts_with(FRAMEWORK_IMPL_PREFIX))
         .count()
+}
+
+fn graph_symbol_may_have_implementations(idx: usize, symbols: &[GraphSymbol]) -> bool {
+    let symbol = &symbols[idx];
+    if is_type_reference_symbol_kind(&symbol.kind) {
+        return graph_has_direct_child_type(symbol, symbols);
+    }
+    if !matches!(symbol.kind.as_str(), "method" | "constructor") {
+        return false;
+    }
+    let Some(container_name) = symbol.container_name.as_ref() else {
+        return false;
+    };
+    let Some(container) = symbols.iter().find(|candidate| {
+        is_type_reference_symbol_kind(&candidate.kind)
+            && (candidate.qualified_name == *container_name || candidate.name == *container_name)
+    }) else {
+        return false;
+    };
+    graph_has_direct_child_type(container, symbols)
+}
+
+fn graph_has_direct_child_type(parent: &GraphSymbol, symbols: &[GraphSymbol]) -> bool {
+    symbols.iter().any(|symbol| {
+        symbol.id != parent.id
+            && is_type_reference_symbol_kind(&symbol.kind)
+            && symbol
+                .extends_names
+                .iter()
+                .chain(symbol.implements_names.iter())
+                .any(|name| graph_parent_name_matches_symbol(name, parent))
+    })
+}
+
+fn graph_parent_name_matches_symbol(parent_name: &str, symbol: &GraphSymbol) -> bool {
+    parent_name == symbol.qualified_name
+        || parent_name == symbol.name
+        || last_qualified_part(parent_name) == symbol.name
 }
 
 fn descendant_type_indices(
@@ -3678,22 +3724,59 @@ fn push_reference_to_symbol(
     }
     let mut reference = make_graph_reference(file, name, line, line_idx, start, end);
     reference.target_symbol_id = Some(symbol.id.clone());
-    reference.edge_kind = classify_reference_edge_kind(line, start, end, &symbol.kind);
     reference.enclosing_symbol_id = enclosing_by_line.get(line_idx).cloned().flatten();
+    reference.edge_kind = classify_reference_edge_kind(
+        line,
+        start,
+        end,
+        &file.rel_path,
+        &symbol.kind,
+        reference.enclosing_symbol_id.is_some(),
+    );
     out.push((symbol.id.clone(), reference));
 }
 
-fn classify_reference_edge_kind(line: &str, start: usize, end: usize, target_kind: &str) -> String {
-    let next_non_ws = line
-        .get(end..)
-        .and_then(|suffix| suffix.chars().find(|ch| !ch.is_whitespace()));
-    if next_non_ws != Some('(') {
+fn classify_reference_edge_kind(
+    line: &str,
+    start: usize,
+    end: usize,
+    rel_path: &str,
+    target_kind: &str,
+    has_enclosing_symbol: bool,
+) -> String {
+    if !has_enclosing_symbol || !is_call_reference_symbol_kind(target_kind) {
         return "usage".to_string();
     }
-    if target_kind == "class" && previous_identifier(line, start).as_deref() == Some("new") {
+    if !is_call_expression_token(line, start, end, rel_path) {
+        return "usage".to_string();
+    }
+    if target_kind == "constructor" || target_kind == "class" {
         return "construct".to_string();
     }
     "call".to_string()
+}
+
+fn is_call_reference_symbol_kind(kind: &str) -> bool {
+    matches!(kind, "function" | "method" | "constructor" | "class")
+}
+
+fn is_call_expression_token(line: &str, start: usize, end: usize, rel_path: &str) -> bool {
+    if is_probable_ts_type_context(line, start, end)
+        || (rel_path.ends_with(".py") && is_probable_python_type_context(line, start, end))
+    {
+        return false;
+    }
+    let after = line.get(end..).unwrap_or("").trim_start();
+    if !(after.starts_with('(') || after.starts_with("?.(")) {
+        return false;
+    }
+    if previous_identifier(line, start)
+        .as_deref()
+        .is_some_and(|word| matches!(word, "class" | "def" | "function" | "interface" | "type"))
+    {
+        return false;
+    }
+    true
 }
 
 fn previous_identifier(line: &str, start: usize) -> Option<String> {
@@ -7426,6 +7509,32 @@ mod tests {
                     && reference.edge_kind == "call"),
             "expected references to carry enclosing function ids"
         );
+        assert!(
+            references
+                .references
+                .iter()
+                .any(|reference| reference.enclosing_symbol_id.is_none()
+                    && reference.edge_kind == "usage"),
+            "expected top-level references without an enclosing callable to remain usage edges"
+        );
+        let beta_references = query_graph(&root, "typescript:src/a.ts:beta:4", 10, &config)?
+            .expect("beta graph query result");
+        assert!(
+            beta_references.references.iter().any(|reference| {
+                reference.enclosing_symbol_id.as_deref() == Some("typescript:src/a.ts:alpha:1")
+                    && reference.edge_kind == "call"
+            }),
+            "expected beta() inside alpha to materialize as a call edge"
+        );
+        let alpha_callees = query_graph_callees(&root, "typescript:src/a.ts:alpha:1", 10, &config)?
+            .expect("alpha callee query result");
+        assert!(
+            alpha_callees.references.iter().any(|reference| {
+                reference.target_symbol_id.as_deref() == Some("typescript:src/a.ts:beta:4")
+                    && reference.edge_kind == "call"
+            }),
+            "expected graph-callees to return beta as an outgoing call from alpha"
+        );
         let beta_callees = query_graph_callees(&root, "typescript:src/a.ts:beta:4", 10, &config)?
             .expect("callee query result");
         assert!(
@@ -7433,7 +7542,7 @@ mod tests {
                 reference.target_symbol_id.as_deref() == Some("typescript:src/a.ts:alpha:1")
                     && reference.edge_kind == "call"
             }),
-            "expected graph-callees to return alpha as an outgoing usage from beta"
+            "expected graph-callees to return alpha as an outgoing call from beta"
         );
         let _ = fs::remove_dir_all(root);
         Ok(())
