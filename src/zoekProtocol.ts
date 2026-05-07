@@ -74,6 +74,7 @@ export interface ZoektInfoResponse {
 export interface ZoektSearchRequest {
   workspaceRoot: string;
   query: string;
+  queryTerms?: string[];
   caseSensitive: boolean;
   wholeWord: boolean;
   useRegex: boolean;

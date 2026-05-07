@@ -3,7 +3,7 @@ use crate::corpus::discover_text_files;
 use crate::mmap_store::StoreLayout;
 use crate::overlay::load_overlay_with_recovery;
 use crate::planner::{build_query_plan, QueryMode};
-use crate::protocol::{SearchRequest, SearchResponse};
+use crate::protocol::{SearchMatch, SearchRequest, SearchResponse};
 use crate::scorer::score_file;
 use crate::shard::{ShardDocument, ShardReader};
 use crate::verifier::{
@@ -82,23 +82,8 @@ pub fn search_workspace(
             continue;
         };
         let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
-        let matches = match plan.mode {
-            QueryMode::Literal => verify_literal(
-                &current.text,
-                &request.query,
-                request.case_sensitive,
-                request.whole_word,
-                remaining_match_budget,
-            ),
-            QueryMode::Regex => verify_regex(
-                &current.text,
-                &plan.effective_query,
-                request.case_sensitive,
-                request.regex_multiline,
-                remaining_match_budget,
-            )
-            .map_err(|err| err.to_string())?,
-        };
+        let matches = verify_plan_terms(&current.text, &plan, request, remaining_match_budget)
+            .map_err(|err| err.to_string())?;
         if matches.is_empty() {
             continue;
         }
@@ -270,7 +255,7 @@ fn candidate_doc_ids(
     plan: &crate::planner::QueryPlan,
 ) -> Result<BTreeSet<u32>, std::io::Error> {
     let docs = reader.documents()?;
-    if plan.required_grams.is_empty() {
+    if plan.terms.is_empty() || plan.terms.iter().any(|term| term.required_grams.is_empty()) {
         return Ok(docs
             .into_iter()
             .map(|doc| doc.doc_id)
@@ -289,23 +274,26 @@ fn candidate_doc_ids(
         .map(|doc| doc.doc_id)
         .collect();
 
-    let mut acc: Option<BTreeSet<u32>> = None;
-    for gram in &plan.required_grams {
-        let posting = reader.find_posting(gram)?;
-        let ids = posting
-            .map(|posting| posting.doc_ids.into_iter().collect::<BTreeSet<_>>())
-            .unwrap_or_default();
-        acc = Some(match acc {
-            Some(existing) => existing.intersection(&ids).copied().collect(),
-            None => ids,
-        });
-        if acc.as_ref().is_some_and(BTreeSet::is_empty) {
-            break;
+    let mut selected_ids = BTreeSet::new();
+    for term in &plan.terms {
+        let mut term_ids: Option<BTreeSet<u32>> = None;
+        for gram in &term.required_grams {
+            let posting = reader.find_posting(gram)?;
+            let ids = posting
+                .map(|posting| posting.doc_ids.into_iter().collect::<BTreeSet<_>>())
+                .unwrap_or_default();
+            term_ids = Some(match term_ids {
+                Some(existing) => existing.intersection(&ids).copied().collect(),
+                None => ids,
+            });
+            if term_ids.as_ref().is_some_and(BTreeSet::is_empty) {
+                break;
+            }
         }
+        selected_ids.extend(term_ids.unwrap_or_default());
     }
-    let mut acc = acc.unwrap_or_default();
-    acc.extend(incomplete_ids);
-    Ok(acc)
+    selected_ids.extend(incomplete_ids);
+    Ok(selected_ids)
 }
 
 fn docs_for_ids<'a>(docs: &'a [ShardDocument], ids: &BTreeSet<u32>) -> Vec<&'a ShardDocument> {
@@ -341,7 +329,55 @@ fn overlay_matches_plan(
         })
         .collect::<BTreeSet<_>>();
     let _ = config;
-    plan.required_grams.iter().all(|gram| grams.contains(gram))
+    plan.terms.iter().any(|term| {
+        term.required_grams.is_empty()
+            || term.required_grams.iter().all(|gram| grams.contains(gram))
+    })
+}
+
+fn verify_plan_terms(
+    text: &str,
+    plan: &crate::planner::QueryPlan,
+    request: &SearchRequest,
+    limit: usize,
+) -> Result<Vec<SearchMatch>, regex::Error> {
+    let mut matches = Vec::new();
+    for term in &plan.terms {
+        match plan.mode {
+            QueryMode::Literal => matches.extend(verify_literal(
+                text,
+                &term.query,
+                request.case_sensitive,
+                request.whole_word,
+                limit,
+            )),
+            QueryMode::Regex => matches.extend(verify_regex(
+                text,
+                &term.effective_query,
+                request.case_sensitive,
+                request.regex_multiline,
+                limit,
+            )?),
+        }
+    }
+    matches.sort_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then_with(|| left.start_column.cmp(&right.start_column))
+            .then_with(|| left.end_line.cmp(&right.end_line))
+            .then_with(|| left.end_column.cmp(&right.end_column))
+    });
+    matches.dedup_by(|left, right| {
+        left.line == right.line
+            && left.start_column == right.start_column
+            && left.end_line == right.end_line
+            && left.end_column == right.end_column
+            && left.preview == right.preview
+    });
+    if matches.len() > limit {
+        matches.truncate(limit);
+    }
+    Ok(matches)
 }
 
 fn fallback_candidates(
@@ -405,6 +441,7 @@ mod tests {
             &SearchRequest {
                 workspace_root: root.to_string_lossy().into_owned(),
                 query: "AlphaService".to_string(),
+                query_terms: Vec::new(),
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
@@ -420,6 +457,51 @@ mod tests {
         .map_err(io::Error::other)?;
         assert_eq!(response.total_files_matched, 1);
         assert_eq!(response.files[0].rel_path, "src/a.rs");
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn search_workspace_uses_shards_for_literal_or_queries() -> io::Result<()> {
+        let root = temp_dir("searcher-or");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/a.rs"), "struct AlphaService {}\n")?;
+        fs::write(root.join("src/b.rs"), "struct BetaService {}\n")?;
+        fs::write(root.join("src/c.rs"), "struct GammaService {}\n")?;
+        index_directory(&root, &EngineConfig::default())?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "AlphaService".to_string(),
+                query_terms: vec!["BetaService".to_string()],
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec!["src/*".to_string()],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &EngineConfig::default(),
+        )
+        .map_err(io::Error::other)?;
+        let rel_paths = response
+            .files
+            .iter()
+            .map(|file| file.rel_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(response.total_files_matched, 2);
+        assert!(rel_paths.contains(&"src/a.rs"));
+        assert!(rel_paths.contains(&"src/b.rs"));
+        assert!(
+            response.total_files_scanned < 3,
+            "OR query should union selective shard candidates instead of scanning every file; scanned {} files",
+            response.total_files_scanned,
+        );
 
         fs::remove_dir_all(root)?;
         Ok(())
@@ -449,6 +531,7 @@ mod tests {
             &SearchRequest {
                 workspace_root: root.to_string_lossy().into_owned(),
                 query: "export const RightToConsentOrConsultInvestorsSelectTable = ({\n  name,\n  investorCandidates,\n  isShowInvestors,\n  onCheck".to_string(),
+                query_terms: Vec::new(),
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
@@ -499,6 +582,7 @@ mod tests {
             &SearchRequest {
                 workspace_root: root.to_string_lossy().into_owned(),
                 query: "AlphaService".to_string(),
+                query_terms: Vec::new(),
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
@@ -529,6 +613,7 @@ mod tests {
             &SearchRequest {
                 workspace_root: root.to_string_lossy().into_owned(),
                 query: "foo.*baz".to_string(),
+                query_terms: Vec::new(),
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: true,
@@ -560,6 +645,7 @@ mod tests {
             &SearchRequest {
                 workspace_root: root.to_string_lossy().into_owned(),
                 query: "foo.*baz".to_string(),
+                query_terms: Vec::new(),
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: true,
@@ -596,6 +682,7 @@ mod tests {
             &SearchRequest {
                 workspace_root: root.to_string_lossy().into_owned(),
                 query: "AlphaService".to_string(),
+                query_terms: Vec::new(),
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
@@ -613,6 +700,7 @@ mod tests {
             &SearchRequest {
                 workspace_root: root.to_string_lossy().into_owned(),
                 query: "BetaService".to_string(),
+                query_terms: Vec::new(),
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
@@ -650,6 +738,7 @@ mod tests {
             &SearchRequest {
                 workspace_root: root.to_string_lossy().into_owned(),
                 query: "GammaService".to_string(),
+                query_terms: Vec::new(),
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
@@ -684,6 +773,7 @@ mod tests {
             &SearchRequest {
                 workspace_root: root.to_string_lossy().into_owned(),
                 query: "needle".to_string(),
+                query_terms: Vec::new(),
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
@@ -726,6 +816,7 @@ mod tests {
             &SearchRequest {
                 workspace_root: root.to_string_lossy().into_owned(),
                 query: "class".to_string(),
+                query_terms: Vec::new(),
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,
@@ -773,6 +864,7 @@ mod tests {
             &SearchRequest {
                 workspace_root: root.to_string_lossy().into_owned(),
                 query: "한글검색".to_string(),
+                query_terms: Vec::new(),
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,

@@ -17,6 +17,7 @@ import {
 import {
   mergeFileMatches,
   runSearch,
+  searchQueryTerms,
   type FileMatch,
   type SearchEngine,
   type SearchForTestsResult,
@@ -118,6 +119,7 @@ type McpSearchScope = {
 
 type ParsedMcpSearchQuery = {
   effectiveQuery: string;
+  effectiveQueries: string[];
   useRegex: boolean;
   queryKind: 'literal' | 'regex' | 'zoekt';
   pathRegex?: string;
@@ -139,6 +141,10 @@ const DEFAULT_SYMBOL_MAX_CHARS = DEFAULT_MCP_MAX_CHARS;
 const DEFAULT_BUNDLE_MAX_CHARS = DEFAULT_MCP_MAX_CHARS;
 const DEFAULT_READ_SNIPPETS_MAX_CHARS = DEFAULT_MCP_MAX_CHARS;
 const MAX_SNIPPET_LINES = 300;
+const MCP_SEARCH_CONCURRENCY = 4;
+const MCP_FULL_SCAN_CONCURRENCY = 1;
+const MCP_TEST_CONCURRENCY = 1;
+const MCP_GENERATED_MAX_FILE_SIZE_BYTES = 16 * 1024 * 1024;
 
 const SENSITIVE_EXCLUDE_GLOBS = [
   '**/.env',
@@ -173,6 +179,13 @@ const DEPENDENCY_EXCLUDE_GLOBS = [
   '**/.lh/**',
 ];
 
+const GENERATED_EXCLUDE_GLOBS = [
+  '**/*.min.*',
+  '**/generated/**',
+  '**/__generated__/**',
+  '**/graphql-codegen/**',
+];
+
 const LANGUAGE_GLOBS: Record<string, string[]> = {
   ts: ['**/*.ts'],
   typescript: ['**/*.ts'],
@@ -195,6 +208,9 @@ export class CallGraphMcpServer implements vscode.Disposable {
   private server: http.Server | undefined;
   private port: number | undefined;
   private startPromise: Promise<string> | undefined;
+  private readonly searchGate = new AsyncSemaphore(MCP_SEARCH_CONCURRENCY);
+  private readonly fullScanGate = new AsyncSemaphore(MCP_FULL_SCAN_CONCURRENCY);
+  private readonly testGate = new AsyncSemaphore(MCP_TEST_CONCURRENCY);
   private readonly snippets = new Map<string, SnippetRecord>();
   private readonly bundles = new Map<string, BundleRecord>();
   private readonly recentSymbols = new Map<string, CallGraphSymbol>();
@@ -233,7 +249,10 @@ export class CallGraphMcpServer implements vscode.Disposable {
   private async startListening(port: number): Promise<string> {
     const boundedPort = Number.isFinite(port) && port >= 0 ? Math.floor(port) : 0;
     this.server = http.createServer((req, res) => {
-      void this.handleRequest(req, res);
+      void this.handleRequest(req, res).catch((err) => {
+        this.log.appendLine(`codeidx MCP request failed outside handler: ${err instanceof Error ? err.message : String(err)}`);
+        this.writeJson(res, 500, jsonRpcError(null, -32603, err instanceof Error ? err.message : String(err)));
+      });
     });
     this.server.keepAliveTimeout = 30_000;
     this.server.headersTimeout = 35_000;
@@ -402,19 +421,21 @@ export class CallGraphMcpServer implements vscode.Disposable {
         case 'codeidx_index_status':
           return toolResult(this.capEnvelope(await this.indexStatus(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
         case 'codeidx_search_code':
-          return toolResult(this.capEnvelope(await this.searchCode(args), readIntArg(args, 'max_chars', DEFAULT_SEARCH_MAX_CHARS)));
+          return this.runSearchTool(args, async () =>
+            toolResult(this.capEnvelope(await this.searchCode(args), readIntArg(args, 'max_chars', DEFAULT_SEARCH_MAX_CHARS))));
         case 'codeidx_count':
-          return toolResult(this.capEnvelope(await this.countCode(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return this.runSearchTool(args, async () =>
+            toolResult(this.capEnvelope(await this.countCode(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS))));
         case 'codeidx_probe':
-          return this.probeCode(args);
+          return this.runSearchTool(args, () => this.probeCode(args));
         case 'codeidx_exists':
-          return this.existsCode(args);
+          return this.runSearchTool(args, () => this.existsCode(args));
         case 'codeidx_files':
-          return this.filesCode(args);
+          return this.runSearchTool(args, () => this.filesCode(args));
         case 'codeidx_first':
-          return this.firstCode(args);
+          return this.runSearchTool(args, () => this.firstCode(args));
         case 'codeidx_top_files':
-          return this.topFilesCode(args);
+          return this.runSearchTool(args, () => this.topFilesCode(args));
         case 'codeidx_search_symbols':
           return toolResult(this.capEnvelope(await this.searchSymbols(args), readIntArg(args, 'max_chars', DEFAULT_SYMBOL_MAX_CHARS)));
         case 'codeidx_outline':
@@ -456,7 +477,8 @@ export class CallGraphMcpServer implements vscode.Disposable {
         case 'mcp_health':
           return toolResult(this.capEnvelope(await this.mcpHealth(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
         case 'mcp_test':
-          return toolResult(this.capEnvelope(await this.mcpTest(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return this.testGate.run(() => this.fullScanGate.run(async () =>
+            toolResult(this.capEnvelope(await this.mcpTest(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)))));
 
         // Legacy compatibility for users who already configured the original
         // call-graph-only endpoint. These aliases are intentionally omitted
@@ -476,6 +498,11 @@ export class CallGraphMcpServer implements vscode.Disposable {
     } catch (err) {
       return toolErrorEnvelope('internal_error', err instanceof Error ? err.message : String(err));
     }
+  }
+
+  private async runSearchTool<T>(args: Record<string, unknown>, fn: () => Promise<T>): Promise<T> {
+    const gate = searchArgsRequireFullScan(args) ? this.fullScanGate : this.searchGate;
+    return gate.run(fn);
   }
 
   private async callLegacyTool(name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -634,7 +661,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
   }
 
   private async searchCode(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const query = readRequiredStringArg(args, 'query');
+    const queryTerms = readSearchQueryTerms(args);
     const queryKind = readEnumArg(args, 'query_kind', ['auto', 'literal', 'regex', 'zoekt'], 'auto');
     const caseMode = readEnumArg(args, 'case_sensitive', ['auto', 'yes', 'no'], 'auto');
     const limit = readIntArg(args, 'limit', 20, 1, 200);
@@ -649,7 +676,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const requestedEngine = this.searchBackend ? 'configured' : 'codesearch';
     let parsedQuery: ParsedMcpSearchQuery;
     try {
-      parsedQuery = parseMcpSearchQuery(query, queryKind);
+      parsedQuery = parseMcpSearchQueries(queryTerms, queryKind);
     } catch (err) {
       return this.errorEnvelope('invalid_query', err instanceof Error ? err.message : String(err));
     }
@@ -682,7 +709,8 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const resultLimit = Math.min(1_000, offset + limit + 1);
     const options: SearchOptions = {
       query: parsedQuery.effectiveQuery,
-      caseSensitive: caseMode === 'yes' || (caseMode === 'auto' && hasUppercase(parsedQuery.effectiveQuery)),
+      queries: parsedQuery.effectiveQueries,
+      caseSensitive: caseMode === 'yes' || (caseMode === 'auto' && parsedQuery.effectiveQueries.some(hasUppercase)),
       wholeWord: false,
       useRegex: parsedQuery.useRegex,
       regexMultiline: multiline,
@@ -691,6 +719,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
       pathRegex: parsedQuery.pathRegex,
       forceFullScan,
       ignoreConfiguredExcludes: scope.excludePolicy !== 'default',
+      maxFileSizeBytes: maxFileSizeForScope(scope),
       resultLimit,
     };
     let detailed = await this.runSearchBackend(options);
@@ -758,9 +787,11 @@ export class CallGraphMcpServer implements vscode.Disposable {
         requested_engine: detailed.requestedEngine,
         query_kind: parsedQuery.queryKind,
         effective_query_kind: parsedQuery.useRegex ? 'regex' : 'literal',
+        query_operator: parsedQuery.effectiveQueries.length > 1 ? 'any' : null,
+        query_terms: parsedQuery.effectiveQueries,
         regex_dialect: parsedQuery.useRegex ? 'javascript-regexp fallback / zoekt backend when configured' : null,
         parsed: true,
-        has_required_trigram: estimateRequiredLiteral(parsedQuery.effectiveQuery).length >= 3,
+        has_required_trigram: parsedQuery.effectiveQueries.some((term) => estimateRequiredLiteral(term).length >= 3),
         estimated_candidate_files: null,
         path_regex: parsedQuery.pathRegex ?? null,
         fallback_used: !!detailed.fallbackReason,
@@ -792,7 +823,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
   }
 
   private async countCode(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const query = readRequiredStringArg(args, 'query');
+    const queryTerms = readSearchQueryTerms(args);
     const queryKind = readEnumArg(args, 'query_kind', ['auto', 'literal', 'regex', 'zoekt'], 'auto');
     const caseMode = readEnumArg(args, 'case_sensitive', ['auto', 'yes', 'no'], 'auto');
     const multiline = readBoolArg(args, 'multiline', false);
@@ -803,7 +834,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const scope = readMcpSearchScope(args);
     let parsedQuery: ParsedMcpSearchQuery;
     try {
-      parsedQuery = parseMcpSearchQuery(query, queryKind);
+      parsedQuery = parseMcpSearchQueries(queryTerms, queryKind);
     } catch (err) {
       return this.errorEnvelope('invalid_query', err instanceof Error ? err.message : String(err));
     }
@@ -829,7 +860,8 @@ export class CallGraphMcpServer implements vscode.Disposable {
     }
     const options: SearchOptions = {
       query: parsedQuery.effectiveQuery,
-      caseSensitive: caseMode === 'yes' || (caseMode === 'auto' && hasUppercase(parsedQuery.effectiveQuery)),
+      queries: parsedQuery.effectiveQueries,
+      caseSensitive: caseMode === 'yes' || (caseMode === 'auto' && parsedQuery.effectiveQueries.some(hasUppercase)),
       wholeWord: false,
       useRegex: parsedQuery.useRegex,
       regexMultiline: multiline,
@@ -838,6 +870,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
       pathRegex: parsedQuery.pathRegex,
       forceFullScan,
       ignoreConfiguredExcludes: scope.excludePolicy !== 'default',
+      maxFileSizeBytes: maxFileSizeForScope(scope),
       resultLimit: maxMatches + 1,
     };
     const detailed = await this.runSearchBackend(options);
@@ -864,7 +897,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
       warnings.push('Scope override may include files outside the Zoekt index; using codesearch full scan to preserve correctness.');
     }
     return {
-      ...this.baseEnvelope(this.callGraph.getSnapshot(), `Counted ${totalMatches}${truncated ? '+' : ''} matches for ${JSON.stringify(query)} across ${byFile.length}${truncated ? '+' : ''} files.`),
+      ...this.baseEnvelope(this.callGraph.getSnapshot(), `Counted ${totalMatches}${truncated ? '+' : ''} matches for ${JSON.stringify(parsedQuery.effectiveQueries)} across ${byFile.length}${truncated ? '+' : ''} files.`),
       count: {
         total_matches: totalMatches,
         total_files: byFile.length,
@@ -880,6 +913,8 @@ export class CallGraphMcpServer implements vscode.Disposable {
         requested_engine: detailed.requestedEngine,
         query_kind: parsedQuery.queryKind,
         effective_query_kind: parsedQuery.useRegex ? 'regex' : 'literal',
+        query_operator: parsedQuery.effectiveQueries.length > 1 ? 'any' : null,
+        query_terms: parsedQuery.effectiveQueries,
         path_regex: parsedQuery.pathRegex ?? null,
         fallback_used: !!detailed.fallbackReason,
         fallback_reason: detailed.fallbackReason,
@@ -2042,7 +2077,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
         useRegex: false,
         regexMultiline: false,
         includePatterns: languageGlobs(languages),
-        excludePatterns: [...DEPENDENCY_EXCLUDE_GLOBS, '**/*.min.*', '**/generated/**', '**/__generated__/**'],
+        excludePatterns: [...DEPENDENCY_EXCLUDE_GLOBS, ...GENERATED_EXCLUDE_GLOBS],
         forceFullScan: true,
         resultLimit: 20,
       });
@@ -2072,15 +2107,18 @@ export class CallGraphMcpServer implements vscode.Disposable {
   }
 
   private async explainSearchQuery(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const query = readRequiredStringArg(args, 'query');
+    const queryTerms = readSearchQueryTerms(args);
     const queryKind = readEnumArg(args, 'query_kind', ['auto', 'literal', 'regex', 'zoekt'], 'auto');
     let parsedQuery: ParsedMcpSearchQuery;
     try {
-      parsedQuery = parseMcpSearchQuery(query, queryKind);
+      parsedQuery = parseMcpSearchQueries(queryTerms, queryKind);
     } catch (err) {
       return this.errorEnvelope('invalid_query', err instanceof Error ? err.message : String(err));
     }
-    const literal = estimateRequiredLiteral(parsedQuery.effectiveQuery);
+    const literals = parsedQuery.effectiveQueries
+      .map(estimateRequiredLiteral)
+      .filter((literal) => literal.length > 0);
+    const literal = literals.sort((a, b) => b.length - a.length)[0] ?? '';
     const warnings = [...parsedQuery.warnings];
     const scope = readMcpSearchScope(args);
     const multiline = readBoolArg(args, 'multiline', false);
@@ -2100,9 +2138,11 @@ export class CallGraphMcpServer implements vscode.Disposable {
         parsed: true,
         query_kind: parsedQuery.queryKind,
         effective_query_kind: parsedQuery.useRegex ? 'regex' : 'literal',
+        query_operator: parsedQuery.effectiveQueries.length > 1 ? 'any' : null,
+        query_terms: parsedQuery.effectiveQueries,
         path_regex: parsedQuery.pathRegex ?? null,
-        required_literals: literal ? [literal] : [],
-        has_required_trigram: literal.length >= 3,
+        required_literals: [...new Set(literals)],
+        has_required_trigram: literals.some((item) => item.length >= 3),
         estimated_candidate_files: null,
         fallback_required: regexRisk.blocked,
         suggested_fallback: regexRisk.blocked ? 'rg' : null,
@@ -2183,6 +2223,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
       pathRegex: parsedQuery.pathRegex,
       forceFullScan: scopeOverrideRequiresFullScan(scope),
       ignoreConfiguredExcludes: scope.excludePolicy !== 'default',
+      maxFileSizeBytes: maxFileSizeForScope(scope),
       resultLimit: limit,
     };
 
@@ -3057,12 +3098,61 @@ export class CallGraphMcpServer implements vscode.Disposable {
   }
 
   private writeJson(res: http.ServerResponse, status: number, body: unknown): void {
-    const payload = JSON.stringify(body);
-    res.writeHead(status, {
-      'content-type': 'application/json; charset=utf-8',
-      'content-length': Buffer.byteLength(payload),
+    if (res.destroyed || res.writableEnded) { return; }
+    let payload: string;
+    try {
+      payload = JSON.stringify(body);
+    } catch (err) {
+      payload = JSON.stringify(jsonRpcError(null, -32603, err instanceof Error ? err.message : String(err)));
+      status = 500;
+    }
+    try {
+      if (!res.headersSent) {
+        res.writeHead(status, {
+          'content-type': 'application/json; charset=utf-8',
+          'content-length': Buffer.byteLength(payload),
+        });
+      }
+      res.end(payload);
+    } catch (err) {
+      this.log.appendLine(`codeidx MCP response write failed: ${err instanceof Error ? err.message : String(err)}`);
+      try { res.destroy(); } catch {}
+    }
+  }
+}
+
+class AsyncSemaphore {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly maxActive: number) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  }
+
+  private acquire(): Promise<void> {
+    if (this.active < this.maxActive) {
+      this.active += 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.waiters.push(() => {
+        this.active += 1;
+        resolve();
+      });
     });
-    res.end(payload);
+  }
+
+  private release(): void {
+    this.active = Math.max(0, this.active - 1);
+    const next = this.waiters.shift();
+    if (next) { next(); }
   }
 }
 
@@ -3146,7 +3236,9 @@ function toolDefinitions(): ToolDefinition[] {
       title: 'Search Code',
       description: 'Run bounded literal or regex code search through the configured Zoekt/codesearch pipeline and return snippets plus resource links.',
       inputSchema: objectSchema({
-        query: { type: 'string' },
+        query: { type: 'string', description: 'Primary search term. Optional when queries is provided.' },
+        queries: { type: 'array', items: { type: 'string' }, default: [], description: 'Additional terms ORed with query; when query is omitted, this array supplies all terms.' },
+        query_operator: { type: 'string', enum: ['any'], default: 'any', description: 'Combines query/queries with OR semantics.' },
         query_kind: { type: 'string', enum: ['auto', 'literal', 'regex', 'zoekt'], default: 'auto' },
         case_sensitive: { type: 'string', enum: ['auto', 'yes', 'no'], default: 'auto' },
         languages: { type: 'array', items: { type: 'string' }, default: [] },
@@ -3171,7 +3263,7 @@ function toolDefinitions(): ToolDefinition[] {
         require_fresh: { type: 'boolean', default: false },
         explain: { type: 'boolean', default: true },
         verbose: { type: 'boolean', default: false, description: 'When true, include full scope exclude pattern arrays in query diagnostics.' },
-      }, ['query']),
+      }),
       annotations: readOnlyAnnotations(),
     },
     {
@@ -3179,7 +3271,9 @@ function toolDefinitions(): ToolDefinition[] {
       title: 'Count Code Matches',
       description: 'Count literal or regex code matches by file without returning snippets or match locations.',
       inputSchema: objectSchema({
-        query: { type: 'string' },
+        query: { type: 'string', description: 'Primary search term. Optional when queries is provided.' },
+        queries: { type: 'array', items: { type: 'string' }, default: [], description: 'Additional terms ORed with query; when query is omitted, this array supplies all terms.' },
+        query_operator: { type: 'string', enum: ['any'], default: 'any', description: 'Combines query/queries with OR semantics.' },
         query_kind: { type: 'string', enum: ['auto', 'literal', 'regex', 'zoekt'], default: 'auto' },
         case_sensitive: { type: 'string', enum: ['auto', 'yes', 'no'], default: 'auto' },
         languages: { type: 'array', items: { type: 'string' }, default: [] },
@@ -3201,7 +3295,7 @@ function toolDefinitions(): ToolDefinition[] {
         max_files: { type: 'integer', minimum: 1, maximum: 5000, default: 100 },
         max_chars: { type: 'integer', minimum: 1000, maximum: 200000, default: DEFAULT_MCP_MAX_CHARS },
         verbose: { type: 'boolean', default: false, description: 'When true, include full scope exclude pattern arrays in query diagnostics.' },
-      }, ['query']),
+      }),
       annotations: readOnlyAnnotations(),
     },
     {
@@ -3568,12 +3662,14 @@ function toolDefinitions(): ToolDefinition[] {
       title: 'Explain Search Query',
       description: 'Validate and diagnose a search query without running the full search.',
       inputSchema: objectSchema({
-        query: { type: 'string' },
+        query: { type: 'string', description: 'Primary search term. Optional when queries is provided.' },
+        queries: { type: 'array', items: { type: 'string' }, default: [], description: 'Additional terms ORed with query; when query is omitted, this array supplies all terms.' },
+        query_operator: { type: 'string', enum: ['any'], default: 'any', description: 'Combines query/queries with OR semantics.' },
         query_kind: { type: 'string', enum: ['auto', 'literal', 'regex', 'zoekt'], default: 'auto' },
         languages: { type: 'array', items: { type: 'string' }, default: [] },
         file_globs: { type: 'array', items: { type: 'string' }, default: [] },
         multiline: { type: 'boolean', default: false },
-      }, ['query']),
+      }),
       annotations: readOnlyAnnotations(),
     },
     {
@@ -4227,7 +4323,7 @@ function readMcpSearchScope(args: Record<string, unknown>): McpSearchScope {
     defaultExcludePatterns.push(...DEPENDENCY_EXCLUDE_GLOBS);
   }
   if (!includeGenerated) {
-    defaultExcludePatterns.push('**/*.min.*', '**/generated/**', '**/__generated__/**');
+    defaultExcludePatterns.push(...GENERATED_EXCLUDE_GLOBS);
   }
 
   let excludePatterns: string[] = [];
@@ -4253,26 +4349,43 @@ function readMcpSearchScope(args: Record<string, unknown>): McpSearchScope {
 }
 
 function searchScopeWarnings(scope: McpSearchScope): string[] {
+  const warnings: string[] = [];
   if (scope.excludePolicy === 'none') {
-    return ['exclude_policy=none disables default excludes and user exclude_globs, including sensitive-file excludes. Use narrow include_globs/file_globs when searching excluded paths.'];
+    warnings.push('exclude_policy=none disables default excludes and user exclude_globs, including sensitive-file excludes. Use narrow include_globs/file_globs when searching excluded paths.');
   }
   if (scope.excludePolicy === 'custom_only') {
-    return ['exclude_policy=custom_only disables default excludes; user exclude_globs still apply. Use this with narrow include_globs/file_globs for dependency or generated paths.'];
+    warnings.push('exclude_policy=custom_only disables default excludes; user exclude_globs still apply. Use this with narrow include_globs/file_globs for dependency or generated paths.');
   }
-  return [];
+  if (scope.includeGenerated) {
+    warnings.push('include_generated=true disables generated/codegen excludes and uses a bounded full scan with a larger MCP file-size cap.');
+  }
+  return warnings;
 }
 
 function scopeOverrideRequiresFullScan(scope: McpSearchScope): boolean {
+  if (scope.includeGenerated) { return true; }
   if (scope.excludePolicy === 'default') { return false; }
   if (scope.includePatterns.length === 0) { return true; }
   return scope.includePatterns.some((pattern) => includePatternMayNeedUnindexedPath(pattern));
+}
+
+function maxFileSizeForScope(scope: McpSearchScope): number | undefined {
+  return scope.includeGenerated ? MCP_GENERATED_MAX_FILE_SIZE_BYTES : undefined;
+}
+
+function searchArgsRequireFullScan(args: Record<string, unknown>): boolean {
+  try {
+    return scopeOverrideRequiresFullScan(readMcpSearchScope(args));
+  } catch {
+    return true;
+  }
 }
 
 function includePatternMayNeedUnindexedPath(pattern: string): boolean {
   const normalized = pattern.replace(/\\/g, '/').replace(/^\.\//, '');
   if (!normalized || normalized === '**' || normalized.startsWith('**/')) { return true; }
   if (normalized.includes('{')) { return true; }
-  return /(^|\/)(?:\.git|\.hg|\.svn|node_modules|bower_components|vendor|venv|\.venv|dist|build|out|target|coverage|__pycache__|generated|__generated__|\.vscode-test|\.lh)(?:\/|$)/.test(normalized);
+  return /(^|\/)(?:\.git|\.hg|\.svn|node_modules|bower_components|vendor|venv|\.venv|dist|build|out|target|coverage|__pycache__|generated|__generated__|graphql-codegen|\.vscode-test|\.lh)(?:\/|$)/.test(normalized);
 }
 
 function searchScopeDiagnostics(scope: McpSearchScope, verbose = false): Record<string, unknown> {
@@ -4592,33 +4705,108 @@ function hasUppercase(value: string): boolean {
   return /[A-Z]/.test(value);
 }
 
+function readSearchQueryTerms(args: Record<string, unknown>): string[] {
+  const primary = readOptionalStringArg(args, 'query');
+  const alternatives = readStringArrayArg(args, 'queries', []);
+  const terms = primary ? [primary, ...alternatives] : alternatives;
+  return [...new Set(terms.map((term) => term.trim()).filter(Boolean))];
+}
+
+function escapeRegexSource(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function parseMcpSearchQuery(query: string, queryKind: 'auto' | 'literal' | 'regex' | 'zoekt'): ParsedMcpSearchQuery {
+  return parseMcpSearchQueries([query], queryKind);
+}
+
+function parseMcpSearchQueries(queries: string[], queryKind: 'auto' | 'literal' | 'regex' | 'zoekt'): ParsedMcpSearchQuery {
+  if (queries.length === 0) {
+    throw new Error('query or queries must include at least one non-empty search term.');
+  }
+  if (queries.length === 1) {
+    return parseSingleMcpSearchQuery(queries[0], queryKind);
+  }
+  if (queryKind === 'zoekt') {
+    throw new Error('query_kind=zoekt does not support queries OR yet; use query_kind=literal or regex with file_globs/languages for scope.');
+  }
+  if (queryKind === 'literal') {
+    return {
+      effectiveQuery: queries[0],
+      effectiveQueries: queries,
+      useRegex: false,
+      queryKind: 'literal',
+      warnings: [`queries uses native OR across ${queries.length} literal terms.`],
+    };
+  }
+  if (queryKind === 'regex') {
+    const effectiveQueries = queries.map((query) => unwrapSlashRegex(query) ?? query);
+    for (const query of effectiveQueries) {
+      validateRegexPattern(query);
+    }
+    return {
+      effectiveQuery: effectiveQueries[0],
+      effectiveQueries,
+      useRegex: true,
+      queryKind: 'regex',
+      warnings: [`queries uses native OR across ${queries.length} regex terms.`],
+    };
+  }
+  const parsed = queries.map((query) => parseSingleMcpSearchQuery(query, 'auto'));
+  const useRegex = parsed.some((item) => item.useRegex);
+  if (!useRegex) {
+    return {
+      effectiveQuery: queries[0],
+      effectiveQueries: queries,
+      useRegex: false,
+      queryKind: 'literal',
+      warnings: [`queries uses native OR across ${queries.length} literal terms.`],
+    };
+  }
+  const effectiveQueries = parsed.map((item, index) => item.useRegex ? item.effectiveQuery : escapeRegexSource(queries[index]));
+  for (const query of effectiveQueries) {
+    validateRegexPattern(query);
+  }
+  return {
+    effectiveQuery: effectiveQueries[0],
+    effectiveQueries,
+    useRegex: true,
+    queryKind: 'regex',
+    warnings: [
+      `queries uses native OR across ${queries.length} terms.`,
+      'query_kind=auto inferred regex syntax in at least one term; literal-looking terms were regex-escaped.',
+    ],
+  };
+}
+
+function parseSingleMcpSearchQuery(query: string, queryKind: 'auto' | 'literal' | 'regex' | 'zoekt'): ParsedMcpSearchQuery {
   if (queryKind === 'zoekt') {
     return parseZoektSubsetQuery(query);
   }
   if (queryKind === 'literal') {
-    return { effectiveQuery: query, useRegex: false, queryKind: 'literal', warnings: [] };
+    return { effectiveQuery: query, effectiveQueries: [query], useRegex: false, queryKind: 'literal', warnings: [] };
   }
   if (queryKind === 'regex') {
     const effectiveQuery = unwrapSlashRegex(query) ?? query;
     validateRegexPattern(effectiveQuery);
-    return { effectiveQuery, useRegex: true, queryKind: 'regex', warnings: [] };
+    return { effectiveQuery, effectiveQueries: [effectiveQuery], useRegex: true, queryKind: 'regex', warnings: [] };
   }
   const slashRegex = unwrapSlashRegex(query);
   if (slashRegex !== undefined) {
     validateRegexPattern(slashRegex);
-    return { effectiveQuery: slashRegex, useRegex: true, queryKind: 'regex', warnings: [] };
+    return { effectiveQuery: slashRegex, effectiveQueries: [slashRegex], useRegex: true, queryKind: 'regex', warnings: [] };
   }
   if (looksLikeRegexPattern(query)) {
     validateRegexPattern(query);
     return {
       effectiveQuery: query,
+      effectiveQueries: [query],
       useRegex: true,
       queryKind: 'regex',
       warnings: ['query_kind=auto inferred regex syntax; pass query_kind=literal to force literal search.'],
     };
   }
-  return { effectiveQuery: query, useRegex: false, queryKind: 'literal', warnings: [] };
+  return { effectiveQuery: query, effectiveQueries: [query], useRegex: false, queryKind: 'literal', warnings: [] };
 }
 
 function parseZoektSubsetQuery(query: string): ParsedMcpSearchQuery {
@@ -4646,6 +4834,7 @@ function parseZoektSubsetQuery(query: string): ParsedMcpSearchQuery {
   }
   return {
     effectiveQuery,
+    effectiveQueries: [effectiveQuery],
     useRegex,
     queryKind: 'zoekt',
     pathRegex,
@@ -4752,11 +4941,15 @@ function regexRiskDiagnostics(
   if (!parsedQuery.useRegex) {
     return { blocked: false, message: '', warnings: [], requiredLiteral: '' };
   }
-  const requiredLiteral = estimateRequiredLiteral(parsedQuery.effectiveQuery);
+  const requiredLiteral = parsedQuery.effectiveQueries
+    .map(estimateRequiredLiteral)
+    .sort((a, b) => b.length - a.length)[0] ?? '';
   const scoped = scope.includePatterns.length > 0 || !!parsedQuery.pathRegex;
-  const alternationCount = countUnescapedRegexChar(parsedQuery.effectiveQuery, '|');
-  const hasMultilineWildcard = /\\s\\S|\\S\\s|\[\^][^\]]*\]|\.\*/.test(parsedQuery.effectiveQuery);
-  const complexAlternation = alternationCount >= 4 || /\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\|/.test(parsedQuery.effectiveQuery);
+  const alternationCount = parsedQuery.effectiveQueries.reduce((sum, query) => sum + countUnescapedRegexChar(query, '|'), 0);
+  const hasMultilineWildcard = parsedQuery.effectiveQueries.some((query) => /\\s\\S|\\S\\s|\[\^][^\]]*\]|\.\*/.test(query));
+  const complexAlternation = parsedQuery.effectiveQueries.length >= 8 ||
+    alternationCount >= 4 ||
+    parsedQuery.effectiveQueries.some((query) => /\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\|/.test(query));
   const broad = requiredLiteral.length < 3 && !scoped;
   const blocked = (multiline && (broad || complexAlternation || hasMultilineWildcard)) ||
     (complexAlternation && broad);
@@ -4813,8 +5006,14 @@ function buildCountingRegex(
   caseSensitive: boolean,
   multiline: boolean,
 ): RegExp | undefined {
-  if (!parsedQuery.effectiveQuery) { return undefined; }
-  const source = parsedQuery.useRegex ? parsedQuery.effectiveQuery : escapeRegexSource(parsedQuery.effectiveQuery);
+  const terms = parsedQuery.effectiveQueries.length > 0 ? parsedQuery.effectiveQueries : [parsedQuery.effectiveQuery].filter(Boolean);
+  if (terms.length === 0) { return undefined; }
+  let source = terms
+    .map((term) => parsedQuery.useRegex ? `(?:${term})` : escapeRegexSource(term))
+    .join('|');
+  if (terms.length > 1) {
+    source = `(?:${source})`;
+  }
   const flags = 'g' + (caseSensitive ? '' : 'i') + (parsedQuery.useRegex && multiline ? 'ms' : '');
   try {
     return new RegExp(source, flags);
@@ -4834,10 +5033,6 @@ function countRegexMatches(text: string, regex: RegExp): number {
     }
   }
   return count;
-}
-
-function escapeRegexSource(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function extractKeywords(task: string): string[] {

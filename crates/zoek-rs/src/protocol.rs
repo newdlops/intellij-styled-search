@@ -82,6 +82,7 @@ pub struct InfoResponse {
 pub struct SearchRequest {
     pub workspace_root: String,
     pub query: String,
+    pub query_terms: Vec<String>,
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub use_regex: bool,
@@ -91,6 +92,21 @@ pub struct SearchRequest {
     pub path_regex: Option<String>,
     pub limit: usize,
     pub offset: usize,
+}
+
+impl SearchRequest {
+    pub fn all_query_terms(&self) -> Vec<String> {
+        let mut terms = Vec::with_capacity(self.query_terms.len() + 1);
+        if !self.query.is_empty() {
+            terms.push(self.query.clone());
+        }
+        for term in &self.query_terms {
+            if !term.is_empty() && !terms.iter().any(|existing| existing == term) {
+                terms.push(term.clone());
+            }
+        }
+        terms
+    }
 }
 
 #[derive(Clone, Debug)]

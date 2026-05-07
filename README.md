@@ -76,7 +76,17 @@ Useful MCP self-check tools:
 - `mcp_health`: verifies the MCP connection and reports endpoint, discovery file, capabilities, and index status.
 - `mcp_test`: compares `codeidx_search_code` against a bounded grep-like workspace scan and reports result overlap plus estimated token savings.
 
-By default, `codeidx_search_code` protects common dependency/generated/sensitive paths such as `node_modules/**`, `out/**`, `dist/**`, and `.env*`. To deliberately search a normally excluded path, pass a narrow include plus an exclude policy override:
+Native OR search is available through `queries`; the engine unions per-term index candidates before verification, so this avoids broad regex alternation for simple keyword sets:
+
+```json
+{
+  "queries": ["AlphaService", "BetaService", "GammaService"],
+  "query_kind": "literal",
+  "query_operator": "any"
+}
+```
+
+By default, `codeidx_search_code` protects common dependency/generated/sensitive paths such as `node_modules/**`, `out/**`, `dist/**`, `graphql-codegen/**`, and `.env*`. To deliberately search a normally excluded path, pass a narrow include plus an exclude policy override:
 
 ```json
 {
@@ -88,6 +98,7 @@ By default, `codeidx_search_code` protects common dependency/generated/sensitive
 
 Use `exclude_policy: "none"` only when you intentionally want to ignore both default excludes and `exclude_globs`.
 Both override modes bypass `intellijStyledSearch.excludeGlobs` for that MCP request; keep `include_globs` narrow when searching dependency or generated trees.
+For generated/codegen searches, `include_generated: true` disables generated excludes and uses a bounded full scan with a larger MCP file-size cap so large generated files are not silently missed.
 
 Example prompt for Codex or Claude:
 

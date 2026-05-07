@@ -536,7 +536,8 @@ unknown:
 ```text
 - regex has no selective literal; add lang/file filters
 - multiline regex used fallback scanner for dirty files
-- query scanned generated files only because include_generated=true
+- query scanned generated/codegen files only because include_generated=true
+- include_generated=true uses bounded full scan and a larger MCP file-size cap for generated/codegen files
 - index was stale; merged dirty overlay results
 - result truncated by max_chars
 ```
@@ -919,7 +920,18 @@ Zoekt 기반 code search를 agent-friendly하게 제공한다. literal, regex, r
   "properties": {
     "query": {
       "type": "string",
-      "description": "Literal string, regex pattern, or raw Zoekt query depending on query_kind."
+      "description": "Primary literal string, regex pattern, or raw Zoekt query depending on query_kind. Optional when queries is provided."
+    },
+    "queries": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Additional search terms ORed with query. For literal/regex searches the engine unions per-term index candidates before verification."
+    },
+    "query_operator": {
+      "type": "string",
+      "enum": ["any"],
+      "default": "any"
     },
     "query_kind": {
       "type": "string",

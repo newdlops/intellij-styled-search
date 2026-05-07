@@ -12,6 +12,7 @@ import {
   getRequestedResultLimit,
   getRequestedResultOffset,
   isRegexMultilineEnabled,
+  searchQueryTerms,
   compileSearchPathRegex,
   FILE_MATCH_CHUNK_MATCH_LIMIT,
   FILE_MATCH_CHUNK_CHAR_LIMIT,
@@ -343,20 +344,21 @@ export async function runRgSearch(
 
   const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
   const excludeGlobs = opts.ignoreConfiguredExcludes ? [] : cfg.get<string[]>('excludeGlobs', []);
-  const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
+  const maxFileSize = opts.maxFileSizeBytes ?? cfg.get<number>('maxFileSize', 1_048_576);
   const resultLimit = getRequestedResultLimit(opts, cfg);
   const resultOffset = getRequestedResultOffset(opts);
   const pathScopeMatcher = compilePathScopeMatcher(opts.includePatterns, opts.excludePatterns);
   const pathRegexMatcher = compileSearchPathRegex(opts.pathRegex);
   const includeGlobs = toRipgrepGlobs(opts.includePatterns);
   const scopeExcludeGlobs = toRipgrepGlobs(opts.excludePatterns);
+  const queryTerms = searchQueryTerms(opts);
 
   const isRegexMultiline = isRegexMultilineEnabled(opts);
-  if (opts.useRegex && !isRegexMultiline && opts.query.includes('\n')) {
+  if (opts.useRegex && !isRegexMultiline && queryTerms.some((term) => term.includes('\n'))) {
     progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
     return;
   }
-  const isMultiline = isRegexMultiline || (!opts.useRegex && opts.query.includes('\n'));
+  const isMultiline = isRegexMultiline || (!opts.useRegex && queryTerms.some((term) => term.includes('\n')));
   const args: string[] = [
     '--json',
     '--hidden',
@@ -410,7 +412,9 @@ export async function runRgSearch(
     // globs to ripgrep's format (which is the same glob syntax).
     for (const g of excludeGlobs) { args.push('--glob', '!' + g); }
   }
-  args.push('-e', opts.query);
+  for (const term of queryTerms) {
+    args.push('-e', term);
+  }
   if (useNarrowing) {
     // Pass files as positional args after `--`. We previously used
     // `--files-from=-` (stdin) and `--files-from <file>` (tmp file), but

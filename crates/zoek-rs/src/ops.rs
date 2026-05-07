@@ -280,6 +280,7 @@ pub fn benchmark_workspaces(
                 &SearchRequest {
                     workspace_root: root.to_string_lossy().into_owned(),
                     query,
+                    query_terms: Vec::new(),
                     case_sensitive: true,
                     whole_word: false,
                     use_regex: false,
@@ -325,29 +326,39 @@ pub fn benchmark_workspaces(
 }
 
 fn candidate_doc_ids(reader: &ShardReader, plan: &QueryPlan) -> io::Result<BTreeSet<u32>> {
-    if plan.required_grams.is_empty() {
-        return Ok(reader
-            .documents()?
+    let docs = reader.documents()?;
+    if plan.terms.is_empty() || plan.terms.iter().any(|term| term.required_grams.is_empty()) {
+        return Ok(docs
             .into_iter()
             .map(|doc| doc.doc_id)
             .collect::<BTreeSet<_>>());
     }
 
-    let mut acc: Option<BTreeSet<u32>> = None;
-    for gram in &plan.required_grams {
-        let posting = reader.find_posting(gram)?;
-        let ids = posting
-            .map(|posting| posting.doc_ids.into_iter().collect::<BTreeSet<_>>())
-            .unwrap_or_default();
-        acc = Some(match acc {
-            Some(existing) => existing.intersection(&ids).copied().collect(),
-            None => ids,
-        });
-        if acc.as_ref().is_some_and(BTreeSet::is_empty) {
-            break;
+    let incomplete_ids: BTreeSet<u32> = docs
+        .iter()
+        .filter(|doc| doc.gram_incomplete)
+        .map(|doc| doc.doc_id)
+        .collect();
+    let mut selected_ids = BTreeSet::new();
+    for term in &plan.terms {
+        let mut term_ids: Option<BTreeSet<u32>> = None;
+        for gram in &term.required_grams {
+            let posting = reader.find_posting(gram)?;
+            let ids = posting
+                .map(|posting| posting.doc_ids.into_iter().collect::<BTreeSet<_>>())
+                .unwrap_or_default();
+            term_ids = Some(match term_ids {
+                Some(existing) => existing.intersection(&ids).copied().collect(),
+                None => ids,
+            });
+            if term_ids.as_ref().is_some_and(BTreeSet::is_empty) {
+                break;
+            }
         }
+        selected_ids.extend(term_ids.unwrap_or_default());
     }
-    Ok(acc.unwrap_or_default())
+    selected_ids.extend(incomplete_ids);
+    Ok(selected_ids)
 }
 
 fn docs_for_ids<'a>(docs: &'a [ShardDocument], ids: &BTreeSet<u32>) -> Vec<&'a ShardDocument> {
@@ -360,7 +371,10 @@ fn docs_for_ids<'a>(docs: &'a [ShardDocument], ids: &BTreeSet<u32>) -> Vec<&'a S
 }
 
 fn overlay_matches_plan(entry: &crate::overlay::OverlayEntry, plan: &QueryPlan) -> bool {
-    if plan.required_grams.is_empty() {
+    if plan.terms.is_empty() || plan.terms.iter().any(|term| term.required_grams.is_empty()) {
+        return true;
+    }
+    if entry.gram_incomplete {
         return true;
     }
     let grams = entry
@@ -373,7 +387,9 @@ fn overlay_matches_plan(entry: &crate::overlay::OverlayEntry, plan: &QueryPlan) 
                 .collect::<String>()
         })
         .collect::<BTreeSet<_>>();
-    plan.required_grams.iter().all(|gram| grams.contains(gram))
+    plan.terms
+        .iter()
+        .any(|term| term.required_grams.iter().all(|gram| grams.contains(gram)))
 }
 
 fn benchmark_temp_dir(file_count: usize) -> PathBuf {
@@ -566,6 +582,7 @@ mod tests {
             &SearchRequest {
                 workspace_root: root.to_string_lossy().into_owned(),
                 query: "AlphaService".to_string(),
+                query_terms: Vec::new(),
                 case_sensitive: true,
                 whole_word: false,
                 use_regex: false,

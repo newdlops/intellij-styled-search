@@ -1040,7 +1040,7 @@ suite('Call graph', () => {
   });
 
   test('serves codeidx MCP tools, resources, and prompts over the local JSON-RPC endpoint', async function () {
-    this.timeout(20_000);
+    this.timeout(30_000);
     const api = await getApi();
     const folder = vscode.workspace.workspaceFolders?.[0];
     assert.ok(folder, 'expected fixture workspace folder');
@@ -1050,6 +1050,8 @@ suite('Call graph', () => {
     const mcpPythonModel = vscode.Uri.joinPath(folder.uri, 'mcp_python_model.py');
     const mcpExcludedDir = vscode.Uri.joinPath(folder.uri, 'out');
     const mcpExcluded = vscode.Uri.joinPath(mcpExcludedDir, 'mcp_excluded_probe.js');
+    const mcpGeneratedDir = vscode.Uri.joinPath(folder.uri, 'src', 'client', 'graphql-codegen');
+    const mcpGeneratedLarge = vscode.Uri.joinPath(mcpGeneratedDir, 'graphql.ts');
     try {
       await vscode.workspace.fs.writeFile(mcpTarget, Buffer.from([
         'export function mcpGraphTarget() {',
@@ -1094,6 +1096,13 @@ suite('Call graph', () => {
       ].join('\n'), 'utf8'));
       await api.callGraph.rebuild(undefined, undefined, { force: true });
       const url = await api.mcpServer.start(0);
+      await vscode.workspace.fs.createDirectory(mcpGeneratedDir);
+      await vscode.workspace.fs.writeFile(mcpGeneratedLarge, Buffer.from([
+        'export const generatedNeedleA = "mcpLargeGeneratedNeedle";',
+        'export const generatedNeedleB = "mcpLargeGeneratedOtherNeedle";',
+        'export const mcpLargeGeneratedPadding = "' + 'x'.repeat(1_100_000) + '";',
+        '',
+      ].join('\n'), 'utf8'));
       const init = await postJson(url, {
         jsonrpc: '2.0',
         id: 1,
@@ -1675,6 +1684,76 @@ suite('Call graph', () => {
         true,
         'expected custom scope for out/ to force full scan because out/ is outside the Zoekt index',
       );
+      const generatedDefaultSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 95,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpLargeGeneratedNeedle',
+            query_kind: 'literal',
+            include_globs: ['src/**/graphql-codegen/**'],
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(generatedDefaultSearch.result?.isError, false);
+      assert.strictEqual(
+        generatedDefaultSearch.result?.structuredContent?.results?.length,
+        0,
+        `expected default MCP generated excludes to omit graphql-codegen, got ${JSON.stringify(generatedDefaultSearch.result?.structuredContent?.results ?? [])}`,
+      );
+      const generatedIncludedSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 96,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpLargeGeneratedNeedle',
+            query_kind: 'literal',
+            include_globs: ['src/**/graphql-codegen/**'],
+            include_generated: true,
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(generatedIncludedSearch.result?.isError, false);
+      assert.strictEqual(
+        generatedIncludedSearch.result?.structuredContent?.query_diagnostics?.scope?.force_full_scan,
+        true,
+        'expected include_generated=true to force full scan for generated files that may be outside the Zoekt index or file-size cap',
+      );
+      assert.ok(
+        generatedIncludedSearch.result?.structuredContent?.results?.some(
+          (item: { path?: string }) => item.path === 'src/client/graphql-codegen/graphql.ts',
+        ),
+        `expected include_generated=true to search large graphql-codegen files, got ${JSON.stringify(generatedIncludedSearch.result?.structuredContent?.results ?? [])}`,
+      );
+      const generatedOrCount = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 97,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_count',
+          arguments: {
+            queries: ['mcpLargeGeneratedNeedle', 'mcpLargeGeneratedOtherNeedle'],
+            query_kind: 'literal',
+            query_operator: 'any',
+            include_globs: ['src/**/graphql-codegen/**'],
+            include_generated: true,
+            max_matches: 10,
+          },
+        },
+      });
+      assert.strictEqual(generatedOrCount.result?.isError, false);
+      assert.strictEqual(generatedOrCount.result?.structuredContent?.query_diagnostics?.query_operator, 'any');
+      assert.strictEqual(
+        generatedOrCount.result?.structuredContent?.count?.total_matches,
+        2,
+        `expected include_generated OR count to include both generated terms, got ${JSON.stringify(generatedOrCount.result?.structuredContent)}`,
+      );
       const indexedCustomScopeSearch = await postJson(url, {
         jsonrpc: '2.0',
         id: 40,
@@ -1746,6 +1825,35 @@ suite('Call graph', () => {
         typeof mcpTest.result?.structuredContent?.test?.efficiency?.estimated_mcp_tokens === 'number',
         'expected mcp_test to report token estimates',
       );
+      const parallelMcpTests = await Promise.all(Array.from({ length: 4 }, (_, index) => postJson(url, {
+        jsonrpc: '2.0',
+        id: 90 + index,
+        method: 'tools/call',
+        params: {
+          name: 'mcp_test',
+          arguments: {
+            query: index % 2 === 0 ? 'mcpGraphTarget' : 'mcpGraphBox',
+            query_kind: 'literal',
+            include_globs: ['mcp_graph_*.ts'],
+            limit: 10,
+            max_chars: 40_000,
+          },
+        },
+      })));
+      assert.ok(
+        parallelMcpTests.every((item) => item.result?.isError === false),
+        `expected parallel mcp_test calls to be queued and complete, got ${JSON.stringify(parallelMcpTests.map((item) => item.error ?? item.result?.structuredContent?.error))}`,
+      );
+      const postParallelHealth = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 94,
+        method: 'tools/call',
+        params: {
+          name: 'mcp_health',
+          arguments: {},
+        },
+      });
+      assert.strictEqual(postParallelHealth.result?.structuredContent?.health?.mcp_connection, 'ok');
       const mcpBroadRecallTest = await postJson(url, {
         jsonrpc: '2.0',
         id: 26,
@@ -2291,6 +2399,7 @@ suite('Call graph', () => {
       try { await vscode.workspace.fs.delete(mcpLate); } catch {}
       try { await vscode.workspace.fs.delete(mcpPythonModel); } catch {}
       try { await vscode.workspace.fs.delete(mcpExcluded); } catch {}
+      try { await vscode.workspace.fs.delete(mcpGeneratedDir, { recursive: true, useTrash: false }); } catch {}
     }
   });
 });

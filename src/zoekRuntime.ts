@@ -15,6 +15,7 @@ import {
   getRequestedResultLimit,
   getRequestedResultOffset,
   compileSearchPathRegex,
+  searchQueryTerms,
 } from './search';
 import type {
   ZoektDiagnoseResponse,
@@ -376,11 +377,12 @@ export class ZoektRuntime implements vscode.Disposable {
     try {
       const limit = getRequestedResultLimit(options);
       const offset = getRequestedResultOffset(options);
+      const queryArgs = this.effectiveQueryArgs(options);
       const response = await this.invokeJson([
         binary,
         'search',
         workspaceRoot,
-        this.effectiveQuery(options),
+        ...queryArgs,
         ...(options.useRegex ? ['--regex'] : []),
         ...(options.useRegex && options.regexMultiline === false ? ['--regex-singleline'] : []),
         ...(!options.useRegex && options.wholeWord ? ['--whole-word'] : []),
@@ -491,11 +493,12 @@ export class ZoektRuntime implements vscode.Disposable {
     const binary = await this.resolveBinary(false);
     if (!binary) { return null; }
     try {
+      const queryArgs = this.effectiveQueryArgs(options);
       const response = await this.invokeJson([
         binary,
         'diagnose',
         workspaceRoot,
-        this.effectiveQuery(options),
+        ...queryArgs,
         ...(options.useRegex ? ['--regex'] : []),
         ...(options.useRegex && options.regexMultiline === false ? ['--regex-singleline'] : []),
         ...(!options.useRegex && options.wholeWord ? ['--whole-word'] : []),
@@ -1050,11 +1053,18 @@ export class ZoektRuntime implements vscode.Disposable {
     }
   }
 
-  private effectiveQuery(options: SearchOptions): string {
+  private effectiveQueryArgs(options: SearchOptions): string[] {
+    const terms = searchQueryTerms(options).map((term) => this.effectiveQueryTerm(options, term));
+    if (terms.length === 0) { return ['']; }
+    const [first, ...rest] = terms;
+    return [first, ...rest.flatMap((term) => ['--or-query', term])];
+  }
+
+  private effectiveQueryTerm(options: SearchOptions, term: string): string {
     if (options.useRegex && options.wholeWord) {
-      return `\\b${options.query}\\b`;
+      return `\\b${term}\\b`;
     }
-    return options.query;
+    return term;
   }
 
   private effectiveIncludeArgs(options: SearchOptions): string[] {

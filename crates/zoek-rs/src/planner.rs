@@ -17,6 +17,7 @@ pub enum QueryMode {
 pub struct QueryPlan {
     pub mode: QueryMode,
     pub effective_query: String,
+    pub terms: Vec<QueryTermPlan>,
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub include: Vec<String>,
@@ -26,20 +27,65 @@ pub struct QueryPlan {
     pub required_grams: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct QueryTermPlan {
+    pub query: String,
+    pub effective_query: String,
+    pub required_literals: Vec<String>,
+    pub required_grams: Vec<String>,
+}
+
 pub fn build_query_plan(request: &SearchRequest) -> QueryPlan {
-    let effective_query = effective_query_pattern(request);
     let mode = if request.use_regex {
         QueryMode::Regex
     } else {
         QueryMode::Literal
     };
+    let terms = request
+        .all_query_terms()
+        .into_iter()
+        .map(|query| build_query_term_plan(request, query))
+        .collect::<Vec<_>>();
+    let effective_query = terms
+        .iter()
+        .map(|term| term.effective_query.clone())
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let mut required_literals = terms
+        .iter()
+        .flat_map(|term| term.required_literals.iter().cloned())
+        .collect::<Vec<_>>();
+    required_literals.sort();
+    required_literals.dedup();
+    let mut required_grams = terms
+        .iter()
+        .flat_map(|term| term.required_grams.iter().cloned())
+        .collect::<Vec<_>>();
+    required_grams.sort();
+    required_grams.dedup();
 
+    QueryPlan {
+        mode,
+        effective_query,
+        terms,
+        case_sensitive: request.case_sensitive,
+        whole_word: request.whole_word,
+        include: request.include.clone(),
+        exclude: request.exclude.clone(),
+        path_regex: request.path_regex.clone(),
+        required_literals,
+        required_grams,
+    }
+}
+
+fn build_query_term_plan(request: &SearchRequest, query: String) -> QueryTermPlan {
+    let effective_query = effective_query_pattern(request, &query);
     let mut required_literals = if request.use_regex {
         extract_mandatory_literals(&effective_query).mandatory_literals
-    } else if request.query.is_empty() {
+    } else if query.is_empty() {
         Vec::new()
     } else {
-        vec![normalize_literal(&request.query, request.case_sensitive)]
+        vec![normalize_literal(&query, request.case_sensitive)]
     };
     if request.use_regex && !request.case_sensitive {
         required_literals = required_literals
@@ -74,28 +120,23 @@ pub fn build_query_plan(request: &SearchRequest) -> QueryPlan {
     required_grams.sort();
     required_grams.dedup();
 
-    QueryPlan {
-        mode,
+    QueryTermPlan {
+        query,
         effective_query,
-        case_sensitive: request.case_sensitive,
-        whole_word: request.whole_word,
-        include: request.include.clone(),
-        exclude: request.exclude.clone(),
-        path_regex: request.path_regex.clone(),
         required_literals,
         required_grams,
     }
 }
 
-pub fn effective_query_pattern(request: &SearchRequest) -> String {
+pub fn effective_query_pattern(request: &SearchRequest, query: &str) -> String {
     if request.use_regex {
         if request.whole_word {
-            format!(r"\b(?:{})\b", request.query)
+            format!(r"\b(?:{})\b", query)
         } else {
-            request.query.clone()
+            query.to_string()
         }
     } else {
-        request.query.clone()
+        query.to_string()
     }
 }
 
@@ -117,6 +158,7 @@ mod tests {
         let plan = build_query_plan(&SearchRequest {
             workspace_root: "/tmp/workspace".to_string(),
             query: "export const RightToConsentOrConsultInvestorsSelectTable = ({\n  name,\n  investorCandidates,\n  isShowInvestors,\n  onCheck,\n});".to_string(),
+            query_terms: Vec::new(),
             case_sensitive: true,
             whole_word: false,
             use_regex: false,
@@ -132,5 +174,32 @@ mod tests {
             .required_grams
             .iter()
             .any(|gram| gram == "righ" || gram == "inve"));
+    }
+
+    #[test]
+    fn literal_or_terms_keep_separate_required_gram_sets() {
+        let plan = build_query_plan(&SearchRequest {
+            workspace_root: "/tmp/workspace".to_string(),
+            query: "AlphaService".to_string(),
+            query_terms: vec!["BetaService".to_string()],
+            case_sensitive: true,
+            whole_word: false,
+            use_regex: false,
+            regex_multiline: true,
+            include: vec![],
+            exclude: vec![],
+            path_regex: None,
+            limit: 10,
+            offset: 0,
+        });
+        assert_eq!(plan.terms.len(), 2);
+        assert!(plan.terms[0]
+            .required_grams
+            .iter()
+            .any(|gram| gram.to_lowercase().contains("alph")));
+        assert!(plan.terms[1]
+            .required_grams
+            .iter()
+            .any(|gram| gram.to_lowercase().contains("beta")));
     }
 }

@@ -5,6 +5,7 @@ import { decodeTextBytes, hasBinaryFileExtension, looksBinaryContent } from './t
 
 export interface SearchOptions {
   query: string;
+  queries?: string[];
   caseSensitive: boolean;
   wholeWord: boolean;
   useRegex: boolean;
@@ -14,6 +15,7 @@ export interface SearchOptions {
   pathRegex?: string;
   forceFullScan?: boolean;
   ignoreConfiguredExcludes?: boolean;
+  maxFileSizeBytes?: number;
   resultOffset?: number;
   resultLimit?: number;
 }
@@ -59,6 +61,13 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+export function searchQueryTerms(opts: Pick<SearchOptions, 'query' | 'queries'>): string[] {
+  const terms = (opts.queries && opts.queries.length > 0 ? opts.queries : [opts.query])
+    .map((term) => term.trim())
+    .filter(Boolean);
+  return [...new Set(terms)];
+}
+
 export function isRegexMultilineEnabled(
   opts: Pick<SearchOptions, 'useRegex' | 'regexMultiline'>,
 ): boolean {
@@ -66,8 +75,12 @@ export function isRegexMultilineEnabled(
 }
 
 function buildRegex(opts: SearchOptions): RegExp | null {
-  if (!opts.query) { return null; }
-  let src = opts.useRegex ? opts.query : escapeRegex(opts.query);
+  const terms = searchQueryTerms(opts);
+  if (terms.length === 0) { return null; }
+  let src = terms
+    .map((term) => opts.useRegex ? `(?:${term})` : escapeRegex(term))
+    .join('|');
+  if (terms.length > 1) { src = `(?:${src})`; }
   if (opts.wholeWord) { src = `\\b${src}\\b`; }
   const flags = 'g' + (opts.caseSensitive ? '' : 'i') + (isRegexMultilineEnabled(opts) ? 'ms' : '');
   try {
@@ -207,7 +220,7 @@ export async function runSearch(
 
   const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
   const excludeGlobs = opts.ignoreConfiguredExcludes ? [] : cfg.get<string[]>('excludeGlobs', []);
-  const maxFileSize = cfg.get<number>('maxFileSize', 1_048_576);
+  const maxFileSize = opts.maxFileSizeBytes ?? cfg.get<number>('maxFileSize', 1_048_576);
   const resultLimit = getRequestedResultLimit(opts, cfg);
   const resultOffset = getRequestedResultOffset(opts);
   const pathScopeMatcher = compilePathScopeMatcher(opts.includePatterns, opts.excludePatterns);
@@ -312,7 +325,7 @@ export async function runSearch(
           text,
           regex,
           uri,
-          isRegexMultilineEnabled(opts) || (!opts.useRegex && opts.query.includes('\n')),
+          isRegexMultilineEnabled(opts) || (!opts.useRegex && searchQueryTerms(opts).some((term) => term.includes('\n'))),
         );
         if (fileMatch.matches.length === 0) { continue; }
 

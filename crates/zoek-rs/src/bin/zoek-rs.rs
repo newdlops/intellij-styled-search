@@ -229,6 +229,7 @@ fn run_search(args: &[String]) -> Result<EngineResponse, String> {
     let mut request = SearchRequest {
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         query,
+        query_terms: Vec::new(),
         case_sensitive: false,
         whole_word: false,
         use_regex: false,
@@ -278,6 +279,13 @@ fn run_search(args: &[String]) -> Result<EngineResponse, String> {
                     .get(idx + 1)
                     .ok_or_else(|| "--path-regex requires a value".to_string())?;
                 request.path_regex = Some(value.clone());
+                idx += 2;
+            }
+            "--or-query" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--or-query requires a value".to_string())?;
+                request.query_terms.push(value.clone());
                 idx += 2;
             }
             "--limit" => {
@@ -319,6 +327,7 @@ fn run_diagnose(args: &[String]) -> Result<EngineResponse, String> {
     let mut request = SearchRequest {
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         query,
+        query_terms: Vec::new(),
         case_sensitive: false,
         whole_word: false,
         use_regex: false,
@@ -368,6 +377,13 @@ fn run_diagnose(args: &[String]) -> Result<EngineResponse, String> {
                     .get(idx + 1)
                     .ok_or_else(|| "--path-regex requires a value".to_string())?;
                 request.path_regex = Some(value.clone());
+                idx += 2;
+            }
+            "--or-query" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--or-query requires a value".to_string())?;
+                request.query_terms.push(value.clone());
                 idx += 2;
             }
             other => return Err(format!("unknown diagnose flag: {other}")),

@@ -13,6 +13,7 @@ import {
   getRequestedResultLimit,
   isRegexMultilineEnabled,
   getConfiguredSearchEngine,
+  searchQueryTerms,
   type SearchForTestsResult,
   type SearchEngine,
 } from './search';
@@ -1272,7 +1273,8 @@ export class OverlayPanel {
         fallbackReason: 'no workspace folder',
       };
     }
-    if (!options.query) {
+    const queryTerms = searchQueryTerms(options);
+    if (queryTerms.length === 0) {
       return {
         matches: [],
         requestedEngine,
@@ -1305,7 +1307,7 @@ export class OverlayPanel {
       effectiveEngine = 'codesearch';
       fallbackReason = 'scope override requires full workspace scan';
     }
-    const { uris: candidates } = options.forceFullScan ? { uris: null } : this.trigramIndex.candidatesFor(options.query, {
+    const { uris: candidates } = options.forceFullScan || queryTerms.length > 1 ? { uris: null } : this.trigramIndex.candidatesFor(options.query, {
       useRegex: options.useRegex,
       regexMultiline: options.regexMultiline,
       caseSensitive: options.caseSensitive,
@@ -1820,7 +1822,8 @@ export class OverlayPanel {
   }
 
   async explainZoektQuery(options: SearchOptions): Promise<void> {
-    if (!options.query) {
+    const queryTerms = searchQueryTerms(options);
+    if (queryTerms.length === 0) {
       vscode.window.showWarningMessage('Enter a query first.');
       return;
     }
@@ -3178,6 +3181,7 @@ export class OverlayPanel {
   private baseSearchOptions(options: SearchOptions): SearchOptions {
     return {
       query: options.query,
+      queries: options.queries ? [...options.queries] : undefined,
       caseSensitive: options.caseSensitive,
       wholeWord: options.wholeWord,
       useRegex: options.useRegex,
@@ -3194,7 +3198,8 @@ export class OverlayPanel {
     this.currentSearchRendererSrc = rendererSrc;
     const requestedEngine = getConfiguredSearchEngine();
     const emptyPageSize = getConfiguredResultLimit();
-    if (!options.query) {
+    const queryTerms = searchQueryTerms(options);
+    if (queryTerms.length === 0) {
       this.currentSearchSession = {
         searchId,
         options: this.baseSearchOptions(options),
@@ -3254,7 +3259,7 @@ export class OverlayPanel {
       options.useRegex ? 'regex' : '',
       options.caseSensitive ? 'case' : '',
       options.wholeWord ? 'word' : '',
-      (isRegexMultilineEnabled(options) || (!options.useRegex && options.query.includes('\n'))) ? 'multiline' : '',
+      (isRegexMultilineEnabled(options) || (!options.useRegex && queryTerms.some((term) => term.includes('\n')))) ? 'multiline' : '',
       options.includePatterns && options.includePatterns.length > 0 ? `include=${options.includePatterns.length}` : '',
       options.excludePatterns && options.excludePatterns.length > 0 ? `exclude=${options.excludePatterns.length}` : '',
     ].filter(Boolean).join(',') || 'plain';
@@ -3262,7 +3267,7 @@ export class OverlayPanel {
       ? 'planner=zoekt'
       : `indexReady=${this.trigramIndex.isReady} indexSize=${this.trigramIndex.size}`;
     this.log.appendLine(
-      `search start: len=${options.query.length} flags=[${optTags}] ${plannerSummary}`,
+      `search start: len=${queryTerms.join('').length} terms=${queryTerms.length} flags=[${optTags}] ${plannerSummary}`,
     );
     if (requestedEngine === 'zoekt' && effectiveEngine === 'codesearch') {
       this.log.appendLine(
@@ -3278,7 +3283,9 @@ export class OverlayPanel {
       // returns null, the planner couldn't constrain — rg walks the whole
       // workspace. If the index returns an empty set, the regex can't
       // match anything.
-      const { uris: candidates, reason } = this.trigramIndex.candidatesFor(options.query, {
+      const { uris: candidates, reason } = queryTerms.length > 1
+        ? { uris: null, reason: 'multi-query OR uses full codesearch fallback' }
+        : this.trigramIndex.candidatesFor(options.query, {
         useRegex: options.useRegex,
         regexMultiline: options.regexMultiline,
         caseSensitive: options.caseSensitive,
