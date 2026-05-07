@@ -24,6 +24,7 @@ import {
   type SearchOptions,
 } from './search';
 import { decodeTextBytes, hasBinaryFileExtension, looksBinaryContent } from './textFiles';
+import { compareGitWorkspaceState, getWorkspaceGitStateSync } from './gitState';
 
 type JsonRpcId = string | number | null;
 
@@ -632,15 +633,21 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const includeErrors = readBoolArg(args, 'include_errors', false);
     const maxItems = readIntArg(args, 'max_items', 50, 1, 200);
     const snapshot = await this.callGraph.ensureRestoredSnapshot();
-    const warnings = (snapshot?.warnings ?? []).slice(0, maxItems);
-    const overall = snapshot ? 'usable' : 'index_not_ready';
+    const freshness = this.callGraph.getGitStateFreshness();
+    const warnings = [
+      ...(freshness.freshness === 'stale' && freshness.reason ? [`index stale: ${freshness.reason}`] : []),
+      ...(snapshot?.warnings ?? []),
+    ].slice(0, maxItems);
+    const overall = freshness.freshness === 'stale' ? 'stale' : snapshot ? 'usable' : 'index_not_ready';
     const payload: Record<string, unknown> = {
-      ...this.baseEnvelope(snapshot, snapshot
+      ...this.baseEnvelope(snapshot, overall === 'stale'
+        ? `Index is stale${freshness.reason ? `: ${freshness.reason}` : ''}. Use codeidx_refresh_index to rebuild it.`
+        : snapshot
         ? `Index is usable. Call graph has ${snapshot.stats.symbolCount} symbols and ${snapshot.stats.edgeCount} edges.`
         : 'Index is not built yet. Use codeidx_refresh_index to build it.'),
       status: {
         overall,
-        symbol_index: snapshot ? 'fresh' : 'not_ready',
+        symbol_index: overall === 'stale' ? 'stale' : snapshot ? 'fresh' : 'not_ready',
         zoekt_index: 'available_if_configured',
         runtime_index: 'unavailable',
         last_full_index_at: snapshot ? new Date(snapshot.builtAtUnixMs).toISOString() : null,
@@ -2849,12 +2856,13 @@ export class CallGraphMcpServer implements vscode.Disposable {
 
   private workspaceInfo(snapshot?: CallGraphSnapshot): Record<string, unknown> {
     const root = this.workspaceRootPath();
+    const gitState = getWorkspaceGitStateSync(root);
     return {
       workspace_id: this.workspaceId(),
       root,
       display_root: root ? displayPath(root) : null,
-      git_head: null,
-      branch: null,
+      git_head: gitState.head,
+      branch: gitState.branch,
       built_at: snapshot ? new Date(snapshot.builtAtUnixMs).toISOString() : null,
     };
   }
@@ -2922,14 +2930,20 @@ export class CallGraphMcpServer implements vscode.Disposable {
   }
 
   private snapshotMetadata(snapshot: CallGraphSnapshot | undefined): Record<string, unknown> {
+    const root = this.workspaceRootPath();
+    const currentGitState = getWorkspaceGitStateSync(root);
+    const indexedGitState = snapshot?.gitState ?? currentGitState;
+    const freshness = snapshot
+      ? (compareGitWorkspaceState(indexedGitState, currentGitState).matches ? 'fresh' : 'stale')
+      : 'unknown';
     return {
       workspace_id: this.workspaceId(),
       index_revision: snapshot ? `idx_${snapshot.builtAtUnixMs}` : null,
       zoekt_revision: null,
       dirty_overlay_revision: `ovl_${vscode.workspace.textDocuments.filter((document) => document.isDirty).length}`,
-      git_head: null,
-      branch: null,
-      freshness: snapshot ? 'fresh' : 'unknown',
+      git_head: indexedGitState.head,
+      branch: indexedGitState.branch,
+      freshness,
       indexed_at: snapshot ? new Date(snapshot.builtAtUnixMs).toISOString() : null,
     };
   }

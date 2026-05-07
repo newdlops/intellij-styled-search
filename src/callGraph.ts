@@ -9,6 +9,11 @@ import { gzip, gunzip } from 'zlib';
 import * as vscode from 'vscode';
 import { compilePathScopeMatcher } from './pathScope';
 import { decodeTextBytes, looksBinaryContent } from './textFiles';
+import {
+  compareGitWorkspaceState,
+  getWorkspaceGitStateSync,
+  type GitWorkspaceState,
+} from './gitState';
 
 export type CallGraphLanguage = 'python' | 'java' | 'kotlin' | 'typescript' | 'javascript' | 'graphql';
 export type CallGraphSymbolKind = 'class' | 'interface' | 'enum' | 'type' | 'struct' | 'function' | 'method' | 'constructor' | 'constant' | 'variable' | 'field' | 'property';
@@ -102,6 +107,7 @@ export interface CallGraphStats {
 export interface CallGraphSnapshot {
   workspaceRoot: string;
   builtAtUnixMs: number;
+  gitState?: GitWorkspaceState;
   symbols: CallGraphSymbol[];
   edges: CallGraphEdge[];
   references: CallGraphReference[];
@@ -152,6 +158,7 @@ export interface CallGraphWorkerRebuildInput {
   workspaceRoot: string;
   cacheDirFsPath: string;
   configSignature: string;
+  gitState?: GitWorkspaceState;
   excludeGlobs: string[];
   maxFileSize: number;
   buildLimits: {
@@ -241,6 +248,7 @@ type CallGraphCacheManifest = {
   version: number;
   workspaceRoot: string;
   configSignature: string;
+  gitState?: GitWorkspaceState;
   builtAtUnixMs: number;
   chunks: CallGraphCacheChunk[];
   recordIndex?: CallGraphRecordIndexEntry[];
@@ -721,6 +729,7 @@ export class CallGraphService implements vscode.Disposable {
   private documentSummaryMigrationPromise: Promise<boolean> | undefined;
   private readonly documentSummaryFilePromises = new Map<string, Promise<boolean>>();
   private nextRustGraphChildId = 1;
+  private lastGitStateMismatchReason: string | undefined;
 
   readonly onDidChangeSnapshot = this.onDidChangeSnapshotEmitter.event;
 
@@ -783,7 +792,26 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   getSnapshot(): CallGraphSnapshot | undefined {
+    if (this.snapshot && !this.isSnapshotGitStateCurrent(this.snapshot, 'snapshot access', { clear: false })) {
+      return undefined;
+    }
     return this.snapshot;
+  }
+
+  getGitStateFreshness(): { freshness: 'fresh' | 'stale' | 'unknown'; reason?: string } {
+    const indexed = this.snapshot?.gitState ?? this.cacheManifest?.gitState;
+    const workspaceRoot = this.snapshot?.workspaceRoot ?? this.cacheManifest?.workspaceRoot ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceRoot || (!this.snapshot && !this.cacheManifest)) {
+      if (this.lastGitStateMismatchReason) {
+        return { freshness: 'stale', reason: this.lastGitStateMismatchReason };
+      }
+      return { freshness: 'unknown', reason: this.lastGitStateMismatchReason };
+    }
+    const comparison = compareGitWorkspaceState(indexed, getWorkspaceGitStateSync(workspaceRoot));
+    if (comparison.matches) {
+      return { freshness: 'fresh' };
+    }
+    return { freshness: 'stale', reason: comparison.reason ?? this.lastGitStateMismatchReason };
   }
 
   isRustNativeIndexOnly(snapshot = this.snapshot): boolean {
@@ -794,25 +822,73 @@ export class CallGraphService implements vscode.Disposable {
     return this.isRustNativeIndexOnly() || isRustNativeGraphManifest(this.cacheManifest);
   }
 
+  private isSnapshotGitStateCurrent(
+    snapshot: CallGraphSnapshot,
+    reason: string,
+    options: { clear?: boolean } = {},
+  ): boolean {
+    const comparison = compareGitWorkspaceState(snapshot.gitState, getWorkspaceGitStateSync(snapshot.workspaceRoot));
+    if (comparison.matches) {
+      return true;
+    }
+    this.lastGitStateMismatchReason = comparison.reason ?? 'Git state changed';
+    if (options.clear !== false) {
+      this.log.appendLine(`call graph snapshot stale: ${this.lastGitStateMismatchReason}; reason=${reason}`);
+      this.clearLoadedIndexState();
+      this.onDidChangeSnapshotEmitter.fire();
+    }
+    return false;
+  }
+
+  private isCacheManifestGitStateCurrent(
+    manifest: CallGraphCacheManifest,
+    reason: string,
+    options: { clear?: boolean } = {},
+  ): boolean {
+    const comparison = compareGitWorkspaceState(manifest.gitState, getWorkspaceGitStateSync(manifest.workspaceRoot));
+    if (comparison.matches) {
+      return true;
+    }
+    this.lastGitStateMismatchReason = comparison.reason ?? 'Git state changed';
+    if (options.clear !== false) {
+      this.log.appendLine(`call graph cache stale: ${this.lastGitStateMismatchReason}; reason=${reason}`);
+      this.clearLoadedIndexState();
+      this.onDidChangeSnapshotEmitter.fire();
+    }
+    return false;
+  }
+
+  private clearLoadedIndexState(): void {
+    this.snapshot = undefined;
+    this.indexCache = undefined;
+    this.relationSummaryCache = undefined;
+    this.fileRecordsByUri.clear();
+    this.cacheRecordsLoaded = false;
+    this.cacheManifest = undefined;
+    this.cacheConfigSignature = undefined;
+    this.clearSymbolRelationCache();
+    this.clearDocumentSummaryCache();
+  }
+
   async ensureBuilt(): Promise<CallGraphSnapshot> {
-    if (this.snapshot) { return this.snapshot; }
+    if (this.snapshot && this.isSnapshotGitStateCurrent(this.snapshot, 'ensure-built')) { return this.snapshot; }
     if (this.restorePromise) {
       await this.restorePromise;
-      if (this.snapshot) { return this.snapshot; }
+      if (this.snapshot && this.isSnapshotGitStateCurrent(this.snapshot, 'ensure-built')) { return this.snapshot; }
     }
     await this.restorePersistedSnapshot();
-    if (this.snapshot) { return this.snapshot; }
+    if (this.snapshot && this.isSnapshotGitStateCurrent(this.snapshot, 'ensure-built')) { return this.snapshot; }
     return this.rebuild();
   }
 
   async ensureRestoredSnapshot(): Promise<CallGraphSnapshot | undefined> {
-    if (this.snapshot) { return this.snapshot; }
+    if (this.snapshot && this.isSnapshotGitStateCurrent(this.snapshot, 'ensure-restored')) { return this.snapshot; }
     if (this.restorePromise) {
       await this.restorePromise;
-      if (this.snapshot) { return this.snapshot; }
+      if (this.snapshot && this.isSnapshotGitStateCurrent(this.snapshot, 'ensure-restored')) { return this.snapshot; }
     }
     await this.restorePersistedSnapshot();
-    return this.snapshot;
+    return this.snapshot && this.isSnapshotGitStateCurrent(this.snapshot, 'ensure-restored') ? this.snapshot : undefined;
   }
 
   async ensureDocumentSummariesRestored(uri?: vscode.Uri): Promise<boolean> {
@@ -823,6 +899,9 @@ export class CallGraphService implements vscode.Disposable {
     }
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
+    if (manifest && !this.isCacheManifestGitStateCurrent(manifest, 'document-summary-restore')) {
+      return false;
+    }
     if (uri && folder && manifest && this.hasRustNativePrimaryGraph()) {
       return this.ensureRustNativeDocumentSummary(uri);
     }
@@ -1650,7 +1729,7 @@ export class CallGraphService implements vscode.Disposable {
 
   private shouldWatchExternalFileChanges(): boolean {
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-    return cfg.get<boolean>('callGraphWatchExternalFileChanges', false);
+    return cfg.get<boolean>('callGraphWatchExternalFileChanges', true);
   }
 
   private async refreshChangedFiles(uris: vscode.Uri[], reason: string): Promise<void> {
@@ -1660,6 +1739,17 @@ export class CallGraphService implements vscode.Disposable {
     }
     if (this.restorePromise) {
       await this.restorePromise;
+    }
+    const manifest = this.cacheManifest;
+    if (this.snapshot && !this.isSnapshotGitStateCurrent(this.snapshot, `incremental-${reason}`)) {
+      this.log.appendLine(`call graph incremental ${reason}: Git state changed; rebuilding instead of applying file deltas`);
+      await this.rebuild();
+      return;
+    }
+    if (!this.snapshot && manifest && !this.isCacheManifestGitStateCurrent(manifest, `incremental-${reason}`)) {
+      this.log.appendLine(`call graph incremental ${reason}: cached Git state changed; rebuilding instead of applying file deltas`);
+      await this.rebuild();
+      return;
     }
     if (this.hasRustNativePrimaryGraph()) {
       if (this.incrementalPromise) {
@@ -1995,6 +2085,7 @@ export class CallGraphService implements vscode.Disposable {
     const snapshot: CallGraphSnapshot = {
       workspaceRoot: input.workspaceRoot,
       builtAtUnixMs: Date.now(),
+      gitState: input.baseSnapshot.gitState,
       symbols,
       edges,
       references,
@@ -2049,8 +2140,17 @@ export class CallGraphService implements vscode.Disposable {
       if (!Array.isArray(manifest.symbolRelations)) {
         this.log.appendLine('call graph cache metadata loaded without symbol relation buckets; derived relation cache will rebuild lazily');
       }
+      const gitStateComparison = compareGitWorkspaceState(manifest.gitState, getWorkspaceGitStateSync(folder.uri.fsPath));
+      if (!gitStateComparison.matches) {
+        this.lastGitStateMismatchReason = gitStateComparison.reason ?? 'Git state changed';
+        this.log.appendLine(
+          `call graph cache ignored: ${this.lastGitStateMismatchReason}; persisted files preserved until explicit rebuild`,
+        );
+        return;
+      }
       this.cacheManifest = manifest as CallGraphCacheManifest;
       this.cacheConfigSignature = configSignature;
+      this.lastGitStateMismatchReason = undefined;
       this.cacheRecordsLoaded = false;
       const stats = this.cacheManifest.snapshot?.stats;
       const cachedAt = new Date(this.cacheManifest.builtAtUnixMs).toISOString();
@@ -2138,6 +2238,7 @@ export class CallGraphService implements vscode.Disposable {
         const snapshot: CallGraphSnapshot = {
           workspaceRoot: manifest.workspaceRoot,
           builtAtUnixMs: manifest.snapshot.builtAtUnixMs,
+          gitState: manifest.gitState,
           symbols,
           edges,
           references,
@@ -2157,6 +2258,7 @@ export class CallGraphService implements vscode.Disposable {
       const records = await this.loadCacheRecords(folder.uri.fsPath, manifest);
       const { snapshot, index } = await buildSnapshotFromFileRecords({
         workspaceRoot: folder.uri.fsPath,
+        gitState: manifest.gitState,
         records,
         skippedFileCount: 0,
         warnings: [],
@@ -2634,6 +2736,7 @@ export class CallGraphService implements vscode.Disposable {
       const snapshot: CallGraphSnapshot = {
         workspaceRoot: manifest.workspaceRoot,
         builtAtUnixMs: manifest.snapshot.builtAtUnixMs,
+        gitState: manifest.gitState,
         symbols,
         edges,
         references,
@@ -2774,6 +2877,7 @@ export class CallGraphService implements vscode.Disposable {
       this.cacheRecordsLoaded = false;
     }
     this.cacheConfigSignature = configSignature;
+    this.lastGitStateMismatchReason = undefined;
     this.clearSymbolRelationCache();
     this.onDidChangeSnapshotEmitter.fire();
   }
@@ -2836,6 +2940,7 @@ export class CallGraphService implements vscode.Disposable {
           version: CALL_GRAPH_CACHE_VERSION,
           workspaceRoot,
           configSignature,
+          gitState: snapshot.gitState,
           builtAtUnixMs: snapshot.builtAtUnixMs,
           chunks,
           recordIndex,
@@ -3736,6 +3841,7 @@ export class CallGraphService implements vscode.Disposable {
 
   private async rebuildInWorkerProcess(input: {
     workspaceRoot: string;
+    gitState?: GitWorkspaceState;
     excludeGlobs: string[];
     maxFileSize: number;
     buildLimits: CallGraphBuildLimits;
@@ -3871,6 +3977,7 @@ export class CallGraphService implements vscode.Disposable {
           workspaceRoot: input.workspaceRoot,
           cacheDirFsPath,
           configSignature: input.configSignature,
+          gitState: input.gitState,
           excludeGlobs: input.excludeGlobs,
           maxFileSize: input.maxFileSize,
           buildLimits: input.buildLimits,
@@ -3907,6 +4014,7 @@ export class CallGraphService implements vscode.Disposable {
 
   private async rebuildInRustGraphProcess(input: {
     workspaceRoot: string;
+    gitState?: GitWorkspaceState;
     maxFileSize: number;
     parseConcurrency: number;
     configSignature: string;
@@ -4007,6 +4115,7 @@ export class CallGraphService implements vscode.Disposable {
     const snapshot: CallGraphSnapshot = {
       workspaceRoot: input.workspaceRoot,
       builtAtUnixMs: response.builtAtUnixMs ?? builtAtUnixMs,
+      gitState: input.gitState,
       symbols: [],
       edges: [],
       references: [],
@@ -4043,6 +4152,7 @@ export class CallGraphService implements vscode.Disposable {
       version: CALL_GRAPH_CACHE_VERSION,
       workspaceRoot: snapshot.workspaceRoot,
       configSignature,
+      gitState: snapshot.gitState,
       builtAtUnixMs: snapshot.builtAtUnixMs,
       chunks: [],
       recordIndex: [],
@@ -4090,9 +4200,11 @@ export class CallGraphService implements vscode.Disposable {
     const parseConcurrency = getConfiguredCallGraphConcurrency(cfg);
     const backend = getConfiguredCallGraphBackend(cfg);
     const configSignature = getCallGraphConfigSignature(cfg);
+    const gitState = getWorkspaceGitStateSync(workspaceRoot);
     if (backend === 'javascript') {
       return this.rebuildInWorkerProcess({
         workspaceRoot,
+        gitState,
         excludeGlobs: getConfiguredCallGraphExcludeGlobs(cfg),
         maxFileSize,
         buildLimits: getConfiguredCallGraphBuildLimits(cfg),
@@ -4108,6 +4220,7 @@ export class CallGraphService implements vscode.Disposable {
     }
     return this.rebuildInRustGraphProcess({
       workspaceRoot,
+      gitState,
       maxFileSize,
       parseConcurrency,
       configSignature,
@@ -4688,6 +4801,7 @@ function isSupportedSourceUri(uri: vscode.Uri): boolean {
 
 async function buildSnapshotFromFileRecords(input: {
   workspaceRoot: string;
+  gitState?: GitWorkspaceState;
   records: CallGraphFileRecord[];
   skippedFileCount: number;
   warnings: string[];
@@ -4757,6 +4871,7 @@ async function buildSnapshotFromFileRecords(input: {
     snapshot: {
       workspaceRoot: input.workspaceRoot,
       builtAtUnixMs: Date.now(),
+      gitState: input.gitState,
       symbols,
       edges,
       references,
@@ -4948,6 +5063,7 @@ export async function rebuildCallGraphWorker(
   const recordIndex = buildRecordIndexFromRecords(records);
   const snapshotBuild = await buildSnapshotFromFileRecords({
     workspaceRoot: input.workspaceRoot,
+    gitState: input.gitState,
     records,
     skippedFileCount: progressState.skippedFiles,
     warnings,
@@ -5162,6 +5278,7 @@ async function writeCallGraphWorkerCache(input: {
     version: CALL_GRAPH_CACHE_VERSION,
     workspaceRoot: input.workspaceRoot,
     configSignature: input.configSignature,
+    gitState: input.snapshot.gitState,
     builtAtUnixMs: input.snapshot.builtAtUnixMs,
     chunks: [],
     recordIndex: input.recordIndex,

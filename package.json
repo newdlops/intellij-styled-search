@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.698",
+  "version": "0.1.699",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -298,8 +298,8 @@
         },
         "intellijStyledSearch.zoektWatchExternalFileDeletes": {
           "type": "boolean",
-          "default": false,
-          "description": "Watch external filesystem delete events for zoekt incremental updates. Disabled by default so the extension does not subscribe to every workspace file event; saved editor documents and VS Code delete/rename operations are still tracked."
+          "default": true,
+          "description": "Watch external filesystem delete events for zoekt incremental updates. Enabled by default so branch checkouts and external agents cannot leave deleted files visible in the search index."
         },
         "intellijStyledSearch.zoektWatchExternalFileChanges": {
           "type": "boolean",
@@ -401,8 +401,8 @@
         },
         "intellijStyledSearch.callGraphWatchExternalFileChanges": {
           "type": "boolean",
-          "default": false,
-          "description": "Watch external filesystem create/change/delete events for call graph incremental updates. Disabled by default so call graph updates only follow confirmed VS Code save/create/delete/rename operations."
+          "default": true,
+          "description": "Watch external filesystem create/change/delete events for call graph incremental updates. Enabled by default so branch checkouts and external edits do not leave symbol data stale."
         },
         "intellijStyledSearch.callGraphBackend": {
           "type": "string",

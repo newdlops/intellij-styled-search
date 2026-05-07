@@ -17,6 +17,12 @@ import {
   compileSearchPathRegex,
   searchQueryTerms,
 } from './search';
+import {
+  compareGitWorkspaceState,
+  getWorkspaceGitStateSync,
+  isGitWorkspaceState,
+  type GitWorkspaceState,
+} from './gitState';
 import type {
   ZoektDiagnoseResponse,
   ZoektEngineResponse,
@@ -29,6 +35,7 @@ import type {
 type SearchReadiness = {
   ready: boolean;
   reason?: string;
+  stale?: boolean;
 };
 
 type QueuedRename = {
@@ -55,10 +62,25 @@ const AUTO_BASE_REFRESH_MIN_INTERVAL_MS = 60_000;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
 const ZOEKT_PROGRESS_PREFIX = '__ZOEK_PROGRESS__';
 const ZOEKT_SCHEMA_VERSION = 2;
+const ZOEKT_INDEX_GIT_STATE_SCHEMA_VERSION = 1;
+const ZOEKT_INDEX_GIT_STATE_FILE = 'git-state.json';
 const ZOEKT_UPDATE_IGNORED_DIR_NAMES = new Set([
   '.zoek-rs',
   '.zoekt-rs',
 ]);
+
+type ZoektIndexStateStatus = {
+  ready: boolean;
+  reason?: string;
+  stale?: boolean;
+};
+
+type ZoektIndexGitStateFile = {
+  schemaVersion: number;
+  workspaceRoot: string;
+  writtenAtUnixMs: number;
+  gitState: GitWorkspaceState;
+};
 
 function runtimeBinaryPlatformId(): string {
   return `${process.platform}-${process.arch}`;
@@ -304,6 +326,7 @@ export class ZoektRuntime implements vscode.Disposable {
     }
     const detach = this.attachIndexProgressListener(workspaceRoot, report);
     const promise = (async () => {
+      const startedGitState = getWorkspaceGitStateSync(workspaceRoot);
       this.emitIndexProgress(workspaceRoot, 'zoek-rs: force rebuilding workspace index');
       const response = await this.invokeJson([binary, workspaceRoot, '--force'], undefined, {
         onStderrLine: (line) => this.handleIndexProgressLine(
@@ -318,6 +341,7 @@ export class ZoektRuntime implements vscode.Disposable {
       this.log.appendLine(
         `zoek-rs index ready: files=${response.stats.indexedFiles} shards=${response.stats.shardCount} grams=${response.stats.totalGrams}`,
       );
+      await this.writeIndexGitState(workspaceRoot, startedGitState);
       this.emitIndexProgress(workspaceRoot, 'zoek-rs: index ready', 100);
       return true;
     })().finally(() => {
@@ -345,7 +369,8 @@ export class ZoektRuntime implements vscode.Disposable {
       }
       return { ready: false, reason: 'zoek-rs binary unavailable; run Rebuild Search Index to build it' };
     }
-    if (await this.hasReadyIndex(workspaceRoot)) {
+    const indexStatus = await this.getIndexStateStatus(workspaceRoot);
+    if (indexStatus.ready) {
       return { ready: true };
     }
     if (this.indexPromises.has(workspaceRoot) || this.foregroundIndexPromises.has(workspaceRoot)) {
@@ -353,9 +378,14 @@ export class ZoektRuntime implements vscode.Disposable {
     }
     if (this.shouldIndexInBackgroundOnSearch()) {
       this.scheduleBackgroundIndex(workspaceRoot, 'search');
-      return { ready: false, reason: 'zoek-rs index incomplete; background index scheduled' };
+      const reason = indexStatus.reason ?? 'zoek-rs index incomplete';
+      return { ready: false, reason: `${reason}; background index scheduled`, stale: indexStatus.stale };
     }
-    return { ready: false, reason: 'zoek-rs index incomplete; run Rebuild Search Index to build it' };
+    return {
+      ready: false,
+      reason: `${indexStatus.reason ?? 'zoek-rs index incomplete'}; run Rebuild Search Index to build it`,
+      stale: indexStatus.stale,
+    };
   }
 
   async runSearch(
@@ -635,7 +665,7 @@ export class ZoektRuntime implements vscode.Disposable {
 
   private shouldWatchExternalFileDeletes(): boolean {
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-    return cfg.get<boolean>('zoektWatchExternalFileDeletes', false);
+    return cfg.get<boolean>('zoektWatchExternalFileDeletes', true);
   }
 
   private shouldWatchExternalFileChanges(): boolean {
@@ -842,7 +872,13 @@ export class ZoektRuntime implements vscode.Disposable {
         return;
       }
       this.clearPending();
-      this.log.appendLine('zoek-rs update skipped: index is not ready; run Rebuild Search Index to refresh saved changes');
+      const indexStatus = await this.getIndexStateStatus(workspaceRoot);
+      if (indexStatus.stale && this.shouldIndexInBackgroundOnSearch()) {
+        this.scheduleBackgroundIndex(workspaceRoot, 'git-state-changed');
+      }
+      this.log.appendLine(
+        `zoek-rs update skipped: ${indexStatus.reason ?? 'index is not ready'}; run Rebuild Search Index to refresh saved changes`,
+      );
       return;
     }
 
@@ -854,6 +890,7 @@ export class ZoektRuntime implements vscode.Disposable {
     this.updateInFlight = true;
     this.updatePromise = this.updatePromise
       .then(async () => {
+        const startedGitState = getWorkspaceGitStateSync(workspaceRoot);
         const args: string[] = [binary, 'update', workspaceRoot];
         for (const relPath of changed) {
           args.push(relPath);
@@ -871,6 +908,7 @@ export class ZoektRuntime implements vscode.Disposable {
           return;
         }
         this.logUpdateWarnings(response);
+        await this.writeIndexGitState(workspaceRoot, startedGitState);
         this.maybeStartBaseRefresh(workspaceRoot, binary, response);
       })
       .catch((err) => {
@@ -917,6 +955,7 @@ export class ZoektRuntime implements vscode.Disposable {
     }
     this.lastAutoBaseRefreshAt.set(workspaceRoot, now);
     const promise = (async () => {
+      const startedGitState = getWorkspaceGitStateSync(workspaceRoot);
       this.log.appendLine(
         `zoek-rs background base refresh start: overlay latest=${update.latestVisibleEntries} total=${update.overlayTotalEntries}`,
       );
@@ -936,6 +975,7 @@ export class ZoektRuntime implements vscode.Disposable {
         this.log.appendLine(
           `zoek-rs background base refresh ready: files=${response.stats.indexedFiles} shards=${response.stats.shardCount}`,
         );
+        await this.writeIndexGitState(workspaceRoot, startedGitState);
         this.emitIndexProgress(workspaceRoot, 'zoek-rs: index ready', 100);
         return true;
       } catch (err) {
@@ -959,6 +999,7 @@ export class ZoektRuntime implements vscode.Disposable {
     const promise = (async () => {
       const binary = await this.resolveBinary(true);
       if (!binary) { return false; }
+      const startedGitState = getWorkspaceGitStateSync(workspaceRoot);
       this.log.appendLine(`zoek-rs background index start (${reason})`);
       this.emitIndexProgress(workspaceRoot, 'zoek-rs: indexing workspace');
       try {
@@ -976,6 +1017,7 @@ export class ZoektRuntime implements vscode.Disposable {
         this.log.appendLine(
           `zoek-rs background index ready: files=${response.stats.indexedFiles} shards=${response.stats.shardCount}`,
         );
+        await this.writeIndexGitState(workspaceRoot, startedGitState);
         this.emitIndexProgress(workspaceRoot, 'zoek-rs: index ready', 100);
         return true;
       } catch (err) {
@@ -1039,21 +1081,66 @@ export class ZoektRuntime implements vscode.Disposable {
   }
 
   private async hasReadyIndex(workspaceRoot: string): Promise<boolean> {
+    return (await this.getIndexStateStatus(workspaceRoot)).ready;
+  }
+
+  private async getIndexStateStatus(workspaceRoot: string): Promise<ZoektIndexStateStatus> {
     const indexRoot = path.join(workspaceRoot, '.zoek-rs');
     const manifestPath = path.join(indexRoot, 'manifest.json');
     if (!fs.existsSync(manifestPath)) {
-      return false;
+      return { ready: false, reason: 'zoek-rs index manifest is missing' };
     }
     try {
       const manifestText = await fs.promises.readFile(manifestPath, 'utf8');
       const manifest = JSON.parse(manifestText) as { schemaVersion?: unknown };
       if (manifest.schemaVersion !== ZOEKT_SCHEMA_VERSION) {
-        return false;
+        return { ready: false, reason: 'zoek-rs index schema changed' };
       }
       const entries = await fs.promises.readdir(indexRoot);
-      return entries.some((entry) => /^base-shard-\d+\.zrs$/.test(entry));
+      if (!entries.some((entry) => /^base-shard-\d+\.zrs$/.test(entry))) {
+        return { ready: false, reason: 'zoek-rs index shards are missing' };
+      }
+      const currentGitState = getWorkspaceGitStateSync(workspaceRoot);
+      const indexedGitState = await this.readIndexGitState(workspaceRoot);
+      const gitStateComparison = compareGitWorkspaceState(indexedGitState, currentGitState);
+      if (!gitStateComparison.matches) {
+        return {
+          ready: false,
+          stale: true,
+          reason: `zoek-rs index is stale: ${gitStateComparison.reason ?? 'Git state changed'}`,
+        };
+      }
+      return { ready: true };
     } catch {
-      return false;
+      return { ready: false, reason: 'zoek-rs index metadata could not be read' };
+    }
+  }
+
+  private async readIndexGitState(workspaceRoot: string): Promise<GitWorkspaceState | undefined> {
+    const statePath = path.join(workspaceRoot, '.zoek-rs', ZOEKT_INDEX_GIT_STATE_FILE);
+    try {
+      const raw = await fs.promises.readFile(statePath, 'utf8');
+      const parsed = JSON.parse(raw) as Partial<ZoektIndexGitStateFile>;
+      if (parsed.schemaVersion !== ZOEKT_INDEX_GIT_STATE_SCHEMA_VERSION) { return undefined; }
+      return isGitWorkspaceState(parsed.gitState) ? parsed.gitState : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async writeIndexGitState(workspaceRoot: string, gitState: GitWorkspaceState): Promise<void> {
+    const statePath = path.join(workspaceRoot, '.zoek-rs', ZOEKT_INDEX_GIT_STATE_FILE);
+    const payload: ZoektIndexGitStateFile = {
+      schemaVersion: ZOEKT_INDEX_GIT_STATE_SCHEMA_VERSION,
+      workspaceRoot,
+      writtenAtUnixMs: Date.now(),
+      gitState,
+    };
+    try {
+      await fs.promises.mkdir(path.dirname(statePath), { recursive: true });
+      await fs.promises.writeFile(statePath, JSON.stringify(payload, null, 2) + '\n', 'utf8');
+    } catch (err) {
+      this.log.appendLine(`zoek-rs index Git state write skipped: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
