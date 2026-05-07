@@ -60,6 +60,10 @@ const ZOEKT_UPDATE_IGNORED_DIR_NAMES = new Set([
   '.zoekt-rs',
 ]);
 
+function runtimeBinaryPlatformId(): string {
+  return `${process.platform}-${process.arch}`;
+}
+
 class ProcessCancelledError extends Error {
   constructor(message: string) {
     super(message);
@@ -1180,6 +1184,8 @@ export class ZoektRuntime implements vscode.Disposable {
     return [
       path.join(this.extensionRoot, 'target', 'debug', `${baseName}${exeSuffix}`),
       path.join(this.extensionRoot, 'target', 'release', `${baseName}${exeSuffix}`),
+      path.join(this.extensionRoot, 'resources', 'bin', runtimeBinaryPlatformId(), `${baseName}${exeSuffix}`),
+      path.join(this.extensionRoot, 'resources', 'bin', `${baseName}${exeSuffix}`),
     ];
   }
 

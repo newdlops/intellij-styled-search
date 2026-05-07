@@ -17,6 +17,8 @@ The extension resolves binaries from:
 - `target/release/zoek-rs`
 - `target/debug/ijss-rebuild`
 - `target/release/ijss-rebuild`
+- `resources/bin/<platform>-<arch>/zoek-rs`
+- `resources/bin/<platform>-<arch>/ijss-rebuild`
 
 If a binary is missing and `Cargo.toml` is present, the extension attempts a local fallback build with:
 
@@ -48,20 +50,22 @@ npm test
 cargo test -p zoek-rs
 ```
 
-5. Build the Rust binaries you intend to ship:
+5. Build the self-contained VSIX for the current platform:
 
 ```bash
-cargo build --release -p zoek-rs
+npm run package
 ```
 
-That single Cargo command builds both:
+`npm run package` builds and stages:
 
-- `target/release/zoek-rs`
-- `target/release/ijss-rebuild`
+- `resources/bin/<platform>-<arch>/zoek-rs`
+- `resources/bin/<platform>-<arch>/ijss-rebuild`
+
+Install this VSIX on another computer with the same platform/architecture to run without Rust/Cargo on the target machine.
 
 ## Default `vsce package` Behavior
 
-The current `.vscodeignore` excludes `target/**`.
+The current `.vscodeignore` excludes `target/**`, but it allows staged `resources/bin/**` binaries.
 
 That means a plain:
 
@@ -69,13 +73,13 @@ That means a plain:
 vsce package
 ```
 
-produces a VSIX without prebuilt Rust executables.
+from a clean tree produces a VSIX without prebuilt Rust executables. If you already ran `npm run rust:stage`, the staged `resources/bin/<platform>-<arch>/` binaries are included.
 
 What that implies:
 
 - The packaged extension still contains the Rust workspace (`Cargo.toml`, `crates/zoek-rs/**`).
 - On first activation, the extension can still build the Rust engine locally if the target machine has Cargo available.
-- If Cargo is not available on the target machine, the extension falls back to the TypeScript `codesearch` path when possible, but `zoekt`-specific capabilities will not be fully available until the Rust runtime exists.
+- If Cargo is not available on the target machine, `zoekt` and rust-native call graph rebuilds are unavailable until a Rust runtime exists.
 
 Use this mode when:
 
@@ -84,31 +88,29 @@ Use this mode when:
 
 ## Self-contained VSIX
 
-If you want the VSIX itself to contain runnable Rust binaries, you must ship the `target/release` artifacts.
+If you want the VSIX itself to contain runnable Rust binaries, use the repository packaging script:
 
-The current codebase does not have a dedicated packaging script for this. The required manual step is to allow the release binaries through `.vscodeignore` before packaging.
+```bash
+npm run package
+```
 
-At minimum, the VSIX must include:
-
-- `target/release/zoek-rs`
-- `target/release/ijss-rebuild`
-
-Recommended flow:
-
-1. Build release binaries:
+That script runs:
 
 ```bash
 cargo build --release -p zoek-rs
-```
-
-2. Update `.vscodeignore` so `target/release/zoek-rs*` and `target/release/ijss-rebuild*` are included.
-3. Package the extension:
-
-```bash
+node scripts/stageRustBinaries.js
 vsce package
 ```
 
-4. Install and verify the packaged VSIX on a machine without relying on repo-local state.
+The staged binaries live under:
+
+- `resources/bin/darwin-arm64/`
+- `resources/bin/darwin-x64/`
+- `resources/bin/linux-x64/`
+- `resources/bin/win32-x64/`
+- or the matching `<process.platform>-<process.arch>` directory for the build host
+
+Build the VSIX on each platform/architecture you intend to support, or stage the matching binaries for each target before packaging. Do not expect a macOS-built binary to run on Windows or Linux.
 
 ## Local Verification
 

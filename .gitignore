@@ -3,6 +3,7 @@ node_modules/
 .vscode-test/
 *.vsix
 resources/monaco.bundle.js
+resources/bin/*/
 target/
 .zoek-rs/
 .codeidx/

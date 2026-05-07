@@ -3198,6 +3198,8 @@ export class CallGraphService implements vscode.Disposable {
     const candidates = [
       path.join(extensionRoot, 'target', 'debug', `zoek-rs${exeSuffix}`),
       path.join(extensionRoot, 'target', 'release', `zoek-rs${exeSuffix}`),
+      path.join(extensionRoot, 'resources', 'bin', runtimeBinaryPlatformId(), `zoek-rs${exeSuffix}`),
+      path.join(extensionRoot, 'resources', 'bin', `zoek-rs${exeSuffix}`),
     ];
     return candidates.find((candidate) => fs.existsSync(candidate));
   }
@@ -3913,7 +3915,10 @@ export class CallGraphService implements vscode.Disposable {
   }): Promise<CallGraphSnapshot> {
     const binary = await this.resolveRustGraphBinary(true);
     if (!binary) {
-      throw new Error('zoek-rs binary is unavailable for rust-native call graph rebuild');
+      throw new Error(
+        'zoek-rs binary is unavailable for rust-native call graph rebuild. ' +
+        'Install Rust/Cargo so the extension can build zoek-rs locally, or install a self-contained VSIX built with `npm run package` for this platform.',
+      );
     }
     const started = Date.now();
     const builtAtUnixMs = Date.now();
@@ -7950,6 +7955,10 @@ function languageFromUri(uri: vscode.Uri): CallGraphLanguage {
 function languageFromRelPath(relPath: string): CallGraphLanguage {
   const ext = path.extname(relPath).toLowerCase();
   return LANGUAGE_BY_EXTENSION.get(ext) ?? 'javascript';
+}
+
+function runtimeBinaryPlatformId(): string {
+  return `${process.platform}-${process.arch}`;
 }
 
 function getDefaultCallGraphConcurrency(): number {

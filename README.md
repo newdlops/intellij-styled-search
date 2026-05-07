@@ -146,12 +146,12 @@ Deployment and release steps now live in [DEPLOY.md](DEPLOY.md).
 
 Short version:
 
-- `vsce package` builds a lightweight VSIX from the current `.vscodeignore`.
-- That default VSIX does not include `target/**`, so it relies on first-run Cargo builds for the Rust `zoekt` runtime.
-- A self-contained VSIX requires prebuilding `target/release/zoek-rs` and `target/release/ijss-rebuild`, then allowing those artifacts through `.vscodeignore` before packaging.
+- `npm run package` builds a self-contained VSIX for the current platform. It runs `cargo build --release -p zoek-rs`, stages `zoek-rs` and `ijss-rebuild` under `resources/bin/<platform>-<arch>/`, then packages the extension.
+- Install that self-contained VSIX on another computer with the same platform/architecture and it does not need Rust/Cargo at runtime.
+- A plain `vsce package` from a clean tree still relies on first-run local Cargo builds, so the target computer must have Rust/Cargo installed.
 
 Quick local package:
 
 ```bash
-vsce package
+npm run package
 ```
