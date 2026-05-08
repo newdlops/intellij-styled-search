@@ -9,6 +9,9 @@ import { defineConfig } from '@vscode/test-cli';
 export default defineConfig({
   label: 'e2e',
   files: 'out/test/suite/**/*.test.js',
+  // Keep the Electron main-process inspector for the test VS Code away from
+  // a developer's already-running VS Code, which usually owns port 9229.
+  launchArgs: ['--inspect=9239'],
   workspaceFolder: './tests/fixtures/workspace',
   mocha: {
     ui: 'tdd',
