@@ -1,7 +1,12 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import type { ExtensionTestApi } from '../../extension';
-import { getConfiguredSearchEngine, type FileMatch, type SearchForTestsResult } from '../../search';
+import {
+  getConfiguredExcludeGlobs,
+  getConfiguredSearchEngine,
+  type FileMatch,
+  type SearchForTestsResult,
+} from '../../search';
 import { extractTrigramsLower } from '../../trigramIndex';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
@@ -46,6 +51,17 @@ suite('Search — engine end-to-end against fixture workspace', () => {
     assert.strictEqual(getConfiguredSearchEngine(cfg('bad-value')), 'zoekt');
   });
 
+  test('configured excludes default to empty and are not engine performance policy', () => {
+    const ext = vscode.extensions.getExtension<ExtensionTestApi>(EXTENSION_ID);
+    const properties = ext?.packageJSON?.contributes?.configuration?.properties ?? {};
+    const packageDefault = properties['intellijStyledSearch.excludeGlobs']?.default ?? [];
+    assert.deepStrictEqual(packageDefault, [], 'package default excludes must stay empty');
+    const emptyCfg = {
+      get: <T>(_key: string, fallback: T) => fallback,
+    } as vscode.WorkspaceConfiguration;
+    assert.deepStrictEqual(getConfiguredExcludeGlobs(emptyCfg), [], 'effective configured excludes default to empty');
+  });
+
   test('fixture workspace searches execute via zoekt without fallback', async () => {
     const { overlay } = await getApi();
     const result = await overlay.searchForTestsDetailed({
@@ -62,6 +78,196 @@ suite('Search — engine end-to-end against fixture workspace', () => {
       `expected fixture search to stay on zoekt; ${formatEngineRoute(result)}`,
     );
     assert.deepStrictEqual(relPaths(result.matches), ['alpha.py']);
+  });
+
+  test('zoekt applies explicit configured excludes without baking in default excludes', async function () {
+    this.timeout(60_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const prior = cfg.inspect<string[]>('excludeGlobs');
+    const cacheDir = vscode.Uri.joinPath(folder!.uri, '.mypy_cache', '3.11');
+    const generated = vscode.Uri.joinPath(cacheDir, 'ijss-default-exclude.data.json');
+    const needle = `ijss_default_exclude_token_${Date.now()}`;
+
+    try {
+      await vscode.workspace.fs.createDirectory(cacheDir);
+      await vscode.workspace.fs.writeFile(generated, Buffer.from(`${needle}\n`, 'utf8'));
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+
+      const withoutExclude = await overlay.searchForTestsDetailed({
+        query: needle,
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      });
+      assert.strictEqual(withoutExclude.effectiveEngine, 'zoekt', `expected zoekt; ${formatEngineRoute(withoutExclude)}`);
+      assert.deepStrictEqual(
+        relPaths(withoutExclude.matches),
+        ['.mypy_cache/3.11/ijss-default-exclude.data.json'],
+        'zoekt must not hide cache paths unless the user configured an exclude',
+      );
+
+      await cfg.update('excludeGlobs', ['**/.mypy_cache/**'], vscode.ConfigurationTarget.Workspace);
+      const withExplicitExclude = await overlay.searchForTestsDetailed({
+        query: needle,
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      });
+      assert.strictEqual(withExplicitExclude.effectiveEngine, 'zoekt', `expected zoekt; ${formatEngineRoute(withExplicitExclude)}`);
+      assert.deepStrictEqual(relPaths(withExplicitExclude.matches), []);
+    } finally {
+      await cfg.update('excludeGlobs', prior?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      try { await vscode.workspace.fs.delete(vscode.Uri.joinPath(folder!.uri, '.mypy_cache'), { recursive: true }); } catch {}
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+    }
+  });
+
+  test('zoekt index reflects saved edits before the next search', async function () {
+    this.timeout(60_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const generated = vscode.Uri.joinPath(folder!.uri, 'edit-resilience.txt');
+    const before = 'edit_resilience_before_token';
+    const after = 'edit_resilience_after_token';
+
+    try {
+      await vscode.workspace.fs.writeFile(generated, Buffer.from(`${before}\n`, 'utf8'));
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+
+      const beforeResult = await overlay.searchForTestsDetailed({
+        query: before,
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      });
+      assert.strictEqual(beforeResult.effectiveEngine, 'zoekt', `expected zoekt before edit; ${formatEngineRoute(beforeResult)}`);
+      assert.deepStrictEqual(relPaths(beforeResult.matches), ['edit-resilience.txt']);
+
+      const doc = await vscode.workspace.openTextDocument(generated);
+      const fullRange = new vscode.Range(new vscode.Position(0, 0), doc.lineAt(doc.lineCount - 1).range.end);
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(generated, fullRange, `${after}\n`);
+      assert.strictEqual(await vscode.workspace.applyEdit(edit), true, 'expected edit to apply');
+      assert.strictEqual(await doc.save(), true, 'expected edited document to save');
+
+      const afterResult = await overlay.searchForTestsDetailed({
+        query: after,
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      });
+      assert.strictEqual(afterResult.effectiveEngine, 'zoekt', `expected zoekt after edit; ${formatEngineRoute(afterResult)}`);
+      assert.deepStrictEqual(relPaths(afterResult.matches), ['edit-resilience.txt']);
+
+      const staleResult = await overlay.searchForTestsDetailed({
+        query: before,
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      });
+      assert.deepStrictEqual(relPaths(staleResult.matches), []);
+    } finally {
+      try { await vscode.workspace.fs.delete(generated, { useTrash: false }); } catch {}
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+    }
+  });
+
+  test('zoekt workspace sync survives branch-like modify, create, and delete', async function () {
+    this.timeout(60_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const gitFile = vscode.Uri.joinPath(folder!.uri, '.git');
+    const gitStore = vscode.Uri.joinPath(folder!.uri, '.branch-sync-git');
+    const gitRefs = vscode.Uri.joinPath(gitStore, 'refs', 'heads');
+    const gitMainRef = vscode.Uri.joinPath(gitRefs, 'main');
+    const gitFeatureRef = vscode.Uri.joinPath(gitRefs, 'feature');
+    const modified = vscode.Uri.joinPath(folder!.uri, 'branch-sync-modified.txt');
+    const deleted = vscode.Uri.joinPath(folder!.uri, 'branch-sync-deleted.txt');
+    const created = vscode.Uri.joinPath(folder!.uri, 'branch-sync-created.txt');
+    const before = 'branch_sync_before_token';
+    const after = 'branch_sync_after_token';
+    const removed = 'branch_sync_removed_token';
+    const added = 'branch_sync_added_token';
+
+    const cleanup = async () => {
+      for (const uri of [modified, deleted, created, gitFile, gitStore]) {
+        try { await vscode.workspace.fs.delete(uri, { recursive: true, useTrash: false }); } catch {}
+      }
+    };
+
+    try {
+      await cleanup();
+      await vscode.workspace.fs.createDirectory(gitRefs);
+      await vscode.workspace.fs.writeFile(gitFile, Buffer.from('gitdir: .branch-sync-git\n', 'utf8'));
+      await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(gitStore, 'HEAD'), Buffer.from('ref: refs/heads/main\n', 'utf8'));
+      await vscode.workspace.fs.writeFile(gitMainRef, Buffer.from('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', 'utf8'));
+      await vscode.workspace.fs.writeFile(modified, Buffer.from(`${before}\n`, 'utf8'));
+      await vscode.workspace.fs.writeFile(deleted, Buffer.from(`${removed}\n`, 'utf8'));
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+
+      const initial = await overlay.searchForTestsDetailed({
+        query: before,
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      });
+      assert.strictEqual(initial.effectiveEngine, 'zoekt', `expected zoekt on initial branch; ${formatEngineRoute(initial)}`);
+      assert.deepStrictEqual(relPaths(initial.matches), ['branch-sync-modified.txt']);
+
+      await vscode.workspace.fs.writeFile(gitFeatureRef, Buffer.from('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n', 'utf8'));
+      await vscode.workspace.fs.writeFile(gitFile, Buffer.from('gitdir: .branch-sync-git\n', 'utf8'));
+      await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(gitStore, 'HEAD'), Buffer.from('ref: refs/heads/feature\n', 'utf8'));
+      await vscode.workspace.fs.writeFile(modified, Buffer.from(`${after}\n`, 'utf8'));
+      await vscode.workspace.fs.writeFile(created, Buffer.from(`${added}\n`, 'utf8'));
+      await vscode.workspace.fs.delete(deleted, { useTrash: false });
+
+      const afterResult = await overlay.searchForTestsDetailed({
+        query: after,
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      });
+      assert.strictEqual(afterResult.effectiveEngine, 'zoekt', `expected zoekt after branch-like change; ${formatEngineRoute(afterResult)}`);
+      assert.deepStrictEqual(relPaths(afterResult.matches), ['branch-sync-modified.txt']);
+
+      const addedResult = await overlay.searchForTestsDetailed({
+        query: added,
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      });
+      assert.deepStrictEqual(relPaths(addedResult.matches), ['branch-sync-created.txt']);
+
+      const staleBefore = await overlay.searchForTestsDetailed({
+        query: before,
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      });
+      assert.deepStrictEqual(relPaths(staleBefore.matches), []);
+
+      const staleRemoved = await overlay.searchForTestsDetailed({
+        query: removed,
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      });
+      assert.deepStrictEqual(relPaths(staleRemoved.matches), []);
+    } finally {
+      await cleanup();
+      await overlay.rebuildIndex();
+      await overlay.waitForIndexReady(30_000);
+    }
   });
 
   test('rebuildIndex follows codesearch setting and repopulates the trigram cache', async function () {

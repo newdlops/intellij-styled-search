@@ -21,6 +21,23 @@ suite('Activation', () => {
     assert.ok(api.overlay, 'overlay was not exposed on ext.exports');
   });
 
+  test('e2e launch config isolates the test VS Code main inspector', () => {
+    const ext = vscode.extensions.getExtension<ExtensionTestApi>(EXTENSION_ID);
+    assert.ok(ext, `extension ${EXTENSION_ID} not registered`);
+    const configPath = path.join(ext.extensionPath, '.vscode-test.mjs');
+    const configText = fs.readFileSync(configPath, 'utf8');
+    assert.match(
+      configText,
+      /launchArgs:\s*\[[^\]]*['"]--inspect=9239['"]/,
+      'e2e must launch the test VS Code main process on an inspector port separate from the developer VS Code default 9229',
+    );
+    assert.doesNotMatch(
+      configText,
+      /launchArgs:\s*\[[^\]]*['"]--inspect=9229['"]/,
+      'e2e must not reuse the default Node inspector port',
+    );
+  });
+
   test('commands are registered', async () => {
     const ext = vscode.extensions.getExtension<ExtensionTestApi>(EXTENSION_ID);
     await getApi();
@@ -28,6 +45,7 @@ suite('Activation', () => {
       'intellijStyledSearch.searchInProject',
       'intellijStyledSearch.searchSelection',
       'intellijStyledSearch.reinject',
+      'intellijStyledSearch.installZoektBinary',
       'intellijStyledSearch.rebuildIndex',
       'intellijStyledSearch.switchEngine',
       'intellijStyledSearch.showZoektInfo',
@@ -183,6 +201,49 @@ suite('Activation', () => {
     }
   });
 
+  test('external zoekt process sweep is scoped to the exact workspace root', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+
+    const projectRoot = path.resolve(workspaceRoot, '..', '..', '..');
+    assert.strictEqual(
+      runtime.commandTargetsWorkspaceRoot(`zoek-rs-update update ${workspaceRoot} docs.md`, workspaceRoot),
+      true,
+    );
+    assert.strictEqual(
+      runtime.commandTargetsWorkspaceRoot(`zoek-rs-update update "${workspaceRoot}" docs.md`, workspaceRoot),
+      true,
+      'quoted workspace root should still count as the exact target argument',
+    );
+    assert.strictEqual(
+      runtime.commandTargetsWorkspaceRoot(`zoek-rs-update update '${workspaceRoot}' docs.md`, workspaceRoot),
+      true,
+      'single-quoted workspace root should still count as the exact target argument',
+    );
+    assert.strictEqual(
+      runtime.commandTargetsWorkspaceRoot(`zoek-rs-update update ${projectRoot} out/extension.js`, workspaceRoot),
+      false,
+      'e2e fixture sweep must not kill the developer VS Code workspace indexer',
+    );
+    assert.strictEqual(
+      runtime.commandTargetsWorkspaceRoot(`zoek-rs-update update --workspace=${workspaceRoot} docs.md`, workspaceRoot),
+      false,
+      'workspace root must be a full command argument, not part of a flag value',
+    );
+    assert.strictEqual(
+      runtime.commandTargetsWorkspaceRoot(`zoek-rs-update update ${workspaceRoot}-copy docs.md`, workspaceRoot),
+      false,
+      'workspace root must match as a full command argument',
+    );
+    assert.strictEqual(
+      runtime.commandTargetsWorkspaceRoot(`zoek-rs-update update ${path.join(workspaceRoot, 'nested')} docs.md`, workspaceRoot),
+      false,
+      'workspace root prefix is not enough; nested workspaces are separate targets',
+    );
+  });
+
   test('resolveBinary treats failed cargo build as unavailable runtime', async () => {
     const { overlay } = await getApi();
     const runtime = (overlay as any).zoektRuntime as any;
@@ -216,12 +277,86 @@ suite('Activation', () => {
     }
   });
 
-  test('resolveBinary skips stale zoek-rs binaries that do not support exclude flags', async () => {
+  test('installBinary builds both zoekt runtime binaries when missing', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const originalResolveBinary = runtime.resolveBinary.bind(runtime);
+    const calls: Array<{ allowBuild: boolean; target: string }> = [];
+    const progress: string[] = [];
+
+    runtime.resolveBinary = async (allowBuild: boolean, target: string = 'engine') => {
+      calls.push({ allowBuild, target });
+      if (!allowBuild) { return null; }
+      return target === 'rebuild' ? '/tmp/ijss-rebuild' : '/tmp/zoek-rs';
+    };
+
+    try {
+      const result = await runtime.installBinary((message: string) => progress.push(message));
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(result.alreadyInstalled, false);
+      assert.strictEqual(result.engineBinary, '/tmp/zoek-rs');
+      assert.strictEqual(result.rebuildBinary, '/tmp/ijss-rebuild');
+      assert.deepStrictEqual(calls, [
+        { allowBuild: false, target: 'engine' },
+        { allowBuild: false, target: 'rebuild' },
+        { allowBuild: true, target: 'engine' },
+        { allowBuild: true, target: 'rebuild' },
+      ]);
+      assert.ok(progress.includes('building zoek-rs binaries with Cargo'));
+      assert.ok(progress.includes('zoek-rs binaries ready'));
+    } finally {
+      runtime.resolveBinary = originalResolveBinary;
+    }
+  });
+
+  test('installBinary reports missing Rust/Cargo toolchain clearly', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const originalInvokeText = runtime.invokeText.bind(runtime);
+    const originalGetBinaryCandidates = runtime.getBinaryCandidates.bind(runtime);
+    const originalGetBinaryCandidatesFor = runtime.getBinaryCandidatesFor.bind(runtime);
+    const originalBinaryPath = runtime.binaryPath;
+    const originalRebuildBinaryPath = runtime.rebuildBinaryPath;
+    const originalBuildPromise = runtime.buildPromise;
+
+    runtime.binaryPath = undefined;
+    runtime.rebuildBinaryPath = undefined;
+    runtime.buildPromise = undefined;
+    runtime.binaryCompatibility?.clear?.();
+    runtime.getBinaryCandidates = () => ['/definitely/missing/zoek-rs'];
+    runtime.getBinaryCandidatesFor = (target: string) => [
+      target === 'rebuild' ? '/definitely/missing/ijss-rebuild' : '/definitely/missing/zoek-rs',
+    ];
+    runtime.invokeText = async () => {
+      const err = new Error('spawn cargo ENOENT') as NodeJS.ErrnoException;
+      err.code = 'ENOENT';
+      throw err;
+    };
+
+    try {
+      const result = await runtime.installBinary();
+      assert.strictEqual(result.ok, false);
+      assert.strictEqual(result.requiresCargoToolchain, true);
+      assert.match(result.message ?? '', /Rust\/Cargo toolchain is not installed or not on PATH/);
+      assert.match(result.message ?? '', /https:\/\/rustup\.rs\//);
+    } finally {
+      runtime.invokeText = originalInvokeText;
+      runtime.getBinaryCandidates = originalGetBinaryCandidates;
+      runtime.getBinaryCandidatesFor = originalGetBinaryCandidatesFor;
+      runtime.binaryPath = originalBinaryPath;
+      runtime.rebuildBinaryPath = originalRebuildBinaryPath;
+      runtime.buildPromise = originalBuildPromise;
+      runtime.binaryCompatibility?.clear?.();
+    }
+  });
+
+  test('resolveBinary skips stale zoek-rs binaries that do not support required capabilities', async () => {
     const { overlay } = await getApi();
     const runtime = (overlay as any).zoektRuntime as any;
     const workspaceRoot = runtime.getWorkspaceRootPath();
     assert.ok(workspaceRoot, 'expected fixture workspace folder');
     const staleBinary = path.join(workspaceRoot, '.tmp-stale-zoek-rs');
+    const oldBinary = path.join(workspaceRoot, '.tmp-old-zoek-rs');
     const freshBinary = path.join(workspaceRoot, '.tmp-fresh-zoek-rs');
     const originalInvokeText = runtime.invokeText.bind(runtime);
     const originalCandidates = runtime.getBinaryCandidates.bind(runtime);
@@ -229,20 +364,48 @@ suite('Activation', () => {
     const originalBuildPromise = runtime.buildPromise;
 
     fs.writeFileSync(staleBinary, '');
+    fs.writeFileSync(oldBinary, '');
     fs.writeFileSync(freshBinary, '');
     runtime.binaryPath = undefined;
     runtime.buildPromise = undefined;
     runtime.binaryCompatibility?.clear?.();
-    runtime.getBinaryCandidates = () => [staleBinary, freshBinary];
-    runtime.invokeText = async (args: string[]) => ({
-      stdout: args[0] === staleBinary
-        ? '{"type":"error","ok":false,"message":"unknown diagnose flag: --exclude"}'
-        : '{"type":"diagnose","ok":true}',
-      stderr: '',
-      code: 0,
-      signal: null,
-      cancelled: false,
-    });
+    runtime.getBinaryCandidates = () => [staleBinary, oldBinary, freshBinary];
+    runtime.invokeText = async (args: string[]) => {
+      if (args[0] === staleBinary) {
+        return {
+          stdout: '{"type":"error","ok":false,"message":"unknown diagnose flag: --exclude"}',
+          stderr: '',
+          code: 0,
+          signal: null,
+          cancelled: false,
+        };
+      }
+      if (args[0] === oldBinary && args[1] === 'capabilities') {
+        return {
+          stdout: '{"type":"error","ok":false,"message":"unknown command"}',
+          stderr: '',
+          code: 0,
+          signal: null,
+          cancelled: false,
+        };
+      }
+      if (args[1] === 'capabilities') {
+        return {
+          stdout: '{"type":"capabilities","ok":true,"engine":{"name":"zoek-rs","protocolVersion":2,"schemaVersion":3},"optimizedCandidateLoading":true,"virtualIndexBenchmark":true,"incompleteDocSentinel":true,"maxFilesPerShard":50000}',
+          stderr: '',
+          code: 0,
+          signal: null,
+          cancelled: false,
+        };
+      }
+      return {
+        stdout: '{"type":"diagnose","ok":true}',
+        stderr: '',
+        code: 0,
+        signal: null,
+        cancelled: false,
+      };
+    };
 
     try {
       const binary = await runtime.resolveBinary(false);
@@ -254,6 +417,7 @@ suite('Activation', () => {
       runtime.buildPromise = originalBuildPromise;
       runtime.binaryCompatibility?.clear?.();
       try { fs.unlinkSync(staleBinary); } catch {}
+      try { fs.unlinkSync(oldBinary); } catch {}
       try { fs.unlinkSync(freshBinary); } catch {}
     }
   });
@@ -348,6 +512,12 @@ suite('Activation', () => {
   test('call graph rust queries use tracked process metadata and timeouts', async () => {
     const { callGraph } = await getApi();
     const service = callGraph as any;
+    assert.strictEqual(service.classifyRustGraphProcess(['build', '-q', '-p', 'zoek-rs']), 'build');
+    assert.strictEqual(
+      service.argv0ForRustGraphProcess('build'),
+      undefined,
+      'cargo/rustup proxy must keep argv0 as cargo; rustup rejects custom proxy names',
+    );
     assert.strictEqual(service.classifyRustGraphProcess(['graph-symbol-query']), 'graph-symbol-query');
     assert.strictEqual(service.argv0ForRustGraphProcess('graph-symbol-query'), 'ijss-rust-graph-symbol-query');
     assert.strictEqual(service.defaultRustGraphTimeoutMs('graph-symbol-query'), 30_000);
@@ -532,6 +702,277 @@ suite('Activation', () => {
     }
   });
 
+  test('workspace sync invokes zoekt update --sync when git state is dirty', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+
+    const originalInvokeJson = runtime.invokeJson.bind(runtime);
+    const invoked: string[][] = [];
+
+    runtime.workspaceSyncNeeded = true;
+    runtime.lastWorkspaceSyncAt.delete(workspaceRoot);
+    runtime.invokeJson = async (args: string[]) => {
+      invoked.push(args);
+      return {
+        type: 'update',
+        ok: true,
+        generation: 9,
+        entriesWritten: 2,
+        liveEntries: 1,
+        tombstones: 1,
+        overlayTotalEntries: 2,
+        latestVisibleEntries: 2,
+        journalBytes: 128,
+        compactionSuggested: false,
+        warnings: [],
+      };
+    };
+
+    try {
+      await runtime.syncWorkspaceIndexIfNeeded(workspaceRoot, '/tmp/zoek-rs', 'test');
+      assert.deepStrictEqual(invoked, [['/tmp/zoek-rs', 'update', workspaceRoot, '--sync']]);
+      assert.strictEqual(runtime.workspaceSyncNeeded, false);
+      const syncedAt = runtime.lastWorkspaceSyncAt.get(workspaceRoot);
+      assert.ok(typeof syncedAt === 'number' && syncedAt > 0);
+    } finally {
+      runtime.workspaceSyncNeeded = false;
+      runtime.lastWorkspaceSyncAt.delete(workspaceRoot);
+      runtime.invokeJson = originalInvokeJson;
+    }
+  });
+
+  test('workspace sync reruns immediately when git branch state changes', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+
+    const originalInvokeJson = runtime.invokeJson.bind(runtime);
+    const originalReadGitState = runtime.readGitState.bind(runtime);
+    const invoked: string[][] = [];
+    let gitState = 'HEAD ref: refs/heads/main\nREF aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+    runtime.workspaceSyncNeeded = false;
+    runtime.lastGitState.delete(workspaceRoot);
+    runtime.lastWorkspaceSyncAt.delete(workspaceRoot);
+    runtime.readGitState = async () => gitState;
+    runtime.invokeJson = async (args: string[]) => {
+      invoked.push(args);
+      return {
+        type: 'update',
+        ok: true,
+        generation: invoked.length,
+        entriesWritten: 1,
+        liveEntries: 1,
+        tombstones: 0,
+        overlayTotalEntries: invoked.length,
+        latestVisibleEntries: invoked.length,
+        journalBytes: 128,
+        compactionSuggested: false,
+        warnings: [],
+      };
+    };
+
+    try {
+      await runtime.syncWorkspaceIndexIfNeeded(workspaceRoot, '/tmp/zoek-rs', 'initial-search');
+      await runtime.syncWorkspaceIndexIfNeeded(workspaceRoot, '/tmp/zoek-rs', 'same-branch');
+      gitState = 'HEAD ref: refs/heads/feature\nREF bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+      await runtime.syncWorkspaceIndexIfNeeded(workspaceRoot, '/tmp/zoek-rs', 'branch-change');
+
+      assert.deepStrictEqual(invoked, [
+        ['/tmp/zoek-rs', 'update', workspaceRoot, '--sync'],
+        ['/tmp/zoek-rs', 'update', workspaceRoot, '--sync'],
+      ]);
+      assert.strictEqual(runtime.workspaceSyncNeeded, false);
+      assert.strictEqual(runtime.lastGitState.get(workspaceRoot), gitState);
+    } finally {
+      runtime.workspaceSyncNeeded = false;
+      runtime.lastGitState.delete(workspaceRoot);
+      runtime.lastWorkspaceSyncAt.delete(workspaceRoot);
+      runtime.invokeJson = originalInvokeJson;
+      runtime.readGitState = originalReadGitState;
+    }
+  });
+
+  test('zoekt search starts within budget when workspace sync is slow', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+
+    const originalGetSearchReadiness = runtime.getSearchReadiness.bind(runtime);
+    const originalResolveBinary = runtime.resolveBinary.bind(runtime);
+    const originalHasPendingUpdates = runtime.hasPendingUpdates.bind(runtime);
+    const originalSyncWorkspaceIndexIfNeeded = runtime.syncWorkspaceIndexIfNeeded.bind(runtime);
+    const originalInvokeJson = runtime.invokeJson.bind(runtime);
+    let resolveSync!: () => void;
+    const slowSync = new Promise<void>((resolve) => { resolveSync = resolve; });
+    let searchInvokedAt = 0;
+
+    runtime.getSearchReadiness = async () => ({ ready: true });
+    runtime.resolveBinary = async () => '/tmp/zoek-rs';
+    runtime.hasPendingUpdates = () => false;
+    runtime.syncWorkspaceIndexIfNeeded = async () => slowSync;
+    runtime.invokeJson = async () => {
+      searchInvokedAt = Date.now();
+      return {
+        type: 'search',
+        ok: true,
+        engine: { name: 'zoek-rs', protocolVersion: 2, schemaVersion: 3 },
+        queryMode: 'literal',
+        totalFilesScanned: 0,
+        totalFilesMatched: 0,
+        totalMatches: 0,
+        truncated: false,
+        warnings: [],
+        files: [],
+      };
+    };
+
+    try {
+      const startedAt = Date.now();
+      const cts = new vscode.CancellationTokenSource();
+      const result = await runtime.runSearch({
+        query: 'SlowSyncNeedle',
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      }, cts.token, {
+        onFile: () => {},
+        onDone: () => {},
+        onError: (err: Error) => { throw err; },
+      });
+      assert.strictEqual(result.ready, true);
+      assert.ok(searchInvokedAt > 0, 'expected search engine invocation');
+      assert.ok(
+        searchInvokedAt - startedAt < 2_000,
+        `search should not wait for the full workspace sync; waited ${searchInvokedAt - startedAt}ms`,
+      );
+    } finally {
+      resolveSync();
+      await slowSync;
+      runtime.getSearchReadiness = originalGetSearchReadiness;
+      runtime.resolveBinary = originalResolveBinary;
+      runtime.hasPendingUpdates = originalHasPendingUpdates;
+      runtime.syncWorkspaceIndexIfNeeded = originalSyncWorkspaceIndexIfNeeded;
+      runtime.invokeJson = originalInvokeJson;
+    }
+  });
+
+  test('preview requests use a 20ms Monaco warmup budget and refresh when ready', async () => {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalActiveWindowId = anyOverlay.activeWindowId;
+    const originalIsMonacoCaptureEnabled = anyOverlay.isMonacoCaptureEnabled.bind(anyOverlay);
+    const originalEnsureMonacoCapture = anyOverlay.ensureMonacoCapture.bind(anyOverlay);
+    const originalIsMonacoReadyInWindow = anyOverlay.isMonacoReadyInWindow.bind(anyOverlay);
+    const originalSendPreview = anyOverlay.sendPreview.bind(anyOverlay);
+    const originalReleasePreviewCaptureTabsSoon = anyOverlay.releasePreviewCaptureTabsSoon.bind(anyOverlay);
+    const originalScheduleCdpSearchIdleClose = anyOverlay.scheduleCdpSearchIdleClose.bind(anyOverlay);
+    const originalCancelCdpSearchIdleClose = anyOverlay.cancelCdpSearchIdleClose.bind(anyOverlay);
+    const originalLspPressure = anyOverlay.lspPressure;
+    const previewUri = 'file:///preview-warmup-budget.py';
+    const previewSeq = 42;
+    let resolveWarmup: (() => void) | undefined;
+    const warmupPromise = new Promise<void>((resolve) => { resolveWarmup = resolve; });
+    const sends: Array<{ at: number; args: unknown[] }> = [];
+    const captureCalls: unknown[][] = [];
+
+    anyOverlay.activeWindowId = 7;
+    anyOverlay.isMonacoCaptureEnabled = () => true;
+    anyOverlay.lspPressure = {
+      snapshot: () => ({ active: false, until: 0, delayMs: 0, reason: '', tokens: 1, diagnosticsBurstCount: 0 }),
+    };
+    anyOverlay.ensureMonacoCapture = async (...args: unknown[]) => {
+      captureCalls.push(args);
+      return warmupPromise;
+    };
+    anyOverlay.isMonacoReadyInWindow = async () => true;
+    anyOverlay.sendPreview = async (...args: unknown[]) => {
+      sends.push({ at: Date.now(), args });
+    };
+    anyOverlay.releasePreviewCaptureTabsSoon = () => {};
+    anyOverlay.scheduleCdpSearchIdleClose = () => {};
+    anyOverlay.cancelCdpSearchIdleClose = () => {};
+
+    try {
+      const started = Date.now();
+      await anyOverlay.handlePreviewRequest({
+        type: 'requestPreview',
+        uri: previewUri,
+        line: 3,
+        ranges: [{ start: 0, end: 5 }],
+        contextLines: 0,
+        previewSeq,
+      });
+      const targetSends = () => sends.filter((send) => send.args[0] === previewUri && send.args[4] === previewSeq);
+      assert.strictEqual(targetSends().length, 1, 'preview should render once when Monaco warmup exceeds the budget');
+      assert.strictEqual(captureCalls.length, 1, 'preview should attempt Monaco warmup once');
+      assert.strictEqual(captureCalls[0]?.[1], undefined, 'preview warmup should not pass a force-open URI');
+      assert.strictEqual(
+        (captureCalls[0]?.[2] as { allowForceOpen?: boolean } | undefined)?.allowForceOpen,
+        false,
+        'preview warmup must not force-open an editor tab or column',
+      );
+      assert.ok(
+        targetSends()[0]!.at - started < 80,
+        `preview should not wait for full Monaco warmup; waited ${targetSends()[0]!.at - started}ms`,
+      );
+      resolveWarmup?.();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.strictEqual(targetSends().length, 2, 'preview should refresh after late Monaco warmup becomes ready');
+      assert.deepStrictEqual(targetSends().map((send) => send.args[4]), [previewSeq, previewSeq]);
+    } finally {
+      anyOverlay.activeWindowId = originalActiveWindowId;
+      anyOverlay.isMonacoCaptureEnabled = originalIsMonacoCaptureEnabled;
+      anyOverlay.ensureMonacoCapture = originalEnsureMonacoCapture;
+      anyOverlay.isMonacoReadyInWindow = originalIsMonacoReadyInWindow;
+      anyOverlay.sendPreview = originalSendPreview;
+      anyOverlay.releasePreviewCaptureTabsSoon = originalReleasePreviewCaptureTabsSoon;
+      anyOverlay.scheduleCdpSearchIdleClose = originalScheduleCdpSearchIdleClose;
+      anyOverlay.cancelCdpSearchIdleClose = originalCancelCdpSearchIdleClose;
+      anyOverlay.lspPressure = originalLspPressure;
+    }
+  });
+
+  test('rapid preview requests are coalesced before fetching preview content', async () => {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalSendPreview = anyOverlay.sendPreview.bind(anyOverlay);
+    const originalIsMonacoCaptureEnabled = anyOverlay.isMonacoCaptureEnabled.bind(anyOverlay);
+    const calls: unknown[][] = [];
+    const src = `activation-preview-coalesce-${Date.now()}`;
+
+    anyOverlay.isMonacoCaptureEnabled = () => false;
+    anyOverlay.sendPreview = async (...args: unknown[]) => {
+      calls.push(args);
+    };
+
+    try {
+      for (let i = 0; i < 24; i++) {
+        overlay.injectRendererEventForTests(JSON.stringify({
+          type: 'requestPreview',
+          uri: `file:///tmp/ijss-preview-coalesce-${i % 3}.ts`,
+          line: i,
+          contextLines: 0,
+          previewSeq: i,
+          __src: src,
+          __seq: i + 1,
+        }));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.strictEqual(calls.length, 1, `rapid preview requests should fetch only the latest preview; calls=${JSON.stringify(calls)}`);
+      assert.strictEqual(calls[0]?.[0], 'file:///tmp/ijss-preview-coalesce-2.ts');
+      assert.strictEqual(calls[0]?.[1], 23);
+      assert.strictEqual(calls[0]?.[4], 23);
+    } finally {
+      anyOverlay.sendPreview = originalSendPreview;
+      anyOverlay.isMonacoCaptureEnabled = originalIsMonacoCaptureEnabled;
+    }
+  });
+
   test('zoekt searches skip trigram candidate planning', async () => {
     const { overlay } = await getApi();
     const anyOverlay = overlay as any;
@@ -567,5 +1008,39 @@ suite('Activation', () => {
       anyOverlay.postToRenderer = originalPostToRenderer;
       anyOverlay.runSearchPage = originalRunSearchPage;
     }
+  });
+});
+
+suite('Search performance budgets', () => {
+  test('1000k zoekt simple word and 10k literal searches stay within budget', async function () {
+    this.timeout(240_000);
+    const { overlay } = await getApi();
+    const response = await overlay.runZoektBenchmarkForTests([1_000_000], {
+      profile: 'synthetic',
+      searchOnly: true,
+      virtualIndex: true,
+    });
+    assert.ok(response, 'expected zoek-rs benchmark response');
+    const item = response.cases.find((candidate) => candidate.fileCount === 1_000_000);
+    assert.ok(item, `expected 1000k benchmark case; got ${JSON.stringify(response.cases)}`);
+    const simpleP95 = item.queryP95Ms;
+    const longP95 = item.longQueryP95Ms ?? Number.POSITIVE_INFINITY;
+    const longBytes = item.longQueryBytes ?? 0;
+    console.log(
+      `[zoek-e2e-perf] files=${item.fileCount} ` +
+      `simpleP95=${simpleP95}ms longBytes=${longBytes} longP95=${longP95}ms`,
+    );
+    assert.ok(
+      simpleP95 <= 100,
+      `1000k simple word query p95 exceeded 100ms budget: ${simpleP95}ms`,
+    );
+    assert.ok(
+      longBytes >= 10_000,
+      `10k literal benchmark query should be at least 10000 bytes; got ${longBytes}`,
+    );
+    assert.ok(
+      longP95 <= 20_000,
+      `1000k 10k-literal query p95 exceeded 20s budget: ${longP95}ms`,
+    );
   });
 });

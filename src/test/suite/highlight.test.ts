@@ -80,6 +80,19 @@ async function pollUntil<T>(
   throw new Error(`pollUntil timed out (${timeoutMs}ms): ${label}; last=${JSON.stringify(last)}`);
 }
 
+async function waitForPreviewDecorations(
+  api: ExtensionTestApi,
+  timeoutMs: number,
+  label: string,
+): Promise<PreviewDecorationsProbe> {
+  return pollUntil(
+    () => probeDecos(api),
+    (probe) => Array.isArray(probe.decorations) && probe.decorations.length > 0,
+    timeoutMs,
+    label,
+  );
+}
+
 let cdpAvailable = false;
 let monacoReady = false;
 let priorEngineSetting: string | undefined;
@@ -161,10 +174,11 @@ suite('Preview highlight — decoration regression', () => {
         10_000,
         'multi-line search to finish and preview to render in monaco',
       );
-      // Give the decoration application + reveal a frame to settle.
-      await new Promise((r) => setTimeout(r, 100));
-
-      const probe = await probeDecos(api);
+      const probe = await waitForPreviewDecorations(
+        api,
+        10_000,
+        'multi-line preview decorations to apply',
+      );
       assert.ok(probe.decorations, `no decorations array: ${JSON.stringify(probe)}`);
       assert.ok(
         probe.decorations!.length > 0,
@@ -225,8 +239,11 @@ suite('Preview highlight — decoration regression', () => {
       10_000,
       'first search to settle',
     );
-    await new Promise((r) => setTimeout(r, 100));
-    const firstProbe = await probeDecos(api);
+    const firstProbe = await waitForPreviewDecorations(
+      api,
+      10_000,
+      'first preview decorations to apply',
+    );
     assert.ok(
       firstProbe.decorations && firstProbe.decorations.length > 0,
       'first search must produce at least one findMatch decoration',
@@ -242,8 +259,11 @@ suite('Preview highlight — decoration regression', () => {
       10_000,
       'second search to settle with new input value',
     );
-    await new Promise((r) => setTimeout(r, 100));
-    const secondProbe = await probeDecos(api);
+    const secondProbe = await waitForPreviewDecorations(
+      api,
+      10_000,
+      'second preview decorations to apply',
+    );
     assert.ok(
       secondProbe.decorations && secondProbe.decorations.length > 0,
       'second search must leave at least one findMatch decoration in preview. ' +

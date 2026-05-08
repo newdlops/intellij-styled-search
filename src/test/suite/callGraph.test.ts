@@ -730,6 +730,10 @@ suite('Call graph', () => {
         commandParts.every((entry) => !entry.part.tooltip && !entry.hint.tooltip),
         'expected call graph inlay commands to avoid hover-only tooltip actions',
       );
+      assert.ok(
+        commandParts.every((entry) => entry.part.command?.title === ''),
+        'expected call graph inlay hover to keep underline affordance without command-title tooltip text',
+      );
       await vscode.workspace.getConfiguration('intellijStyledSearch').update(
         'callGraphShowCalleeInlayHints',
         true,

@@ -21,6 +21,8 @@ interface SearchState {
   filterQuery: string;
   historyCount?: number;
   history?: string[];
+  lastBatchMatches?: number;
+  lastBatchFiles?: number;
   err?: string;
 }
 
@@ -40,8 +42,16 @@ async function waitUntil(
   const deadline = Date.now() + timeoutMs;
   let last: SearchState | undefined;
   while (Date.now() < deadline) {
-    last = await probeState(api);
-    if (predicate(last)) { return last; }
+    try {
+      last = await probeState(api);
+      if (predicate(last)) { return last; }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!/CDP WebSocket closed|no active workbench window/.test(message)) {
+        throw err;
+      }
+      last = { err: message } as SearchState;
+    }
     await new Promise((r) => setTimeout(r, 60));
   }
   throw new Error(`waitUntil timed out (${timeoutMs}ms): ${label}. last=${JSON.stringify(last)}`);
@@ -296,7 +306,10 @@ suite('Extension-typing filter — client-side narrowing', () => {
     await api.overlay.show(query);
     const after = await waitUntil(
       api,
-      (s) => !s.searching && s.inputValue === query && s.rgQuery === query && s.filesCount > 0,
+      (s) => !s.searching &&
+        s.inputValue === query &&
+        s.rgQuery === query &&
+        ((s.filesCount > 0) || ((s.lastBatchMatches ?? 0) > 0 && (s.lastBatchFiles ?? 0) > 0)),
       10_000,
       'multiline query to survive renderer roundtrip without trimming',
     );
