@@ -128,6 +128,14 @@ export function getConfiguredSearchEngine(
   return raw === 'codesearch' ? 'codesearch' : 'zoekt';
 }
 
+export function getConfiguredExcludeGlobs(
+  cfg = vscode.workspace.getConfiguration('intellijStyledSearch'),
+): string[] {
+  const configured = cfg.get<string[]>('excludeGlobs', []);
+  if (!Array.isArray(configured)) { return []; }
+  return configured.filter((glob): glob is string => typeof glob === 'string' && glob.trim().length > 0);
+}
+
 function estimateMatchPayloadSize(match: FileMatch['matches'][number]): number {
   return (match.preview?.length ?? 0) + (match.ranges?.length ?? 0) * 48 + 64;
 }

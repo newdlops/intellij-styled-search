@@ -19,8 +19,10 @@ use zoek_rs::protocol::{
     GraphSymbolResponse, IndexRequest, IndexResponse, IndexStats, InfoResponse,
     OverlayUpdateResponse, SearchRequest,
 };
-use zoek_rs::searcher::search_workspace;
+use zoek_rs::searcher::{search_workspace, search_workspace_streaming};
 use zoek_rs::watcher::build_change_batch;
+
+const SEARCH_STREAM_PREFIX: &str = "__ZOEK_SEARCH__";
 
 fn main() {
     let response = match run(env::args().skip(1).collect()) {
@@ -240,10 +242,15 @@ fn run_search(args: &[String]) -> Result<EngineResponse, String> {
         limit: 200,
         offset: 0,
     };
+    let mut stream = false;
 
     let mut idx = 2;
     while idx < args.len() {
         match args[idx].as_str() {
+            "--stream" => {
+                stream = true;
+                idx += 1;
+            }
             "--case-sensitive" => {
                 request.case_sensitive = true;
                 idx += 1;
@@ -310,7 +317,18 @@ fn run_search(args: &[String]) -> Result<EngineResponse, String> {
         }
     }
 
-    let response = search_workspace(&request, &EngineConfig::default())?;
+    let response = if stream {
+        search_workspace_streaming(&request, &EngineConfig::default(), |file| {
+            eprintln!(
+                "{}{{\"type\":\"search:file\",\"file\":{}}}",
+                SEARCH_STREAM_PREFIX,
+                file.to_json()
+            );
+            Ok(())
+        })?
+    } else {
+        search_workspace(&request, &EngineConfig::default())?
+    };
     Ok(EngineResponse::Search(response))
 }
 

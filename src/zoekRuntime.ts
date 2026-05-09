@@ -20,6 +20,8 @@ import {
 import type {
   ZoektDiagnoseResponse,
   ZoektEngineResponse,
+  ZoektSearchFileResult,
+  ZoektSearchFileStreamEvent,
   ZoektInfoResponse,
   ZoektIndexResponse,
   ZoektSearchResponse,
@@ -54,7 +56,8 @@ const UPDATE_RETRY_WHILE_INDEXING_MS = 1_000;
 const AUTO_BASE_REFRESH_MIN_INTERVAL_MS = 60_000;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
 const ZOEKT_PROGRESS_PREFIX = '__ZOEK_PROGRESS__';
-const ZOEKT_SCHEMA_VERSION = 2;
+const ZOEKT_SEARCH_EVENT_PREFIX = '__ZOEK_SEARCH__';
+const ZOEKT_SCHEMA_VERSION = 7;
 const ZOEKT_UPDATE_IGNORED_DIR_NAMES = new Set([
   '.zoek-rs',
   '.zoekt-rs',
@@ -378,11 +381,28 @@ export class ZoektRuntime implements vscode.Disposable {
       const limit = getRequestedResultLimit(options);
       const offset = getRequestedResultOffset(options);
       const queryArgs = this.effectiveQueryArgs(options);
+      const pathScopeMatcher = compilePathScopeMatcher(options.includePatterns, options.excludePatterns);
+      const pathRegexMatcher = compileSearchPathRegex(options.pathRegex);
+      let sawStreamingSearchEvent = false;
+      const emitFileResult = (file: ZoektSearchFileResult): void => {
+        const fileMatch = this.toFileMatch(file, workspaceRoot);
+        if (
+          (pathScopeMatcher && !pathScopeMatcher(fileMatch.relPath)) ||
+          (pathRegexMatcher && !pathRegexMatcher(fileMatch.relPath))
+        ) {
+          return;
+        }
+        for (const chunk of splitFileMatchChunks(fileMatch)) {
+          if (token.isCancellationRequested) { return; }
+          progress.onFile(chunk);
+        }
+      };
       const response = await this.invokeJson([
         binary,
         'search',
         workspaceRoot,
         ...queryArgs,
+        '--stream',
         ...(options.useRegex ? ['--regex'] : []),
         ...(options.useRegex && options.regexMultiline === false ? ['--regex-singleline'] : []),
         ...(!options.useRegex && options.wholeWord ? ['--whole-word'] : []),
@@ -394,7 +414,29 @@ export class ZoektRuntime implements vscode.Disposable {
         String(limit),
         '--offset',
         String(offset),
-      ], token);
+      ], token, {
+        onStderrLine: (line) => {
+          if (!line.startsWith(ZOEKT_SEARCH_EVENT_PREFIX)) {
+            return false;
+          }
+          sawStreamingSearchEvent = true;
+          const payload = line.slice(ZOEKT_SEARCH_EVENT_PREFIX.length);
+          try {
+            const event = JSON.parse(payload) as ZoektSearchFileStreamEvent;
+            if (
+              event.type === 'search:file' &&
+              event.file &&
+              typeof event.file.relPath === 'string' &&
+              Array.isArray(event.file.matches)
+            ) {
+              emitFileResult(event.file);
+            }
+          } catch (err) {
+            this.log.appendLine(`zoek-rs search stream parse failed: ${err instanceof Error ? err.message : err}`);
+          }
+          return true;
+        },
+      });
       if (response.type !== 'search' || !response.ok) {
         return { ready: false, reason: this.describeEngineFailure(response, 'zoek-rs search failed') };
       }
@@ -414,10 +456,12 @@ export class ZoektRuntime implements vscode.Disposable {
       for (const warning of page.warnings) {
         this.log.appendLine(`zoek-rs warning: ${warning}`);
       }
-      for (const file of page.matches) {
-        if (token.isCancellationRequested) { return { ready: true }; }
-        for (const chunk of splitFileMatchChunks(file)) {
-          progress.onFile(chunk);
+      if (!sawStreamingSearchEvent) {
+        for (const file of page.matches) {
+          if (token.isCancellationRequested) { return { ready: true }; }
+          for (const chunk of splitFileMatchChunks(file)) {
+            progress.onFile(chunk);
+          }
         }
       }
       if (!token.isCancellationRequested) {
@@ -581,6 +625,49 @@ export class ZoektRuntime implements vscode.Disposable {
       lines.push(`warning: ${warning}`);
     }
     return lines.join('\n');
+  }
+
+  async runBenchmarkForTests(
+    fileCounts: number[],
+    options?: { profile?: 'synthetic' | 'mixed'; searchOnly?: boolean; virtualIndex?: boolean },
+  ): Promise<import('./zoekProtocol').ZoektBenchmarkResponse | null> {
+    let binary = await this.resolveBinary(false);
+    if (!binary) { return null; }
+    const counts = fileCounts
+      .map((value) => Math.max(0, Math.floor(value)))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    if (counts.length === 0) { return null; }
+    const runBenchmark = async (engineBinary: string): Promise<ZoektEngineResponse> => this.invokeJson([
+      engineBinary,
+      'benchmark',
+      '--files',
+      counts.join(','),
+      '--profile',
+      options?.profile ?? 'synthetic',
+      ...(options?.searchOnly ? ['--search-only'] : []),
+      ...(options?.virtualIndex ? ['--virtual-index'] : []),
+    ]);
+    try {
+      let response = await runBenchmark(binary);
+      if (
+        response.type === 'error' &&
+        options?.virtualIndex &&
+        /unknown benchmark flag: --virtual-index/.test(response.message)
+      ) {
+        this.binaryCompatibility.set(binary, false);
+        this.clearResolvedBinary('engine', binary);
+        binary = await this.resolveBinary(true) ?? binary;
+        response = await runBenchmark(binary);
+      }
+      if (response.type === 'benchmark' && response.ok) {
+        return response;
+      }
+      this.log.appendLine(this.describeEngineFailure(response, 'zoek-rs benchmark failed'));
+      return null;
+    } catch (err) {
+      this.log.appendLine(`zoek-rs benchmark failed: ${err instanceof Error ? err.message : err}`);
+      return null;
+    }
   }
 
   private getConfiguredEngine(): 'zoekt' | 'codesearch' {
@@ -1097,15 +1184,7 @@ export class ZoektRuntime implements vscode.Disposable {
     const pathScopeMatcher = compilePathScopeMatcher(options.includePatterns, options.excludePatterns);
     const pathRegexMatcher = compileSearchPathRegex(options.pathRegex);
     const files = response.files
-      .map((file): FileMatch => ({
-        uri: vscode.Uri.file(path.join(workspaceRoot, file.relPath)).toString(),
-        relPath: file.relPath,
-        matches: file.matches.map((match) => ({
-          line: match.line,
-          preview: match.preview,
-          ranges: [this.toRange(match)],
-        })),
-      }))
+      .map((file): FileMatch => this.toFileMatch(file, workspaceRoot))
       .filter((file) => (!pathScopeMatcher || pathScopeMatcher(file.relPath)) && (!pathRegexMatcher || pathRegexMatcher(file.relPath)));
 
     const pageMatchCount = files.reduce((sum, file) => sum + file.matches.length, 0);
@@ -1117,6 +1196,18 @@ export class ZoektRuntime implements vscode.Disposable {
       totalMatches: pageMatchCount,
       truncated: response.truncated,
       warnings: response.warnings,
+    };
+  }
+
+  private toFileMatch(file: ZoektSearchFileResult, workspaceRoot: string): FileMatch {
+    return {
+      uri: vscode.Uri.file(path.join(workspaceRoot, file.relPath)).toString(),
+      relPath: file.relPath,
+      matches: file.matches.map((match) => ({
+        line: match.line,
+        preview: match.preview,
+        ranges: [this.toRange(match)],
+      })),
     };
   }
 
@@ -1178,9 +1269,13 @@ export class ZoektRuntime implements vscode.Disposable {
   private getBinaryCandidatesFor(target: BinaryTarget, exeSuffix = process.platform === 'win32' ? '.exe' : ''): string[] {
     const baseName = target === 'rebuild' ? 'ijss-rebuild' : 'zoek-rs';
     return [
-      path.join(this.extensionRoot, 'target', 'debug', `${baseName}${exeSuffix}`),
       path.join(this.extensionRoot, 'target', 'release', `${baseName}${exeSuffix}`),
+      path.join(this.extensionRoot, 'target', 'debug', `${baseName}${exeSuffix}`),
     ];
+  }
+
+  private isDebugBuildCandidate(candidate: string): boolean {
+    return candidate.replace(/\\/g, '/').includes('/target/debug/');
   }
 
   private async resolveBinary(allowBuild: boolean, target: BinaryTarget = 'engine'): Promise<string | null> {
@@ -1194,7 +1289,13 @@ export class ZoektRuntime implements vscode.Disposable {
       this.clearResolvedBinary(target, cached);
     }
     const candidates = target === 'engine' ? this.getBinaryCandidates() : this.getBinaryCandidatesFor(target);
+    const skipDebugBeforeBuild = allowBuild && candidates.some((candidate) =>
+      candidate.replace(/\\/g, '/').includes('/target/release/'),
+    );
     for (const candidate of candidates) {
+      if (skipDebugBeforeBuild && this.isDebugBuildCandidate(candidate)) {
+        continue;
+      }
       if (fs.existsSync(candidate) && await this.isBinaryCompatible(candidate, target)) {
         this.cacheResolvedBinary(target, candidate);
         return candidate;
@@ -1218,9 +1319,9 @@ export class ZoektRuntime implements vscode.Disposable {
       return null;
     }
     this.buildPromise = (async () => {
-      this.log.appendLine('zoek-rs build: cargo build -q -p zoek-rs');
+      this.log.appendLine('zoek-rs build: cargo build -q --release -p zoek-rs');
       try {
-        const result = await this.invokeText(['cargo', 'build', '-q', '-p', 'zoek-rs'], this.extensionRoot, this.lifecycleCts.token);
+        const result = await this.invokeText(['cargo', 'build', '-q', '--release', '-p', 'zoek-rs'], this.extensionRoot, this.lifecycleCts.token);
         if (result.cancelled) {
           throw new ProcessCancelledError('cargo build cancelled');
         }

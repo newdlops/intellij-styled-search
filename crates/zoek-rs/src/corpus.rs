@@ -1,6 +1,7 @@
 use crate::config::EngineConfig;
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -38,6 +39,12 @@ pub struct CorpusStats {
 pub struct CorpusProgress {
     pub visited_files: usize,
     pub total_candidate_files: usize,
+}
+
+#[derive(Debug)]
+pub enum ReadTextBytesOutcome {
+    Text(Vec<u8>),
+    Binary,
 }
 
 pub fn discover_text_files(
@@ -124,11 +131,14 @@ fn walk_dir(
         }
 
         stats.visited_files += 1;
-        if total_candidate_files > 0
-            && (stats.visited_files == 1
+        let should_report = if total_candidate_files > 0 {
+            stats.visited_files == 1
                 || stats.visited_files % 128 == 0
-                || stats.visited_files == total_candidate_files)
-        {
+                || stats.visited_files == total_candidate_files
+        } else {
+            stats.visited_files == 1 || stats.visited_files % 4096 == 0
+        };
+        if should_report {
             progress(CorpusProgress {
                 visited_files: stats.visited_files,
                 total_candidate_files,
@@ -214,8 +224,53 @@ pub fn looks_binary_bytes(bytes: &[u8]) -> bool {
     bytes[..sample_len].iter().any(|byte| *byte == 0)
 }
 
+pub fn read_file_bytes_if_not_binary(
+    path: &Path,
+    size_hint: u64,
+) -> io::Result<ReadTextBytesOutcome> {
+    const BINARY_PROBE_BYTES: usize = 4096;
+
+    let capacity = size_hint.min(usize::MAX as u64) as usize;
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    {
+        let mut probe_reader = (&mut file).take(BINARY_PROBE_BYTES as u64);
+        probe_reader.read_to_end(&mut bytes)?;
+    }
+    if looks_binary_bytes(&bytes) {
+        return Ok(ReadTextBytesOutcome::Binary);
+    }
+    file.read_to_end(&mut bytes)?;
+    Ok(ReadTextBytesOutcome::Text(bytes))
+}
+
 fn has_utf16_bom(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff])
+}
+
+pub fn decode_bytes_owned(bytes: Vec<u8>) -> (String, TextEncoding) {
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return (
+            String::from_utf8_lossy(&bytes[3..]).into_owned(),
+            TextEncoding::Utf8Bom,
+        );
+    }
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        return (decode_utf16_units(&bytes[2..], true), TextEncoding::Utf16Le);
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        return (
+            decode_utf16_units(&bytes[2..], false),
+            TextEncoding::Utf16Be,
+        );
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => (text, TextEncoding::Utf8),
+        Err(err) => (
+            String::from_utf8_lossy(&err.into_bytes()).into_owned(),
+            TextEncoding::LossyUtf8,
+        ),
+    }
 }
 
 pub fn decode_bytes(bytes: &[u8]) -> (String, TextEncoding) {

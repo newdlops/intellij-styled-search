@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 pub const ENGINE_NAME: &str = "zoek-rs";
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -22,16 +22,18 @@ impl Default for EngineConfig {
         Self {
             index_dir_name: ".zoek-rs".to_string(),
             max_file_size_bytes: 1_048_576,
-            shard_target_bytes: 64 * 1024 * 1024,
+            shard_target_bytes: 32 * 1024 * 1024,
+            // Keep tiny-file monorepos from producing hundreds of shard files.
+            // Byte limits still split normal/larger source files; this cap is
+            // mainly for 1M-file repos where process-per-search shard opens
+            // dominate latency.
             max_files_per_shard: 50_000,
-            // 256 was low enough that large source files had many tokens
-            // pruned from the index, causing false-negatives in gram AND
-            // filtering. 8192 comfortably holds sliding-window grams for
-            // typical source files (after dedup). Files that still exceed
-            // the cap get their `gram_incomplete` flag set so the searcher
-            // skips gram filtering for them — correctness wins without
-            // unbounded size growth.
-            max_grams_per_file: 8192,
+            // Large generated or minified text files can emit enormous sliding
+            // gram sets. Keep a tighter per-file budget and mark overflowed
+            // docs `gram_incomplete`; search includes those docs before exact
+            // verification, so this trades some candidate expansion for much
+            // lower cold indexing cost without false negatives.
+            max_grams_per_file: 4096,
             overlay_compaction_entry_threshold: 512,
             overlay_compaction_journal_bytes_threshold: 2 * 1024 * 1024,
             excluded_dir_names: vec![".zoek-rs".to_string(), ".zoekt-rs".to_string()],

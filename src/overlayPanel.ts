@@ -1377,6 +1377,14 @@ export class OverlayPanel {
     return result.matches;
   }
 
+  /** @internal Runs the Rust engine benchmark through the production runtime path. */
+  async runZoektBenchmarkForTests(
+    fileCounts: number[],
+    options?: { profile?: 'synthetic' | 'mixed'; searchOnly?: boolean; virtualIndex?: boolean },
+  ) {
+    return this.zoektRuntime.runBenchmarkForTests(fileCounts, options);
+  }
+
   /** @internal Exposed so tests can drive the index directly. */
   getTrigramIndex(): TrigramIndex {
     return this.trigramIndex;

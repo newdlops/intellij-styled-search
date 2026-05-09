@@ -1,3 +1,7 @@
 [workspace]
 members = ["crates/zoek-rs"]
 resolver = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -634,6 +634,7 @@ const VALUE_BINDING_TYPE_NAMES = new Set([
 ]);
 
 const MAX_CALL_GRAPH_CONCURRENCY = 64;
+const DEFAULT_CALL_GRAPH_CONCURRENCY_LIMIT = 64;
 const MAX_POSSIBLE_EDGES_PER_CALL = 40;
 const DEFAULT_CALL_GRAPH_CONCURRENCY = getDefaultCallGraphConcurrency();
 const DEFAULT_CALL_GRAPH_MAX_EDGES = 0;
@@ -3168,16 +3169,16 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   private async resolveRustGraphBinary(allowBuild: boolean): Promise<string | undefined> {
-    const existing = this.findRustGraphBinary();
+    const existing = this.findRustGraphBinary({ includeDebug: !allowBuild });
     if (existing || !allowBuild) { return existing; }
     if (this.rustGraphBuildPromise) { return this.rustGraphBuildPromise; }
     const cargoToml = path.join(this.context.extensionUri.fsPath, 'Cargo.toml');
     if (!fs.existsSync(cargoToml)) { return undefined; }
     this.rustGraphBuildPromise = (async () => {
       try {
-        this.log.appendLine('call graph rust graph index: building zoek-rs binary');
-        await this.invokeRustGraphText(['cargo', 'build', '-q', '-p', 'zoek-rs']);
-        const binary = this.findRustGraphBinary();
+        this.log.appendLine('call graph rust graph index: building release zoek-rs binary');
+        await this.invokeRustGraphText(['cargo', 'build', '-q', '--release', '-p', 'zoek-rs']);
+        const binary = this.findRustGraphBinary({ includeDebug: false }) ?? this.findRustGraphBinary();
         if (binary) {
           this.log.appendLine(`call graph rust graph index: zoek-rs binary ready: ${binary}`);
         }
@@ -3192,13 +3193,13 @@ export class CallGraphService implements vscode.Disposable {
     return this.rustGraphBuildPromise;
   }
 
-  private findRustGraphBinary(): string | undefined {
+  private findRustGraphBinary(options: { includeDebug?: boolean } = {}): string | undefined {
     const exeSuffix = process.platform === 'win32' ? '.exe' : '';
     const extensionRoot = this.context.extensionUri.fsPath;
     const candidates = [
-      path.join(extensionRoot, 'target', 'debug', `zoek-rs${exeSuffix}`),
       path.join(extensionRoot, 'target', 'release', `zoek-rs${exeSuffix}`),
-    ];
+      path.join(extensionRoot, 'target', 'debug', `zoek-rs${exeSuffix}`),
+    ].filter((candidate) => options.includeDebug !== false || !candidate.replace(/\\/g, '/').includes('/target/debug/'));
     return candidates.find((candidate) => fs.existsSync(candidate));
   }
 
@@ -7953,7 +7954,7 @@ function languageFromRelPath(relPath: string): CallGraphLanguage {
 }
 
 function getDefaultCallGraphConcurrency(): number {
-  return MAX_CALL_GRAPH_CONCURRENCY;
+  return DEFAULT_CALL_GRAPH_CONCURRENCY_LIMIT;
 }
 
 function getConfiguredCallGraphConcurrency(

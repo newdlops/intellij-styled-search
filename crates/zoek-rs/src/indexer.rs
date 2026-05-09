@@ -1,14 +1,20 @@
 use crate::config::{EngineConfig, ENGINE_NAME, SCHEMA_VERSION};
-use crate::corpus::{count_candidate_files, discover_text_files_with_progress, CorpusEntry};
+use crate::corpus::{
+    decode_bytes_owned, read_file_bytes_if_not_binary, CorpusStats, ReadTextBytesOutcome,
+    TextEncoding,
+};
 use crate::mmap_store::{write_atomically, StoreLayout};
 use crate::overlay::OverlayManifest;
 use crate::protocol::json_string;
-use crate::shard::{build_shard_bytes, IndexedDocument, ShardReader};
+use crate::shard::{build_shard_bytes, IndexedDocument};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -66,6 +72,22 @@ impl IndexProgress {
     }
 }
 
+#[derive(Clone, Debug)]
+struct IndexFileRecord {
+    rel_path: String,
+    abs_path: PathBuf,
+    size_bytes: u64,
+    modified_unix_secs: u64,
+}
+
+enum IndexedRecordOutcome {
+    Indexed {
+        document: IndexedDocument,
+        encoding: TextEncoding,
+    },
+    SkippedBinary,
+}
+
 pub fn index_directory(workspace_root: &Path, config: &EngineConfig) -> io::Result<IndexArtifacts> {
     let mut noop = |_progress: IndexProgress| {};
     index_directory_with_progress(workspace_root, config, &mut noop)
@@ -79,25 +101,6 @@ pub fn index_directory_with_progress<F>(
 where
     F: FnMut(IndexProgress),
 {
-    let total_candidate_files = count_candidate_files(workspace_root, config)?;
-    let (entries, corpus_stats) = discover_text_files_with_progress(
-        workspace_root,
-        config,
-        total_candidate_files,
-        &mut |scan| {
-            progress(IndexProgress {
-                phase: "scan",
-                current: scan.visited_files,
-                total: scan.total_candidate_files.max(1),
-                percent: weighted_percent(scan.visited_files, scan.total_candidate_files, 0, 70),
-                detail: format!(
-                    "scanning files {}/{}",
-                    scan.visited_files,
-                    scan.total_candidate_files.max(scan.visited_files),
-                ),
-            });
-        },
-    )?;
     let layout = StoreLayout::for_workspace(workspace_root, config);
     layout.ensure_dirs()?;
     let _ = layout.cleanup_stale_temp_files(30);
@@ -108,11 +111,8 @@ where
         .map(|value| value.as_secs())
         .unwrap_or(0);
 
-    let indexed_docs = prepare_indexed_documents(&entries, config, progress);
-
-    let fingerprint = fingerprint_documents(&indexed_docs);
-    let shards = partition_documents(&indexed_docs, config);
-    let shard_artifacts = write_base_shards_parallel(&layout, &shards, now, progress)?;
+    let (shard_artifacts, corpus_stats, fingerprint) =
+        write_base_shards_from_workspace(workspace_root, config, &layout, now, progress)?;
     let total_grams = shard_artifacts
         .iter()
         .map(|artifact| artifact.gram_count)
@@ -172,44 +172,114 @@ where
     })
 }
 
-fn write_base_shards_parallel<F>(
+fn write_base_shards_from_workspace<F>(
+    workspace_root: &Path,
+    config: &EngineConfig,
     layout: &StoreLayout,
-    shards: &[&[IndexedDocument]],
     now: u64,
     progress: &mut F,
-) -> io::Result<Vec<ShardArtifact>>
+) -> io::Result<(Vec<ShardArtifact>, CorpusStats, u64)>
+where
+    F: FnMut(IndexProgress),
+{
+    let (records, mut stats) = collect_index_file_records(workspace_root, config, progress)?;
+    let record_shards = partition_records(&records, config);
+    let (artifacts, build_stats, fingerprint) =
+        write_base_shards_from_records_parallel(layout, &record_shards, config, now, progress)?;
+    merge_corpus_stats(&mut stats, build_stats);
+    Ok((artifacts, stats, fingerprint))
+}
+
+fn write_base_shards_from_records_parallel<F>(
+    layout: &StoreLayout,
+    shards: &[&[IndexFileRecord]],
+    config: &EngineConfig,
+    now: u64,
+    progress: &mut F,
+) -> io::Result<(Vec<ShardArtifact>, CorpusStats, u64)>
 where
     F: FnMut(IndexProgress),
 {
     let total_shards = shards.len();
     if total_shards == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), CorpusStats::default(), 0));
     }
-    let mut artifacts = vec![None; total_shards];
-    thread::scope(|scope| -> io::Result<()> {
-        let mut handles = Vec::with_capacity(total_shards);
-        for (shard_id, docs) in shards.iter().copied().enumerate() {
-            handles.push(scope.spawn(move || write_base_shard(layout, shard_id as u32, now, docs)));
-        }
-        let mut completed = 0usize;
-        for (idx, handle) in handles.into_iter().enumerate() {
-            let artifact = handle.join().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "base shard writer panicked")
-            })??;
-            completed += 1;
-            artifacts[idx] = Some(artifact);
-            progress(IndexProgress {
-                phase: "write",
-                current: completed,
-                total: total_shards.max(1),
-                percent: weighted_percent(completed, total_shards, 90, 10),
-                detail: format!("writing shards {}/{}", completed, total_shards.max(1)),
-            });
-        }
-        Ok(())
-    })?;
 
-    artifacts
+    let worker_count = shard_build_worker_count(total_shards);
+    let mut artifacts = vec![None; total_shards];
+    let mut shard_fingerprints = vec![0u64; total_shards];
+    let mut stats = CorpusStats::default();
+    let mut completed = 0usize;
+
+    let next_shard = AtomicUsize::new(0);
+    let (result_tx, result_rx) = mpsc::channel();
+    let mut first_error: Option<io::Error> = None;
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let result_tx = result_tx.clone();
+            let next_shard = &next_shard;
+            handles.push(scope.spawn(move || loop {
+                let shard_id = next_shard.fetch_add(1, AtomicOrdering::Relaxed);
+                if shard_id >= total_shards {
+                    break;
+                }
+                let output = build_and_write_base_shard_from_records(
+                    layout,
+                    shard_id as u32,
+                    now,
+                    shards[shard_id],
+                    config,
+                );
+                let failed = output.is_err();
+                if result_tx.send((shard_id, output)).is_err() || failed {
+                    break;
+                }
+            }));
+        }
+        drop(result_tx);
+
+        for (shard_id, output) in result_rx {
+            match output {
+                Ok(output) => {
+                    completed += 1;
+                    merge_corpus_stats(&mut stats, output.stats);
+                    shard_fingerprints[shard_id] = output.fingerprint;
+                    artifacts[shard_id] = Some(output.artifact);
+                    progress(IndexProgress {
+                        phase: "write",
+                        current: completed,
+                        total: total_shards.max(1),
+                        percent: weighted_percent(completed, total_shards, 10, 90),
+                        detail: format!(
+                            "building and writing shards {}/{}",
+                            completed,
+                            total_shards.max(1)
+                        ),
+                    });
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+
+        for handle in handles {
+            if handle.join().is_err() && first_error.is_none() {
+                first_error = Some(io::Error::new(
+                    io::ErrorKind::Other,
+                    "base shard builder panicked",
+                ));
+            }
+        }
+    });
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+
+    let artifacts = artifacts
         .into_iter()
         .map(|artifact| {
             artifact.ok_or_else(|| {
@@ -219,7 +289,62 @@ where
                 )
             })
         })
-        .collect()
+        .collect::<io::Result<Vec<_>>>()?;
+    let fingerprint = fingerprint_shards(&shard_fingerprints);
+    Ok((artifacts, stats, fingerprint))
+}
+
+struct BaseShardBuildOutput {
+    artifact: ShardArtifact,
+    stats: CorpusStats,
+    fingerprint: u64,
+}
+
+fn build_and_write_base_shard_from_records(
+    layout: &StoreLayout,
+    shard_id: u32,
+    now: u64,
+    records: &[IndexFileRecord],
+    config: &EngineConfig,
+) -> io::Result<BaseShardBuildOutput> {
+    let mut docs = Vec::with_capacity(records.len());
+    let mut stats = CorpusStats::default();
+    for record in records {
+        match build_indexed_document_from_record(record, config)? {
+            IndexedRecordOutcome::Indexed { document, encoding } => {
+                if matches!(encoding, TextEncoding::Utf16Le | TextEncoding::Utf16Be) {
+                    stats.decoded_utf16_files += 1;
+                }
+                stats.indexed_files += 1;
+                docs.push(document);
+            }
+            IndexedRecordOutcome::SkippedBinary => {
+                stats.skipped_binary += 1;
+            }
+        }
+    }
+    let fingerprint = fingerprint_documents(&docs);
+    let artifact = write_base_shard(layout, shard_id, now, &docs)?;
+    Ok(BaseShardBuildOutput {
+        artifact,
+        stats,
+        fingerprint,
+    })
+}
+
+fn shard_build_worker_count(total_shards: usize) -> usize {
+    let parallelism = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    parallelism.min(16).min(total_shards.max(1))
+}
+
+fn directory_scan_worker_count() -> usize {
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(32)
+        .max(1)
 }
 
 fn write_base_shard(
@@ -229,107 +354,364 @@ fn write_base_shard(
     docs: &[IndexedDocument],
 ) -> io::Result<ShardArtifact> {
     let build = build_shard_bytes(shard_id, now, docs)?;
+    let header = build.header.clone();
+    let file_bytes = build.bytes.len() as u64;
     let path = layout.shard_path(shard_id);
     write_atomically(&path, &build.bytes)?;
-    let reader = ShardReader::open(&path)?;
-    let header = reader.header().clone();
     Ok(ShardArtifact {
         shard_id,
         file_name: layout.shard_file_name(shard_id),
         path,
         doc_count: header.doc_count,
         gram_count: header.gram_count,
-        file_bytes: build.bytes.len() as u64,
+        file_bytes,
         source_bytes: build.source_bytes,
     })
 }
 
-fn prepare_indexed_documents<F>(
-    entries: &[CorpusEntry],
+fn collect_index_file_records<F>(
+    workspace_root: &Path,
     config: &EngineConfig,
     progress: &mut F,
-) -> Vec<IndexedDocument>
+) -> io::Result<(Vec<IndexFileRecord>, CorpusStats)>
 where
     F: FnMut(IndexProgress),
 {
-    let total_entries = entries.len();
-    if total_entries == 0 {
-        return Vec::new();
+    let worker_count = directory_scan_worker_count();
+    if worker_count > 1 {
+        return collect_index_file_records_parallel(workspace_root, config, worker_count, progress);
     }
-
-    let workers = thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .min(total_entries);
-    if workers <= 1 || total_entries < 256 {
-        let mut indexed_docs = Vec::with_capacity(total_entries);
-        for (idx, entry) in entries.iter().enumerate() {
-            indexed_docs.push(build_indexed_document(entry, config));
-            report_prepare_progress(progress, idx + 1, total_entries);
-        }
-        return indexed_docs;
-    }
-
-    let chunk_size = total_entries.div_ceil(workers).max(1);
-    let mut completed = 0usize;
-    let mut chunks = Vec::new();
-    thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (chunk_idx, chunk) in entries.chunks(chunk_size).enumerate() {
-            handles.push(scope.spawn(move || {
-                let docs = chunk
-                    .iter()
-                    .map(|entry| build_indexed_document(entry, config))
-                    .collect::<Vec<_>>();
-                (chunk_idx, docs)
-            }));
-        }
-        for handle in handles {
-            let (chunk_idx, docs) = handle.join().expect("gram extraction worker panicked");
-            completed += docs.len();
-            emit_prepare_progress(progress, completed.min(total_entries), total_entries);
-            chunks.push((chunk_idx, docs));
-        }
+    let mut records = Vec::new();
+    let mut stats = CorpusStats::default();
+    walk_index_file_records(
+        workspace_root,
+        workspace_root,
+        config,
+        &mut records,
+        &mut stats,
+        progress,
+    )?;
+    records.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    progress(IndexProgress {
+        phase: "scan",
+        current: stats.visited_files,
+        total: stats.visited_files.max(1),
+        percent: 10,
+        detail: format!(
+            "scanned {} files; {} candidates",
+            stats.visited_files,
+            records.len()
+        ),
     });
-    chunks.sort_by_key(|(chunk_idx, _)| *chunk_idx);
-
-    let mut indexed_docs = Vec::with_capacity(total_entries);
-    for (_, docs) in chunks {
-        indexed_docs.extend(docs);
-    }
-    indexed_docs
+    Ok((records, stats))
 }
 
-fn build_indexed_document(entry: &CorpusEntry, config: &EngineConfig) -> IndexedDocument {
+enum IndexScanMessage {
+    Progress { visited: usize, candidates: usize },
+    Done(io::Result<(Vec<IndexFileRecord>, CorpusStats)>),
+}
+
+fn collect_index_file_records_parallel<F>(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    worker_count: usize,
+    progress: &mut F,
+) -> io::Result<(Vec<IndexFileRecord>, CorpusStats)>
+where
+    F: FnMut(IndexProgress),
+{
+    let dirs = Arc::new(Mutex::new(vec![workspace_root.to_path_buf()]));
+    let pending_dirs = Arc::new(AtomicUsize::new(1));
+    let stop = Arc::new(AtomicBool::new(false));
+    let visited_files = Arc::new(AtomicUsize::new(0));
+    let candidate_files = Arc::new(AtomicUsize::new(0));
+    let workspace_root = Arc::new(workspace_root.to_path_buf());
+    let index_root = Arc::new(config.index_root(&workspace_root));
+    let config = Arc::new(config.clone());
+    let (tx, rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let dirs = Arc::clone(&dirs);
+            let pending_dirs = Arc::clone(&pending_dirs);
+            let stop = Arc::clone(&stop);
+            let visited_files = Arc::clone(&visited_files);
+            let candidate_files = Arc::clone(&candidate_files);
+            let workspace_root = Arc::clone(&workspace_root);
+            let index_root = Arc::clone(&index_root);
+            let config = Arc::clone(&config);
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let mut records = Vec::new();
+                let mut stats = CorpusStats::default();
+                loop {
+                    if stop.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                    let dir = {
+                        let mut guard = dirs.lock().expect("index directory queue poisoned");
+                        guard.pop()
+                    };
+                    let Some(dir) = dir else {
+                        if pending_dirs.load(AtomicOrdering::Acquire) == 0 {
+                            break;
+                        }
+                        thread::yield_now();
+                        continue;
+                    };
+                    let result = scan_index_dir_one_level(
+                        &dir,
+                        workspace_root.as_path(),
+                        index_root.as_path(),
+                        config.as_ref(),
+                        &dirs,
+                        &pending_dirs,
+                        &visited_files,
+                        &candidate_files,
+                        &mut records,
+                        &mut stats,
+                        &tx,
+                    );
+                    pending_dirs.fetch_sub(1, AtomicOrdering::AcqRel);
+                    if let Err(err) = result {
+                        stop.store(true, AtomicOrdering::Relaxed);
+                        let _ = tx.send(IndexScanMessage::Done(Err(err)));
+                        return;
+                    }
+                }
+                let _ = tx.send(IndexScanMessage::Done(Ok((records, stats))));
+            });
+        }
+        drop(tx);
+
+        let mut records = Vec::new();
+        let mut stats = CorpusStats::default();
+        let mut first_error: Option<io::Error> = None;
+        for message in rx {
+            match message {
+                IndexScanMessage::Progress {
+                    visited,
+                    candidates,
+                } => progress(IndexProgress {
+                    phase: "scan",
+                    current: visited,
+                    total: visited.max(1),
+                    percent: 0,
+                    detail: format!("scanning files {visited}; {candidates} candidates"),
+                }),
+                IndexScanMessage::Done(Ok((mut worker_records, worker_stats))) => {
+                    records.append(&mut worker_records);
+                    merge_corpus_stats(&mut stats, worker_stats);
+                }
+                IndexScanMessage::Done(Err(err)) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        records.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        progress(IndexProgress {
+            phase: "scan",
+            current: stats.visited_files,
+            total: stats.visited_files.max(1),
+            percent: 10,
+            detail: format!(
+                "scanned {} files; {} candidates",
+                stats.visited_files,
+                records.len()
+            ),
+        });
+        Ok((records, stats))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_index_dir_one_level(
+    dir: &Path,
+    workspace_root: &Path,
+    index_root: &Path,
+    config: &EngineConfig,
+    dirs: &Arc<Mutex<Vec<PathBuf>>>,
+    pending_dirs: &AtomicUsize,
+    visited_files: &AtomicUsize,
+    candidate_files: &AtomicUsize,
+    records: &mut Vec<IndexFileRecord>,
+    stats: &mut CorpusStats,
+    tx: &mpsc::Sender<IndexScanMessage>,
+) -> io::Result<()> {
+    for item in fs::read_dir(dir)? {
+        let item = item?;
+        let path = item.path();
+        let file_type = item.file_type()?;
+        if file_type.is_dir() {
+            let file_name = item.file_name();
+            let name = file_name.to_string_lossy();
+            if config.is_excluded_dir_name(&name) || path == index_root {
+                stats.skipped_dirs += 1;
+                continue;
+            }
+            pending_dirs.fetch_add(1, AtomicOrdering::AcqRel);
+            dirs.lock()
+                .expect("index directory queue poisoned")
+                .push(path);
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+
+        stats.visited_files += 1;
+        let global_visited = visited_files.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        if global_visited == 1 || global_visited % 4096 == 0 {
+            let _ = tx.send(IndexScanMessage::Progress {
+                visited: global_visited,
+                candidates: candidate_files.load(AtomicOrdering::Relaxed),
+            });
+        }
+
+        if config.is_binary_extension(&path) {
+            stats.skipped_binary_extension += 1;
+            continue;
+        }
+        let metadata = item.metadata()?;
+        if metadata.len() > config.max_file_size_bytes {
+            stats.skipped_too_large += 1;
+            continue;
+        }
+        let modified_unix_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_secs())
+            .unwrap_or(0);
+        records.push(IndexFileRecord {
+            rel_path: normalize_rel_path(path.strip_prefix(workspace_root).unwrap_or(&path)),
+            abs_path: path,
+            size_bytes: metadata.len(),
+            modified_unix_secs,
+        });
+        candidate_files.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    Ok(())
+}
+
+fn walk_index_file_records<F>(
+    dir: &Path,
+    workspace_root: &Path,
+    config: &EngineConfig,
+    records: &mut Vec<IndexFileRecord>,
+    stats: &mut CorpusStats,
+    progress: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(IndexProgress),
+{
+    for item in fs::read_dir(dir)? {
+        let item = item?;
+        let path = item.path();
+        let file_type = item.file_type()?;
+        if file_type.is_dir() {
+            let file_name = item.file_name();
+            let name = file_name.to_string_lossy();
+            if config.is_excluded_dir_name(&name) || path == config.index_root(workspace_root) {
+                stats.skipped_dirs += 1;
+                continue;
+            }
+            walk_index_file_records(&path, workspace_root, config, records, stats, progress)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+
+        stats.visited_files += 1;
+        if stats.visited_files == 1 || stats.visited_files % 4096 == 0 {
+            progress(IndexProgress {
+                phase: "scan",
+                current: stats.visited_files,
+                total: stats.visited_files.max(1),
+                percent: 0,
+                detail: format!(
+                    "scanning files {}; {} candidates",
+                    stats.visited_files,
+                    records.len()
+                ),
+            });
+        }
+
+        if config.is_binary_extension(&path) {
+            stats.skipped_binary_extension += 1;
+            continue;
+        }
+        let metadata = item.metadata()?;
+        if metadata.len() > config.max_file_size_bytes {
+            stats.skipped_too_large += 1;
+            continue;
+        }
+        let modified_unix_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_secs())
+            .unwrap_or(0);
+        records.push(IndexFileRecord {
+            rel_path: normalize_rel_path(path.strip_prefix(workspace_root).unwrap_or(&path)),
+            abs_path: path,
+            size_bytes: metadata.len(),
+            modified_unix_secs,
+        });
+    }
+    Ok(())
+}
+
+fn build_indexed_document_from_record(
+    record: &IndexFileRecord,
+    config: &EngineConfig,
+) -> io::Result<IndexedRecordOutcome> {
+    let bytes = match read_file_bytes_if_not_binary(&record.abs_path, record.size_bytes)? {
+        ReadTextBytesOutcome::Text(bytes) => bytes,
+        ReadTextBytesOutcome::Binary => return Ok(IndexedRecordOutcome::SkippedBinary),
+    };
+    let (text, encoding) = decode_bytes_owned(bytes);
     let (grams, overflow) = crate::gram::extract_dynamic_gram_values_with_overflow(
-        &entry.rel_path,
-        &entry.text,
+        &record.rel_path,
+        &text,
         config.max_grams_per_file,
     );
-    IndexedDocument {
-        rel_path: entry.rel_path.clone(),
-        byte_len: entry.size_bytes,
-        modified_unix_secs: entry.modified_unix_secs,
-        content_hash: stable_hash(&entry.text),
-        grams,
-        gram_incomplete: overflow,
-    }
+    Ok(IndexedRecordOutcome::Indexed {
+        document: IndexedDocument {
+            rel_path: record.rel_path.clone(),
+            byte_len: record.size_bytes,
+            modified_unix_secs: record.modified_unix_secs,
+            content_hash: stable_hash(&text),
+            grams,
+            gram_incomplete: overflow,
+        },
+        encoding,
+    })
 }
 
-fn report_prepare_progress(progress: &mut impl FnMut(IndexProgress), current: usize, total: usize) {
-    if total > 0 && (current == 1 || current % 128 == 0 || current == total) {
-        emit_prepare_progress(progress, current, total);
-    }
+fn merge_corpus_stats(target: &mut CorpusStats, source: CorpusStats) {
+    target.visited_files += source.visited_files;
+    target.indexed_files += source.indexed_files;
+    target.skipped_binary += source.skipped_binary;
+    target.skipped_binary_extension += source.skipped_binary_extension;
+    target.skipped_too_large += source.skipped_too_large;
+    target.skipped_dirs += source.skipped_dirs;
+    target.decoded_utf16_files += source.decoded_utf16_files;
 }
 
-fn emit_prepare_progress(progress: &mut impl FnMut(IndexProgress), current: usize, total: usize) {
-    progress(IndexProgress {
-        phase: "prepare",
-        current,
-        total,
-        percent: weighted_percent(current, total, 70, 20),
-        detail: format!("extracting grams {current}/{total}"),
-    });
+fn normalize_rel_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if path.contains('\\') {
+        path.replace('\\', "/")
+    } else {
+        path.into_owned()
+    }
 }
 
 fn weighted_percent(current: usize, total: usize, base: usize, weight: usize) -> usize {
@@ -341,32 +723,6 @@ fn weighted_percent(current: usize, total: usize, base: usize, weight: usize) ->
     }
     let pct = ((current.min(total) * weight) + (total / 2)) / total;
     (base + pct).min(100)
-}
-
-fn partition_documents<'a>(
-    docs: &'a [IndexedDocument],
-    config: &EngineConfig,
-) -> Vec<&'a [IndexedDocument]> {
-    if docs.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let mut current_bytes = 0u64;
-
-    for (idx, doc) in docs.iter().enumerate() {
-        let would_overflow_bytes =
-            idx > start && current_bytes + doc.byte_len > config.shard_target_bytes;
-        let would_overflow_files = idx - start >= config.max_files_per_shard;
-        if would_overflow_bytes || would_overflow_files {
-            out.push(&docs[start..idx]);
-            start = idx;
-            current_bytes = 0;
-        }
-        current_bytes += doc.byte_len;
-    }
-    out.push(&docs[start..]);
-    out
 }
 
 fn stable_hash(value: &str) -> u64 {
@@ -387,6 +743,41 @@ fn fingerprint_documents(docs: &[IndexedDocument]) -> u64 {
         }
     }
     hasher.finish()
+}
+
+fn fingerprint_shards(shards: &[u64]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for (shard_id, fingerprint) in shards.iter().enumerate() {
+        shard_id.hash(&mut hasher);
+        fingerprint.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn partition_records<'a>(
+    records: &'a [IndexFileRecord],
+    config: &EngineConfig,
+) -> Vec<&'a [IndexFileRecord]> {
+    if records.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut current_bytes = 0u64;
+
+    for (idx, record) in records.iter().enumerate() {
+        let would_overflow_bytes =
+            idx > start && current_bytes + record.size_bytes > config.shard_target_bytes;
+        let would_overflow_files = idx - start >= config.max_files_per_shard;
+        if would_overflow_bytes || would_overflow_files {
+            out.push(&records[start..idx]);
+            start = idx;
+            current_bytes = 0;
+        }
+        current_bytes += record.size_bytes;
+    }
+    out.push(&records[start..]);
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -479,7 +870,7 @@ mod tests {
         let artifacts = index_directory(&root, &config)?;
         assert_eq!(artifacts.summary.shard_count, 3);
         let manifest = fs::read_to_string(root.join(".zoek-rs/manifest.json"))?;
-        assert!(manifest.contains("\"schemaVersion\":2"));
+        assert!(manifest.contains("\"schemaVersion\":7"));
         assert!(manifest.contains("base-shard-0000.zrs"));
 
         let reader = ShardReader::open(&root.join(".zoek-rs/base-shard-0000.zrs"))?;

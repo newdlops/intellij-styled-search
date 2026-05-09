@@ -2,9 +2,11 @@ use crate::config::EngineConfig;
 use crate::corpus::{decode_bytes, looks_binary_bytes};
 use crate::mmap_store::write_atomically;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -24,6 +26,11 @@ const GRAPH_SYMBOL_INDEX_ENTRY_SIZE: usize = 12;
 const GRAPH_MANIFEST_NAME: &str = "callgraph-manifest.json";
 const MODULE_IMPORT_TARGET: &str = "__ijss_module__";
 const FRAMEWORK_IMPL_PREFIX: &str = "__ijss_framework_impl__:";
+const GRAPH_DISCOVERY_PROGRESS_INTERVAL: usize = 16_384;
+const GRAPH_FILE_PROGRESS_INTERVAL: usize = 16_384;
+const GRAPH_GROUP_PROGRESS_INTERVAL: usize = 500_000;
+const GRAPH_RELATION_SHARD_PROGRESS_INTERVAL: usize = 8;
+const GRAPH_SYMBOL_PROGRESS_INTERVAL: usize = 262_144;
 
 #[derive(Clone, Debug)]
 pub struct GraphIndexSummary {
@@ -154,6 +161,12 @@ struct PendingGraphRelationGeneration {
     manifest_path: PathBuf,
     manifest: String,
     generation: u64,
+}
+
+struct GroupedGraphReferences {
+    grouped: HashMap<String, Vec<GraphReference>>,
+    rel_paths: HashSet<String>,
+    reference_count: usize,
 }
 
 pub fn graph_index_path(workspace_root: &Path, config: &EngineConfig) -> PathBuf {
@@ -348,16 +361,17 @@ where
             symbols.len()
         ),
     });
-    let references = resolve_native_graph_references(parsed_files, &symbols, workers, progress);
+    let resolved =
+        resolve_native_graph_references_grouped(parsed_files, &symbols, workers, progress);
     progress(GraphRebuildProgress {
         stage: "indexing",
-        current: references.len(),
-        total: references.len(),
-        message: format!("rust graph writing {} references", references.len()),
+        current: resolved.reference_count,
+        total: resolved.reference_count,
+        message: format!("rust graph writing {} references", resolved.reference_count),
     });
-    let pending = prepare_graph_relation_generation_with_progress(
+    let pending = prepare_graph_relation_generation_from_grouped_with_progress(
         workspace_root,
-        references,
+        resolved,
         built_at_unix_ms,
         config,
         worker_count,
@@ -651,11 +665,14 @@ fn serialize_graph_record(
     let symbol_len = checked_u32(symbol_id.len(), "symbol length")?;
     let refs_offset = bytes.len();
     put_u32(&mut bytes, ref_count);
+    let mut last_name = String::new();
+    let mut last_raw_text = String::new();
+    let mut last_rel_path = String::new();
     for reference in refs {
-        put_string(&mut bytes, &reference.name)?;
-        put_string(&mut bytes, &reference.raw_text)?;
-        put_string(&mut bytes, &reference.uri)?;
-        put_string(&mut bytes, &reference.rel_path)?;
+        put_delta_string(&mut bytes, &reference.name, &mut last_name)?;
+        put_delta_string(&mut bytes, &reference.raw_text, &mut last_raw_text)?;
+        put_string(&mut bytes, "")?;
+        put_delta_string(&mut bytes, &reference.rel_path, &mut last_rel_path)?;
         put_u32(&mut bytes, reference.start_line);
         put_u32(&mut bytes, reference.start_column);
         put_u32(&mut bytes, reference.end_line);
@@ -664,7 +681,7 @@ fn serialize_graph_record(
             &mut bytes,
             reference.enclosing_symbol_id.as_deref().unwrap_or(""),
         )?;
-        put_string(&mut bytes, &reference.edge_kind)?;
+        put_edge_kind(&mut bytes, &reference.edge_kind)?;
     }
     let refs_len = checked_u32(bytes.len() - refs_offset, "reference payload length")?;
     Ok(SerializedGraphRecord {
@@ -739,11 +756,10 @@ fn prepare_graph_relation_generation_with_progress<F>(
 where
     F: FnMut(GraphRebuildProgress),
 {
-    let layout_root = config.index_root(workspace_root);
-    fs::create_dir_all(&layout_root)?;
-    let mut grouped: BTreeMap<String, Vec<GraphReference>> = BTreeMap::new();
-    let mut rel_paths = BTreeSet::new();
     let total_references = references.len();
+    let mut grouped: HashMap<String, Vec<GraphReference>> =
+        HashMap::with_capacity((total_references / 4).max(1));
+    let mut rel_paths = HashSet::new();
     progress(GraphRebuildProgress {
         stage: "indexing",
         current: 0,
@@ -753,10 +769,12 @@ where
     let mut grouped_references = 0usize;
     for (symbol_id, reference) in references {
         grouped_references += 1;
-        rel_paths.insert(reference.rel_path.clone());
+        if !rel_paths.contains(reference.rel_path.as_str()) {
+            rel_paths.insert(reference.rel_path.clone());
+        }
         grouped.entry(symbol_id).or_default().push(reference);
         if grouped_references == 1
-            || grouped_references % 50_000 == 0
+            || grouped_references % GRAPH_GROUP_PROGRESS_INTERVAL == 0
             || grouped_references == total_references
         {
             progress(GraphRebuildProgress {
@@ -769,7 +787,46 @@ where
             });
         }
     }
+    prepare_graph_relation_generation_from_grouped_with_progress(
+        workspace_root,
+        GroupedGraphReferences {
+            grouped,
+            rel_paths,
+            reference_count: total_references,
+        },
+        built_at_unix_ms,
+        config,
+        worker_count,
+        progress,
+    )
+}
+
+fn prepare_graph_relation_generation_from_grouped_with_progress<F>(
+    workspace_root: &Path,
+    resolved: GroupedGraphReferences,
+    built_at_unix_ms: u64,
+    config: &EngineConfig,
+    worker_count: usize,
+    progress: &mut F,
+) -> io::Result<PendingGraphRelationGeneration>
+where
+    F: FnMut(GraphRebuildProgress),
+{
+    let layout_root = config.index_root(workspace_root);
+    fs::create_dir_all(&layout_root)?;
+    let GroupedGraphReferences {
+        grouped,
+        rel_paths,
+        reference_count,
+    } = resolved;
+    progress(GraphRebuildProgress {
+        stage: "indexing",
+        current: reference_count,
+        total: reference_count,
+        message: format!("rust graph grouped {reference_count}/{reference_count} references"),
+    });
     let symbol_count = grouped.len();
+    let grouped: Vec<(String, Vec<GraphReference>)> = grouped.into_iter().collect();
     let shard_count = graph_relation_shard_count(worker_count, symbol_count);
     let generation = next_graph_relation_generation(&layout_root, config, workspace_root);
     progress(GraphRebuildProgress {
@@ -923,7 +980,7 @@ fn next_graph_relation_generation(
 
 fn write_graph_relation_shards_parallel_with_progress<F>(
     layout_root: &Path,
-    grouped: BTreeMap<String, Vec<GraphReference>>,
+    grouped: Vec<(String, Vec<GraphReference>)>,
     built_at_unix_ms: u64,
     generation: u64,
     shard_count: usize,
@@ -943,7 +1000,8 @@ where
     let workers = effective_graph_worker_count(worker_count, shard_count);
     if workers <= 1 || shard_count <= 1 {
         let mut out = Vec::with_capacity(shard_count);
-        for (shard_id, groups) in shard_groups.into_iter().enumerate() {
+        for (shard_id, mut groups) in shard_groups.into_iter().enumerate() {
+            groups.sort_unstable_by(|left, right| left.0.cmp(&right.0));
             let summary = write_graph_relation_shard(
                 layout_root,
                 generation,
@@ -952,16 +1010,21 @@ where
                 built_at_unix_ms,
             )?;
             out.push(summary);
-            progress(GraphRebuildProgress {
-                stage: "indexing",
-                current: out.len(),
-                total: shard_count,
-                message: format!(
-                    "rust graph wrote relation shard {}/{}",
-                    out.len(),
-                    shard_count
-                ),
-            });
+            if out.len() == 1
+                || out.len() % GRAPH_RELATION_SHARD_PROGRESS_INTERVAL == 0
+                || out.len() == shard_count
+            {
+                progress(GraphRebuildProgress {
+                    stage: "indexing",
+                    current: out.len(),
+                    total: shard_count,
+                    message: format!(
+                        "rust graph wrote relation shard {}/{}",
+                        out.len(),
+                        shard_count
+                    ),
+                });
+            }
         }
         return Ok(out);
     }
@@ -979,7 +1042,8 @@ where
         let layout_root = layout_root.to_path_buf();
         let result_tx = result_tx.clone();
         handles.push(thread::spawn(move || -> io::Result<()> {
-            for (shard_id, groups) in chunk {
+            for (shard_id, mut groups) in chunk {
+                groups.sort_unstable_by(|left, right| left.0.cmp(&right.0));
                 let result = write_graph_relation_shard(
                     &layout_root,
                     generation,
@@ -1007,12 +1071,19 @@ where
             Ok((shard_id, summary)) => {
                 completed += 1;
                 ordered[shard_id] = Some(summary);
-                progress(GraphRebuildProgress {
-                    stage: "indexing",
-                    current: completed,
-                    total: shard_count,
-                    message: format!("rust graph wrote relation shard {completed}/{shard_count}"),
-                });
+                if completed == 1
+                    || completed % GRAPH_RELATION_SHARD_PROGRESS_INTERVAL == 0
+                    || completed == shard_count
+                {
+                    progress(GraphRebuildProgress {
+                        stage: "indexing",
+                        current: completed,
+                        total: shard_count,
+                        message: format!(
+                            "rust graph wrote relation shard {completed}/{shard_count}"
+                        ),
+                    });
+                }
             }
             Err(err) => {
                 if first_error.is_none() {
@@ -1233,16 +1304,16 @@ where
         message: format!("rust graph writing symbol index for {total_symbols} symbols"),
     });
     for (idx, symbol) in sorted.into_iter().enumerate() {
-        let graph_symbol = native_symbol_to_graph_symbol(symbol, None);
         let record_offset = data.len() as u64;
-        write_graph_symbol_record(&mut data, &graph_symbol)?;
+        write_native_graph_symbol_record(&mut data, symbol)?;
         let record_len = checked_u32(data.len() - record_offset as usize, "symbol record length")?;
         entries.push(SymbolEntry {
             record_offset,
             record_len,
         });
         let current = idx + 1;
-        if current == 1 || current % 4096 == 0 || current == total_symbols {
+        if current == 1 || current % GRAPH_SYMBOL_PROGRESS_INTERVAL == 0 || current == total_symbols
+        {
             progress(GraphRebuildProgress {
                 stage: "indexing",
                 current,
@@ -1255,29 +1326,32 @@ where
     let index_offset = GRAPH_SYMBOL_HEADER_SIZE as u64;
     let data_offset =
         GRAPH_SYMBOL_HEADER_SIZE as u64 + (entries.len() * GRAPH_SYMBOL_INDEX_ENTRY_SIZE) as u64;
-    let mut bytes = Vec::with_capacity(data_offset as usize + data.len());
-    bytes.extend_from_slice(GRAPH_SYMBOL_MAGIC);
-    put_u32(&mut bytes, GRAPH_VERSION);
+    let mut header = Vec::with_capacity(GRAPH_SYMBOL_HEADER_SIZE);
+    header.extend_from_slice(GRAPH_SYMBOL_MAGIC);
+    put_u32(&mut header, GRAPH_VERSION);
     put_u32(
-        &mut bytes,
+        &mut header,
         checked_u32(entries.len(), "symbol index entry count")?,
     );
-    put_u64(&mut bytes, built_at_unix_ms);
-    put_u64(&mut bytes, index_offset);
-    put_u64(&mut bytes, data_offset);
+    put_u64(&mut header, built_at_unix_ms);
+    put_u64(&mut header, index_offset);
+    put_u64(&mut header, data_offset);
+    let mut index = Vec::with_capacity(entries.len() * GRAPH_SYMBOL_INDEX_ENTRY_SIZE);
     for entry in &entries {
-        put_u64(&mut bytes, entry.record_offset);
-        put_u32(&mut bytes, entry.record_len);
+        put_u64(&mut index, entry.record_offset);
+        put_u32(&mut index, entry.record_len);
     }
-    bytes.extend_from_slice(&data);
-    let byte_len = bytes.len() as u64;
+    let byte_len = (header.len() + index.len() + data.len()) as u64;
     progress(GraphRebuildProgress {
         stage: "indexing",
         current: total_symbols,
         total: total_symbols,
         message: format!("rust graph flushing symbol index ({byte_len} bytes)"),
     });
-    write_atomically(&layout_root.join(GRAPH_SYMBOL_FILE_NAME), &bytes)?;
+    write_atomically_from_chunks(
+        &layout_root.join(GRAPH_SYMBOL_FILE_NAME),
+        &[header.as_slice(), index.as_slice(), data.as_slice()],
+    )?;
     progress(GraphRebuildProgress {
         stage: "indexing",
         current: total_symbols,
@@ -1285,6 +1359,30 @@ where
         message: format!("rust graph wrote symbol index ({byte_len} bytes)"),
     });
     Ok(byte_len)
+}
+
+fn write_atomically_from_chunks(path: &Path, chunks: &[&[u8]]) -> io::Result<()> {
+    let mut temp_name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "temp".to_string());
+    temp_name.push_str(".tmp");
+    let temp_path = path.with_file_name(temp_name);
+    let result = (|| -> io::Result<()> {
+        let file = fs::File::create(&temp_path)?;
+        let mut writer = BufWriter::new(file);
+        for chunk in chunks {
+            writer.write_all(chunk)?;
+        }
+        writer.flush()?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    fs::rename(temp_path, path)?;
+    Ok(())
 }
 
 pub fn query_graph_symbols(
@@ -1534,7 +1632,7 @@ pub fn query_graph(
                 references: Vec::new(),
             }));
         };
-        let mut references = read_references(&bytes, &header, &entry, limit)?;
+        let mut references = read_references(workspace_root, &bytes, &header, &entry, limit)?;
         for reference in &mut references {
             reference.target_symbol_id = Some(symbol_id.to_string());
         }
@@ -1561,7 +1659,7 @@ pub fn query_graph(
             references: Vec::new(),
         }));
     };
-    let mut references = read_references(&bytes, &header, &entry, limit)?;
+    let mut references = read_references(workspace_root, &bytes, &header, &entry, limit)?;
     for reference in &mut references {
         reference.target_symbol_id = Some(symbol_id.to_string());
     }
@@ -1941,17 +2039,20 @@ fn flush_record(
     let symbol_len = checked_u32(symbol_id.len(), "symbol length")?;
     let refs_offset = data.len() as u64;
     put_u32(data, ref_count);
+    let mut last_name = String::new();
+    let mut last_raw_text = String::new();
+    let mut last_rel_path = String::new();
     for reference in refs.drain(..) {
-        put_string(data, &reference.name)?;
-        put_string(data, &reference.raw_text)?;
-        put_string(data, &reference.uri)?;
-        put_string(data, &reference.rel_path)?;
+        put_delta_string(data, &reference.name, &mut last_name)?;
+        put_delta_string(data, &reference.raw_text, &mut last_raw_text)?;
+        put_string(data, "")?;
+        put_delta_string(data, &reference.rel_path, &mut last_rel_path)?;
         put_u32(data, reference.start_line);
         put_u32(data, reference.start_column);
         put_u32(data, reference.end_line);
         put_u32(data, reference.end_column);
         put_string(data, reference.enclosing_symbol_id.as_deref().unwrap_or(""))?;
-        put_string(data, &reference.edge_kind)?;
+        put_edge_kind(data, &reference.edge_kind)?;
     }
     let refs_len = checked_u32(
         data.len() - refs_offset as usize,
@@ -1974,7 +2075,6 @@ struct NativeGraphSymbol {
     qualified_name: String,
     kind: String,
     language: String,
-    uri: String,
     rel_path: String,
     start_line: u32,
     start_column: u32,
@@ -2058,7 +2158,7 @@ where
             if config.is_excluded_dir_name(&name) || path == config.index_root(workspace_root) {
                 continue;
             }
-            if *visited_entries == 1 || *visited_entries % 4096 == 0 {
+            if *visited_entries == 1 || *visited_entries % GRAPH_DISCOVERY_PROGRESS_INTERVAL == 0 {
                 progress(GraphRebuildProgress {
                     stage: "discovering",
                     current: *visited_entries,
@@ -2083,7 +2183,7 @@ where
         if metadata.is_file() && is_graph_source_path(&path) {
             out.push(path);
         }
-        if *visited_entries == 1 || *visited_entries % 4096 == 0 {
+        if *visited_entries == 1 || *visited_entries % GRAPH_DISCOVERY_PROGRESS_INTERVAL == 0 {
             progress(GraphRebuildProgress {
                 stage: "discovering",
                 current: *visited_entries,
@@ -2214,7 +2314,7 @@ where
                 }
             }
         }
-        if processed == 1 || processed % 256 == 0 || processed == total {
+        if processed == 1 || processed % GRAPH_FILE_PROGRESS_INTERVAL == 0 || processed == total {
             progress(GraphRebuildProgress {
                 stage: "parsing",
                 current: processed,
@@ -3540,7 +3640,8 @@ where
             processed += 1;
             processed_bytes = processed_bytes.saturating_add(byte_len);
             out.extend(references);
-            if processed == 1 || processed % 256 == 0 || processed == total {
+            if processed == 1 || processed % GRAPH_FILE_PROGRESS_INTERVAL == 0 || processed == total
+            {
                 progress(GraphRebuildProgress {
                     stage: "resolving",
                     current: processed,
@@ -3553,6 +3654,128 @@ where
         }
     });
     out
+}
+
+fn resolve_native_graph_references_grouped<F>(
+    files: Vec<NativeGraphFile>,
+    symbols: &[NativeGraphSymbol],
+    worker_count: usize,
+    progress: &mut F,
+) -> GroupedGraphReferences
+where
+    F: FnMut(GraphRebuildProgress),
+{
+    let total = files.len();
+    if total == 0 || symbols.is_empty() {
+        return GroupedGraphReferences {
+            grouped: HashMap::new(),
+            rel_paths: HashSet::new(),
+            reference_count: 0,
+        };
+    }
+    let mut maps = GraphResolutionMaps::default();
+    for (idx, symbol) in symbols.iter().enumerate() {
+        maps.by_name
+            .entry(symbol.name.clone())
+            .or_default()
+            .push(idx);
+        maps.by_file_name
+            .entry(symbol_lookup_key(&symbol.rel_path, &symbol.name))
+            .or_default()
+            .push(idx);
+        if is_type_reference_symbol_kind(&symbol.kind) {
+            maps.type_by_name
+                .entry(symbol.name.clone())
+                .or_default()
+                .push(idx);
+            maps.type_by_name
+                .entry(symbol.qualified_name.clone())
+                .or_default()
+                .push(idx);
+        }
+        if let Some(container_name) = symbol.container_name.as_ref() {
+            maps.members_by_container_name
+                .entry(member_lookup_key(container_name, &symbol.name))
+                .or_default()
+                .push(idx);
+        }
+        if symbol.kind == "function" || symbol.kind == "method" {
+            maps.declaration_ranges_by_file
+                .entry(symbol.rel_path.clone())
+                .or_default()
+                .push(DeclarationRange {
+                    start_line: symbol.start_line,
+                    start_column: 0,
+                    end_line: symbol.declaration_end_line,
+                    end_column: symbol.declaration_end_column,
+                });
+        }
+    }
+    let total_bytes = files.iter().map(|file| file.byte_len).sum::<u64>();
+    let (tx, rx) = mpsc::channel();
+    let mut grouped = HashMap::new();
+    let mut rel_paths = HashSet::new();
+    let mut reference_count = 0usize;
+    let mut processed = 0usize;
+    let mut processed_bytes = 0u64;
+
+    let worker_count = worker_count.max(1).min(total.max(1));
+    let mut chunks: Vec<Vec<NativeGraphFile>> = std::iter::repeat_with(Vec::new)
+        .take(worker_count)
+        .collect();
+    for (idx, file) in files.into_iter().enumerate() {
+        chunks[idx % worker_count].push(file);
+    }
+
+    thread::scope(|scope| {
+        for chunk in chunks.into_iter().filter(|chunk| !chunk.is_empty()) {
+            let tx = tx.clone();
+            let symbols_ref = symbols;
+            let maps_ref = &maps;
+            scope.spawn(move || {
+                for file in chunk {
+                    let byte_len = file.byte_len;
+                    let references =
+                        resolve_native_graph_references_for_file(file, symbols_ref, maps_ref);
+                    if tx.send((references, byte_len)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        for (references, byte_len) in rx {
+            processed += 1;
+            processed_bytes = processed_bytes.saturating_add(byte_len);
+            for (symbol_id, reference) in references {
+                reference_count += 1;
+                if !rel_paths.contains(reference.rel_path.as_str()) {
+                    rel_paths.insert(reference.rel_path.clone());
+                }
+                grouped
+                    .entry(symbol_id)
+                    .or_insert_with(Vec::new)
+                    .push(reference);
+            }
+            if processed == 1 || processed % GRAPH_FILE_PROGRESS_INTERVAL == 0 || processed == total
+            {
+                progress(GraphRebuildProgress {
+                    stage: "resolving",
+                    current: processed,
+                    total,
+                    message: format!(
+                        "rust graph resolved references files={processed}/{total} bytes={processed_bytes}/{total_bytes} with {worker_count} workers"
+                    ),
+                });
+            }
+        }
+    });
+    GroupedGraphReferences {
+        grouped,
+        rel_paths,
+        reference_count,
+    }
 }
 
 fn resolve_native_graph_references_for_file(
@@ -4878,7 +5101,7 @@ fn effective_graph_worker_count(requested: usize, total: usize) -> usize {
 
 fn make_native_graph_symbol(
     language: &str,
-    uri: &str,
+    _uri: &str,
     rel_path: &str,
     kind: &str,
     name: &str,
@@ -4897,7 +5120,6 @@ fn make_native_graph_symbol(
         qualified_name: qualified_name.to_string(),
         kind: kind.to_string(),
         language: language.to_string(),
-        uri: uri.to_string(),
         rel_path: rel_path.to_string(),
         start_line: line_idx as u32,
         start_column: column as u32,
@@ -4917,36 +5139,6 @@ fn make_native_graph_symbol(
     }
 }
 
-fn native_symbol_to_graph_symbol(
-    symbol: &NativeGraphSymbol,
-    usage_count: Option<usize>,
-) -> GraphSymbol {
-    GraphSymbol {
-        id: symbol.id.clone(),
-        name: symbol.name.clone(),
-        qualified_name: symbol.qualified_name.clone(),
-        kind: symbol.kind.clone(),
-        language: symbol.language.clone(),
-        uri: symbol.uri.clone(),
-        rel_path: symbol.rel_path.clone(),
-        start_line: symbol.start_line,
-        start_column: symbol.start_column,
-        end_line: symbol.end_line,
-        end_column: symbol.end_column,
-        body_start_line: symbol.body_start_line,
-        body_start_column: symbol.body_start_column,
-        body_end_line: symbol.body_end_line,
-        body_end_column: symbol.body_end_column,
-        container_id: symbol.container_id.clone(),
-        container_name: symbol.container_name.clone(),
-        package_name: symbol.package_name.clone(),
-        extends_names: symbol.extends_names.clone(),
-        implements_names: symbol.implements_names.clone(),
-        usage_count,
-        implementation_count: None,
-    }
-}
-
 fn graph_symbol_to_native_symbol(symbol: GraphSymbol) -> NativeGraphSymbol {
     NativeGraphSymbol {
         id: symbol.id,
@@ -4954,7 +5146,6 @@ fn graph_symbol_to_native_symbol(symbol: GraphSymbol) -> NativeGraphSymbol {
         qualified_name: symbol.qualified_name,
         kind: symbol.kind,
         language: symbol.language,
-        uri: symbol.uri,
         rel_path: symbol.rel_path,
         start_line: symbol.start_line,
         start_column: symbol.start_column,
@@ -4972,6 +5163,16 @@ fn graph_symbol_to_native_symbol(symbol: GraphSymbol) -> NativeGraphSymbol {
         extends_names: symbol.extends_names,
         implements_names: symbol.implements_names,
     }
+}
+
+fn parse_native_symbol_id_parts(id: &str) -> Option<(&str, &str, &str)> {
+    let (without_line, line) = id.rsplit_once(':')?;
+    if line.parse::<u32>().is_err() {
+        return None;
+    }
+    let (language_and_path, qualified_name) = without_line.rsplit_once(':')?;
+    let (language, rel_path) = language_and_path.split_once(':')?;
+    Some((language, rel_path, qualified_name))
 }
 
 fn score_graph_symbol_match(symbol: &GraphSymbol, normalized: &str, lower: &str) -> i32 {
@@ -6806,7 +7007,11 @@ fn read_symbol_index(
     let mut symbols = Vec::with_capacity(header.record_count);
     for idx in 0..header.record_count {
         let entry = read_symbol_entry(&bytes, &header, idx)?;
-        symbols.push(read_graph_symbol_record(&bytes, &header, &entry)?);
+        let mut symbol = read_graph_symbol_record(&bytes, &header, &entry)?;
+        if symbol.uri.is_empty() {
+            symbol.uri = file_uri(&workspace_root.join(Path::new(&symbol.rel_path)));
+        }
+        symbols.push(symbol);
     }
     Ok(Some((header.built_at_unix_ms, symbols)))
 }
@@ -6831,7 +7036,12 @@ fn read_all_graph_references(
                     ),
                 ));
             }
-            append_all_graph_references_from_bytes(&bytes, &header, &mut references)?;
+            append_all_graph_references_from_bytes(
+                workspace_root,
+                &bytes,
+                &header,
+                &mut references,
+            )?;
         }
         return Ok(Some((manifest.built_at_unix_ms, references)));
     }
@@ -6842,11 +7052,12 @@ fn read_all_graph_references(
     let bytes = fs::read(index_path)?;
     let header = read_header(&bytes)?;
     let mut references = Vec::new();
-    append_all_graph_references_from_bytes(&bytes, &header, &mut references)?;
+    append_all_graph_references_from_bytes(workspace_root, &bytes, &header, &mut references)?;
     Ok(Some((header.built_at_unix_ms, references)))
 }
 
 fn append_all_graph_references_from_bytes(
+    workspace_root: &Path,
     bytes: &[u8],
     header: &Header,
     references: &mut Vec<(String, GraphReference)>,
@@ -6854,7 +7065,7 @@ fn append_all_graph_references_from_bytes(
     for idx in 0..header.record_count {
         let entry = read_entry(&bytes, &header, idx)?;
         let symbol_id = read_symbol(&bytes, &header, &entry)?;
-        for reference in read_references(&bytes, &header, &entry, usize::MAX)? {
+        for reference in read_references(workspace_root, bytes, header, &entry, usize::MAX)? {
             let mut reference = reference;
             reference.target_symbol_id = Some(symbol_id.clone());
             references.push((symbol_id.clone(), reference));
@@ -6941,14 +7152,47 @@ fn read_symbol_entry(bytes: &[u8], header: &SymbolHeader, index: usize) -> io::R
     })
 }
 
-fn write_graph_symbol_record(out: &mut Vec<u8>, symbol: &GraphSymbol) -> io::Result<()> {
+fn write_native_graph_symbol_record(
+    out: &mut Vec<u8>,
+    symbol: &NativeGraphSymbol,
+) -> io::Result<()> {
     put_string(out, &symbol.id)?;
     put_string(out, &symbol.name)?;
-    put_string(out, &symbol.qualified_name)?;
+    put_string(
+        out,
+        if symbol.qualified_name == symbol.name {
+            ""
+        } else {
+            &symbol.qualified_name
+        },
+    )?;
     put_string(out, &symbol.kind)?;
-    put_string(out, &symbol.language)?;
-    put_string(out, &symbol.uri)?;
-    put_string(out, &symbol.rel_path)?;
+    let id_parts = parse_native_symbol_id_parts(&symbol.id);
+    put_string(
+        out,
+        if id_parts
+            .as_ref()
+            .map(|(language, _, _)| *language == symbol.language.as_str())
+            .unwrap_or(false)
+        {
+            ""
+        } else {
+            &symbol.language
+        },
+    )?;
+    put_string(out, "")?;
+    put_string(
+        out,
+        if id_parts
+            .as_ref()
+            .map(|(_, rel_path, _)| *rel_path == symbol.rel_path.as_str())
+            .unwrap_or(false)
+        {
+            ""
+        } else {
+            &symbol.rel_path
+        },
+    )?;
     put_u32(out, symbol.start_line);
     put_u32(out, symbol.start_column);
     put_u32(out, symbol.end_line);
@@ -6993,11 +7237,27 @@ fn read_graph_symbol_record(
     let mut cursor = 0usize;
     let id = read_string(payload, &mut cursor)?;
     let name = read_string(payload, &mut cursor)?;
-    let qualified_name = read_string(payload, &mut cursor)?;
+    let qualified_name = match read_string(payload, &mut cursor)? {
+        value if value.is_empty() => name.clone(),
+        value => value,
+    };
     let kind = read_string(payload, &mut cursor)?;
-    let language = read_string(payload, &mut cursor)?;
+    let id_parts = parse_native_symbol_id_parts(&id);
+    let language = match read_string(payload, &mut cursor)? {
+        value if value.is_empty() => id_parts
+            .as_ref()
+            .map(|(language, _, _)| (*language).to_string())
+            .unwrap_or_default(),
+        value => value,
+    };
     let uri = read_string(payload, &mut cursor)?;
-    let rel_path = read_string(payload, &mut cursor)?;
+    let rel_path = match read_string(payload, &mut cursor)? {
+        value if value.is_empty() => id_parts
+            .as_ref()
+            .map(|(_, rel_path, _)| (*rel_path).to_string())
+            .unwrap_or_default(),
+        value => value,
+    };
     let start_line = read_u32(payload, &mut cursor)?;
     let start_column = read_u32(payload, &mut cursor)?;
     let end_line = read_u32(payload, &mut cursor)?;
@@ -7110,6 +7370,7 @@ fn find_entry(bytes: &[u8], header: &Header, symbol_id: &str) -> io::Result<Opti
 }
 
 fn read_references(
+    workspace_root: &Path,
     bytes: &[u8],
     header: &Header,
     entry: &IndexEntry,
@@ -7128,11 +7389,19 @@ fn read_references(
     let count = read_u32(payload, &mut cursor)? as usize;
     let wanted = count.min(limit);
     let mut references = Vec::with_capacity(wanted);
+    let mut last_name = String::new();
+    let mut last_raw_text = String::new();
+    let mut last_rel_path = String::new();
     for idx in 0..count {
-        let name = read_string(payload, &mut cursor)?;
-        let raw_text = read_string(payload, &mut cursor)?;
+        let name = read_delta_string(payload, &mut cursor, &mut last_name)?;
+        let raw_text = read_delta_string(payload, &mut cursor, &mut last_raw_text)?;
         let uri = read_string(payload, &mut cursor)?;
-        let rel_path = read_string(payload, &mut cursor)?;
+        let rel_path = read_delta_string(payload, &mut cursor, &mut last_rel_path)?;
+        let uri = if uri.is_empty() {
+            file_uri(&workspace_root.join(Path::new(&rel_path)))
+        } else {
+            uri
+        };
         let start_line = read_u32(payload, &mut cursor)?;
         let start_column = read_u32(payload, &mut cursor)?;
         let end_line = read_u32(payload, &mut cursor)?;
@@ -7141,7 +7410,10 @@ fn read_references(
             value if value.is_empty() => None,
             value => Some(value),
         };
-        let edge_kind = read_string(payload, &mut cursor)?;
+        let edge_kind = match read_string(payload, &mut cursor)? {
+            value if value.is_empty() => "usage".to_string(),
+            value => value,
+        };
         if idx < wanted {
             references.push(GraphReference {
                 target_symbol_id: None,
@@ -7219,6 +7491,25 @@ fn put_string(out: &mut Vec<u8>, value: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn put_delta_string(out: &mut Vec<u8>, value: &str, last_value: &mut String) -> io::Result<()> {
+    if value == last_value {
+        put_string(out, "")
+    } else {
+        put_string(out, value)?;
+        last_value.clear();
+        last_value.push_str(value);
+        Ok(())
+    }
+}
+
+fn put_edge_kind(out: &mut Vec<u8>, value: &str) -> io::Result<()> {
+    if value == "usage" {
+        put_string(out, "")
+    } else {
+        put_string(out, value)
+    }
+}
+
 fn put_string_list(out: &mut Vec<u8>, values: &[String]) -> io::Result<()> {
     put_u32(out, checked_u32(values.len(), "string list length")?);
     for value in values {
@@ -7239,6 +7530,21 @@ fn read_string(bytes: &[u8], cursor: &mut usize) -> io::Result<String> {
     std::str::from_utf8(slice)
         .map(|value| value.to_string())
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn read_delta_string(
+    bytes: &[u8],
+    cursor: &mut usize,
+    last_value: &mut String,
+) -> io::Result<String> {
+    let value = read_string(bytes, cursor)?;
+    if value.is_empty() {
+        Ok(last_value.clone())
+    } else {
+        last_value.clear();
+        last_value.push_str(&value);
+        Ok(value)
+    }
 }
 
 fn read_string_list(bytes: &[u8], cursor: &mut usize) -> io::Result<Vec<String>> {

@@ -3,7 +3,7 @@ use crate::corpus::discover_text_files;
 use crate::mmap_store::StoreLayout;
 use crate::overlay::load_overlay_with_recovery;
 use crate::planner::{build_query_plan, QueryMode};
-use crate::protocol::{SearchMatch, SearchRequest, SearchResponse};
+use crate::protocol::{SearchFileResult, SearchMatch, SearchRequest, SearchResponse};
 use crate::scorer::score_file;
 use crate::shard::{ShardDocument, ShardReader};
 use crate::verifier::{
@@ -12,17 +12,46 @@ use crate::verifier::{
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::thread;
 
 #[derive(Clone, Debug)]
 struct CandidateDocument {
     rel_path: String,
     absolute_path: PathBuf,
+    rank: u16,
 }
+
+const COMPLETE_CANDIDATE_RANK_BONUS: u16 = 1_000;
+const INCOMPLETE_GRAM_BACKFILL_LIMIT: usize = 1;
+const PARALLEL_VERIFY_THRESHOLD: usize = 512;
 
 pub fn search_workspace(
     request: &SearchRequest,
     config: &EngineConfig,
 ) -> Result<SearchResponse, String> {
+    search_workspace_inner(request, config, false, |_| Ok(()))
+}
+
+pub fn search_workspace_streaming<F>(
+    request: &SearchRequest,
+    config: &EngineConfig,
+    on_file: F,
+) -> Result<SearchResponse, String>
+where
+    F: FnMut(&SearchFileResult) -> Result<(), String>,
+{
+    search_workspace_inner(request, config, true, on_file)
+}
+
+fn search_workspace_inner<F>(
+    request: &SearchRequest,
+    config: &EngineConfig,
+    stream_files: bool,
+    mut on_file: F,
+) -> Result<SearchResponse, String>
+where
+    F: FnMut(&SearchFileResult) -> Result<(), String>,
+{
     let plan = build_query_plan(request);
     let path_regex = plan
         .path_regex
@@ -65,37 +94,135 @@ pub fn search_workspace(
         .saturating_add(1);
     let mut stopped_early = false;
 
-    for candidate in candidates.values() {
-        if let Some(regex) = &path_regex {
-            if !regex.is_match(&candidate.rel_path) {
+    let mut ordered_candidates = candidates.values().collect::<Vec<_>>();
+    ordered_candidates.sort_by(|left, right| {
+        right
+            .rank
+            .cmp(&left.rank)
+            .then_with(|| left.rel_path.cmp(&right.rel_path))
+    });
+
+    if !stream_files && ordered_candidates.len() >= PARALLEL_VERIFY_THRESHOLD {
+        let (files, scanned, matches) = verify_candidates_parallel(
+            &ordered_candidates,
+            &plan,
+            request,
+            config,
+            path_regex.clone(),
+            target_matches,
+        )?;
+        total_files_scanned += scanned;
+        total_matches += matches;
+        verified_files.extend(files);
+    } else {
+        for candidate in ordered_candidates {
+            if let Some(regex) = &path_regex {
+                if !regex.is_match(&candidate.rel_path) {
+                    continue;
+                }
+            }
+            if total_matches >= target_matches {
+                stopped_early = true;
+                break;
+            }
+            total_files_scanned += 1;
+            let Some(current) = load_current_text(&candidate.absolute_path, config)
+                .map_err(|err| err.to_string())?
+            else {
+                continue;
+            };
+            let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
+            let matches = verify_plan_terms(&current.text, &plan, request, remaining_match_budget)
+                .map_err(|err| err.to_string())?;
+            if matches.is_empty() {
                 continue;
             }
+            let file_match_start = total_matches;
+            total_matches += matches.len();
+            let score = score_file(&candidate.rel_path, &matches);
+            let file_result = build_file_result(
+                candidate.rel_path.clone(),
+                current.byte_len,
+                current.modified_unix_secs,
+                score,
+                matches,
+            );
+            if stream_files {
+                if let Some(paged_file) = page_file_by_global_match_offset(
+                    &file_result,
+                    file_match_start,
+                    request.offset,
+                    request.limit,
+                ) {
+                    on_file(&paged_file)?;
+                }
+            }
+            verified_files.push(file_result);
         }
-        if total_matches >= target_matches {
-            stopped_early = true;
-            break;
+    }
+
+    if verified_files.is_empty() && !request.use_regex {
+        let has_overlay_tombstones = load_overlay_with_recovery(&layout)
+            .map(|result| {
+                result
+                    .manifest
+                    .latest_entries()
+                    .values()
+                    .any(|entry| entry.tombstone)
+            })
+            .unwrap_or(false);
+        if !has_overlay_tombstones {
+            let fallback = fallback_candidates(workspace_root, request, &mut warnings)
+                .map_err(|err| err.to_string())?;
+            for (rel_path, candidate) in fallback {
+                if candidates.contains_key(&rel_path) {
+                    continue;
+                }
+                if let Some(regex) = &path_regex {
+                    if !regex.is_match(&candidate.rel_path) {
+                        continue;
+                    }
+                }
+                if total_matches >= target_matches {
+                    stopped_early = true;
+                    break;
+                }
+                total_files_scanned += 1;
+                let Some(current) = load_current_text(&candidate.absolute_path, config)
+                    .map_err(|err| err.to_string())?
+                else {
+                    continue;
+                };
+                let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
+                let matches =
+                    verify_plan_terms(&current.text, &plan, request, remaining_match_budget)
+                        .map_err(|err| err.to_string())?;
+                if matches.is_empty() {
+                    continue;
+                }
+                let file_match_start = total_matches;
+                total_matches += matches.len();
+                let score = score_file(&candidate.rel_path, &matches);
+                let file_result = build_file_result(
+                    candidate.rel_path.clone(),
+                    current.byte_len,
+                    current.modified_unix_secs,
+                    score,
+                    matches,
+                );
+                if stream_files {
+                    if let Some(paged_file) = page_file_by_global_match_offset(
+                        &file_result,
+                        file_match_start,
+                        request.offset,
+                        request.limit,
+                    ) {
+                        on_file(&paged_file)?;
+                    }
+                }
+                verified_files.push(file_result);
+            }
         }
-        total_files_scanned += 1;
-        let Some(current) =
-            load_current_text(&candidate.absolute_path, config).map_err(|err| err.to_string())?
-        else {
-            continue;
-        };
-        let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
-        let matches = verify_plan_terms(&current.text, &plan, request, remaining_match_budget)
-            .map_err(|err| err.to_string())?;
-        if matches.is_empty() {
-            continue;
-        }
-        total_matches += matches.len();
-        let score = score_file(&candidate.rel_path, &matches);
-        verified_files.push(build_file_result(
-            candidate.rel_path.clone(),
-            current.byte_len,
-            current.modified_unix_secs,
-            score,
-            matches,
-        ));
     }
 
     verified_files.sort_by(|left, right| {
@@ -126,11 +253,43 @@ pub fn search_workspace(
     })
 }
 
-fn page_files_by_match_offset(
-    files: &[crate::protocol::SearchFileResult],
+fn page_file_by_global_match_offset(
+    file: &SearchFileResult,
+    file_match_start: usize,
     offset: usize,
     limit: usize,
-) -> Vec<crate::protocol::SearchFileResult> {
+) -> Option<SearchFileResult> {
+    if limit == 0 || file.matches.is_empty() {
+        return None;
+    }
+    let file_match_end = file_match_start.saturating_add(file.matches.len());
+    let page_start = offset;
+    let page_end = offset.saturating_add(limit);
+    if file_match_end <= page_start || file_match_start >= page_end {
+        return None;
+    }
+    let start = page_start.saturating_sub(file_match_start);
+    let end = file
+        .matches
+        .len()
+        .min(page_end.saturating_sub(file_match_start));
+    if start >= end {
+        return None;
+    }
+    Some(SearchFileResult {
+        rel_path: file.rel_path.clone(),
+        byte_len: file.byte_len,
+        modified_unix_secs: file.modified_unix_secs,
+        score: file.score,
+        matches: file.matches[start..end].to_vec(),
+    })
+}
+
+fn page_files_by_match_offset(
+    files: &[SearchFileResult],
+    offset: usize,
+    limit: usize,
+) -> Vec<SearchFileResult> {
     if limit == 0 {
         return Vec::new();
     }
@@ -150,7 +309,7 @@ fn page_files_by_match_offset(
 
         let start = remaining_offset;
         let take = (file.matches.len() - start).min(remaining_limit);
-        paged.push(crate::protocol::SearchFileResult {
+        paged.push(SearchFileResult {
             rel_path: file.rel_path.clone(),
             byte_len: file.byte_len,
             modified_unix_secs: file.modified_unix_secs,
@@ -199,8 +358,8 @@ fn collect_index_candidates(
     for shard_path in shard_paths {
         let reader = ShardReader::open(&shard_path).map_err(|err| err.to_string())?;
         let docs = reader.documents().map_err(|err| err.to_string())?;
-        let selected_ids = candidate_doc_ids(&reader, plan).map_err(|err| err.to_string())?;
-        for doc in docs_for_ids(&docs, &selected_ids) {
+        let selected_ids = candidate_doc_ranks(&reader, plan).map_err(|err| err.to_string())?;
+        for (doc, rank) in docs_for_ranked_ids(&docs, &selected_ids) {
             if latest_overlay.contains_key(&doc.rel_path) {
                 continue;
             }
@@ -217,6 +376,7 @@ fn collect_index_candidates(
                 CandidateDocument {
                     rel_path: doc.rel_path.clone(),
                     absolute_path: workspace_root.join(&doc.rel_path),
+                    rank,
                 },
             );
         }
@@ -243,6 +403,7 @@ fn collect_index_candidates(
             CandidateDocument {
                 rel_path: overlay_entry.rel_path.clone(),
                 absolute_path: workspace_root.join(&overlay_entry.rel_path),
+                rank: u16::MAX,
             },
         );
     }
@@ -250,38 +411,46 @@ fn collect_index_candidates(
     Ok(Some(candidates))
 }
 
-fn candidate_doc_ids(
+fn candidate_doc_ranks(
     reader: &ShardReader,
     plan: &crate::planner::QueryPlan,
-) -> Result<BTreeSet<u32>, std::io::Error> {
+) -> Result<BTreeMap<u32, u16>, std::io::Error> {
     let docs = reader.documents()?;
     if plan.terms.is_empty() || plan.terms.iter().any(|term| term.required_grams.is_empty()) {
         return Ok(docs
             .into_iter()
-            .map(|doc| doc.doc_id)
-            .collect::<BTreeSet<_>>());
+            .map(|doc| (doc.doc_id, 0))
+            .collect::<BTreeMap<_, _>>());
     }
 
-    // Any doc whose posting set was truncated at index time (indexer's
-    // max_grams_per_file cap) must be included unconditionally — the
-    // gram AND-intersection below would otherwise drop real-match files
-    // whose dropped gram happened to coincide with one of the required
-    // grams. The verifier re-scans content so including more candidates
-    // costs I/O but never correctness.
     let incomplete_ids: BTreeSet<u32> = docs
         .iter()
         .filter(|doc| doc.gram_incomplete)
         .map(|doc| doc.doc_id)
         .collect();
 
-    let mut selected_ids = BTreeSet::new();
+    let mut selected_ids = BTreeMap::<u32, u16>::new();
     for term in &plan.terms {
         let mut term_ids: Option<BTreeSet<u32>> = None;
+        let mut incomplete_sets = Vec::new();
+        let mut incomplete_hit_counts = BTreeMap::<u32, u16>::new();
         for gram in &term.required_grams {
             let posting = reader.find_posting(gram)?;
             let ids = posting
                 .map(|posting| posting.doc_ids.into_iter().collect::<BTreeSet<_>>())
                 .unwrap_or_default();
+            if !incomplete_ids.is_empty() {
+                let incomplete_docs = ids
+                    .intersection(&incomplete_ids)
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if !incomplete_docs.is_empty() {
+                    for doc_id in &incomplete_docs {
+                        *incomplete_hit_counts.entry(*doc_id).or_default() += 1;
+                    }
+                    incomplete_sets.push(incomplete_docs);
+                }
+            }
             term_ids = Some(match term_ids {
                 Some(existing) => existing.intersection(&ids).copied().collect(),
                 None => ids,
@@ -290,18 +459,42 @@ fn candidate_doc_ids(
                 break;
             }
         }
-        selected_ids.extend(term_ids.unwrap_or_default());
+        let complete_rank =
+            COMPLETE_CANDIDATE_RANK_BONUS.saturating_add(term.required_grams.len() as u16);
+        for doc_id in term_ids.unwrap_or_default() {
+            selected_ids
+                .entry(doc_id)
+                .and_modify(|rank| *rank = (*rank).max(complete_rank))
+                .or_insert(complete_rank);
+        }
+        if !incomplete_sets.is_empty() {
+            incomplete_sets.sort_by_key(BTreeSet::len);
+            for docs in incomplete_sets
+                .into_iter()
+                .take(INCOMPLETE_GRAM_BACKFILL_LIMIT)
+            {
+                for doc_id in docs {
+                    let rank = incomplete_hit_counts.get(&doc_id).copied().unwrap_or(1);
+                    selected_ids
+                        .entry(doc_id)
+                        .and_modify(|existing| *existing = (*existing).max(rank))
+                        .or_insert(rank);
+                }
+            }
+        }
     }
-    selected_ids.extend(incomplete_ids);
     Ok(selected_ids)
 }
 
-fn docs_for_ids<'a>(docs: &'a [ShardDocument], ids: &BTreeSet<u32>) -> Vec<&'a ShardDocument> {
+fn docs_for_ranked_ids<'a>(
+    docs: &'a [ShardDocument],
+    ids: &BTreeMap<u32, u16>,
+) -> Vec<(&'a ShardDocument, u16)> {
     if ids.is_empty() {
         return Vec::new();
     }
     ids.iter()
-        .filter_map(|doc_id| docs.get(*doc_id as usize))
+        .filter_map(|(doc_id, rank)| docs.get(*doc_id as usize).map(|doc| (doc, *rank)))
         .collect()
 }
 
@@ -380,6 +573,82 @@ fn verify_plan_terms(
     Ok(matches)
 }
 
+fn verify_candidates_parallel(
+    candidates: &[&CandidateDocument],
+    plan: &crate::planner::QueryPlan,
+    request: &SearchRequest,
+    config: &EngineConfig,
+    path_regex: Option<Regex>,
+    per_file_limit: usize,
+) -> Result<(Vec<SearchFileResult>, usize, usize), String> {
+    let worker_count = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+        .clamp(2, 8)
+        .min(candidates.len().max(1));
+    let chunk_size = candidates.len().div_ceil(worker_count).max(1);
+    let mut handles = Vec::new();
+
+    for chunk in candidates.chunks(chunk_size) {
+        let chunk = chunk
+            .iter()
+            .map(|candidate| (*candidate).clone())
+            .collect::<Vec<_>>();
+        let plan = plan.clone();
+        let request = request.clone();
+        let config = config.clone();
+        let path_regex = path_regex.clone();
+        handles.push(thread::spawn(
+            move || -> Result<(Vec<SearchFileResult>, usize, usize), String> {
+                let mut files = Vec::new();
+                let mut scanned = 0usize;
+                let mut total_matches = 0usize;
+                for candidate in chunk {
+                    if let Some(regex) = &path_regex {
+                        if !regex.is_match(&candidate.rel_path) {
+                            continue;
+                        }
+                    }
+                    scanned += 1;
+                    let Some(current) = load_current_text(&candidate.absolute_path, &config)
+                        .map_err(|err| err.to_string())?
+                    else {
+                        continue;
+                    };
+                    let matches = verify_plan_terms(&current.text, &plan, &request, per_file_limit)
+                        .map_err(|err| err.to_string())?;
+                    if matches.is_empty() {
+                        continue;
+                    }
+                    total_matches += matches.len();
+                    let score = score_file(&candidate.rel_path, &matches);
+                    files.push(build_file_result(
+                        candidate.rel_path,
+                        current.byte_len,
+                        current.modified_unix_secs,
+                        score,
+                        matches,
+                    ));
+                }
+                Ok((files, scanned, total_matches))
+            },
+        ));
+    }
+
+    let mut files = Vec::new();
+    let mut scanned = 0usize;
+    let mut total_matches = 0usize;
+    for handle in handles {
+        let (chunk_files, chunk_scanned, chunk_matches) = handle
+            .join()
+            .map_err(|_| "parallel verifier worker panicked".to_string())??;
+        files.extend(chunk_files);
+        scanned += chunk_scanned;
+        total_matches += chunk_matches;
+    }
+    Ok((files, scanned, total_matches))
+}
+
 fn fallback_candidates(
     workspace_root: &Path,
     request: &SearchRequest,
@@ -408,6 +677,7 @@ fn fallback_candidates(
                 CandidateDocument {
                     rel_path: entry.rel_path,
                     absolute_path: entry.abs_path,
+                    rank: 0,
                 },
             )
         })

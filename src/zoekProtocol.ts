@@ -115,6 +115,11 @@ export interface ZoektSearchResponse {
   files: ZoektSearchFileResult[];
 }
 
+export interface ZoektSearchFileStreamEvent {
+  type: 'search:file';
+  file: ZoektSearchFileResult;
+}
+
 export interface ZoektGramDiagnostic {
   gram: string;
   docFreq: number;
@@ -169,10 +174,22 @@ export interface ZoektBenchmarkCase {
   label: string;
   fileCount: number;
   indexMs: number;
+  graphIndexMs?: number;
+  graphSymbolCount?: number;
+  graphReferenceCount?: number;
   updateP50Ms: number;
   updateP95Ms: number;
   queryP50Ms: number;
   queryP95Ms: number;
+  commonQueryP50Ms?: number;
+  commonQueryP95Ms?: number;
+  scopedQueryP50Ms?: number;
+  scopedQueryP95Ms?: number;
+  pathScopeOverheadP50Ms?: number;
+  pathScopeOverheadP95Ms?: number;
+  longQueryP50Ms?: number;
+  longQueryP95Ms?: number;
+  longQueryBytes?: number;
   process: ZoektRuntimeStats;
 }
 
