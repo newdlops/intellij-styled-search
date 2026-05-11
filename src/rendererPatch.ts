@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 123;
+export const RENDERER_PATCH_VERSION = 127;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -931,12 +931,29 @@ export function getRendererPatchScript(
       overviewRulerLanes: 3,
       hideCursorInOverviewRuler: false,
     };
+    // Force isSimpleWidget=true so the workbench does not treat this editor
+    // as the active code editor when it gains focus. Without this the user
+    // clicking inside the preview triggered VSCode's EditorService to take
+    // over the widget: its DOM was detached from our host and its model was
+    // cleared, leaving the preview blank. Simple widgets stay opted out of
+    // that takeover while keeping hover/inlay/intellisense features intact.
+    var widgetOptions = {};
+    if (m.widgetOptions && typeof m.widgetOptions === 'object') {
+      try {
+        for (var wk in m.widgetOptions) {
+          if (Object.prototype.hasOwnProperty.call(m.widgetOptions, wk)) {
+            widgetOptions[wk] = m.widgetOptions[wk];
+          }
+        }
+      } catch (eWidgetOpts) {}
+    }
+    widgetOptions.isSimpleWidget = true;
     var triedDirectNew = false;
     function tryDirectNew(label) {
       if (triedDirectNew) { return null; }
       triedDirectNew = true;
       try {
-        var directEditor = new m.ctor(host, options, m.widgetOptions || { isSimpleWidget: false });
+        var directEditor = new m.ctor(host, options, widgetOptions);
         try { m.createMode = 'new'; } catch (eModeNew) {}
         send({ type: 'log', msg: 'createPreviewEditor using direct new ' + label });
         return directEditor;
@@ -958,7 +975,7 @@ export function getRendererPatchScript(
         continue;
       }
       try {
-        var editor = insts[i].inst.createInstance(m.ctor, host, options, m.widgetOptions || { isSimpleWidget: false });
+        var editor = insts[i].inst.createInstance(m.ctor, host, options, widgetOptions);
         rememberMonacoInstCandidate(m, insts[i].inst, insts[i].label);
         try { m.editorInst = insts[i].inst; } catch (eEditorInst) {}
         try { m.createMode = 'createInstance'; } catch (eModeCreateInstance) {}
@@ -2299,6 +2316,12 @@ export function getRendererPatchScript(
     previewMonacoInlayDisposers: [],
     previewMonacoSaveEditor: null,
     previewMonacoKeydownListener: null,
+    previewMonacoDiagDisposers: [],
+    previewMonacoDiagObserver: null,
+    previewMonacoHealObserver: null,
+    previewMonacoHealPending: false,
+    previewMonacoHealRecursion: 0,
+    previewMonacoHealLastAt: 0,
     resultsInfoText: '',
     rgScope: '',
 	    searchHistory: [],
@@ -5208,6 +5231,262 @@ export function getRendererPatchScript(
     }
   }
 
+  function teardownPreviewMonacoHealObserver() {
+    try {
+      if (state.previewMonacoHealObserver && typeof state.previewMonacoHealObserver.disconnect === 'function') {
+        state.previewMonacoHealObserver.disconnect();
+      }
+    } catch (eHealTeardown) {}
+    state.previewMonacoHealObserver = null;
+    state.previewMonacoHealPending = false;
+  }
+
+  function wirePreviewMonacoHealObserver(editor, host) {
+    // Watch the preview host: if the workbench tears the editor DOM out from
+    // under us (which happens when a click inside the editor causes some
+    // workbench service to dispose its view/model without calling
+    // editor.dispose), re-render the preview from the last message so the
+    // user sees content again. isSimpleWidget=true alone doesn't prevent the
+    // takeover, so we recover instead of trying to block it.
+    teardownPreviewMonacoHealObserver();
+    if (typeof MutationObserver !== 'function' || !host || !editor) { return; }
+    try {
+      var observer = new MutationObserver(function () {
+        if (state.previewMonacoHealPending) { return; }
+        if (state.previewMonacoEditor !== editor) { return; }
+        var dom = null;
+        try { dom = typeof editor.getDomNode === 'function' ? editor.getDomNode() : null; } catch (eDomHeal) {}
+        if (dom && dom.parentElement === host) { return; }
+        state.previewMonacoHealPending = true;
+        var now = perfNow();
+        var sinceLast = now - (state.previewMonacoHealLastAt || 0);
+        state.previewMonacoHealLastAt = now;
+        // Cap recursion: if heals keep firing back-to-back, give up and fall
+        // through to DOM mode rather than burn CPU re-creating editors that
+        // get torn down again on the very next focus event.
+        if (sinceLast < 500) {
+          state.previewMonacoHealRecursion++;
+        } else {
+          state.previewMonacoHealRecursion = 0;
+        }
+        var lastMsg = state.lastPreviewMsg;
+        if (state.previewMonacoHealRecursion >= 3 || !lastMsg) {
+          teardownPreviewMonacoHealObserver();
+          if (state.previewMonacoHealRecursion >= 3) {
+            try { send({ type: 'log', msg: 'preview monaco self-heal giving up after repeated detach' }); } catch (eGiveUp) {}
+          }
+          state.previewMonacoHealPending = false;
+          return;
+        }
+        // Forget the broken editor instance so renderPreviewMonacoReal
+        // recreates a fresh widget instead of trying to reuse the orphaned
+        // one. The host element itself remains under $previewBody.
+        state.previewMonacoEditor = null;
+        Promise.resolve().then(function () {
+          try {
+            renderPreviewMonacoReal(lastMsg);
+          } catch (eHealRender) {
+            try { send({ type: 'log', msg: 'preview monaco self-heal render threw: ' + (eHealRender && eHealRender.message) }); } catch (eHealLog) {}
+          } finally {
+            state.previewMonacoHealPending = false;
+          }
+        });
+      });
+      observer.observe(host, { childList: true });
+      state.previewMonacoHealObserver = observer;
+    } catch (eHealWire) {
+      try { send({ type: 'log', msg: 'preview monaco self-heal wire failed: ' + (eHealWire && eHealWire.message) }); } catch (eHealLogWire) {}
+    }
+  }
+
+  function teardownPreviewMonacoDiagnostics() {
+    try {
+      var d = state.previewMonacoDiagDisposers || [];
+      for (var i = 0; i < d.length; i++) {
+        try { if (d[i] && typeof d[i].dispose === 'function') { d[i].dispose(); } }
+        catch (eDispDiag) {}
+      }
+    } catch (eDiagTeardown) {}
+    state.previewMonacoDiagDisposers = [];
+    try {
+      if (state.previewMonacoDiagObserver && typeof state.previewMonacoDiagObserver.disconnect === 'function') {
+        state.previewMonacoDiagObserver.disconnect();
+      }
+    } catch (eDiagObs) {}
+    state.previewMonacoDiagObserver = null;
+  }
+
+  function snapshotPreviewMonacoState(label, extra) {
+    try {
+      var ed = state.previewMonacoEditor;
+      var host = state.previewMonacoHost;
+      var dom = ed && typeof ed.getDomNode === 'function' ? ed.getDomNode() : null;
+      var hostInBody = !!(host && host.parentElement === $previewBody);
+      var domInHost = !!(host && dom && (dom.parentElement === host || (dom.parentNode && dom.parentNode === host)));
+      var viewLines = 0;
+      try {
+        if (dom && dom.querySelectorAll) {
+          viewLines = dom.querySelectorAll('.view-line').length;
+        }
+      } catch (eVl) {}
+      var rect = null;
+      try { if (host && host.getBoundingClientRect) { rect = host.getBoundingClientRect(); } } catch (eRect) {}
+      var modelOk = false;
+      try { modelOk = !!(ed && typeof ed.getModel === 'function' && ed.getModel()); } catch (eMo) {}
+      var bodyChildren = 0;
+      try { bodyChildren = $previewBody ? $previewBody.childElementCount : -1; } catch (eBc) {}
+      var snap = {
+        label: String(label || ''),
+        hostInBody: hostInBody,
+        domInHost: domInHost,
+        viewLines: viewLines,
+        modelOk: modelOk,
+        bodyChildren: bodyChildren,
+        hostW: rect ? Math.round(rect.width) : -1,
+        hostH: rect ? Math.round(rect.height) : -1,
+        activeEl: document.activeElement && document.activeElement.tagName ? document.activeElement.tagName.toLowerCase() : 'none',
+        activeCls: document.activeElement && document.activeElement.className ? String(document.activeElement.className).slice(0, 60) : '',
+        previewMode: state.previewMode || '',
+      };
+      if (extra && typeof extra === 'object') {
+        for (var k in extra) {
+          if (Object.prototype.hasOwnProperty.call(extra, k)) { snap[k] = extra[k]; }
+        }
+      }
+      trace('previewDiag:snap', snap);
+    } catch (eSnap) {
+      try { trace('previewDiag:snap-err', { label: String(label || ''), err: String(eSnap && eSnap.message || eSnap).slice(0, 120) }); } catch (eSendErr) {}
+    }
+  }
+
+  function wirePreviewMonacoDiagnostics(editor) {
+    teardownPreviewMonacoDiagnostics();
+    if (!editor) { return; }
+    var disposers = [];
+    var safeOn = function (eventName) {
+      try {
+        if (typeof editor[eventName] === 'function') {
+          return editor[eventName];
+        }
+      } catch (eName) {}
+      return null;
+    };
+    try {
+      var onFocus = safeOn('onDidFocusEditorWidget');
+      if (onFocus) {
+        disposers.push(onFocus.call(editor, function () {
+          trace('previewDiag:event', { name: 'focusEditorWidget' });
+          snapshotPreviewMonacoState('focus');
+        }));
+      }
+    } catch (eFocus) {
+      trace('previewDiag:wire-err', { hook: 'focus', err: String(eFocus && eFocus.message).slice(0, 120) });
+    }
+    try {
+      var onBlur = safeOn('onDidBlurEditorWidget');
+      if (onBlur) {
+        disposers.push(onBlur.call(editor, function () {
+          trace('previewDiag:event', { name: 'blurEditorWidget' });
+          snapshotPreviewMonacoState('blur');
+        }));
+      }
+    } catch (eBlur) {
+      trace('previewDiag:wire-err', { hook: 'blur', err: String(eBlur && eBlur.message).slice(0, 120) });
+    }
+    try {
+      var onSel = safeOn('onDidChangeCursorSelection');
+      if (onSel) {
+        var selSeq = 0;
+        disposers.push(onSel.call(editor, function (e) {
+          selSeq++;
+          if (selSeq > 4) { return; } // throttle so a drag-select doesn't flood the log
+          var src = e && e.source ? String(e.source) : '?';
+          var hasSel = false;
+          try {
+            var s = e && e.selection;
+            hasSel = !!(s && (s.startLineNumber !== s.endLineNumber || s.startColumn !== s.endColumn));
+          } catch (eSelInfo) {}
+          trace('previewDiag:event', { name: 'cursorSelection', source: src, hasSel: hasSel, seq: selSeq });
+          snapshotPreviewMonacoState('cursorSelection#' + selSeq);
+        }));
+      }
+    } catch (eSel) {
+      trace('previewDiag:wire-err', { hook: 'selection', err: String(eSel && eSel.message).slice(0, 120) });
+    }
+    try {
+      var onLayout = safeOn('onDidLayoutChange');
+      if (onLayout) {
+        var layoutSeq = 0;
+        disposers.push(onLayout.call(editor, function (e) {
+          layoutSeq++;
+          if (layoutSeq > 6) { return; }
+          var w = e && typeof e.width === 'number' ? Math.round(e.width) : -1;
+          var h = e && typeof e.height === 'number' ? Math.round(e.height) : -1;
+          trace('previewDiag:event', { name: 'layoutChange', w: w, h: h, seq: layoutSeq });
+          if (w === 0 || h === 0) { snapshotPreviewMonacoState('layoutZero', { w: w, h: h }); }
+        }));
+      }
+    } catch (eLayout) {
+      trace('previewDiag:wire-err', { hook: 'layout', err: String(eLayout && eLayout.message).slice(0, 120) });
+    }
+    try {
+      var onDispose = safeOn('onDidDispose');
+      if (onDispose) {
+        disposers.push(onDispose.call(editor, function () {
+          trace('previewDiag:event', { name: 'editorDispose' });
+          snapshotPreviewMonacoState('editorDispose');
+        }));
+      }
+    } catch (eDisp) {
+      trace('previewDiag:wire-err', { hook: 'dispose', err: String(eDisp && eDisp.message).slice(0, 120) });
+    }
+    try {
+      if (typeof MutationObserver === 'function' && $previewBody) {
+        var lastReport = 0;
+        var mutationSeq = 0;
+        var observer = new MutationObserver(function (records) {
+          var now = perfNow();
+          for (var i = 0; i < records.length; i++) {
+            var rec = records[i];
+            var removed = rec.removedNodes ? rec.removedNodes.length : 0;
+            var added = rec.addedNodes ? rec.addedNodes.length : 0;
+            if (!removed && !added) { continue; }
+            var targetCls = '';
+            try { targetCls = rec.target && rec.target.className ? String(rec.target.className).slice(0, 80) : ''; } catch (eTc) {}
+            if (now - lastReport < 100) { continue; }
+            lastReport = now;
+            mutationSeq++;
+            trace('previewDiag:event', { name: 'mutation', target: targetCls, removed: removed, added: added, seq: mutationSeq });
+            snapshotPreviewMonacoState('mutation#' + mutationSeq);
+          }
+        });
+        observer.observe($previewBody, { childList: true, subtree: true });
+        state.previewMonacoDiagObserver = observer;
+      }
+    } catch (eObs) {
+      trace('previewDiag:wire-err', { hook: 'mutation', err: String(eObs && eObs.message).slice(0, 120) });
+    }
+    try {
+      var dom = typeof editor.getDomNode === 'function' ? editor.getDomNode() : null;
+      if (dom && dom.addEventListener) {
+        var pointerHandler = function (ev) {
+          trace('previewDiag:event', { name: 'pointerdown', button: ev.button, shift: !!ev.shiftKey });
+          snapshotPreviewMonacoState('pointerdown');
+        };
+        dom.addEventListener('pointerdown', pointerHandler, true);
+        disposers.push({
+          dispose: function () {
+            try { dom.removeEventListener('pointerdown', pointerHandler, true); } catch (eRm) {}
+          },
+        });
+      }
+    } catch (ePtr) {
+      trace('previewDiag:wire-err', { hook: 'pointerdown', err: String(ePtr && ePtr.message).slice(0, 120) });
+    }
+    state.previewMonacoDiagDisposers = disposers;
+    snapshotPreviewMonacoState('wired');
+  }
+
   function wirePreviewMonacoEditor(editor) {
     registerPreviewSaveKeybinding(editor);
     try {
@@ -5238,6 +5517,8 @@ export function getRendererPatchScript(
     } catch (eChangeListener) {
       send({ type: 'log', msg: 'preview change listener failed: ' + (eChangeListener && eChangeListener.message) });
     }
+    wirePreviewMonacoDiagnostics(editor);
+    wirePreviewMonacoHealObserver(editor, state.previewMonacoHost);
   }
 
   // Seat a real cursor at the match start so (a) the overview-ruler draws a
@@ -5514,6 +5795,8 @@ export function getRendererPatchScript(
 
   function disposePreviewMonacoEditor() {
     clearPreviewMonacoCallGraphInlays();
+    teardownPreviewMonacoHealObserver();
+    teardownPreviewMonacoDiagnostics();
     try {
       if (state.monacoChangeListener && state.monacoChangeListener.dispose) {
         state.monacoChangeListener.dispose();
@@ -7648,6 +7931,45 @@ export function getRendererPatchScript(
   };
   // Test-only probes. Safe to ship — they just expose read-only state the
   // E2E suite polls to avoid racing async CDP evals.
+  window.__ijFindGetPreviewMonacoStateForTests = function () {
+    try {
+      var ed = state.previewMonacoEditor;
+      var host = state.previewMonacoHost;
+      var dom = null;
+      var domErr = '';
+      try { dom = ed && typeof ed.getDomNode === 'function' ? ed.getDomNode() : null; }
+      catch (eDomTest) { domErr = String(eDomTest && eDomTest.message || eDomTest).slice(0, 80); }
+      var hostInBody = !!(host && host.parentElement === $previewBody);
+      var domInHost = !!(host && dom && dom.parentElement === host);
+      var viewLines = 0;
+      try { if (dom && dom.querySelectorAll) { viewLines = dom.querySelectorAll('.view-line').length; } } catch (eVlTest) {}
+      var modelOk = false;
+      try { modelOk = !!(ed && typeof ed.getModel === 'function' && ed.getModel()); } catch (eMoTest) {}
+      var disposed = false;
+      try {
+        if (ed) {
+          // Monaco editors expose _isDisposed (StandaloneCodeEditor) and
+          // _disposed (CodeEditorWidget). Probe both safely.
+          if (typeof ed._isDisposed === 'boolean') { disposed = ed._isDisposed; }
+          else if (typeof ed._disposed === 'boolean') { disposed = ed._disposed; }
+        }
+      } catch (eDisp) {}
+      return {
+        hasEditor: !!ed,
+        hasHost: !!host,
+        hostInBody: hostInBody,
+        domInHost: domInHost,
+        viewLines: viewLines,
+        modelOk: modelOk,
+        disposed: disposed,
+        domErr: domErr,
+        previewMode: state.previewMode || null,
+        previewUri: state.previewUri || null,
+      };
+    } catch (eState) {
+      return { err: String(eState && eState.message || eState).slice(0, 200) };
+    }
+  };
   window.__ijFindGetSearchState = function () {
     try {
       return {

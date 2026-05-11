@@ -45,7 +45,6 @@ suite('Activation', () => {
       'intellijStyledSearch.searchInProject',
       'intellijStyledSearch.searchSelection',
       'intellijStyledSearch.reinject',
-      'intellijStyledSearch.installZoektBinary',
       'intellijStyledSearch.rebuildIndex',
       'intellijStyledSearch.switchEngine',
       'intellijStyledSearch.showZoektInfo',
@@ -66,21 +65,29 @@ suite('Activation', () => {
       assert.ok(all.includes(cmd), `command ${cmd} not registered`);
     }
     const contributes = ext?.packageJSON?.contributes;
+    const visibleCommands = (contributes?.commands ?? [])
+      .map((item: { command?: string }) => item.command)
+      .filter(Boolean);
+    assert.deepStrictEqual(
+      visibleCommands,
+      [
+        'intellijStyledSearch.searchInProject',
+        'intellijStyledSearch.rebuildIndex',
+      ],
+      'only Search and integrated Force Rebuild should be visible in the command palette',
+    );
     const submenu = contributes?.submenus?.find((item: { id?: string }) => item.id === 'intellijStyledSearch.editorContext');
     assert.ok(submenu, 'IntelliJ Search editor context submenu not contributed');
     const submenuCommands = (contributes?.menus?.['intellijStyledSearch.editorContext'] ?? [])
       .map((item: { command?: string }) => item.command)
       .filter(Boolean);
-    const expectedInSubmenu = expected.filter((cmd) => cmd !== 'intellijStyledSearch.findCallers');
-    for (const cmd of expectedInSubmenu) {
-      assert.ok(
-        submenuCommands.includes(cmd),
-        `command ${cmd} not present in IntelliJ Search editor context submenu`,
-      );
-    }
-    assert.ok(
-      !submenuCommands.includes('intellijStyledSearch.findCallers'),
-      'findCallers should be hidden from the context submenu because callers are folded into usages',
+    assert.deepStrictEqual(
+      submenuCommands,
+      [
+        'intellijStyledSearch.searchInProject',
+        'intellijStyledSearch.rebuildIndex',
+      ],
+      'editor context submenu should expose only Search and integrated Force Rebuild',
     );
   });
 

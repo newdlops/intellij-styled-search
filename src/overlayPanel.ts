@@ -2111,7 +2111,7 @@ export class OverlayPanel {
     const now = Date.now();
     if (now - this.lastZoektIndexPromptAt < 30_000) { return; }
     this.lastZoektIndexPromptAt = now;
-    const action = 'Rebuild Search Index';
+    const action = 'Force Rebuild Search + Graph Index';
     const subject = lower.includes('binary unavailable') ? 'zoekt search engine' : 'zoekt search index';
     void vscode.window.showWarningMessage(
       `IntelliJ Styled Search: ${subject} is not ready. Search will use codesearch fallback until the index is rebuilt.`,

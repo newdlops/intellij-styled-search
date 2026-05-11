@@ -302,27 +302,27 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       setTimeout(() => status.dispose(), 4_000);
     }
   };
+  const showSearchCommand = async (commandName: string): Promise<void> => {
+    overlay.logCommand(commandName);
+    const initialQuery = getQueryFromActiveEditor();
+    if (!initialQuery) {
+      void overlay.show('');
+      return;
+    }
+    const searchOnOpen = vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<boolean>('searchOnOpen', false);
+    const spawnContext = await overlay.getSearchSelectionShowContext();
+    void overlay.show(initialQuery, {
+      forceLiteral: true,
+      suppressSearch: !searchOnOpen,
+      preferredWindowId: spawnContext.preferredWindowId,
+      spawn: spawnContext.spawn,
+    });
+  };
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('intellijStyledSearch.searchInProject', () => {
-      overlay.logCommand('searchInProject');
-      void overlay.show('');
-    }),
-    vscode.commands.registerCommand('intellijStyledSearch.searchSelection', async () => {
-      overlay.logCommand('searchSelection');
-      const initialQuery = getQueryFromActiveEditor();
-      const searchOnOpen = vscode.workspace.getConfiguration('intellijStyledSearch')
-        .get<boolean>('searchOnOpen', false);
-      const spawnContext = initialQuery
-        ? await overlay.getSearchSelectionShowContext()
-        : {};
-      void overlay.show(initialQuery, {
-        forceLiteral: true,
-        suppressSearch: !!initialQuery && !searchOnOpen,
-        preferredWindowId: spawnContext.preferredWindowId,
-        spawn: spawnContext.spawn,
-      });
-    }),
+    vscode.commands.registerCommand('intellijStyledSearch.searchInProject', () => showSearchCommand('searchInProject')),
+    vscode.commands.registerCommand('intellijStyledSearch.searchSelection', () => showSearchCommand('searchSelection')),
     vscode.commands.registerCommand('intellijStyledSearch.reinject', async () => {
       overlay.logCommand('reinject');
       await overlay.forceReinject();
@@ -339,14 +339,15 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       vscode.window.showInformationMessage(`IntelliJ Styled Search: safe UI recovery completed (${report}).`);
     }),
     vscode.commands.registerCommand('intellijStyledSearch.rebuildIndex', async () => {
-      overlay.logCommand('rebuildIndex');
+      overlay.logCommand('forceRebuildIndexes');
       try {
         await overlay.rebuildIndex();
-        vscode.window.showInformationMessage('IntelliJ Styled Search: index rebuilt.');
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         vscode.window.showErrorMessage(`Index rebuild failed: ${msg}`);
+        return;
       }
+      await runCallGraphRebuild(true);
     }),
     vscode.commands.registerCommand('intellijStyledSearch.switchEngine', async () => {
       overlay.logCommand('switchEngine');

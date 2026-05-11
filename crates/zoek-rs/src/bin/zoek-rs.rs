@@ -1,5 +1,10 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
 
 use zoek_rs::config::EngineConfig;
 use zoek_rs::graph::{
@@ -19,7 +24,8 @@ use zoek_rs::protocol::{
     OverlayUpdateResponse, SearchRequest,
 };
 use zoek_rs::searcher::{search_workspace, search_workspace_streaming};
-use zoek_rs::watcher::build_change_batch;
+use zoek_rs::shard::ShardReader;
+use zoek_rs::watcher::{build_change_batch, ChangeBatch, FileChange, FileChangeKind};
 
 const SEARCH_STREAM_PREFIX: &str = "__ZOEK_SEARCH__";
 
@@ -142,6 +148,7 @@ fn run_compact(args: &[String]) -> Result<EngineResponse, String> {
 }
 
 fn run_update(args: &[String]) -> Result<EngineResponse, String> {
+    let started = Instant::now();
     let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
     let config = EngineConfig::default();
     let layout = StoreLayout::for_workspace(&workspace_root, &config);
@@ -152,9 +159,14 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
     let mut changed_paths = Vec::new();
     let mut deleted_paths = Vec::new();
     let mut renamed_paths = Vec::new();
+    let mut sync_workspace = false;
     let mut idx = 1;
     while idx < args.len() {
         match args[idx].as_str() {
+            "--sync" => {
+                sync_workspace = true;
+                idx += 1;
+            }
             "--delete" => {
                 let value = args
                     .get(idx + 1)
@@ -179,12 +191,17 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
         }
     }
 
-    let batch = build_change_batch(
-        current_generation,
-        &changed_paths,
-        &deleted_paths,
-        &renamed_paths,
-    );
+    let batch = if sync_workspace {
+        build_workspace_sync_batch(&workspace_root, &layout, &config, current_generation)
+            .map_err(|err| err.to_string())?
+    } else {
+        build_change_batch(
+            current_generation,
+            &changed_paths,
+            &deleted_paths,
+            &renamed_paths,
+        )
+    };
     let summary = apply_change_batch(&workspace_root, &layout, &config, &batch)
         .map_err(|err| err.to_string())?;
     let mut warnings = Vec::new();
@@ -208,8 +225,213 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
         latest_visible_entries: summary.latest_visible_entries,
         journal_bytes: summary.journal_bytes,
         compaction_suggested: summary.compaction_suggested,
+        elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         warnings,
     }))
+}
+
+fn build_workspace_sync_batch(
+    workspace_root: &Path,
+    layout: &StoreLayout,
+    config: &EngineConfig,
+    current_generation: u64,
+) -> io::Result<ChangeBatch> {
+    let base_docs = collect_base_doc_hashes(layout)?;
+    let overlay_latest = load_overlay_with_recovery(layout)
+        .map(|result| result.manifest.latest_entries())
+        .unwrap_or_default();
+    let current_files = collect_current_index_candidates(workspace_root, config)?;
+    let mut changed = Vec::new();
+    let mut deleted = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for (rel_path, current_hash) in current_files {
+        seen.insert(rel_path.clone());
+        if config.is_overlay_update_excluded_relative_path(&rel_path) {
+            continue;
+        }
+        match overlay_latest.get(&rel_path) {
+            Some(entry) if !entry.tombstone => {
+                changed.push(rel_path);
+                continue;
+            }
+            Some(_) => {
+                changed.push(rel_path);
+                continue;
+            }
+            None => {}
+        }
+        if base_docs.get(&rel_path).copied() != Some(current_hash) {
+            changed.push(rel_path);
+        }
+    }
+
+    for rel_path in base_docs.keys() {
+        if !seen.contains(rel_path) {
+            deleted.push(rel_path.clone());
+        }
+    }
+    for (rel_path, entry) in overlay_latest {
+        if !entry.tombstone && !seen.contains(&rel_path) {
+            deleted.push(rel_path);
+        }
+    }
+    changed.sort();
+    changed.dedup();
+    deleted.sort();
+    deleted.dedup();
+
+    Ok(ChangeBatch {
+        generation: current_generation.saturating_add(1),
+        committed_unix_secs: 0,
+        changes: changed
+            .into_iter()
+            .map(|rel_path| FileChange {
+                kind: FileChangeKind::Modify,
+                rel_path,
+                new_rel_path: None,
+            })
+            .chain(deleted.into_iter().map(|rel_path| FileChange {
+                kind: FileChangeKind::Delete,
+                rel_path,
+                new_rel_path: None,
+            }))
+            .collect(),
+    })
+}
+
+fn collect_base_doc_hashes(layout: &StoreLayout) -> io::Result<BTreeMap<String, u64>> {
+    let mut out = BTreeMap::new();
+    for shard_path in layout.list_shard_paths()? {
+        let reader = ShardReader::open(&shard_path)?;
+        for doc in reader.documents()? {
+            out.insert(doc.rel_path, doc.content_hash);
+        }
+    }
+    Ok(out)
+}
+
+fn collect_current_index_candidates(
+    workspace_root: &Path,
+    config: &EngineConfig,
+) -> io::Result<BTreeMap<String, u64>> {
+    if let Some(files) = list_files_with_rg(workspace_root)? {
+        return stat_current_candidates(workspace_root, config, files);
+    }
+    let mut files = Vec::new();
+    collect_files_walk(workspace_root, workspace_root, config, &mut files)?;
+    stat_current_candidates(workspace_root, config, files)
+}
+
+fn list_files_with_rg(workspace_root: &Path) -> io::Result<Option<Vec<String>>> {
+    let output = match Command::new("rg")
+        .current_dir(workspace_root)
+        .args([
+            "--files",
+            "--hidden",
+            "--no-ignore",
+            "--no-ignore-parent",
+            "--glob",
+            "!.zoek-rs/**",
+            "--glob",
+            "!.zoekt-rs/**",
+            ".",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(None),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(
+        stdout
+            .lines()
+            .map(|line| normalize_sync_rel_path(line.trim()))
+            .filter(|line| !line.is_empty())
+            .collect(),
+    ))
+}
+
+fn collect_files_walk(
+    workspace_root: &Path,
+    dir: &Path,
+    config: &EngineConfig,
+    out: &mut Vec<String>,
+) -> io::Result<()> {
+    for item in fs::read_dir(dir)? {
+        let item = item?;
+        let path = item.path();
+        let file_type = item.file_type()?;
+        if file_type.is_dir() {
+            let name = item.file_name();
+            let name = name.to_string_lossy();
+            if config.is_internal_index_dir_name(&name) || config.is_excluded_dir_name(&name) {
+                continue;
+            }
+            collect_files_walk(workspace_root, &path, config, out)?;
+        } else if file_type.is_file() {
+            out.push(normalize_sync_rel_path(
+                &path
+                    .strip_prefix(workspace_root)
+                    .unwrap_or(&path)
+                    .to_string_lossy(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn stat_current_candidates(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    files: Vec<String>,
+) -> io::Result<BTreeMap<String, u64>> {
+    let mut out = BTreeMap::new();
+    for rel_path in files {
+        if rel_path.is_empty() || config.is_overlay_update_excluded_relative_path(&rel_path) {
+            continue;
+        }
+        let abs_path = workspace_root.join(&rel_path);
+        if config.is_binary_extension(&abs_path) {
+            continue;
+        }
+        let metadata = match fs::metadata(&abs_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        if !metadata.is_file() || metadata.len() > config.max_file_size_bytes {
+            continue;
+        }
+        let modified_unix_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_secs())
+            .unwrap_or(0);
+        out.insert(
+            rel_path.clone(),
+            zoek_rs::indexer::stable_record_hash(&rel_path, metadata.len(), modified_unix_secs),
+        );
+    }
+    Ok(out)
+}
+
+fn normalize_sync_rel_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn run_search(args: &[String]) -> Result<EngineResponse, String> {

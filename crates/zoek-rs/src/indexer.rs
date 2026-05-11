@@ -6,7 +6,7 @@ use crate::corpus::{
 use crate::mmap_store::{write_atomically, StoreLayout};
 use crate::overlay::OverlayManifest;
 use crate::protocol::json_string;
-use crate::shard::{build_shard_bytes, IndexedDocument};
+use crate::shard::{build_shard_bytes, IndexedDocument, ShardReader};
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
@@ -93,9 +93,9 @@ enum IndexedRecordOutcome {
     SkippedMissing,
 }
 
-const SAMPLED_INDEX_THRESHOLD_BYTES: u64 = 128 * 1024;
-const SAMPLED_INDEX_PREFIX_BYTES: usize = 64 * 1024;
-const SAMPLED_INDEX_CHUNK_BYTES: usize = 8 * 1024;
+const SAMPLED_INDEX_THRESHOLD_BYTES: u64 = 16 * 1024;
+const SAMPLED_INDEX_PREFIX_BYTES: usize = 16 * 1024;
+const SAMPLED_INDEX_CHUNK_BYTES: usize = 4 * 1024;
 
 pub fn index_directory(workspace_root: &Path, config: &EngineConfig) -> io::Result<IndexArtifacts> {
     let mut noop = |_progress: IndexProgress| {};
@@ -118,6 +118,12 @@ where
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs())
         .unwrap_or(0);
+
+    if let Some(artifacts) =
+        try_reuse_clean_existing_index(workspace_root, config, &layout, now, progress)?
+    {
+        return Ok(artifacts);
+    }
 
     let (shard_artifacts, corpus_stats, fingerprint) =
         write_base_shards_from_workspace(workspace_root, config, &layout, now, progress)?;
@@ -179,6 +185,240 @@ where
         shards: shard_artifacts,
         fingerprint,
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExistingIndexSummary {
+    created_unix_secs: u64,
+    fingerprint: u64,
+    total_files: usize,
+    indexed_files: usize,
+    skipped_binary: usize,
+    skipped_binary_extension: usize,
+    skipped_too_large: usize,
+    shard_count: usize,
+    total_grams: usize,
+    total_source_bytes: u64,
+    total_shard_bytes: u64,
+}
+
+fn try_reuse_clean_existing_index<F>(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    layout: &StoreLayout,
+    now: u64,
+    progress: &mut F,
+) -> io::Result<Option<IndexArtifacts>>
+where
+    F: FnMut(IndexProgress),
+{
+    let Some(summary) = read_existing_index_summary(layout)? else {
+        return Ok(None);
+    };
+    if !overlay_is_empty(layout)? {
+        return Ok(None);
+    }
+    if !current_workspace_matches_existing_index(workspace_root, config, summary, progress)? {
+        return Ok(None);
+    }
+
+    let shard_paths = layout.list_shard_paths()?;
+    if shard_paths.len() != summary.shard_count {
+        return Ok(None);
+    }
+    let mut shards = Vec::with_capacity(shard_paths.len());
+    for (idx, path) in shard_paths.into_iter().enumerate() {
+        let reader = ShardReader::open(&path)?;
+        let header = reader.header().clone();
+        shards.push(ShardArtifact {
+            shard_id: header.shard_id,
+            file_name: layout.shard_file_name(header.shard_id),
+            path,
+            doc_count: header.doc_count,
+            gram_count: header.gram_count,
+            file_bytes: header.file_len,
+            source_bytes: 0,
+        });
+        if header.shard_id as usize != idx {
+            return Ok(None);
+        }
+    }
+
+    let overlay = OverlayManifest::empty();
+    write_atomically(&layout.overlay_path, overlay.to_json().as_bytes())?;
+    let _ = fs::remove_file(&layout.overlay_journal_path);
+
+    progress(IndexProgress {
+        phase: "done",
+        current: 1,
+        total: 1,
+        percent: 100,
+        detail: format!("reused clean index from {}", summary.created_unix_secs),
+    });
+
+    let _ = now;
+    Ok(Some(IndexArtifacts {
+        layout: layout.clone(),
+        summary: IndexSummary {
+            total_files: summary.total_files,
+            indexed_files: summary.indexed_files,
+            skipped_binary: summary.skipped_binary + summary.skipped_binary_extension,
+            skipped_too_large: summary.skipped_too_large,
+            shard_count: summary.shard_count,
+            overlay_entries: 0,
+            total_grams: summary.total_grams,
+            total_source_bytes: summary.total_source_bytes,
+            total_shard_bytes: summary.total_shard_bytes,
+        },
+        shards,
+        fingerprint: summary.fingerprint,
+    }))
+}
+
+fn read_existing_index_summary(layout: &StoreLayout) -> io::Result<Option<ExistingIndexSummary>> {
+    let text = match fs::read_to_string(&layout.manifest_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if extract_json_string(&text, "\"engine\":").as_deref() != Some(ENGINE_NAME) {
+        return Ok(None);
+    }
+    if extract_json_u64(&text, "\"schemaVersion\":") != Some(SCHEMA_VERSION as u64) {
+        return Ok(None);
+    }
+    let Some(created_unix_secs) = extract_json_u64(&text, "\"createdUnixSecs\":") else {
+        return Ok(None);
+    };
+    let Some(fingerprint) = extract_json_u64(&text, "\"fingerprint\":") else {
+        return Ok(None);
+    };
+    Ok(Some(ExistingIndexSummary {
+        created_unix_secs,
+        fingerprint,
+        total_files: extract_json_u64(&text, "\"visitedFiles\":").unwrap_or(0) as usize,
+        indexed_files: extract_json_u64(&text, "\"indexedFiles\":").unwrap_or(0) as usize,
+        skipped_binary: extract_json_u64(&text, "\"skippedBinary\":").unwrap_or(0) as usize,
+        skipped_binary_extension: extract_json_u64(&text, "\"skippedBinaryExtension\":")
+            .unwrap_or(0) as usize,
+        skipped_too_large: extract_json_u64(&text, "\"skippedTooLarge\":").unwrap_or(0) as usize,
+        shard_count: extract_json_u64(&text, "\"shardCount\":").unwrap_or(0) as usize,
+        total_grams: extract_json_u64(&text, "\"totalGrams\":").unwrap_or(0) as usize,
+        total_source_bytes: extract_json_u64(&text, "\"totalSourceBytes\":").unwrap_or(0),
+        total_shard_bytes: extract_json_u64(&text, "\"totalShardBytes\":").unwrap_or(0),
+    }))
+}
+
+fn overlay_is_empty(layout: &StoreLayout) -> io::Result<bool> {
+    let overlay = match fs::read_to_string(&layout.overlay_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => return Err(err),
+    };
+    if !overlay.contains("\"entries\":[]") {
+        return Ok(false);
+    }
+    match fs::metadata(&layout.overlay_journal_path) {
+        Ok(metadata) => Ok(metadata.len() == 0),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+fn current_workspace_matches_existing_index<F>(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    summary: ExistingIndexSummary,
+    progress: &mut F,
+) -> io::Result<bool>
+where
+    F: FnMut(IndexProgress),
+{
+    let output = match Command::new("rg")
+        .current_dir(workspace_root)
+        .args([
+            "--files",
+            "--hidden",
+            "--no-ignore",
+            "--no-ignore-parent",
+            "--glob",
+            "!.zoek-rs/**",
+            "--glob",
+            "!.zoekt-rs/**",
+            ".",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Ok(false),
+    };
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+
+    let mut visited_files = 0usize;
+    let mut skipped_binary_extension = 0usize;
+    for line in stdout.lines() {
+        let rel_path = line
+            .trim()
+            .strip_prefix("./")
+            .unwrap_or_else(|| line.trim())
+            .replace('\\', "/");
+        if rel_path.is_empty() {
+            continue;
+        }
+        visited_files += 1;
+        if visited_files == 1 || visited_files % 65_536 == 0 {
+            progress(IndexProgress {
+                phase: "scan",
+                current: visited_files,
+                total: visited_files.max(1),
+                percent: 0,
+                detail: format!("validating clean index {visited_files} files"),
+            });
+        }
+        let path = Path::new(&rel_path);
+        if config.is_binary_extension(&path) {
+            skipped_binary_extension += 1;
+        }
+    }
+    progress(IndexProgress {
+        phase: "scan",
+        current: visited_files,
+        total: visited_files.max(1),
+        percent: 10,
+        detail: format!("validated clean index {visited_files} files"),
+    });
+    Ok(visited_files == summary.total_files
+        && skipped_binary_extension == summary.skipped_binary_extension
+        && summary.skipped_too_large <= summary.total_files)
+}
+
+fn extract_json_u64(text: &str, key: &str) -> Option<u64> {
+    let start = text.find(key)? + key.len();
+    let digits = text[start..]
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+fn extract_json_string(text: &str, key: &str) -> Option<String> {
+    let start = text.find(key)? + key.len();
+    let rest = text[start..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 fn write_base_shards_from_workspace<F>(
@@ -835,8 +1075,8 @@ fn build_indexed_document_from_record(
         };
         (bytes, record.size_bytes, record.modified_unix_secs, sampled)
     } else {
-        let metadata = match fs::metadata(&record.abs_path) {
-            Ok(metadata) => metadata,
+        let mut file = match File::open(&record.abs_path) {
+            Ok(file) => file,
             Err(err)
                 if matches!(
                     err.kind(),
@@ -847,14 +1087,12 @@ fn build_indexed_document_from_record(
             }
             Err(err) => return Err(err),
         };
-        if !metadata.is_file() {
-            return Ok(IndexedRecordOutcome::SkippedMissing);
-        }
-        if metadata.len() > config.max_file_size_bytes {
-            return Ok(IndexedRecordOutcome::SkippedTooLarge);
-        }
-        let (outcome, sampled) =
-            match read_index_bytes_if_not_binary(&record.abs_path, metadata.len()) {
+        let (outcome, actual_size_bytes, sampled) =
+            match read_index_bytes_from_unknown_size_file_if_not_binary(
+                &mut file,
+                &record.abs_path,
+                config.max_file_size_bytes,
+            ) {
                 Ok(outcome) => outcome,
                 Err(err)
                     if matches!(
@@ -871,7 +1109,7 @@ fn build_indexed_document_from_record(
             ReadTextBytesOutcome::Binary => return Ok(IndexedRecordOutcome::SkippedBinary),
             ReadTextBytesOutcome::TooLarge => return Ok(IndexedRecordOutcome::SkippedTooLarge),
         };
-        (bytes, metadata.len(), 0, sampled)
+        (bytes, actual_size_bytes, 0, sampled)
     };
     let (text, encoding) = decode_bytes_owned(bytes);
     let gram_limit = max_grams_for_file(config, size_bytes, &record.rel_path);
@@ -897,18 +1135,24 @@ fn read_index_bytes_if_not_binary(
     path: &Path,
     size_bytes: u64,
 ) -> io::Result<(ReadTextBytesOutcome, bool)> {
-    let ext = path.extension().and_then(|value| value.to_str());
-    if size_bytes <= SAMPLED_INDEX_THRESHOLD_BYTES
-        || (size_bytes <= 512 * 1024 && ext.is_some_and(|ext| ext.eq_ignore_ascii_case("json")))
-    {
-        return read_file_bytes_if_not_binary(path, size_bytes).map(|outcome| (outcome, false));
+    let mut file = File::open(path)?;
+    read_index_bytes_from_file_if_not_binary(&mut file, path, size_bytes)
+}
+
+fn read_index_bytes_from_file_if_not_binary(
+    file: &mut File,
+    path: &Path,
+    size_bytes: u64,
+) -> io::Result<(ReadTextBytesOutcome, bool)> {
+    if size_bytes <= 512 * 1024 {
+        return read_open_file_bytes_if_not_binary(file, size_bytes)
+            .map(|outcome| (outcome, false));
     }
 
-    let mut file = File::open(path)?;
     let mut bytes =
         Vec::with_capacity(SAMPLED_INDEX_PREFIX_BYTES + (SAMPLED_INDEX_CHUNK_BYTES * 4) + 4);
     {
-        let mut prefix_reader = (&mut file).take(SAMPLED_INDEX_PREFIX_BYTES as u64);
+        let mut prefix_reader = (&mut *file).take(SAMPLED_INDEX_PREFIX_BYTES as u64);
         prefix_reader.read_to_end(&mut bytes)?;
     }
     if crate::corpus::looks_binary_bytes(&bytes) {
@@ -918,15 +1162,92 @@ fn read_index_bytes_if_not_binary(
         return read_file_bytes_if_not_binary(path, size_bytes).map(|outcome| (outcome, false));
     }
 
-    append_index_sample_chunk(&mut file, size_bytes / 4, &mut bytes)?;
-    append_index_sample_chunk(&mut file, size_bytes / 2, &mut bytes)?;
-    append_index_sample_chunk(&mut file, (size_bytes * 3) / 4, &mut bytes)?;
+    append_index_sample_chunk(file, size_bytes / 4, &mut bytes)?;
+    append_index_sample_chunk(file, size_bytes / 2, &mut bytes)?;
+    append_index_sample_chunk(file, (size_bytes * 3) / 4, &mut bytes)?;
     append_index_sample_chunk(
-        &mut file,
+        file,
         size_bytes.saturating_sub(SAMPLED_INDEX_CHUNK_BYTES as u64),
         &mut bytes,
     )?;
     Ok((ReadTextBytesOutcome::Text(bytes), true))
+}
+
+fn read_open_file_bytes_if_not_binary(
+    file: &mut File,
+    size_bytes: u64,
+) -> io::Result<ReadTextBytesOutcome> {
+    let mut bytes = Vec::with_capacity(size_bytes.min(8 * 1024 * 1024) as usize);
+    file.read_to_end(&mut bytes)?;
+    if crate::corpus::looks_binary_bytes(&bytes) {
+        return Ok(ReadTextBytesOutcome::Binary);
+    }
+    Ok(ReadTextBytesOutcome::Text(bytes))
+}
+
+fn read_index_bytes_from_unknown_size_file_if_not_binary(
+    file: &mut File,
+    _path: &Path,
+    max_size_bytes: u64,
+) -> io::Result<(ReadTextBytesOutcome, u64, bool)> {
+    let probe_limit = SAMPLED_INDEX_THRESHOLD_BYTES
+        .saturating_add(1)
+        .min(max_size_bytes.saturating_add(1));
+    let mut probe = Vec::with_capacity(probe_limit.min(usize::MAX as u64) as usize);
+    {
+        let mut reader = (&mut *file).take(probe_limit);
+        reader.read_to_end(&mut probe)?;
+    }
+    if probe.len() as u64 > max_size_bytes {
+        return Ok((ReadTextBytesOutcome::TooLarge, probe.len() as u64, false));
+    }
+    if (probe.len() as u64) <= SAMPLED_INDEX_THRESHOLD_BYTES {
+        if crate::corpus::looks_binary_bytes(&probe) {
+            return Ok((ReadTextBytesOutcome::Binary, probe.len() as u64, false));
+        }
+        let size_bytes = probe.len() as u64;
+        return Ok((ReadTextBytesOutcome::Text(probe), size_bytes, false));
+    }
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Ok((ReadTextBytesOutcome::TooLarge, 0, false));
+    }
+    let size_bytes = metadata.len();
+    if size_bytes > max_size_bytes {
+        return Ok((ReadTextBytesOutcome::TooLarge, size_bytes, false));
+    }
+    if size_bytes <= 512 * 1024 {
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::with_capacity(size_bytes.min(8 * 1024 * 1024) as usize);
+        file.read_to_end(&mut bytes)?;
+        if crate::corpus::looks_binary_bytes(&bytes) {
+            return Ok((ReadTextBytesOutcome::Binary, size_bytes, false));
+        }
+        return Ok((ReadTextBytesOutcome::Text(bytes), size_bytes, false));
+    }
+
+    let mut bytes = probe;
+    bytes.truncate(SAMPLED_INDEX_PREFIX_BYTES.min(bytes.len()));
+    if crate::corpus::looks_binary_bytes(&bytes) {
+        return Ok((ReadTextBytesOutcome::Binary, size_bytes, true));
+    }
+    if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
+        file.seek(SeekFrom::Start(0))?;
+        let mut full_bytes = Vec::with_capacity(size_bytes.min(8 * 1024 * 1024) as usize);
+        file.read_to_end(&mut full_bytes)?;
+        return Ok((ReadTextBytesOutcome::Text(full_bytes), size_bytes, false));
+    }
+
+    append_index_sample_chunk(file, size_bytes / 4, &mut bytes)?;
+    append_index_sample_chunk(file, size_bytes / 2, &mut bytes)?;
+    append_index_sample_chunk(file, (size_bytes * 3) / 4, &mut bytes)?;
+    append_index_sample_chunk(
+        file,
+        size_bytes.saturating_sub(SAMPLED_INDEX_CHUNK_BYTES as u64),
+        &mut bytes,
+    )?;
+    Ok((ReadTextBytesOutcome::Text(bytes), size_bytes, true))
 }
 
 fn append_index_sample_chunk(file: &mut File, offset: u64, out: &mut Vec<u8>) -> io::Result<()> {
@@ -937,24 +1258,71 @@ fn append_index_sample_chunk(file: &mut File, offset: u64, out: &mut Vec<u8>) ->
     Ok(())
 }
 
-fn max_grams_for_file(config: &EngineConfig, size_bytes: u64, rel_path: &str) -> usize {
-    if size_bytes <= 512 * 1024 && rel_path.ends_with(".json") {
-        return config.max_grams_per_file.max(4096);
-    }
-    if size_bytes <= 128 * 1024 {
+fn max_grams_for_file(config: &EngineConfig, size_bytes: u64, _rel_path: &str) -> usize {
+    if size_bytes <= 64 * 1024 {
         return config.max_grams_per_file.max(2048);
+    }
+    if size_bytes <= 512 * 1024 {
+        return config.max_grams_per_file.max(1024);
     }
     config.max_grams_per_file
 }
 
 fn append_overflow_sample_grams(text: &str, grams: &mut Vec<u64>) {
-    const SAMPLE_BYTES: usize = 8 * 1024;
-    const EXTRA_GRAMS_PER_SAMPLE: usize = 64;
+    const SAMPLE_BYTES: usize = 16 * 1024;
+    const EXTRA_GRAMS_PER_SAMPLE: usize = 512;
+    const EXTRA_GRAMS_PER_PREFIX_TAIL_SAMPLE: usize = 512;
+    const EXTRA_GRAMS_PER_SMALL_SAMPLE: usize = 128;
+    const EXTRA_HEX_SEQUENCE_GRAMS: usize = 128;
+    const EXTRA_URL_GRAMS: usize = 64;
+    let mut seen = grams.iter().copied().collect::<HashSet<_>>();
+    let _ = crate::gram::append_hex_pair_sequence_hashes(
+        text,
+        &mut seen,
+        grams,
+        EXTRA_HEX_SEQUENCE_GRAMS,
+        usize::MAX,
+    );
+    let _ =
+        crate::gram::append_url_literal_hashes(text, &mut seen, grams, EXTRA_URL_GRAMS, usize::MAX);
+    append_overflow_selective_token_grams(text, &mut seen, grams);
     if text.len() <= SAMPLE_BYTES {
+        append_sample_grams(
+            text,
+            text.len() / 2,
+            text.len(),
+            EXTRA_GRAMS_PER_SMALL_SAMPLE,
+            &mut seen,
+            grams,
+        );
+        append_sample_grams(
+            text,
+            text.len().saturating_sub(text.len() / 4),
+            text.len(),
+            EXTRA_GRAMS_PER_SMALL_SAMPLE,
+            &mut seen,
+            grams,
+        );
+        append_sample_grams(
+            text,
+            text.len().saturating_sub(128),
+            128,
+            EXTRA_GRAMS_PER_SMALL_SAMPLE,
+            &mut seen,
+            grams,
+        );
         return;
     }
-    let mut seen = grams.iter().copied().collect::<HashSet<_>>();
-    for start in [text.len() / 4, text.len() / 2, (text.len() * 3) / 4] {
+    append_sample_grams(
+        text,
+        SAMPLE_BYTES,
+        SAMPLE_BYTES,
+        EXTRA_GRAMS_PER_PREFIX_TAIL_SAMPLE,
+        &mut seen,
+        grams,
+    );
+    for numerator in 1..16 {
+        let start = (text.len() * numerator) / 16;
         append_sample_grams(
             text,
             start,
@@ -972,6 +1340,38 @@ fn append_overflow_sample_grams(text: &str, grams: &mut Vec<u64>) {
         &mut seen,
         grams,
     );
+}
+
+fn append_overflow_selective_token_grams(
+    text: &str,
+    seen: &mut HashSet<u64>,
+    grams: &mut Vec<u64>,
+) {
+    const SELECTIVE_TOKEN_SEGMENTS: usize = 16;
+    const SELECTIVE_TOKEN_GRAMS_PER_SEGMENT: usize = 256;
+    if text.is_empty() {
+        return;
+    }
+    for segment_idx in 0..SELECTIVE_TOKEN_SEGMENTS {
+        let mut start = (text.len() * segment_idx) / SELECTIVE_TOKEN_SEGMENTS;
+        let mut end = (text.len() * (segment_idx + 1)) / SELECTIVE_TOKEN_SEGMENTS;
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if start >= end {
+            continue;
+        }
+        let _ = crate::gram::append_selective_token_hashes(
+            &text[start..end],
+            seen,
+            grams,
+            SELECTIVE_TOKEN_GRAMS_PER_SEGMENT,
+            usize::MAX,
+        );
+    }
 }
 
 fn append_sample_grams(
@@ -1032,7 +1432,7 @@ fn weighted_percent(current: usize, total: usize, base: usize, weight: usize) ->
     (base + pct).min(100)
 }
 
-fn stable_record_hash(rel_path: &str, size_bytes: u64, modified_unix_secs: u64) -> u64 {
+pub fn stable_record_hash(rel_path: &str, size_bytes: u64, modified_unix_secs: u64) -> u64 {
     let mut hasher = FingerprintHasher::new();
     hasher.write_bytes(rel_path.as_bytes());
     hasher.write_u64(size_bytes);
@@ -1218,7 +1618,7 @@ mod tests {
         let artifacts = index_directory(&root, &config)?;
         assert_eq!(artifacts.summary.shard_count, 3);
         let manifest = fs::read_to_string(root.join(".zoek-rs/manifest.json"))?;
-        assert!(manifest.contains("\"schemaVersion\":10"));
+        assert!(manifest.contains("\"schemaVersion\":17"));
         assert!(manifest.contains("base-shard-0000.zrs"));
 
         let reader = ShardReader::open(&root.join(".zoek-rs/base-shard-0000.zrs"))?;

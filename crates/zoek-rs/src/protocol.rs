@@ -189,6 +189,7 @@ pub struct OverlayUpdateResponse {
     pub latest_visible_entries: usize,
     pub journal_bytes: u64,
     pub compaction_suggested: bool,
+    pub elapsed_ms: u64,
     pub warnings: Vec<String>,
 }
 
@@ -492,7 +493,7 @@ impl DiagnoseResponse {
 impl OverlayUpdateResponse {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"type\":\"update\",\"ok\":{},\"engine\":{},\"generation\":{},\"entriesWritten\":{},\"liveEntries\":{},\"tombstones\":{},\"overlayTotalEntries\":{},\"latestVisibleEntries\":{},\"journalBytes\":{},\"compactionSuggested\":{},\"warnings\":[{}]}}",
+            "{{\"type\":\"update\",\"ok\":{},\"engine\":{},\"generation\":{},\"entriesWritten\":{},\"liveEntries\":{},\"tombstones\":{},\"overlayTotalEntries\":{},\"latestVisibleEntries\":{},\"journalBytes\":{},\"compactionSuggested\":{},\"elapsedMs\":{},\"warnings\":[{}]}}",
             self.ok,
             self.engine.to_json(),
             self.generation,
@@ -503,6 +504,7 @@ impl OverlayUpdateResponse {
             self.latest_visible_entries,
             self.journal_bytes,
             self.compaction_suggested,
+            self.elapsed_ms,
             json_string_vec(&self.warnings)
         )
     }

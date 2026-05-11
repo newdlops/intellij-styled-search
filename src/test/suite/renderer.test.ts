@@ -329,6 +329,317 @@ suite('Renderer — overlay UI probes', () => {
     }
   });
 
+  // Regression: clicking inside the Monaco preview used to make the editor's
+  // DOM detach from our preview host and lose its model. Workbench treats any
+  // non-simple editor that gets focused as "the active code editor" and
+  // reparents it; isSimpleWidget=true prevents that takeover.
+  test('Monaco preview survives a click inside the editor without losing its DOM or model', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(20_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected a workspace folder');
+    // Workspace-agnostic: pick any plain text file VSCode can open. We only
+    // need a real editor in the workbench so Monaco capture has something to
+    // bind services to; the preview message itself carries synthetic content
+    // and uses a synthetic URI that does not have to exist on disk.
+    const captureCandidates = await vscode.workspace.findFiles(
+      '**/*.{py,ts,tsx,js,jsx,md,txt,json}',
+      '{**/node_modules/**,**/.git/**,**/out/**,**/dist/**,**/build/**,**/.vscode/**,**/.vscode-test/**}',
+      8,
+    );
+    let captureUri: vscode.Uri | undefined;
+    for (const candidate of captureCandidates) {
+      try {
+        const stat = await vscode.workspace.fs.stat(candidate);
+        if (stat && stat.size > 0 && stat.size < 200_000) { captureUri = candidate; break; }
+      } catch {}
+    }
+    if (!captureUri) {
+      const synthetic = await vscode.workspace.openTextDocument({
+        language: 'plaintext',
+        content: '// IntelliJ Styled Search preview-click probe capture buffer\n',
+      });
+      captureUri = synthetic.uri;
+    }
+    const previewUri = vscode.Uri.parse(
+      `file:///${folder!.uri.path.replace(/^\/+/, '').replace(/\/+$/, '')}/__ijss-preview-click-${Date.now()}.py`,
+    );
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+
+    try {
+      await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
+      await vscode.window.showTextDocument(captureUri, {
+        preview: false,
+        preserveFocus: false,
+        viewColumn: vscode.ViewColumn.One,
+        selection: new vscode.Range(new vscode.Position(0, 0), new vscode.Position(0, 0)),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      await overlay.show('PreviewClickSurvivesProbe', { forceLiteral: true, suppressSearch: true });
+      const anyOverlay = overlay as any;
+      try {
+        await anyOverlay.ensureMonacoCapture(anyOverlay.activeWindowId, undefined, {
+          allowForceOpen: true,
+          reason: 'test-preview-click-survives',
+        });
+      } catch {}
+      const monacoReady = await overlay.waitForMonacoReadyForTests(6_000);
+      if (!monacoReady) { this.skip(); return; }
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var alpha = ${JSON.stringify(previewUri.toString())};
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === 'PreviewClickSurvivesProbe';
+          }) || document.querySelector('.ij-find-overlay.visible');
+          if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          window.__ijFindActiveInstanceId = targetSrc;
+          window.__ijFindOnMessage({
+            type: 'preview',
+            __targetSrc: targetSrc,
+            uri: alpha,
+            relPath: '__ijss-preview-click.py',
+            languageId: 'python',
+            focusLine: 0,
+            fullFile: true,
+            lines: [
+              { lineNumber: 0, text: 'class AlphaService:' },
+              { lineNumber: 1, text: '    def __init__(self, name: str) -> None:' },
+              { lineNumber: 2, text: '        self.name = name' },
+              { lineNumber: 3, text: '        self.counter = 0' }
+            ],
+            ranges: [{ start: 6, end: 18 }]
+          });
+          function probe(label) {
+            var snap = window.__ijFindGetPreviewMonacoStateForTests
+              ? window.__ijFindGetPreviewMonacoStateForTests()
+              : null;
+            var body = root.querySelector('.ij-find-preview-body');
+            var hostEl = body ? body.querySelector('.ij-find-monaco-preview-host') : null;
+            return {
+              label: label,
+              previewMode: snap && snap.previewMode,
+              hostMounted: !!hostEl,
+              domInHost: !!(snap && snap.domInHost),
+              viewLines: snap && typeof snap.viewLines === 'number' ? snap.viewLines : 0,
+              modelOk: !!(snap && snap.modelOk),
+            };
+          }
+          var mountDeadline = performance.now() + 4000;
+          var mounted = null;
+          while (performance.now() < mountDeadline) {
+            mounted = probe('mount');
+            if (mounted.previewMode === 'monaco' && mounted.hostMounted && mounted.domInHost && mounted.viewLines > 0 && mounted.modelOk) {
+              break;
+            }
+            await new Promise(function (resolve) { setTimeout(resolve, 16); });
+          }
+          if (!mounted || !(mounted.previewMode === 'monaco' && mounted.hostMounted && mounted.domInHost && mounted.viewLines > 0 && mounted.modelOk)) {
+            return JSON.stringify({ phase: 'mount-failed', mounted: mounted });
+          }
+          var body = root.querySelector('.ij-find-preview-body');
+          var host = body ? body.querySelector('.ij-find-monaco-preview-host') : null;
+          var dom = host ? host.querySelector('.monaco-editor') : null;
+          if (!host || !dom) { return JSON.stringify({ phase: 'no-dom', mounted: mounted }); }
+          var clickTarget = dom.querySelector('.view-line') || dom.querySelector('.view-lines') || dom;
+          var rect = clickTarget.getBoundingClientRect();
+          var x = rect.left + Math.max(8, Math.round(rect.width / 2));
+          var y = rect.top + Math.max(2, Math.round(rect.height / 2));
+          function fireMouseEvent(type, target) {
+            try {
+              var ev = new MouseEvent(type, { bubbles: true, cancelable: true, view: window, button: 0, clientX: x, clientY: y });
+              target.dispatchEvent(ev);
+            } catch (eMouse) {}
+          }
+          function firePointerEvent(type, target) {
+            try {
+              if (typeof PointerEvent === 'function') {
+                var ev = new PointerEvent(type, { bubbles: true, cancelable: true, pointerType: 'mouse', isPrimary: true, button: 0, clientX: x, clientY: y });
+                target.dispatchEvent(ev);
+              }
+            } catch (ePointer) {}
+          }
+          var mutationLog = [];
+          var hostMutations = [];
+          var bodyMutations = [];
+          var hostDetachObserver = null;
+          var bodyObserver = null;
+          var rootObserver = null;
+          try {
+            if (typeof MutationObserver === 'function') {
+              hostDetachObserver = new MutationObserver(function (records) {
+                for (var ri = 0; ri < records.length; ri++) {
+                  var rec = records[ri];
+                  var removed = rec.removedNodes ? rec.removedNodes.length : 0;
+                  var added = rec.addedNodes ? rec.addedNodes.length : 0;
+                  if (!removed && !added) { continue; }
+                  hostMutations.push({
+                    tMs: Math.round(performance.now() - clickStart),
+                    targetCls: rec.target && rec.target.className ? String(rec.target.className).slice(0, 80) : '',
+                    targetTag: rec.target && rec.target.tagName ? String(rec.target.tagName).toLowerCase() : '',
+                    removed: removed,
+                    added: added,
+                    removedTags: rec.removedNodes ? Array.prototype.map.call(rec.removedNodes, function (n) {
+                      return ((n && n.tagName) ? String(n.tagName).toLowerCase() : '#text') + '.' + ((n && n.className) ? String(n.className).slice(0, 40) : '');
+                    }).slice(0, 4) : [],
+                  });
+                }
+              });
+              hostDetachObserver.observe(host, { childList: true, subtree: true });
+              bodyObserver = new MutationObserver(function (records) {
+                for (var ri = 0; ri < records.length; ri++) {
+                  var rec = records[ri];
+                  var removed = rec.removedNodes ? rec.removedNodes.length : 0;
+                  var added = rec.addedNodes ? rec.addedNodes.length : 0;
+                  if (!removed && !added) { continue; }
+                  bodyMutations.push({
+                    tMs: Math.round(performance.now() - clickStart),
+                    targetCls: rec.target && rec.target.className ? String(rec.target.className).slice(0, 80) : '',
+                    targetTag: rec.target && rec.target.tagName ? String(rec.target.tagName).toLowerCase() : '',
+                    removed: removed,
+                    added: added,
+                  });
+                }
+              });
+              bodyObserver.observe(body, { childList: true });
+              // Track the editor DOM itself across the body — if it moves, capture the new parent.
+              rootObserver = new MutationObserver(function (records) {
+                for (var ri = 0; ri < records.length; ri++) {
+                  var rec = records[ri];
+                  if (!rec.removedNodes || !rec.removedNodes.length) { continue; }
+                  for (var ni = 0; ni < rec.removedNodes.length; ni++) {
+                    var node = rec.removedNodes[ni];
+                    if (node === dom) {
+                      mutationLog.push({
+                        tMs: Math.round(performance.now() - clickStart),
+                        kind: 'editor-dom-removed',
+                        fromTag: rec.target && rec.target.tagName ? String(rec.target.tagName).toLowerCase() : '',
+                        fromCls: rec.target && rec.target.className ? String(rec.target.className).slice(0, 80) : '',
+                      });
+                    }
+                  }
+                }
+              });
+              rootObserver.observe(document.body, { childList: true, subtree: true });
+            }
+          } catch (eDetachObs) {}
+          var clickStart = performance.now();
+          firePointerEvent('pointerdown', clickTarget);
+          fireMouseEvent('mousedown', clickTarget);
+          firePointerEvent('pointerup', clickTarget);
+          fireMouseEvent('mouseup', clickTarget);
+          fireMouseEvent('click', clickTarget);
+          var afterImmediate = probe('after-click-immediate');
+          // Sample state every ~10ms so we can pinpoint when DOM detaches.
+          var timeline = [];
+          for (var step = 0; step < 26; step++) {
+            await new Promise(function (resolve) { setTimeout(resolve, 10); });
+            var snap = window.__ijFindGetPreviewMonacoStateForTests
+              ? window.__ijFindGetPreviewMonacoStateForTests()
+              : null;
+            timeline.push({
+              tMs: Math.round(performance.now() - clickStart),
+              domInHost: !!(snap && snap.domInHost),
+              viewLines: snap && typeof snap.viewLines === 'number' ? snap.viewLines : 0,
+              modelOk: !!(snap && snap.modelOk),
+              disposed: !!(snap && snap.disposed),
+              domErr: snap && snap.domErr || '',
+            });
+            if (snap && !snap.domInHost) { break; }
+          }
+          var afterShortWait = probe('after-click-250ms');
+          await new Promise(function (resolve) { setTimeout(resolve, 750); });
+          var afterLongWait = probe('after-click-1000ms');
+          try { if (hostDetachObserver) { hostDetachObserver.disconnect(); } } catch (eDetachDisc) {}
+          try { if (bodyObserver) { bodyObserver.disconnect(); } } catch (eBodyDisc) {}
+          try { if (rootObserver) { rootObserver.disconnect(); } } catch (eRootDisc) {}
+          // Capture where the editor's DOM ended up.
+          var detachedDomParentChain = [];
+          try {
+            var cursor = dom;
+            while (cursor && cursor.parentNode && detachedDomParentChain.length < 6) {
+              cursor = cursor.parentNode;
+              detachedDomParentChain.push(((cursor && cursor.tagName) ? String(cursor.tagName).toLowerCase() : '#') + '.' + ((cursor && cursor.className) ? String(cursor.className).slice(0, 60) : ''));
+            }
+          } catch (eChain) {}
+          return JSON.stringify({
+            phase: 'measured',
+            mounted: mounted,
+            afterImmediate: afterImmediate,
+            afterShortWait: afterShortWait,
+            afterLongWait: afterLongWait,
+            timeline: timeline,
+            hostMutations: hostMutations.slice(0, 30),
+            bodyMutations: bodyMutations.slice(0, 30),
+            mutationLog: mutationLog,
+            detachedDomParentChain: detachedDomParentChain,
+          });
+        })()`,
+      );
+      const parsed = JSON.parse(raw) as {
+        phase?: string;
+        err?: string;
+        mounted?: { previewMode?: string; hostMounted?: boolean; domInHost?: boolean; viewLines?: number; modelOk?: boolean };
+        afterImmediate?: { domInHost?: boolean; viewLines?: number; modelOk?: boolean };
+        afterShortWait?: { domInHost?: boolean; viewLines?: number; modelOk?: boolean };
+        afterLongWait?: { domInHost?: boolean; viewLines?: number; modelOk?: boolean };
+      };
+      assert.strictEqual(parsed.err, undefined, `expected preview-click probe to run: ${raw}`);
+      assert.strictEqual(parsed.phase, 'measured', `expected probe to complete the mount+click sequence: ${raw}`);
+      assert.strictEqual(parsed.mounted?.previewMode, 'monaco', `preview should mount in Monaco mode before click: ${raw}`);
+      assert.strictEqual(parsed.mounted?.domInHost, true, `editor DOM should be inside the host before click: ${raw}`);
+      assert.strictEqual(parsed.mounted?.modelOk, true, `editor should have a model before click: ${raw}`);
+      // The actual regression assertions: after a click in the preview editor,
+      // its DOM must remain inside our host and its model must stay attached.
+      assert.strictEqual(
+        parsed.afterShortWait?.domInHost,
+        true,
+        `editor DOM should remain inside the host 250ms after a click — workbench takeover regression: ${raw}`,
+      );
+      assert.strictEqual(
+        parsed.afterShortWait?.modelOk,
+        true,
+        `editor model should remain attached 250ms after a click: ${raw}`,
+      );
+      assert.ok(
+        (parsed.afterShortWait?.viewLines ?? 0) > 0,
+        `editor should still render view-lines 250ms after a click: ${raw}`,
+      );
+      assert.strictEqual(
+        parsed.afterLongWait?.domInHost,
+        true,
+        `editor DOM should remain inside the host 1s after a click: ${raw}`,
+      );
+      assert.strictEqual(
+        parsed.afterLongWait?.modelOk,
+        true,
+        `editor model should remain attached 1s after a click: ${raw}`,
+      );
+    } finally {
+      await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== 'PreviewClickSurvivesProbe') { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      try { await overlay.forceReinject(); } catch {}
+      try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
+    }
+  });
+
   test('DOM fallback preview auto-recovers to Monaco for the same file after capture returns', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(20_000);

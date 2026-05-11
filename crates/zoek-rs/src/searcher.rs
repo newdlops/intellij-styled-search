@@ -12,6 +12,7 @@ use crate::verifier::{
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 
 #[derive(Clone, Debug)]
@@ -23,9 +24,9 @@ struct CandidateDocument {
 
 const COMPLETE_CANDIDATE_RANK_BONUS: u16 = 1_000;
 const INCOMPLETE_GRAM_BACKFILL_LIMIT: usize = 1;
-const INCOMPLETE_GRAM_BACKFILL_DOC_LIMIT: usize = 256;
+const INCOMPLETE_GRAM_BACKFILL_DOC_LIMIT: usize = 128;
 const LONG_LITERAL_INCOMPLETE_BACKFILL_CHARS: usize = 512;
-const PARALLEL_VERIFY_THRESHOLD: usize = 512;
+const PARALLEL_VERIFY_THRESHOLD: usize = 128;
 
 pub fn search_workspace(
     request: &SearchRequest,
@@ -90,6 +91,7 @@ where
     let mut verified_files = Vec::new();
     let mut total_files_scanned = 0usize;
     let mut total_matches = 0usize;
+    let mut matched_terms = vec![false; plan.terms.len()];
     let target_matches = request
         .offset
         .saturating_add(request.limit.max(1))
@@ -105,7 +107,7 @@ where
     });
 
     if !stream_files && ordered_candidates.len() >= PARALLEL_VERIFY_THRESHOLD {
-        let (files, scanned, matches) = verify_candidates_parallel(
+        let (files, scanned, matches, term_coverage) = verify_candidates_parallel(
             &ordered_candidates,
             &plan,
             request,
@@ -115,6 +117,7 @@ where
         )?;
         total_files_scanned += scanned;
         total_matches += matches;
+        merge_term_coverage(&mut matched_terms, &term_coverage);
         verified_files.extend(files);
     } else {
         for candidate in ordered_candidates {
@@ -134,11 +137,17 @@ where
                 continue;
             };
             let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
-            let matches = verify_plan_terms(&current.text, &plan, request, remaining_match_budget)
-                .map_err(|err| err.to_string())?;
+            let (matches, term_coverage) = verify_plan_terms_with_coverage(
+                &current.text,
+                &plan,
+                request,
+                remaining_match_budget,
+            )
+            .map_err(|err| err.to_string())?;
             if matches.is_empty() {
                 continue;
             }
+            merge_term_coverage(&mut matched_terms, &term_coverage);
             let file_match_start = total_matches;
             total_matches += matches.len();
             let score = score_file(&candidate.rel_path, &matches);
@@ -163,67 +172,73 @@ where
         }
     }
 
-    if verified_files.is_empty() && !request.use_regex {
-        let has_overlay_tombstones = load_overlay_with_recovery(&layout)
-            .map(|result| {
-                result
-                    .manifest
-                    .latest_entries()
-                    .values()
-                    .any(|entry| entry.tombstone)
-            })
-            .unwrap_or(false);
-        if !has_overlay_tombstones {
-            let fallback = fallback_candidates(workspace_root, request, &mut warnings)
-                .map_err(|err| err.to_string())?;
-            for (rel_path, candidate) in fallback {
-                if candidates.contains_key(&rel_path) {
-                    continue;
-                }
-                if let Some(regex) = &path_regex {
-                    if !regex.is_match(&candidate.rel_path) {
-                        continue;
-                    }
-                }
-                if total_matches >= target_matches {
-                    stopped_early = true;
-                    break;
-                }
-                total_files_scanned += 1;
-                let Some(current) = load_current_text(&candidate.absolute_path, config)
-                    .map_err(|err| err.to_string())?
-                else {
-                    continue;
-                };
-                let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
-                let matches =
-                    verify_plan_terms(&current.text, &plan, request, remaining_match_budget)
-                        .map_err(|err| err.to_string())?;
-                if matches.is_empty() {
-                    continue;
-                }
-                let file_match_start = total_matches;
-                total_matches += matches.len();
-                let score = score_file(&candidate.rel_path, &matches);
-                let file_result = build_file_result(
-                    candidate.rel_path.clone(),
-                    current.byte_len,
-                    current.modified_unix_secs,
-                    score,
-                    matches,
-                );
-                if stream_files {
-                    if let Some(paged_file) = page_file_by_global_match_offset(
-                        &file_result,
-                        file_match_start,
-                        request.offset,
-                        request.limit,
-                    ) {
-                        on_file(&paged_file)?;
-                    }
-                }
-                verified_files.push(file_result);
+    if let Some(fallback_request) =
+        literal_fallback_request_for_missing_terms(request, &plan, &matched_terms)
+    {
+        let latest_overlay = load_overlay_with_recovery(&layout)
+            .map(|result| result.manifest.latest_entries())
+            .unwrap_or_default();
+        let fallback = fallback_candidates(workspace_root, &fallback_request, &mut warnings)
+            .map_err(|err| err.to_string())?;
+        for (rel_path, candidate) in fallback {
+            if candidates.contains_key(&rel_path) {
+                continue;
             }
+            if latest_overlay
+                .get(&rel_path)
+                .map(|entry| entry.tombstone)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if let Some(regex) = &path_regex {
+                if !regex.is_match(&candidate.rel_path) {
+                    continue;
+                }
+            }
+            if total_matches >= target_matches {
+                stopped_early = true;
+                break;
+            }
+            total_files_scanned += 1;
+            let Some(current) = load_current_text(&candidate.absolute_path, config)
+                .map_err(|err| err.to_string())?
+            else {
+                continue;
+            };
+            let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
+            let (matches, term_coverage) = verify_plan_terms_with_coverage(
+                &current.text,
+                &plan,
+                request,
+                remaining_match_budget,
+            )
+            .map_err(|err| err.to_string())?;
+            if matches.is_empty() {
+                continue;
+            }
+            merge_term_coverage(&mut matched_terms, &term_coverage);
+            let file_match_start = total_matches;
+            total_matches += matches.len();
+            let score = score_file(&candidate.rel_path, &matches);
+            let file_result = build_file_result(
+                candidate.rel_path.clone(),
+                current.byte_len,
+                current.modified_unix_secs,
+                score,
+                matches,
+            );
+            if stream_files {
+                if let Some(paged_file) = page_file_by_global_match_offset(
+                    &file_result,
+                    file_match_start,
+                    request.offset,
+                    request.limit,
+                ) {
+                    on_file(&paged_file)?;
+                }
+            }
+            verified_files.push(file_result);
         }
     }
 
@@ -437,12 +452,21 @@ fn candidate_doc_ranks(
         let mut term_ids: Option<BTreeSet<u32>> = None;
         let mut incomplete_sets = Vec::new();
         let mut incomplete_hit_counts = BTreeMap::<u32, u16>::new();
+        let has_literal_special_gram = term
+            .required_grams
+            .iter()
+            .any(|gram| gram.contains("://") || gram.contains(':'));
         for gram in &term.required_grams {
             let posting = reader.find_posting(gram)?;
             let ids = posting
                 .map(|posting| posting.doc_ids.into_iter().collect::<BTreeSet<_>>())
                 .unwrap_or_default();
-            if !incomplete_ids.is_empty() && ids.len() <= INCOMPLETE_GRAM_BACKFILL_DOC_LIMIT {
+            let allow_incomplete_backfill =
+                !has_literal_special_gram || gram.contains("://") || gram.contains(':');
+            if allow_incomplete_backfill
+                && !incomplete_ids.is_empty()
+                && ids.len() <= INCOMPLETE_GRAM_BACKFILL_DOC_LIMIT
+            {
                 let incomplete_docs = ids
                     .intersection(&incomplete_ids)
                     .copied()
@@ -542,29 +566,34 @@ fn overlay_matches_plan(
     })
 }
 
-fn verify_plan_terms(
+fn verify_plan_terms_with_coverage(
     text: &str,
     plan: &crate::planner::QueryPlan,
     request: &SearchRequest,
     limit: usize,
-) -> Result<Vec<SearchMatch>, regex::Error> {
+) -> Result<(Vec<SearchMatch>, Vec<bool>), regex::Error> {
     let mut matches = Vec::new();
-    for term in &plan.terms {
-        match plan.mode {
-            QueryMode::Literal => matches.extend(verify_literal(
+    let mut matched_terms = vec![false; plan.terms.len()];
+    for (term_idx, term) in plan.terms.iter().enumerate() {
+        let term_matches = match plan.mode {
+            QueryMode::Literal => verify_literal(
                 text,
                 &term.query,
                 request.case_sensitive,
                 request.whole_word,
                 limit,
-            )),
-            QueryMode::Regex => matches.extend(verify_regex(
+            ),
+            QueryMode::Regex => verify_regex(
                 text,
                 &term.effective_query,
                 request.case_sensitive,
                 request.regex_multiline,
                 limit,
-            )?),
+            )?,
+        };
+        if !term_matches.is_empty() {
+            matched_terms[term_idx] = true;
+            matches.extend(term_matches);
         }
     }
     matches.sort_by(|left, right| {
@@ -584,7 +613,46 @@ fn verify_plan_terms(
     if matches.len() > limit {
         matches.truncate(limit);
     }
-    Ok(matches)
+    Ok((matches, matched_terms))
+}
+
+fn merge_term_coverage(target: &mut [bool], source: &[bool]) {
+    for (idx, value) in source.iter().enumerate() {
+        if *value {
+            if let Some(target_value) = target.get_mut(idx) {
+                *target_value = true;
+            }
+        }
+    }
+}
+
+fn literal_fallback_request_for_missing_terms(
+    request: &SearchRequest,
+    plan: &crate::planner::QueryPlan,
+    matched_terms: &[bool],
+) -> Option<SearchRequest> {
+    if request.use_regex || plan.mode != QueryMode::Literal || plan.terms.is_empty() {
+        return None;
+    }
+    let missing_terms = plan
+        .terms
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, term)| {
+            if matched_terms.get(idx).copied().unwrap_or(false) {
+                None
+            } else {
+                Some(term.query.clone())
+            }
+        })
+        .collect::<Vec<_>>();
+    if missing_terms.is_empty() {
+        return None;
+    }
+    let mut fallback_request = request.clone();
+    fallback_request.query = missing_terms[0].clone();
+    fallback_request.query_terms = missing_terms[1..].to_vec();
+    Some(fallback_request)
 }
 
 fn verify_candidates_parallel(
@@ -594,7 +662,7 @@ fn verify_candidates_parallel(
     config: &EngineConfig,
     path_regex: Option<Regex>,
     per_file_limit: usize,
-) -> Result<(Vec<SearchFileResult>, usize, usize), String> {
+) -> Result<(Vec<SearchFileResult>, usize, usize, Vec<bool>), String> {
     let worker_count = thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(4)
@@ -613,10 +681,11 @@ fn verify_candidates_parallel(
         let config = config.clone();
         let path_regex = path_regex.clone();
         handles.push(thread::spawn(
-            move || -> Result<(Vec<SearchFileResult>, usize, usize), String> {
+            move || -> Result<(Vec<SearchFileResult>, usize, usize, Vec<bool>), String> {
                 let mut files = Vec::new();
                 let mut scanned = 0usize;
                 let mut total_matches = 0usize;
+                let mut matched_terms = vec![false; plan.terms.len()];
                 for candidate in chunk {
                     if let Some(regex) = &path_regex {
                         if !regex.is_match(&candidate.rel_path) {
@@ -629,11 +698,17 @@ fn verify_candidates_parallel(
                     else {
                         continue;
                     };
-                    let matches = verify_plan_terms(&current.text, &plan, &request, per_file_limit)
-                        .map_err(|err| err.to_string())?;
+                    let (matches, term_coverage) = verify_plan_terms_with_coverage(
+                        &current.text,
+                        &plan,
+                        &request,
+                        per_file_limit,
+                    )
+                    .map_err(|err| err.to_string())?;
                     if matches.is_empty() {
                         continue;
                     }
+                    merge_term_coverage(&mut matched_terms, &term_coverage);
                     total_matches += matches.len();
                     let score = score_file(&candidate.rel_path, &matches);
                     files.push(build_file_result(
@@ -644,7 +719,7 @@ fn verify_candidates_parallel(
                         matches,
                     ));
                 }
-                Ok((files, scanned, total_matches))
+                Ok((files, scanned, total_matches, matched_terms))
             },
         ));
     }
@@ -652,15 +727,17 @@ fn verify_candidates_parallel(
     let mut files = Vec::new();
     let mut scanned = 0usize;
     let mut total_matches = 0usize;
+    let mut matched_terms = vec![false; plan.terms.len()];
     for handle in handles {
-        let (chunk_files, chunk_scanned, chunk_matches) = handle
+        let (chunk_files, chunk_scanned, chunk_matches, chunk_term_coverage) = handle
             .join()
             .map_err(|_| "parallel verifier worker panicked".to_string())??;
         files.extend(chunk_files);
         scanned += chunk_scanned;
         total_matches += chunk_matches;
+        merge_term_coverage(&mut matched_terms, &chunk_term_coverage);
     }
-    Ok((files, scanned, total_matches))
+    Ok((files, scanned, total_matches, matched_terms))
 }
 
 fn fallback_candidates(
@@ -668,6 +745,31 @@ fn fallback_candidates(
     request: &SearchRequest,
     warnings: &mut Vec<String>,
 ) -> std::io::Result<BTreeMap<String, CandidateDocument>> {
+    if let Some(rel_path) = request
+        .path_regex
+        .as_deref()
+        .and_then(exact_path_from_regex)
+    {
+        if !matches_path_filters(&rel_path, &request.include, &request.exclude) {
+            return Ok(BTreeMap::new());
+        }
+        let absolute_path = workspace_root.join(&rel_path);
+        if !absolute_path.is_file() {
+            return Ok(BTreeMap::new());
+        }
+        warnings.push("search fallback checked exact path regex only".to_string());
+        return Ok(BTreeMap::from([(
+            rel_path.clone(),
+            CandidateDocument {
+                rel_path,
+                absolute_path,
+                rank: 0,
+            },
+        )]));
+    }
+    if let Some(candidates) = rg_literal_fallback_candidates(workspace_root, request, warnings)? {
+        return Ok(candidates);
+    }
     let (entries, _) = discover_text_files(workspace_root, &EngineConfig::default())?;
     warnings.push("search fallback scanned the current text corpus".to_string());
     let path_regex = request
@@ -698,9 +800,124 @@ fn fallback_candidates(
         .collect())
 }
 
+fn rg_literal_fallback_candidates(
+    workspace_root: &Path,
+    request: &SearchRequest,
+    warnings: &mut Vec<String>,
+) -> std::io::Result<Option<BTreeMap<String, CandidateDocument>>> {
+    let literal_terms = request.all_query_terms();
+    if request.use_regex
+        || literal_terms.is_empty()
+        || literal_terms.iter().any(|term| term.contains('\n'))
+    {
+        return Ok(None);
+    }
+    let mut args = vec![
+        "--files-with-matches",
+        "--fixed-strings",
+        "--hidden",
+        "--no-ignore",
+        "--no-ignore-parent",
+        "--text",
+        "--glob",
+        "!.zoek-rs/**",
+        "--glob",
+        "!.zoekt-rs/**",
+    ];
+    if !request.case_sensitive {
+        args.push("--ignore-case");
+    }
+    if request.whole_word {
+        args.push("--word-regexp");
+    }
+    for term in &literal_terms {
+        args.push("-e");
+        args.push(term);
+    }
+    args.push("--");
+    args.push(".");
+    let output = match Command::new("rg")
+        .current_dir(workspace_root)
+        .args(args)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Ok(None);
+    }
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(stdout) => stdout,
+        Err(_) => return Ok(None),
+    };
+    let path_regex = request
+        .path_regex
+        .as_deref()
+        .map(Regex::new)
+        .transpose()
+        .map_err(std::io::Error::other)?;
+    let mut out = BTreeMap::new();
+    for line in stdout.lines() {
+        let rel_path = line
+            .trim()
+            .strip_prefix("./")
+            .unwrap_or_else(|| line.trim())
+            .replace('\\', "/");
+        if rel_path.is_empty()
+            || !matches_path_filters(&rel_path, &request.include, &request.exclude)
+        {
+            continue;
+        }
+        if path_regex
+            .as_ref()
+            .map(|regex| !regex.is_match(&rel_path))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        out.insert(
+            rel_path.clone(),
+            CandidateDocument {
+                absolute_path: workspace_root.join(&rel_path),
+                rel_path,
+                rank: 0,
+            },
+        );
+    }
+    warnings.push("search fallback used ripgrep literal prefilter".to_string());
+    Ok(Some(out))
+}
+
+fn exact_path_from_regex(pattern: &str) -> Option<String> {
+    let inner = pattern.strip_prefix('^')?.strip_suffix('$')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            let escaped = chars.next()?;
+            out.push(escaped);
+            continue;
+        }
+        if matches!(
+            ch,
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
+        ) {
+            return None;
+        }
+        out.push(ch);
+    }
+    if out.is_empty() || out.contains('\0') || out.starts_with('/') || out.contains("..") {
+        None
+    } else {
+        Some(out.replace('\\', "/"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::search_workspace;
+    use super::{exact_path_from_regex, search_workspace};
     use crate::config::EngineConfig;
     use crate::indexer::index_directory;
     use crate::mmap_store::StoreLayout;
@@ -747,6 +964,16 @@ mod tests {
     }
 
     #[test]
+    fn exact_path_regex_is_decoded_for_targeted_fallback() {
+        assert_eq!(
+            exact_path_from_regex(r"^ijss\-e2e\-incremental\-123\.txt$").as_deref(),
+            Some("ijss-e2e-incremental-123.txt")
+        );
+        assert_eq!(exact_path_from_regex(r"^src/.*\.rs$"), None);
+        assert_eq!(exact_path_from_regex(r"^../secret$"), None);
+    }
+
+    #[test]
     fn search_workspace_uses_shards_for_literal_or_queries() -> io::Result<()> {
         let root = temp_dir("searcher-or");
         fs::create_dir_all(root.join("src"))?;
@@ -785,6 +1012,51 @@ mod tests {
             response.total_files_scanned < 3,
             "OR query should union selective shard candidates instead of scanning every file; scanned {} files",
             response.total_files_scanned,
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn literal_or_fallback_covers_query_terms_missing_from_sampled_index() -> io::Result<()> {
+        let root = temp_dir("searcher-or-fallback");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/a.txt"), "AlphaIndexedTerm\n")?;
+
+        let mut sampled_gap = "x".repeat(30 * 1024);
+        sampled_gap.push_str("BetaFallbackTerm\n");
+        sampled_gap.push_str(&"y".repeat(70 * 1024));
+        fs::write(root.join("src/b.txt"), sampled_gap)?;
+        index_directory(&root, &EngineConfig::default())?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "AlphaIndexedTerm".to_string(),
+                query_terms: vec!["BetaFallbackTerm".to_string()],
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec!["src/*".to_string()],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &EngineConfig::default(),
+        )
+        .map_err(io::Error::other)?;
+        let rel_paths = response
+            .files
+            .iter()
+            .map(|file| file.rel_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(rel_paths.contains(&"src/a.txt"));
+        assert!(
+            rel_paths.contains(&"src/b.txt"),
+            "missing query_terms must trigger a literal fallback even when the primary query matched"
         );
 
         fs::remove_dir_all(root)?;
@@ -834,6 +1106,112 @@ mod tests {
         assert!(
             response.total_files_scanned < 10,
             "expected multiline literal planning to avoid scanning the whole workspace; scanned {} files",
+            response.total_files_scanned,
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn short_prefix_literals_do_not_force_full_scan_when_bounded_terms_select() -> io::Result<()> {
+        let root = temp_dir("short-prefix-literal");
+        fs::create_dir_all(root.join("src"))?;
+        let prefix = (0..120)
+            .map(|idx| format!("unique_prefix_token_{idx}_with_suffix_{idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            root.join("src/target.py"),
+            format!("{prefix}\nfingerprintMatch = fp == b\"85:25:04:32:58:55:96:9f:57:ee:fb:a8:1a:ea:69:da\"\n"),
+        )?;
+        for idx in 0..40 {
+            fs::write(
+                root.join("src").join(format!("noise-{idx}.py")),
+                format!("fingerprintMatch = other_{idx}\n"),
+            )?;
+        }
+        let mut config = EngineConfig::default();
+        config.max_grams_per_file = 16;
+        index_directory(&root, &config)?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "tch = fp == b\"85:25:04:32:58:55:96:9f:57:ee:fb:a8".to_string(),
+                query_terms: Vec::new(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec![],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &config,
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(response.total_files_matched, 1);
+        assert_eq!(response.files[0].rel_path, "src/target.py");
+        assert!(
+            response.total_files_scanned < 10,
+            "short unbounded prefix should not drop the indexed target and trigger full scan; scanned {}",
+            response.total_files_scanned,
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn small_overflow_files_keep_late_sampled_grams_searchable() -> io::Result<()> {
+        let root = temp_dir("small-overflow-late-sample");
+        fs::create_dir_all(root.join("src"))?;
+        let prefix = (0..160)
+            .map(|idx| format!("unique_prefix_token_{idx}_with_suffix_{idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            root.join("src/target.py"),
+            format!(
+                "{prefix}\nstart_date = datetime.datetime.strptime(_start_date, \"%Y-%m-%d\").date()\n"
+            ),
+        )?;
+        for idx in 0..40 {
+            fs::write(
+                root.join("src").join(format!("noise-{idx}.py")),
+                format!("unique_noise_token_{idx}_with_suffix_{idx}\n"),
+            )?;
+        }
+        let mut config = EngineConfig::default();
+        config.max_grams_per_file = 16;
+        index_directory(&root, &config)?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "time.datetime.strptime(_start_date, \"%Y-%m-%d\").date(".to_string(),
+                query_terms: Vec::new(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec![],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &config,
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(response.total_files_matched, 1);
+        assert_eq!(response.files[0].rel_path, "src/target.py");
+        assert!(
+            response.total_files_scanned < 20,
+            "small overflow files should keep late sampled grams and avoid full scan; scanned {}",
             response.total_files_scanned,
         );
 

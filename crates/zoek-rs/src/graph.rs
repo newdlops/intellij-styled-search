@@ -394,14 +394,13 @@ where
             ),
         });
         let (resolved, symbol_bytes) = thread::scope(|scope| {
-            let symbol_writer = scope.spawn(|| {
-                write_symbol_index(workspace_root, &symbols, built_at_unix_ms, config)
-            });
+            let symbol_writer = scope
+                .spawn(|| write_symbol_index(workspace_root, &symbols, built_at_unix_ms, config));
             let resolved =
                 resolve_native_graph_references_grouped(parsed_files, &symbols, workers, progress);
-            let symbol_bytes = symbol_writer
-                .join()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "graph symbol writer panicked"))??;
+            let symbol_bytes = symbol_writer.join().map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "graph symbol writer panicked")
+            })??;
             Ok::<_, io::Error>((resolved, symbol_bytes))
         })?;
         progress(GraphRebuildProgress {
@@ -7335,14 +7334,7 @@ fn write_native_graph_symbol_record(
 ) -> io::Result<()> {
     let canonical_id = canonical_native_graph_symbol_id(symbol);
     let stores_canonical_id = symbol.id == canonical_id;
-    put_string(
-        out,
-        if stores_canonical_id {
-            ""
-        } else {
-            &symbol.id
-        },
-    )?;
+    put_string(out, if stores_canonical_id { "" } else { &symbol.id })?;
     put_string(out, &symbol.name)?;
     put_string(
         out,
@@ -7362,9 +7354,9 @@ fn write_native_graph_symbol_record(
         out,
         if !stores_canonical_id
             && id_parts
-            .as_ref()
-            .map(|(language, _, _)| *language == symbol.language.as_str())
-            .unwrap_or(false)
+                .as_ref()
+                .map(|(language, _, _)| *language == symbol.language.as_str())
+                .unwrap_or(false)
         {
             ""
         } else {
@@ -7376,9 +7368,9 @@ fn write_native_graph_symbol_record(
         out,
         if !stores_canonical_id
             && id_parts
-            .as_ref()
-            .map(|(_, rel_path, _)| *rel_path == symbol.rel_path.as_str())
-            .unwrap_or(false)
+                .as_ref()
+                .map(|(_, rel_path, _)| *rel_path == symbol.rel_path.as_str())
+                .unwrap_or(false)
         {
             ""
         } else {
@@ -7606,10 +7598,11 @@ fn read_references(
     let mut last_enclosing_symbol_id = String::new();
     for idx in 0..count {
         let name = read_delta_string(payload, &mut cursor, &mut last_name)?;
-        let raw_text = match read_delta_string_allow_empty(payload, &mut cursor, &mut last_raw_text)? {
-            value if value.is_empty() => name.clone(),
-            value => value,
-        };
+        let raw_text =
+            match read_delta_string_allow_empty(payload, &mut cursor, &mut last_raw_text)? {
+                value if value.is_empty() => name.clone(),
+                value => value,
+            };
         let uri = read_string(payload, &mut cursor)?;
         let rel_path = read_delta_string(payload, &mut cursor, &mut last_rel_path)?;
         let uri = if uri.is_empty() {

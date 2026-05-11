@@ -57,7 +57,7 @@ const AUTO_BASE_REFRESH_MIN_INTERVAL_MS = 60_000;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
 const ZOEKT_PROGRESS_PREFIX = '__ZOEK_PROGRESS__';
 const ZOEKT_SEARCH_EVENT_PREFIX = '__ZOEK_SEARCH__';
-const ZOEKT_SCHEMA_VERSION = 10;
+const ZOEKT_SCHEMA_VERSION = 17;
 const ZOEKT_UPDATE_IGNORED_DIR_NAMES = new Set([
   '.zoek-rs',
   '.zoekt-rs',
@@ -131,6 +131,9 @@ export class ZoektRuntime implements vscode.Disposable {
   private pendingRenames: QueuedRename[] = [];
   private readonly activeChildren = new Map<number, TrackedChild>();
   private readonly lastAutoBaseRefreshAt = new Map<string, number>();
+  private workspaceSyncNeeded = false;
+  private readonly lastWorkspaceSyncAt = new Map<string, number>();
+  private readonly lastGitState = new Map<string, string>();
   private nextChildId = 1;
   private disposed = false;
   private externalSweepPromise: Promise<void> | undefined;
@@ -374,6 +377,7 @@ export class ZoektRuntime implements vscode.Disposable {
     if (!binary) {
       return { ready: false, reason: 'zoek-rs binary disappeared' };
     }
+    await this.syncWorkspaceIndexIfNeeded(workspaceRoot, binary, 'search');
     if (this.hasPendingUpdates()) {
       await this.flushPendingUpdates();
     }
@@ -973,6 +977,177 @@ export class ZoektRuntime implements vscode.Disposable {
     ) {
       this.scheduleFlush();
     }
+  }
+
+  private async syncWorkspaceIndexIfNeeded(
+    workspaceRoot: string,
+    binary: string,
+    reason: string,
+  ): Promise<void> {
+    if (this.disposed || !this.shouldRunIncrementalFileUpdates()) { return; }
+    if (this.getConfiguredEngine() !== 'zoekt') { return; }
+    const gitState = await this.readGitState(workspaceRoot);
+    const previousGitState = this.lastGitState.get(workspaceRoot);
+    if (!this.workspaceSyncNeeded && (!gitState || previousGitState === gitState)) {
+      if (gitState && previousGitState === undefined) {
+        this.lastGitState.set(workspaceRoot, gitState);
+      }
+      return;
+    }
+    if (!await this.hasReadyIndex(workspaceRoot)) { return; }
+
+    const previousHead = previousGitState ? this.gitHeadFromState(previousGitState) : undefined;
+    const currentHead = gitState ? this.gitHeadFromState(gitState) : undefined;
+    const changes = previousHead && currentHead && previousHead !== currentHead
+      ? await this.collectGitBranchChanges(workspaceRoot, previousHead, currentHead)
+      : null;
+    const started = Date.now();
+    try {
+      if (changes && (changes.changed.length > 0 || changes.deleted.length > 0 || changes.renamed.length > 0)) {
+        await this.invokeJson(this.buildUpdateArgs(binary, workspaceRoot, changes), this.lifecycleCts.token);
+      } else if (this.workspaceSyncNeeded) {
+        await this.invokeJson([binary, 'update', workspaceRoot, '--sync'], this.lifecycleCts.token);
+      }
+      this.lastWorkspaceSyncAt.set(workspaceRoot, Date.now());
+      if (gitState) {
+        this.lastGitState.set(workspaceRoot, gitState);
+      }
+      this.workspaceSyncNeeded = false;
+      this.log.appendLine(`zoek-rs workspace sync complete: reason=${reason} elapsed=${Date.now() - started}ms`);
+    } catch (err) {
+      if (err instanceof ProcessCancelledError) { return; }
+      this.log.appendLine(`zoek-rs workspace sync failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  private buildUpdateArgs(
+    binary: string,
+    workspaceRoot: string,
+    changes: { changed: string[]; deleted: string[]; renamed: QueuedRename[] },
+  ): string[] {
+    const args = [binary, 'update', workspaceRoot];
+    for (const relPath of changes.changed) {
+      args.push(relPath);
+    }
+    for (const relPath of changes.deleted) {
+      args.push('--delete', relPath);
+    }
+    for (const rename of changes.renamed) {
+      args.push('--rename', rename.oldRelPath, rename.newRelPath);
+    }
+    return args;
+  }
+
+  private async readGitState(workspaceRoot: string): Promise<string | null> {
+    const gitDir = await this.resolveGitDir(workspaceRoot);
+    if (!gitDir) { return null; }
+    try {
+      const headPath = path.join(gitDir, 'HEAD');
+      const head = (await fs.promises.readFile(headPath, 'utf8')).trim();
+      let ref = '';
+      const match = /^ref:\s+(.+)$/.exec(head);
+      if (match) {
+        const refPath = path.join(gitDir, match[1]);
+        try {
+          ref = (await fs.promises.readFile(refPath, 'utf8')).trim();
+        } catch {
+          ref = await this.readPackedRef(gitDir, match[1]) ?? '';
+        }
+      } else {
+        ref = head;
+      }
+      return `HEAD ${head}\nREF ${ref}`;
+    } catch {
+      return null;
+    }
+  }
+
+  private async resolveGitDir(workspaceRoot: string): Promise<string | null> {
+    const gitPath = path.join(workspaceRoot, '.git');
+    try {
+      const stat = await fs.promises.stat(gitPath);
+      if (stat.isDirectory()) { return gitPath; }
+      if (!stat.isFile()) { return null; }
+      const text = await fs.promises.readFile(gitPath, 'utf8');
+      const match = /^gitdir:\s*(.+)\s*$/m.exec(text);
+      if (!match) { return null; }
+      return path.resolve(workspaceRoot, match[1]);
+    } catch {
+      return null;
+    }
+  }
+
+  private async readPackedRef(gitDir: string, refName: string): Promise<string | null> {
+    try {
+      const text = await fs.promises.readFile(path.join(gitDir, 'packed-refs'), 'utf8');
+      for (const line of text.split(/\r?\n/)) {
+        if (!line || line.startsWith('#') || line.startsWith('^')) { continue; }
+        const [hash, ref] = line.trim().split(/\s+/, 2);
+        if (ref === refName && /^[0-9a-f]{40}$/i.test(hash)) {
+          return hash;
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  private gitHeadFromState(state: string): string | undefined {
+    const refMatch = /^REF ([0-9a-f]{40})$/im.exec(state);
+    if (refMatch) { return refMatch[1]; }
+    const headMatch = /^HEAD ([0-9a-f]{40})$/im.exec(state);
+    return headMatch?.[1];
+  }
+
+  private async collectGitBranchChanges(
+    workspaceRoot: string,
+    previousHead: string,
+    currentHead: string,
+  ): Promise<{ changed: string[]; deleted: string[]; renamed: QueuedRename[] } | null> {
+    const result = await this.invokeText([
+      'git',
+      'diff',
+      '--name-status',
+      '-z',
+      '--find-renames',
+      previousHead,
+      currentHead,
+    ], workspaceRoot, this.lifecycleCts.token);
+    if (result.cancelled || result.code !== 0) {
+      return null;
+    }
+    return this.parseGitNameStatusZ(result.stdout);
+  }
+
+  private parseGitNameStatusZ(stdout: string): { changed: string[]; deleted: string[]; renamed: QueuedRename[] } {
+    const parts = stdout.split('\0').filter((part) => part.length > 0);
+    const changed: string[] = [];
+    const deleted: string[] = [];
+    const renamed: QueuedRename[] = [];
+    for (let idx = 0; idx < parts.length;) {
+      const status = parts[idx++] ?? '';
+      const code = status[0] ?? '';
+      if (code === 'R' || code === 'C') {
+        const oldRelPath = parts[idx++];
+        const newRelPath = parts[idx++];
+        if (oldRelPath && newRelPath) {
+          renamed.push({
+            oldRelPath: this.normalizeRelativePath(oldRelPath),
+            newRelPath: this.normalizeRelativePath(newRelPath),
+          });
+        }
+        continue;
+      }
+      const relPath = parts[idx++];
+      if (!relPath) { continue; }
+      const normalized = this.normalizeRelativePath(relPath);
+      if (this.isIgnoredRelativePath(normalized)) { continue; }
+      if (code === 'D') {
+        deleted.push(normalized);
+      } else {
+        changed.push(normalized);
+      }
+    }
+    return { changed, deleted, renamed };
   }
 
   private clearPending(): void {

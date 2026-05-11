@@ -38,103 +38,18 @@
     "commands": [
       {
         "command": "intellijStyledSearch.searchInProject",
-        "title": "Find in Path (IntelliJ Style)",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.searchSelection",
-        "title": "Find Selection in Project",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.reinject",
-        "title": "Reinject Renderer Patch (Uses CDP)",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.stopMonacoCapture",
-        "title": "Stop Monaco Capture (Safe)",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.recoverRendererUi",
-        "title": "Recover VS Code UI Responsiveness (Safe)",
+        "title": "Search",
         "category": "IntelliJ Search"
       },
       {
         "command": "intellijStyledSearch.rebuildIndex",
-        "title": "Rebuild Search Index",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.switchEngine",
-        "title": "Switch Search Engine",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.showZoektInfo",
-        "title": "Show Zoekt Diagnostics",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.explainZoektQuery",
-        "title": "Explain Query With Zoekt",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.diagnoseFileInIndex",
-        "title": "Diagnose Active File in Search Index",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.rebuildCallGraph",
-        "title": "Rebuild Call Graph",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.forceRebuildCallGraph",
-        "title": "Force Rebuild Call Graph",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.showCallGraphInfo",
-        "title": "Show Call Graph Info",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.findCallers",
-        "title": "Find Callers",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.findCallees",
-        "title": "Find Callees",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.findImplementations",
-        "title": "Find Implementations",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.findUsages",
-        "title": "Find Usages",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.startMcpServer",
-        "title": "Start Codeidx MCP Server",
-        "category": "IntelliJ Search"
-      },
-      {
-        "command": "intellijStyledSearch.stopMcpServer",
-        "title": "Stop Codeidx MCP Server",
+        "title": "Force Rebuild Search + Graph Index",
         "category": "IntelliJ Search"
       }
     ],
     "keybindings": [
       {
-        "command": "intellijStyledSearch.searchSelection",
+        "command": "intellijStyledSearch.searchInProject",
         "key": "ctrl+shift+alt+f",
         "mac": "cmd+shift+alt+f",
         "when": "editorTextFocus"
@@ -157,11 +72,6 @@
           "submenu": "intellijStyledSearch.editorContext",
           "when": "editorTextFocus",
           "group": "navigation@98"
-        },
-        {
-          "command": "intellijStyledSearch.searchSelection",
-          "when": "editorHasSelection",
-          "group": "navigation@99"
         }
       ],
       "intellijStyledSearch.editorContext": [
@@ -170,73 +80,8 @@
           "group": "1_search@1"
         },
         {
-          "command": "intellijStyledSearch.searchSelection",
-          "when": "editorHasSelection",
-          "group": "1_search@2"
-        },
-        {
-          "command": "intellijStyledSearch.findCallees",
-          "group": "2_callGraph@2"
-        },
-        {
-          "command": "intellijStyledSearch.findImplementations",
-          "group": "2_callGraph@3"
-        },
-        {
-          "command": "intellijStyledSearch.findUsages",
-          "group": "2_callGraph@4"
-        },
-        {
-          "command": "intellijStyledSearch.rebuildCallGraph",
-          "group": "2_callGraph@5"
-        },
-        {
-          "command": "intellijStyledSearch.forceRebuildCallGraph",
-          "group": "2_callGraph@6"
-        },
-        {
-          "command": "intellijStyledSearch.showCallGraphInfo",
-          "group": "2_callGraph@7"
-        },
-        {
-          "command": "intellijStyledSearch.startMcpServer",
-          "group": "3_mcp@1"
-        },
-        {
-          "command": "intellijStyledSearch.stopMcpServer",
-          "group": "3_mcp@2"
-        },
-        {
           "command": "intellijStyledSearch.rebuildIndex",
-          "group": "4_index@1"
-        },
-        {
-          "command": "intellijStyledSearch.switchEngine",
-          "group": "4_index@2"
-        },
-        {
-          "command": "intellijStyledSearch.showZoektInfo",
-          "group": "4_index@3"
-        },
-        {
-          "command": "intellijStyledSearch.explainZoektQuery",
-          "group": "4_index@4"
-        },
-        {
-          "command": "intellijStyledSearch.diagnoseFileInIndex",
-          "group": "4_index@5"
-        },
-        {
-          "command": "intellijStyledSearch.reinject",
-          "group": "5_recovery@1"
-        },
-        {
-          "command": "intellijStyledSearch.stopMonacoCapture",
-          "group": "5_recovery@2"
-        },
-        {
-          "command": "intellijStyledSearch.recoverRendererUi",
-          "group": "5_recovery@3"
+          "group": "1_search@2"
         }
       ]
     },
