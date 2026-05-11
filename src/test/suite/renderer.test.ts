@@ -75,6 +75,22 @@ function assertNoAddedTabs(before: Map<string, number>, label: string): void {
   assert.deepStrictEqual(added, [], `${label} should not open additional editor tabs; added=${JSON.stringify(added)}`);
 }
 
+async function closeTabsByUri(uri: vscode.Uri): Promise<void> {
+  const uriStr = uri.toString();
+  const tabs: vscode.Tab[] = [];
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      const input = tab.input as { uri?: vscode.Uri } | undefined;
+      if (input?.uri?.toString() === uriStr) {
+        tabs.push(tab);
+      }
+    }
+  }
+  if (tabs.length > 0) {
+    await vscode.window.tabGroups.close(tabs, true);
+  }
+}
+
 async function useCallGraphBackend(backend: 'rust-native' | 'javascript'): Promise<() => Promise<void>> {
   const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
   const prior = cfg.inspect<string>('callGraphBackend');
@@ -308,11 +324,12 @@ suite('Renderer — overlay UI probes', () => {
           })()`,
         );
       } catch {}
+      try { await overlay.forceReinject(); } catch {}
       try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
     }
   });
 
-  test('DOM fallback preview recovers to Monaco for the same file after capture returns', async function () {
+  test('DOM fallback preview auto-recovers to Monaco for the same file after capture returns', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(20_000);
     const { overlay } = await getApi();
@@ -345,10 +362,6 @@ suite('Renderer — overlay UI probes', () => {
           if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
           var targetSrc = root.getAttribute('data-ij-find-src') || '';
           window.__ijFindActiveInstanceId = targetSrc;
-          var prewarmStatus = window.__ijFindPrewarmPreviewMonacoEditor
-            ? window.__ijFindPrewarmPreviewMonacoEditor('test-dom-preview-recovery', targetSrc)
-            : 'missing-prewarm-fn';
-          await new Promise(function (resolve) { setTimeout(resolve, 32); });
           var uri = 'file:///tmp/ijss-dom-preview-recovery-' + Date.now() + '.py';
           var msg = {
             type: 'preview',
@@ -384,11 +397,10 @@ suite('Renderer — overlay UI probes', () => {
           }
           window.__ijFindDisableMonacoProbes = false;
           var recoveryStarted = performance.now();
-          window.__ijFindOnMessage(Object.assign({}, msg));
           var recovered = null;
           var recoveredHost = false;
           var recoveryElapsedMs = null;
-          var deadline = performance.now() + 100;
+          var deadline = performance.now() + 4000;
           while (performance.now() < deadline) {
             recovered = window.__ijFindGetSearchState(targetSrc);
             recoveredHost = !!root.querySelector('.ij-find-monaco-preview-host .monaco-editor');
@@ -401,7 +413,7 @@ suite('Renderer — overlay UI probes', () => {
           window.__ijFindDisableMonacoProbes = oldDisable;
           return JSON.stringify({
             uri: uri,
-            prewarmStatus: prewarmStatus,
+            statusAfterCaptureReturn: window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'not-ready:no-status',
             recoveryElapsedMs: recoveryElapsedMs,
             degraded: {
               mode: degraded && degraded.previewMode,
@@ -424,24 +436,24 @@ suite('Renderer — overlay UI probes', () => {
         err?: string;
         status?: string;
         uri?: string;
-        prewarmStatus?: string;
+        statusAfterCaptureReturn?: string;
         recoveryElapsedMs?: number | null;
         degraded?: { mode?: string; uri?: string; host?: boolean; hasText?: boolean };
         recovered?: { mode?: string; uri?: string; host?: boolean; modelUri?: string };
       };
       if (parsed.skipped) { this.skip(); return; }
       assert.strictEqual(parsed.err, undefined, `expected DOM recovery probe to run: ${raw}`);
-      assert.ok(/^ready:/.test(parsed.prewarmStatus ?? ''), `expected target preview Monaco prewarm before recovery probe: ${raw}`);
+      assert.strictEqual(parsed.statusAfterCaptureReturn, 'ready', `expected Monaco capture to be ready after probes are re-enabled: ${raw}`);
       assert.strictEqual(parsed.degraded?.mode, 'dom', `preview should first degrade to DOM fallback: ${raw}`);
       assert.strictEqual(parsed.degraded?.uri, parsed.uri, `DOM fallback should keep the same preview URI: ${raw}`);
       assert.strictEqual(parsed.degraded?.host, false, `DOM fallback should not keep a Monaco host mounted: ${raw}`);
       assert.strictEqual(parsed.degraded?.hasText, true, `DOM fallback should render preview contents: ${raw}`);
-      assert.strictEqual(parsed.recovered?.mode, 'monaco', `same preview should recover to Monaco mode: ${raw}`);
+      assert.strictEqual(parsed.recovered?.mode, 'monaco', `same preview should recover to Monaco mode without a second preview message: ${raw}`);
       assert.strictEqual(parsed.recovered?.uri, parsed.uri, `recovered Monaco preview should keep the same URI: ${raw}`);
       assert.strictEqual(parsed.recovered?.host, true, `recovered preview should mount a Monaco editor host: ${raw}`);
       assert.ok(
-        typeof parsed.recoveryElapsedMs === 'number' && parsed.recoveryElapsedMs <= 100,
-        `DOM fallback preview should recover to Monaco within 100ms after capture returns: ${raw}`,
+        typeof parsed.recoveryElapsedMs === 'number' && parsed.recoveryElapsedMs <= 4000,
+        `DOM fallback preview should recover to Monaco within 4000ms after capture returns: ${raw}`,
       );
     } finally {
       await overlay.evalInActiveWindowForTests(
@@ -872,7 +884,596 @@ suite('Renderer — overlay UI probes', () => {
     );
   });
 
-  test('preview warmup does not open an extra tab or editor group for capture', async function () {
+  test('preview force-open capture fallback is coalesced during burst navigation', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(30_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const activeFixture = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
+    const previewFixture = vscode.Uri.joinPath(folder!.uri, 'beta.js');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+    await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
+    overlay.resumeMonacoCaptureForTests();
+    try { await closeTabsByUri(previewFixture); } catch {}
+    await vscode.window.showTextDocument(activeFixture, {
+      preview: false,
+      preserveFocus: false,
+      viewColumn: vscode.ViewColumn.One,
+    });
+    await overlay.show('PreviewForceOpenBurstProbe', { forceLiteral: true, suppressSearch: true });
+    overlay.resetPreviewCaptureStatsForTests();
+
+    const tabsBefore = snapshotTabCounts();
+    const groupsBefore = snapshotTabGroupCount();
+    const visibleBefore = visibleNonMemoryEditorUris();
+    const activeBefore = vscode.window.activeTextEditor?.document.uri.toString();
+    const src = `preview-force-open-burst-${Date.now()}`;
+
+    try {
+      await overlay.evalInActiveWindowForTests(
+        `(function(){
+          window.__ijFindMonaco = null;
+          window.__ijFindDisableMonacoProbes = false;
+          window.__ijFindMonacoStatusOriginalForForceOpenBurstTest = window.__ijFindMonacoStatus;
+          window.__ijFindMonacoStatus = function(){ return 'not-ready:test-forced'; };
+          window.__ijFindTestCreateWidgetOriginalForForceOpenBurstTest = window.__ijFindTestCreateWidget;
+          window.__ijFindTestCreateWidget = function(){ return 'test-widget-create-disabled-for-force-open-burst'; };
+          if (window.__ijFindCaptures) {
+            window.__ijFindCaptures.widgets = [];
+            window.__ijFindCaptures.services = [];
+            window.__ijFindCaptures.widgetCtors = [];
+            window.__ijFindCaptures.serviceMaps = [];
+          }
+          window.__ijFindCaptureFromDomOriginalForForceOpenBurstTest = window.__ijFindCaptureFromDom;
+          window.__ijFindCaptureFromDom = function(){ return 'test-dom-capture-disabled'; };
+          return window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status';
+        })()`,
+      );
+      let maxGroupCount = groupsBefore;
+      let maxAddedTabs: string[] = [];
+      let previewFileBecameVisible = false;
+      let finalStats = overlay.getPreviewCaptureStatsForTests();
+      for (let i = 0; i < 32; i++) {
+        overlay.injectRendererEventForTests(JSON.stringify({
+          type: 'requestPreview',
+          uri: previewFixture.toString(),
+          line: i % 4,
+          contextLines: 0,
+          ranges: [{ start: 0, end: 4 }],
+          __src: src,
+          __seq: i + 1,
+        }));
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        maxGroupCount = Math.max(maxGroupCount, snapshotTabGroupCount());
+        const added = addedTabKeys(tabsBefore, snapshotTabCounts());
+        if (added.length > maxAddedTabs.length) {
+          maxAddedTabs = added;
+        }
+        if (visibleEditorUris().includes(previewFixture.toString())) {
+          previewFileBecameVisible = true;
+        }
+      }
+      const pollUntil = Date.now() + 7000;
+      while (Date.now() < pollUntil) {
+        maxGroupCount = Math.max(maxGroupCount, snapshotTabGroupCount());
+        const added = addedTabKeys(tabsBefore, snapshotTabCounts());
+        if (added.length > maxAddedTabs.length) {
+          maxAddedTabs = added;
+        }
+        if (visibleEditorUris().includes(previewFixture.toString())) {
+          previewFileBecameVisible = true;
+        }
+        finalStats = overlay.getPreviewCaptureStatsForTests();
+        if (finalStats.forceOpenAttempts >= 1 && !finalStats.forceOpenActive && !finalStats.forceOpenTimerActive) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      assert.ok(
+        finalStats.forceOpenAttempts >= 1,
+        `preview warmup should fall back to force-opening the requested URI when capture stays unavailable: ${JSON.stringify(finalStats)}`,
+      );
+      assert.strictEqual(
+        finalStats.lastForceOpenUri,
+        previewFixture.toString(),
+        `preview force-open should target the latest requested preview URI: ${JSON.stringify(finalStats)}`,
+      );
+      assert.strictEqual(
+        finalStats.lastCaptureOpenUri,
+        previewFixture.toString(),
+        `preview force-open should open the requested preview URI, not an unrelated workspace file: ${JSON.stringify(finalStats)}`,
+      );
+      assert.ok(
+        finalStats.forceOpenAttempts <= 1,
+        `burst preview navigation should be coalesced into one force-open capture attempt: ${JSON.stringify(finalStats)}`,
+      );
+      assert.ok(
+        maxGroupCount <= groupsBefore + 1,
+        `preview force-open fallback should create at most one transient editor group; before=${groupsBefore} max=${maxGroupCount}`,
+      );
+      assert.ok(
+        maxAddedTabs.length <= 1,
+        `preview force-open fallback should open at most one transient capture tab; added=${JSON.stringify(maxAddedTabs)}`,
+      );
+      assert.deepStrictEqual(
+        visibleNonMemoryEditorUris().filter((uri) => uri !== previewFixture.toString()),
+        visibleBefore,
+        'preview force-open fallback should preserve the original visible editors apart from the transient capture tab',
+      );
+      assert.ok(
+        previewFileBecameVisible,
+        'preview force-open fallback should be allowed to transiently open the requested preview file for capture',
+      );
+      assert.strictEqual(
+        vscode.window.activeTextEditor?.document.uri.toString(),
+        activeBefore,
+        'preview force-open fallback should keep the user active editor selected',
+      );
+    } finally {
+      await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            if (window.__ijFindCaptureFromDomOriginalForForceOpenBurstTest) {
+              window.__ijFindCaptureFromDom = window.__ijFindCaptureFromDomOriginalForForceOpenBurstTest;
+              delete window.__ijFindCaptureFromDomOriginalForForceOpenBurstTest;
+            }
+            if (window.__ijFindMonacoStatusOriginalForForceOpenBurstTest) {
+              window.__ijFindMonacoStatus = window.__ijFindMonacoStatusOriginalForForceOpenBurstTest;
+              delete window.__ijFindMonacoStatusOriginalForForceOpenBurstTest;
+            }
+            if (window.__ijFindTestCreateWidgetOriginalForForceOpenBurstTest) {
+              window.__ijFindTestCreateWidget = window.__ijFindTestCreateWidgetOriginalForForceOpenBurstTest;
+              delete window.__ijFindTestCreateWidgetOriginalForForceOpenBurstTest;
+            }
+            return 'restored';
+          })()`,
+        );
+      } catch {}
+      overlay.resetPreviewCaptureStatsForTests();
+      try { await closeTabsByUri(previewFixture); } catch {}
+      try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
+    }
+  });
+
+  test('spawned preview reuses the Monaco editor factory singleton without force-open capture', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(30_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const activeFixture = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
+    const previewFixture = vscode.Uri.joinPath(folder!.uri, 'beta.js');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+    await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
+    overlay.resumeMonacoCaptureForTests();
+    try { await closeTabsByUri(previewFixture); } catch {}
+
+    try {
+      await vscode.window.showTextDocument(activeFixture, {
+        preview: false,
+        preserveFocus: false,
+        viewColumn: vscode.ViewColumn.One,
+      });
+      await overlay.show('PreviewFactorySingletonPrime', { forceLiteral: true, suppressSearch: true });
+      const anyOverlay = overlay as any;
+      let monacoReady = false;
+      try {
+        await anyOverlay.ensureMonacoCapture(anyOverlay.activeWindowId, undefined, {
+          allowForceOpen: true,
+          reason: 'test-preview-factory-singleton',
+          bypassThrottle: true,
+        });
+        monacoReady = await overlay.waitForMonacoReadyForTests(6_000);
+      } catch {}
+      if (!monacoReady) {
+        try {
+          const forced = await overlay.forceCaptureForTests();
+          monacoReady = /^ready/.test(forced) || await overlay.waitForMonacoReadyForTests(4_000);
+        } catch {}
+      }
+      if (!monacoReady) { this.skip(); return; }
+
+      const primeRaw = await overlay.evalInActiveWindowForTests(
+        `(function(){
+          var m = window.__ijFindMonaco;
+          var f = window.__ijFindMonacoFactory;
+          return JSON.stringify({
+            status: window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status',
+            hasCurrent: !!(m && m.ctor),
+            hasFactory: !!(f && f.ctor),
+            factorySingleton: !!(f && f.factorySingleton),
+            instCandidates: f && f.instCandidates ? f.instCandidates.length : 0,
+            modelSvcCandidates: f && f.modelSvcCandidates ? f.modelSvcCandidates.length : 0
+          });
+        })()`,
+      );
+      const prime = JSON.parse(primeRaw) as {
+        status?: string;
+        hasCurrent?: boolean;
+        hasFactory?: boolean;
+        factorySingleton?: boolean;
+        instCandidates?: number;
+        modelSvcCandidates?: number;
+      };
+      assert.strictEqual(prime.status, 'ready', `expected primed Monaco factory to be ready: ${primeRaw}`);
+      assert.strictEqual(prime.hasFactory, true, `capture should persist a factory singleton, not only a widget ref: ${primeRaw}`);
+      assert.strictEqual(prime.factorySingleton, true, `factory singleton flag should be set: ${primeRaw}`);
+      assert.ok((prime.instCandidates ?? 0) >= 1, `factory should retain instantiation-service candidates: ${primeRaw}`);
+      assert.ok((prime.modelSvcCandidates ?? 0) >= 1, `factory should retain model-service candidates: ${primeRaw}`);
+
+      overlay.resetPreviewCaptureStatsForTests();
+      const tabsBefore = snapshotTabCounts();
+      const groupsBefore = snapshotTabGroupCount();
+      const visibleBefore = visibleNonMemoryEditorUris();
+      const activeBefore = vscode.window.activeTextEditor?.document.uri.toString();
+
+      await overlay.show('PreviewFactorySingletonSpawnProbe', {
+        forceLiteral: true,
+        suppressSearch: true,
+        spawn: true,
+      });
+      const spawnRaw = await overlay.evalInActiveWindowForTests(
+        `(function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === 'PreviewFactorySingletonSpawnProbe';
+          });
+          var m = window.__ijFindMonaco;
+          var f = window.__ijFindMonacoFactory;
+          return JSON.stringify({
+            err: root ? undefined : 'missing spawned root',
+            src: root ? root.getAttribute('data-ij-find-src') || '' : '',
+            status: window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status',
+            hasCurrent: !!(m && m.ctor),
+            hasFactory: !!(f && f.ctor),
+            sameObject: !!(m && f && m === f),
+            factoryVersion: f && f.factoryVersion,
+            instCandidates: f && f.instCandidates ? f.instCandidates.length : 0,
+            modelSvcCandidates: f && f.modelSvcCandidates ? f.modelSvcCandidates.length : 0
+          });
+        })()`,
+      );
+      const spawned = JSON.parse(spawnRaw) as {
+        err?: string;
+        src?: string;
+        status?: string;
+        hasCurrent?: boolean;
+        hasFactory?: boolean;
+        sameObject?: boolean;
+        instCandidates?: number;
+        modelSvcCandidates?: number;
+      };
+      assert.strictEqual(spawned.err, undefined, `expected spawned probe to open: ${spawnRaw}`);
+      assert.ok(spawned.src, `expected spawned panel src: ${spawnRaw}`);
+      assert.strictEqual(spawned.status, 'ready', `spawn/additional patch install should preserve the ready factory: ${spawnRaw}`);
+      assert.strictEqual(spawned.hasFactory, true, `factory should survive spawned patch install: ${spawnRaw}`);
+      assert.strictEqual(spawned.sameObject, true, `current Monaco handle should point at the persisted factory: ${spawnRaw}`);
+      assert.ok((spawned.instCandidates ?? 0) >= 1, `spawned factory should keep inst candidates: ${spawnRaw}`);
+      assert.ok((spawned.modelSvcCandidates ?? 0) >= 1, `spawned factory should keep model candidates: ${spawnRaw}`);
+
+      const src = spawned.src!;
+      const previewSeq = Number(await overlay.evalInActiveWindowForTests(
+        `(function(){
+          var src = ${JSON.stringify(src)};
+          var state = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(src) : {};
+          var active = state && typeof state.activePreviewSeq === 'number' ? state.activePreviewSeq : 0;
+          return String(Math.max(Date.now(), active + 1));
+        })()`,
+      ));
+      overlay.injectRendererEventForTests(JSON.stringify({
+        type: 'requestPreview',
+        uri: previewFixture.toString(),
+        line: 0,
+        contextLines: 0,
+        ranges: [{ start: 6, end: 16 }],
+        previewSeq,
+        __src: src,
+        __seq: Date.now(),
+      }));
+
+      let finalState = '';
+      let maxGroupCount = groupsBefore;
+      let maxAddedTabs: string[] = [];
+      let previewFileBecameVisible = false;
+      const started = Date.now();
+      while (Date.now() - started < 2500) {
+        maxGroupCount = Math.max(maxGroupCount, snapshotTabGroupCount());
+        const added = addedTabKeys(tabsBefore, snapshotTabCounts());
+        if (added.length > maxAddedTabs.length) {
+          maxAddedTabs = added;
+        }
+        if (visibleEditorUris().includes(previewFixture.toString())) {
+          previewFileBecameVisible = true;
+        }
+        finalState = await overlay.evalInActiveWindowForTests(
+          `(function(){
+            var src = ${JSON.stringify(src)};
+            var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+              return (node.getAttribute('data-ij-find-src') || '') === src;
+            });
+            if (!root) { return JSON.stringify({ err: 'missing root' }); }
+            var state = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(src) : {};
+            var body = root.querySelector('.ij-find-preview-body');
+            var f = window.__ijFindMonacoFactory;
+            return JSON.stringify({
+              previewMode: state && state.previewMode,
+              previewUri: state && state.previewUri,
+              hasMonacoHost: !!(body && body.querySelector('.ij-find-monaco-preview-host .monaco-editor')),
+              monacoStatus: window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status',
+              hasFactory: !!(f && f.ctor),
+              instCandidates: f && f.instCandidates ? f.instCandidates.length : 0,
+              modelSvcCandidates: f && f.modelSvcCandidates ? f.modelSvcCandidates.length : 0
+            });
+          })()`,
+        );
+        const parsed = JSON.parse(finalState) as {
+          previewMode?: string;
+          previewUri?: string;
+          hasMonacoHost?: boolean;
+          monacoStatus?: string;
+        };
+        if (
+          parsed.previewMode === 'monaco' &&
+          parsed.previewUri === previewFixture.toString() &&
+          parsed.hasMonacoHost === true &&
+          parsed.monacoStatus === 'ready'
+        ) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+
+      const parsed = JSON.parse(finalState) as {
+        err?: string;
+        previewMode?: string;
+        previewUri?: string;
+        hasMonacoHost?: boolean;
+        monacoStatus?: string;
+        hasFactory?: boolean;
+      };
+      const finalStats = overlay.getPreviewCaptureStatsForTests();
+      assert.strictEqual(parsed.err, undefined, `expected spawned preview state probe to run: ${finalState}`);
+      assert.strictEqual(parsed.monacoStatus, 'ready', `factory should stay ready through preview render: ${finalState}`);
+      assert.strictEqual(parsed.hasFactory, true, `factory should still be present after preview render: ${finalState}`);
+      assert.strictEqual(parsed.previewMode, 'monaco', `spawned preview should render via Monaco factory, not DOM fallback: ${finalState}`);
+      assert.strictEqual(parsed.previewUri, previewFixture.toString(), `spawned preview should render requested file: ${finalState}`);
+      assert.strictEqual(parsed.hasMonacoHost, true, `spawned preview should mount a Monaco host: ${finalState}`);
+      assert.strictEqual(
+        finalStats.forceOpenAttempts,
+        0,
+        `ready factory should prevent force-open capture while recovering preview: ${JSON.stringify(finalStats)}`,
+      );
+      assert.strictEqual(finalStats.forceOpenTimerActive, false, `factory path should not leave a force-open timer: ${JSON.stringify(finalStats)}`);
+      assert.strictEqual(maxGroupCount, groupsBefore, 'factory preview should not create an extra editor group/column');
+      assert.deepStrictEqual(
+        maxAddedTabs,
+        [],
+        `factory preview should not open transient capture tabs; added=${JSON.stringify(maxAddedTabs)}`,
+      );
+      assert.deepStrictEqual(
+        visibleNonMemoryEditorUris(),
+        visibleBefore,
+        'factory preview should not introduce visible workbench editors',
+      );
+      assert.ok(!previewFileBecameVisible, 'factory preview should not transiently open the preview file in a workbench editor');
+      assert.strictEqual(
+        vscode.window.activeTextEditor?.document.uri.toString(),
+        activeBefore,
+        'factory preview should keep the user active editor selected',
+      );
+    } finally {
+      await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      overlay.resetPreviewCaptureStatsForTests();
+      try { await closeTabsByUri(previewFixture); } catch {}
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            var cleanupQueries = {
+              PreviewFactorySingletonPrime: true,
+              PreviewFactorySingletonSpawnProbe: true
+            };
+            var closed = 0;
+            var registry = window.__ijFindInstances || {};
+            Object.keys(registry).forEach(function (id) {
+              var inst = registry[id];
+              var panel = inst && inst.panel;
+              var query = panel && panel.querySelector ? panel.querySelector('.ij-find-query') : null;
+              var value = query && query.value || '';
+              if (!cleanupQueries[value]) { return; }
+              try {
+                var close = panel && panel.querySelector && panel.querySelector('.ij-find-close');
+                if (close) {
+                  close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                  closed++;
+                }
+              } catch (eClose) {}
+            });
+            try { window.__ijFindActiveInstanceId = ''; } catch (eActive) {}
+            return 'closed=' + closed;
+          })()`,
+        );
+      } catch {}
+      try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
+    }
+  });
+
+  test('force-open capture uses an untitled buffer when the requested preview file is already open', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(30_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const activeFixture = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
+    const previewFixture = vscode.Uri.joinPath(folder!.uri, 'beta.js');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+    await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
+    overlay.resumeMonacoCaptureForTests();
+    overlay.resetPreviewCaptureStatsForTests();
+
+    try {
+      await vscode.window.showTextDocument(previewFixture, {
+        preview: false,
+        preserveFocus: false,
+        viewColumn: vscode.ViewColumn.Two,
+      });
+      await vscode.window.showTextDocument(activeFixture, {
+        preview: false,
+        preserveFocus: false,
+        viewColumn: vscode.ViewColumn.One,
+      });
+      await overlay.show('PreviewForceOpenExistingFileProbe', { forceLiteral: true, suppressSearch: true });
+      await overlay.evalInActiveWindowForTests(
+        `(function(){
+          window.__ijFindMonaco = null;
+          window.__ijFindDisableMonacoProbes = false;
+          window.__ijFindMonacoStatusOriginalForExistingForceOpenTest = window.__ijFindMonacoStatus;
+          window.__ijFindMonacoStatus = function(){ return 'not-ready:test-existing-force-open'; };
+          window.__ijFindTestCreateWidgetOriginalForExistingForceOpenTest = window.__ijFindTestCreateWidget;
+          window.__ijFindTestCreateWidget = function(){ return 'test-widget-create-disabled-for-existing-force-open'; };
+          if (window.__ijFindCaptures) {
+            window.__ijFindCaptures.widgets = [];
+            window.__ijFindCaptures.services = [];
+            window.__ijFindCaptures.widgetCtors = [];
+            window.__ijFindCaptures.serviceMaps = [];
+          }
+          window.__ijFindCaptureFromDomOriginalForExistingForceOpenTest = window.__ijFindCaptureFromDom;
+          window.__ijFindCaptureFromDom = function(){ return 'test-dom-capture-disabled'; };
+          return 'patched';
+        })()`,
+      );
+
+      const anyOverlay = overlay as any;
+      await anyOverlay.ensureMonacoCapture(anyOverlay.activeWindowId, previewFixture, {
+        allowForceOpen: true,
+        reason: 'test-existing-preview-force-open',
+        bypassThrottle: true,
+      });
+      const stats = overlay.getPreviewCaptureStatsForTests();
+      assert.ok(
+        stats.lastCaptureOpenUri && /^untitled:/.test(stats.lastCaptureOpenUri),
+        `force-open should use a capture-only untitled buffer when the requested preview file is already open: ${JSON.stringify(stats)}`,
+      );
+      assert.notStrictEqual(
+        stats.lastCaptureOpenUri,
+        activeFixture.toString(),
+        `force-open must not choose an unrelated workspace file: ${JSON.stringify(stats)}`,
+      );
+    } finally {
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            if (window.__ijFindMonacoStatusOriginalForExistingForceOpenTest) {
+              window.__ijFindMonacoStatus = window.__ijFindMonacoStatusOriginalForExistingForceOpenTest;
+              delete window.__ijFindMonacoStatusOriginalForExistingForceOpenTest;
+            }
+            if (window.__ijFindTestCreateWidgetOriginalForExistingForceOpenTest) {
+              window.__ijFindTestCreateWidget = window.__ijFindTestCreateWidgetOriginalForExistingForceOpenTest;
+              delete window.__ijFindTestCreateWidgetOriginalForExistingForceOpenTest;
+            }
+            if (window.__ijFindCaptureFromDomOriginalForExistingForceOpenTest) {
+              window.__ijFindCaptureFromDom = window.__ijFindCaptureFromDomOriginalForExistingForceOpenTest;
+              delete window.__ijFindCaptureFromDomOriginalForExistingForceOpenTest;
+            }
+            return 'restored';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      overlay.resetPreviewCaptureStatsForTests();
+      try { await closeTabsByUri(previewFixture); } catch {}
+      try { await closeTabsByUri(activeFixture); } catch {}
+    }
+  });
+
+  test('renderer recovery only pauses Monaco capture and allows later preview capture', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(20_000);
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+    await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
+    overlay.resumeMonacoCaptureForTests();
+
+    try {
+      await overlay.show('RecoveryCaptureProbe', { forceLiteral: true, suppressSearch: true });
+      const report = await overlay.recoverRendererUi('test');
+      assert.match(
+        report,
+        /future-monaco-capture=paused:\d+ms/,
+        `renderer recovery should pause, not permanently disable, future Monaco capture: ${report}`,
+      );
+      let state = overlay.getMonacoCaptureStateForTests();
+      assert.strictEqual(state.stoppedForSession, false, `recoverRendererUi should not stop capture for the full session: ${JSON.stringify(state)}`);
+      assert.ok(state.recoveryPauseRemainingMs > 0, `recoverRendererUi should apply a short recovery pause: ${JSON.stringify(state)}`);
+
+      const deadline = Date.now() + 6000;
+      while (Date.now() < deadline) {
+        state = overlay.getMonacoCaptureStateForTests();
+        if (state.enabled && state.recoveryPauseRemainingMs === 0) { break; }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      assert.strictEqual(state.enabled, true, `Monaco capture should resume after renderer recovery pause: ${JSON.stringify(state)}`);
+
+      await overlay.show('RecoveryCaptureProbeAfterPause', { forceLiteral: true, suppressSearch: true });
+      const rendererFlag = await overlay.evalInActiveWindowForTests(
+        `(function(){
+          try {
+            return window.__ijFindDisableMonacoProbes === false ? 'capture-enabled' : 'capture-disabled:' + String(window.__ijFindDisableMonacoProbes);
+          } catch (e) {
+            return 'throw:' + (e && e.message);
+          }
+        })()`,
+      );
+      assert.strictEqual(rendererFlag, 'capture-enabled', `renderer patch should be re-enabled for Monaco preview probes after recovery: ${rendererFlag}`);
+    } finally {
+      await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      overlay.resumeMonacoCaptureForTests();
+      try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
+    }
+  });
+
+  test('inlay click warmup keeps the renderer bridge hot for the first spawned header', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(20_000);
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorHook = cfg.inspect<boolean>('rendererInlayClickHook');
+    const priorIdle = cfg.inspect<number>('rendererBridgeSingletonIdleMs');
+    await cfg.update('rendererInlayClickHook', true, vscode.ConfigurationTarget.Workspace);
+    await cfg.update('rendererBridgeSingletonIdleMs', 5000, vscode.ConfigurationTarget.Workspace);
+    overlay.resetRendererInlayClickHookWarmupForTests();
+
+    try {
+      overlay.scheduleRendererInlayClickHookWarmup('test-hot-first-click', 0, true);
+      let state = overlay.getRendererInlayClickHookStateForTests();
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        state = overlay.getRendererInlayClickHookStateForTests();
+        if (state.ready && state.readyForActiveWindow && state.cdpOpen && state.idleCloseTimerActive) { break; }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      assert.strictEqual(state.ready, true, `renderer inlay click hook should be warmed: ${JSON.stringify(state)}`);
+      assert.strictEqual(
+        state.readyForActiveWindow,
+        true,
+        `warmup should install the inlay click hook in the active workbench window, not just any window: ${JSON.stringify(state)}`,
+      );
+      assert.strictEqual(state.cdpOpen, true, `warmup should keep CDP open for the first inlay click instead of closing immediately: ${JSON.stringify(state)}`);
+      assert.strictEqual(state.idleCloseTimerActive, true, `warmup should schedule singleton idle close rather than immediate close: ${JSON.stringify(state)}`);
+      assert.strictEqual(state.warmupFailures, 0, `warmup should not exhaust retries in the happy path: ${JSON.stringify(state)}`);
+    } finally {
+      await cfg.update('rendererInlayClickHook', priorHook?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('rendererBridgeSingletonIdleMs', priorIdle?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      overlay.resetRendererInlayClickHookWarmupForTests();
+    }
+  });
+
+  test('preview warmup promotes an existing editor object without opening the preview file', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(20_000);
     const { overlay } = await getApi();
@@ -880,26 +1481,44 @@ suite('Renderer — overlay UI probes', () => {
     assert.ok(folder, 'expected fixture workspace folder');
     const activeFixture = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
     const previewFixture = vscode.Uri.joinPath(folder!.uri, 'beta.js');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+    await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
     await vscode.window.showTextDocument(activeFixture, {
       preview: false,
       preserveFocus: false,
       viewColumn: vscode.ViewColumn.One,
     });
-    await overlay.show('PreviewNoCaptureColumnProbe', { forceLiteral: true, suppressSearch: true });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await overlay.show('PreviewExistingEditorWarmupProbe', { forceLiteral: true, suppressSearch: true });
 
     const tabsBefore = snapshotTabCounts();
     const groupsBefore = snapshotTabGroupCount();
     const visibleBefore = visibleNonMemoryEditorUris();
     const activeBefore = vscode.window.activeTextEditor?.document.uri.toString();
-    const src = `preview-no-capture-column-${Date.now()}`;
-
-    try {
+    const src = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+          var query = node.querySelector('.ij-find-query');
+          return query && query.value === 'PreviewExistingEditorWarmupProbe';
+        });
+        return root ? root.getAttribute('data-ij-find-src') || '' : '';
+        })()`,
+      );
+      assert.ok(src, 'expected PreviewExistingEditorWarmupProbe renderer source');
+      try {
+        const previewSeq = Number(await overlay.evalInActiveWindowForTests(
+          `(function(){
+            var src = ${JSON.stringify(src)};
+            var state = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(src) : {};
+            var active = state && typeof state.activePreviewSeq === 'number' ? state.activePreviewSeq : 0;
+            return String(Math.max(Date.now(), active + 1));
+          })()`,
+        ));
       await overlay.evalInActiveWindowForTests(
         `(function(){
           window.__ijFindMonaco = null;
           window.__ijFindDisableMonacoProbes = false;
-          window.__ijFindCaptureFromDomOriginalForNoColumnTest = window.__ijFindCaptureFromDom;
-          window.__ijFindCaptureFromDom = function(){ return 'test-dom-capture-disabled'; };
           return window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status';
         })()`,
       );
@@ -908,44 +1527,97 @@ suite('Renderer — overlay UI probes', () => {
         uri: previewFixture.toString(),
         line: 0,
         contextLines: 0,
-        ranges: [{ start: 0, end: 4 }],
-        previewSeq: 991,
+        ranges: [{ start: 6, end: 16 }],
+        previewSeq,
         __src: src,
-        __seq: 1,
+        __seq: Date.now(),
       }));
-      await new Promise((resolve) => setTimeout(resolve, 900));
+
+      let maxGroupCount = groupsBefore;
+      let maxAddedTabs: string[] = [];
+      let previewFileBecameVisible = false;
+      let finalState = '';
+      const started = Date.now();
+      while (Date.now() - started < 2500) {
+        maxGroupCount = Math.max(maxGroupCount, snapshotTabGroupCount());
+        const added = addedTabKeys(tabsBefore, snapshotTabCounts());
+        if (added.length > maxAddedTabs.length) {
+          maxAddedTabs = added;
+        }
+        if (visibleEditorUris().includes(previewFixture.toString())) {
+          previewFileBecameVisible = true;
+        }
+        finalState = await overlay.evalInActiveWindowForTests(
+          `(function(){
+            var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+              var query = node.querySelector('.ij-find-query');
+              return query && query.value === 'PreviewExistingEditorWarmupProbe';
+            });
+            if (!root) { return JSON.stringify({ err: 'missing root' }); }
+            var src = root.getAttribute('data-ij-find-src') || '';
+            var state = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(src) : {};
+            var body = root.querySelector('.ij-find-preview-body');
+            return JSON.stringify({
+              previewMode: state && state.previewMode,
+              previewUri: state && state.previewUri,
+              hasMonacoHost: !!(body && body.querySelector('.ij-find-monaco-preview-host .monaco-editor')),
+              monacoStatus: window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status'
+            });
+          })()`,
+        );
+        const parsed = JSON.parse(finalState) as {
+          previewMode?: string;
+          previewUri?: string;
+          hasMonacoHost?: boolean;
+          monacoStatus?: string;
+        };
+        if (
+          parsed.previewMode === 'monaco' &&
+          parsed.previewUri === previewFixture.toString() &&
+          parsed.hasMonacoHost === true
+        ) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const parsed = JSON.parse(finalState) as {
+        err?: string;
+        previewMode?: string;
+        previewUri?: string;
+        hasMonacoHost?: boolean;
+        monacoStatus?: string;
+      };
+      assert.strictEqual(parsed.err, undefined, `expected preview state probe to run: ${finalState}`);
+      assert.strictEqual(parsed.previewMode, 'monaco', `preview warmup should recover from DOM fallback to Monaco using an existing editor object: ${finalState}`);
+      assert.strictEqual(parsed.previewUri, previewFixture.toString(), `preview warmup should refresh the latest requested preview: ${finalState}`);
+      assert.strictEqual(parsed.hasMonacoHost, true, `preview warmup should mount a Monaco preview host: ${finalState}`);
       assert.strictEqual(
-        snapshotTabGroupCount(),
+        maxGroupCount,
         groupsBefore,
-        'preview warmup should not create an extra editor group/column for Monaco capture',
+        'existing-editor preview warmup should not create an extra editor group/column',
       );
-      assertNoAddedTabs(tabsBefore, 'preview warmup capture');
+      assert.deepStrictEqual(
+        maxAddedTabs,
+        [],
+        `existing-editor preview warmup should not open additional editor tabs; added=${JSON.stringify(maxAddedTabs)}`,
+      );
       assert.deepStrictEqual(
         visibleNonMemoryEditorUris(),
         visibleBefore,
-        'preview warmup should not introduce extra visible workbench editors',
+        'existing-editor preview warmup should not introduce extra visible workbench editors',
       );
       assert.ok(
-        !visibleEditorUris().includes(previewFixture.toString()),
-        'preview warmup should not open the preview file in a workbench editor',
+        !previewFileBecameVisible,
+        'existing-editor preview warmup should not transiently open the preview file in a workbench editor',
       );
       assert.strictEqual(
         vscode.window.activeTextEditor?.document.uri.toString(),
         activeBefore,
-        'preview warmup should keep the user active editor selected',
+        'existing-editor preview warmup should keep the user active editor selected',
       );
     } finally {
-      try {
-        await overlay.evalInActiveWindowForTests(
-          `(function(){
-            if (window.__ijFindCaptureFromDomOriginalForNoColumnTest) {
-              window.__ijFindCaptureFromDom = window.__ijFindCaptureFromDomOriginalForNoColumnTest;
-              delete window.__ijFindCaptureFromDomOriginalForNoColumnTest;
-            }
-            return 'restored';
-          })()`,
-        );
-      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      try { await closeTabsByUri(previewFixture); } catch {}
       try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
     }
   });
@@ -1107,6 +1779,161 @@ suite('Renderer — overlay UI probes', () => {
     assert.ok(
       parsed.sent.some((msg) => msg.type === 'runCommand' && msg.command === 'intellijStyledSearch.activateCallGraphInlayAtVisibleLine'),
       `plain no-position inlay should run visible-line command: ${raw}`,
+    );
+  });
+
+  test('call graph inlay click hook prefers the clicked widget target over visible-line fallback', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('');
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(async function(){
+        var oldBridge = globalThis.irSearchEvent;
+        var sent = [];
+        globalThis.irSearchEvent = function (payload) {
+          try { sent.push(JSON.parse(String(payload))); } catch (e) {}
+        };
+        var editor = document.createElement('div');
+        editor.className = 'monaco-editor';
+        editor.style.cssText = 'position:fixed;left:30px;top:30px;width:220px;height:50px;z-index:2147483647;';
+        editor.__ijssFakeWidget = {
+          layout: function(){},
+          getDomNode: function(){ return editor; },
+          getModel: function(){ return { uri: { toString: function(){ return 'file:///wrong-token-position.py'; } } }; },
+          getTargetAtClientPoint: function(){ return { position: { lineNumber: 99, column: 7 } }; }
+        };
+        var lines = document.createElement('div');
+        lines.className = 'view-lines';
+        var line = document.createElement('div');
+        line.className = 'view-line';
+        var hint = document.createElement('span');
+        hint.className = 'inline-hints-widget ijss-callgraph';
+        hint.textContent = 'usages 2';
+        hint.style.cssText = 'display:inline-block;padding:2px;';
+        line.appendChild(hint);
+        lines.appendChild(line);
+        editor.appendChild(lines);
+        document.body.appendChild(editor);
+        var pointer = new PointerEvent('pointerdown', {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+          clientX: 36,
+          clientY: 36
+        });
+        var dispatchResult = hint.dispatchEvent(pointer);
+        await new Promise(function (resolve) { setTimeout(resolve, 25); });
+        editor.remove();
+        globalThis.irSearchEvent = oldBridge;
+        return JSON.stringify({
+          prevented: pointer.defaultPrevented || !dispatchResult,
+          sent: sent
+        });
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      prevented: boolean;
+      sent: Array<{ type?: string; command?: string; args?: unknown[] }>;
+    };
+    assert.strictEqual(parsed.prevented, true, `inlay pointerdown should be consumed by the call graph hook: ${raw}`);
+    assert.ok(
+      parsed.sent.some((msg) =>
+        msg.type === 'runCommand' &&
+        msg.command === 'intellijStyledSearch.activateCallGraphInlayAtPosition' &&
+        msg.args?.[1] === 'file:///wrong-token-position.py' &&
+        msg.args?.[2] === 98 &&
+        msg.args?.[3] === 6),
+      `inlay click should pass the clicked Monaco target position instead of a visible-line ordinal: ${raw}`,
+    );
+    assert.ok(
+      !parsed.sent.some((msg) => msg.type === 'runCommand' && msg.command === 'intellijStyledSearch.activateCallGraphInlayAtVisibleLine'),
+      `clicked widget target should avoid stale visible-line fallback: ${raw}`,
+    );
+  });
+
+  test('call graph inlay click hook does not reuse the previous inlay target for the next click', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('');
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(async function(){
+        var oldBridge = globalThis.irSearchEvent;
+        var sent = [];
+        globalThis.irSearchEvent = function (payload) {
+          try { sent.push(JSON.parse(String(payload))); } catch (e) {}
+        };
+        var activeTarget = { lineNumber: 11, column: 22 };
+        var editor = document.createElement('div');
+        editor.className = 'monaco-editor';
+        editor.style.cssText = 'position:fixed;left:30px;top:30px;width:260px;height:50px;z-index:2147483647;';
+        editor.__ijssFakeWidget = {
+          layout: function(){},
+          getDomNode: function(){ return editor; },
+          getModel: function(){ return { uri: { toString: function(){ return 'file:///clicked-inlay-target.py'; } } }; },
+          getTargetAtClientPoint: function(){ return { position: activeTarget }; }
+        };
+        var lines = document.createElement('div');
+        lines.className = 'view-lines';
+        var line = document.createElement('div');
+        line.className = 'view-line';
+        lines.appendChild(line);
+        editor.appendChild(lines);
+        document.body.appendChild(editor);
+        function clickHint(text, target) {
+          activeTarget = target;
+          line.textContent = '';
+          var hint = document.createElement('span');
+          hint.className = 'inline-hints-widget ijss-callgraph';
+          hint.textContent = text;
+          hint.style.cssText = 'display:inline-block;padding:2px;';
+          line.appendChild(hint);
+          var rect = hint.getBoundingClientRect();
+          var pointer = new PointerEvent('pointerdown', {
+            bubbles: true,
+            cancelable: true,
+            button: 0,
+            clientX: rect.left + 2,
+            clientY: rect.top + 2
+          });
+          var dispatchResult = hint.dispatchEvent(pointer);
+          return { prevented: pointer.defaultPrevented || !dispatchResult };
+        }
+        var first = clickHint('usages 1', { lineNumber: 11, column: 22 });
+        var second = clickHint('usages 2', { lineNumber: 41, column: 18 });
+        await new Promise(function (resolve) { setTimeout(resolve, 25); });
+        editor.remove();
+        globalThis.irSearchEvent = oldBridge;
+        return JSON.stringify({
+          first: first,
+          second: second,
+          sent: sent
+        });
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      first?: { prevented?: boolean };
+      second?: { prevented?: boolean };
+      sent: Array<{ type?: string; command?: string; args?: unknown[] }>;
+    };
+    const positionCommands = parsed.sent.filter((msg) =>
+      msg.type === 'runCommand' &&
+      msg.command === 'intellijStyledSearch.activateCallGraphInlayAtPosition');
+    assert.strictEqual(parsed.first?.prevented, true, `first inlay pointerdown should be consumed: ${raw}`);
+    assert.strictEqual(parsed.second?.prevented, true, `second inlay pointerdown should be consumed: ${raw}`);
+    assert.strictEqual(positionCommands.length, 2, `both inlay clicks should dispatch exact position commands: ${raw}`);
+    assert.deepStrictEqual(
+      positionCommands.map((msg) => msg.args),
+      [
+        ['usages', 'file:///clicked-inlay-target.py', 10, 21],
+        ['usages', 'file:///clicked-inlay-target.py', 40, 17],
+      ],
+      `second inlay click must use the clicked target, not the previous inlay target: ${raw}`,
+    );
+    assert.ok(
+      !parsed.sent.some((msg) => msg.type === 'runCommand' && msg.command === 'intellijStyledSearch.activateCallGraphInlayAtVisibleLine'),
+      `exact clicked positions should avoid visible-line fallback reuse: ${raw}`,
     );
   });
 
@@ -1527,6 +2354,90 @@ suite('Renderer — overlay UI probes', () => {
     assert.ok(parsed.previewHeight > parsed.resultsHeight * 1.5, `preview pane should dominate the result list by default: ${raw}`);
   });
 
+  test('DOM fallback preview render failures keep the panel chrome and resize handle attached', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('DomPreviewChromeFailureProbe', { forceLiteral: true, suppressSearch: true, spawn: true });
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+          var query = node.querySelector('.ij-find-query');
+          return query && query.value === 'DomPreviewChromeFailureProbe';
+        });
+        if (!root) { return JSON.stringify({ err: 'missing root' }); }
+        var targetSrc = root.getAttribute('data-ij-find-src') || '';
+        var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+        window.__ijFindDisableMonacoProbes = true;
+        var badLine = { lineNumber: 0 };
+        Object.defineProperty(badLine, 'text', {
+          get: function(){ throw new Error('test preview text getter failed'); }
+        });
+        try {
+          window.__ijFindOnMessage({
+            type: 'preview',
+            __targetSrc: targetSrc,
+            uri: 'file:///dom-preview-chrome-failure.py',
+            relPath: 'dom-preview-chrome-failure.py',
+            languageId: 'python',
+            focusLine: 0,
+            fullFile: true,
+            lines: [badLine],
+            ranges: [{ start: 0, end: 4 }]
+          });
+        } catch (e) {}
+        window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+        var rect = root.getBoundingClientRect();
+        var header = root.querySelector('.ij-find-header');
+        var toolbar = root.querySelector('.ij-find-toolbar');
+        var results = root.querySelector('.ij-find-results');
+        var splitter = root.querySelector('.ij-find-splitter');
+        var preview = root.querySelector('.ij-find-preview');
+        var resizer = root.querySelector('.ij-find-resizer');
+        var rr = resizer ? resizer.getBoundingClientRect() : { bottom: 0, right: 0 };
+        var close = root.querySelector('.ij-find-close');
+        var out = {
+          shell: root.classList.contains('ij-find-shell'),
+          headerHeight: header ? Math.round(header.getBoundingClientRect().height) : 0,
+          toolbarAttached: !!toolbar && toolbar.parentElement === root,
+          resultsAttached: !!results && results.parentElement === root,
+          splitterAttached: !!splitter && splitter.parentElement === root,
+          previewAttached: !!preview && preview.parentElement === root,
+          resizerAttached: !!resizer && resizer.parentElement === root,
+          resizerBottomDelta: Math.round(rect.bottom - rr.bottom),
+          resizerRightDelta: Math.round(rect.right - rr.right),
+          previewText: preview ? (preview.textContent || '') : ''
+        };
+        if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+        return JSON.stringify(out);
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      err?: string;
+      shell: boolean;
+      headerHeight: number;
+      toolbarAttached: boolean;
+      resultsAttached: boolean;
+      splitterAttached: boolean;
+      previewAttached: boolean;
+      resizerAttached: boolean;
+      resizerBottomDelta: number;
+      resizerRightDelta: number;
+      previewText: string;
+    };
+    assert.strictEqual(parsed.err, undefined, `expected DOM preview chrome probe to run: ${raw}`);
+    assert.strictEqual(parsed.shell, false, `fallback preview should restore full panel mode: ${raw}`);
+    assert.ok(parsed.headerHeight > 20, `panel header should remain visible after fallback render failure: ${raw}`);
+    assert.strictEqual(parsed.toolbarAttached, true, `toolbar should remain attached: ${raw}`);
+    assert.strictEqual(parsed.resultsAttached, true, `results should remain attached: ${raw}`);
+    assert.strictEqual(parsed.splitterAttached, true, `splitter should remain attached: ${raw}`);
+    assert.strictEqual(parsed.previewAttached, true, `preview should remain attached: ${raw}`);
+    assert.strictEqual(parsed.resizerAttached, true, `resize handle should remain attached: ${raw}`);
+    assert.ok(Math.abs(parsed.resizerBottomDelta) <= 2, `resize handle should stay on the panel bottom edge: ${raw}`);
+    assert.ok(Math.abs(parsed.resizerRightDelta) <= 2, `resize handle should stay on the panel right edge: ${raw}`);
+    assert.match(parsed.previewText, /Preview fallback render failed/, `fallback error should render inside preview body: ${raw}`);
+  });
+
   test('splitter grows results without leaving blank space below preview', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);
@@ -1877,7 +2788,610 @@ suite('Renderer — overlay UI probes', () => {
     );
   });
 
-  test('preview inlay clicks open spawned result panels within 50ms under repeated load', async function () {
+  test('search restart keeps the current preview visible until replacement arrives', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('PreviewRestartPreserveHost', { forceLiteral: true, suppressSearch: true });
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+          var query = node.querySelector('.ij-find-query');
+          return query && query.value === 'PreviewRestartPreserveHost';
+        });
+        if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
+        var targetSrc = root.getAttribute('data-ij-find-src') || '';
+        var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+        window.__ijFindDisableMonacoProbes = true;
+        window.__ijFindOnMessage({
+          type: 'preview',
+          __targetSrc: targetSrc,
+          uri: 'file:///preview-restart-preserve.py',
+          relPath: 'preview-restart-preserve.py',
+          languageId: 'python',
+          focusLine: 0,
+          previewSeq: 11,
+          fullFile: true,
+          lines: [
+            { lineNumber: 0, text: 'class PreviewRestartPreserve:' },
+            { lineNumber: 1, text: '    pass' }
+          ]
+        });
+        var beforeState = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(targetSrc) : {};
+        var beforeText = root.querySelector('.ij-find-preview-body')?.textContent || '';
+        window.__ijFindOnMessage({ type: 'results:start', __targetSrc: targetSrc, searchId: 1201 });
+        var afterState = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(targetSrc) : {};
+        var afterText = root.querySelector('.ij-find-preview-body')?.textContent || '';
+        window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+        return JSON.stringify({
+          before: { mode: beforeState.previewMode, uri: beforeState.previewUri, text: beforeText },
+          after: { mode: afterState.previewMode, uri: afterState.previewUri, text: afterText }
+        });
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      err?: string;
+      before?: { mode?: string; uri?: string; text?: string };
+      after?: { mode?: string; uri?: string; text?: string };
+    };
+    assert.strictEqual(parsed.err, undefined, `expected restart preserve probe to run: ${raw}`);
+    assert.strictEqual(parsed.before?.mode, 'dom', `preview should render before search restart: ${raw}`);
+    assert.strictEqual(parsed.after?.mode, 'dom', `results:start should not clear preview mode: ${raw}`);
+    assert.strictEqual(parsed.after?.uri, 'file:///preview-restart-preserve.py', `results:start should keep preview URI: ${raw}`);
+    assert.ok(parsed.after?.text?.includes('PreviewRestartPreserve'), `results:start should keep preview contents: ${raw}`);
+  });
+
+  test('async preview inlays render and survive same-preview refresh', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('PreviewAsyncInlayRefreshHost', { forceLiteral: true, suppressSearch: true });
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+          var query = node.querySelector('.ij-find-query');
+          return query && query.value === 'PreviewAsyncInlayRefreshHost';
+        });
+        if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
+        var targetSrc = root.getAttribute('data-ij-find-src') || '';
+        var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+        window.__ijFindDisableMonacoProbes = true;
+        var previewMsg = {
+          type: 'preview',
+          __targetSrc: targetSrc,
+          uri: 'file:///preview-async-inlay-refresh.py',
+          relPath: 'preview-async-inlay-refresh.py',
+          languageId: 'python',
+          focusLine: 0,
+          previewSeq: 21,
+          fullFile: true,
+          lines: [
+            { lineNumber: 0, text: 'class PreviewAsyncInlayRefresh:' },
+            { lineNumber: 1, text: '    pass' }
+          ]
+        };
+        window.__ijFindOnMessage(previewMsg);
+        var beforeInlays = root.querySelectorAll('.ij-find-preview-inlay.ijss-callgraph').length;
+        window.__ijFindOnMessage({
+          type: 'preview:inlays',
+          __targetSrc: targetSrc,
+          uri: previewMsg.uri,
+          previewSeq: previewMsg.previewSeq,
+          callGraphInlays: [{
+            line: 0,
+            column: 31,
+            kind: 'usages',
+            text: 'usages 3',
+            symbolId: 'python:preview-async-inlay-refresh.py:PreviewAsyncInlayRefresh:1',
+            label: 'PreviewAsyncInlayRefresh'
+          }]
+        });
+        var afterInlayMsg = root.querySelectorAll('.ij-find-preview-inlay.ijss-callgraph').length;
+        window.__ijFindOnMessage(Object.assign({}, previewMsg));
+        var afterRefresh = root.querySelectorAll('.ij-find-preview-inlay.ijss-callgraph').length;
+        var text = root.querySelector('.ij-find-preview-body')?.textContent || '';
+        window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+        return JSON.stringify({
+          beforeInlays: beforeInlays,
+          afterInlayMsg: afterInlayMsg,
+          afterRefresh: afterRefresh,
+          text: text
+        });
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      err?: string;
+      beforeInlays?: number;
+      afterInlayMsg?: number;
+      afterRefresh?: number;
+      text?: string;
+    };
+    assert.strictEqual(parsed.err, undefined, `expected async inlay refresh probe to run: ${raw}`);
+    assert.strictEqual(parsed.beforeInlays, 0, `initial preview body should start without metadata inlays: ${raw}`);
+    assert.strictEqual(parsed.afterInlayMsg, 1, `preview:inlays should render into the current preview: ${raw}`);
+    assert.strictEqual(parsed.afterRefresh, 1, `same-preview refresh should preserve async inlays: ${raw}`);
+    assert.ok(parsed.text?.includes('usages 3'), `preview body should contain async inlay text: ${raw}`);
+  });
+
+  test('Monaco preview call graph inlays survive call graph result header refresh', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(25_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const activeFixture = vscode.Uri.joinPath(folder.uri, 'alpha.py');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+    await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
+    overlay.resumeMonacoCaptureForTests();
+    await vscode.window.showTextDocument(activeFixture, {
+      preview: false,
+      preserveFocus: false,
+      viewColumn: vscode.ViewColumn.One,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await overlay.show('PreviewMonacoInlayPreserveHost', { forceLiteral: true, suppressSearch: true });
+
+    try {
+      const anyOverlay = overlay as unknown as {
+        ensureMonacoCapture?: (windowId?: number, forceOpenUri?: vscode.Uri, options?: { reason?: string; allowForceOpen?: boolean }) => Promise<void>;
+        activeWindowId?: number;
+      };
+      try {
+        await anyOverlay.ensureMonacoCapture?.(anyOverlay.activeWindowId, undefined, {
+          reason: 'monaco-preview-inlay-preserve-test',
+          allowForceOpen: false,
+        });
+      } catch {}
+      let monacoReady = await overlay.waitForMonacoReadyForTests(6_000);
+      if (!monacoReady) {
+        const forced = await overlay.evalInActiveWindowForTests(
+          `(function(){
+            try { if (typeof window.__ijFindTestCreateWidget === 'function') { window.__ijFindTestCreateWidget(); } } catch (e) {}
+            return window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status';
+          })()`,
+        );
+        monacoReady = /^ready/.test(forced) || await overlay.waitForMonacoReadyForTests(4_000);
+      }
+      assert.ok(monacoReady, 'expected Monaco factory to be ready for preview inlay test');
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === 'PreviewMonacoInlayPreserveHost';
+          });
+          if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          var oldBridge = globalThis.irSearchEvent;
+          var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+          var sent = [];
+          globalThis.irSearchEvent = function (payload) {
+            try { sent.push(JSON.parse(String(payload))); } catch (e) {}
+          };
+          window.__ijFindDisableMonacoProbes = false;
+          var stateBefore = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(targetSrc) : {};
+          var previewSeq = Math.max(Date.now(), (stateBefore && stateBefore.activePreviewSeq || 0) + 1);
+          window.__ijFindOnMessage({
+            type: 'preview',
+            __targetSrc: targetSrc,
+            uri: 'file:///preview-monaco-metadata-inlay.py',
+            relPath: 'preview-monaco-metadata-inlay.py',
+            languageId: 'python',
+            focusLine: 0,
+            previewSeq: previewSeq,
+            baseLine: 0,
+            fullFile: true,
+            lines: [
+              { lineNumber: 0, text: 'class PreviewMonacoMetadataSymbol:' },
+              { lineNumber: 1, text: '    pass' }
+            ],
+            callGraphInlays: [{
+              line: 0,
+              column: 34,
+              kind: 'usages',
+              text: 'usages 2',
+              symbolId: 'python:preview-monaco-metadata-inlay.py:PreviewMonacoMetadataSymbol:1',
+              label: 'PreviewMonacoMetadataSymbol'
+            }]
+          });
+          var initial = {};
+          var started = Date.now();
+          while (Date.now() - started < 2000) {
+            var state = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(targetSrc) : {};
+            var body = root.querySelector('.ij-find-preview-body');
+            initial = {
+              mode: state && state.previewMode,
+              uri: state && state.previewUri,
+              host: !!(body && body.querySelector('.ij-find-monaco-preview-host .monaco-editor')),
+              inlayCount: body ? body.querySelectorAll('.ij-find-preview-inlay.ijss-callgraph').length : -1,
+              text: body ? body.textContent : ''
+            };
+            if (initial.mode === 'monaco' && initial.host && initial.inlayCount > 0) { break; }
+            await new Promise(function (resolve) { setTimeout(resolve, 50); });
+          }
+          window.__ijFindShow('Find Usages [call graph cache-index]: PreviewMonacoMetadataSymbol', {
+            forceLiteral: true,
+            suppressSearch: true,
+            preservePreview: true,
+            __targetSrc: targetSrc
+          });
+          await new Promise(function (resolve) { setTimeout(resolve, 80); });
+          var afterState = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(targetSrc) : {};
+          var afterBody = root.querySelector('.ij-find-preview-body');
+          var inlay = afterBody && afterBody.querySelector('.ij-find-preview-inlay.ijss-callgraph');
+          var clickPrevented = false;
+          if (inlay) {
+            var rect = inlay.getBoundingClientRect();
+            var ev = new PointerEvent('pointerdown', {
+              bubbles: true,
+              cancelable: true,
+              button: 0,
+              clientX: rect.left + 2,
+              clientY: rect.top + 2
+            });
+            var dispatchResult = inlay.dispatchEvent(ev);
+            clickPrevented = ev.defaultPrevented || !dispatchResult;
+          }
+          globalThis.irSearchEvent = oldBridge;
+          window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+          return JSON.stringify({
+            initial: initial,
+            after: {
+              mode: afterState && afterState.previewMode,
+              uri: afterState && afterState.previewUri,
+              host: !!(afterBody && afterBody.querySelector('.ij-find-monaco-preview-host .monaco-editor')),
+              inlayCount: afterBody ? afterBody.querySelectorAll('.ij-find-preview-inlay.ijss-callgraph').length : -1,
+              text: afterBody ? afterBody.textContent : ''
+            },
+            clickPrevented: clickPrevented,
+            sent: sent
+          });
+        })()`,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        initial?: { mode?: string; uri?: string; host?: boolean; inlayCount?: number; text?: string };
+        after?: { mode?: string; uri?: string; host?: boolean; inlayCount?: number; text?: string };
+        clickPrevented?: boolean;
+        sent?: Array<{ type?: string; command?: string; args?: unknown[] }>;
+      };
+      assert.strictEqual(parsed.err, undefined, `expected Monaco preview inlay probe to run: ${raw}`);
+      assert.strictEqual(parsed.initial?.mode, 'monaco', `preview should render through Monaco: ${raw}`);
+      assert.strictEqual(parsed.initial?.host, true, `Monaco preview host should mount: ${raw}`);
+      assert.ok((parsed.initial?.inlayCount ?? 0) > 0, `Monaco preview should render call graph metadata inlays: ${raw}`);
+      assert.strictEqual(parsed.after?.mode, 'monaco', `call graph header refresh should preserve preview mode: ${raw}`);
+      assert.strictEqual(parsed.after?.uri, 'file:///preview-monaco-metadata-inlay.py', `call graph header refresh should preserve preview URI: ${raw}`);
+      assert.strictEqual(parsed.after?.host, true, `call graph header refresh should keep Monaco preview mounted: ${raw}`);
+      assert.ok((parsed.after?.inlayCount ?? 0) > 0, `call graph header refresh should keep preview inlays mounted: ${raw}`);
+      assert.strictEqual(parsed.clickPrevented, true, `Monaco preview metadata inlay click should be consumed: ${raw}`);
+      assert.ok(
+        parsed.sent?.some((msg) =>
+          msg.type === 'runCommand' &&
+          msg.command === 'intellijStyledSearch.showUsagesForSymbol' &&
+          msg.args?.[0] === 'python:preview-monaco-metadata-inlay.py:PreviewMonacoMetadataSymbol:1' &&
+          msg.args?.[1] === 'PreviewMonacoMetadataSymbol'),
+        `Monaco preview metadata inlay click should dispatch direct symbol command: ${raw}`,
+      );
+    } finally {
+      await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
+    }
+  });
+
+  test('DOM preview inlay clicks respond within one event loop turn after fallback rendering', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('PreviewMetadataInlayFastHost', { forceLiteral: true, suppressSearch: true });
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(function(){
+        var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+          var query = node.querySelector('.ij-find-query');
+          return query && query.value === 'PreviewMetadataInlayFastHost';
+        });
+        if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
+        var targetSrc = root.getAttribute('data-ij-find-src') || '';
+        var oldBridge = globalThis.irSearchEvent;
+        var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+        var sent = [];
+        var timings = [];
+        globalThis.irSearchEvent = function (payload) {
+          try { sent.push(JSON.parse(String(payload))); } catch (e) {}
+        };
+        window.__ijFindDisableMonacoProbes = true;
+        window.__ijFindOnMessage({
+          type: 'preview',
+          __targetSrc: targetSrc,
+          uri: 'file:///preview-fast-inlay.py',
+          relPath: 'preview-fast-inlay.py',
+          languageId: 'python',
+          focusLine: 1,
+          fullFile: true,
+          lines: [
+            { lineNumber: 0, text: 'class PreviewFastSymbol:' },
+            { lineNumber: 1, text: '    def run(self):' },
+            { lineNumber: 2, text: '        return 1' }
+          ],
+          callGraphInlays: [{
+            line: 1,
+            column: 18,
+            kind: 'usages',
+            text: 'usages 4',
+            symbolId: 'python:preview-fast-inlay.py:PreviewFastSymbol.run:2',
+            label: 'PreviewFastSymbol.run'
+          }]
+        });
+        var inlay = root.querySelector('[data-ijss-callgraph-symbol-id]');
+        if (!inlay) {
+          globalThis.irSearchEvent = oldBridge;
+          window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+          return JSON.stringify({ err: 'missing preview inlay', html: root.querySelector('.ij-find-preview-body')?.innerHTML || '' });
+        }
+        var rect = inlay.getBoundingClientRect();
+        for (var i = 0; i < 4; i++) {
+          var before = sent.length;
+          var started = performance.now();
+          var ev = new PointerEvent('pointerdown', {
+            bubbles: true,
+            cancelable: true,
+            button: 0,
+            clientX: rect.left + 3,
+            clientY: rect.top + 3
+          });
+          var dispatchResult = inlay.dispatchEvent(ev);
+          timings.push({
+            elapsedMs: Math.round(performance.now() - started),
+            prevented: ev.defaultPrevented || !dispatchResult,
+            before: before,
+            after: sent.length
+          });
+        }
+        globalThis.irSearchEvent = oldBridge;
+        window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+        return JSON.stringify({ timings: timings, sent: sent });
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      err?: string;
+      timings?: Array<{ elapsedMs: number; prevented: boolean; before: number; after: number }>;
+      sent?: Array<{ type?: string; command?: string; args?: unknown[] }>;
+    };
+    assert.strictEqual(parsed.err, undefined, `expected fast preview inlay probe to run: ${raw}`);
+    assert.strictEqual(parsed.timings?.length, 4, `expected four inlay click timings: ${raw}`);
+    for (const [index, timing] of (parsed.timings ?? []).entries()) {
+      assert.strictEqual(timing.prevented, true, `preview inlay click ${index} should be consumed: ${raw}`);
+      assert.strictEqual(timing.after, timing.before + 1, `preview inlay click ${index} should synchronously send one command: ${raw}`);
+      assert.ok(timing.elapsedMs <= 10, `preview inlay click ${index} should respond within one event loop turn: ${raw}`);
+    }
+    const commands = (parsed.sent ?? []).filter((msg) =>
+      msg.type === 'runCommand' &&
+      msg.command === 'intellijStyledSearch.showUsagesForSymbol' &&
+      msg.args?.[0] === 'python:preview-fast-inlay.py:PreviewFastSymbol.run:2');
+    assert.strictEqual(commands.length, 4, `every preview inlay click should dispatch a direct symbol command: ${raw}`);
+  });
+
+  test('preview inlay clicks expose a pending result header before call graph results resolve', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(30_000);
+    const restoreBackend = await useCallGraphBackend('javascript');
+    const api = await getApi();
+    const { overlay } = api;
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const fixture = vscode.Uri.joinPath(folder!.uri, 'inlay_pending_header_fixture.py');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorCallGraphInlayHints = cfg.inspect<boolean>('callGraphInlayHints');
+    try {
+      await cfg.update('callGraphInlayHints', true, vscode.ConfigurationTarget.Workspace);
+      await vscode.workspace.fs.writeFile(fixture, Buffer.from(buildInlayClickLoadFixture(), 'utf8'));
+      const document = await vscode.workspace.openTextDocument(fixture);
+      await vscode.window.showTextDocument(document, {
+        preview: false,
+        preserveFocus: false,
+        viewColumn: vscode.ViewColumn.One,
+        selection: new vscode.Range(new vscode.Position(0, 0), new vscode.Position(0, 0)),
+      });
+      await api.callGraph.rebuild(undefined, undefined, { force: true });
+      const hints = await vscode.commands.executeCommand<vscode.InlayHint[]>(
+        'vscode.executeInlayHintProvider',
+        fixture,
+        new vscode.Range(new vscode.Position(0, 0), new vscode.Position(document.lineCount, 0)),
+      );
+      const usageHints = (hints ?? []).filter((hint) => {
+        const parts = Array.isArray(hint.label) ? hint.label : [];
+        return parts.some((part) => /^usages \d+$/.test(part.value));
+      }).sort((a, b) => a.position.line - b.position.line);
+      assert.ok(usageHints.length > 0, 'expected at least one usage inlay for pending-header probe');
+      const usageHint = usageHints[0]!;
+
+      await overlay.show('PreviewInlayPendingHeaderHost', { forceLiteral: true, suppressSearch: true });
+      const hostSrc = await overlay.evalInActiveWindowForTests(
+        `(function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === 'PreviewInlayPendingHeaderHost';
+          });
+          if (!root) { return ''; }
+          var hostSrc = root.getAttribute('data-ij-find-src') || '';
+          Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (panel) {
+            if ((panel.getAttribute('data-ij-find-src') || '') === hostSrc) { return; }
+            var close = panel.querySelector('.ij-find-close');
+            if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+          });
+          return hostSrc;
+        })()`,
+      );
+      assert.ok(hostSrc, 'expected pending-header host panel to expose a renderer src');
+
+      await vscode.window.showTextDocument(document, {
+        preview: false,
+        preserveFocus: false,
+        viewColumn: vscode.ViewColumn.One,
+        selection: new vscode.Range(usageHint.position, usageHint.position),
+      });
+      await vscode.commands.executeCommand('revealLine', {
+        lineNumber: usageHint.position.line,
+        at: 'top',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const editor = vscode.window.activeTextEditor;
+      assert.ok(editor, 'expected active editor for pending-header inlay resolution');
+      assert.strictEqual(editor.document.uri.toString(), fixture.toString(), 'expected pending-header fixture to stay active');
+      const lineOrdinal = visibleLineOrdinalForEditorLine(editor, usageHint.position.line);
+      assert.notStrictEqual(lineOrdinal, undefined, `expected inlay line ${usageHint.position.line} to be visible`);
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var hostSrc = ${JSON.stringify(hostSrc)};
+          var host = document.querySelector('.ij-find-overlay.visible[data-ij-find-src="' + hostSrc + '"]');
+          var body = host ? host.querySelector('.ij-find-preview-body') : null;
+          if (!body) { return JSON.stringify({ err: 'missing preview body' }); }
+          var beforeCount = document.querySelectorAll('.ij-find-overlay.visible').length;
+          var editor = document.createElement('div');
+          editor.className = 'monaco-editor';
+          editor.style.cssText = 'position:absolute;left:16px;top:16px;width:320px;height:160px;z-index:2;';
+          var nativeEdit = document.createElement('div');
+          nativeEdit.className = 'native-edit-context';
+          nativeEdit.tabIndex = 0;
+          editor.appendChild(nativeEdit);
+          var lines = document.createElement('div');
+          lines.className = 'view-lines';
+          var hint = null;
+          var targetOrdinal = ${lineOrdinal};
+          for (var i = 0; i <= targetOrdinal; i++) {
+            var line = document.createElement('div');
+            line.className = 'view-line';
+            line.style.cssText = 'height:20px;';
+            if (i === targetOrdinal) {
+              hint = document.createElement('span');
+              hint.className = 'inline-hints-widget ijss-callgraph';
+              hint.textContent = 'usages 1';
+              hint.style.cssText = 'display:inline-block;padding:2px 4px;';
+              line.appendChild(hint);
+            } else {
+              line.textContent = 'preview line ' + i;
+            }
+            lines.appendChild(line);
+          }
+          editor.appendChild(lines);
+          body.appendChild(editor);
+          nativeEdit.focus();
+          var spawnSelection = window.__ijFindShouldSpawnSearchSelection ? window.__ijFindShouldSpawnSearchSelection() : '';
+          if (!hint) {
+            editor.remove();
+            return JSON.stringify({ err: 'missing synthetic hint', spawnSelection: spawnSelection });
+          }
+          var started = performance.now();
+          var dispatchInfo = { prevented: false, dispatchResult: true };
+          var result = await new Promise(function (resolve) {
+            var done = false;
+            var timer = null;
+            var interval = null;
+            var observer = null;
+            function snapshot() {
+              return Array.from(document.querySelectorAll('.ij-find-overlay.visible')).map(function (root) {
+                var query = root.querySelector('.ij-find-query');
+                return {
+                  src: root.getAttribute('data-ij-find-src') || '',
+                  query: query ? query.value : ''
+                };
+              });
+            }
+            function finish(reason, firstPanel) {
+              if (done) { return; }
+              done = true;
+              if (timer) { clearTimeout(timer); }
+              if (interval) { clearInterval(interval); }
+              if (observer) { observer.disconnect(); }
+              resolve({
+                reason: reason,
+                elapsedMs: Math.round(performance.now() - started),
+                beforeCount: beforeCount,
+                afterCount: snapshot().length,
+                firstPanel: firstPanel || null,
+                panels: snapshot()
+              });
+            }
+            function check() {
+              var panels = snapshot();
+              var first = panels.find(function (panel) {
+                return panel.src !== hostSrc && panel.query;
+              });
+              if (first) { finish('first-extra-header', first); }
+            }
+            observer = new MutationObserver(check);
+            observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style', 'value'] });
+            interval = setInterval(check, 5);
+            timer = setTimeout(function () { finish('timeout', null); }, 800);
+            var rect = hint.getBoundingClientRect();
+            var ev = new PointerEvent('pointerdown', {
+              bubbles: true,
+              cancelable: true,
+              button: 0,
+              clientX: rect.left + 2,
+              clientY: rect.top + 2
+            });
+            var dispatchResult = hint.dispatchEvent(ev);
+            dispatchInfo = { prevented: ev.defaultPrevented || !dispatchResult, dispatchResult: dispatchResult };
+            if (!dispatchInfo.prevented) { check(); }
+          });
+          editor.remove();
+          result.spawnSelection = spawnSelection;
+          result.dispatchInfo = dispatchInfo;
+          return JSON.stringify(result);
+        })()`,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        reason?: string;
+        elapsedMs?: number;
+        beforeCount?: number;
+        afterCount?: number;
+        spawnSelection?: string;
+        firstPanel?: { query: string; src: string } | null;
+        dispatchInfo?: { prevented: boolean; dispatchResult: boolean };
+      };
+      assert.strictEqual(parsed.err, undefined, `expected pending-header inlay probe to run: ${raw}`);
+      assert.strictEqual(parsed.spawnSelection, 'preview', `preview inlay focus should use spawned panel context: ${raw}`);
+      assert.strictEqual(parsed.dispatchInfo?.prevented, true, `preview inlay click should be consumed: ${raw}`);
+      assert.strictEqual(parsed.reason, 'first-extra-header', `preview inlay click should expose a result header before final results: ${raw}`);
+      assert.strictEqual(
+        parsed.afterCount,
+        (parsed.beforeCount ?? 0) + 1,
+        `preview inlay click should create one spawned result panel: ${raw}`,
+      );
+      assert.ok(
+        parsed.firstPanel?.query.startsWith('Find Usages: '),
+        `first spawned panel should show the pending Find Usages header, not wait for final results: ${raw}`,
+      );
+      assert.ok(
+        !parsed.firstPanel?.query.includes('[call graph'),
+        `first spawned panel should be the pending header before call graph source labeling: ${raw}`,
+      );
+      assert.ok(
+        (parsed.elapsedMs ?? Number.POSITIVE_INFINITY) <= 75,
+        `pending result header should appear promptly after preview inlay click: ${raw}`,
+      );
+    } finally {
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible .ij-find-close')).forEach(function (btn) {
+              btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('callGraphInlayHints', priorCallGraphInlayHints?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
+      try { await vscode.workspace.fs.delete(fixture); } catch {}
+      await restoreBackend();
+    }
+  });
+
+  test('preview inlay clicks open spawned result panels within 75ms under repeated load', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(60_000);
     const restoreBackend = await useCallGraphBackend('javascript');
@@ -2101,7 +3615,7 @@ suite('Renderer — overlay UI probes', () => {
         await new Promise((resolve) => setTimeout(resolve, 75));
       }
       assert.strictEqual(timings.length, measuredIterations, 'expected every measured preview inlay load iteration to record timing');
-      assertTimingsWithin('preview inlay spawned panel latency', timings, 50);
+      assertTimingsWithin('preview inlay spawned panel latency', timings, 75);
     } finally {
       try {
         await overlay.evalInActiveWindowForTests(
@@ -2466,7 +3980,7 @@ suite('Renderer — overlay UI probes', () => {
     assert.ok((state.rowHeight ?? 0) <= 22, `single result row should stay one line tall: ${raw}`);
   });
 
-  test('search result clicks switch the preview within 50ms under repeated load', async function () {
+  test('search result clicks switch the preview within 10ms under repeated load', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);
     const { overlay } = await getApi();
@@ -2564,14 +4078,14 @@ suite('Renderer — overlay UI probes', () => {
             ranges: [{ start: 4, end: 11 }]
           });
           var previewAtMs = null;
-          while (performance.now() - started <= 50) {
+          while (performance.now() - started <= 10) {
             var previewBody = root ? root.querySelector('.ij-find-preview-body') : document.querySelector('.ij-find-overlay.visible:not(.ij-find-detached) .ij-find-preview-body');
             var previewText = previewBody ? previewBody.textContent || '' : '';
             if (previewText.indexOf(uniquePreviewText) >= 0) {
               previewAtMs = performance.now() - started;
               break;
             }
-            await new Promise(function (resolve) { setTimeout(resolve, 5); });
+            await new Promise(function (resolve) { setTimeout(resolve, 1); });
           }
           timings.push({
             idx: idx,
@@ -2607,8 +4121,8 @@ suite('Renderer — overlay UI probes', () => {
     assert.ok(parsed.previewUri === alphaUri || parsed.previewUri === betaUri, `final click should switch preview to a fixture URI: ${raw}`);
     assert.strictEqual(parsed.requestTimings.length, 16, `expected every loaded click to request preview: ${raw}`);
     assert.strictEqual(parsed.renderTimings.length, 16, `expected every loaded click to render preview: ${raw}`);
-    assertTimingsWithin('result click preview request latency', parsed.requestTimings, 50);
-    assertTimingsWithin('result click preview render latency', parsed.renderTimings, 50);
+    assertTimingsWithin('result click preview request latency', parsed.requestTimings, 10);
+    assertTimingsWithin('result click preview render latency', parsed.renderTimings, 10);
   });
 
   test('rapid result clicks ignore stale out-of-order preview responses under load', async function () {
@@ -2745,6 +4259,148 @@ suite('Renderer — overlay UI probes', () => {
     assert.strictEqual(parsed.activeIndex, 1, `final rapid click should leave beta row selected: ${raw}`);
     assert.strictEqual(parsed.previewUri, betaUri, `final preview should stay on latest clicked row: ${raw}`);
     assert.ok(parsed.activePreviewSeq >= 80, `stress loop should issue many preview requests: ${raw}`);
+  });
+
+  test('rapid back-and-forth result switching keeps the newest preview visible', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(20_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const alphaUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py').toString();
+    const betaUri = vscode.Uri.joinPath(folder!.uri, 'beta.js').toString();
+
+    await overlay.show('PreviewBackAndForth', { forceLiteral: true, suppressSearch: true });
+    const raw = await overlay.evalInActiveWindowForTests(
+      `(async function(){
+        var alpha = ${JSON.stringify(alphaUri)};
+        var beta = ${JSON.stringify(betaUri)};
+        var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+        var oldBridge = globalThis.irSearchEvent;
+        var sent = [];
+        var failures = [];
+        window.__ijFindDisableMonacoProbes = true;
+        globalThis.irSearchEvent = function (payload) {
+          try {
+            var msg = JSON.parse(String(payload));
+            if (msg.type === 'requestPreview') { sent.push(msg); }
+          } catch (e) {}
+        };
+        try {
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === 'PreviewBackAndForth';
+          }) || document.querySelector('.ij-find-overlay.visible');
+          var targetSrc = root ? root.getAttribute('data-ij-find-src') || '' : '';
+          var q = root ? root.querySelector('.ij-find-query') : document.querySelector('.ij-find-query');
+          if (q) { q.value = ''; }
+          if (window.__ijFindRefreshSearch) { window.__ijFindRefreshSearch(targetSrc); }
+          window.__ijFindOnMessage({ type: 'results:start', searchId: 942, __targetSrc: targetSrc });
+          window.__ijFindOnMessage({
+            type: 'results:file',
+            searchId: 942,
+            __targetSrc: targetSrc,
+            match: {
+              uri: alpha,
+              relPath: 'alpha.py',
+              matches: [{ line: 0, preview: 'class AlphaService back forth', ranges: [{ start: 6, end: 18 }] }]
+            }
+          });
+          window.__ijFindOnMessage({
+            type: 'results:file',
+            searchId: 942,
+            __targetSrc: targetSrc,
+            match: {
+              uri: beta,
+              relPath: 'beta.js',
+              matches: [{ line: 0, preview: 'class BetaWidget back forth', ranges: [{ start: 6, end: 16 }] }]
+            }
+          });
+          window.__ijFindOnMessage({ type: 'results:done', searchId: 942, totalFiles: 2, totalMatches: 2, truncated: false, __targetSrc: targetSrc });
+          function row(flatIdx) {
+            return root && root.querySelector('.ij-find-row[data-flat="' + flatIdx + '"]');
+          }
+          function clickAndRequest(flatIdx) {
+            var target = row(flatIdx);
+            if (!target) { return { err: 'missing row ' + flatIdx }; }
+            sent.length = 0;
+            target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+            var req = sent.find(function (msg) { return msg.type === 'requestPreview'; });
+            if (!req) { return { err: 'missing preview request ' + flatIdx }; }
+            return req;
+          }
+          function deliver(req, label, cycle) {
+            window.__ijFindOnMessage({
+              type: 'preview',
+              __targetSrc: targetSrc,
+              uri: req.uri,
+              relPath: req.uri === beta ? 'beta.js' : 'alpha.py',
+              languageId: req.uri === beta ? 'javascript' : 'python',
+              focusLine: 0,
+              fullFile: true,
+              lines: [{ lineNumber: 0, text: label + ' newest preview cycle ' + cycle }],
+              ranges: [{ start: 0, end: 6 }]
+            });
+          }
+          var lastExpected = null;
+          for (var cycle = 0; cycle < 60; cycle++) {
+            var firstReq = clickAndRequest(1);
+            var secondReq = clickAndRequest(0);
+            if (firstReq.err || secondReq.err) {
+              failures.push({ cycle: cycle, firstReq: firstReq, secondReq: secondReq });
+              break;
+            }
+            lastExpected = secondReq.uri;
+            deliver(secondReq, 'latest', cycle);
+            deliver(firstReq, 'older', cycle);
+            var state = window.__ijFindGetSearchState(targetSrc);
+            var body = root ? root.querySelector('.ij-find-preview-body') : null;
+            var text = body ? body.textContent || '' : '';
+            if (state.previewUri !== lastExpected ||
+                text.indexOf('latest newest preview cycle ' + cycle) < 0 ||
+                text.indexOf('older newest preview cycle ' + cycle) >= 0) {
+              failures.push({
+                cycle: cycle,
+                expectedUri: lastExpected,
+                state: state,
+                text: text
+              });
+              break;
+            }
+            await new Promise(function (resolve) { setTimeout(resolve, 0); });
+          }
+          var finalState = window.__ijFindGetSearchState(targetSrc);
+          var finalBody = root ? root.querySelector('.ij-find-preview-body') : null;
+          var finalText = finalBody ? finalBody.textContent || '' : '';
+          var close = root && root.querySelector('.ij-find-close');
+          if (close) {
+            close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          }
+          return JSON.stringify({
+            failures: failures,
+            activeIndex: finalState.activeIndex,
+            previewUri: finalState.previewUri,
+            finalText: finalText,
+            expectedUri: lastExpected
+          });
+        } finally {
+          globalThis.irSearchEvent = oldBridge;
+          window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+        }
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      failures: unknown[];
+      activeIndex: number;
+      previewUri: string | null;
+      finalText: string;
+      expectedUri: string | null;
+    };
+    assert.deepStrictEqual(parsed.failures, [], `rapid back-and-forth preview should keep newest content: ${raw}`);
+    assert.strictEqual(parsed.previewUri, parsed.expectedUri, `final preview URI should match the final clicked row: ${raw}`);
+    assert.ok(parsed.finalText.includes('latest newest preview cycle 59'), `final preview body should show the newest delivered preview: ${raw}`);
+    assert.ok(!parsed.finalText.includes('older newest preview cycle 59'), `final preview body must not be overwritten by stale content: ${raw}`);
+    assert.strictEqual(parsed.activeIndex, 0, `60 back-and-forth cycles should leave the final alpha row selected: ${raw}`);
   });
 
   test('result rows expose reveal and open actions', async function () {

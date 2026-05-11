@@ -3208,12 +3208,30 @@ export class CallGraphService implements vscode.Disposable {
     options: RustGraphInvokeOptions = {},
   ): Promise<unknown> {
     return this.invokeRustGraphText(args, options).then((stdout) => {
-      try {
-        return JSON.parse(stdout.trim());
-      } catch (err) {
-        throw new Error(`failed to parse zoek-rs graph response: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      return this.parseRustGraphJson(stdout);
     });
+  }
+
+  private parseRustGraphJson(stdout: string): unknown {
+    const text = stdout.trim();
+    if (!text) {
+      throw new Error('failed to parse zoek-rs graph response: empty stdout');
+    }
+    try {
+      return JSON.parse(text);
+    } catch (firstErr) {
+      const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i];
+        if (!line.startsWith('{') && !line.startsWith('[')) { continue; }
+        try {
+          return JSON.parse(line);
+        } catch {
+          // Keep scanning; zoek-rs diagnostics can precede the final JSON line.
+        }
+      }
+      throw new Error(`failed to parse zoek-rs graph response: ${firstErr instanceof Error ? firstErr.message : String(firstErr)}`);
+    }
   }
 
   private invokeRustGraphText(

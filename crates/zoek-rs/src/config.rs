@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 pub const ENGINE_NAME: &str = "zoek-rs";
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 10;
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -22,7 +22,7 @@ impl Default for EngineConfig {
         Self {
             index_dir_name: ".zoek-rs".to_string(),
             max_file_size_bytes: 1_048_576,
-            shard_target_bytes: 32 * 1024 * 1024,
+            shard_target_bytes: 40 * 1024 * 1024,
             // Keep tiny-file monorepos from producing hundreds of shard files.
             // Byte limits still split normal/larger source files; this cap is
             // mainly for 1M-file repos where process-per-search shard opens
@@ -33,10 +33,10 @@ impl Default for EngineConfig {
             // docs `gram_incomplete`; search includes those docs before exact
             // verification, so this trades some candidate expansion for much
             // lower cold indexing cost without false negatives.
-            max_grams_per_file: 4096,
+            max_grams_per_file: 512,
             overlay_compaction_entry_threshold: 512,
             overlay_compaction_journal_bytes_threshold: 2 * 1024 * 1024,
-            excluded_dir_names: vec![".zoek-rs".to_string(), ".zoekt-rs".to_string()],
+            excluded_dir_names: Vec::new(),
             binary_file_extensions: vec![
                 ".png".to_string(),
                 ".jpg".to_string(),
@@ -75,6 +75,40 @@ impl Default for EngineConfig {
                 ".pyo".to_string(),
                 ".rmeta".to_string(),
                 ".rlib".to_string(),
+                ".mo".to_string(),
+                ".bcmap".to_string(),
+                ".mat".to_string(),
+                ".sav".to_string(),
+                ".npy".to_string(),
+                ".pfb".to_string(),
+                ".bare".to_string(),
+                ".npz".to_string(),
+                ".xlsx".to_string(),
+                ".dat".to_string(),
+                ".pkl".to_string(),
+                ".bfbs".to_string(),
+                ".docx".to_string(),
+                ".cur".to_string(),
+                ".bplist".to_string(),
+                ".bz2".to_string(),
+                ".parquet".to_string(),
+                ".gzip".to_string(),
+                ".xz".to_string(),
+                ".lzma".to_string(),
+                ".orc".to_string(),
+                ".nc".to_string(),
+                ".z".to_string(),
+                ".oxt".to_string(),
+                ".obj".to_string(),
+                ".bin".to_string(),
+                ".feather".to_string(),
+                ".jar".to_string(),
+                ".ani".to_string(),
+                ".plist".to_string(),
+                ".aep".to_string(),
+                ".mod".to_string(),
+                ".egg".to_string(),
+                ".icc".to_string(),
             ],
         }
     }
@@ -89,24 +123,32 @@ impl EngineConfig {
         self.excluded_dir_names.iter().any(|entry| entry == name)
     }
 
+    pub fn is_internal_index_dir_name(&self, name: &str) -> bool {
+        name == self.index_dir_name || name == ".zoekt-rs"
+    }
+
     pub fn is_overlay_update_excluded_relative_path(&self, rel_path: &str) -> bool {
         rel_path
             .replace('\\', "/")
             .split('/')
-            .any(|segment| segment == ".zoek-rs" || segment == ".zoekt-rs")
+            .any(|segment| self.is_internal_index_dir_name(segment))
     }
 
     pub fn is_binary_extension(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
+        if path
+            .file_name()
             .and_then(|value| value.to_str())
-            .map(|value| format!(".{}", value.to_ascii_lowercase()));
-        match ext {
-            Some(ext) => self
-                .binary_file_extensions
-                .iter()
-                .any(|entry| entry == &ext),
-            None => false,
+            .is_some_and(|value| value == ".DS_Store")
+        {
+            return true;
         }
+        let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
+            return false;
+        };
+        self.binary_file_extensions.iter().any(|entry| {
+            entry
+                .strip_prefix('.')
+                .is_some_and(|binary_ext| binary_ext.eq_ignore_ascii_case(ext))
+        })
     }
 }

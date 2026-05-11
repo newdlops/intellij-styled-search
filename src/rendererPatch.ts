@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 118;
+export const RENDERER_PATCH_VERSION = 123;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -36,9 +36,10 @@ export function getRendererPatchScript(
     try { window.__ijFindShouldSuspendIntelliSenseRecursionCapture = !!__ijFindShouldSuspendIntelliSenseRecursionCapture; } catch (eIrFlag) {}
     try { window.__ijFindEnableRendererInlayClickHook = !!__ijFindEnableRendererInlayClickHook; } catch (eInlayFlag) {}
     try { window.__ijFindDisposeRendererPatchOnHide = !!__ijFindDisposeRendererPatchOnHide; } catch (eDisposeFlag) {}
-    if (!__ijFindEnableMonacoPreviewCapture) {
+  if (!__ijFindEnableMonacoPreviewCapture) {
       try { if (window.__ijFindStopCapture) { window.__ijFindStopCapture('already-patched-monaco-disabled'); } } catch (eStopAlready) {}
       try { window.__ijFindMonaco = null; } catch (eMonacoAlready) {}
+      try { window.__ijFindMonacoFactory = null; } catch (eMonacoFactoryAlready) {}
     }
     return 'already patched:v' + __ijFindPatchVersion;
   }
@@ -268,12 +269,23 @@ export function getRendererPatchScript(
   // VSCode renderer, not just this extension.
   try { if (window.__ijFindStopCapture) { window.__ijFindStopCapture('patch-upgrade'); } } catch (eStopOld) {}
   try { window.__ijFindDisableMonacoProbes = !__ijFindEnableMonacoPreviewCapture; } catch (eDisableFlag) {}
-  // Drop cached monaco refs from a previous patch version. They may carry
-  // stale widgetOptions (e.g. V56s contributions-empty setting which
-  // disabled hover/LSP contributions) and would keep being reused until a
-  // full VSCode restart — clear so the next capture diagnostic
-  // repopulates with this versions settings.
-  try { window.__ijFindMonaco = null; } catch (eMM) {}
+  // Keep the Monaco editor factory across additional/spawned panel installs.
+  // The factory stores constructor + DI services, not a preview widget, so it
+  // is safe to reuse for the lifetime of this renderer/workspace and avoids
+  // reopening a tab just to recover from DOM fallback.
+  try {
+    var preservedMonacoFactory = window.__ijFindMonacoFactory ||
+      (window.__ijFindMonaco && window.__ijFindMonaco.factorySingleton ? window.__ijFindMonaco : null);
+    if (preservedMonacoFactory &&
+        preservedMonacoFactory.ctor &&
+        preservedMonacoFactory.factoryVersion === __ijFindPatchVersion) {
+      window.__ijFindMonacoFactory = preservedMonacoFactory;
+      window.__ijFindMonaco = preservedMonacoFactory;
+    } else {
+      window.__ijFindMonacoFactory = null;
+      window.__ijFindMonaco = null;
+    }
+  } catch (eMM) {}
 
   // ── Capture VSCode internals via prototype interception ─────────────
   // Optional Monaco capture. This is disabled by default because these
@@ -411,7 +423,13 @@ export function getRendererPatchScript(
   };
   window.__ijFindRefreshCapture = function (reason) {
     if (window.__ijFindDisableMonacoProbes) { return 'capture-disabled'; }
-    try { window.__ijFindMonaco = null; } catch (eMonaco) {}
+    try {
+      if (window.__ijFindMonacoFactory && window.__ijFindMonacoFactory.ctor) {
+        window.__ijFindMonaco = window.__ijFindMonacoFactory;
+      } else {
+        window.__ijFindMonaco = null;
+      }
+    } catch (eMonaco) {}
     return window.__ijFindStartCapture(reason || 'refresh');
   };
   if (!window.__ijFindDisableMonacoProbes) {
@@ -559,25 +577,116 @@ export function getRendererPatchScript(
       return 'bad-modelSvc:' + errorText(e).slice(0, 160);
     }
   }
+  function getMonacoFactorySingleton() {
+    var factory = null;
+    var current = null;
+    try { factory = window.__ijFindMonacoFactory || null; } catch (eFactory) {}
+    try { current = window.__ijFindMonaco || null; } catch (eCurrent) {}
+    if (factory && factory.ctor) {
+      try {
+        if (!current || !current.ctor) {
+          window.__ijFindMonaco = factory;
+        }
+      } catch (ePromoteFactory) {}
+      return factory;
+    }
+    if (current && current.ctor) {
+      if (current.factorySingleton) {
+        try { window.__ijFindMonacoFactory = current; } catch (ePromoteCurrent) {}
+      }
+      return current;
+    }
+    return null;
+  }
+  function ensureMonacoFactoryCandidateArrays(m) {
+    if (!m) { return; }
+    try {
+      if (!Array.isArray(m.instCandidates)) { m.instCandidates = []; }
+    } catch (eInstArr) {}
+    try {
+      if (!Array.isArray(m.modelSvcCandidates)) { m.modelSvcCandidates = []; }
+    } catch (eModelArr) {}
+  }
+  function installMonacoFactorySingleton(m) {
+    if (!m || !m.ctor) { return m; }
+    ensureMonacoFactoryCandidateArrays(m);
+    try { m.factorySingleton = true; } catch (eFlag) {}
+    try { m.factoryVersion = __ijFindPatchVersion; } catch (eVersion) {}
+    try { m.factoryCreatedAt = m.factoryCreatedAt || Date.now(); } catch (eCreated) {}
+    try { window.__ijFindMonacoFactory = m; } catch (eFactory) {}
+    try { window.__ijFindMonaco = m; } catch (eCurrent) {}
+    return m;
+  }
+  function rememberMonacoInstCandidate(m, inst, label) {
+    if (!m || !isInstantiationServiceLike(inst)) { return; }
+    ensureMonacoFactoryCandidateArrays(m);
+    try {
+      addInstCandidate(m.instCandidates, inst, label || 'factory');
+      if (m.instCandidates.length > 16) { m.instCandidates.length = 16; }
+      m.inst = inst;
+    } catch (eRememberInst) {}
+  }
+  function rememberMonacoModelServiceCandidate(m, modelSvc, label) {
+    if (!m || !isModelServiceLike(modelSvc)) { return; }
+    ensureMonacoFactoryCandidateArrays(m);
+    try {
+      addModelServiceCandidate(m.modelSvcCandidates, modelSvc, label || 'factory');
+      if (m.modelSvcCandidates.length > 16) { m.modelSvcCandidates.length = 16; }
+      m.modelSvc = modelSvc;
+    } catch (eRememberModel) {}
+  }
+  function forgetMonacoInstCandidate(inst) {
+    if (!inst) { return; }
+    var m = getMonacoFactorySingleton();
+    if (!m) { return; }
+    try {
+      if (m.inst === inst) { m.inst = null; }
+      if (Array.isArray(m.instCandidates)) {
+        m.instCandidates = m.instCandidates.filter(function (entry) {
+          return entry && entry.inst !== inst;
+        });
+      }
+    } catch (eForgetInst) {}
+  }
+  function forgetMonacoModelServiceCandidate(modelSvc) {
+    if (!modelSvc) { return; }
+    var m = getMonacoFactorySingleton();
+    if (!m) { return; }
+    try {
+      if (m.modelSvc === modelSvc) { m.modelSvc = null; }
+      if (Array.isArray(m.modelSvcCandidates)) {
+        m.modelSvcCandidates = m.modelSvcCandidates.filter(function (entry) {
+          return entry && entry.modelSvc !== modelSvc;
+        });
+      }
+    } catch (eForgetModel) {}
+  }
   function describeMonacoState() {
-    var m = window.__ijFindMonaco;
+    var m = getMonacoFactorySingleton();
     if (!m) { return { ready: false, reason: 'none', disposed: false }; }
     if (!m.ctor) { return { ready: false, reason: 'missing-ctor', disposed: false }; }
-    var instErr = validateInstantiationService(m.inst);
-    if (instErr) { return { ready: false, reason: instErr, disposed: isDisposedText(instErr) }; }
-    var modelErr = validateModelService(m.modelSvc);
-    if (modelErr) { return { ready: false, reason: modelErr, disposed: isDisposedText(modelErr) }; }
+    installMonacoFactorySingleton(m);
+    var instChoice = chooseLiveInstantiationService(false, null);
+    if (!instChoice) {
+      var instErr = validateInstantiationService(m.inst);
+      return { ready: false, reason: instErr || 'missing-inst', disposed: isDisposedText(instErr) };
+    }
+    rememberMonacoInstCandidate(m, instChoice.inst, instChoice.label);
+    var modelChoice = chooseLiveModelService(false, null);
+    if (!modelChoice) {
+      var modelErr = validateModelService(m.modelSvc);
+      return { ready: false, reason: modelErr || 'missing-modelSvc', disposed: isDisposedText(modelErr) };
+    }
+    rememberMonacoModelServiceCandidate(m, modelChoice.modelSvc, modelChoice.label);
     return { ready: true, reason: 'ready', disposed: false };
   }
   window.__ijFindMonacoStatus = function () {
     var status = describeMonacoState();
-    if (!status.ready && status.disposed) {
-      try { window.__ijFindMonaco = null; } catch (e) {}
-    }
     return status.ready ? 'ready' : ('not-ready:' + status.reason);
   };
   window.__ijFindInvalidateMonaco = function (reason) {
     try { window.__ijFindMonaco = null; } catch (e) {}
+    try { window.__ijFindMonacoFactory = null; } catch (eFactory) {}
     return 'invalidated:' + (reason || 'unknown');
   };
 
@@ -654,6 +763,21 @@ export function getRendererPatchScript(
   }
   function collectInstantiationServiceCandidates(includeDom, report) {
     var out = [];
+    try {
+      var m = getMonacoFactorySingleton();
+      if (m) {
+        if (m.editorInst) { addInstCandidate(out, m.editorInst, 'factory.editor'); }
+        if (m.inst) { addInstCandidate(out, m.inst, 'factory.cached'); }
+        if (Array.isArray(m.instCandidates)) {
+          for (var mi = 0; mi < m.instCandidates.length; mi++) {
+            var entry = m.instCandidates[mi];
+            if (entry && entry.inst) {
+              addInstCandidate(out, entry.inst, 'factory[' + mi + ']:' + (entry.label || 'inst'));
+            }
+          }
+        }
+      }
+    } catch (eFactoryCached) {}
     if (includeDom) {
       try {
         var editors = collectWorkbenchMonacoEditorElements();
@@ -665,10 +789,6 @@ export function getRendererPatchScript(
         if (report) { report.push('dom inst scan err: ' + errorText(eDom).slice(0, 100)); }
       }
     }
-    try {
-      var m = window.__ijFindMonaco;
-      if (m && m.inst) { addInstCandidate(out, m.inst, 'cached'); }
-    } catch (eCached) {}
     var c = null;
     try { c = window.__ijFindCaptures || caps; } catch (eCaps) {}
     if (c) {
@@ -689,6 +809,20 @@ export function getRendererPatchScript(
   }
   function collectModelServiceCandidates(includeDom, report) {
     var out = [];
+    try {
+      var m = getMonacoFactorySingleton();
+      if (m) {
+        if (m.modelSvc) { addModelServiceCandidate(out, m.modelSvc, 'factory.cached'); }
+        if (Array.isArray(m.modelSvcCandidates)) {
+          for (var mi = 0; mi < m.modelSvcCandidates.length; mi++) {
+            var entry = m.modelSvcCandidates[mi];
+            if (entry && entry.modelSvc) {
+              addModelServiceCandidate(out, entry.modelSvc, 'factory[' + mi + ']:' + (entry.label || 'modelSvc'));
+            }
+          }
+        }
+      }
+    } catch (eFactoryCached) {}
     if (includeDom) {
       try {
         var editors = collectWorkbenchMonacoEditorElements();
@@ -700,10 +834,6 @@ export function getRendererPatchScript(
         if (report) { report.push('dom modelSvc scan err: ' + errorText(eDom).slice(0, 100)); }
       }
     }
-    try {
-      var m = window.__ijFindMonaco;
-      if (m && m.modelSvc) { addModelServiceCandidate(out, m.modelSvc, 'cached'); }
-    } catch (eCached) {}
     var c = null;
     try { c = window.__ijFindCaptures || caps; } catch (eCaps) {}
     if (c) {
@@ -722,11 +852,22 @@ export function getRendererPatchScript(
     }
     return out;
   }
+  function chooseLiveInstantiationService(includeDom, report) {
+    var instCandidates = collectInstantiationServiceCandidates(includeDom, report);
+    for (var i = 0; i < instCandidates.length; i++) {
+      var err = validateInstantiationService(instCandidates[i].inst);
+      if (!err) { return instCandidates[i]; }
+      if (isDisposedText(err)) { forgetMonacoInstCandidate(instCandidates[i].inst); }
+      if (report) { report.push('SKIP inst ' + instCandidates[i].label + ': ' + err); }
+    }
+    return null;
+  }
   function chooseLiveModelService(includeDom, report) {
     var modelCandidates = collectModelServiceCandidates(includeDom, report);
     for (var i = 0; i < modelCandidates.length; i++) {
       var err = validateModelService(modelCandidates[i].modelSvc);
       if (!err) { return modelCandidates[i]; }
+      if (isDisposedText(err)) { forgetMonacoModelServiceCandidate(modelCandidates[i].modelSvc); }
       if (report) { report.push('SKIP modelSvc ' + modelCandidates[i].label + ': ' + err); }
     }
     return null;
@@ -761,8 +902,9 @@ export function getRendererPatchScript(
   }
 
   function createPreviewEditor(host) {
-    var m = window.__ijFindMonaco;
+    var m = getMonacoFactorySingleton();
     if (!m || !m.ctor) { return null; }
+    installMonacoFactorySingleton(m);
     var overflowHost = getOrCreatePreviewOverflowHost();
     var options = {
       automaticLayout: true,
@@ -789,150 +931,99 @@ export function getRendererPatchScript(
       overviewRulerLanes: 3,
       hideCursorInOverviewRuler: false,
     };
+    var triedDirectNew = false;
+    function tryDirectNew(label) {
+      if (triedDirectNew) { return null; }
+      triedDirectNew = true;
+      try {
+        var directEditor = new m.ctor(host, options, m.widgetOptions || { isSimpleWidget: false });
+        try { m.createMode = 'new'; } catch (eModeNew) {}
+        send({ type: 'log', msg: 'createPreviewEditor using direct new ' + label });
+        return directEditor;
+      } catch (eDirectNew) {
+        send({ type: 'log', msg: 'createPreviewEditor direct new err ' + label + ': ' + errorText(eDirectNew).slice(0, 160) });
+        return null;
+      }
+    }
+    if (m.createMode === 'new') {
+      var directFirst = tryDirectNew('factory.createMode');
+      if (directFirst) { return directFirst; }
+    }
     var insts = collectInstantiationServiceCandidates(true, null);
-    var sawDisposed = false;
     for (var i = 0; i < insts.length; i++) {
       var instErr = validateInstantiationService(insts[i].inst);
       if (instErr) {
-        if (isDisposedText(instErr)) { sawDisposed = true; }
+        if (isDisposedText(instErr)) { forgetMonacoInstCandidate(insts[i].inst); }
         send({ type: 'log', msg: 'createPreviewEditor skip inst ' + insts[i].label + ': ' + instErr });
         continue;
       }
       try {
         var editor = insts[i].inst.createInstance(m.ctor, host, options, m.widgetOptions || { isSimpleWidget: false });
-        m.inst = insts[i].inst;
+        rememberMonacoInstCandidate(m, insts[i].inst, insts[i].label);
+        try { m.editorInst = insts[i].inst; } catch (eEditorInst) {}
+        try { m.createMode = 'createInstance'; } catch (eModeCreateInstance) {}
         var modelChoice = chooseLiveModelService(true, null);
-        if (modelChoice) { m.modelSvc = modelChoice.modelSvc; }
+        if (modelChoice) { rememberMonacoModelServiceCandidate(m, modelChoice.modelSvc, modelChoice.label); }
         send({ type: 'log', msg: 'createPreviewEditor using inst ' + insts[i].label });
         return editor;
       } catch (e) {
         var msg = errorText(e);
-        if (isDisposedText(msg)) { sawDisposed = true; }
+        if (isDisposedText(msg)) { forgetMonacoInstCandidate(insts[i].inst); }
+        try {
+          if (m.editorInst === insts[i].inst && (isDisposedText(msg) || /UNKNOWN service|Method not found/i.test(msg))) {
+            m.editorInst = null;
+          }
+        } catch (eForgetEditorInst) {}
         send({ type: 'log', msg: 'createPreviewEditor err via ' + insts[i].label + ': ' + msg.slice(0, 160) });
+        if (!triedDirectNew && /UNKNOWN service|Method not found/i.test(msg)) {
+          var directAfterCreateError = tryDirectNew('after-createInstance-error');
+          if (directAfterCreateError) { return directAfterCreateError; }
+        }
       }
     }
-    if (sawDisposed) {
-      try { window.__ijFindMonaco = null; } catch (eClear) {}
-    }
+    var directFallback = tryDirectNew('fallback');
+    if (directFallback) { return directFallback; }
     return null;
   }
   window.__ijFindCreatePreviewEditor = createPreviewEditor;
-  // Look up an existing TextModel in VSCode's ModelService by URI string.
-  // When a file is open in VSCode (or has been touched via
-  // vscode.workspace.openTextDocument), its model is registered here and
-  // shared with any widget attached to it. Reusing it means edits in our
-  // preview propagate straight into VSCode's buffer (and any open tab on
-  // the same file picks the change up in real time).
-  function findSharedModelByUri(uriStr) {
-    if (!uriStr) { return null; }
-    var m = window.__ijFindMonaco;
-    if (!m || !m.modelSvc) { return null; }
-    try {
-      var models = typeof m.modelSvc.getModels === 'function' ? m.modelSvc.getModels() : [];
-      for (var i = 0; i < models.length; i++) {
-        var mdl = models[i];
-        try {
-          if (mdl && mdl.uri && typeof mdl.uri.toString === 'function' && mdl.uri.toString() === uriStr) {
-            return mdl;
-          }
-        } catch (eLoop) {}
-      }
-    } catch (e) {}
-    return null;
-  }
-
-  function parsePreviewResourceUri(uriStr) {
-    if (!uriStr) { return null; }
-    try {
-      if (typeof monaco !== 'undefined' && monaco && monaco.Uri && typeof monaco.Uri.parse === 'function') {
-        return monaco.Uri.parse(uriStr);
-      }
-    } catch (eGlobalMonacoUri) {}
-    try {
-      var globalMonaco = globalThis && globalThis.monaco;
-      if (globalMonaco && globalMonaco.Uri && typeof globalMonaco.Uri.parse === 'function') {
-        return globalMonaco.Uri.parse(uriStr);
-      }
-    } catch (eGlobalThisMonacoUri) {}
-    try {
-      var m = window.__ijFindMonaco;
-      var models = m && m.modelSvc && typeof m.modelSvc.getModels === 'function' ? m.modelSvc.getModels() : [];
-      for (var i = 0; i < models.length; i++) {
-        var uri = models[i] && models[i].uri;
-        var ctor = uri && uri.constructor;
-        if (ctor && typeof ctor.parse === 'function') {
-          return ctor.parse(uriStr);
-        }
-      }
-    } catch (eModelUri) {}
-    return null;
-  }
-
   function createPreviewTextModel(content, languageId, uriStr, fullFile) {
-    var m = window.__ijFindMonaco;
+    var m = getMonacoFactorySingleton();
+    if (!m || !m.modelSvc) {
+      var modelChoice = chooseLiveModelService(true, null);
+      if (m && modelChoice) { rememberMonacoModelServiceCandidate(m, modelChoice.modelSvc, modelChoice.label); }
+    }
     if (!m || !m.modelSvc) { return null; }
     var lang = languageId || 'plaintext';
-    if (fullFile) {
-      var resource = parsePreviewResourceUri(uriStr);
-      if (resource) {
-        try {
-          var modelWithResource = m.modelSvc.createModel(content || '', lang, resource, false);
-          send({ type: 'log', msg: 'setPreviewContent: created resource model uri=' + uriStr });
-          return modelWithResource;
-        } catch (eResourceModel) {
-          var sharedAfterResourceError = findSharedModelByUri(uriStr);
-          if (sharedAfterResourceError) {
-            send({ type: 'log', msg: 'setPreviewContent: resource model already existed uri=' + uriStr });
-            return sharedAfterResourceError;
-          }
-          send({ type: 'log', msg: 'setPreviewContent resource model failed: ' + (eResourceModel && eResourceModel.message) });
-        }
-      } else {
-        send({ type: 'log', msg: 'setPreviewContent: no URI parser for resource model ' + uriStr });
-      }
-    }
     var isolated = m.modelSvc.createModel(content || '', lang);
-    send({ type: 'log', msg: 'setPreviewContent: isolated model (no shared/resource model for ' + uriStr + ')' });
+    state.previewIsolatedModelCreates++;
+    send({ type: 'log', msg: 'setPreviewContent: isolated preview model for ' + uriStr });
     return isolated;
   }
 
   function setPreviewContent(editor, content, languageId, uriStr, fullFile) {
-    var m = window.__ijFindMonaco;
+    var m = getMonacoFactorySingleton();
     if (!m || !editor) { return false; }
     if (!m.modelSvc || validateModelService(m.modelSvc)) {
       var modelChoice = chooseLiveModelService(true, null);
-      if (modelChoice) { m.modelSvc = modelChoice.modelSvc; }
+      if (modelChoice) { rememberMonacoModelServiceCandidate(m, modelChoice.modelSvc, modelChoice.label); }
     }
     if (!m.modelSvc || validateModelService(m.modelSvc)) { return false; }
     try {
-      var shared = findSharedModelByUri(uriStr);
       var old = editor.getModel && editor.getModel();
-      if (shared) {
-        // Share VSCode's buffer. Edits flow both ways. Do NOT overwrite
-        // its content — VSCode's buffer may have unsaved edits newer than
-        // whatever content we were handed.
-        if (old === shared) { return true; }
-        editor.setModel(shared);
-        // Only dispose the OLD model if it's one we created ourselves
-        // (not registered under a real URI). Disposing a shared VSCode
-        // model would break every other editor that references it.
-        if (old && old.dispose && old !== shared) {
-          var isIsolated = false;
-          try { isIsolated = !(old.uri && old.uri.scheme && old.uri.scheme !== 'inmemory'); } catch (eU) { isIsolated = false; }
-          if (isIsolated) { try { old.dispose(); } catch (eD) {} }
-        }
-        send({ type: 'log', msg: 'setPreviewContent: reused shared model uri=' + uriStr });
-        return true;
-      }
       var model = createPreviewTextModel(content, languageId, uriStr, !!fullFile);
       if (!model) { return false; }
       editor.setModel(model);
-      if (old && old.dispose && old !== model) { try { old.dispose(); } catch (e) {} }
+      if (old && old.dispose && old !== model) {
+        try {
+          old.dispose();
+          state.previewOwnedModelDisposes++;
+        } catch (e) {}
+      }
       return true;
     } catch (e) {
       var msg = errorText(e);
       if (isDisposedText(msg)) {
-        try { window.__ijFindMonaco = null; } catch (eClear) {}
+        forgetMonacoModelServiceCandidate(m.modelSvc);
       }
       send({ type: 'log', msg: 'setPreviewContent err: ' + msg });
       return false;
@@ -1047,8 +1138,9 @@ export function getRendererPatchScript(
     // don't recreate anything — we'd just burn a boot-time stub slot. Renderer
     // globals survive extension-host restarts, so this hits on warm reloads.
     try {
-      var existing = window.__ijFindMonaco;
+      var existing = getMonacoFactorySingleton();
       if (existing && existing.ctor && window.__ijFindMonacoStatus && window.__ijFindMonacoStatus() === 'ready') {
+        installMonacoFactorySingleton(existing);
         return 'monaco-already-captured ctor=' + (existing.ctor.name || '?');
       }
     } catch (e) {}
@@ -1174,6 +1266,7 @@ export function getRendererPatchScript(
     var createdEditor = null;
     var winnerWidgetOptions = null;
     var winnerInst = null;
+    var winnerCreateMode = '';
     for (var ii = 0; ii < instCandidates.length && !createdEditor; ii++) {
       var inst = instCandidates[ii].inst;
       var instLabel = instCandidates[ii].label;
@@ -1191,18 +1284,20 @@ export function getRendererPatchScript(
             attempts.push({
               fn: function (C) { return instForAttempt.createInstance(C, host, testOptions, entry.value); },
               label: 'createInstance(host,opts,' + entry.label + ')',
+              mode: 'createInstance',
               widgetOptions: entry.value,
             });
             attempts.push({
               fn: function (C) { return new C(host, testOptions, entry.value); },
               label: 'new(host,opts,' + entry.label + ')',
+              mode: 'new',
               widgetOptions: entry.value,
             });
           })(widgetOptionCandidates[wo], inst);
         }
         (function (instForAttempt) {
-          attempts.push({ fn: function (C) { return instForAttempt.createInstance(C, host, testOptions); }, label: 'createInstance(host,opts)', widgetOptions: null });
-          attempts.push({ fn: function (C) { return new C(host, testOptions); }, label: 'new(host,opts)', widgetOptions: null });
+          attempts.push({ fn: function (C) { return instForAttempt.createInstance(C, host, testOptions); }, label: 'createInstance(host,opts)', mode: 'createInstance', widgetOptions: null });
+          attempts.push({ fn: function (C) { return new C(host, testOptions); }, label: 'new(host,opts)', mode: 'new', widgetOptions: null });
         })(inst);
         for (var aa = 0; aa < attempts.length && !createdEditor; aa++) {
           try {
@@ -1211,6 +1306,7 @@ export function getRendererPatchScript(
               createdEditor = ed;
               winnerInst = inst;
               winnerWidgetOptions = attempts[aa].widgetOptions;
+              winnerCreateMode = attempts[aa].mode || '';
               report.push('OK ' + srcLabel + ' via ' + instLabel + ' ' + attempts[aa].label + ' → ' + (ed.constructor && ed.constructor.name));
               break;
             }
@@ -1238,12 +1334,23 @@ export function getRendererPatchScript(
       }
     }
     if (!winnerCtor) { winnerCtor = candidates[0] && candidates[0].ctor; }
-    window.__ijFindMonaco = {
+    var monacoFactory = installMonacoFactorySingleton({
       ctor: winnerCtor,
       inst: winnerInst,
+      editorInst: winnerInst,
+      createMode: winnerCreateMode,
       modelSvc: null, // filled below
       widgetOptions: winnerWidgetOptions || { isSimpleWidget: false },
-    };
+      instCandidates: [],
+      modelSvcCandidates: [],
+    });
+    rememberMonacoInstCandidate(monacoFactory, winnerInst, 'winner');
+    for (var ic = 0; ic < instCandidates.length; ic++) {
+      rememberMonacoInstCandidate(monacoFactory, instCandidates[ic].inst, instCandidates[ic].label);
+    }
+    try { monacoFactory.inst = winnerInst; } catch (eWinnerInst) {}
+    try { monacoFactory.editorInst = winnerInst; } catch (eWinnerEditorInst) {}
+    try { monacoFactory.createMode = winnerCreateMode; } catch (eWinnerCreateMode) {}
 
     // ── Post-create: force proper rendering ───────────────────────────
     // Widget was constructed, but content likely isn't rendered because the
@@ -1252,9 +1359,17 @@ export function getRendererPatchScript(
     // explicitly call layout() with the host's size.
     var modelChoice = chooseLiveModelService(true, report);
     var modelSvc = modelChoice && modelChoice.modelSvc;
-    if (modelChoice) { report.push('using modelSvc ' + modelChoice.label); }
+    if (modelChoice) {
+      rememberMonacoModelServiceCandidate(monacoFactory, modelChoice.modelSvc, modelChoice.label);
+      report.push('using modelSvc ' + modelChoice.label);
+    }
+    var collectedModelSvcs = collectModelServiceCandidates(true, report);
+    for (var mc = 0; mc < collectedModelSvcs.length; mc++) {
+      rememberMonacoModelServiceCandidate(monacoFactory, collectedModelSvcs[mc].modelSvc, collectedModelSvcs[mc].label);
+    }
+    if (modelChoice) { try { monacoFactory.modelSvc = modelChoice.modelSvc; } catch (eWinnerModel) {} }
+    modelSvc = monacoFactory.modelSvc;
     report.push('IModelService found=' + !!modelSvc);
-    window.__ijFindMonaco.modelSvc = modelSvc;
 
     try {
       var currentModel = createdEditor.getModel && createdEditor.getModel();
@@ -1814,6 +1929,28 @@ export function getRendererPatchScript(
     '  user-select: none;',
     '}',
     '.ij-find-preview-text { flex: 0 0 auto; min-width: 0; }',
+    '.ij-find-preview-inlay {',
+    '  flex: 0 0 auto;',
+    '  display: inline-flex; align-items: center;',
+    '  margin-left: 12px; padding: 0 4px;',
+    '  border-radius: 3px;',
+    '  color: var(--vscode-editorInlayHint-foreground, var(--vscode-descriptionForeground, #9d9d9d));',
+    '  background: var(--vscode-editorInlayHint-background, transparent);',
+    '  cursor: pointer;',
+    '  user-select: none;',
+    '}',
+    '.ij-find-preview-inlay:hover {',
+    '  color: var(--vscode-editorLink-activeForeground, var(--vscode-textLink-activeForeground, #4daafc));',
+    '  background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08));',
+    '}',
+    '.ij-find-preview-monaco-inlay-layer {',
+    '  position: absolute; inset: 0; pointer-events: none; z-index: 20;',
+    '  overflow: hidden;',
+    '}',
+    '.ij-find-preview-monaco-inlay-layer .ij-find-preview-inlay {',
+    '  position: absolute; margin-left: 0; height: 18px; line-height: 18px;',
+    '  pointer-events: auto; white-space: nowrap;',
+    '}',
     // Host element for the embedded Monaco editor. Monaco needs a sized box.
     '.ij-find-monaco-host {',
     '  flex: 1 1 auto; width: 100%; height: 100%; min-height: 0; overflow: hidden;',
@@ -2121,6 +2258,7 @@ export function getRendererPatchScript(
     searching: false,
     debounce: null,
     lastPreviewKey: '',
+    activePreviewSeq: 0,
     previewUri: '',
     previewLanguageId: '',
     previewBaseLine: 0,
@@ -2138,6 +2276,10 @@ export function getRendererPatchScript(
     searchTicker: null,        // setInterval handle refreshing the status with live elapsed time
     previewMode: '',           // 'monaco' | 'stolen' | 'dom'
     lastPreviewMsg: null,
+    previewRecoveryTimer: null,
+    previewResourceModelCreates: 0,
+    previewIsolatedModelCreates: 0,
+    previewOwnedModelDisposes: 0,
     editing: false,
     editTextarea: null,
     // DOM-move ("stolen editor") state: we physically relocate a real VSCode
@@ -2153,6 +2295,8 @@ export function getRendererPatchScript(
     stolenGroupOrigStyles: null,
     previewMonacoEditor: null,
     previewMonacoHost: null,
+    previewMonacoInlayLayer: null,
+    previewMonacoInlayDisposers: [],
     previewMonacoSaveEditor: null,
     previewMonacoKeydownListener: null,
     resultsInfoText: '',
@@ -2349,7 +2493,7 @@ export function getRendererPatchScript(
         at: Math.round(perfNow() - __ijPanelDiag.startedAt),
         name: String(name || ''),
         data: data || {},
-      }, 80);
+      }, 0);
     } catch (eMark) {}
   }
   function percentile(values, p) {
@@ -3056,10 +3200,64 @@ export function getRendererPatchScript(
         document.body.contains(getFocusedSearchPanel())
       ) {
         var focusedRect = getFocusedSearchPanel().getBoundingClientRect();
-        if (focusedRect && focusedRect.width > 0 && focusedRect.height > 0) { return focusedRect; }
+        if (isUsableSpawnBaseRect(focusedRect)) { return focusedRect; }
       }
     } catch (eFocusedRect) {}
-    try { return panel.getBoundingClientRect(); } catch (ePanelRect) { return null; }
+    try {
+      if (panel.classList && panel.classList.contains('visible') && document.body.contains(panel)) {
+        var panelRect = panel.getBoundingClientRect();
+        if (isUsableSpawnBaseRect(panelRect)) { return panelRect; }
+      }
+    } catch (ePanelRect) {}
+    return null;
+  }
+
+  function isUsableSpawnBaseRect(rect) {
+    try {
+      if (!rect) { return false; }
+      if (!Number.isFinite(rect.left) || !Number.isFinite(rect.top)) { return false; }
+      if (!Number.isFinite(rect.width) || !Number.isFinite(rect.height)) { return false; }
+      if (rect.width < 320 || rect.height < 220) { return false; }
+      if (rect.right <= 0 || rect.bottom <= 0) { return false; }
+      if (rect.left >= window.innerWidth || rect.top >= window.innerHeight) { return false; }
+      return true;
+    } catch (eUsableSpawnRect) {
+      return false;
+    }
+  }
+
+  function defaultSpawnPanelLayout() {
+    var availableWidth = Math.max(420, window.innerWidth - 44);
+    var availableHeight = Math.max(320, window.innerHeight - 84);
+    var width = Math.min(860, availableWidth);
+    var height = Math.min(680, availableHeight);
+    var left = Math.round((window.innerWidth - width) / 2);
+    var top = Math.max(36, Math.round((window.innerHeight - height) / 2));
+    return {
+      left: Math.max(8, left),
+      top: Math.max(8, top),
+      width: Math.round(width),
+      height: Math.round(height),
+    };
+  }
+
+  function applyPanelLayout(layout) {
+    if (!layout) { return; }
+    panel.style.left = Math.round(layout.left) + 'px';
+    panel.style.top = Math.round(layout.top) + 'px';
+    panel.style.width = Math.round(layout.width) + 'px';
+    panel.style.height = Math.round(layout.height) + 'px';
+    panel.style.maxWidth = 'none';
+    panel.style.maxHeight = 'none';
+    panel.style.transform = 'none';
+  }
+
+  function applyPreviewHeavyLayout(panelHeight) {
+    try {
+      var maxPreview = Math.max(150, Math.round(panelHeight) - 180);
+      var desired = Math.max(320, Math.round(panelHeight * 0.58));
+      $preview.style.flex = '0 0 ' + Math.min(maxPreview, desired) + 'px';
+    } catch (ePreviewHeavy) {}
   }
 
   function offsetPanelPosition(baseRect, width, height) {
@@ -3309,6 +3507,27 @@ export function getRendererPatchScript(
     } catch (eShell) {}
   }
 
+  function ensureFullPanelStructure(reason) {
+    try {
+      if (state.minimized) { return; }
+      if (
+        panel.classList.contains('ij-find-shell') ||
+        $results.parentElement !== panel ||
+        $splitter.parentElement !== panel ||
+        $preview.parentElement !== panel ||
+        $resizer.parentElement !== panel
+      ) {
+        setShellMode(false);
+        panelDiagMark('panelStructure:restore', { reason: reason || '' });
+      }
+    } catch (ePanelStructure) {
+      panelDiagMark('panelStructure:error', {
+        reason: reason || '',
+        message: ePanelStructure && ePanelStructure.message,
+      });
+    }
+  }
+
   // Render elapsed time as ' (N.Ns)' or ' (Nms)' — appended to status
   // messages so the user sees a live counter during long searches.
   function formatElapsed(ms) {
@@ -3495,6 +3714,11 @@ export function getRendererPatchScript(
   function clearPreview() {
     $previewPath.textContent = '';
     $preview.classList.remove('ij-find-modified');
+    clearPreviewMonacoCallGraphInlays();
+    if (state.previewRecoveryTimer) {
+      clearTimeout(state.previewRecoveryTimer);
+      state.previewRecoveryTimer = null;
+    }
     if (state.stolenEditor) { restoreStolenEditor(); }
     if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
       // Keep editor in memory; just blank out its model contents.
@@ -3503,7 +3727,10 @@ export function getRendererPatchScript(
       clearChildren($previewBody);
     }
     state.lastPreviewKey = '';
+    state.activePreviewSeq++;
     state.previewUri = '';
+    state.previewMode = '';
+    state.lastPreviewMsg = null;
     state.previewLanguageId = '';
     hideHover();
   }
@@ -3802,15 +4029,16 @@ export function getRendererPatchScript(
     // file at line 0 so the user can skim while rg catches up.
     if (fm.pendingUri) {
       var pkey = fm.pendingUri + '#pending';
-      if (pkey === state.lastPreviewKey) { return; }
+      if (pkey === state.lastPreviewKey && state.previewUri === fm.pendingUri) { return; }
       state.lastPreviewKey = pkey;
-      send({ type: 'requestPreview', uri: fm.pendingUri, line: 0, contextLines: 0 });
+      state.activePreviewSeq++;
+      send({ type: 'requestPreview', uri: fm.pendingUri, line: 0, contextLines: 0, previewSeq: state.activePreviewSeq });
       return;
     }
     var f = state.files[fm.fi];
     var m = f.matches[fm.mi];
     var key = f.uri + '#' + m.line;
-    if (key === state.lastPreviewKey) { return; }
+    if (key === state.lastPreviewKey && state.previewUri === f.uri) { return; }
     state.lastPreviewKey = key;
     // When the user is in extension-typing mode, rg's m.ranges cover the
     // OLD (shorter) query. The preview should highlight what the user
@@ -3819,7 +4047,8 @@ export function getRendererPatchScript(
     var previewRanges = rangesForCurrentQuery(m);
     // Only refresh the overlay's preview pane; do NOT touch VSCode's editor
     // area at all. Arrow-key browsing leaves no trace.
-    send({ type: 'requestPreview', uri: f.uri, line: m.line, ranges: previewRanges, contextLines: 0 });
+    state.activePreviewSeq++;
+    send({ type: 'requestPreview', uri: f.uri, line: m.line, ranges: previewRanges, contextLines: 0, previewSeq: state.activePreviewSeq });
   }
 
   // If we're in extension-filter mode, compute single-line ranges for the
@@ -4751,7 +4980,80 @@ export function getRendererPatchScript(
     }
   }
 
+  function previewMessageIsStale(msg) {
+    if (!msg) { return false; }
+    if (typeof msg.previewSeq === 'number') {
+      return msg.previewSeq < state.activePreviewSeq;
+    }
+    if (!state.lastPreviewKey || !msg.uri) { return false; }
+    var selectedUri = state.lastPreviewKey.split('#')[0] || '';
+    return !!selectedUri && msg.uri !== selectedUri;
+  }
+
+  function scheduleDomPreviewRecovery(msg) {
+    if (!msg || previewMessageIsStale(msg)) { return; }
+    if (state.previewRecoveryTimer) {
+      clearTimeout(state.previewRecoveryTimer);
+      state.previewRecoveryTimer = null;
+    }
+    var deadline = perfNow() + 1000;
+    var expectedUri = msg.uri;
+    var expectedSeq = typeof msg.previewSeq === 'number' ? msg.previewSeq : null;
+    var attempt = function () {
+      state.previewRecoveryTimer = null;
+      if (expectedSeq !== null && expectedSeq < state.activePreviewSeq) { return; }
+      if (state.previewMode !== 'dom' || state.previewUri !== expectedUri || state.lastPreviewMsg !== msg) { return; }
+      if (!window.__ijFindDisableMonacoProbes) {
+        var m = null;
+        var monacoStatus = 'disabled';
+        try { monacoStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status'; }
+        catch (eStatus) { monacoStatus = 'status-err:' + (eStatus && eStatus.message); }
+        if (monacoStatus !== 'ready' && typeof window.__ijFindTestCreateWidget === 'function') {
+          try { window.__ijFindTestCreateWidget(); } catch (ePromote) {}
+          try { monacoStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : monacoStatus; }
+          catch (eStatusAfterPromote) {}
+        }
+        try { m = getMonacoFactorySingleton(); } catch (eMonaco) {}
+        if (monacoStatus === 'ready' && m && m.ctor) {
+          try {
+            renderPreviewMonacoReal(msg);
+            return;
+          } catch (eRender) {
+            send({ type: 'log', msg: 'preview auto-recovery render threw: ' + (eRender && eRender.message) });
+          }
+        }
+      }
+      if (perfNow() < deadline) {
+        state.previewRecoveryTimer = setTimeout(attempt, 40);
+      }
+    };
+    state.previewRecoveryTimer = setTimeout(attempt, 16);
+  }
+
   function renderPreview(msg) {
+    if (previewMessageIsStale(msg)) {
+      send({ type: 'log', msg: 'ignored stale preview seq=' + msg.previewSeq + ' active=' + state.activePreviewSeq + ' uri=' + (msg.uri || '') });
+      return;
+    }
+    if (
+      state.lastPreviewMsg &&
+      state.lastPreviewMsg.uri === msg.uri &&
+      typeof state.lastPreviewMsg.previewSeq === 'number' &&
+      typeof msg.previewSeq === 'number' &&
+      state.lastPreviewMsg.previewSeq === msg.previewSeq &&
+      !Array.isArray(msg.callGraphInlays) &&
+      Array.isArray(state.lastPreviewMsg.callGraphInlays)
+    ) {
+      try { msg.callGraphInlays = state.lastPreviewMsg.callGraphInlays; } catch (eMergePreviewInlays) {}
+      send({ type: 'log', msg: 'preview inlays merged into same-preview refresh uri=' + (msg.uri || '') + ' previewSeq=' + msg.previewSeq + ' count=' + msg.callGraphInlays.length });
+    }
+    if (msg && typeof msg.previewSeq === 'number' && msg.previewSeq > state.activePreviewSeq) {
+      state.activePreviewSeq = msg.previewSeq;
+    }
+    if (state.previewRecoveryTimer) {
+      clearTimeout(state.previewRecoveryTimer);
+      state.previewRecoveryTimer = null;
+    }
     state.lastPreviewMsg = msg;
     $previewPath.textContent = msg.relPath || msg.uri;
     state.previewUri = msg.uri;
@@ -4761,12 +5063,12 @@ export function getRendererPatchScript(
       : (msg.lines && msg.lines.length > 0 && typeof msg.lines[0].lineNumber === 'number' ? msg.lines[0].lineNumber : 0);
     state.previewFullFile = msg.fullFile !== false;
     $preview.classList.remove('ij-find-modified');
-    var m = window.__ijFindDisableMonacoProbes ? null : window.__ijFindMonaco;
+    var m = window.__ijFindDisableMonacoProbes ? null : getMonacoFactorySingleton();
     var monacoStatus = 'disabled';
     if (!window.__ijFindDisableMonacoProbes) {
       try { monacoStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status'; }
       catch (eStatus) { monacoStatus = 'status-err:' + (eStatus && eStatus.message); }
-      try { m = window.__ijFindMonaco; } catch (eRefreshMonaco) {}
+      try { m = getMonacoFactorySingleton(); } catch (eRefreshMonaco) {}
     }
     send({ type: 'log', msg: 'renderPreview uri=' + (msg.relPath || msg.uri).slice(0, 80) +
       ' hasMonaco=' + (!!m) +
@@ -4774,12 +5076,13 @@ export function getRendererPatchScript(
       ' inst=' + (!!(m && m.inst)) +
       ' modelSvc=' + (!!(m && m.modelSvc)) +
       ' status=' + monacoStatus });
-    if (monacoStatus === 'ready' && m && m.ctor && m.inst) {
+    if (monacoStatus === 'ready' && m && m.ctor) {
       try { renderPreviewMonacoReal(msg); return; }
       catch (e) { send({ type: 'log', msg: 'renderPreviewMonacoReal threw: ' + (e && e.message) }); }
     }
     send({ type: 'log', msg: 'renderPreview: DOM fallback' });
     renderPreviewDOM(msg);
+    scheduleDomPreviewRecovery(msg);
   }
 
   function renderPreviewMonacoReal(msg) {
@@ -4800,6 +5103,7 @@ export function getRendererPatchScript(
         applyPreviewMatchDecorations(state.previewMonacoEditor, msg);
         try { revealMatchImmediate(state.previewMonacoEditor, msg); } catch (e) {}
         placeCursorAtMatch(state.previewMonacoEditor, msg);
+        renderPreviewMonacoCallGraphInlays(state.previewMonacoEditor, msg);
         state.previewMode = 'monaco';
         return;
       }
@@ -4818,6 +5122,7 @@ export function getRendererPatchScript(
       try { $previewBody.removeChild(host); } catch (e) {}
       $previewBody.classList.remove('ij-find-editor-mounted');
       renderPreviewDOM(msg);
+      scheduleDomPreviewRecovery(msg);
       return;
     }
     state.previewMonacoEditor = editor;
@@ -4836,6 +5141,7 @@ export function getRendererPatchScript(
     applyPreviewMatchDecorations(editor, msg);
     try { revealMatchImmediate(editor, msg); } catch (e) {}
     placeCursorAtMatch(editor, msg);
+    renderPreviewMonacoCallGraphInlays(editor, msg);
     // Post-render check
     try {
       var vl = editor.getDomNode && editor.getDomNode() && editor.getDomNode().querySelectorAll('.view-line');
@@ -4955,6 +5261,141 @@ export function getRendererPatchScript(
     return Math.max(1, (typeof fileLine === 'number' ? fileLine : 0) - base + 1);
   }
 
+  function clearPreviewMonacoCallGraphInlays() {
+    try {
+      var disposers = state.previewMonacoInlayDisposers || [];
+      for (var i = 0; i < disposers.length; i++) {
+        try {
+          if (disposers[i] && typeof disposers[i].dispose === 'function') {
+            disposers[i].dispose();
+          }
+        } catch (eDisposeInlay) {}
+      }
+    } catch (eInlayDisposers) {}
+    state.previewMonacoInlayDisposers = [];
+    if (state.previewMonacoInlayLayer && state.previewMonacoInlayLayer.parentElement) {
+      try { state.previewMonacoInlayLayer.parentElement.removeChild(state.previewMonacoInlayLayer); } catch (eRemoveInlayLayer) {}
+    }
+    state.previewMonacoInlayLayer = null;
+  }
+
+  function renderPreviewMonacoCallGraphInlays(editor, msg) {
+    clearPreviewMonacoCallGraphInlays();
+    var byLine = previewCallGraphInlaysByLine(msg);
+    var inlays = [];
+    for (var lineKey in byLine) {
+      if (!Object.prototype.hasOwnProperty.call(byLine, lineKey)) { continue; }
+      for (var li = 0; li < byLine[lineKey].length; li++) {
+        inlays.push(byLine[lineKey][li]);
+      }
+    }
+    send({ type: 'log', msg: 'preview monaco inlays render start uri=' + (msg && msg.uri || state.previewUri || '') + ' previewSeq=' + (msg && typeof msg.previewSeq === 'number' ? msg.previewSeq : 'none') + ' count=' + inlays.length + ' hasEditor=' + (!!editor) + ' hasHost=' + (!!state.previewMonacoHost) });
+    if (!editor || inlays.length === 0 || !state.previewMonacoHost) { return; }
+    var host = state.previewMonacoHost;
+    if (!host.parentElement) { return; }
+    try {
+      var hostPosition = window.getComputedStyle ? window.getComputedStyle(host).position : '';
+      if (!hostPosition || hostPosition === 'static') { host.style.position = 'relative'; }
+    } catch (eHostPosition) {
+      host.style.position = 'relative';
+    }
+    var layer = markSearchUiRoot(el('div', { className: 'ij-find-preview-monaco-inlay-layer' }));
+    host.appendChild(layer);
+    state.previewMonacoInlayLayer = layer;
+    var pending = false;
+    var updateLayer = function () {
+      pending = false;
+      if (state.previewMonacoInlayLayer !== layer || !layer.parentElement) { return; }
+      var model = null;
+      try { model = editor.getModel && editor.getModel(); } catch (eModel) {}
+      if (!model) { return; }
+      clearChildren(layer);
+      var hostWidth = Math.max(0, host.clientWidth || 0);
+      var hostHeight = Math.max(0, host.clientHeight || 0);
+      var rendered = 0;
+      for (var i = 0; i < inlays.length; i++) {
+        var inlay = inlays[i];
+        var lineNumber = previewModelLineForFileLine(inlay.line);
+        var lineCount = 0;
+        try { lineCount = model.getLineCount ? model.getLineCount() : 0; } catch (eLineCount) {}
+        if (lineCount > 0 && (lineNumber < 1 || lineNumber > lineCount)) { continue; }
+        var maxColumn = 1073741823;
+        try { maxColumn = model.getLineMaxColumn ? model.getLineMaxColumn(lineNumber) : maxColumn; } catch (eMaxColumn) {}
+        var column = typeof inlay.column === 'number' ? inlay.column + 1 : maxColumn;
+        column = Math.max(1, Math.min(maxColumn, column));
+        var pos = null;
+        try {
+          if (typeof editor.getScrolledVisiblePosition === 'function') {
+            pos = editor.getScrolledVisiblePosition({ lineNumber: lineNumber, column: column });
+          }
+        } catch (eVisiblePos) {}
+        var top = pos && typeof pos.top === 'number' ? pos.top : NaN;
+        var left = pos && typeof pos.left === 'number' ? pos.left : NaN;
+        var height = pos && typeof pos.height === 'number' && pos.height > 0 ? pos.height : 18;
+        if (!Number.isFinite(top)) {
+          try {
+            if (typeof editor.getTopForLineNumber === 'function' && typeof editor.getScrollTop === 'function') {
+              top = editor.getTopForLineNumber(lineNumber) - editor.getScrollTop();
+            }
+          } catch (eTopFallback) {}
+        }
+        if (!Number.isFinite(left)) { left = 80; }
+        if (!Number.isFinite(top)) { continue; }
+        if (hostHeight > 0 && (top + height < 0 || top > hostHeight)) { continue; }
+        left = left + 8;
+        if (hostWidth > 0 && left > hostWidth - 28) {
+          left = Math.max(48, hostWidth - 140);
+        }
+        var attrs = {
+          'data-ijss-callgraph-symbol-id': inlay.symbolId,
+          'data-ijss-callgraph-kind': inlay.kind,
+          'data-ijss-callgraph-label': inlay.label,
+          'data-ijss-callgraph-column': String(inlay.column),
+          'role': 'button',
+          'tabindex': '0',
+          'aria-label': (inlay.label ? inlay.label + ' ' : '') + inlay.text,
+        };
+        var node = el('span', {
+          className: 'ij-find-preview-inlay ijss-callgraph',
+          text: inlay.text,
+          title: inlay.label ? inlay.label : inlay.text,
+          attrs: attrs,
+        });
+        node.style.top = Math.round(top + Math.max(0, (height - 18) / 2)) + 'px';
+        node.style.left = Math.round(left) + 'px';
+        layer.appendChild(node);
+        rendered++;
+      }
+      send({ type: 'log', msg: 'preview monaco inlays layer update uri=' + (msg && msg.uri || state.previewUri || '') + ' rendered=' + rendered + ' requested=' + inlays.length + ' host=' + hostWidth + 'x' + hostHeight });
+    };
+    var scheduleUpdate = function () {
+      if (pending) { return; }
+      pending = true;
+      requestAnimationFrame(updateLayer);
+    };
+    var disposers = [];
+    try {
+      if (typeof editor.onDidScrollChange === 'function') {
+        disposers.push(editor.onDidScrollChange(scheduleUpdate));
+      }
+    } catch (eScrollListen) {}
+    try {
+      if (typeof editor.onDidLayoutChange === 'function') {
+        disposers.push(editor.onDidLayoutChange(scheduleUpdate));
+      }
+    } catch (eLayoutListen) {}
+    try {
+      var modelForListener = editor.getModel && editor.getModel();
+      if (modelForListener && typeof modelForListener.onDidChangeContent === 'function') {
+        disposers.push(modelForListener.onDidChangeContent(scheduleUpdate));
+      }
+    } catch (eContentListen) {}
+    state.previewMonacoInlayDisposers = disposers;
+    updateLayer();
+    requestAnimationFrame(updateLayer);
+    setTimeout(updateLayer, 0);
+  }
+
   // Scroll the preview to the match without the default smooth animation.
   // For multi-line matches, put the start near the top of the viewport so
   // as many match lines as possible are visible. ScrollType.Immediate = 1.
@@ -5072,6 +5513,7 @@ export function getRendererPatchScript(
   }
 
   function disposePreviewMonacoEditor() {
+    clearPreviewMonacoCallGraphInlays();
     try {
       if (state.monacoChangeListener && state.monacoChangeListener.dispose) {
         state.monacoChangeListener.dispose();
@@ -5104,6 +5546,7 @@ export function getRendererPatchScript(
       else { out.push('stop=no-fn'); }
     } catch (eStop) { out.push('stop-err=' + (eStop && eStop.message)); }
     try { window.__ijFindMonaco = null; out.push('monaco=null'); } catch (eMonaco) {}
+    try { window.__ijFindMonacoFactory = null; out.push('monacoFactory=null'); } catch (eMonacoFactory) {}
     try {
       monacoState.tried = true;
       monacoState.api = null;
@@ -6238,8 +6681,97 @@ export function getRendererPatchScript(
     return { lines: out, omittedBefore: omittedBefore, omittedAfter: omittedAfter };
   }
 
+  function normalizePreviewCallGraphInlay(raw) {
+    if (!raw || typeof raw !== 'object') { return null; }
+    var line = typeof raw.line === 'number' ? raw.line :
+      (typeof raw.lineNumber === 'number' ? raw.lineNumber : NaN);
+    if (!Number.isFinite(line)) { return null; }
+    var symbolId = String(raw.symbolId || raw.id || '');
+    if (!symbolId) { return null; }
+    var kind = String(raw.kind || callGraphInlayKindFromText(String(raw.text || raw.label || '')) || 'usages');
+    if (kind === 'implementation') { kind = 'impl'; }
+    if (kind !== 'usages' && kind !== 'callees' && kind !== 'impl') { kind = 'usages'; }
+    var text = String(raw.text || '');
+    if (!text) {
+      var count = typeof raw.count === 'number' && raw.count >= 0 ? raw.count : '';
+      text = kind + (count === '' ? '' : ' ' + count);
+    }
+    return {
+      line: Math.max(0, Math.floor(line)),
+      column: typeof raw.column === 'number' ? Math.max(0, Math.floor(raw.column)) : 0,
+      kind: kind,
+      text: text || kind,
+      symbolId: symbolId,
+      label: String(raw.label || raw.name || ''),
+    };
+  }
+
+  function previewCallGraphInlaysByLine(msg) {
+    var byLine = {};
+    var raw = Array.isArray(msg && msg.callGraphInlays) ? msg.callGraphInlays : [];
+    for (var i = 0; i < raw.length; i++) {
+      var inlay = normalizePreviewCallGraphInlay(raw[i]);
+      if (!inlay) { continue; }
+      var key = String(inlay.line);
+      if (!byLine[key]) { byLine[key] = []; }
+      byLine[key].push(inlay);
+    }
+    for (var line in byLine) {
+      byLine[line].sort(function (a, b) { return a.column - b.column; });
+    }
+    return byLine;
+  }
+
+  function previewCallGraphInlayCountByLine(byLine) {
+    var count = 0;
+    for (var line in (byLine || {})) {
+      if (!Object.prototype.hasOwnProperty.call(byLine, line)) { continue; }
+      count += byLine[line] ? byLine[line].length : 0;
+    }
+    return count;
+  }
+
+  function commandForPreviewCallGraphInlayKind(kind) {
+    if (kind === 'callees') { return 'intellijStyledSearch.showCalleesForSymbol'; }
+    if (kind === 'impl') { return 'intellijStyledSearch.showImplementationsForSymbol'; }
+    return 'intellijStyledSearch.showUsagesForSymbol';
+  }
+
+  function titleForCallGraphInlayKind(kind) {
+    if (kind === 'callees') { return 'Find Callees'; }
+    if (kind === 'impl') { return 'Find Implementations'; }
+    return 'Find Usages';
+  }
+
+  function appendDomPreviewCallGraphInlays(lineEl, lineNumber, inlaysByLine) {
+    var lineInlays = inlaysByLine && inlaysByLine[String(lineNumber)];
+    if (!lineInlays || lineInlays.length === 0) { return; }
+    for (var i = 0; i < lineInlays.length; i++) {
+      var inlay = lineInlays[i];
+      var attrs = {
+        'data-ijss-callgraph-symbol-id': inlay.symbolId,
+        'data-ijss-callgraph-kind': inlay.kind,
+        'data-ijss-callgraph-label': inlay.label,
+        'data-ijss-callgraph-column': String(inlay.column),
+        'role': 'button',
+        'tabindex': '0',
+        'aria-label': (inlay.label ? inlay.label + ' ' : '') + inlay.text,
+      };
+      lineEl.appendChild(el('span', {
+        className: 'ij-find-preview-inlay ijss-callgraph',
+        text: inlay.text,
+        title: inlay.label ? inlay.label : inlay.text,
+        attrs: attrs,
+      }));
+    }
+  }
+
   function renderPreviewDOM(msg) {
     var previewT0 = perfNow();
+    var renderedLines = 0;
+    var omittedBefore = 0;
+    var omittedAfter = 0;
+    var previewError = null;
     startPerfWatch('preview:dom', 8000);
     panelDiagMark('preview:dom:start', {
       uri: msg && msg.uri ? String(msg.uri).slice(-120) : '',
@@ -6251,72 +6783,101 @@ export function getRendererPatchScript(
       lineCount: msg && msg.lines ? msg.lines.length : 0,
       focusLine: msg ? msg.focusLine : undefined,
     });
-    if (state.stolenEditor) { restoreStolenEditor(); }
-    state.previewMode = 'dom';
-    // If we previously hosted Monaco, detach it.
-    if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
-      try { state.monacoHost.parentElement.removeChild(state.monacoHost); } catch (e) {}
-    }
-    $previewBody.classList.remove('ij-find-editor-mounted');
-    clearChildren($previewBody);
-    var bounded = boundedPreviewLines(msg);
-    var contentEl = el('div', { className: 'ij-find-preview-content' });
-    var focusEl = null;
-    var frag = document.createDocumentFragment();
-    if (bounded.omittedBefore > 0) {
-      frag.appendChild(el('div', {
-        className: 'ij-find-preview-line ij-find-preview-truncated',
-        text: '... ' + bounded.omittedBefore + ' earlier line(s) omitted',
-      }));
-    }
-    for (var i = 0; i < bounded.lines.length; i++) {
-      var line = bounded.lines[i];
-      var isFocus = (line.lineNumber === msg.focusLine);
-      var lineEl = el('div', {
-        className: 'ij-find-preview-line' + (isFocus ? ' focus' : ''),
-        attrs: { 'data-line': String(line.lineNumber) },
-      });
-      lineEl.appendChild(el('span', { className: 'ij-find-preview-lineno', text: String(line.lineNumber + 1) }));
-      var textSpan = el('span', { className: 'ij-find-preview-text' });
-      if (isFocus && msg.ranges && msg.ranges.length > 0) {
-        appendHighlightedInto(textSpan, line.text, msg.ranges);
-      } else if (!fallbackHighlight(textSpan, line.text, state.previewLanguageId)) {
-        textSpan.textContent = line.text;
+    try {
+      ensureFullPanelStructure('preview-dom-start');
+      if (state.stolenEditor) { restoreStolenEditor(); }
+      state.previewMode = 'dom';
+      clearPreviewMonacoCallGraphInlays();
+      // If we previously hosted Monaco, detach it.
+      if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
+        try { state.monacoHost.parentElement.removeChild(state.monacoHost); } catch (e) {}
       }
-      lineEl.appendChild(textSpan);
-      frag.appendChild(lineEl);
-      if (isFocus) { focusEl = lineEl; }
+      $previewBody.classList.remove('ij-find-editor-mounted');
+      clearChildren($previewBody);
+      var bounded = boundedPreviewLines(msg);
+      omittedBefore = bounded.omittedBefore;
+      omittedAfter = bounded.omittedAfter;
+      var contentEl = el('div', { className: 'ij-find-preview-content' });
+      var focusEl = null;
+      var frag = document.createDocumentFragment();
+      var inlaysByLine = previewCallGraphInlaysByLine(msg);
+      send({ type: 'log', msg: 'preview dom inlays render uri=' + (msg && msg.uri || '') + ' previewSeq=' + (msg && typeof msg.previewSeq === 'number' ? msg.previewSeq : 'none') + ' count=' + previewCallGraphInlayCountByLine(inlaysByLine) });
+      if (bounded.omittedBefore > 0) {
+        frag.appendChild(el('div', {
+          className: 'ij-find-preview-line ij-find-preview-truncated',
+          text: '... ' + bounded.omittedBefore + ' earlier line(s) omitted',
+        }));
+      }
+      for (var i = 0; i < bounded.lines.length; i++) {
+        var line = bounded.lines[i];
+        var isFocus = (line.lineNumber === msg.focusLine);
+        var lineEl = el('div', {
+          className: 'ij-find-preview-line' + (isFocus ? ' focus' : ''),
+          attrs: { 'data-line': String(line.lineNumber) },
+        });
+        lineEl.appendChild(el('span', { className: 'ij-find-preview-lineno', text: String(line.lineNumber + 1) }));
+        var textSpan = el('span', { className: 'ij-find-preview-text' });
+        if (isFocus && msg.ranges && msg.ranges.length > 0) {
+          appendHighlightedInto(textSpan, line.text, msg.ranges);
+        } else if (!fallbackHighlight(textSpan, line.text, state.previewLanguageId)) {
+          textSpan.textContent = line.text;
+        }
+        lineEl.appendChild(textSpan);
+        appendDomPreviewCallGraphInlays(lineEl, line.lineNumber, inlaysByLine);
+        frag.appendChild(lineEl);
+        if (isFocus) { focusEl = lineEl; }
+      }
+      renderedLines = bounded.lines.length;
+      if (bounded.omittedAfter > 0) {
+        frag.appendChild(el('div', {
+          className: 'ij-find-preview-line ij-find-preview-truncated',
+          text: '... ' + bounded.omittedAfter + ' later line(s) omitted',
+        }));
+      }
+      contentEl.appendChild(frag);
+      $previewBody.appendChild(contentEl);
+      if (focusEl) {
+        setTimeout(function () {
+          try { focusEl.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) {}
+        }, 0);
+      }
+    } catch (eDomPreview) {
+      previewError = eDomPreview;
+      send({ type: 'log', msg: 'renderPreviewDOM threw: ' + (eDomPreview && eDomPreview.message) });
+      try {
+        state.previewMode = 'dom';
+        $previewBody.classList.remove('ij-find-editor-mounted');
+        clearChildren($previewBody);
+        $previewBody.appendChild(el('div', {
+          className: 'ij-find-preview-content',
+          children: [el('div', {
+            className: 'ij-find-preview-line ij-find-preview-truncated',
+            text: 'Preview fallback render failed. Select another result or reopen search.',
+          })],
+        }));
+      } catch (eDomPreviewFallback) {}
+    } finally {
+      ensureFullPanelStructure('preview-dom-end');
+      trace('preview:dom:end', {
+        renderedLines: renderedLines,
+        omittedBefore: omittedBefore,
+        omittedAfter: omittedAfter,
+        durationMs: Math.round(perfNow() - previewT0),
+        error: previewError && previewError.message ? String(previewError.message).slice(0, 160) : '',
+      });
+      panelDiagMark('preview:dom:end', {
+        renderedLines: renderedLines,
+        omittedBefore: omittedBefore,
+        omittedAfter: omittedAfter,
+        durationMs: Math.round(perfNow() - previewT0),
+        error: previewError && previewError.message ? String(previewError.message).slice(0, 160) : '',
+      });
+      reportPerfPhase('preview:dom', previewT0, {
+        renderedLines: renderedLines,
+        omittedBefore: omittedBefore,
+        omittedAfter: omittedAfter,
+      }, 10);
     }
-    if (bounded.omittedAfter > 0) {
-      frag.appendChild(el('div', {
-        className: 'ij-find-preview-line ij-find-preview-truncated',
-        text: '... ' + bounded.omittedAfter + ' later line(s) omitted',
-      }));
-    }
-    contentEl.appendChild(frag);
-    $previewBody.appendChild(contentEl);
-    if (focusEl) {
-      setTimeout(function () {
-        try { focusEl.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) {}
-      }, 0);
-    }
-    trace('preview:dom:end', {
-      renderedLines: bounded.lines.length,
-      omittedBefore: bounded.omittedBefore,
-      omittedAfter: bounded.omittedAfter,
-      durationMs: Math.round(perfNow() - previewT0),
-    });
-    panelDiagMark('preview:dom:end', {
-      renderedLines: bounded.lines.length,
-      omittedBefore: bounded.omittedBefore,
-      omittedAfter: bounded.omittedAfter,
-      durationMs: Math.round(perfNow() - previewT0),
-    });
-    reportPerfPhase('preview:dom', previewT0, {
-      renderedLines: bounded.lines.length,
-      omittedBefore: bounded.omittedBefore,
-      omittedAfter: bounded.omittedAfter,
-    }, 10);
   }
 
   // ── Hover ────────────────────────────────────────────────────────────
@@ -6662,6 +7223,74 @@ export function getRendererPatchScript(
     $hoverTooltip.style.top = y + 'px';
   }
 
+  var __ijFindLastDomPreviewInlayActivation = null;
+  function closestDomPreviewCallGraphInlay(target) {
+    try {
+      var el = target && target.nodeType === 3 ? target.parentElement : target;
+      if (!el || !el.closest) { return null; }
+      var inlay = el.closest('[data-ijss-callgraph-symbol-id]');
+      if (!inlay || !$previewBody.contains(inlay)) { return null; }
+      return inlay;
+    } catch (eDomInlayTarget) {
+      return null;
+    }
+  }
+
+  function suppressDomPreviewInlayEvent(event) {
+    try {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+    } catch (eSuppressDomInlay) {}
+  }
+
+  function recentlyActivatedDomPreviewInlay(event, inlay) {
+    try {
+      var last = __ijFindLastDomPreviewInlayActivation;
+      if (!last || Date.now() - last.at > 900) { return false; }
+      return last.inlay === inlay &&
+        Math.abs((event.clientX || 0) - last.x) <= 3 &&
+        Math.abs((event.clientY || 0) - last.y) <= 3;
+    } catch (eRecentDomInlay) {
+      return false;
+    }
+  }
+
+  function activateDomPreviewCallGraphInlay(event) {
+    if (!event) { return; }
+    var keyboard = event.type === 'keydown';
+    if (keyboard) {
+      var key = String(event.key || '');
+      if (key !== 'Enter' && key !== ' ') { return; }
+    } else if (typeof event.button === 'number' && event.button !== 0) {
+      return;
+    }
+    var inlay = closestDomPreviewCallGraphInlay(event.target);
+    if (!inlay) { return; }
+    if (!keyboard && event.type !== 'pointerdown' && recentlyActivatedDomPreviewInlay(event, inlay)) {
+      suppressDomPreviewInlayEvent(event);
+      return;
+    }
+    var symbolId = inlay.getAttribute('data-ijss-callgraph-symbol-id') || '';
+    if (!symbolId) { return; }
+    var kind = inlay.getAttribute('data-ijss-callgraph-kind') || callGraphInlayLabelKindForElement(inlay) || 'usages';
+    var label = inlay.getAttribute('data-ijss-callgraph-label') || '';
+    suppressDomPreviewInlayEvent(event);
+    try {
+      __ijFindLastDomPreviewInlayActivation = {
+        at: Date.now(),
+        inlay: inlay,
+        x: event.clientX || 0,
+        y: event.clientY || 0,
+      };
+    } catch (eRememberDomInlay) {}
+    sendPersistent({
+      type: 'runCommand',
+      command: commandForPreviewCallGraphInlayKind(kind),
+      args: [symbolId, label],
+    });
+  }
+
   // Mousedown in the preview pane must hand focus to the Monaco editor. Without
   // this, dragging to select or Shift+arrow keeps focus on the overlay query,
   // and Monaco renders the selection in its "inactive" style — which the theme
@@ -6669,6 +7298,11 @@ export function getRendererPatchScript(
   // overview but nothing in the actual editor. Focusing the editor flips the
   // selection layer to the theme's active color AND wires up cursor-position
   // indicators on the scrollbar / minimap.
+  on($previewBody, 'pointerdown', activateDomPreviewCallGraphInlay, true);
+  on($previewBody, 'mousedown', activateDomPreviewCallGraphInlay, true);
+  on($previewBody, 'click', activateDomPreviewCallGraphInlay, true);
+  on($previewBody, 'keydown', activateDomPreviewCallGraphInlay, true);
+
   on($previewBody, 'mousedown', function () {
     var ed = state.previewMonacoEditor || state.monacoEditor;
     if (ed && typeof ed.focus === 'function') {
@@ -6724,6 +7358,7 @@ export function getRendererPatchScript(
 	      var wasVisible = panel.classList.contains('visible');
 	      var suppressSearch = !!(showOptions && showOptions.suppressSearch);
 	      var forceLiteral = !!(showOptions && showOptions.forceLiteral);
+      var preservePreview = !!(showOptions && showOptions.preservePreview);
       var spawnPanel = !!(showOptions && showOptions.spawn);
       var showStatusText = showOptions && typeof showOptions.statusText === 'string' ? showOptions.statusText : '';
       var showLoading = !!(showOptions && showOptions.loading);
@@ -6747,15 +7382,22 @@ export function getRendererPatchScript(
       reportPerfPhase('show:setShellMode', shellT0, { shouldShell: shouldShell }, 1);
       var styleT0 = perfNow();
       var spawnBaseRect = spawnPanel ? rectForSpawnBase() : null;
-      if (spawnBaseRect && !wasVisible) {
-        var spawnPos = offsetPanelPosition(spawnBaseRect, spawnBaseRect.width || 640, spawnBaseRect.height || 420);
-        panel.style.left = spawnPos.left + 'px';
-        panel.style.top = spawnPos.top + 'px';
-        panel.style.width = Math.round(spawnBaseRect.width || 640) + 'px';
-        panel.style.height = Math.round(spawnBaseRect.height || 420) + 'px';
-        panel.style.maxWidth = 'none';
-        panel.style.maxHeight = 'none';
-        panel.style.transform = 'none';
+      if (spawnPanel && !wasVisible) {
+        if (spawnBaseRect) {
+          var spawnWidth = Math.max(420, Math.round(spawnBaseRect.width || 640));
+          var spawnHeight = Math.max(320, Math.round(spawnBaseRect.height || 420));
+          var spawnPos = offsetPanelPosition(spawnBaseRect, spawnWidth, spawnHeight);
+          applyPanelLayout({
+            left: spawnPos.left,
+            top: spawnPos.top,
+            width: spawnWidth,
+            height: spawnHeight,
+          });
+        } else {
+          var centeredLayout = defaultSpawnPanelLayout();
+          applyPanelLayout(centeredLayout);
+          applyPreviewHeavyLayout(centeredLayout.height);
+        }
       }
       panel.classList.add('visible');
       panel.style.setProperty('display', 'flex', 'important');
@@ -6764,6 +7406,12 @@ export function getRendererPatchScript(
       panel.style.setProperty('pointer-events', 'auto', 'important');
       panel.style.setProperty('z-index', String(10000 + detachedPanelSeq), 'important');
       panel.style.setProperty('position', 'fixed', 'important');
+      var mountT0 = perfNow();
+      ensureSearchUiMounted(panel);
+      reportPerfPhase('show:mount', mountT0, {
+        shouldShell: shouldShell,
+        parentTag: panel.parentElement && panel.parentElement.tagName ? String(panel.parentElement.tagName).toLowerCase() : '',
+      }, 1);
       bringSearchPanelToFront(panel);
       reportPerfPhase('show:style', styleT0, { shouldShell: shouldShell }, 1);
       var themeT0 = perfNow();
@@ -6774,12 +7422,6 @@ export function getRendererPatchScript(
         syncPreviewOverflowTheme($hoverTooltip);
       }
       reportPerfPhase('show:themeSync', themeT0, { shouldShell: shouldShell }, 1);
-      var mountT0 = perfNow();
-      ensureSearchUiMounted(panel);
-      reportPerfPhase('show:mount', mountT0, {
-        shouldShell: shouldShell,
-        parentTag: panel.parentElement && panel.parentElement.tagName ? String(panel.parentElement.tagName).toLowerCase() : '',
-      }, 1);
       if (!shouldShell && isDomPreviewHoverEnabled() && document.body.lastElementChild !== $hoverTooltip) {
         document.body.appendChild($hoverTooltip);
       }
@@ -6795,7 +7437,7 @@ export function getRendererPatchScript(
       // processes our JS (send to extension → runRgSearch → network roundtrip)
       // inside the same microtask and the panel appears only after the first
       // results:start message lands. rAF guarantees one paint first.
-      trace('show:options', { suppressSearch: suppressSearch, forceLiteral: forceLiteral, loading: showLoading });
+      trace('show:options', { suppressSearch: suppressSearch, forceLiteral: forceLiteral, loading: showLoading, preservePreview: preservePreview });
       if (forceLiteral) {
         state.options.useRegex = false;
         state.options.wholeWord = false;
@@ -6826,9 +7468,11 @@ export function getRendererPatchScript(
         autosizeQuery();
         if (state.debounce) { clearTimeout(state.debounce); state.debounce = null; }
         if (suppressSearch || !initialQuery) {
-          panelDiagMark('show:suppressSearch', { len: initialQuery.length });
+          panelDiagMark('show:suppressSearch', { len: initialQuery.length, preservePreview: preservePreview });
           cancelScheduledRender();
-          clearPreview();
+          if (!preservePreview) {
+            clearPreview();
+          }
           state.files = [];
           state.flat = [];
           state.candidates = [];
@@ -7011,8 +7655,15 @@ export function getRendererPatchScript(
         filesCount: (state.files || []).length,
         flatCount: (state.flat || []).length,
         activeIndex: typeof state.activeIndex === 'number' ? state.activeIndex : -1,
+        activePreviewSeq: typeof state.activePreviewSeq === 'number' ? state.activePreviewSeq : 0,
         previewMode: state.previewMode || null,
         previewUri: state.previewUri || null,
+        previewModelUri: state.previewMonacoEditor && state.previewMonacoEditor.getModel && state.previewMonacoEditor.getModel() && state.previewMonacoEditor.getModel().uri
+          ? String(state.previewMonacoEditor.getModel().uri.toString())
+          : null,
+        previewResourceModelCreates: state.previewResourceModelCreates || 0,
+        previewIsolatedModelCreates: state.previewIsolatedModelCreates || 0,
+        previewOwnedModelDisposes: state.previewOwnedModelDisposes || 0,
         lastPreviewKey: state.lastPreviewKey || null,
         inputValue: $q ? $q.value : null,
         scopeValue: $scope ? $scope.value : null,
@@ -7100,7 +7751,7 @@ export function getRendererPatchScript(
 	  function onSearchMessage(msg) {
 	    if (__ijFindDisposed) { return 'disposed'; }
 	    if (Date.now() < (state.recoveryUntil || 0)) { return 'suppressed:recovery'; }
-	    if (!panel.classList.contains('visible') && msg && /^(results:|preview$|hover$)/.test(String(msg.type || ''))) {
+	    if (!panel.classList.contains('visible') && msg && /^(results:|preview(?::inlays)?$|hover$)/.test(String(msg.type || ''))) {
 	      return 'ignored:hidden';
 	    }
 	    var msgSearchId = typeof msg.searchId === 'number' ? msg.searchId : null;
@@ -7137,7 +7788,6 @@ export function getRendererPatchScript(
           if (!state.searching) { return; }
           updateSearchingStatus();
         }, 500);
-        clearPreview();
         updateSearchingStatus();
         render();
         break;
@@ -7279,6 +7929,28 @@ export function getRendererPatchScript(
         startPerfWatch('preview:message', 8000);
         renderPreview(msg);
         break;
+      case 'preview:inlays':
+        var previewInlayCount = Array.isArray(msg.callGraphInlays) ? msg.callGraphInlays.length : 0;
+        send({ type: 'log', msg: 'preview inlays message uri=' + (msg.uri || '') + ' previewSeq=' + (typeof msg.previewSeq === 'number' ? msg.previewSeq : 'none') + ' count=' + previewInlayCount + ' stateUri=' + (state.previewUri || '') + ' activeSeq=' + state.activePreviewSeq + ' mode=' + (state.previewMode || '') + ' hasLast=' + (!!state.lastPreviewMsg) });
+        if (msg.uri && state.previewUri && msg.uri !== state.previewUri) {
+          send({ type: 'log', msg: 'preview inlays dropped uri mismatch msgUri=' + msg.uri + ' stateUri=' + state.previewUri });
+          break;
+        }
+        if (typeof msg.previewSeq === 'number' && msg.previewSeq < state.activePreviewSeq) {
+          send({ type: 'log', msg: 'preview inlays dropped stale previewSeq=' + msg.previewSeq + ' active=' + state.activePreviewSeq });
+          break;
+        }
+        if (state.lastPreviewMsg) {
+          try { state.lastPreviewMsg.callGraphInlays = Array.isArray(msg.callGraphInlays) ? msg.callGraphInlays : []; } catch (eInlayMsg) {}
+        }
+        if (state.previewMode === 'monaco' && state.previewMonacoEditor) {
+          renderPreviewMonacoCallGraphInlays(state.previewMonacoEditor, msg);
+        } else if (state.previewMode === 'dom' && state.lastPreviewMsg) {
+          renderPreviewDOM(state.lastPreviewMsg);
+        } else {
+          send({ type: 'log', msg: 'preview inlays not rendered: mode=' + (state.previewMode || '') + ' hasMonaco=' + (!!state.previewMonacoEditor) + ' hasLast=' + (!!state.lastPreviewMsg) });
+        }
+        break;
       case 'hover':
         showHoverContents(msg);
         break;
@@ -7302,11 +7974,34 @@ export function getRendererPatchScript(
     }
   }
 
+  function isRegisteredSearchInstanceVisible(inst) {
+    try {
+      var p = inst && inst.panel;
+      if (!p || !p.classList || !p.classList.contains('visible')) { return false; }
+      if (typeof p.isConnected === 'boolean') { return p.isConnected; }
+      return !!(p.ownerDocument && p.ownerDocument.body && p.ownerDocument.body.contains(p));
+    } catch (eVisibleInstance) {
+      return false;
+    }
+  }
+
   function findRegisteredSearchInstance(targetSrc) {
     try {
       var registry = searchInstanceRegistry();
       if (targetSrc && registry[targetSrc]) { return registry[targetSrc]; }
       var activeId = window.__ijFindActiveInstanceId || '';
+      if (activeId && registry[activeId] && isRegisteredSearchInstanceVisible(registry[activeId])) {
+        return registry[activeId];
+      }
+      if (registry[__ijFindInstanceId] && isRegisteredSearchInstanceVisible(registry[__ijFindInstanceId])) {
+        return registry[__ijFindInstanceId];
+      }
+      for (var visibleKey in registry) {
+        if (Object.prototype.hasOwnProperty.call(registry, visibleKey) &&
+            isRegisteredSearchInstanceVisible(registry[visibleKey])) {
+          return registry[visibleKey];
+        }
+      }
       if (activeId && registry[activeId]) { return registry[activeId]; }
       if (registry[__ijFindInstanceId]) { return registry[__ijFindInstanceId]; }
       for (var key in registry) {
@@ -7335,6 +8030,15 @@ export function getRendererPatchScript(
       window.__ijFindActiveInstanceId = __ijFindInstanceId;
       window.__ijFindShow = function (initialQuery, showOptions) {
         var targetSrc = showOptions && showOptions.__targetSrc ? String(showOptions.__targetSrc) : '';
+        if (!targetSrc && showOptions && showOptions.spawn) {
+          try {
+            var spawnRegistry = searchInstanceRegistry();
+            var spawnInst = spawnRegistry[__ijFindInstanceId];
+            if (spawnInst && typeof spawnInst.show === 'function') {
+              return spawnInst.show(initialQuery, showOptions || {});
+            }
+          } catch (eSpawnShowInstance) {}
+        }
         var inst = findRegisteredSearchInstance(targetSrc);
         if (inst && typeof inst.show === 'function') {
           return inst.show(initialQuery, showOptions || {});

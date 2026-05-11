@@ -2,7 +2,7 @@ use crate::config::EngineConfig;
 use crate::corpus::discover_text_files;
 use crate::mmap_store::StoreLayout;
 use crate::overlay::load_overlay_with_recovery;
-use crate::planner::{build_query_plan, QueryMode};
+use crate::planner::{build_query_plan, QueryMode, QueryTermPlan};
 use crate::protocol::{SearchFileResult, SearchMatch, SearchRequest, SearchResponse};
 use crate::scorer::score_file;
 use crate::shard::{ShardDocument, ShardReader};
@@ -23,6 +23,8 @@ struct CandidateDocument {
 
 const COMPLETE_CANDIDATE_RANK_BONUS: u16 = 1_000;
 const INCOMPLETE_GRAM_BACKFILL_LIMIT: usize = 1;
+const INCOMPLETE_GRAM_BACKFILL_DOC_LIMIT: usize = 256;
+const LONG_LITERAL_INCOMPLETE_BACKFILL_CHARS: usize = 512;
 const PARALLEL_VERIFY_THRESHOLD: usize = 512;
 
 pub fn search_workspace(
@@ -358,7 +360,8 @@ fn collect_index_candidates(
     for shard_path in shard_paths {
         let reader = ShardReader::open(&shard_path).map_err(|err| err.to_string())?;
         let docs = reader.documents().map_err(|err| err.to_string())?;
-        let selected_ids = candidate_doc_ranks(&reader, plan).map_err(|err| err.to_string())?;
+        let selected_ids =
+            candidate_doc_ranks(&reader, &docs, plan).map_err(|err| err.to_string())?;
         for (doc, rank) in docs_for_ranked_ids(&docs, &selected_ids) {
             if latest_overlay.contains_key(&doc.rel_path) {
                 continue;
@@ -413,12 +416,12 @@ fn collect_index_candidates(
 
 fn candidate_doc_ranks(
     reader: &ShardReader,
+    docs: &[ShardDocument],
     plan: &crate::planner::QueryPlan,
 ) -> Result<BTreeMap<u32, u16>, std::io::Error> {
-    let docs = reader.documents()?;
     if plan.terms.is_empty() || plan.terms.iter().any(|term| term.required_grams.is_empty()) {
         return Ok(docs
-            .into_iter()
+            .iter()
             .map(|doc| (doc.doc_id, 0))
             .collect::<BTreeMap<_, _>>());
     }
@@ -439,7 +442,7 @@ fn candidate_doc_ranks(
             let ids = posting
                 .map(|posting| posting.doc_ids.into_iter().collect::<BTreeSet<_>>())
                 .unwrap_or_default();
-            if !incomplete_ids.is_empty() {
+            if !incomplete_ids.is_empty() && ids.len() <= INCOMPLETE_GRAM_BACKFILL_DOC_LIMIT {
                 let incomplete_docs = ids
                     .intersection(&incomplete_ids)
                     .copied()
@@ -467,6 +470,12 @@ fn candidate_doc_ranks(
                 .and_modify(|rank| *rank = (*rank).max(complete_rank))
                 .or_insert(complete_rank);
         }
+        if should_verify_all_incomplete_docs(plan.mode, term) {
+            for doc_id in &incomplete_ids {
+                selected_ids.entry(*doc_id).or_insert(0);
+            }
+            continue;
+        }
         if !incomplete_sets.is_empty() {
             incomplete_sets.sort_by_key(BTreeSet::len);
             for docs in incomplete_sets
@@ -484,6 +493,11 @@ fn candidate_doc_ranks(
         }
     }
     Ok(selected_ids)
+}
+
+fn should_verify_all_incomplete_docs(mode: QueryMode, term: &QueryTermPlan) -> bool {
+    mode == QueryMode::Literal
+        && (term.query.contains('\n') || term.query.len() >= LONG_LITERAL_INCOMPLETE_BACKFILL_CHARS)
 }
 
 fn docs_for_ranked_ids<'a>(
@@ -822,6 +836,50 @@ mod tests {
             "expected multiline literal planning to avoid scanning the whole workspace; scanned {} files",
             response.total_files_scanned,
         );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn long_multiline_literal_searches_verify_gram_incomplete_docs() -> io::Result<()> {
+        let root = temp_dir("long-multiline-incomplete");
+        fs::create_dir_all(root.join("src"))?;
+        let target = (0..80)
+            .map(|idx| format!("unique_target_token_{idx}_with_long_suffix_{idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(root.join("src/target.txt"), &target)?;
+        for idx in 0..8 {
+            fs::write(
+                root.join("src").join(format!("noise-{idx}.txt")),
+                format!("unique_noise_token_{idx}_with_long_suffix_{idx}\n"),
+            )?;
+        }
+        let mut config = EngineConfig::default();
+        config.max_grams_per_file = 4;
+        index_directory(&root, &config)?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: target,
+                query_terms: Vec::new(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec!["src/*".to_string()],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &config,
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(response.total_files_matched, 1);
+        assert_eq!(response.files[0].rel_path, "src/target.txt");
 
         fs::remove_dir_all(root)?;
         Ok(())

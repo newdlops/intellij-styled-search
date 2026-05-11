@@ -56,6 +56,28 @@ impl StoreLayout {
         Ok(())
     }
 
+    pub fn clear_base_shards_from(&self, first_stale_id: usize) -> io::Result<()> {
+        if !self.root.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(shard_id) = parse_base_shard_id(&name) else {
+                continue;
+            };
+            if shard_id >= first_stale_id {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn list_shard_paths(&self) -> io::Result<Vec<PathBuf>> {
         if !self.root.exists() {
             return Ok(Vec::new());
@@ -113,6 +135,11 @@ impl StoreLayout {
         removed.sort();
         Ok(removed)
     }
+}
+
+fn parse_base_shard_id(name: &str) -> Option<usize> {
+    let id = name.strip_prefix("base-shard-")?.strip_suffix(".zrs")?;
+    id.parse().ok()
 }
 
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {

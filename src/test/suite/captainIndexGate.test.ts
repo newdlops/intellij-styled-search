@@ -11,8 +11,8 @@ import { decodeTextBytes, hasBinaryFileExtension, looksBinaryContent } from '../
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 const CAPTAIN_WORKSPACE_SUFFIX = path.join('captain2', 'captain');
-const SEARCH_INDEX_BUDGET_MS = 15_000;
-const GRAPH_INDEX_BUDGET_MS = 15_000;
+const SEARCH_INDEX_BUDGET_MS = 8_000;
+const GRAPH_INDEX_BUDGET_MS = 8_000;
 const TIMEOUT_GRACE_MS = 5_000;
 const MAX_FILE_SIZE_BYTES = 1_048_576;
 const RANDOM_QUERY_COUNT = 1_000;
@@ -22,6 +22,8 @@ const SEARCH_SPEED_QUERY_COUNT = 100;
 const SEARCH_SPEED_P95_BUDGET_MS = 150;
 const SEARCH_SPEED_QUERY_TIMEOUT_MS = 5_000;
 const SEARCH_SPEED_TEST_TIMEOUT_MS = 600_000;
+const UI_RESPONSE_BUDGET_MS = 10;
+const UI_RESPONSE_TEST_TIMEOUT_MS = 20_000;
 const MAX_RANDOM_EXPECTED_MATCHES = 1;
 const RANDOM_SEARCH_BATCH_SIZE = 50;
 const LONG_QUERY_LENGTH = 10_000;
@@ -44,6 +46,15 @@ async function getApi(): Promise<ExtensionTestApi> {
   return api;
 }
 
+async function ensureRendererInjectionForUi(overlay: ExtensionTestApi['overlay']): Promise<string> {
+  try {
+    await overlay.awaitInjection();
+    return '';
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
 function workspaceRoot(): string {
   const folder = vscode.workspace.workspaceFolders?.[0];
   assert.ok(folder, 'expected captain workspace folder');
@@ -56,39 +67,6 @@ function assertCaptainWorkspace(root: string): void {
     normalized.endsWith(CAPTAIN_WORKSPACE_SUFFIX),
     `expected E2E workspace to be project/captain2/captain, got ${normalized}`,
   );
-}
-
-async function runWithBudget<T>(
-  label: string,
-  budgetMs: number,
-  operation: () => Promise<T>,
-  onTimeout?: () => void,
-): Promise<{ value: T; elapsedMs: number }> {
-  const started = Date.now();
-  const work = operation();
-  let timedOut = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<T>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      timedOut = true;
-      try { onTimeout?.(); } catch {}
-      reject(new Error(`${label} exceeded ${budgetMs}ms`));
-    }, budgetMs);
-  });
-
-  try {
-    const value = await Promise.race([work, timeout]);
-    const elapsedMs = Date.now() - started;
-    assert.ok(elapsedMs <= budgetMs, `${label} took ${elapsedMs}ms, budget ${budgetMs}ms`);
-    return { value, elapsedMs };
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
-    if (timedOut) {
-      void work.catch(() => undefined);
-    }
-  }
 }
 
 function formatEngineRoute(result: SearchForTestsResult): string {
@@ -120,14 +98,14 @@ async function getRipgrepForTests(): Promise<string> {
   return rgPath;
 }
 
-function getZoekRsBinaryForTests(): string {
-  const exe = process.platform === 'win32' ? 'zoek-rs.exe' : 'zoek-rs';
+function getZoekRsBinaryForTests(baseName = 'zoek-rs'): string {
+  const exe = process.platform === 'win32' ? `${baseName}.exe` : baseName;
   const candidates = [
     path.join(process.cwd(), 'target', 'release', exe),
     path.join(process.cwd(), 'target', 'debug', exe),
   ];
   const binary = candidates.find((candidate) => fs.existsSync(candidate));
-  assert.ok(binary, `zoek-rs binary not found; tried ${candidates.join(', ')}`);
+  assert.ok(binary, `${baseName} binary not found; tried ${candidates.join(', ')}`);
   return binary;
 }
 
@@ -511,6 +489,22 @@ function percentile(sortedValues: number[], percentileValue: number): number {
   return sortedValues[index];
 }
 
+function assertTimingsWithin(label: string, timings: number[], budgetMs: number): void {
+  assert.ok(timings.length > 0, `${label} should record timings`);
+  const sorted = [...timings].sort((a, b) => a - b);
+  const maxMs = sorted[sorted.length - 1] ?? 0;
+  const p95Ms = percentile(sorted, 0.95);
+  const avgMs = timings.reduce((sum, value) => sum + value, 0) / timings.length;
+  assert.ok(
+    maxMs <= budgetMs,
+    `${label} max should stay <= ${budgetMs}ms; timings=${timings.join(',')}ms max=${maxMs}ms p95=${p95Ms}ms avg=${Math.round(avgMs)}ms`,
+  );
+  assert.ok(
+    p95Ms <= budgetMs,
+    `${label} p95 should stay <= ${budgetMs}ms; timings=${timings.join(',')}ms max=${maxMs}ms p95=${p95Ms}ms avg=${Math.round(avgMs)}ms`,
+  );
+}
+
 async function runZoektSearchForSpeed(
   root: string,
   query: string,
@@ -611,89 +605,322 @@ suite('Captain E2E index gates', () => {
     assertCaptainWorkspace(workspaceRoot());
   });
 
-  test('rust-native call graph rebuilds the full captain workspace within 15 seconds', async function () {
+  test('captain search result clicks switch preview within 10ms after warmup', async function () {
+    this.timeout(UI_RESPONSE_TEST_TIMEOUT_MS);
+    const api = await getApi();
+    const { overlay } = api;
+    const injectionError = await ensureRendererInjectionForUi(overlay);
+    if (injectionError) {
+      console.log(`[captain-e2e] skipping UI latency probe; renderer injection unavailable: ${injectionError}`);
+      this.skip();
+      return;
+    }
+    const root = workspaceRoot();
+    assertCaptainWorkspace(root);
+    const managePath = path.join(root, 'manage.py');
+    const urlsPath = path.join(root, 'zuzu', 'app', 'urls.py');
+    assert.ok(fs.existsSync(managePath), `expected captain fixture file ${managePath}`);
+    assert.ok(fs.existsSync(urlsPath), `expected captain fixture file ${urlsPath}`);
+    const manageUri = vscode.Uri.file(managePath).toString();
+    const urlsUri = vscode.Uri.file(urlsPath).toString();
+
+    await overlay.show('CaptainPreviewClickProbe', { forceLiteral: true, suppressSearch: true });
+    try {
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var first = ${JSON.stringify(manageUri)};
+          var second = ${JSON.stringify(urlsUri)};
+          var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+          window.__ijFindDisableMonacoProbes = true;
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === 'CaptainPreviewClickProbe';
+          }) || document.querySelector('.ij-find-overlay.visible');
+          var targetSrc = root ? root.getAttribute('data-ij-find-src') || '' : '';
+          var q = root ? root.querySelector('.ij-find-query') : document.querySelector('.ij-find-query');
+          if (q) { q.value = ''; }
+          if (window.__ijFindRefreshSearch) { window.__ijFindRefreshSearch(targetSrc); }
+          window.__ijFindOnMessage({ type: 'results:start', searchId: 1940, __targetSrc: targetSrc });
+          var firstMatches = [];
+          var secondMatches = [];
+          for (var i = 0; i < 16; i++) {
+            firstMatches.push({
+              line: i,
+              preview: 'captain manage preview row ' + i,
+              ranges: [{ start: 8, end: 14 }]
+            });
+            secondMatches.push({
+              line: i,
+              preview: 'captain urls preview row ' + i,
+              ranges: [{ start: 8, end: 12 }]
+            });
+          }
+          window.__ijFindOnMessage({
+            type: 'results:file',
+            searchId: 1940,
+            __targetSrc: targetSrc,
+            match: { uri: first, relPath: 'manage.py', matches: firstMatches }
+          });
+          window.__ijFindOnMessage({
+            type: 'results:file',
+            searchId: 1940,
+            __targetSrc: targetSrc,
+            match: { uri: second, relPath: 'zuzu/app/urls.py', matches: secondMatches }
+          });
+          window.__ijFindOnMessage({ type: 'results:done', searchId: 1940, totalFiles: 2, totalMatches: 32, truncated: false, __targetSrc: targetSrc });
+          var oldBridge = globalThis.irSearchEvent;
+          var sent = [];
+          globalThis.irSearchEvent = function (payload) {
+            try {
+              var msg = JSON.parse(String(payload));
+              sent.push(msg);
+            } catch (e) {}
+          };
+          var requestTimings = [];
+          var renderTimings = [];
+          var timings = [];
+          for (var idx = 1; idx <= 16; idx++) {
+            var row = root && root.querySelector('.ij-find-row[data-flat="' + idx + '"]');
+            if (!row) {
+              globalThis.irSearchEvent = oldBridge;
+              window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+              return JSON.stringify({ err: 'missing result row ' + idx, state: window.__ijFindGetSearchState(targetSrc), timings: timings });
+            }
+            sent.length = 0;
+            var started = performance.now();
+            row.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+            var previewReq = sent.find(function (msg) { return msg.type === 'requestPreview' && (msg.uri === first || msg.uri === second); });
+            var requestAtMs = previewReq ? performance.now() - started : null;
+            if (!previewReq) {
+              timings.push({ idx: idx, requestAtMs: null, previewAtMs: null, uri: null });
+              continue;
+            }
+            var uniquePreviewText = 'captain preview switch row ' + idx + ' ' + previewReq.uri;
+            window.__ijFindOnMessage({
+              type: 'preview',
+              uri: previewReq.uri,
+              previewSeq: previewReq.previewSeq,
+              __targetSrc: targetSrc,
+              relPath: previewReq.uri === second ? 'zuzu/app/urls.py' : 'manage.py',
+              languageId: previewReq.uri === second ? 'python' : 'python',
+              focusLine: 3,
+              fullFile: true,
+              lines: [
+                { lineNumber: 0, text: 'captain preview header ' + idx },
+                { lineNumber: 1, text: 'captain preview filler ' + idx + ' a' },
+                { lineNumber: 2, text: 'captain preview filler ' + idx + ' b' },
+                { lineNumber: 3, text: uniquePreviewText },
+                { lineNumber: 40, text: 'captain preview tail ' + idx }
+              ],
+              ranges: [{ start: 8, end: 15 }]
+            });
+            var previewAtMs = null;
+            while (performance.now() - started <= ${UI_RESPONSE_BUDGET_MS}) {
+              var previewBody = root ? root.querySelector('.ij-find-preview-body') : document.querySelector('.ij-find-overlay.visible:not(.ij-find-detached) .ij-find-preview-body');
+              var previewText = previewBody ? previewBody.textContent || '' : '';
+              if (previewText.indexOf(uniquePreviewText) >= 0) {
+                previewAtMs = performance.now() - started;
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 1); });
+            }
+            timings.push({
+              idx: idx,
+              requestAtMs: requestAtMs === null ? null : Math.round(requestAtMs),
+              previewAtMs: previewAtMs === null ? null : Math.round(previewAtMs),
+              uri: previewReq.uri
+            });
+            if (requestAtMs !== null) { requestTimings.push(Math.round(requestAtMs)); }
+            if (previewAtMs !== null) { renderTimings.push(Math.round(previewAtMs)); }
+          }
+          var state = window.__ijFindGetSearchState(targetSrc);
+          globalThis.irSearchEvent = oldBridge;
+          window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+          return JSON.stringify({
+            activeIndex: state.activeIndex,
+            previewUri: state.previewUri,
+            requestTimings: requestTimings,
+            renderTimings: renderTimings,
+            timings: timings
+          });
+        })()`,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        activeIndex: number;
+        previewUri: string | null;
+        requestTimings: number[];
+        renderTimings: number[];
+        timings: Array<{ idx: number; requestAtMs: number | null; previewAtMs: number | null; uri: string | null }>;
+      };
+      assert.strictEqual(parsed.err, undefined, `expected captain result rows: ${raw}`);
+      assert.strictEqual(parsed.activeIndex, 16, `final click should select the final loaded row: ${raw}`);
+      assert.ok(parsed.previewUri === manageUri || parsed.previewUri === urlsUri, `final click should switch preview to a captain URI: ${raw}`);
+      assert.strictEqual(parsed.requestTimings.length, 16, `expected every loaded click to request preview: ${raw}`);
+      assert.strictEqual(parsed.renderTimings.length, 16, `expected every loaded click to render preview: ${raw}`);
+      assertTimingsWithin('captain result click preview request latency', parsed.requestTimings, UI_RESPONSE_BUDGET_MS);
+      assertTimingsWithin('captain result click preview render latency', parsed.renderTimings, UI_RESPONSE_BUDGET_MS);
+      console.log(
+        `[captain-e2e] UI preview switch request=${parsed.requestTimings.join(',')}ms ` +
+        `render=${parsed.renderTimings.join(',')}ms`,
+      );
+    } finally {
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible .ij-find-close')).forEach(function (btn) {
+              btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+    }
+  });
+
+  test('captain first-load inlay hook is ready for the active workbench window', async function () {
+    this.timeout(UI_RESPONSE_TEST_TIMEOUT_MS);
+    const api = await getApi();
+    const { overlay } = api;
+    const injectionError = await ensureRendererInjectionForUi(overlay);
+    if (injectionError) {
+      console.log(`[captain-e2e] skipping first-load inlay probe; renderer injection unavailable: ${injectionError}`);
+      this.skip();
+      return;
+    }
+    const root = workspaceRoot();
+    assertCaptainWorkspace(root);
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorHook = cfg.inspect<boolean>('rendererInlayClickHook');
+    const priorIdle = cfg.inspect<number>('rendererBridgeSingletonIdleMs');
+    await cfg.update('rendererInlayClickHook', true, vscode.ConfigurationTarget.Workspace);
+    await cfg.update('rendererBridgeSingletonIdleMs', 5000, vscode.ConfigurationTarget.Workspace);
+
+    try {
+      await overlay.show('CaptainFirstInlayHookProbe', { forceLiteral: true, suppressSearch: true });
+      overlay.resetRendererInlayClickHookWarmupForTests();
+      overlay.scheduleRendererInlayClickHookWarmup('captain-first-load-inlay', 0, true);
+      let state = overlay.getRendererInlayClickHookStateForTests();
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        state = overlay.getRendererInlayClickHookStateForTests();
+        if (state.ready && state.readyForActiveWindow && state.cdpOpen && state.idleCloseTimerActive) { break; }
+        await delay(50);
+      }
+      assert.strictEqual(state.ready, true, `captain inlay hook should be warmed before the first click: ${JSON.stringify(state)}`);
+      assert.strictEqual(
+        state.readyForActiveWindow,
+        true,
+        `captain first-load inlay click must not reuse a hook installed in another workbench window: ${JSON.stringify(state)}`,
+      );
+      assert.strictEqual(state.cdpOpen, true, `captain first inlay click should not reopen CDP on demand: ${JSON.stringify(state)}`);
+      assert.strictEqual(state.idleCloseTimerActive, true, `captain warmup should keep the singleton bridge alive for the first click: ${JSON.stringify(state)}`);
+      assert.strictEqual(state.warmupFailures, 0, `captain inlay warmup should not exhaust retries: ${JSON.stringify(state)}`);
+      console.log('[captain-e2e] first-load inlay hook ready for active workbench window');
+    } finally {
+      await cfg.update('rendererInlayClickHook', priorHook?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('rendererBridgeSingletonIdleMs', priorIdle?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      overlay.resetRendererInlayClickHookWarmupForTests();
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible .ij-find-close')).forEach(function (btn) {
+              btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+    }
+  });
+
+  test('rust-native call graph rebuilds the full captain workspace within 8 seconds', async function () {
     this.timeout(GRAPH_INDEX_BUDGET_MS + TIMEOUT_GRACE_MS);
     const root = workspaceRoot();
     assertCaptainWorkspace(root);
 
-    const binary = getZoekRsBinaryForTests();
-    await delay(2_500);
+    const api = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorBackend = cfg.inspect<string>('callGraphBackend');
+    await cfg.update('callGraphBackend', 'rust-native', vscode.ConfigurationTarget.Workspace);
+    const urlsPath = path.join(root, 'zuzu', 'app', 'urls.py');
+    assert.ok(fs.existsSync(urlsPath), `expected captain urls fixture file ${urlsPath}`);
+    try {
+      const started = Date.now();
+      const snapshot = await api.callGraph.rebuild(undefined, undefined, { force: true });
+      const elapsedMs = Date.now() - started;
+      assert.ok(elapsedMs <= GRAPH_INDEX_BUDGET_MS, `captain rust-native graph-rebuild took ${elapsedMs}ms`);
+      assert.ok(snapshot.stats.fileCount > 0, 'captain call graph indexed no files');
+      assert.ok(snapshot.stats.symbolCount > 0, 'captain call graph indexed no symbols');
+      assert.ok(
+        snapshot.stats.referenceCount > 0,
+        'captain call graph indexed no references; this would leave call graph inlays empty',
+      );
+      assert.ok(
+        snapshot.warnings.some((warning) => warning.includes('rust-native graph-rebuild')),
+        `expected rust-native graph index response; warnings=${snapshot.warnings.join(' | ')}`,
+      );
+      const urlsUri = vscode.Uri.file(urlsPath);
+      assert.ok(
+        await api.callGraph.ensureDocumentSummariesRestored(urlsUri),
+        'captain extension call graph failed to restore urls.py document summary from rust-native index',
+      );
+      const document = await vscode.workspace.openTextDocument(urlsUri);
+      const fullRange = new vscode.Range(
+        new vscode.Position(0, 0),
+        document.lineAt(document.lineCount - 1).range.end,
+      );
+      const cachedSummaries = api.callGraph.getCachedSymbolRelationSummariesForDocument(urlsUri, fullRange);
+      assert.ok(
+        cachedSummaries.some((summary) => summary.usageCount > 0 || summary.implementationCount > 0 || summary.calleeCount > 0),
+        `captain extension cached summaries had no relation counts: ${JSON.stringify(cachedSummaries.slice(0, 5))}`,
+      );
+      const hints = await vscode.commands.executeCommand<vscode.InlayHint[]>(
+        'vscode.executeInlayHintProvider',
+        urlsUri,
+        fullRange,
+      );
+      const relationHints = (hints ?? []).filter((hint) => {
+        const label = Array.isArray(hint.label)
+          ? hint.label.map((part) => part.value).join(' ')
+          : String(hint.label ?? '');
+        return /\b(usages|impl|callees)\s+\d+\b/.test(label);
+      });
+      assert.ok(relationHints.length > 0, 'captain inlay provider returned no relation inlay hints for urls.py');
+      console.log(
+        `[captain-e2e] graph rebuild ${elapsedMs}ms files=${snapshot.stats.fileCount} ` +
+        `symbols=${snapshot.stats.symbolCount} refs=${snapshot.stats.referenceCount}`,
+      );
+    } finally {
+      await cfg.update('callGraphBackend', priorBackend?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+    }
+  });
+
+  test('search index rebuilds the full captain workspace within 8 seconds', async function () {
+    this.timeout(SEARCH_INDEX_BUDGET_MS + TIMEOUT_GRACE_MS);
+    const root = workspaceRoot();
+    assertCaptainWorkspace(root);
+    const binary = getZoekRsBinaryForTests('ijss-rebuild');
     const started = Date.now();
     const result = await runProcess(
       binary,
-      [
-        'graph-rebuild',
-        root,
-        '--max-file-size',
-        String(MAX_FILE_SIZE_BYTES),
-        '--workers',
-        '16',
-      ],
+      [root, '--force'],
       process.cwd(),
-      GRAPH_INDEX_BUDGET_MS,
+      SEARCH_INDEX_BUDGET_MS,
     );
     const elapsedMs = Date.now() - started;
-    assert.strictEqual(result.code, 0, `zoek-rs graph-rebuild failed code=${result.code} stderr=${result.stderr.slice(-1000)}`);
-    assert.ok(elapsedMs <= GRAPH_INDEX_BUDGET_MS, `captain rust-native graph-rebuild took ${elapsedMs}ms`);
-    const response = JSON.parse(result.stdout.trim()) as {
-      ok?: boolean;
-      type?: string;
-      fileCount?: number;
-      symbolCount?: number;
-      referenceCount?: number;
-      warnings?: string[];
-    };
-
-    assert.strictEqual(response.type, 'graph-index');
+    assert.strictEqual(result.code, 0, `ijss-rebuild failed code=${result.code} stderr=${result.stderr.slice(-1000)}`);
+    assert.ok(elapsedMs <= SEARCH_INDEX_BUDGET_MS, `captain search index rebuild took ${elapsedMs}ms`);
+    const response = JSON.parse(result.stdout.trim()) as { ok?: boolean; type?: string; stats?: { indexedFiles?: number; shardCount?: number } };
+    assert.strictEqual(response.type, 'index');
     assert.strictEqual(response.ok, true);
-    assert.ok((response.fileCount ?? 0) > 0, 'captain call graph indexed no files');
-    assert.ok((response.symbolCount ?? 0) > 0, 'captain call graph indexed no symbols');
-    assert.ok(
-      (response.warnings ?? []).some((warning) => warning.includes('rust-native graph-rebuild')),
-      `expected rust-native graph index response; warnings=${(response.warnings ?? []).join(' | ')}`,
-    );
-    console.log(
-      `[captain-e2e] graph rebuild ${elapsedMs}ms files=${response.fileCount} ` +
-      `symbols=${response.symbolCount} refs=${response.referenceCount}`,
-    );
-  });
+    assert.ok((response.stats?.indexedFiles ?? 0) > 0, 'captain search index rebuild indexed no files');
+    assert.ok((response.stats?.shardCount ?? 0) > 0, 'captain search index rebuild wrote no shards');
 
-  test('search index rebuilds the full captain workspace within 15 seconds', async function () {
-    this.timeout(SEARCH_INDEX_BUDGET_MS + TIMEOUT_GRACE_MS);
     const api = await getApi();
-    const root = workspaceRoot();
-    assertCaptainWorkspace(root);
-
     const runtime = (api.overlay as any).zoektRuntime as {
-      rebuildIndex: (report?: (message: string, percent?: number) => void) => Promise<boolean>;
-      cancelRunningProcesses: (reason?: string, options?: { kinds?: string[] }) => void;
       getSearchReadiness: () => Promise<{ ready: boolean; reason?: string }>;
     };
-    const progress: string[] = [];
-    const { value: usedZoekt, elapsedMs } = await (async () => {
-      try {
-        return await runWithBudget(
-          'captain search index rebuild',
-          SEARCH_INDEX_BUDGET_MS,
-          () => runtime.rebuildIndex((message, percent) => {
-            const suffix = typeof percent === 'number' ? ` ${Math.round(percent)}%` : '';
-            progress.push(`${message}${suffix}`);
-          }),
-          () => runtime.cancelRunningProcesses('captain search index gate timed out', {
-            kinds: ['index', 'rebuild', 'update'],
-          }),
-        );
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        throw new Error(`${msg}; progress=${progress.slice(-12).join(' | ') || 'none'}`);
-      }
-    })();
-    assert.strictEqual(
-      usedZoekt,
-      true,
-      `zoek-rs did not run for captain search index rebuild; progress=${progress.slice(-8).join(' | ')}`,
-    );
-
     const readiness = await runtime.getSearchReadiness();
     assert.deepStrictEqual(readiness, { ready: true });
 
@@ -737,7 +964,13 @@ suite('Captain E2E index gates', () => {
       totalMatches: number;
     }> = [];
     for (let idx = 0; idx < queries.length; idx++) {
-      const stats = await runZoektSearchForSpeed(root, queries[idx]);
+      let stats: { elapsedMs: number; totalFilesScanned: number; totalFilesMatched: number; totalMatches: number };
+      try {
+        stats = await runZoektSearchForSpeed(root, queries[idx]);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`speed query #${idx} failed query=${JSON.stringify(queries[idx])}: ${message}`);
+      }
       records.push({ idx, query: queries[idx], ...stats });
       if ((idx + 1) % 25 === 0) {
         const sortedSoFar = records.map((record) => record.elapsedMs).sort((a, b) => a - b);

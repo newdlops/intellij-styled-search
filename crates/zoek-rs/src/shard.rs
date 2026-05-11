@@ -1,4 +1,5 @@
 use crate::config::SCHEMA_VERSION;
+use crate::gram::{hash_gram_value, GramHashMap};
 use crate::mmap_store::MappedFile;
 use std::io;
 use std::path::Path;
@@ -6,7 +7,7 @@ use std::path::Path;
 const SHARD_MAGIC: &[u8; 8] = b"ZKSHRD01";
 const HEADER_BYTES: usize = 88;
 const DOC_RECORD_BYTES: usize = 48;
-const POSTING_RECORD_BYTES: usize = 32;
+const POSTING_RECORD_BYTES: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct IndexedDocument {
@@ -14,7 +15,7 @@ pub struct IndexedDocument {
     pub byte_len: u64,
     pub modified_unix_secs: u64,
     pub content_hash: u64,
-    pub grams: Vec<String>,
+    pub grams: Vec<u64>,
     /// Per-file "gram budget exhausted" flag. When true, the stored
     /// `grams` set is a prefix of the document's true gram set because the
     /// indexer hit `max_grams_per_file` before visiting every token.
@@ -80,7 +81,13 @@ pub fn build_shard_bytes(
 ) -> io::Result<ShardBuildResult> {
     let mut doc_records = Vec::with_capacity(documents.len());
     let mut string_blob = Vec::new();
-    let mut postings_map = std::collections::BTreeMap::<String, Vec<u32>>::new();
+    let estimated_postings = documents
+        .iter()
+        .map(|doc| doc.grams.len())
+        .sum::<usize>()
+        .min(262_144);
+    let mut postings_map =
+        GramHashMap::<Vec<u32>>::with_capacity_and_hasher(estimated_postings, Default::default());
     let source_bytes = documents.iter().map(|doc| doc.byte_len).sum::<u64>();
 
     for (doc_id, doc) in documents.iter().enumerate() {
@@ -101,29 +108,30 @@ pub fn build_shard_bytes(
             flags,
         ));
         for gram in &doc.grams {
-            postings_map
-                .entry(gram.clone())
-                .or_default()
-                .push(doc_id as u32);
+            postings_map.entry(*gram).or_default().push(doc_id as u32);
         }
     }
 
     let mut doc_ids_blob = Vec::new();
     let mut posting_records = Vec::with_capacity(postings_map.len());
-    for (gram, mut doc_ids) in postings_map {
-        doc_ids.sort_unstable();
-        doc_ids.dedup();
-        let gram_offset = string_blob.len() as u64;
-        string_blob.extend_from_slice(gram.as_bytes());
+    let mut postings = postings_map.into_iter().collect::<Vec<_>>();
+    postings.sort_unstable_by_key(|(gram_hash, _)| *gram_hash);
+    for (gram_hash, doc_ids) in postings {
         let doc_ids_offset = doc_ids_blob.len() as u64;
-        for doc_id in &doc_ids {
-            push_u32(&mut doc_ids_blob, *doc_id);
+        let mut previous_doc_id = 0u32;
+        for (idx, doc_id) in doc_ids.iter().enumerate() {
+            let delta = if idx == 0 {
+                *doc_id
+            } else {
+                doc_id.saturating_sub(previous_doc_id)
+            };
+            push_var_u32(&mut doc_ids_blob, delta);
+            previous_doc_id = *doc_id;
         }
         posting_records.push((
-            gram_offset,
-            gram.len() as u32,
+            gram_hash,
             doc_ids.len() as u32,
-            doc_ids_offset,
+            checked_u32(doc_ids_offset, "doc ids offset")?,
         ));
     }
 
@@ -138,7 +146,7 @@ pub fn build_shard_bytes(
         created_unix_secs,
         doc_count: doc_records.len(),
         gram_count: posting_records.len(),
-        doc_ids_count: doc_ids_blob.len() / 4,
+        doc_ids_count: doc_ids_blob.len(),
         docs_offset,
         postings_offset,
         doc_ids_offset,
@@ -179,8 +187,6 @@ pub fn build_shard_bytes(
         push_u64(&mut bytes, record.0);
         push_u32(&mut bytes, record.1);
         push_u32(&mut bytes, record.2);
-        push_u64(&mut bytes, record.3);
-        push_u64(&mut bytes, 0);
     }
     bytes.extend_from_slice(&doc_ids_blob);
     bytes.extend_from_slice(&string_blob);
@@ -238,17 +244,14 @@ impl ShardReader {
         let mut postings = Vec::with_capacity(self.header.gram_count);
         for idx in 0..self.header.gram_count {
             let base = self.header.postings_offset as usize + idx * POSTING_RECORD_BYTES;
-            let gram_offset = read_u64_at(&self.bytes, base)?;
-            let gram_len = read_u32_at(&self.bytes, base + 8)? as usize;
-            let doc_freq = read_u32_at(&self.bytes, base + 12)? as usize;
-            let doc_ids_offset = read_u64_at(&self.bytes, base + 16)?;
+            let gram_hash = read_u64_at(&self.bytes, base)?;
+            let doc_freq = read_u32_at(&self.bytes, base + 8)? as usize;
+            let doc_ids_offset = read_u32_at(&self.bytes, base + 12)? as u64;
             let mut doc_ids = Vec::with_capacity(doc_freq);
             let ids_base = self.header.doc_ids_offset as usize + doc_ids_offset as usize;
-            for doc_idx in 0..doc_freq {
-                doc_ids.push(read_u32_at(&self.bytes, ids_base + doc_idx * 4)?);
-            }
+            read_var_doc_ids(&self.bytes, ids_base, doc_freq, &mut doc_ids)?;
             postings.push(PostingList {
-                gram: self.read_string(gram_offset, gram_len)?,
+                gram: format!("{gram_hash:016x}"),
                 doc_ids,
             });
         }
@@ -265,35 +268,24 @@ impl ShardReader {
         if total == 0 {
             return Ok(None);
         }
-        let needle_bytes = needle.as_bytes();
+        let needle_hash = hash_gram_value(needle);
         let mut lo = 0usize;
         let mut hi = total;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let base = self.header.postings_offset as usize + mid * POSTING_RECORD_BYTES;
-            let gram_offset = read_u64_at(&self.bytes, base)?;
-            let gram_len = read_u32_at(&self.bytes, base + 8)? as usize;
-            let gram_start = self.header.strings_offset as usize + gram_offset as usize;
-            let gram_end = gram_start + gram_len;
-            let gram_bytes = self.bytes.get(gram_start..gram_end).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "gram range outside shard file",
-                )
-            })?;
-            match gram_bytes.cmp(needle_bytes) {
+            let gram_hash = read_u64_at(&self.bytes, base)?;
+            match gram_hash.cmp(&needle_hash) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
-                    let doc_freq = read_u32_at(&self.bytes, base + 12)? as usize;
-                    let doc_ids_offset = read_u64_at(&self.bytes, base + 16)?;
+                    let doc_freq = read_u32_at(&self.bytes, base + 8)? as usize;
+                    let doc_ids_offset = read_u32_at(&self.bytes, base + 12)? as u64;
                     let ids_base = self.header.doc_ids_offset as usize + doc_ids_offset as usize;
                     let mut doc_ids = Vec::with_capacity(doc_freq);
-                    for doc_idx in 0..doc_freq {
-                        doc_ids.push(read_u32_at(&self.bytes, ids_base + doc_idx * 4)?);
-                    }
+                    read_var_doc_ids(&self.bytes, ids_base, doc_freq, &mut doc_ids)?;
                     return Ok(Some(PostingList {
-                        gram: self.read_string(gram_offset, gram_len)?,
+                        gram: format!("{gram_hash:016x}"),
                         doc_ids,
                     }));
                 }
@@ -379,6 +371,68 @@ fn push_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
+fn checked_u32(value: u64, label: &str) -> io::Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} exceeds u32 range"),
+        )
+    })
+}
+
+fn push_var_u32(bytes: &mut Vec<u8>, mut value: u32) {
+    while value >= 0x80 {
+        bytes.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
+}
+
+fn read_var_doc_ids(
+    bytes: &[u8],
+    mut offset: usize,
+    count: usize,
+    out: &mut Vec<u32>,
+) -> io::Result<()> {
+    let mut previous = 0u32;
+    for idx in 0..count {
+        let (delta, next_offset) = read_var_u32_at(bytes, offset)?;
+        offset = next_offset;
+        let doc_id = if idx == 0 {
+            delta
+        } else {
+            previous.checked_add(delta).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "doc id delta overflow")
+            })?
+        };
+        out.push(doc_id);
+        previous = doc_id;
+    }
+    Ok(())
+}
+
+fn read_var_u32_at(bytes: &[u8], mut offset: usize) -> io::Result<(u32, usize)> {
+    let mut value = 0u32;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(offset).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "varint outside shard file")
+        })?;
+        offset += 1;
+        value |= u32::from(byte & 0x7f) << shift;
+        if (byte & 0x80) == 0 {
+            return Ok((value, offset));
+        }
+        shift += 7;
+        if shift >= 35 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint is too long for u32",
+            ));
+        }
+    }
+}
+
 fn read_u32_at(bytes: &[u8], offset: usize) -> io::Result<u32> {
     let slice = bytes.get(offset..offset + 4).ok_or_else(|| {
         io::Error::new(io::ErrorKind::UnexpectedEof, "u32 read outside shard file")
@@ -398,6 +452,7 @@ fn read_u64_at(bytes: &[u8], offset: usize) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{build_shard_bytes, IndexedDocument, ShardReader};
+    use crate::gram::hash_gram_value;
     use crate::mmap_store::write_atomically;
     use std::fs;
     use std::io;
@@ -418,7 +473,7 @@ mod tests {
                     byte_len: 10,
                     modified_unix_secs: 1,
                     content_hash: 11,
-                    grams: vec!["src".to_string(), "alph".to_string()],
+                    grams: vec![hash_gram_value("src"), hash_gram_value("alph")],
                     gram_incomplete: false,
                 },
                 IndexedDocument {
@@ -426,7 +481,7 @@ mod tests {
                     byte_len: 20,
                     modified_unix_secs: 2,
                     content_hash: 22,
-                    grams: vec!["src".to_string(), "beta".to_string()],
+                    grams: vec![hash_gram_value("src"), hash_gram_value("beta")],
                     gram_incomplete: false,
                 },
             ],
@@ -458,7 +513,10 @@ mod tests {
                 byte_len: 1,
                 modified_unix_secs: idx as u64,
                 content_hash: idx as u64,
-                grams: vec![format!("g{:03}", idx), "shared".to_string()],
+                grams: vec![
+                    hash_gram_value(&format!("g{:03}", idx)),
+                    hash_gram_value("shared"),
+                ],
                 gram_incomplete: false,
             });
         }

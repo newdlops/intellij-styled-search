@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as http from 'http';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import WebSocket from 'ws';
 import {
   runSearch,
@@ -32,7 +32,7 @@ type RendererEvent =
   | { type: 'trace'; phase: string; data?: unknown; light?: unknown; ir?: unknown; perf?: number }
   | { type: 'openFile'; uri: string; line: number; column: number }
   | { type: 'previewFile'; uri: string; line: number; column: number }
-  | { type: 'requestPreview'; uri: string; line: number; ranges?: MatchRange[]; contextLines: number }
+  | { type: 'requestPreview'; uri: string; line: number; ranges?: MatchRange[]; contextLines: number; previewSeq?: number }
   | { type: 'revealFile'; uri: string }
   | { type: 'openInSideEditor'; uri: string; line: number; column: number }
   | { type: 'pinInSideEditor'; uri: string; line: number; column: number }
@@ -42,6 +42,20 @@ type RendererEvent =
   | { type: 'log'; msg: string };
 
 type PreviewLine = { lineNumber: number; text: string };
+export type PreviewCallGraphInlay = {
+  line: number;
+  column?: number;
+  kind: 'usages' | 'callees' | 'impl';
+  text: string;
+  symbolId: string;
+  label?: string;
+  count?: number;
+};
+export type PreviewCallGraphInlayProvider = (
+  uri: vscode.Uri,
+  document: vscode.TextDocument,
+  range: vscode.Range,
+) => Promise<PreviewCallGraphInlay[]> | PreviewCallGraphInlay[];
 type HoverContent = { value: string; isTrusted: boolean; allowedCommands?: readonly string[] };
 
 type OverlayMessage =
@@ -68,10 +82,18 @@ type OverlayMessage =
       relPath: string;
       focusLine: number;
       ranges?: MatchRange[];
+      previewSeq?: number;
       lines: PreviewLine[];
       languageId: string;
       baseLine: number;
       fullFile: boolean;
+      callGraphInlays?: PreviewCallGraphInlay[];
+    }
+  | {
+      type: 'preview:inlays';
+      uri: string;
+      previewSeq?: number;
+      callGraphInlays: PreviewCallGraphInlay[];
     }
   | { type: 'hover'; reqId: number; uri: string; line: number; column: number; x: number; y: number; contents: HoverContent[] };
 
@@ -96,11 +118,25 @@ export interface ShowOptions {
   spawn?: boolean;
   statusText?: string;
   loading?: boolean;
+  preservePreview?: boolean;
 }
 
 type PendingShow = {
   query: string;
   options?: ShowOptions;
+};
+
+type PreviewRequestEvent = Extract<RendererEvent, { type: 'requestPreview' }>;
+type QueuedPreviewRequest = {
+  evt: PreviewRequestEvent;
+  seq: number;
+  resolve: () => void;
+};
+
+type PendingPreviewForceOpen = {
+  evt: PreviewRequestEvent;
+  seq: number;
+  windowId: number;
 };
 
 type PendingStaticResults = {
@@ -129,6 +165,13 @@ const RENDERER_BINDING = 'irSearchEvent';
 const SEARCH_HISTORY_KEY = 'intellijStyledSearch.searchHistory';
 const DEFAULT_SEARCH_HISTORY_LIMIT = 100;
 const HARD_SEARCH_HISTORY_LIMIT = 1000;
+const PREVIEW_FORCE_OPEN_DEBOUNCE_MS = 750;
+const PREVIEW_FORCE_OPEN_COOLDOWN_MS = 2_000;
+const LARGE_LITERAL_MULTILINE_SEARCH_CHARS = 512;
+const LARGE_LITERAL_MULTILINE_SEARCH_LINES = 16;
+const LARGE_LITERAL_MULTILINE_SEARCH_COALESCE_MS = 1_000;
+const MONACO_CAPTURE_RECOVERY_PAUSE_MS = 2500;
+const RENDERER_INLAY_WARMUP_MAX_FAILURES = 5;
 
 function wrapLogWithPrefix(channel: vscode.OutputChannel, version: string): vscode.OutputChannel {
   // Every log line gets `[<ISO ts>] [v<version>]` prefixed so bug reports
@@ -149,6 +192,69 @@ function wrapLogWithPrefix(channel: vscode.OutputChannel, version: string): vsco
   });
 }
 
+type LargeLiteralMultilineSearchBurst = {
+  key: string;
+  chars: number;
+  lines: number;
+};
+
+type LargeLiteralMultilineSearchMarker = {
+  burst: LargeLiteralMultilineSearchBurst;
+  startedAt: number;
+  completedAt?: number;
+  promise: Promise<void>;
+  resolve: () => void;
+  cleanupTimer?: ReturnType<typeof setTimeout>;
+};
+
+function largeLiteralMultilineSearchBurst(
+  options: SearchOptions,
+  queryTerms: readonly string[],
+): LargeLiteralMultilineSearchBurst | undefined {
+  if (options.useRegex) { return undefined; }
+  let chars = 0;
+  let lines = 0;
+  let large = false;
+  for (const term of queryTerms) {
+    if (!term.includes('\n')) { continue; }
+    const lineCount = term.split(/\r?\n/).length;
+    chars += term.length;
+    lines += lineCount;
+    if (term.length > LARGE_LITERAL_MULTILINE_SEARCH_CHARS || lineCount > LARGE_LITERAL_MULTILINE_SEARCH_LINES) {
+      large = true;
+    }
+  }
+  if (!large) { return undefined; }
+  const payload = JSON.stringify({
+    queryTerms,
+    caseSensitive: !!options.caseSensitive,
+    wholeWord: !!options.wholeWord,
+    includePatterns: options.includePatterns ?? [],
+    excludePatterns: options.excludePatterns ?? [],
+    pathRegex: options.pathRegex ?? '',
+    resultLimit: options.resultLimit ?? null,
+    resultOffset: options.resultOffset ?? null,
+  });
+  return {
+    key: `${chars}:${lines}:${stableSearchHash(payload)}`,
+    chars,
+    lines,
+  };
+}
+
+function stableSearchHash(value: string): string {
+  let h1 = 0xdeadbeef ^ value.length;
+  let h2 = 0x41c6ce57 ^ value.length;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `${(h2 >>> 0).toString(36)}${(h1 >>> 0).toString(36)}`;
+}
+
 export class OverlayPanel {
   private static instance: OverlayPanel | undefined;
   private ws: WebSocket | undefined;
@@ -167,13 +273,29 @@ export class OverlayPanel {
   private backgroundCaptureTimer: ReturnType<typeof setTimeout> | undefined;
   private previewCaptureHoldTabs: vscode.Tab[] = [];
   private previewCaptureHoldTimer: ReturnType<typeof setTimeout> | undefined;
+  private pendingPreviewRequest: QueuedPreviewRequest | undefined;
+  private previewRequestTimer: ReturnType<typeof setTimeout> | undefined;
+  private previewRequestSeq = 0;
+  private previewPumpActive = false;
+  private previewWarmupPromise: Promise<void> | undefined;
+  private pendingPreviewForceOpen: PendingPreviewForceOpen | undefined;
+  private previewForceOpenTimer: ReturnType<typeof setTimeout> | undefined;
+  private previewForceOpenPromise: Promise<void> | undefined;
+  private previewForceOpenCooldownUntil = 0;
+  private previewForceOpenAttemptCount = 0;
+  private previewForceOpenSuppressedCount = 0;
+  private lastPreviewForceOpenUri: string | undefined;
+  private lastCaptureDiagnosticOpenUri: string | undefined;
   private cdpIdleCloseTimer: ReturnType<typeof setTimeout> | undefined;
   private cdpSearchIdleCloseTimer: ReturnType<typeof setTimeout> | undefined;
   private monacoCaptureDisabledLogged = false;
   private monacoCaptureStoppedForSession = false;
+  private monacoCaptureRecoveryPauseUntil = 0;
+  private monacoCaptureRecoveryPauseTimer: ReturnType<typeof setTimeout> | undefined;
   private rendererRecoveryUntil = 0;
   private searchSeq = 0;
   private currentSearchSession: SearchSession | undefined;
+  private largeLiteralMultilineSearch: LargeLiteralMultilineSearchMarker | undefined;
   private rendererPostChain: Promise<void> = Promise.resolve();
   private localBridgeServer: http.Server | undefined;
   private localBridgePort: number | undefined;
@@ -187,6 +309,8 @@ export class OverlayPanel {
   private rendererInlayClickWarmupTimer: ReturnType<typeof setTimeout> | undefined;
   private lastRendererInlayClickWarmupAt = 0;
   private rendererInlayClickHookReady = false;
+  private rendererInlayClickHookReadyWindows = new Set<number>();
+  private rendererInlayClickWarmupFailureCount = 0;
   private pendingStaticResults: PendingStaticResults | undefined;
   private pendingStaticResultsTimer: ReturnType<typeof setTimeout> | undefined;
   private staticResultsRequestSeq = 0;
@@ -196,6 +320,7 @@ export class OverlayPanel {
   private rendererCommandPendingPanelExpiresAt = 0;
   private activeRendererSrc: string | undefined;
   private currentSearchRendererSrc: string | undefined;
+  private previewCallGraphInlayProvider: PreviewCallGraphInlayProvider | undefined;
   // Per-source lastSeenSeq: each renderer patch install has its own instance
   // id (`__src`) and monotonic `__seq`. We dedup duplicates delivered by
   // accumulated CDP `message` listeners *within the same source*, but never
@@ -218,8 +343,105 @@ export class OverlayPanel {
     return this.log;
   }
 
+  setPreviewCallGraphInlayProvider(provider: PreviewCallGraphInlayProvider | undefined): void {
+    this.previewCallGraphInlayProvider = provider;
+  }
+
   getRendererCommandWindowIdForShow(): number | undefined {
     return this.rendererCommandWindowId;
+  }
+
+  /** @internal E2E diagnostics for preview capture resource throttling. */
+  getPreviewCaptureStatsForTests(): {
+    forceOpenAttempts: number;
+    forceOpenSuppressed: number;
+    forceOpenActive: boolean;
+    forceOpenTimerActive: boolean;
+    forceOpenCooldownUntil: number;
+    lastForceOpenUri?: string;
+    lastCaptureOpenUri?: string;
+  } {
+    return {
+      forceOpenAttempts: this.previewForceOpenAttemptCount,
+      forceOpenSuppressed: this.previewForceOpenSuppressedCount,
+      forceOpenActive: !!this.previewForceOpenPromise,
+      forceOpenTimerActive: !!this.previewForceOpenTimer,
+      forceOpenCooldownUntil: this.previewForceOpenCooldownUntil,
+      lastForceOpenUri: this.lastPreviewForceOpenUri,
+      lastCaptureOpenUri: this.lastCaptureDiagnosticOpenUri,
+    };
+  }
+
+  /** @internal E2E diagnostics for renderer/capture recovery behaviour. */
+  getMonacoCaptureStateForTests(): {
+    enabled: boolean;
+    disabledBySetting: boolean;
+    stoppedForSession: boolean;
+    recoveryPauseRemainingMs: number;
+  } {
+    const recoveryPauseRemainingMs = Math.max(0, this.monacoCaptureRecoveryPauseUntil - Date.now());
+    return {
+      enabled: this.isMonacoCaptureEnabled(),
+      disabledBySetting: this.isMonacoCaptureDisabledBySetting(),
+      stoppedForSession: this.monacoCaptureStoppedForSession,
+      recoveryPauseRemainingMs,
+    };
+  }
+
+  /** @internal E2E diagnostics for inlay-click warmup behaviour. */
+  getRendererInlayClickHookStateForTests(): {
+    ready: boolean;
+    readyForActiveWindow: boolean;
+    cdpOpen: boolean;
+    idleCloseTimerActive: boolean;
+    warmupTimerActive: boolean;
+    warmupFailures: number;
+  } {
+    return {
+      ready: this.rendererInlayClickHookReady,
+      readyForActiveWindow: this.isRendererInlayClickHookReadyFor(this.activeWindowId),
+      cdpOpen: !!this.ws && this.ws.readyState === WebSocket.OPEN,
+      idleCloseTimerActive: !!this.cdpIdleCloseTimer,
+      warmupTimerActive: !!this.rendererInlayClickWarmupTimer,
+      warmupFailures: this.rendererInlayClickWarmupFailureCount,
+    };
+  }
+
+  /** @internal E2E hook; do not use in production code paths. */
+  resetRendererInlayClickHookWarmupForTests(): void {
+    if (this.rendererInlayClickWarmupTimer) {
+      clearTimeout(this.rendererInlayClickWarmupTimer);
+      this.rendererInlayClickWarmupTimer = undefined;
+    }
+    this.rendererInlayClickHookReady = false;
+    this.rendererInlayClickHookReadyWindows.clear();
+    this.rendererInlayClickWarmupFailureCount = 0;
+    this.lastRendererInlayClickWarmupAt = 0;
+  }
+
+  /** @internal E2E hook; do not use in production code paths. */
+  resumeMonacoCaptureForTests(): void {
+    this.monacoCaptureStoppedForSession = false;
+    this.monacoCaptureRecoveryPauseUntil = 0;
+    this.monacoCaptureDisabledLogged = false;
+    if (this.monacoCaptureRecoveryPauseTimer) {
+      clearTimeout(this.monacoCaptureRecoveryPauseTimer);
+      this.monacoCaptureRecoveryPauseTimer = undefined;
+    }
+  }
+
+  /** @internal E2E hook; do not use in production code paths. */
+  resetPreviewCaptureStatsForTests(): void {
+    if (this.previewForceOpenTimer) {
+      clearTimeout(this.previewForceOpenTimer);
+      this.previewForceOpenTimer = undefined;
+    }
+    this.pendingPreviewForceOpen = undefined;
+    this.previewForceOpenCooldownUntil = 0;
+    this.previewForceOpenAttemptCount = 0;
+    this.previewForceOpenSuppressedCount = 0;
+    this.lastPreviewForceOpenUri = undefined;
+    this.lastCaptureDiagnosticOpenUri = undefined;
   }
 
   markRendererCommandPendingPanel(windowId: number | undefined): void {
@@ -284,7 +506,7 @@ export class OverlayPanel {
         });
       }
       if (event.affectsConfiguration('intellijStyledSearch.disableMonacoCapture')) {
-        const disabled = this.isMonacoCaptureDisabled();
+        const disabled = this.isMonacoCaptureDisabledBySetting();
         this.log.appendLine(`disableMonacoCapture changed: ${disabled}`);
         this.monacoCaptureDisabledLogged = false;
         if (disabled) {
@@ -293,6 +515,11 @@ export class OverlayPanel {
           });
         } else {
           this.monacoCaptureStoppedForSession = false;
+          this.monacoCaptureRecoveryPauseUntil = 0;
+          if (this.monacoCaptureRecoveryPauseTimer) {
+            clearTimeout(this.monacoCaptureRecoveryPauseTimer);
+            this.monacoCaptureRecoveryPauseTimer = undefined;
+          }
         }
       }
     }));
@@ -392,6 +619,10 @@ export class OverlayPanel {
       clearTimeout(this.backgroundCaptureTimer);
       this.backgroundCaptureTimer = undefined;
     }
+    if (this.monacoCaptureRecoveryPauseTimer) {
+      clearTimeout(this.monacoCaptureRecoveryPauseTimer);
+      this.monacoCaptureRecoveryPauseTimer = undefined;
+    }
     this.backgroundCaptureTimer = setTimeout(() => {
       this.backgroundCaptureTimer = undefined;
       void this.ensureBackgroundMonacoWarmup(reason).catch((err) => {
@@ -432,10 +663,10 @@ export class OverlayPanel {
   private async ensureMonacoCapture(
     preferredWindowId?: number,
     forceOpenUri?: vscode.Uri,
-    options: { allowForceOpen?: boolean; holdForceOpenedTab?: boolean; reason?: string } = {},
+    options: { allowForceOpen?: boolean; holdForceOpenedTab?: boolean; reason?: string; bypassThrottle?: boolean } = {},
   ): Promise<void> {
     if (!this.isMonacoCaptureEnabled()) {
-      this.logMonacoCaptureDisabled('foreground');
+      this.logMonacoCaptureDisabled(this.getMonacoCaptureDisabledReason() ?? 'foreground');
       return;
     }
     await this.ensureRendererPatchAlive(preferredWindowId, 'monaco-capture');
@@ -452,7 +683,7 @@ export class OverlayPanel {
       if (preferredWindowId === undefined && await this.isMonacoReadyAnywhere()) { return; }
     }
     const now = Date.now();
-    if (!forceOpenUri && now - this.lastCaptureAttemptAt < 1500) { return; }
+    if (!forceOpenUri && !options.bypassThrottle && now - this.lastCaptureAttemptAt < 1500) { return; }
     this.lastCaptureAttemptAt = now;
     try {
       const allowForceOpen = options.allowForceOpen ?? !!forceOpenUri;
@@ -508,8 +739,20 @@ export class OverlayPanel {
   }
 
   private isMonacoCaptureDisabled(): boolean {
-    return this.monacoCaptureStoppedForSession || vscode.workspace.getConfiguration('intellijStyledSearch')
+    return this.getMonacoCaptureDisabledReason() !== undefined;
+  }
+
+  private isMonacoCaptureDisabledBySetting(): boolean {
+    return vscode.workspace.getConfiguration('intellijStyledSearch')
       .get<boolean>('disableMonacoCapture', false);
+  }
+
+  private getMonacoCaptureDisabledReason(): string | undefined {
+    if (this.monacoCaptureStoppedForSession) { return 'session stopped'; }
+    if (this.isMonacoCaptureDisabledBySetting()) { return 'setting disabled'; }
+    const pauseRemaining = this.monacoCaptureRecoveryPauseUntil - Date.now();
+    if (pauseRemaining > 0) { return `recovery pause (${Math.ceil(pauseRemaining)}ms left)`; }
+    return undefined;
   }
 
   private shouldCloseMainInspector(): boolean {
@@ -574,40 +817,98 @@ export class OverlayPanel {
     );
   }
 
-  scheduleRendererInlayClickHookWarmup(reason = 'inlay-hints'): void {
+  scheduleRendererInlayClickHookWarmup(reason = 'inlay-hints', delayMs = 700, bypassThrottle = false): void {
     if (!this.shouldEnableRendererInlayClickHook()) { return; }
-    if (this.rendererInlayClickHookReady) { return; }
+    if (this.activeWindowId !== undefined && this.isRendererInlayClickHookReadyFor(this.activeWindowId)) { return; }
     const now = Date.now();
-    if (now - this.lastRendererInlayClickWarmupAt < 5000 || this.rendererInlayClickWarmupTimer) { return; }
+    if (!bypassThrottle && now - this.lastRendererInlayClickWarmupAt < 5000) { return; }
+    if (this.rendererInlayClickWarmupTimer) { return; }
     this.rendererInlayClickWarmupTimer = setTimeout(() => {
       this.rendererInlayClickWarmupTimer = undefined;
-      if (this.showInFlight || this.pendingShow) { return; }
-      this.lastRendererInlayClickWarmupAt = Date.now();
-      void this.ensureInjected({ ignoreTargetMarker: true })
-        .then(() => {
-          if (!this.showInFlight && !this.pendingShow &&
-              this.activeWindowId === undefined &&
-              this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.closeCdpWebSocket(`renderer inlay click warmup:${reason}`);
-          }
-        })
-        .catch((err) => {
-          this.log.appendLine(`renderer inlay click warmup failed (${reason}): ${err instanceof Error ? err.message : err}`);
-        });
-    }, 700);
+      this.runRendererInlayClickHookWarmup(reason);
+    }, delayMs);
+  }
+
+  private runRendererInlayClickHookWarmup(reason: string): void {
+    if (this.showInFlight || this.pendingShow) {
+      this.scheduleRendererInlayClickHookWarmup(reason, 1000, true);
+      return;
+    }
+    this.lastRendererInlayClickWarmupAt = Date.now();
+    void this.ensureInjected({ ignoreTargetMarker: true })
+      .then(async () => {
+        const targetWindowId = await this.resolveTargetWorkbenchWindowId(this.activeWindowId);
+        if (!this.isRendererInlayClickHookReadyFor(targetWindowId)) {
+          const report = await this.runPatchScript(targetWindowId, { ignoreTargetMarker: true });
+          this.markRendererInlayClickHookReady(String(report), 'warmup-refresh');
+        }
+        this.rendererInlayClickWarmupFailureCount = 0;
+        if (!this.showInFlight && !this.pendingShow &&
+            this.activeWindowId === undefined &&
+            this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.scheduleCdpIdleClose();
+        }
+      })
+      .catch((err) => {
+        this.rendererInlayClickWarmupFailureCount++;
+        const message = err instanceof Error ? err.message : err;
+        if (this.rendererInlayClickWarmupFailureCount >= RENDERER_INLAY_WARMUP_MAX_FAILURES) {
+          this.log.appendLine(
+            `renderer inlay click warmup failed (${reason}); ` +
+            `will retry on the next inlay hint request: ${message}`,
+          );
+          return;
+        }
+        const retryMs = Math.min(30_000, 1000 * (2 ** Math.max(0, this.rendererInlayClickWarmupFailureCount - 1)));
+        this.log.appendLine(
+          `renderer inlay click warmup failed (${reason}); retrying in ${retryMs}ms: ${message}`,
+        );
+        this.scheduleRendererInlayClickHookWarmup(reason, retryMs, true);
+      });
+  }
+
+  private isRendererInlayClickHookReadyFor(windowId: number | undefined): boolean {
+    if (!this.shouldEnableRendererInlayClickHook()) { return false; }
+    if (windowId === undefined) { return this.rendererInlayClickHookReady; }
+    return this.rendererInlayClickHookReadyWindows.has(windowId);
+  }
+
+  private markRendererInlayClickHookReadyWindow(windowId: number): void {
+    if (!Number.isFinite(windowId)) { return; }
+    this.rendererInlayClickHookReadyWindows.add(Math.floor(windowId));
+    this.rendererInlayClickHookReady = this.rendererInlayClickHookReadyWindows.size > 0;
   }
 
   private markRendererInlayClickHookReady(report: string, reason: string): void {
     if (!this.shouldEnableRendererInlayClickHook()) { return; }
     if (!/\bok:/.test(report)) { return; }
-    if (this.rendererInlayClickHookReady) { return; }
-    this.rendererInlayClickHookReady = true;
-    this.log.appendLine(`renderer inlay click hook ready (${reason}).`);
+    const beforeSize = this.rendererInlayClickHookReadyWindows.size;
+    const okMatches = String(report).matchAll(/\bok:(\d+):/g);
+    for (const match of okMatches) {
+      const windowId = Number(match[1]);
+      if (Number.isFinite(windowId)) {
+        this.markRendererInlayClickHookReadyWindow(windowId);
+      }
+    }
+    if (this.rendererInlayClickHookReadyWindows.size === 0) {
+      this.rendererInlayClickHookReady = true;
+    }
+    this.rendererInlayClickWarmupFailureCount = 0;
+    if (this.rendererInlayClickHookReadyWindows.size !== beforeSize || beforeSize === 0) {
+      this.log.appendLine(
+        `renderer inlay click hook ready (${reason})` +
+        (this.rendererInlayClickHookReadyWindows.size > 0
+          ? ` windows=${Array.from(this.rendererInlayClickHookReadyWindows).sort((a, b) => a - b).join(',')}`
+          : '') +
+        '.',
+      );
+    }
   }
 
   private invalidateRendererInlayClickHookReady(reason: string): void {
     if (!this.rendererInlayClickHookReady) { return; }
     this.rendererInlayClickHookReady = false;
+    this.rendererInlayClickHookReadyWindows.clear();
     this.log.appendLine(`renderer inlay click hook invalidated (${reason}).`);
   }
 
@@ -893,9 +1194,16 @@ export class OverlayPanel {
     const monacoPeek = `(function(){
       try {
         var m = window.__ijFindMonaco;
+        var f = window.__ijFindMonacoFactory;
         var status = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'not-ready:no-status';
         if (!m) return 'status=' + status + ' none';
-        return 'status=' + status + ' ctor=' + (!!(m.ctor)) + ' inst=' + (!!(m.inst)) + ' modelSvc=' + (!!(m.modelSvc));
+        return 'status=' + status +
+          ' ctor=' + (!!(m.ctor)) +
+          ' inst=' + (!!(m.inst)) +
+          ' modelSvc=' + (!!(m.modelSvc)) +
+          ' factory=' + (!!(f && f.ctor)) +
+          ' instCandidates=' + ((m.instCandidates || []).length) +
+          ' modelSvcCandidates=' + ((m.modelSvcCandidates || []).length);
       } catch(e){ return 'peek-err:' + (e && e.message); }
     })()`;
     // Check all windows in parallel — if ANY already has globals populated
@@ -1027,9 +1335,13 @@ export class OverlayPanel {
         this.log.appendLine('Existing captures did not promote to Monaco — refreshing capture buffer.');
       }
       await refreshCaptureAll();
-      // Boot-time captures are almost always DI stubs (getModel()=null).
-      // Clear them everywhere and force a real editor creation so fresh
-      // Map/Array/Set writes land in a clean capture buffer.
+      // Keep the refreshed capture buffer for the DOM scan. On warm VS Code
+      // windows it can already contain editor services that make an existing
+      // visible editor promotable without opening any capture file.
+      //
+      // If this path still cannot promote and force-open is allowed, we clear
+      // the buffer immediately before the force-open phase so fresh Map/Array/
+      // Set writes from the introduced editor land in a clean capture buffer.
       const clearExpr = `(function(){
         try {
           if (window.__ijFindCaptures) {
@@ -1041,9 +1353,6 @@ export class OverlayPanel {
           return 'cleared';
         } catch (e) { return 'clear-err:' + (e && e.message); }
       })()`;
-      await Promise.all(windowIds.map(async (id) => {
-        try { await this.evalInWindow(id, clearExpr); } catch {}
-      }));
       // First try to grab widget/service refs from any editor the user
       // already has open, straight from the live DOM. Success here means
       // we can skip the file force-open entirely — no `client.md` (or
@@ -1081,6 +1390,9 @@ export class OverlayPanel {
         );
         return;
       }
+      await Promise.all(windowIds.map(async (id) => {
+        try { await this.evalInWindow(id, clearExpr); } catch {}
+      }));
       this.log.appendLine('Captures cleared — no DOM-visible widgets, forcing real editor creation via file open/close...');
       const t0 = Date.now();
       let tFind = 0, tShow = 0, tPoll = 0, tClose = 0, pollIters = 0, pollPeekMaxMs = 0;
@@ -1098,7 +1410,7 @@ export class OverlayPanel {
         }
 
         let fileUri: vscode.Uri | undefined;
-        if (forceOpenUri && !preExistingUris.has(forceOpenUri.toString())) {
+        if (forceOpenUri) {
           fileUri = forceOpenUri;
         } else {
           const candidates = await findWorkspaceFilesDirect({
@@ -1115,7 +1427,6 @@ export class OverlayPanel {
             maxResults: 128,
           });
           fileUri = candidates.find((candidate) => !preExistingUris.has(candidate.toString()));
-          if (!fileUri && forceOpenUri) { fileUri = forceOpenUri; }
         }
         tFind = Date.now() - tFind0;
 
@@ -1129,6 +1440,7 @@ export class OverlayPanel {
             })
             : await vscode.workspace.openTextDocument(fileUri);
           const captureUriStr = captureDoc.uri.toString();
+          this.lastCaptureDiagnosticOpenUri = captureUriStr;
           this.log.appendLine(
             `Capture diagnostic: opening ${captureUriStr}` +
             (userAlreadyHadThisTab ? ` (capture-only fallback; requested ${fileUri.toString()} is already open)` : ''),
@@ -1539,13 +1851,14 @@ export class OverlayPanel {
     this.cancelCdpSearchIdleClose();
     this.zoektRuntime.cancelRunningProcesses('renderer UI recovery');
     this.rendererPostChain = Promise.resolve();
-    this.disableMonacoCaptureForSession(`recover:${reason}`);
+    this.pauseMonacoCaptureForRecovery(`recover:${reason}`);
+    this.invalidateRendererInlayClickHookReady(`recover:${reason}`);
     const rendererReport = await this.tryRendererEmergencyRecoverViaExistingBridge(`recover:${reason}`);
     const bridgeReport = await this.releaseRendererBridgeSafely('renderer UI recovery', 1000);
     this.activeWindowId = undefined;
     return [
       'active-search=cancelled',
-      'future-monaco-capture=disabled',
+      `future-monaco-capture=paused:${MONACO_CAPTURE_RECOVERY_PAUSE_MS}ms`,
       rendererReport,
       bridgeReport,
       'new-cdp=not-opened',
@@ -1565,12 +1878,40 @@ export class OverlayPanel {
 
   private disableMonacoCaptureForSession(reason: string): void {
     this.monacoCaptureStoppedForSession = true;
+    this.monacoCaptureRecoveryPauseUntil = 0;
+    if (this.monacoCaptureRecoveryPauseTimer) {
+      clearTimeout(this.monacoCaptureRecoveryPauseTimer);
+      this.monacoCaptureRecoveryPauseTimer = undefined;
+    }
     this.monacoCaptureDisabledLogged = false;
     if (this.backgroundCaptureTimer) {
       clearTimeout(this.backgroundCaptureTimer);
       this.backgroundCaptureTimer = undefined;
     }
     this.log.appendLine(`Monaco capture disabled for this extension-host session (${reason}).`);
+  }
+
+  private pauseMonacoCaptureForRecovery(reason: string, delayMs = MONACO_CAPTURE_RECOVERY_PAUSE_MS): void {
+    const until = Date.now() + delayMs;
+    this.monacoCaptureRecoveryPauseUntil = Math.max(this.monacoCaptureRecoveryPauseUntil, until);
+    this.monacoCaptureDisabledLogged = false;
+    if (this.backgroundCaptureTimer) {
+      clearTimeout(this.backgroundCaptureTimer);
+      this.backgroundCaptureTimer = undefined;
+    }
+    if (this.monacoCaptureRecoveryPauseTimer) {
+      clearTimeout(this.monacoCaptureRecoveryPauseTimer);
+    }
+    this.monacoCaptureRecoveryPauseTimer = setTimeout(() => {
+      this.monacoCaptureRecoveryPauseTimer = undefined;
+      if (Date.now() < this.monacoCaptureRecoveryPauseUntil) {
+        this.pauseMonacoCaptureForRecovery(`${reason}:extend`, this.monacoCaptureRecoveryPauseUntil - Date.now());
+        return;
+      }
+      this.monacoCaptureDisabledLogged = false;
+      this.log.appendLine(`Monaco capture recovery pause elapsed (${reason}); future previews may capture again.`);
+    }, delayMs);
+    this.log.appendLine(`Monaco capture paused for renderer recovery (${reason}; ${delayMs}ms).`);
   }
 
   private async ensureLocalBridgeServer(): Promise<{ port: number; token: string }> {
@@ -1922,6 +2263,7 @@ export class OverlayPanel {
       suppressSearch: true,
       preferredWindowId: sourceWindowId,
       spawn: sourceWindowId !== undefined && !reusePendingPanel,
+      preservePreview: reusePendingPanel,
     });
     if (requestId !== this.staticResultsRequestSeq) { return; }
     const searchId = ++this.searchSeq;
@@ -2126,14 +2468,42 @@ export class OverlayPanel {
     options: ShowOptions,
   ): Promise<{ fid: number; result: string } | undefined> {
     if (options.spawn) {
+      let spawnedFast = false;
       try {
+        const fastReport = await this.evalInWindow(windowId, `
+          (function(){
+            try {
+              if (window.__ijFindAdditionalPatchVersion !== ${JSON.stringify(RENDERER_PATCH_VERSION)}) {
+                return 'missing:version';
+              }
+              var expr = window.__ijFindAdditionalPatchExpr;
+              if (typeof expr !== 'string' || !expr) { return 'missing:expr'; }
+              var value = (0, eval)(expr);
+              return String(value || '');
+            } catch (e) {
+              return 'err:' + (e && e.message);
+            }
+          })()
+        `.trim());
+        if (fastReport === 'ij-find patch installed' || fastReport.indexOf('already patched') === 0) {
+          this.log.appendLine(`Spawn instance fast injection(win=${windowId}): ${fastReport}`);
+          spawnedFast = true;
+        } else {
+          this.log.appendLine(`Spawn instance fast injection skipped(win=${windowId}): ${fastReport}`);
+        }
+      } catch (err) {
+        this.log.appendLine(`Spawn instance fast injection failed(win=${windowId}): ${err instanceof Error ? err.message : err}`);
+      }
+      if (!spawnedFast) {
+        try {
         const report = await this.runPatchScript(windowId, {
           additionalInstance: true,
           ignoreTargetMarker: true,
         });
         this.log.appendLine(`Spawn instance injection(win=${windowId}): ${report}`);
-      } catch (err) {
-        this.log.appendLine(`Spawn instance injection failed(win=${windowId}): ${err instanceof Error ? err.message : err}`);
+        } catch (err) {
+          this.log.appendLine(`Spawn instance injection failed(win=${windowId}): ${err instanceof Error ? err.message : err}`);
+        }
       }
     }
     const showExpr = `(function(){ try { return window.__ijFindShow ? window.__ijFindShow(${JSON.stringify(initialQuery)}, ${JSON.stringify(options)}) : 'no-show-fn'; } catch (e) { return 'show-throw:' + (e && e.message); } })()`;
@@ -2633,6 +3003,14 @@ export class OverlayPanel {
       this.shouldDisposeRendererPatchOnHide(),
       !!options.additionalInstance,
     );
+    const additionalPatchExpr = getRendererPatchScript(
+      this.isMonacoCaptureEnabled(),
+      this.isRendererPerfDiagnosticsEnabled(),
+      this.shouldSuspendIntelliSenseRecursionCapture(),
+      this.shouldEnableRendererInlayClickHook(),
+      this.shouldDisposeRendererPatchOnHide(),
+      true,
+    );
     const rendererReadyExpr =
       `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&` +
       `window.__ijFindLightStatus&&window.__ijFindPatchVersion===${RENDERER_PATCH_VERSION}` +
@@ -2645,6 +3023,7 @@ export class OverlayPanel {
       (async function () {
         var BW = require('electron').BrowserWindow;
         var patchExpr = ${JSON.stringify(patchExpr)};
+        var additionalPatchExpr = ${JSON.stringify(additionalPatchExpr)};
         var rendererReadyExpr = ${JSON.stringify(rendererReadyExpr)};
         var rendererBindingName = ${JSON.stringify(RENDERER_BINDING)};
         var mainBridgeBindingName = ${JSON.stringify(BRIDGE_BINDING)};
@@ -2790,6 +3169,14 @@ export class OverlayPanel {
           var w = wins[i];
           try {
             installConsoleBridge(w);
+            try {
+              await w.webContents.executeJavaScript(
+                'window.__ijFindAdditionalPatchVersion=' + ${JSON.stringify(RENDERER_PATCH_VERSION)} + ';' +
+                'window.__ijFindAdditionalPatchExpr=' + JSON.stringify(additionalPatchExpr) + ';' +
+                '"cached"',
+                true
+              );
+            } catch (eCacheAdditionalPatch) {}
             var status = 'missing';
             try { status = await w.webContents.executeJavaScript(rendererReadyExpr, true); } catch (eStatus) { status = 'status-err:' + eStatus.message; }
             var val = status === 'ready' && !forcePatchInstall
@@ -3058,29 +3445,188 @@ export class OverlayPanel {
     }
   }
 
-  private async handlePreviewRequest(evt: Extract<RendererEvent, { type: 'requestPreview' }>) {
+  private handlePreviewRequest(evt: PreviewRequestEvent): Promise<void> {
     this.cancelCdpSearchIdleClose();
-    if (this.activeWindowId !== undefined) {
-      try {
-        await this.ensureMonacoCapture(this.activeWindowId, undefined, {
-          allowForceOpen: false,
-          reason: 'preview-request',
-        });
-        if (!(await this.isMonacoReadyInWindow(this.activeWindowId))) {
-          this.log.appendLine('preview Monaco capture still not ready; retrying v0.1.5 force-open capture path.');
-          await this.ensureMonacoCapture(this.activeWindowId, vscode.Uri.parse(evt.uri), {
-            allowForceOpen: true,
-            holdForceOpenedTab: true,
-            reason: 'preview-request-force-open',
-          });
-        }
-      } catch (err) {
-        this.log.appendLine(`preview Monaco capture failed: ${err instanceof Error ? err.message : err}`);
+    const seq = ++this.previewRequestSeq;
+    if (this.pendingPreviewRequest) {
+      this.pendingPreviewRequest.resolve();
+    }
+    return new Promise((resolve) => {
+      this.pendingPreviewRequest = { evt, seq, resolve };
+      this.schedulePreviewRequestPump();
+    });
+  }
+
+  private schedulePreviewRequestPump(): void {
+    if (this.previewRequestTimer) { return; }
+    this.previewRequestTimer = setTimeout(() => {
+      this.previewRequestTimer = undefined;
+      void this.drainPreviewRequests();
+    }, 16);
+  }
+
+  private async drainPreviewRequests(): Promise<void> {
+    if (this.previewPumpActive) { return; }
+    this.previewPumpActive = true;
+    try {
+      while (this.pendingPreviewRequest) {
+        const queued = this.pendingPreviewRequest;
+        this.pendingPreviewRequest = undefined;
+        await this.deliverLatestPreview(queued);
+      }
+    } finally {
+      this.previewPumpActive = false;
+      if (this.pendingPreviewRequest) {
+        this.schedulePreviewRequestPump();
       }
     }
-    await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges);
-    this.releasePreviewCaptureTabsSoon('preview-delivered');
-    this.scheduleCdpSearchIdleClose('preview-delivered');
+  }
+
+  private async deliverLatestPreview(queued: QueuedPreviewRequest): Promise<void> {
+    const { evt, seq } = queued;
+    const isLatest = () => seq === this.previewRequestSeq;
+    try {
+      if (!isLatest()) { return; }
+      const sent = await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges, evt.previewSeq, isLatest);
+      if (sent === false || !isLatest()) { return; }
+      this.releasePreviewCaptureTabsSoon('preview-delivered');
+      this.scheduleCdpSearchIdleClose('preview-delivered');
+      this.startPreviewWarmup(evt, seq);
+    } finally {
+      queued.resolve();
+    }
+  }
+
+  private startPreviewWarmup(evt: PreviewRequestEvent, seq: number): void {
+    if (this.activeWindowId === undefined) { return; }
+    if (!this.isMonacoCaptureEnabled()) { return; }
+    const targetWindowId = this.activeWindowId;
+    if (!this.previewWarmupPromise) {
+      this.previewWarmupPromise = (async () => {
+        try {
+          await this.ensureMonacoCapture(targetWindowId, undefined, {
+            allowForceOpen: false,
+            reason: 'preview-request',
+          });
+        } catch (err) {
+          this.log.appendLine(`preview Monaco capture failed: ${err instanceof Error ? err.message : err}`);
+        }
+      })().finally(() => {
+        this.previewWarmupPromise = undefined;
+      });
+    }
+    void this.previewWarmupPromise.then(async () => {
+      if (seq !== this.previewRequestSeq) { return; }
+      if (!(await this.isMonacoReadyInWindow(targetWindowId))) {
+        this.log.appendLine(
+          `preview Monaco warmup not ready; scheduling force-open fallback ` +
+          `(seq=${seq}, previewSeq=${typeof evt.previewSeq === 'number' ? evt.previewSeq : 'none'})`,
+        );
+        this.schedulePreviewForceOpen(evt, seq, targetWindowId);
+        return;
+      }
+      if (seq !== this.previewRequestSeq) { return; }
+      if (typeof evt.previewSeq !== 'number') { return; }
+      const isLatest = () => seq === this.previewRequestSeq;
+      const sent = await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges, evt.previewSeq, isLatest);
+      if (sent === false || !isLatest()) { return; }
+      this.releasePreviewCaptureTabsSoon('preview-refresh');
+      this.scheduleCdpSearchIdleClose('preview-refresh');
+    });
+  }
+
+  private schedulePreviewForceOpen(evt: PreviewRequestEvent, seq: number, windowId: number): void {
+    if (!this.isMonacoCaptureEnabled()) { return; }
+    if (seq !== this.previewRequestSeq) { return; }
+    this.pendingPreviewForceOpen = { evt, seq, windowId };
+    if (this.previewForceOpenPromise) {
+      this.previewForceOpenSuppressedCount++;
+      return;
+    }
+    const now = Date.now();
+    if (now < this.previewForceOpenCooldownUntil) {
+      this.previewForceOpenSuppressedCount++;
+      const delayMs = Math.max(0, this.previewForceOpenCooldownUntil - now) + PREVIEW_FORCE_OPEN_DEBOUNCE_MS;
+      if (this.previewForceOpenTimer) {
+        clearTimeout(this.previewForceOpenTimer);
+      }
+      this.previewForceOpenTimer = setTimeout(() => {
+        this.previewForceOpenTimer = undefined;
+        void this.runPreviewForceOpen();
+      }, delayMs);
+      this.log.appendLine(
+        `preview Monaco force-open delayed by cooldown (${Math.max(0, this.previewForceOpenCooldownUntil - now)}ms left)`,
+      );
+      return;
+    }
+    if (this.previewForceOpenTimer) {
+      clearTimeout(this.previewForceOpenTimer);
+    }
+    this.previewForceOpenTimer = setTimeout(() => {
+      this.previewForceOpenTimer = undefined;
+      void this.runPreviewForceOpen();
+    }, PREVIEW_FORCE_OPEN_DEBOUNCE_MS);
+  }
+
+  private async runPreviewForceOpen(): Promise<void> {
+    if (this.previewForceOpenPromise) {
+      await this.previewForceOpenPromise;
+      return;
+    }
+    const queued = this.pendingPreviewForceOpen;
+    this.pendingPreviewForceOpen = undefined;
+    if (!queued) { return; }
+    const { evt, seq, windowId } = queued;
+    if (seq !== this.previewRequestSeq) { return; }
+    let attempted = false;
+    this.previewForceOpenPromise = (async () => {
+      try {
+        if (await this.isMonacoReadyInWindow(windowId)) {
+          await this.refreshLatestPreviewAfterCapture(evt, seq, 'preview-force-open-already-ready');
+          return;
+        }
+        attempted = true;
+        this.previewForceOpenAttemptCount++;
+        this.lastPreviewForceOpenUri = evt.uri;
+        await this.ensureMonacoCapture(windowId, vscode.Uri.parse(evt.uri), {
+          allowForceOpen: true,
+          holdForceOpenedTab: true,
+          reason: 'preview-request-force-open',
+        });
+        const latest = this.pendingPreviewForceOpen && this.pendingPreviewForceOpen.seq === this.previewRequestSeq
+          ? this.pendingPreviewForceOpen
+          : queued;
+        if (latest.seq === this.previewRequestSeq) {
+          await this.refreshLatestPreviewAfterCapture(latest.evt, latest.seq, 'preview-force-open-refresh');
+        }
+      } catch (err) {
+        this.log.appendLine(`preview Monaco force-open capture failed: ${err instanceof Error ? err.message : err}`);
+      } finally {
+        this.pendingPreviewForceOpen = undefined;
+        this.releasePreviewCaptureTabsSoon('preview-force-open-complete');
+      }
+    })().finally(() => {
+      if (attempted) {
+        this.previewForceOpenCooldownUntil = Date.now() + PREVIEW_FORCE_OPEN_COOLDOWN_MS;
+      }
+      this.previewForceOpenPromise = undefined;
+    });
+    await this.previewForceOpenPromise;
+  }
+
+  private async refreshLatestPreviewAfterCapture(
+    evt: PreviewRequestEvent,
+    seq: number,
+    reason: string,
+  ): Promise<void> {
+    if (seq !== this.previewRequestSeq) { return; }
+    if (this.activeWindowId === undefined || !(await this.isMonacoReadyInWindow(this.activeWindowId))) { return; }
+    if (seq !== this.previewRequestSeq) { return; }
+    const isLatest = () => seq === this.previewRequestSeq;
+    const sent = await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges, evt.previewSeq, isLatest);
+    if (sent === false || !isLatest()) { return; }
+    this.releasePreviewCaptureTabsSoon(reason);
+    this.scheduleCdpSearchIdleClose(reason);
   }
 
   private async sendPreview(
@@ -3088,7 +3634,9 @@ export class OverlayPanel {
     line: number,
     _contextLines: number,
     ranges: MatchRange[] | undefined,
-  ) {
+    previewSeq?: number,
+    shouldSend: () => boolean = () => true,
+  ): Promise<boolean> {
     try {
       const uri = vscode.Uri.parse(uriStr);
       const doc = await vscode.workspace.openTextDocument(uri);
@@ -3099,21 +3647,82 @@ export class OverlayPanel {
       for (let i = start; i < end; i++) {
         lines.push({ lineNumber: i, text: allLines[i] ?? '' });
       }
+      if (!shouldSend()) { return false; }
       const relPath = vscode.workspace.asRelativePath(uri, false);
+      if (!shouldSend()) { return false; }
       await this.postToRenderer({
         type: 'preview',
         uri: uriStr,
         relPath,
         focusLine: line,
         ranges,
+        previewSeq,
         lines,
         languageId: doc.languageId,
         baseLine: start,
         fullFile: start === 0 && end === allLines.length,
       });
+      this.sendPreviewCallGraphInlays(uri, doc, start, end, previewSeq, shouldSend);
+      return true;
     } catch (err) {
       this.log.appendLine(`preview fetch failed: ${err instanceof Error ? err.message : err}`);
+      return false;
     }
+  }
+
+  private sendPreviewCallGraphInlays(
+    uri: vscode.Uri,
+    doc: vscode.TextDocument,
+    start: number,
+    end: number,
+    previewSeq: number | undefined,
+    shouldSend: () => boolean,
+  ): void {
+    const provider = this.previewCallGraphInlayProvider;
+    const relPath = vscode.workspace.asRelativePath(uri, false);
+    const seqLabel = typeof previewSeq === 'number' ? String(previewSeq) : 'none';
+    if (!provider) {
+      this.log.appendLine(`preview inlays skipped: no provider uri=${relPath} previewSeq=${seqLabel}`);
+      return;
+    }
+    void (async () => {
+      const startedAt = Date.now();
+      try {
+        const rangeStart = new vscode.Position(start, 0);
+        const rangeEnd = end > start ? doc.lineAt(end - 1).range.end : rangeStart;
+        const previewRange = new vscode.Range(rangeStart, rangeEnd);
+        this.log.appendLine(
+          `preview inlays fetch start: uri=${relPath} previewSeq=${seqLabel} ` +
+          `range=${previewRange.start.line + 1}:${previewRange.start.character + 1}-${previewRange.end.line + 1}:${previewRange.end.character + 1}`,
+        );
+        const provided = await provider(uri, doc, previewRange);
+        const elapsed = Date.now() - startedAt;
+        if (provided.length === 0) {
+          this.log.appendLine(`preview inlays fetch empty: uri=${relPath} previewSeq=${seqLabel} elapsed=${elapsed}ms`);
+          return;
+        }
+        if (!shouldSend()) {
+          this.log.appendLine(`preview inlays dropped stale: uri=${relPath} previewSeq=${seqLabel} count=${provided.length} elapsed=${elapsed}ms`);
+          return;
+        }
+        await this.postToRenderer({
+          type: 'preview:inlays',
+          uri: uri.toString(),
+          previewSeq,
+          callGraphInlays: provided,
+        });
+        const sample = provided
+          .slice(0, 3)
+          .map((inlay) => `${inlay.kind}:${inlay.line + 1}:${inlay.symbolId}`)
+          .join(' | ');
+        this.log.appendLine(
+          `preview inlays posted: uri=${relPath} previewSeq=${seqLabel} count=${provided.length} ` +
+          `elapsed=${elapsed}ms${sample ? ` sample=${sample}` : ''}`,
+        );
+      } catch (err) {
+        this.log.appendLine(`preview call graph inlay fetch failed: ${err instanceof Error ? err.message : err}`);
+      }
+    })();
   }
 
   private async sendHover(reqId: number, uriStr: string, line: number, column: number, x: number, y: number) {
@@ -3199,21 +3808,111 @@ export class OverlayPanel {
     };
   }
 
+  private beginLargeLiteralMultilineSearch(
+    burst: LargeLiteralMultilineSearchBurst | undefined,
+  ): { coalesced: true; promise: Promise<void> } | { coalesced: false; marker: LargeLiteralMultilineSearchMarker } | undefined {
+    if (!burst) { return undefined; }
+    const now = Date.now();
+    const existing = this.largeLiteralMultilineSearch;
+    if (existing?.burst.key === burst.key) {
+      const state = existing.completedAt === undefined
+        ? `running=${now - existing.startedAt}ms`
+        : `cooldown=${now - existing.completedAt}ms`;
+      this.log.appendLine(
+        `search coalesced: duplicate large literal multiline query len=${burst.chars} lines=${burst.lines} ${state}`,
+      );
+      return { coalesced: true, promise: existing.promise };
+    }
+    if (existing?.cleanupTimer) {
+      clearTimeout(existing.cleanupTimer);
+    }
+    let resolve: () => void = () => {};
+    const promise = new Promise<void>((done) => { resolve = done; });
+    const marker: LargeLiteralMultilineSearchMarker = {
+      burst,
+      startedAt: now,
+      promise,
+      resolve,
+    };
+    this.largeLiteralMultilineSearch = marker;
+    return { coalesced: false, marker };
+  }
+
+  private finishLargeLiteralMultilineSearch(marker: LargeLiteralMultilineSearchMarker | undefined): void {
+    if (!marker) { return; }
+    marker.resolve();
+    if (this.largeLiteralMultilineSearch !== marker) { return; }
+    marker.completedAt = Date.now();
+    marker.cleanupTimer = setTimeout(() => {
+      if (this.largeLiteralMultilineSearch === marker) {
+        this.largeLiteralMultilineSearch = undefined;
+      }
+    }, LARGE_LITERAL_MULTILINE_SEARCH_COALESCE_MS);
+    const maybeNodeTimer = marker.cleanupTimer as unknown as { unref?: () => void };
+    if (typeof maybeNodeTimer.unref === 'function') {
+      maybeNodeTimer.unref();
+    }
+  }
+
   private async runSearch(options: SearchOptions) {
-    this.cancelActive();
-    const searchId = ++this.searchSeq;
-    const rendererSrc = this.activeRendererSrc;
-    this.currentSearchRendererSrc = rendererSrc;
-    const requestedEngine = getConfiguredSearchEngine();
-    const emptyPageSize = getConfiguredResultLimit();
     const queryTerms = searchQueryTerms(options);
-    if (queryTerms.length === 0) {
-      this.currentSearchSession = {
+    const largeSearch = this.beginLargeLiteralMultilineSearch(
+      largeLiteralMultilineSearchBurst(options, queryTerms),
+    );
+    if (largeSearch?.coalesced) {
+      return largeSearch.promise;
+    }
+    try {
+      this.cancelActive();
+      const searchId = ++this.searchSeq;
+      const rendererSrc = this.activeRendererSrc;
+      this.currentSearchRendererSrc = rendererSrc;
+      const requestedEngine = getConfiguredSearchEngine();
+      const pageSize = getConfiguredResultLimit();
+      if (queryTerms.length === 0) {
+        this.currentSearchSession = {
+          searchId,
+          options: this.baseSearchOptions(options),
+          requestedEngine,
+          effectiveEngine: requestedEngine,
+          pageSize,
+          loadedMatches: 0,
+          loadedUris: new Set<string>(),
+          hasMore: false,
+          orderedCandidatePaths: null,
+          scopedCandidateUris: null,
+          rendererSrc,
+        };
+        await this.postToRenderer({ type: 'results:start', searchId });
+        await this.postToRenderer({
+          type: 'results:done',
+          searchId,
+          totalFiles: 0,
+          totalMatches: 0,
+          truncated: false,
+          pageSize,
+          pageFiles: 0,
+          pageMatches: 0,
+          offset: 0,
+        });
+        return;
+      }
+      let effectiveEngine: SearchEngine = requestedEngine;
+      let fallbackReason: string | undefined;
+      if (requestedEngine === 'zoekt') {
+        const readiness = await this.zoektRuntime.getSearchReadiness();
+        if (!readiness.ready) {
+          effectiveEngine = 'codesearch';
+          fallbackReason = readiness.reason;
+          this.maybePromptZoektIndexRecommendation(readiness.reason);
+        }
+      }
+      const session: SearchSession = {
         searchId,
         options: this.baseSearchOptions(options),
         requestedEngine,
-        effectiveEngine: requestedEngine,
-        pageSize: emptyPageSize,
+        effectiveEngine,
+        pageSize,
         loadedMatches: 0,
         loadedUris: new Set<string>(),
         hasMore: false,
@@ -3221,159 +3920,124 @@ export class OverlayPanel {
         scopedCandidateUris: null,
         rendererSrc,
       };
+      this.currentSearchSession = session;
       await this.postToRenderer({ type: 'results:start', searchId });
-      await this.postToRenderer({
-        type: 'results:done',
-        searchId,
-        totalFiles: 0,
-        totalMatches: 0,
-        truncated: false,
-        pageSize: emptyPageSize,
-        pageFiles: 0,
-        pageMatches: 0,
-        offset: 0,
-      });
-      return;
-    }
-    let effectiveEngine: SearchEngine = requestedEngine;
-    let fallbackReason: string | undefined;
-    if (requestedEngine === 'zoekt') {
-      const readiness = await this.zoektRuntime.getSearchReadiness();
-      if (!readiness.ready) {
-        effectiveEngine = 'codesearch';
-        fallbackReason = readiness.reason;
-        this.maybePromptZoektIndexRecommendation(readiness.reason);
-      }
-    }
-    const pageSize = getConfiguredResultLimit();
-    const session: SearchSession = {
-      searchId,
-      options: this.baseSearchOptions(options),
-      requestedEngine,
-      effectiveEngine,
-      pageSize,
-      loadedMatches: 0,
-      loadedUris: new Set<string>(),
-      hasMore: false,
-      orderedCandidatePaths: null,
-      scopedCandidateUris: null,
-      rendererSrc,
-    };
-    this.currentSearchSession = session;
-    await this.postToRenderer({ type: 'results:start', searchId });
-    const t0 = Date.now();
-    const optTags = [
-      requestedEngine === effectiveEngine ? `engine=${requestedEngine}` : `engine=${requestedEngine}->${effectiveEngine}`,
-      options.useRegex ? 'regex' : '',
-      options.caseSensitive ? 'case' : '',
-      options.wholeWord ? 'word' : '',
-      (isRegexMultilineEnabled(options) || (!options.useRegex && queryTerms.some((term) => term.includes('\n')))) ? 'multiline' : '',
-      options.includePatterns && options.includePatterns.length > 0 ? `include=${options.includePatterns.length}` : '',
-      options.excludePatterns && options.excludePatterns.length > 0 ? `exclude=${options.excludePatterns.length}` : '',
-    ].filter(Boolean).join(',') || 'plain';
-    const plannerSummary = effectiveEngine === 'zoekt'
-      ? 'planner=zoekt'
-      : `indexReady=${this.trigramIndex.isReady} indexSize=${this.trigramIndex.size}`;
-    this.log.appendLine(
-      `search start: len=${queryTerms.join('').length} terms=${queryTerms.length} flags=[${optTags}] ${plannerSummary}`,
-    );
-    if (requestedEngine === 'zoekt' && effectiveEngine === 'codesearch') {
+      const t0 = Date.now();
+      const optTags = [
+        requestedEngine === effectiveEngine ? `engine=${requestedEngine}` : `engine=${requestedEngine}->${effectiveEngine}`,
+        options.useRegex ? 'regex' : '',
+        options.caseSensitive ? 'case' : '',
+        options.wholeWord ? 'word' : '',
+        (isRegexMultilineEnabled(options) || (!options.useRegex && queryTerms.some((term) => term.includes('\n')))) ? 'multiline' : '',
+        options.includePatterns && options.includePatterns.length > 0 ? `include=${options.includePatterns.length}` : '',
+        options.excludePatterns && options.excludePatterns.length > 0 ? `exclude=${options.excludePatterns.length}` : '',
+      ].filter(Boolean).join(',') || 'plain';
+      const plannerSummary = effectiveEngine === 'zoekt'
+        ? 'planner=zoekt'
+        : `indexReady=${this.trigramIndex.isReady} indexSize=${this.trigramIndex.size}`;
       this.log.appendLine(
-        `Search engine zoekt selected; using codesearch fallback${fallbackReason ? ` (${fallbackReason})` : ''}.`,
+        `search start: len=${queryTerms.join('').length} terms=${queryTerms.length} flags=[${optTags}] ${plannerSummary}`,
       );
-    }
-    try {
-      if (effectiveEngine === 'zoekt') {
-        await this.runSearchPage(session, t0);
-        return;
-      }
-      // Cox's codesearch planner narrows rg's file set. If the index
-      // returns null, the planner couldn't constrain — rg walks the whole
-      // workspace. If the index returns an empty set, the regex can't
-      // match anything.
-      const { uris: candidates, reason } = queryTerms.length > 1
-        ? { uris: null, reason: 'multi-query OR uses full codesearch fallback' }
-        : this.trigramIndex.candidatesFor(options.query, {
-        useRegex: options.useRegex,
-        regexMultiline: options.regexMultiline,
-        caseSensitive: options.caseSensitive,
-        wholeWord: options.wholeWord,
-      });
-      const pathScopeMatcher = compilePathScopeMatcher(options.includePatterns, options.excludePatterns);
-      const scopedCandidates = candidates && pathScopeMatcher
-        ? (() => {
-            const filtered = new Set<string>();
-            for (const u of candidates) {
-              try {
-                const uri = vscode.Uri.parse(u);
-                if (pathScopeMatcher(vscode.workspace.asRelativePath(uri, false))) {
-                  filtered.add(u);
-                }
-              } catch {}
-            }
-            return filtered;
-          })()
-        : candidates;
-      if (scopedCandidates) {
+      if (requestedEngine === 'zoekt' && effectiveEngine === 'codesearch') {
         this.log.appendLine(
-          `TrigramIndex candidates: ${scopedCandidates.size} via ${reason}`,
+          `Search engine zoekt selected; using codesearch fallback${fallbackReason ? ` (${fallbackReason})` : ''}.`,
         );
-      } else {
-        this.log.appendLine(`TrigramIndex candidates: null (${reason}) — rg will full-scan workspace`);
       }
-      session.scopedCandidateUris = scopedCandidates;
-      if (scopedCandidates) {
-        if (scopedCandidates.size === 0) {
-          this.log.appendLine(`search done: 0 matches (candidates empty) in ${Date.now() - t0}ms`);
-          await this.postToRenderer({
-            type: 'results:done',
-            searchId,
-            totalFiles: 0,
-            totalMatches: 0,
-            truncated: false,
-            pageSize: session.pageSize,
-            pageFiles: 0,
-            pageMatches: 0,
-            offset: 0,
-          });
+      try {
+        if (effectiveEngine === 'zoekt') {
+          await this.runSearchPage(session, t0);
           return;
         }
-        // Order candidates by relevance once per search session. Later
-        // pagination reuses the same order so offset-based reruns don't
-        // duplicate or skip matches when the user's open tabs change.
-        const uris: vscode.Uri[] = [];
-        for (const u of scopedCandidates) {
-          try { uris.push(vscode.Uri.parse(u)); } catch {}
+        // Cox's codesearch planner narrows rg's file set. If the index
+        // returns null, the planner couldn't constrain — rg walks the whole
+        // workspace. If the index returns an empty set, the regex can't
+        // match anything.
+        const { uris: candidates, reason } = queryTerms.length > 1
+          ? { uris: null, reason: 'multi-query OR uses full codesearch fallback' }
+          : this.trigramIndex.candidatesFor(options.query, {
+            useRegex: options.useRegex,
+            regexMultiline: options.regexMultiline,
+            caseSensitive: options.caseSensitive,
+            wholeWord: options.wholeWord,
+          });
+        const pathScopeMatcher = compilePathScopeMatcher(options.includePatterns, options.excludePatterns);
+        const scopedCandidates = candidates && pathScopeMatcher
+          ? (() => {
+              const filtered = new Set<string>();
+              for (const u of candidates) {
+                try {
+                  const uri = vscode.Uri.parse(u);
+                  if (pathScopeMatcher(vscode.workspace.asRelativePath(uri, false))) {
+                    filtered.add(u);
+                  }
+                } catch {}
+              }
+              return filtered;
+            })()
+          : candidates;
+        if (scopedCandidates) {
+          this.log.appendLine(
+            `TrigramIndex candidates: ${scopedCandidates.size} via ${reason}`,
+          );
+        } else {
+          this.log.appendLine(`TrigramIndex candidates: null (${reason}) — rg will full-scan workspace`);
         }
-        const ordered = prioritizeFiles(uris);
-        session.orderedCandidatePaths = ordered.map((u) => u.fsPath);
-        const MAX_PENDING = 400;
-        const head = ordered.slice(0, MAX_PENDING);
-        const sample = head.map((u) => ({
-          uri: u.toString(),
-          relPath: vscode.workspace.asRelativePath(u, false),
-        }));
-        const relPaths = ordered.map((u) => vscode.workspace.asRelativePath(u, false));
-        const head3 = relPaths.slice(0, 3).join(' | ');
-        const tail3 = relPaths.length > 6 ? ' ... ' + relPaths.slice(-3).join(' | ') : '';
-        this.log.appendLine(
-          `candidates sample [${relPaths.length}]: ${head3}${tail3}`,
-        );
-        void this.postToRenderer({
-          type: 'results:candidates',
-          searchId,
-          candidates: sample,
-          total: session.orderedCandidatePaths.length,
-        });
+        session.scopedCandidateUris = scopedCandidates;
+        if (scopedCandidates) {
+          if (scopedCandidates.size === 0) {
+            this.log.appendLine(`search done: 0 matches (candidates empty) in ${Date.now() - t0}ms`);
+            await this.postToRenderer({
+              type: 'results:done',
+              searchId,
+              totalFiles: 0,
+              totalMatches: 0,
+              truncated: false,
+              pageSize: session.pageSize,
+              pageFiles: 0,
+              pageMatches: 0,
+              offset: 0,
+            });
+            return;
+          }
+          // Order candidates by relevance once per search session. Later
+          // pagination reuses the same order so offset-based reruns don't
+          // duplicate or skip matches when the user's open tabs change.
+          const uris: vscode.Uri[] = [];
+          for (const u of scopedCandidates) {
+            try { uris.push(vscode.Uri.parse(u)); } catch {}
+          }
+          const ordered = prioritizeFiles(uris);
+          session.orderedCandidatePaths = ordered.map((u) => u.fsPath);
+          const MAX_PENDING = 400;
+          const head = ordered.slice(0, MAX_PENDING);
+          const sample = head.map((u) => ({
+            uri: u.toString(),
+            relPath: vscode.workspace.asRelativePath(u, false),
+          }));
+          const relPaths = ordered.map((u) => vscode.workspace.asRelativePath(u, false));
+          const head3 = relPaths.slice(0, 3).join(' | ');
+          const tail3 = relPaths.length > 6 ? ' ... ' + relPaths.slice(-3).join(' | ') : '';
+          this.log.appendLine(
+            `candidates sample [${relPaths.length}]: ${head3}${tail3}`,
+          );
+          void this.postToRenderer({
+            type: 'results:candidates',
+            searchId,
+            candidates: sample,
+            total: session.orderedCandidatePaths.length,
+          });
+        }
+        await this.runSearchPage(session, t0);
+      } finally {
+        if (this.currentSearchSession === session && session.loadedMatches === 0 && !session.hasMore) {
+          // Keep the session only while the same query is still the current one.
+          // Non-empty sessions are retained so scroll-driven pagination can
+          // request the next page after the initial batch completes.
+          this.currentSearchSession = session;
+        }
       }
-      await this.runSearchPage(session, t0);
     } finally {
-      if (this.currentSearchSession === session && session.loadedMatches === 0 && !session.hasMore) {
-        // Keep the session only while the same query is still the current one.
-        // Non-empty sessions are retained so scroll-driven pagination can
-        // request the next page after the initial batch completes.
-        this.currentSearchSession = session;
-      }
+      this.finishLargeLiteralMultilineSearch(largeSearch?.coalesced ? undefined : largeSearch?.marker);
     }
   }
 
@@ -3848,7 +4512,10 @@ export class OverlayPanel {
     // A global "first Code.app process" match can attach CDP to another VSCode
     // window group and make the Search UI appear in the wrong workspace.
     try {
-      const out = execSync('ps -o pid=,ppid=,command= -ax', { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+      const out = execFileSync('/bin/ps', ['-o', 'pid=,ppid=,command=', '-ax'], {
+        encoding: 'utf8',
+        maxBuffer: 8 * 1024 * 1024,
+      });
       const lines = out.split('\n');
       const processes = new Map<number, { pid: number; ppid: number; cmd: string }>();
       for (const line of lines) {

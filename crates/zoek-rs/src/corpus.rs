@@ -45,6 +45,7 @@ pub struct CorpusProgress {
 pub enum ReadTextBytesOutcome {
     Text(Vec<u8>),
     Binary,
+    TooLarge,
 }
 
 pub fn discover_text_files(
@@ -111,7 +112,10 @@ fn walk_dir(
         if metadata.is_dir() {
             let file_name = item.file_name();
             let name = file_name.to_string_lossy();
-            if config.is_excluded_dir_name(&name) || path == config.index_root(workspace_root) {
+            if config.is_internal_index_dir_name(&name)
+                || config.is_excluded_dir_name(&name)
+                || path == config.index_root(workspace_root)
+            {
                 stats.skipped_dirs += 1;
                 continue;
             }
@@ -193,7 +197,10 @@ fn count_files_dir(dir: &Path, workspace_root: &Path, config: &EngineConfig) -> 
         if metadata.is_dir() {
             let file_name = item.file_name();
             let name = file_name.to_string_lossy();
-            if config.is_excluded_dir_name(&name) || path == config.index_root(workspace_root) {
+            if config.is_internal_index_dir_name(&name)
+                || config.is_excluded_dir_name(&name)
+                || path == config.index_root(workspace_root)
+            {
                 continue;
             }
             total += count_files_dir(&path, workspace_root, config)?;
@@ -228,19 +235,55 @@ pub fn read_file_bytes_if_not_binary(
     path: &Path,
     size_hint: u64,
 ) -> io::Result<ReadTextBytesOutcome> {
+    read_file_bytes_with_limit_if_not_binary(path, u64::MAX, Some(size_hint))
+}
+
+pub fn read_file_bytes_with_limit_if_not_binary(
+    path: &Path,
+    max_size_bytes: u64,
+    size_hint: Option<u64>,
+) -> io::Result<ReadTextBytesOutcome> {
     const BINARY_PROBE_BYTES: usize = 4096;
 
-    let capacity = size_hint.min(usize::MAX as u64) as usize;
+    if size_hint.is_some_and(|size| size <= 128 * 1024 && size <= max_size_bytes) {
+        let bytes = fs::read(path)?;
+        if bytes.len() as u64 > max_size_bytes {
+            return Ok(ReadTextBytesOutcome::TooLarge);
+        }
+        if looks_binary_bytes(&bytes) {
+            return Ok(ReadTextBytesOutcome::Binary);
+        }
+        return Ok(ReadTextBytesOutcome::Text(bytes));
+    }
+
+    let capacity = size_hint
+        .unwrap_or(BINARY_PROBE_BYTES as u64)
+        .min(max_size_bytes)
+        .min(8 * 1024 * 1024)
+        .min(usize::MAX as u64) as usize;
     let mut file = fs::File::open(path)?;
     let mut bytes = Vec::with_capacity(capacity);
     {
-        let mut probe_reader = (&mut file).take(BINARY_PROBE_BYTES as u64);
+        let probe_limit = max_size_bytes
+            .saturating_add(1)
+            .min(BINARY_PROBE_BYTES as u64);
+        let mut probe_reader = (&mut file).take(probe_limit);
         probe_reader.read_to_end(&mut bytes)?;
+    }
+    if bytes.len() as u64 > max_size_bytes {
+        return Ok(ReadTextBytesOutcome::TooLarge);
     }
     if looks_binary_bytes(&bytes) {
         return Ok(ReadTextBytesOutcome::Binary);
     }
-    file.read_to_end(&mut bytes)?;
+    let remaining_limit = max_size_bytes
+        .saturating_add(1)
+        .saturating_sub(bytes.len() as u64);
+    let mut limited_reader = file.take(remaining_limit);
+    limited_reader.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_size_bytes {
+        return Ok(ReadTextBytesOutcome::TooLarge);
+    }
     Ok(ReadTextBytesOutcome::Text(bytes))
 }
 

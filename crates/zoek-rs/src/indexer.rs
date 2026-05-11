@@ -7,11 +7,13 @@ use crate::mmap_store::{write_atomically, StoreLayout};
 use crate::overlay::OverlayManifest;
 use crate::protocol::json_string;
 use crate::shard::{build_shard_bytes, IndexedDocument};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::fs;
-use std::hash::{Hash, Hasher};
+use std::fs::File;
 use std::io;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -78,6 +80,7 @@ struct IndexFileRecord {
     abs_path: PathBuf,
     size_bytes: u64,
     modified_unix_secs: u64,
+    metadata_known: bool,
 }
 
 enum IndexedRecordOutcome {
@@ -86,7 +89,13 @@ enum IndexedRecordOutcome {
         encoding: TextEncoding,
     },
     SkippedBinary,
+    SkippedTooLarge,
+    SkippedMissing,
 }
+
+const SAMPLED_INDEX_THRESHOLD_BYTES: u64 = 128 * 1024;
+const SAMPLED_INDEX_PREFIX_BYTES: usize = 64 * 1024;
+const SAMPLED_INDEX_CHUNK_BYTES: usize = 8 * 1024;
 
 pub fn index_directory(workspace_root: &Path, config: &EngineConfig) -> io::Result<IndexArtifacts> {
     let mut noop = |_progress: IndexProgress| {};
@@ -104,7 +113,6 @@ where
     let layout = StoreLayout::for_workspace(workspace_root, config);
     layout.ensure_dirs()?;
     let _ = layout.cleanup_stale_temp_files(30);
-    layout.clear_stale_base_shards()?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -145,6 +153,7 @@ where
         )
         .as_bytes(),
     )?;
+    layout.clear_base_shards_from(shard_artifacts.len())?;
 
     progress(IndexProgress {
         phase: "done",
@@ -246,17 +255,19 @@ where
                     merge_corpus_stats(&mut stats, output.stats);
                     shard_fingerprints[shard_id] = output.fingerprint;
                     artifacts[shard_id] = Some(output.artifact);
-                    progress(IndexProgress {
-                        phase: "write",
-                        current: completed,
-                        total: total_shards.max(1),
-                        percent: weighted_percent(completed, total_shards, 10, 90),
-                        detail: format!(
-                            "building and writing shards {}/{}",
-                            completed,
-                            total_shards.max(1)
-                        ),
-                    });
+                    if completed == 1 || completed == total_shards || completed % 4 == 0 {
+                        progress(IndexProgress {
+                            phase: "write",
+                            current: completed,
+                            total: total_shards.max(1),
+                            percent: weighted_percent(completed, total_shards, 10, 90),
+                            detail: format!(
+                                "building and writing shards {}/{}",
+                                completed,
+                                total_shards.max(1)
+                            ),
+                        });
+                    }
                 }
                 Err(err) => {
                     if first_error.is_none() {
@@ -321,6 +332,10 @@ fn build_and_write_base_shard_from_records(
             IndexedRecordOutcome::SkippedBinary => {
                 stats.skipped_binary += 1;
             }
+            IndexedRecordOutcome::SkippedTooLarge => {
+                stats.skipped_too_large += 1;
+            }
+            IndexedRecordOutcome::SkippedMissing => {}
         }
     }
     let fingerprint = fingerprint_documents(&docs);
@@ -336,7 +351,10 @@ fn shard_build_worker_count(total_shards: usize) -> usize {
     let parallelism = thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    parallelism.min(16).min(total_shards.max(1))
+    parallelism
+        .saturating_add(parallelism / 3)
+        .min(24)
+        .min(total_shards.max(1))
 }
 
 fn directory_scan_worker_count() -> usize {
@@ -378,6 +396,11 @@ where
     F: FnMut(IndexProgress),
 {
     let worker_count = directory_scan_worker_count();
+    if let Some(result) =
+        collect_index_file_records_with_rg(workspace_root, config, worker_count, progress)?
+    {
+        return Ok(result);
+    }
     if worker_count > 1 {
         return collect_index_file_records_parallel(workspace_root, config, worker_count, progress);
     }
@@ -404,6 +427,97 @@ where
         ),
     });
     Ok((records, stats))
+}
+
+fn collect_index_file_records_with_rg<F>(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    worker_count: usize,
+    progress: &mut F,
+) -> io::Result<Option<(Vec<IndexFileRecord>, CorpusStats)>>
+where
+    F: FnMut(IndexProgress),
+{
+    let output = match Command::new("rg")
+        .current_dir(workspace_root)
+        .args([
+            "--files",
+            "--hidden",
+            "--no-ignore",
+            "--no-ignore-parent",
+            "--glob",
+            "!.zoek-rs/**",
+            "--glob",
+            "!.zoekt-rs/**",
+            ".",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(None),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let files = stdout
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(|line| line.strip_prefix("./").unwrap_or(line).replace('\\', "/"))
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    let mut records = Vec::with_capacity(files.len());
+    let mut stats = CorpusStats::default();
+    for rel_path in files {
+        stats.visited_files += 1;
+        if stats.visited_files == 1 || stats.visited_files % 65_536 == 0 {
+            progress(IndexProgress {
+                phase: "scan",
+                current: stats.visited_files,
+                total: stats.visited_files.max(1),
+                percent: 0,
+                detail: format!(
+                    "scanning files {}; {} candidates",
+                    stats.visited_files,
+                    records.len()
+                ),
+            });
+        }
+        let path = workspace_root.join(&rel_path);
+        if config.is_binary_extension(&path) {
+            stats.skipped_binary_extension += 1;
+            continue;
+        }
+        records.push(IndexFileRecord {
+            rel_path,
+            abs_path: path,
+            size_bytes: 0,
+            modified_unix_secs: 0,
+            metadata_known: false,
+        });
+    }
+    records.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    progress(IndexProgress {
+        phase: "scan",
+        current: stats.visited_files,
+        total: stats.visited_files.max(1),
+        percent: 10,
+        detail: format!(
+            "scanned {} files; {} candidates",
+            stats.visited_files,
+            records.len()
+        ),
+    });
+    let _ = worker_count;
+    Ok(Some((records, stats)))
 }
 
 enum IndexScanMessage {
@@ -543,14 +657,30 @@ fn scan_index_dir_one_level(
     stats: &mut CorpusStats,
     tx: &mpsc::Sender<IndexScanMessage>,
 ) -> io::Result<()> {
-    for item in fs::read_dir(dir)? {
-        let item = item?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    for item in entries {
+        let item = match item {
+            Ok(item) => item,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(err) => return Err(err),
+        };
         let path = item.path();
-        let file_type = item.file_type()?;
+        let file_type = match item.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(err) => return Err(err),
+        };
         if file_type.is_dir() {
             let file_name = item.file_name();
             let name = file_name.to_string_lossy();
-            if config.is_excluded_dir_name(&name) || path == index_root {
+            if config.is_internal_index_dir_name(&name)
+                || config.is_excluded_dir_name(&name)
+                || path == index_root
+            {
                 stats.skipped_dirs += 1;
                 continue;
             }
@@ -577,7 +707,11 @@ fn scan_index_dir_one_level(
             stats.skipped_binary_extension += 1;
             continue;
         }
-        let metadata = item.metadata()?;
+        let metadata = match item.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(err) => return Err(err),
+        };
         if metadata.len() > config.max_file_size_bytes {
             stats.skipped_too_large += 1;
             continue;
@@ -593,6 +727,7 @@ fn scan_index_dir_one_level(
             abs_path: path,
             size_bytes: metadata.len(),
             modified_unix_secs,
+            metadata_known: true,
         });
         candidate_files.fetch_add(1, AtomicOrdering::Relaxed);
     }
@@ -617,7 +752,10 @@ where
         if file_type.is_dir() {
             let file_name = item.file_name();
             let name = file_name.to_string_lossy();
-            if config.is_excluded_dir_name(&name) || path == config.index_root(workspace_root) {
+            if config.is_internal_index_dir_name(&name)
+                || config.is_excluded_dir_name(&name)
+                || path == config.index_root(workspace_root)
+            {
                 stats.skipped_dirs += 1;
                 continue;
             }
@@ -663,6 +801,7 @@ where
             abs_path: path,
             size_bytes: metadata.len(),
             modified_unix_secs,
+            metadata_known: true,
         });
     }
     Ok(())
@@ -672,27 +811,195 @@ fn build_indexed_document_from_record(
     record: &IndexFileRecord,
     config: &EngineConfig,
 ) -> io::Result<IndexedRecordOutcome> {
-    let bytes = match read_file_bytes_if_not_binary(&record.abs_path, record.size_bytes)? {
-        ReadTextBytesOutcome::Text(bytes) => bytes,
-        ReadTextBytesOutcome::Binary => return Ok(IndexedRecordOutcome::SkippedBinary),
+    let (bytes, size_bytes, modified_unix_secs, sampled) = if record.metadata_known {
+        if record.size_bytes > config.max_file_size_bytes {
+            return Ok(IndexedRecordOutcome::SkippedTooLarge);
+        }
+        let (outcome, sampled) =
+            match read_index_bytes_if_not_binary(&record.abs_path, record.size_bytes) {
+                Ok(outcome) => outcome,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    return Ok(IndexedRecordOutcome::SkippedMissing);
+                }
+                Err(err) => return Err(err),
+            };
+        let bytes = match outcome {
+            ReadTextBytesOutcome::Text(bytes) => bytes,
+            ReadTextBytesOutcome::Binary => return Ok(IndexedRecordOutcome::SkippedBinary),
+            ReadTextBytesOutcome::TooLarge => return Ok(IndexedRecordOutcome::SkippedTooLarge),
+        };
+        (bytes, record.size_bytes, record.modified_unix_secs, sampled)
+    } else {
+        let metadata = match fs::metadata(&record.abs_path) {
+            Ok(metadata) => metadata,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(IndexedRecordOutcome::SkippedMissing);
+            }
+            Err(err) => return Err(err),
+        };
+        if !metadata.is_file() {
+            return Ok(IndexedRecordOutcome::SkippedMissing);
+        }
+        if metadata.len() > config.max_file_size_bytes {
+            return Ok(IndexedRecordOutcome::SkippedTooLarge);
+        }
+        let (outcome, sampled) =
+            match read_index_bytes_if_not_binary(&record.abs_path, metadata.len()) {
+                Ok(outcome) => outcome,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    return Ok(IndexedRecordOutcome::SkippedMissing);
+                }
+                Err(err) => return Err(err),
+            };
+        let bytes = match outcome {
+            ReadTextBytesOutcome::Text(bytes) => bytes,
+            ReadTextBytesOutcome::Binary => return Ok(IndexedRecordOutcome::SkippedBinary),
+            ReadTextBytesOutcome::TooLarge => return Ok(IndexedRecordOutcome::SkippedTooLarge),
+        };
+        (bytes, metadata.len(), 0, sampled)
     };
     let (text, encoding) = decode_bytes_owned(bytes);
-    let (grams, overflow) = crate::gram::extract_dynamic_gram_values_with_overflow(
-        &record.rel_path,
-        &text,
-        config.max_grams_per_file,
-    );
+    let gram_limit = max_grams_for_file(config, size_bytes, &record.rel_path);
+    let (mut grams, overflow) =
+        crate::gram::extract_dynamic_gram_hashes_with_overflow(&record.rel_path, &text, gram_limit);
+    if overflow {
+        append_overflow_sample_grams(&text, &mut grams);
+    }
     Ok(IndexedRecordOutcome::Indexed {
         document: IndexedDocument {
             rel_path: record.rel_path.clone(),
-            byte_len: record.size_bytes,
-            modified_unix_secs: record.modified_unix_secs,
-            content_hash: stable_hash(&text),
+            byte_len: size_bytes,
+            modified_unix_secs,
+            content_hash: stable_record_hash(&record.rel_path, size_bytes, modified_unix_secs),
             grams,
-            gram_incomplete: overflow,
+            gram_incomplete: overflow || sampled,
         },
         encoding,
     })
+}
+
+fn read_index_bytes_if_not_binary(
+    path: &Path,
+    size_bytes: u64,
+) -> io::Result<(ReadTextBytesOutcome, bool)> {
+    let ext = path.extension().and_then(|value| value.to_str());
+    if size_bytes <= SAMPLED_INDEX_THRESHOLD_BYTES
+        || (size_bytes <= 512 * 1024 && ext.is_some_and(|ext| ext.eq_ignore_ascii_case("json")))
+    {
+        return read_file_bytes_if_not_binary(path, size_bytes).map(|outcome| (outcome, false));
+    }
+
+    let mut file = File::open(path)?;
+    let mut bytes =
+        Vec::with_capacity(SAMPLED_INDEX_PREFIX_BYTES + (SAMPLED_INDEX_CHUNK_BYTES * 4) + 4);
+    {
+        let mut prefix_reader = (&mut file).take(SAMPLED_INDEX_PREFIX_BYTES as u64);
+        prefix_reader.read_to_end(&mut bytes)?;
+    }
+    if crate::corpus::looks_binary_bytes(&bytes) {
+        return Ok((ReadTextBytesOutcome::Binary, true));
+    }
+    if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
+        return read_file_bytes_if_not_binary(path, size_bytes).map(|outcome| (outcome, false));
+    }
+
+    append_index_sample_chunk(&mut file, size_bytes / 4, &mut bytes)?;
+    append_index_sample_chunk(&mut file, size_bytes / 2, &mut bytes)?;
+    append_index_sample_chunk(&mut file, (size_bytes * 3) / 4, &mut bytes)?;
+    append_index_sample_chunk(
+        &mut file,
+        size_bytes.saturating_sub(SAMPLED_INDEX_CHUNK_BYTES as u64),
+        &mut bytes,
+    )?;
+    Ok((ReadTextBytesOutcome::Text(bytes), true))
+}
+
+fn append_index_sample_chunk(file: &mut File, offset: u64, out: &mut Vec<u8>) -> io::Result<()> {
+    out.push(b'\n');
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = file.take(SAMPLED_INDEX_CHUNK_BYTES as u64);
+    reader.read_to_end(out)?;
+    Ok(())
+}
+
+fn max_grams_for_file(config: &EngineConfig, size_bytes: u64, rel_path: &str) -> usize {
+    if size_bytes <= 512 * 1024 && rel_path.ends_with(".json") {
+        return config.max_grams_per_file.max(4096);
+    }
+    if size_bytes <= 128 * 1024 {
+        return config.max_grams_per_file.max(2048);
+    }
+    config.max_grams_per_file
+}
+
+fn append_overflow_sample_grams(text: &str, grams: &mut Vec<u64>) {
+    const SAMPLE_BYTES: usize = 8 * 1024;
+    const EXTRA_GRAMS_PER_SAMPLE: usize = 64;
+    if text.len() <= SAMPLE_BYTES {
+        return;
+    }
+    let mut seen = grams.iter().copied().collect::<HashSet<_>>();
+    for start in [text.len() / 4, text.len() / 2, (text.len() * 3) / 4] {
+        append_sample_grams(
+            text,
+            start,
+            SAMPLE_BYTES,
+            EXTRA_GRAMS_PER_SAMPLE,
+            &mut seen,
+            grams,
+        );
+    }
+    append_sample_grams(
+        text,
+        text.len().saturating_sub(SAMPLE_BYTES),
+        SAMPLE_BYTES,
+        EXTRA_GRAMS_PER_SAMPLE,
+        &mut seen,
+        grams,
+    );
+}
+
+fn append_sample_grams(
+    text: &str,
+    start: usize,
+    max_bytes: usize,
+    max_grams: usize,
+    seen: &mut HashSet<u64>,
+    grams: &mut Vec<u64>,
+) {
+    let mut start = start.min(text.len());
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = start.saturating_add(max_bytes).min(text.len());
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if start >= end {
+        return;
+    }
+    let (sample_grams, _) =
+        crate::gram::extract_dynamic_gram_hashes_with_overflow("", &text[start..end], max_grams);
+    for gram in sample_grams {
+        if seen.insert(gram) {
+            grams.push(gram);
+        }
+    }
 }
 
 fn merge_corpus_stats(target: &mut CorpusStats, source: CorpusStats) {
@@ -725,33 +1032,69 @@ fn weighted_percent(current: usize, total: usize, base: usize, weight: usize) ->
     (base + pct).min(100)
 }
 
-fn stable_hash(value: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
+fn stable_record_hash(rel_path: &str, size_bytes: u64, modified_unix_secs: u64) -> u64 {
+    let mut hasher = FingerprintHasher::new();
+    hasher.write_bytes(rel_path.as_bytes());
+    hasher.write_u64(size_bytes);
+    hasher.write_u64(modified_unix_secs);
     hasher.finish()
 }
 
 fn fingerprint_documents(docs: &[IndexedDocument]) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FingerprintHasher::new();
     for doc in docs {
-        doc.rel_path.hash(&mut hasher);
-        doc.byte_len.hash(&mut hasher);
-        doc.modified_unix_secs.hash(&mut hasher);
-        doc.content_hash.hash(&mut hasher);
-        for gram in &doc.grams {
-            gram.hash(&mut hasher);
-        }
+        hasher.write_bytes(doc.rel_path.as_bytes());
+        hasher.write_u64(doc.byte_len);
+        hasher.write_u64(doc.modified_unix_secs);
+        hasher.write_u64(doc.content_hash);
+        hasher.write_u64(doc.grams.len() as u64);
+        hasher.write_u64(u64::from(doc.gram_incomplete));
     }
     hasher.finish()
 }
 
 fn fingerprint_shards(shards: &[u64]) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FingerprintHasher::new();
     for (shard_id, fingerprint) in shards.iter().enumerate() {
-        shard_id.hash(&mut hasher);
-        fingerprint.hash(&mut hasher);
+        hasher.write_u64(shard_id as u64);
+        hasher.write_u64(*fingerprint);
     }
     hasher.finish()
+}
+
+struct FingerprintHasher {
+    value: u64,
+}
+
+impl FingerprintHasher {
+    fn new() -> Self {
+        Self {
+            value: 0xcbf29ce484222325,
+        }
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.write_u64(bytes.len() as u64);
+        for byte in bytes {
+            self.value ^= u64::from(*byte);
+            self.value = self.value.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        for byte in value.to_le_bytes() {
+            self.value ^= u64::from(byte);
+            self.value = self.value.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        if self.value == 0 {
+            1
+        } else {
+            self.value
+        }
+    }
 }
 
 fn partition_records<'a>(
@@ -766,15 +1109,20 @@ fn partition_records<'a>(
     let mut current_bytes = 0u64;
 
     for (idx, record) in records.iter().enumerate() {
+        let estimated_size_bytes = if record.metadata_known {
+            record.size_bytes
+        } else {
+            6 * 1024
+        };
         let would_overflow_bytes =
-            idx > start && current_bytes + record.size_bytes > config.shard_target_bytes;
+            idx > start && current_bytes + estimated_size_bytes > config.shard_target_bytes;
         let would_overflow_files = idx - start >= config.max_files_per_shard;
         if would_overflow_bytes || would_overflow_files {
             out.push(&records[start..idx]);
             start = idx;
             current_bytes = 0;
         }
-        current_bytes += record.size_bytes;
+        current_bytes += estimated_size_bytes;
     }
     out.push(&records[start..]);
     out
@@ -870,7 +1218,7 @@ mod tests {
         let artifacts = index_directory(&root, &config)?;
         assert_eq!(artifacts.summary.shard_count, 3);
         let manifest = fs::read_to_string(root.join(".zoek-rs/manifest.json"))?;
-        assert!(manifest.contains("\"schemaVersion\":7"));
+        assert!(manifest.contains("\"schemaVersion\":10"));
         assert!(manifest.contains("base-shard-0000.zrs"));
 
         let reader = ShardReader::open(&root.join(".zoek-rs/base-shard-0000.zrs"))?;

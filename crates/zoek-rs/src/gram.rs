@@ -1,4 +1,27 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
+
+pub type GramHashMap<V> = HashMap<u64, V, BuildHasherDefault<U64IdentityHasher>>;
+type GramHashSet = HashSet<u64, BuildHasherDefault<U64IdentityHasher>>;
+
+#[derive(Default)]
+pub struct U64IdentityHasher {
+    hash: u64,
+}
+
+impl Hasher for U64IdentityHasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.hash = hash_bytes(bytes);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.hash = value;
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum GramKind {
@@ -83,6 +106,49 @@ pub fn extract_dynamic_gram_values_with_overflow(
     (out, false)
 }
 
+pub fn extract_dynamic_gram_hashes_with_overflow(
+    rel_path: &str,
+    text: &str,
+    max_grams: usize,
+) -> (Vec<u64>, bool) {
+    let capacity = max_grams.saturating_mul(2).clamp(16, 16_384);
+    let mut seen = GramHashSet::with_capacity_and_hasher(capacity, BuildHasherDefault::default());
+    let mut out = Vec::with_capacity(max_grams.min(8192));
+
+    for component in rel_path.split('/') {
+        if append_gram_hashes_for_token(component, &mut seen, &mut out, max_grams) {
+            return (out, true);
+        }
+    }
+
+    for token in tokenize(text) {
+        if append_gram_hashes_for_token(token, &mut seen, &mut out, max_grams) {
+            return (out, true);
+        }
+    }
+
+    (out, false)
+}
+
+pub fn hash_gram_value(value: &str) -> u64 {
+    hash_bytes(value.as_bytes())
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
 pub fn extract_dynamic_grams(rel_path: &str, text: &str, max_grams: usize) -> Vec<DynamicGram> {
     extract_dynamic_grams_with_overflow(rel_path, text, max_grams).0
 }
@@ -134,6 +200,9 @@ pub fn selective_grams_for_query_literal(
         if seen_tokens.insert(normalized.clone()) {
             tokens.push(normalized);
         }
+    }
+    if tokens.iter().any(|token| token.chars().count() >= 4) {
+        tokens.retain(|token| token.chars().count() >= 4);
     }
     tokens.sort_by(|left, right| right.chars().count().cmp(&left.chars().count()));
     tokens.truncate(max_tokens);
@@ -221,6 +290,121 @@ fn append_ascii_gram_values_for_token(
     false
 }
 
+fn append_gram_hashes_for_token(
+    token: &str,
+    seen: &mut GramHashSet,
+    out: &mut Vec<u64>,
+    max_grams: usize,
+) -> bool {
+    if token.is_ascii() {
+        append_ascii_gram_hashes_for_token(token, seen, out, max_grams)
+    } else {
+        append_unicode_gram_hashes_for_token(token, seen, out, max_grams)
+    }
+}
+
+fn append_ascii_gram_hashes_for_token(
+    token: &str,
+    seen: &mut GramHashSet,
+    out: &mut Vec<u64>,
+    max_grams: usize,
+) -> bool {
+    let bytes = token.as_bytes();
+    let len = bytes.len();
+    if len < 2 {
+        return false;
+    }
+    for width in gram_widths(len).rev() {
+        for start in 0..=(len - width) {
+            if push_gram_hash(
+                hash_ascii_lower_bytes(&bytes[start..start + width]),
+                seen,
+                out,
+                max_grams,
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn append_unicode_gram_hashes_for_token(
+    token: &str,
+    seen: &mut GramHashSet,
+    out: &mut Vec<u64>,
+    max_grams: usize,
+) -> bool {
+    let normalized = normalize_token(token);
+    let len = normalized.chars().count();
+    if len < 2 {
+        return false;
+    }
+    let chars = normalized.chars().collect::<Vec<_>>();
+    for width in gram_widths(len).rev() {
+        for start in 0..=(len - width) {
+            if push_gram_hash(
+                hash_chars(&chars[start..start + width]),
+                seen,
+                out,
+                max_grams,
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn push_gram_hash(
+    value: u64,
+    seen: &mut GramHashSet,
+    out: &mut Vec<u64>,
+    max_grams: usize,
+) -> bool {
+    if !seen.insert(value) {
+        return false;
+    }
+    if out.len() >= max_grams {
+        return true;
+    }
+    out.push(value);
+    false
+}
+
+fn hash_ascii_lower_bytes(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(byte.to_ascii_lowercase());
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
+fn hash_chars(chars: &[char]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    let mut buf = [0u8; 4];
+    for ch in chars {
+        for byte in ch.encode_utf8(&mut buf).as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
 fn append_unicode_gram_values_for_token(
     token: &str,
     seen: &mut HashSet<String>,
@@ -269,10 +453,9 @@ fn grams_for_token(token: &str, kind: GramKind) -> Vec<DynamicGram> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
 
-    // Preserve shorter fallback grams even for long tokens so substring
-    // queries can intersect with the index regardless of the surrounding
-    // identifier length. Without this, `Alpha` could not narrow candidates
-    // inside `AlphaService`, and Hangul substrings fell back to full scans.
+    // Use the widest indexed grams for selectivity. Shorter standalone
+    // literals still fall back to exact verification if no indexed candidate
+    // can be produced.
     for width in gram_widths(len).rev() {
         // Full sliding-window coverage: every contiguous `width`-char
         // substring. Required so the planner (which may pick a subset of
@@ -293,7 +476,7 @@ fn is_token_char(ch: char) -> bool {
 }
 
 fn gram_widths(len: usize) -> std::ops::RangeInclusive<usize> {
-    2..=len.min(4)
+    len.min(4)..=len.min(4)
 }
 
 #[cfg(test)]
@@ -324,7 +507,7 @@ mod tests {
     #[test]
     fn query_grams_ignore_literal_spacing_and_punctuation() {
         let grams = grams_for_query_literal("class AlphaService:");
-        assert!(grams.iter().any(|gram| gram == "cla"));
+        assert!(grams.iter().any(|gram| gram == "clas"));
         assert!(grams.iter().any(|gram| gram == "alph"));
         assert!(grams.iter().all(|gram| !gram.contains(' ')));
         assert!(grams.iter().all(|gram| !gram.contains(':')));
@@ -340,6 +523,17 @@ mod tests {
         assert!(grams
             .iter()
             .any(|gram| gram.contains("_upd") || gram.contains("dire")));
+    }
+
+    #[test]
+    fn selective_grams_drop_short_tokens_when_longer_tokens_can_select() {
+        let grams = selective_grams_for_query_literal(
+            "BaseDocumentsVisitor, DeclarationKind, LoadedFragment, Par",
+            4,
+            12,
+        );
+        assert!(!grams.iter().any(|gram| gram == "par"));
+        assert!(grams.iter().any(|gram| gram == "base"));
     }
 
     #[test]

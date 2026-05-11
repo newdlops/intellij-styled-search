@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { OverlayPanel } from './overlayPanel';
+import { OverlayPanel, type PreviewCallGraphInlay } from './overlayPanel';
 import type { FileMatch, MatchRange, SearchEngine, SearchForTestsResult } from './search';
 import {
   CallGraphService,
@@ -161,8 +161,14 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   const callGraphLog = overlay.getLogChannel();
   const callGraph = new CallGraphService(context, callGraphLog);
   const callGraphInlayRegistry = new CallGraphInlayRegistry();
+  overlay.setPreviewCallGraphInlayProvider((uri, document, range) =>
+    buildPreviewCallGraphInlays(callGraph, callGraphLog, uri, document, range));
   const mcpServer = new CallGraphMcpServer(callGraph, callGraphLog, overlay);
-  context.subscriptions.push(callGraph, mcpServer);
+  context.subscriptions.push(
+    callGraph,
+    mcpServer,
+    { dispose: () => overlay.setPreviewCallGraphInlayProvider(undefined) },
+  );
   const mcpAutoStart = vscode.workspace.getConfiguration('intellijStyledSearch').get<boolean>('mcpAutoStart', true);
   if (mcpAutoStart && vscode.workspace.isTrusted && vscode.workspace.workspaceFolders?.length) {
     void (async () => {
@@ -435,21 +441,21 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       overlay.logCommand('findUsages');
       await showCallGraphUsageResult(overlay, callGraph, callGraphLog);
     }),
-    vscode.commands.registerCommand('intellijStyledSearch.showCallersForSymbol', async (symbolId: string) => {
+    vscode.commands.registerCommand('intellijStyledSearch.showCallersForSymbol', async (symbolId: string, label?: string) => {
       await runDedupedCallGraphSymbolCommand('showCallersForSymbol', symbolId, () =>
-        showCallGraphUsageResult(overlay, callGraph, callGraphLog, symbolId));
+        showCallGraphUsageResult(overlay, callGraph, callGraphLog, symbolId, label));
     }),
-    vscode.commands.registerCommand('intellijStyledSearch.showCalleesForSymbol', async (symbolId: string) => {
+    vscode.commands.registerCommand('intellijStyledSearch.showCalleesForSymbol', async (symbolId: string, label?: string) => {
       await runDedupedCallGraphSymbolCommand('showCalleesForSymbol', symbolId, () =>
-        showCallGraphQueryResult(overlay, callGraph, callGraphLog, 'callees', symbolId));
+        showCallGraphQueryResult(overlay, callGraph, callGraphLog, 'callees', symbolId, label));
     }),
-    vscode.commands.registerCommand('intellijStyledSearch.showImplementationsForSymbol', async (symbolId: string) => {
+    vscode.commands.registerCommand('intellijStyledSearch.showImplementationsForSymbol', async (symbolId: string, label?: string) => {
       await runDedupedCallGraphSymbolCommand('showImplementationsForSymbol', symbolId, () =>
-        showCallGraphImplementationResult(overlay, callGraph, symbolId));
+        showCallGraphImplementationResult(overlay, callGraph, symbolId, label));
     }),
-    vscode.commands.registerCommand('intellijStyledSearch.showUsagesForSymbol', async (symbolId: string) => {
+    vscode.commands.registerCommand('intellijStyledSearch.showUsagesForSymbol', async (symbolId: string, label?: string) => {
       await runDedupedCallGraphSymbolCommand('showUsagesForSymbol', symbolId, () =>
-        showCallGraphUsageResult(overlay, callGraph, callGraphLog, symbolId));
+        showCallGraphUsageResult(overlay, callGraph, callGraphLog, symbolId, label));
     }),
     vscode.commands.registerCommand('intellijStyledSearch.activateCallGraphInlayAtPosition', async (
       kind: string,
@@ -497,6 +503,7 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
         editor.document.uri.toString(),
         line,
         column,
+        { allowNearby: true },
       );
     }),
     vscode.commands.registerCommand('intellijStyledSearch.startMcpServer', async () => {
@@ -535,6 +542,7 @@ async function activateCallGraphInlayAtPosition(
   uriString?: string,
   line?: number,
   column?: number,
+  options: { allowNearby?: boolean } = {},
 ): Promise<void> {
   const normalizedKind = normalizeCallGraphInlayKind(kind);
   const activeEditor = vscode.window.activeTextEditor;
@@ -555,17 +563,19 @@ async function activateCallGraphInlayAtPosition(
     await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, registered, 'inlay registry position');
     return;
   }
+  if (options.allowNearby === true) {
+    const nearby = registry.resolveNear(uri, safeLine, normalizedKind, safeColumn, 12);
+    if (nearby) {
+      await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, nearby, 'inlay registry nearby');
+      return;
+    }
+  }
   if (registry.isInvalidated(uri)) {
     callGraphLog.appendLine(`call graph inlay click ignored: registry pending refresh for ${uri.toString()}`);
     return;
   }
   const symbol = resolveInlaySymbolAtLine(callGraph, uri, safeLine, safeColumn);
   if (!symbol) {
-    const nearby = registry.resolveNear(uri, safeLine, normalizedKind, safeColumn);
-    if (nearby) {
-      await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, nearby, 'inlay registry nearby');
-      return;
-    }
     callGraphLog.appendLine(`call graph inlay click ignored: no symbol at ${uriString}:${safeLine + 1}`);
     return;
   }
@@ -682,10 +692,9 @@ function getQueryFromActiveEditor(): string {
   if (!editor) { return ''; }
   const { selection, document } = editor;
   if (!selection.isEmpty) {
-    // Pass the full multi-line selection through. Leading/trailing
-    // whitespace and blank lines get trimmed — they're almost always
-    // accidental when copy/selecting code, and rg's literal matcher
-    // wouldn't match them against the file anyway.
+    // Keep explicit selections intact, including large multi-line selections.
+    // Trimming only removes accidental outer whitespace so literal search can
+    // still match a whole-file selection with a final newline.
     const text = document.getText(selection).replace(/^[\s\n]+|[\s\n]+$/g, '');
     if (text) { return text; }
   }
@@ -728,7 +737,7 @@ async function showCallGraphQueryResult(
 ): Promise<void> {
   try {
     const title = direction === 'callers' ? 'Find Callers' : 'Find Callees';
-    if (explicitQuery && !callGraph.getSnapshot()) {
+    if (explicitQuery) {
       await showCallGraphPendingPanel(overlay, title, explicitLabel ?? explicitQuery);
     }
     if (!await ensureCallGraphReadyForUi(callGraph, title)) { return; }
@@ -745,6 +754,11 @@ async function showCallGraphQueryResult(
         : callGraph.getCalleesResolved(query),
     );
     log.appendLine(formatQueryResults(results, direction));
+    if (explicitQuery && results.length === 0) {
+      await overlay.showStaticResults(`${title}: ${explicitLabel ?? query}`, []);
+      vscode.window.showWarningMessage('No matching call graph symbol found. Rebuild the call graph or refine the query.');
+      return;
+    }
     await showCallGraphResultsPanel(overlay, results, direction, title);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -838,7 +852,7 @@ async function showCallGraphImplementationResult(
 ): Promise<void> {
   try {
     const title = 'Find Implementations';
-    if (explicitQuery && !callGraph.getSnapshot()) {
+    if (explicitQuery) {
       await showCallGraphPendingPanel(overlay, title, explicitLabel ?? explicitQuery);
     }
     if (!await ensureCallGraphReadyForUi(callGraph, title)) { return; }
@@ -846,6 +860,9 @@ async function showCallGraphImplementationResult(
     if (!query) { return; }
     const implementations = callGraph.findImplementations(query);
     if (implementations.length === 0) {
+      if (explicitQuery) {
+        await overlay.showStaticResults(`${title}: ${explicitLabel ?? query}`, []);
+      }
       vscode.window.showInformationMessage('No implementations found for the selected call graph symbol.');
       return;
     }
@@ -868,7 +885,8 @@ async function showCallGraphUsageResult(
 ): Promise<void> {
   try {
     const title = 'Find Usages';
-    if (explicitQuery && !callGraph.getSnapshot()) {
+    const showedPendingPanel = !!explicitQuery;
+    if (explicitQuery) {
       await showCallGraphPendingPanel(overlay, title, explicitLabel ?? explicitQuery);
     }
 
@@ -887,6 +905,7 @@ async function showCallGraphUsageResult(
             'call graph cache-index',
             false,
             explicitLabel ?? explicitSymbol?.qualifiedName ?? labelFromCallGraphSymbolId(explicitSymbolId),
+            showedPendingPanel,
           );
           return;
         }
@@ -910,6 +929,7 @@ async function showCallGraphUsageResult(
       'call graph cache',
       !explicitQuery,
       explicitLabel,
+      showedPendingPanel,
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -927,6 +947,7 @@ async function showCallGraphUsageMatches(
   initialSourceLabel: string,
   allowTextFallback: boolean,
   targetLabelOverride?: string,
+  showEmptyPanel = false,
 ): Promise<void> {
   let sourceLabel = initialSourceLabel;
   let matches = await buildCallGraphUsageFileMatches(usages);
@@ -954,6 +975,9 @@ async function showCallGraphUsageMatches(
     );
   }
   if (matches.length === 0) {
+    if (showEmptyPanel) {
+      await overlay.showStaticResults(`${title} [${sourceLabel}]: ${targetLabel}`, []);
+    }
     vscode.window.showInformationMessage('No usages found for the selected call graph symbol.');
     return;
   }
@@ -1301,6 +1325,81 @@ function callGraphStageProgressRange(stage: CallGraphRebuildProgress['stage']): 
   }
 }
 
+async function buildPreviewCallGraphInlays(
+  callGraph: CallGraphService,
+  log: vscode.OutputChannel,
+  uri: vscode.Uri,
+  document: vscode.TextDocument,
+  range: vscode.Range,
+): Promise<PreviewCallGraphInlay[]> {
+  const startedAt = Date.now();
+  const relPath = vscode.workspace.asRelativePath(uri, false);
+  const rangeLabel = `${range.start.line + 1}:${range.start.character + 1}-${range.end.line + 1}:${range.end.character + 1}`;
+  const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+  if (!cfg.get<boolean>('callGraphInlayHints', true)) {
+    log.appendLine(`preview inlays provider skipped: disabled uri=${relPath} range=${rangeLabel}`);
+    return [];
+  }
+  const hasSnapshot = !!callGraph.getSnapshot() && !callGraph.isRustNativeIndexOnly();
+  let restored = hasSnapshot;
+  if (!hasSnapshot) {
+    restored = await callGraph.ensureDocumentSummariesRestored(document.uri);
+    if (!restored) {
+      log.appendLine(`preview inlays provider skipped: no document summaries uri=${relPath} range=${rangeLabel} elapsed=${Date.now() - startedAt}ms`);
+      return [];
+    }
+  }
+  const showCalleeInlayHints = cfg.get<boolean>('callGraphShowCalleeInlayHints', false);
+  const summaries = hasSnapshot
+    ? callGraph.getSymbolRelationSummariesForDocument(document.uri, range)
+    : callGraph.getCachedSymbolRelationSummariesForDocument(document.uri, range);
+  let inRange = 0;
+  let definitionLines = 0;
+  const inlays: PreviewCallGraphInlay[] = [];
+  for (const summary of summaries) {
+    if (summary.symbol.range.startLine < 0 || summary.symbol.range.startLine >= document.lineCount) { continue; }
+    inRange++;
+    if (!isCallGraphInlayDefinitionLine(document, summary.symbol)) { continue; }
+    definitionLines++;
+    const lineEndColumn = document.lineAt(summary.symbol.range.startLine).range.end.character;
+    inlays.push(...buildPreviewCallGraphInlayEntries(summary, showCalleeInlayHints, lineEndColumn));
+  }
+  const sample = inlays
+    .slice(0, 3)
+    .map((inlay) => `${inlay.kind}:${inlay.line + 1}:${inlay.symbolId}`)
+    .join(' | ');
+  log.appendLine(
+    `preview inlays provider: uri=${relPath} range=${rangeLabel} snapshot=${hasSnapshot} restored=${restored} ` +
+    `summaries=${summaries.length} inRange=${inRange} definitionLines=${definitionLines} inlays=${inlays.length} ` +
+    `calleeHints=${showCalleeInlayHints} elapsed=${Date.now() - startedAt}ms${sample ? ` sample=${sample}` : ''}`,
+  );
+  return inlays;
+}
+
+function buildPreviewCallGraphInlayEntries(
+  summary: CallGraphSymbolRelationSummary,
+  showCalleeInlayHints: boolean,
+  lineEndColumn: number,
+): PreviewCallGraphInlay[] {
+  const base = {
+    line: summary.symbol.range.startLine,
+    column: lineEndColumn,
+    symbolId: summary.symbol.id,
+    label: summary.symbol.qualifiedName,
+  };
+  const entries: PreviewCallGraphInlay[] = [];
+  if (showCalleeInlayHints && summary.calleeCount > 0) {
+    entries.push({ ...base, kind: 'callees', text: `callees ${summary.calleeCount}`, count: summary.calleeCount });
+  }
+  if (summary.implementationCount > 0) {
+    entries.push({ ...base, kind: 'impl', text: `impl ${summary.implementationCount}`, count: summary.implementationCount });
+  }
+  if (summary.usageCount > 0) {
+    entries.push({ ...base, kind: 'usages', text: `usages ${summary.usageCount}`, count: summary.usageCount });
+  }
+  return entries;
+}
+
 class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
   readonly onDidChangeInlayHints: vscode.Event<void>;
 
@@ -1423,6 +1522,7 @@ function buildCallGraphInlayHint(
       `Show ${summary.calleeCount} callee${summary.calleeCount === 1 ? '' : 's'}`,
       'intellijStyledSearch.showCalleesForSymbol',
       summary.symbol.id,
+      summary.symbol.qualifiedName,
     ));
   }
   if (summary.implementationCount > 0) {
@@ -1432,6 +1532,7 @@ function buildCallGraphInlayHint(
       `Show ${summary.implementationCount} implementation${summary.implementationCount === 1 ? '' : 's'}`,
       'intellijStyledSearch.showImplementationsForSymbol',
       summary.symbol.id,
+      summary.symbol.qualifiedName,
     ));
   }
   if (summary.usageCount > 0) {
@@ -1441,6 +1542,7 @@ function buildCallGraphInlayHint(
       `Show ${summary.usageCount} usage${summary.usageCount === 1 ? '' : 's'}`,
       'intellijStyledSearch.showUsagesForSymbol',
       summary.symbol.id,
+      summary.symbol.qualifiedName,
     ));
   }
   if (parts.length === 0) { return undefined; }
@@ -1481,12 +1583,13 @@ function makeInlayCommandPart(
   title: string,
   command: string,
   symbolId: string,
+  symbolLabel: string,
 ): vscode.InlayHintLabelPart {
   const part = new vscode.InlayHintLabelPart(label);
   part.command = {
     title,
     command,
-    arguments: [symbolId],
+    arguments: [symbolId, symbolLabel],
   };
   return part;
 }

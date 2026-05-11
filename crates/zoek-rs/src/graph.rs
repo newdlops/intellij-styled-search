@@ -12,7 +12,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 const GRAPH_MAGIC: &[u8; 8] = b"IJSSGRF1";
-const GRAPH_VERSION: u32 = 2;
+const GRAPH_VERSION: u32 = 3;
 const GRAPH_HEADER_SIZE: usize = 40;
 const GRAPH_INDEX_ENTRY_SIZE: usize = 28;
 const GRAPH_FILE_NAME: &str = "callgraph-relations.ijg";
@@ -31,6 +31,9 @@ const GRAPH_FILE_PROGRESS_INTERVAL: usize = 16_384;
 const GRAPH_GROUP_PROGRESS_INTERVAL: usize = 500_000;
 const GRAPH_RELATION_SHARD_PROGRESS_INTERVAL: usize = 8;
 const GRAPH_SYMBOL_PROGRESS_INTERVAL: usize = 262_144;
+const GRAPH_SHALLOW_REBUILD_SOURCE_FILE_THRESHOLD: usize = 50_000;
+const GRAPH_SHALLOW_REBUILD_MAX_DEEP_FILES: usize = 32_768;
+const GRAPH_SHALLOW_REBUILD_FALLBACK_DEEP_FILES: usize = 4_096;
 
 #[derive(Clone, Debug)]
 pub struct GraphIndexSummary {
@@ -336,21 +339,111 @@ where
         progress,
     )?;
     files.sort();
+    let discovered_file_count = files.len();
+    let shallow_rebuild = should_use_shallow_graph_rebuild(&files);
+    let parse_files = if shallow_rebuild {
+        select_shallow_rebuild_deep_parse_files(&files)
+    } else {
+        files
+    };
     progress(GraphRebuildProgress {
         stage: "parsing",
         current: 0,
-        total: files.len(),
-        message: format!("rust graph parsing {} source files", files.len()),
+        total: parse_files.len(),
+        message: if shallow_rebuild {
+            format!(
+                "rust graph shallow parsing {} of {} source files",
+                parse_files.len(),
+                discovered_file_count
+            )
+        } else {
+            format!("rust graph parsing {} source files", parse_files.len())
+        },
     });
 
-    let workers = effective_graph_worker_count(worker_count, files.len());
+    let workers = effective_graph_worker_count(worker_count, parse_files.len());
     let parsed_files =
-        parse_graph_source_files_parallel(workspace_root, config, files, workers, progress)?;
-    let parsed_file_count = parsed_files.len();
+        parse_graph_source_files_parallel(workspace_root, config, parse_files, workers, progress)?;
+    let parsed_file_count = if shallow_rebuild {
+        discovered_file_count
+    } else {
+        parsed_files.len()
+    };
     let symbols: Vec<NativeGraphSymbol> = parsed_files
         .iter()
         .flat_map(|file| file.symbols.iter().cloned())
         .collect();
+
+    if shallow_rebuild {
+        progress(GraphRebuildProgress {
+            stage: "indexing",
+            current: 0,
+            total: symbols.len(),
+            message: format!(
+                "rust graph shallow rebuild resolving references for {} symbols",
+                symbols.len()
+            ),
+        });
+        progress(GraphRebuildProgress {
+            stage: "indexing",
+            current: 0,
+            total: symbols.len(),
+            message: format!(
+                "rust graph writing symbol index for {} symbols",
+                symbols.len()
+            ),
+        });
+        let (resolved, symbol_bytes) = thread::scope(|scope| {
+            let symbol_writer = scope.spawn(|| {
+                write_symbol_index(workspace_root, &symbols, built_at_unix_ms, config)
+            });
+            let resolved =
+                resolve_native_graph_references_grouped(parsed_files, &symbols, workers, progress);
+            let symbol_bytes = symbol_writer
+                .join()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "graph symbol writer panicked"))??;
+            Ok::<_, io::Error>((resolved, symbol_bytes))
+        })?;
+        progress(GraphRebuildProgress {
+            stage: "indexing",
+            current: symbols.len(),
+            total: symbols.len(),
+            message: format!("rust graph wrote symbol index ({symbol_bytes} bytes)"),
+        });
+        progress(GraphRebuildProgress {
+            stage: "indexing",
+            current: resolved.reference_count,
+            total: resolved.reference_count,
+            message: format!(
+                "rust graph shallow rebuild writing {} references",
+                resolved.reference_count
+            ),
+        });
+        let pending = prepare_graph_relation_generation_from_grouped_with_progress(
+            workspace_root,
+            resolved,
+            built_at_unix_ms,
+            config,
+            worker_count,
+            progress,
+        )?;
+        progress(GraphRebuildProgress {
+            stage: "indexing",
+            current: 1,
+            total: 1,
+            message: "rust graph shallow rebuild committing relation manifest".to_string(),
+        });
+        let mut summary = commit_graph_relation_generation(pending)?;
+        progress(GraphRebuildProgress {
+            stage: "indexing",
+            current: 1,
+            total: 1,
+            message: "rust graph shallow rebuild committed relation manifest".to_string(),
+        });
+        summary.file_count = parsed_file_count;
+        summary.symbol_count = symbols.len();
+        return Ok(summary);
+    }
 
     progress(GraphRebuildProgress {
         stage: "indexing",
@@ -361,8 +454,31 @@ where
             symbols.len()
         ),
     });
-    let resolved =
-        resolve_native_graph_references_grouped(parsed_files, &symbols, workers, progress);
+    progress(GraphRebuildProgress {
+        stage: "indexing",
+        current: 0,
+        total: symbols.len(),
+        message: format!(
+            "rust graph writing symbol index for {} symbols",
+            symbols.len()
+        ),
+    });
+    let (resolved, symbol_bytes) = thread::scope(|scope| {
+        let symbol_writer =
+            scope.spawn(|| write_symbol_index(workspace_root, &symbols, built_at_unix_ms, config));
+        let resolved =
+            resolve_native_graph_references_grouped(parsed_files, &symbols, workers, progress);
+        let symbol_bytes = symbol_writer
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "graph symbol writer panicked"))??;
+        Ok::<_, io::Error>((resolved, symbol_bytes))
+    })?;
+    progress(GraphRebuildProgress {
+        stage: "indexing",
+        current: symbols.len(),
+        total: symbols.len(),
+        message: format!("rust graph wrote symbol index ({symbol_bytes} bytes)"),
+    });
     progress(GraphRebuildProgress {
         stage: "indexing",
         current: resolved.reference_count,
@@ -377,7 +493,6 @@ where
         worker_count,
         progress,
     )?;
-    write_symbol_index_with_progress(workspace_root, &symbols, built_at_unix_ms, config, progress)?;
     progress(GraphRebuildProgress {
         stage: "indexing",
         current: 1,
@@ -392,6 +507,7 @@ where
         message: "rust graph committed relation manifest".to_string(),
     });
     summary.file_count = parsed_file_count;
+    summary.symbol_count = symbols.len();
     Ok(summary)
 }
 
@@ -668,18 +784,28 @@ fn serialize_graph_record(
     let mut last_name = String::new();
     let mut last_raw_text = String::new();
     let mut last_rel_path = String::new();
+    let mut last_enclosing_symbol_id = String::new();
     for reference in refs {
         put_delta_string(&mut bytes, &reference.name, &mut last_name)?;
-        put_delta_string(&mut bytes, &reference.raw_text, &mut last_raw_text)?;
+        put_delta_string_allow_empty(
+            &mut bytes,
+            if reference.raw_text == reference.name {
+                ""
+            } else {
+                &reference.raw_text
+            },
+            &mut last_raw_text,
+        )?;
         put_string(&mut bytes, "")?;
         put_delta_string(&mut bytes, &reference.rel_path, &mut last_rel_path)?;
         put_u32(&mut bytes, reference.start_line);
         put_u32(&mut bytes, reference.start_column);
         put_u32(&mut bytes, reference.end_line);
         put_u32(&mut bytes, reference.end_column);
-        put_string(
+        put_delta_string_allow_empty(
             &mut bytes,
             reference.enclosing_symbol_id.as_deref().unwrap_or(""),
+            &mut last_enclosing_symbol_id,
         )?;
         put_edge_kind(&mut bytes, &reference.edge_kind)?;
     }
@@ -2042,16 +2168,29 @@ fn flush_record(
     let mut last_name = String::new();
     let mut last_raw_text = String::new();
     let mut last_rel_path = String::new();
+    let mut last_enclosing_symbol_id = String::new();
     for reference in refs.drain(..) {
         put_delta_string(data, &reference.name, &mut last_name)?;
-        put_delta_string(data, &reference.raw_text, &mut last_raw_text)?;
+        put_delta_string_allow_empty(
+            data,
+            if reference.raw_text == reference.name {
+                ""
+            } else {
+                &reference.raw_text
+            },
+            &mut last_raw_text,
+        )?;
         put_string(data, "")?;
         put_delta_string(data, &reference.rel_path, &mut last_rel_path)?;
         put_u32(data, reference.start_line);
         put_u32(data, reference.start_column);
         put_u32(data, reference.end_line);
         put_u32(data, reference.end_column);
-        put_string(data, reference.enclosing_symbol_id.as_deref().unwrap_or(""))?;
+        put_delta_string_allow_empty(
+            data,
+            reference.enclosing_symbol_id.as_deref().unwrap_or(""),
+            &mut last_enclosing_symbol_id,
+        )?;
         put_edge_kind(data, &reference.edge_kind)?;
     }
     let refs_len = checked_u32(
@@ -2155,7 +2294,10 @@ where
         if metadata.is_dir() {
             let name = item.file_name();
             let name = name.to_string_lossy();
-            if config.is_excluded_dir_name(&name) || path == config.index_root(workspace_root) {
+            if config.is_internal_index_dir_name(&name)
+                || config.is_excluded_dir_name(&name)
+                || path == config.index_root(workspace_root)
+            {
                 continue;
             }
             if *visited_entries == 1 || *visited_entries % GRAPH_DISCOVERY_PROGRESS_INTERVAL == 0 {
@@ -2225,6 +2367,41 @@ fn is_graph_source_path(path: &Path) -> bool {
                 | "gql",
         )
     )
+}
+
+fn should_use_shallow_graph_rebuild(files: &[PathBuf]) -> bool {
+    files.len() > GRAPH_SHALLOW_REBUILD_SOURCE_FILE_THRESHOLD
+}
+
+fn select_shallow_rebuild_deep_parse_files(files: &[PathBuf]) -> Vec<PathBuf> {
+    let mut selected = Vec::new();
+    let mut fallback = Vec::new();
+    for path in files {
+        if has_dependency_graph_path_segment(path) {
+            if fallback.len() < GRAPH_SHALLOW_REBUILD_FALLBACK_DEEP_FILES {
+                fallback.push(path.clone());
+            }
+            continue;
+        }
+        if selected.len() < GRAPH_SHALLOW_REBUILD_MAX_DEEP_FILES {
+            selected.push(path.clone());
+        }
+    }
+    if selected.is_empty() {
+        fallback
+    } else {
+        selected
+    }
+}
+
+fn has_dependency_graph_path_segment(path: &Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        matches!(
+            name.as_ref(),
+            "node_modules" | ".venv" | "venv" | "site-packages"
+        )
+    })
 }
 
 fn parse_graph_source_file(
@@ -7156,7 +7333,16 @@ fn write_native_graph_symbol_record(
     out: &mut Vec<u8>,
     symbol: &NativeGraphSymbol,
 ) -> io::Result<()> {
-    put_string(out, &symbol.id)?;
+    let canonical_id = canonical_native_graph_symbol_id(symbol);
+    let stores_canonical_id = symbol.id == canonical_id;
+    put_string(
+        out,
+        if stores_canonical_id {
+            ""
+        } else {
+            &symbol.id
+        },
+    )?;
     put_string(out, &symbol.name)?;
     put_string(
         out,
@@ -7167,10 +7353,15 @@ fn write_native_graph_symbol_record(
         },
     )?;
     put_string(out, &symbol.kind)?;
-    let id_parts = parse_native_symbol_id_parts(&symbol.id);
+    let id_parts = if stores_canonical_id {
+        None
+    } else {
+        parse_native_symbol_id_parts(&symbol.id)
+    };
     put_string(
         out,
-        if id_parts
+        if !stores_canonical_id
+            && id_parts
             .as_ref()
             .map(|(language, _, _)| *language == symbol.language.as_str())
             .unwrap_or(false)
@@ -7183,7 +7374,8 @@ fn write_native_graph_symbol_record(
     put_string(out, "")?;
     put_string(
         out,
-        if id_parts
+        if !stores_canonical_id
+            && id_parts
             .as_ref()
             .map(|(_, rel_path, _)| *rel_path == symbol.rel_path.as_str())
             .unwrap_or(false)
@@ -7207,6 +7399,16 @@ fn write_native_graph_symbol_record(
     put_string_list(out, &symbol.extends_names)?;
     put_string_list(out, &symbol.implements_names)?;
     Ok(())
+}
+
+fn canonical_native_graph_symbol_id(symbol: &NativeGraphSymbol) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        symbol.language,
+        symbol.rel_path,
+        symbol.qualified_name,
+        symbol.start_line + 1,
+    )
 }
 
 fn read_graph_symbol_record(
@@ -7235,14 +7437,18 @@ fn read_graph_symbol_record(
         )
     })?;
     let mut cursor = 0usize;
-    let id = read_string(payload, &mut cursor)?;
+    let stored_id = read_string(payload, &mut cursor)?;
     let name = read_string(payload, &mut cursor)?;
     let qualified_name = match read_string(payload, &mut cursor)? {
         value if value.is_empty() => name.clone(),
         value => value,
     };
     let kind = read_string(payload, &mut cursor)?;
-    let id_parts = parse_native_symbol_id_parts(&id);
+    let id_parts = if stored_id.is_empty() {
+        None
+    } else {
+        parse_native_symbol_id_parts(&stored_id)
+    };
     let language = match read_string(payload, &mut cursor)? {
         value if value.is_empty() => id_parts
             .as_ref()
@@ -7278,6 +7484,11 @@ fn read_graph_symbol_record(
         read_string_list(payload, &mut cursor)?
     } else {
         Vec::new()
+    };
+    let id = if stored_id.is_empty() {
+        format!("{language}:{rel_path}:{qualified_name}:{}", start_line + 1)
+    } else {
+        stored_id
     };
     Ok(GraphSymbol {
         id,
@@ -7392,9 +7603,13 @@ fn read_references(
     let mut last_name = String::new();
     let mut last_raw_text = String::new();
     let mut last_rel_path = String::new();
+    let mut last_enclosing_symbol_id = String::new();
     for idx in 0..count {
         let name = read_delta_string(payload, &mut cursor, &mut last_name)?;
-        let raw_text = read_delta_string(payload, &mut cursor, &mut last_raw_text)?;
+        let raw_text = match read_delta_string_allow_empty(payload, &mut cursor, &mut last_raw_text)? {
+            value if value.is_empty() => name.clone(),
+            value => value,
+        };
         let uri = read_string(payload, &mut cursor)?;
         let rel_path = read_delta_string(payload, &mut cursor, &mut last_rel_path)?;
         let uri = if uri.is_empty() {
@@ -7406,7 +7621,11 @@ fn read_references(
         let start_column = read_u32(payload, &mut cursor)?;
         let end_line = read_u32(payload, &mut cursor)?;
         let end_column = read_u32(payload, &mut cursor)?;
-        let enclosing_symbol_id = match read_string(payload, &mut cursor)? {
+        let enclosing_symbol_id = match read_delta_string_allow_empty(
+            payload,
+            &mut cursor,
+            &mut last_enclosing_symbol_id,
+        )? {
             value if value.is_empty() => None,
             value => Some(value),
         };
@@ -7502,6 +7721,25 @@ fn put_delta_string(out: &mut Vec<u8>, value: &str, last_value: &mut String) -> 
     }
 }
 
+fn put_delta_string_allow_empty(
+    out: &mut Vec<u8>,
+    value: &str,
+    last_value: &mut String,
+) -> io::Result<()> {
+    if value == last_value {
+        return put_string(out, "");
+    }
+    if value.is_empty() {
+        put_string(out, "\0")?;
+        last_value.clear();
+        return Ok(());
+    }
+    put_string(out, value)?;
+    last_value.clear();
+    last_value.push_str(value);
+    Ok(())
+}
+
 fn put_edge_kind(out: &mut Vec<u8>, value: &str) -> io::Result<()> {
     if value == "usage" {
         put_string(out, "")
@@ -7545,6 +7783,24 @@ fn read_delta_string(
         last_value.push_str(&value);
         Ok(value)
     }
+}
+
+fn read_delta_string_allow_empty(
+    bytes: &[u8],
+    cursor: &mut usize,
+    last_value: &mut String,
+) -> io::Result<String> {
+    let value = read_string(bytes, cursor)?;
+    if value.is_empty() {
+        return Ok(last_value.clone());
+    }
+    if value == "\0" {
+        last_value.clear();
+        return Ok(String::new());
+    }
+    last_value.clear();
+    last_value.push_str(&value);
+    Ok(value)
 }
 
 fn read_string_list(bytes: &[u8], cursor: &mut usize) -> io::Result<Vec<String>> {

@@ -1,5 +1,4 @@
 use std::env;
-use std::fs;
 use std::path::PathBuf;
 
 use zoek_rs::config::EngineConfig;
@@ -84,18 +83,6 @@ fn run_index(args: &[String]) -> Result<EngineResponse, String> {
                 idx += 1;
             }
             other => return Err(format!("unknown index flag: {other}")),
-        }
-    }
-
-    if request.force {
-        let index_root = config.index_root(&workspace_root);
-        if index_root.exists() {
-            fs::remove_dir_all(&index_root).map_err(|err| {
-                format!(
-                    "failed to clear previous index {}: {err}",
-                    index_root.to_string_lossy()
-                )
-            })?;
         }
     }
 

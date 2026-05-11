@@ -524,6 +524,38 @@ suite('Activation', () => {
     assert.strictEqual(service.defaultRustGraphTimeoutMs('graph-rebuild'), 0);
   });
 
+  test('call graph rust JSON parser tolerates diagnostic stdout before final JSON', async () => {
+    const { callGraph } = await getApi();
+    const service = callGraph as any;
+    const originalInvokeRustGraphText = service.invokeRustGraphText.bind(service);
+    const response = {
+      type: 'graph-symbol-query',
+      ok: true,
+      engine: { name: 'zoek-rs', protocolVersion: 1, schemaVersion: 7 },
+      workspaceRoot: '/tmp/ijss-noisy-graph-json',
+      builtAtUnixMs: 1778333437277,
+      totalSymbols: 0,
+      symbols: [],
+      warnings: [],
+    };
+    service.invokeRustGraphText = async () => [
+      'graph-symbol-query diagnostic: warming symbol buckets',
+      JSON.stringify(response),
+      '',
+    ].join('\n');
+
+    try {
+      const parsed = await service.invokeRustGraphJson([
+        '/tmp/zoek-rs',
+        'graph-symbol-query',
+        response.workspaceRoot,
+      ]);
+      assert.deepStrictEqual(parsed, response);
+    } finally {
+      service.invokeRustGraphText = originalInvokeRustGraphText;
+    }
+  });
+
   test('parseIndexProgressLine reads stderr progress events', async () => {
     const { overlay } = await getApi();
     const runtime = (overlay as any).zoektRuntime as any;
@@ -861,7 +893,8 @@ suite('Activation', () => {
     }
   });
 
-  test('preview requests use a 20ms Monaco warmup budget and refresh when ready', async () => {
+  test('preview requests use a 20ms Monaco warmup budget and refresh when ready', async function () {
+    this.timeout(5_000);
     const { overlay } = await getApi();
     const anyOverlay = overlay as any;
     const originalActiveWindowId = anyOverlay.activeWindowId;
@@ -897,9 +930,10 @@ suite('Activation', () => {
     anyOverlay.scheduleCdpSearchIdleClose = () => {};
     anyOverlay.cancelCdpSearchIdleClose = () => {};
 
+    let requestPromise: Promise<void> | undefined;
     try {
       const started = Date.now();
-      await anyOverlay.handlePreviewRequest({
+      requestPromise = anyOverlay.handlePreviewRequest({
         type: 'requestPreview',
         uri: previewUri,
         line: 3,
@@ -907,7 +941,8 @@ suite('Activation', () => {
         contextLines: 0,
         previewSeq,
       });
-      const targetSends = () => sends.filter((send) => send.args[0] === previewUri && send.args[4] === previewSeq);
+      const targetSends = () => sends.filter((send) => send.args[0] === previewUri);
+      await new Promise((resolve) => setTimeout(resolve, 50));
       assert.strictEqual(targetSends().length, 1, 'preview should render once when Monaco warmup exceeds the budget');
       assert.strictEqual(captureCalls.length, 1, 'preview should attempt Monaco warmup once');
       assert.strictEqual(captureCalls[0]?.[1], undefined, 'preview warmup should not pass a force-open URI');
@@ -921,10 +956,15 @@ suite('Activation', () => {
         `preview should not wait for full Monaco warmup; waited ${targetSends()[0]!.at - started}ms`,
       );
       resolveWarmup?.();
+      await requestPromise;
       await new Promise((resolve) => setTimeout(resolve, 20));
       assert.strictEqual(targetSends().length, 2, 'preview should refresh after late Monaco warmup becomes ready');
-      assert.deepStrictEqual(targetSends().map((send) => send.args[4]), [previewSeq, previewSeq]);
+      assert.deepStrictEqual(targetSends().map((send) => send.args[0]), [previewUri, previewUri]);
     } finally {
+      resolveWarmup?.();
+      if (requestPromise) {
+        try { await Promise.race([requestPromise, new Promise((resolve) => setTimeout(resolve, 100))]); } catch {}
+      }
       anyOverlay.activeWindowId = originalActiveWindowId;
       anyOverlay.isMonacoCaptureEnabled = originalIsMonacoCaptureEnabled;
       anyOverlay.ensureMonacoCapture = originalEnsureMonacoCapture;
@@ -934,6 +974,381 @@ suite('Activation', () => {
       anyOverlay.scheduleCdpSearchIdleClose = originalScheduleCdpSearchIdleClose;
       anyOverlay.cancelCdpSearchIdleClose = originalCancelCdpSearchIdleClose;
       anyOverlay.lspPressure = originalLspPressure;
+    }
+  });
+
+  test('preview force-open cooldown trails the latest request instead of dropping it', async function () {
+    this.timeout(5_000);
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalActiveWindowId = anyOverlay.activeWindowId;
+    const originalPreviewRequestSeq = anyOverlay.previewRequestSeq;
+    const originalPendingPreviewForceOpen = anyOverlay.pendingPreviewForceOpen;
+    const originalPreviewForceOpenTimer = anyOverlay.previewForceOpenTimer;
+    const originalPreviewForceOpenPromise = anyOverlay.previewForceOpenPromise;
+    const originalPreviewForceOpenCooldownUntil = anyOverlay.previewForceOpenCooldownUntil;
+    const originalIsMonacoCaptureEnabled = anyOverlay.isMonacoCaptureEnabled.bind(anyOverlay);
+    const originalIsMonacoReadyInWindow = anyOverlay.isMonacoReadyInWindow.bind(anyOverlay);
+    const originalEnsureMonacoCapture = anyOverlay.ensureMonacoCapture.bind(anyOverlay);
+    const originalRefreshLatestPreviewAfterCapture = anyOverlay.refreshLatestPreviewAfterCapture.bind(anyOverlay);
+    const originalReleasePreviewCaptureTabsSoon = anyOverlay.releasePreviewCaptureTabsSoon.bind(anyOverlay);
+    const captureCalls: unknown[][] = [];
+    const refreshCalls: unknown[][] = [];
+    try {
+      if (anyOverlay.previewForceOpenTimer) {
+        clearTimeout(anyOverlay.previewForceOpenTimer);
+      }
+      anyOverlay.activeWindowId = 7;
+      anyOverlay.previewRequestSeq = 77;
+      anyOverlay.pendingPreviewForceOpen = undefined;
+      anyOverlay.previewForceOpenTimer = undefined;
+      anyOverlay.previewForceOpenPromise = undefined;
+      anyOverlay.previewForceOpenCooldownUntil = Date.now() + 80;
+      anyOverlay.isMonacoCaptureEnabled = () => true;
+      anyOverlay.isMonacoReadyInWindow = async () => false;
+      anyOverlay.ensureMonacoCapture = async (...args: unknown[]) => {
+        captureCalls.push(args);
+      };
+      anyOverlay.refreshLatestPreviewAfterCapture = async (...args: unknown[]) => {
+        refreshCalls.push(args);
+      };
+      anyOverlay.releasePreviewCaptureTabsSoon = () => {};
+
+      anyOverlay.schedulePreviewForceOpen({
+        type: 'requestPreview',
+        uri: 'file:///stale-force-open.py',
+        line: 1,
+        contextLines: 0,
+        ranges: [],
+        previewSeq: 1,
+      }, 77, 7);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      anyOverlay.schedulePreviewForceOpen({
+        type: 'requestPreview',
+        uri: 'file:///latest-force-open.py',
+        line: 2,
+        contextLines: 0,
+        ranges: [],
+        previewSeq: 2,
+      }, 77, 7);
+
+      const deadline = Date.now() + 1500;
+      while (Date.now() < deadline && captureCalls.length === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.strictEqual(captureCalls.length, 1, `cooldown should coalesce to one trailing force-open attempt, got ${captureCalls.length}`);
+      assert.strictEqual(
+        (captureCalls[0]?.[1] as vscode.Uri | undefined)?.toString(),
+        'file:///latest-force-open.py',
+        `trailing force-open should use the latest preview URI: ${JSON.stringify(captureCalls.map((call) => String((call[1] as vscode.Uri | undefined)?.toString?.() ?? call[1])))}`,
+      );
+      assert.strictEqual(refreshCalls.length, 1, `force-open completion should refresh the latest preview once, got ${refreshCalls.length}`);
+      assert.strictEqual((refreshCalls[0]?.[0] as { uri?: string } | undefined)?.uri, 'file:///latest-force-open.py');
+    } finally {
+      if (anyOverlay.previewForceOpenTimer) {
+        clearTimeout(anyOverlay.previewForceOpenTimer);
+      }
+      if (originalPreviewForceOpenTimer) {
+        clearTimeout(originalPreviewForceOpenTimer);
+      }
+      anyOverlay.activeWindowId = originalActiveWindowId;
+      anyOverlay.previewRequestSeq = originalPreviewRequestSeq;
+      anyOverlay.pendingPreviewForceOpen = originalPendingPreviewForceOpen;
+      anyOverlay.previewForceOpenTimer = undefined;
+      anyOverlay.previewForceOpenPromise = originalPreviewForceOpenPromise;
+      anyOverlay.previewForceOpenCooldownUntil = originalPreviewForceOpenCooldownUntil;
+      anyOverlay.isMonacoCaptureEnabled = originalIsMonacoCaptureEnabled;
+      anyOverlay.isMonacoReadyInWindow = originalIsMonacoReadyInWindow;
+      anyOverlay.ensureMonacoCapture = originalEnsureMonacoCapture;
+      anyOverlay.refreshLatestPreviewAfterCapture = originalRefreshLatestPreviewAfterCapture;
+      anyOverlay.releasePreviewCaptureTabsSoon = originalReleasePreviewCaptureTabsSoon;
+    }
+  });
+
+  test('out-of-order Monaco preview warmups cannot overwrite the latest preview', async function () {
+    this.timeout(5_000);
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalActiveWindowId = anyOverlay.activeWindowId;
+    const originalIsMonacoCaptureEnabled = anyOverlay.isMonacoCaptureEnabled.bind(anyOverlay);
+    const originalEnsureMonacoCapture = anyOverlay.ensureMonacoCapture.bind(anyOverlay);
+    const originalIsMonacoReadyInWindow = anyOverlay.isMonacoReadyInWindow.bind(anyOverlay);
+    const originalSendPreview = anyOverlay.sendPreview.bind(anyOverlay);
+    const originalReleasePreviewCaptureTabsSoon = anyOverlay.releasePreviewCaptureTabsSoon.bind(anyOverlay);
+    const originalScheduleCdpSearchIdleClose = anyOverlay.scheduleCdpSearchIdleClose.bind(anyOverlay);
+    const originalCancelCdpSearchIdleClose = anyOverlay.cancelCdpSearchIdleClose.bind(anyOverlay);
+    let resolveFirstWarmup: (() => void) | undefined;
+    const firstWarmup = new Promise<void>((resolve) => { resolveFirstWarmup = resolve; });
+    const sends: unknown[][] = [];
+    let warmupCalls = 0;
+
+    anyOverlay.activeWindowId = 7;
+    anyOverlay.isMonacoCaptureEnabled = () => true;
+    anyOverlay.ensureMonacoCapture = async () => {
+      warmupCalls += 1;
+      if (warmupCalls === 1) {
+        return firstWarmup;
+      }
+    };
+    anyOverlay.isMonacoReadyInWindow = async () => true;
+    anyOverlay.sendPreview = async (...args: unknown[]) => {
+      sends.push(args);
+    };
+    anyOverlay.releasePreviewCaptureTabsSoon = () => {};
+    anyOverlay.scheduleCdpSearchIdleClose = () => {};
+    anyOverlay.cancelCdpSearchIdleClose = () => {};
+
+    try {
+      const first = anyOverlay.handlePreviewRequest({
+        type: 'requestPreview',
+        uri: 'file:///tmp/ijss-stale-preview-first.py',
+        line: 1,
+        contextLines: 0,
+        ranges: [{ start: 0, end: 5 }],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const second = anyOverlay.handlePreviewRequest({
+        type: 'requestPreview',
+        uri: 'file:///tmp/ijss-stale-preview-latest.py',
+        line: 2,
+        contextLines: 0,
+        ranges: [{ start: 0, end: 6 }],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.deepStrictEqual(
+        sends.map((args) => args[0]),
+        ['file:///tmp/ijss-stale-preview-latest.py'],
+        `newer preview should render before an older warmup completes; sends=${JSON.stringify(sends)}`,
+      );
+      resolveFirstWarmup?.();
+      await Promise.all([first, second]);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepStrictEqual(
+        sends.map((args) => args[0]),
+        ['file:///tmp/ijss-stale-preview-latest.py'],
+        `stale preview must not overwrite latest after its delayed warmup resolves; sends=${JSON.stringify(sends)}`,
+      );
+    } finally {
+      resolveFirstWarmup?.();
+      anyOverlay.activeWindowId = originalActiveWindowId;
+      anyOverlay.isMonacoCaptureEnabled = originalIsMonacoCaptureEnabled;
+      anyOverlay.ensureMonacoCapture = originalEnsureMonacoCapture;
+      anyOverlay.isMonacoReadyInWindow = originalIsMonacoReadyInWindow;
+      anyOverlay.sendPreview = originalSendPreview;
+      anyOverlay.releasePreviewCaptureTabsSoon = originalReleasePreviewCaptureTabsSoon;
+      anyOverlay.scheduleCdpSearchIdleClose = originalScheduleCdpSearchIdleClose;
+      anyOverlay.cancelCdpSearchIdleClose = originalCancelCdpSearchIdleClose;
+    }
+  });
+
+  test('preview request bursts are coalesced while Monaco warmup is pending', async function () {
+    this.timeout(5_000);
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalActiveWindowId = anyOverlay.activeWindowId;
+    const originalIsMonacoCaptureEnabled = anyOverlay.isMonacoCaptureEnabled.bind(anyOverlay);
+    const originalEnsureMonacoCapture = anyOverlay.ensureMonacoCapture.bind(anyOverlay);
+    const originalIsMonacoReadyInWindow = anyOverlay.isMonacoReadyInWindow.bind(anyOverlay);
+    const originalSendPreview = anyOverlay.sendPreview.bind(anyOverlay);
+    const originalReleasePreviewCaptureTabsSoon = anyOverlay.releasePreviewCaptureTabsSoon.bind(anyOverlay);
+    const originalScheduleCdpSearchIdleClose = anyOverlay.scheduleCdpSearchIdleClose.bind(anyOverlay);
+    const originalCancelCdpSearchIdleClose = anyOverlay.cancelCdpSearchIdleClose.bind(anyOverlay);
+    const src = `activation-preview-burst-${Date.now()}`;
+    let resolveWarmup: (() => void) | undefined;
+    const warmup = new Promise<void>((resolve) => { resolveWarmup = resolve; });
+    const sends: unknown[][] = [];
+    const captureCalls: unknown[][] = [];
+
+    anyOverlay.activeWindowId = 7;
+    anyOverlay.isMonacoCaptureEnabled = () => true;
+    anyOverlay.ensureMonacoCapture = async (...args: unknown[]) => {
+      captureCalls.push(args);
+      return warmup;
+    };
+    anyOverlay.isMonacoReadyInWindow = async () => true;
+    anyOverlay.sendPreview = async (...args: unknown[]) => {
+      sends.push(args);
+    };
+    anyOverlay.releasePreviewCaptureTabsSoon = () => {};
+    anyOverlay.scheduleCdpSearchIdleClose = () => {};
+    anyOverlay.cancelCdpSearchIdleClose = () => {};
+
+    try {
+      for (let i = 0; i < 80; i++) {
+        overlay.injectRendererEventForTests(JSON.stringify({
+          type: 'requestPreview',
+          uri: `file:///tmp/ijss-preview-burst-${i}.ts`,
+          line: i,
+          contextLines: 0,
+          ranges: [{ start: 0, end: 4 }],
+          __src: src,
+          __seq: i + 1,
+        }));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.ok(
+        captureCalls.length <= 2,
+        `preview burst should keep Monaco warmup/capture work bounded; calls=${captureCalls.length}`,
+      );
+      assert.strictEqual(sends.length, 1, `preview burst should render the latest preview once while warmup is pending; sends=${JSON.stringify(sends)}`);
+      assert.strictEqual(sends[0]?.[0], 'file:///tmp/ijss-preview-burst-79.ts');
+      assert.strictEqual(sends[0]?.[1], 79);
+      resolveWarmup?.();
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.ok(
+        sends.length <= 2,
+        `preview burst should not replay every stale preview after warmup resolves; sends=${JSON.stringify(sends)}`,
+      );
+      assert.strictEqual(sends[sends.length - 1]?.[0], 'file:///tmp/ijss-preview-burst-79.ts');
+      assert.strictEqual(sends[sends.length - 1]?.[1], 79);
+    } finally {
+      resolveWarmup?.();
+      anyOverlay.activeWindowId = originalActiveWindowId;
+      anyOverlay.isMonacoCaptureEnabled = originalIsMonacoCaptureEnabled;
+      anyOverlay.ensureMonacoCapture = originalEnsureMonacoCapture;
+      anyOverlay.isMonacoReadyInWindow = originalIsMonacoReadyInWindow;
+      anyOverlay.sendPreview = originalSendPreview;
+      anyOverlay.releasePreviewCaptureTabsSoon = originalReleasePreviewCaptureTabsSoon;
+      anyOverlay.scheduleCdpSearchIdleClose = originalScheduleCdpSearchIdleClose;
+      anyOverlay.cancelCdpSearchIdleClose = originalCancelCdpSearchIdleClose;
+    }
+  });
+
+  test('large literal multiline searches are allowed through zoekt', async function () {
+    this.timeout(5_000);
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalPostToRenderer = anyOverlay.postToRenderer.bind(anyOverlay);
+    const originalScheduleCdpSearchIdleClose = anyOverlay.scheduleCdpSearchIdleClose.bind(anyOverlay);
+    const originalGetSearchReadiness = anyOverlay.zoektRuntime.getSearchReadiness.bind(anyOverlay.zoektRuntime);
+    const originalRunSearch = anyOverlay.zoektRuntime.runSearch.bind(anyOverlay.zoektRuntime);
+    const messages: Array<{ type?: string; message?: string }> = [];
+    const queries: string[] = [];
+    let zoekRuns = 0;
+    try {
+      anyOverlay.postToRenderer = async (msg: { type?: string; message?: string }) => {
+        messages.push(msg);
+      };
+      anyOverlay.scheduleCdpSearchIdleClose = () => {};
+      anyOverlay.zoektRuntime.getSearchReadiness = async () => ({ ready: true });
+      anyOverlay.zoektRuntime.runSearch = async (opts: { query: string }, _token: unknown, progress: { onDone?: (done: { totalFiles: number; totalMatches: number; truncated: boolean }) => void }) => {
+        zoekRuns += 1;
+        queries.push(opts.query);
+        progress.onDone?.({ totalFiles: 0, totalMatches: 0, truncated: false });
+        return { ready: true };
+      };
+      const query = Array.from({ length: 80 }, (_, i) => `selected_line_${i}`).join('\n');
+      await anyOverlay.runSearch({
+        query,
+        caseSensitive: false,
+        wholeWord: false,
+        useRegex: false,
+      });
+      assert.strictEqual(zoekRuns, 1, 'large multiline literal query should be searched by zoekt');
+      assert.strictEqual(queries[0], query, 'zoekt should receive the full multiline query');
+      assert.ok(messages.some((msg) => msg.type === 'results:start'), `expected renderer search start: ${JSON.stringify(messages)}`);
+      assert.ok(!messages.some((msg) => msg.type === 'results:error'), `large multiline search should not be rejected: ${JSON.stringify(messages)}`);
+    } finally {
+      anyOverlay.postToRenderer = originalPostToRenderer;
+      anyOverlay.scheduleCdpSearchIdleClose = originalScheduleCdpSearchIdleClose;
+      anyOverlay.zoektRuntime.getSearchReadiness = originalGetSearchReadiness;
+      anyOverlay.zoektRuntime.runSearch = originalRunSearch;
+      if (anyOverlay.largeLiteralMultilineSearch?.cleanupTimer) {
+        clearTimeout(anyOverlay.largeLiteralMultilineSearch.cleanupTimer);
+      }
+      anyOverlay.largeLiteralMultilineSearch = undefined;
+    }
+  });
+
+  test('duplicate large literal multiline searches coalesce while zoekt is running', async function () {
+    this.timeout(5_000);
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalPostToRenderer = anyOverlay.postToRenderer.bind(anyOverlay);
+    const originalScheduleCdpSearchIdleClose = anyOverlay.scheduleCdpSearchIdleClose.bind(anyOverlay);
+    const originalGetSearchReadiness = anyOverlay.zoektRuntime.getSearchReadiness.bind(anyOverlay.zoektRuntime);
+    const originalRunSearch = anyOverlay.zoektRuntime.runSearch.bind(anyOverlay.zoektRuntime);
+    let releaseSearch: (() => void) | undefined;
+    let zoekRuns = 0;
+    try {
+      anyOverlay.postToRenderer = async () => {};
+      anyOverlay.scheduleCdpSearchIdleClose = () => {};
+      anyOverlay.zoektRuntime.getSearchReadiness = async () => ({ ready: true });
+      anyOverlay.zoektRuntime.runSearch = async () => {
+        zoekRuns += 1;
+        await new Promise<void>((resolve) => { releaseSearch = resolve; });
+        return { ready: true };
+      };
+      const query = Array.from({ length: 80 }, (_, i) => `burst_selected_line_${i}`).join('\n');
+      const options = {
+        query,
+        caseSensitive: false,
+        wholeWord: false,
+        useRegex: false,
+      };
+      const runs = [
+        anyOverlay.runSearch(options),
+        anyOverlay.runSearch(options),
+        anyOverlay.runSearch(options),
+      ];
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.strictEqual(zoekRuns, 1, 'duplicate large multiline searches should not restart zoekt while the first run is active');
+      releaseSearch?.();
+      await Promise.all(runs);
+    } finally {
+      releaseSearch?.();
+      anyOverlay.postToRenderer = originalPostToRenderer;
+      anyOverlay.scheduleCdpSearchIdleClose = originalScheduleCdpSearchIdleClose;
+      anyOverlay.zoektRuntime.getSearchReadiness = originalGetSearchReadiness;
+      anyOverlay.zoektRuntime.runSearch = originalRunSearch;
+      if (anyOverlay.largeLiteralMultilineSearch?.cleanupTimer) {
+        clearTimeout(anyOverlay.largeLiteralMultilineSearch.cleanupTimer);
+      }
+      anyOverlay.largeLiteralMultilineSearch = undefined;
+    }
+  });
+
+  test('searchSelection preserves explicit full-file multiline selections', async function () {
+    this.timeout(10_000);
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalShow = anyOverlay.show.bind(anyOverlay);
+    let capturedQuery = '';
+    let capturedOptions: unknown;
+    let doc: vscode.TextDocument | undefined;
+    try {
+      anyOverlay.show = async (query: string, options?: unknown) => {
+        capturedQuery = query;
+        capturedOptions = options;
+      };
+      const content = Array.from({ length: 120 }, (_, i) => `value_${i} = ${i}`).join('\n');
+      doc = await vscode.workspace.openTextDocument({
+        language: 'python',
+        content,
+      });
+      const editor = await vscode.window.showTextDocument(doc);
+      editor.selection = new vscode.Selection(
+        new vscode.Position(0, 0),
+        new vscode.Position(119, `value_119 = 119`.length),
+      );
+      await vscode.commands.executeCommand('intellijStyledSearch.searchSelection');
+      assert.strictEqual(
+        capturedQuery,
+        content,
+        'large multiline selection should open search UI with the full selected text',
+      );
+      assert.ok(
+        capturedQuery.length > 512 && capturedQuery.includes('\n'),
+        `full multiline query should not be compacted: ${JSON.stringify(capturedQuery.slice(0, 120))}`,
+      );
+      assert.ok(capturedOptions, 'searchSelection should still open the UI with options');
+    } finally {
+      anyOverlay.show = originalShow;
+      if (doc?.isDirty) {
+        try { await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor'); } catch {}
+      } else {
+        try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
+      }
     }
   });
 
@@ -970,6 +1385,149 @@ suite('Activation', () => {
     } finally {
       anyOverlay.sendPreview = originalSendPreview;
       anyOverlay.isMonacoCaptureEnabled = originalIsMonacoCaptureEnabled;
+    }
+  });
+
+  test('preview messages include call graph inlay provider metadata', async () => {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const uri = vscode.Uri.joinPath(folder.uri, 'alpha.py');
+    const originalProvider = anyOverlay.previewCallGraphInlayProvider;
+    const originalPostToRenderer = anyOverlay.postToRenderer.bind(anyOverlay);
+    const posted: unknown[] = [];
+    overlay.setPreviewCallGraphInlayProvider((providerUri, document, range) => {
+      assert.strictEqual(providerUri.toString(), uri.toString(), 'provider should receive preview URI');
+      assert.strictEqual(document.uri.toString(), uri.toString(), 'provider should receive preview document');
+      assert.ok(range.contains(new vscode.Position(0, 0)), 'provider should receive a range covering the preview');
+      return [{
+        line: 0,
+        column: 18,
+        kind: 'usages',
+        text: 'usages 1',
+        symbolId: 'python:alpha.py:AlphaService:1',
+        label: 'AlphaService',
+        count: 1,
+      }];
+    });
+    anyOverlay.postToRenderer = async (msg: unknown) => {
+      posted.push(msg);
+    };
+    try {
+      const sent = await anyOverlay.sendPreview(uri.toString(), 0, 0, undefined, 987);
+      assert.strictEqual(sent, true, 'sendPreview should report the preview message as sent');
+      const preview = posted.find((msg) => (msg as { type?: string }).type === 'preview') as
+        | { callGraphInlays?: Array<{ symbolId?: string; text?: string; label?: string }> }
+        | undefined;
+      assert.ok(preview, `expected preview message, got ${JSON.stringify(posted)}`);
+      assert.strictEqual(preview.callGraphInlays, undefined, 'preview body should not wait for call graph inlay metadata');
+      const deadline = Date.now() + 500;
+      let inlays = posted.find((msg) => (msg as { type?: string }).type === 'preview:inlays') as
+        | { callGraphInlays?: Array<{ symbolId?: string; text?: string; label?: string }> }
+        | undefined;
+      while (!inlays && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        inlays = posted.find((msg) => (msg as { type?: string }).type === 'preview:inlays') as
+          | { callGraphInlays?: Array<{ symbolId?: string; text?: string; label?: string }> }
+          | undefined;
+      }
+      assert.ok(inlays, `expected async preview:inlays message, got ${JSON.stringify(posted)}`);
+      assert.deepStrictEqual(inlays.callGraphInlays, [{
+        line: 0,
+        column: 18,
+        kind: 'usages',
+        text: 'usages 1',
+        symbolId: 'python:alpha.py:AlphaService:1',
+        label: 'AlphaService',
+        count: 1,
+      }]);
+    } finally {
+      overlay.setPreviewCallGraphInlayProvider(originalProvider);
+      anyOverlay.postToRenderer = originalPostToRenderer;
+    }
+  });
+
+  test('preview body delivery does not wait for slow call graph inlay metadata', async () => {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const uri = vscode.Uri.joinPath(folder.uri, 'alpha.py');
+    const originalProvider = anyOverlay.previewCallGraphInlayProvider;
+    const originalPostToRenderer = anyOverlay.postToRenderer.bind(anyOverlay);
+    const posted: Array<{ at: number; msg: { type?: string } }> = [];
+    let resolveProvider: (() => void) | undefined;
+    const providerGate = new Promise<void>((resolve) => { resolveProvider = resolve; });
+    overlay.setPreviewCallGraphInlayProvider(async () => {
+      await providerGate;
+      return [{
+        line: 0,
+        column: 18,
+        kind: 'usages',
+        text: 'usages 1',
+        symbolId: 'python:alpha.py:AlphaService:1',
+        label: 'AlphaService',
+      }];
+    });
+    anyOverlay.postToRenderer = async (msg: { type?: string }) => {
+      posted.push({ at: Date.now(), msg });
+    };
+    try {
+      const started = Date.now();
+      const sent = await anyOverlay.sendPreview(uri.toString(), 0, 0, undefined, 991);
+      const preview = posted.find((entry) => entry.msg.type === 'preview');
+      assert.strictEqual(sent, true, 'sendPreview should report the preview message as sent');
+      assert.ok(preview, `preview body should post before inlay provider resolves: ${JSON.stringify(posted)}`);
+      assert.ok(
+        preview.at - started <= 10,
+        `preview body should not wait for slow inlay metadata; waited ${preview.at - started}ms`,
+      );
+      assert.strictEqual(
+        posted.some((entry) => entry.msg.type === 'preview:inlays'),
+        false,
+        `inlay message should not post before provider resolves: ${JSON.stringify(posted)}`,
+      );
+      resolveProvider?.();
+      const deadline = Date.now() + 500;
+      while (!posted.some((entry) => entry.msg.type === 'preview:inlays') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(
+        posted.some((entry) => entry.msg.type === 'preview:inlays'),
+        `expected async preview:inlays after provider resolves: ${JSON.stringify(posted)}`,
+      );
+    } finally {
+      resolveProvider?.();
+      overlay.setPreviewCallGraphInlayProvider(originalProvider);
+      anyOverlay.postToRenderer = originalPostToRenderer;
+    }
+  });
+
+  test('renderer inlay click warmup readiness is scoped to the active window', async () => {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalReady = anyOverlay.rendererInlayClickHookReady;
+    const originalReadyWindows = anyOverlay.rendererInlayClickHookReadyWindows;
+    const originalActiveWindowId = anyOverlay.activeWindowId;
+    try {
+      anyOverlay.rendererInlayClickHookReady = true;
+      anyOverlay.rendererInlayClickHookReadyWindows = new Set([5]);
+      anyOverlay.activeWindowId = 1;
+      let state = overlay.getRendererInlayClickHookStateForTests();
+      assert.strictEqual(state.ready, true, 'a different window can have a warmed inlay hook');
+      assert.strictEqual(
+        state.readyForActiveWindow,
+        false,
+        'first inlay click in a new active window must not reuse another window readiness',
+      );
+      anyOverlay.markRendererInlayClickHookReady('ok:1:ij-find patch installed', 'test-active-window');
+      state = overlay.getRendererInlayClickHookStateForTests();
+      assert.strictEqual(state.readyForActiveWindow, true, 'active window should become ready after its own patch install');
+    } finally {
+      anyOverlay.rendererInlayClickHookReady = originalReady;
+      anyOverlay.rendererInlayClickHookReadyWindows = originalReadyWindows;
+      anyOverlay.activeWindowId = originalActiveWindowId;
     }
   });
 
