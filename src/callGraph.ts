@@ -959,7 +959,25 @@ export class CallGraphService implements vscode.Disposable {
   async findTargetsAtPositionResolved(uri: vscode.Uri, position: vscode.Position): Promise<CallGraphSymbol[]> {
     const declarations = await this.findDeclarationSymbolsAtPositionResolved(uri, position);
     if (declarations.length > 0) { return declarations; }
-    if (!this.isRustNativeIndexOnly()) { return this.findTargetsAtPosition(uri, position); }
+    if (!this.isRustNativeIndexOnly()) {
+      // For the JS-backed snapshot, prefer declarations + call-edge targets
+      // before falling back to the enclosing function. Without an identifier
+      // check, the enclosing fallback would surface mcpGraphConsumer for
+      // clicks on a keyword (`const`) or local variable (`rendered`).
+      const snapshot = this.snapshot;
+      const localDeclarations = this.findDeclarationSymbolsAtPosition(uri, position);
+      if (localDeclarations.length > 0) { return localDeclarations; }
+      const edgeTargets = snapshot
+        ? this.findCallEdgesAtPosition(uri, position)
+          .map((edge) => edge.calleeId ? this.getIndex(snapshot).byId.get(edge.calleeId) : undefined)
+          .filter((symbol): symbol is CallGraphSymbol => !!symbol)
+        : [];
+      if (edgeTargets.length > 0) { return dedupeSymbols(edgeTargets); }
+      const token = await this.identifierAtPosition(uri, position);
+      if (!token || isCodeIdentifierKeyword(token.name) || isProbableLocalDeclarationIdentifier(token)) { return []; }
+      const enclosing = this.findEnclosingSymbol(uri, position);
+      return enclosing ? [enclosing] : [];
+    }
     const referenceTargets = await this.findReferenceTargetsAtPositionResolved(uri, position);
     if (referenceTargets.length > 0) { return referenceTargets; }
     const enclosing = this.findEnclosingSymbol(uri, position);
@@ -3374,7 +3392,10 @@ export class CallGraphService implements vscode.Disposable {
 
   private argv0ForRustGraphProcess(kind: RustGraphProcessKind): string | undefined {
     switch (kind) {
-      case 'build': return 'ijss-rust-graph-build';
+      // `build` is the cargo build proxy; rustup inspects argv[0] and
+      // rejects anything other than its known toolchain names, so we
+      // intentionally leave it as the original command (`cargo`).
+      case 'build': return undefined;
       case 'graph-rebuild': return 'ijss-rust-graph-rebuild';
       case 'graph-update': return 'ijss-rust-graph-update';
       case 'graph-index': return 'ijss-rust-graph-index';
@@ -7033,17 +7054,38 @@ function readBraceHeader(lines: string[], startLine: number, language: CallGraph
 }
 
 function findBraceBlockEnd(lines: string[], startLine: number): number {
+  // Walk forward looking for the close brace that matches the function body
+  // opener. While we're still in the header (before the body's opening `{`),
+  // ignore braces nested inside parentheses/brackets/angle brackets — those
+  // belong to parameter type annotations like `Array<{ id: string }>` or
+  // destructuring defaults, not the function body.
   let seenOpen = false;
   let depth = 0;
+  let parenDepth = 0;
+  let angleDepth = 0;
   for (let i = startLine; i < lines.length; i++) {
     const line = stripInlineCommentsAndStrings(lines[i], 'javascript');
     for (const ch of line) {
+      if (!seenOpen) {
+        if (ch === '(' || ch === '[') {
+          parenDepth += 1;
+        } else if ((ch === ')' || ch === ']') && parenDepth > 0) {
+          parenDepth -= 1;
+        } else if (ch === '<') {
+          angleDepth += 1;
+        } else if (ch === '>' && angleDepth > 0) {
+          angleDepth -= 1;
+        } else if (ch === '{' && parenDepth === 0 && angleDepth === 0) {
+          depth = 1;
+          seenOpen = true;
+        }
+        continue;
+      }
       if (ch === '{') {
         depth += 1;
-        seenOpen = true;
       } else if (ch === '}') {
         depth -= 1;
-        if (seenOpen && depth <= 0) {
+        if (depth <= 0) {
           return i;
         }
       }

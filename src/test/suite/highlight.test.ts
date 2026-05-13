@@ -1,6 +1,11 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import type { ExtensionTestApi } from '../../extension';
+import {
+  seedFixtureFiles,
+  workspaceHasOwnGit,
+  type FixtureSeed,
+} from '../util/fixtureWorkspace';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 
@@ -96,10 +101,16 @@ async function waitForPreviewDecorations(
 let cdpAvailable = false;
 let monacoReady = false;
 let priorEngineSetting: string | undefined;
+let fixtureSeed: FixtureSeed | undefined;
 
 suite('Preview highlight — decoration regression', () => {
   suiteSetup(async function () {
     this.timeout(60_000);
+    // Suite forces engine=codesearch which needs a full trigram rebuild.
+    // That walk exceeds the 60s setup budget on workspaces with hundreds
+    // of thousands of files, so skip off the dedicated fixture workspace.
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    fixtureSeed = await seedFixtureFiles();
     const api = await getApi();
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     priorEngineSetting = cfg.inspect<string>('engine')?.workspaceValue;
@@ -123,6 +134,9 @@ suite('Preview highlight — decoration regression', () => {
         return 'cleared';
       })()`,
     );
+    // This suite switches the engine to codesearch in setup above, so a
+    // codesearch (trigram) rebuild is required to populate the right
+    // index regardless of whether a prior zoekt rebuild happened.
     await api.overlay.rebuildIndex();
     await api.overlay.waitForIndexReady(30_000);
     // Force a Monaco editor to exist in the workbench so the capture
@@ -146,8 +160,10 @@ suite('Preview highlight — decoration regression', () => {
   });
 
   suiteTeardown(async function () {
+    this.timeout(30_000);
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     await cfg.update('engine', priorEngineSetting, vscode.ConfigurationTarget.Workspace);
+    if (fixtureSeed) { await fixtureSeed.cleanup(); fixtureSeed = undefined; }
   });
 
   test('multi-line match: preview carries at least one decoration whose range spans multiple lines', async function () {

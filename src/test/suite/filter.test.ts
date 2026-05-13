@@ -1,6 +1,11 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import type { ExtensionTestApi } from '../../extension';
+import {
+  seedFixtureFiles,
+  workspaceHasOwnGit,
+  type FixtureSeed,
+} from '../util/fixtureWorkspace';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 
@@ -59,10 +64,17 @@ async function waitUntil(
 
 let cdpAvailable = false;
 let priorEngineSetting: string | undefined;
+let fixtureSeed: FixtureSeed | undefined;
 
 suite('Extension-typing filter — client-side narrowing', () => {
   suiteSetup(async function () {
-    this.timeout(30_000);
+    this.timeout(60_000);
+    // The whole suite forces engine=codesearch which requires a fresh
+    // trigram-index walk. That walk doesn't fit the 60s setup budget on
+    // workspaces with hundreds of thousands of files, so skip cleanly
+    // off the dedicated fixture workspace.
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    fixtureSeed = await seedFixtureFiles();
     const api = await getApi();
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     priorEngineSetting = cfg.inspect<string>('engine')?.workspaceValue;
@@ -74,6 +86,10 @@ suite('Extension-typing filter — client-side narrowing', () => {
       cdpAvailable = false;
     }
     if (cdpAvailable) {
+      // This suite switches the engine to codesearch above, so a
+      // codesearch (trigram) rebuild is required even if a previous suite
+      // already populated the zoekt index. Without an explicit rebuild
+      // the trigram set may be stale from earlier extension activation.
       await api.overlay.rebuildIndex();
       await api.overlay.waitForIndexReady(30_000);
     }
@@ -111,8 +127,10 @@ suite('Extension-typing filter — client-side narrowing', () => {
   });
 
   suiteTeardown(async function () {
+    this.timeout(30_000);
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     await cfg.update('engine', priorEngineSetting, vscode.ConfigurationTarget.Workspace);
+    if (fixtureSeed) { await fixtureSeed.cleanup(); fixtureSeed = undefined; }
   });
 
   // Later test suites (e.g. preview highlight) reuse the overlay's scope

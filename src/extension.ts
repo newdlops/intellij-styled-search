@@ -447,14 +447,25 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
         showCallGraphUsageResult(overlay, callGraph, callGraphLog, symbolId, label));
     }),
     vscode.commands.registerCommand('intellijStyledSearch.showCalleesForSymbol', async (symbolId: string, label?: string) => {
+      // #46 trace: dispatched-command → resolved-search-context. Pairs
+      // with the renderer-side `preview/inlay/click` trace via symbolId.
+      callGraphLog.appendLine(
+        `[inlay-resolve] command=showCalleesForSymbol symbolId=${symbolId} label=${label ?? ''} kind=callees`,
+      );
       await runDedupedCallGraphSymbolCommand('showCalleesForSymbol', symbolId, () =>
         showCallGraphQueryResult(overlay, callGraph, callGraphLog, 'callees', symbolId, label));
     }),
     vscode.commands.registerCommand('intellijStyledSearch.showImplementationsForSymbol', async (symbolId: string, label?: string) => {
+      callGraphLog.appendLine(
+        `[inlay-resolve] command=showImplementationsForSymbol symbolId=${symbolId} label=${label ?? ''} kind=impl`,
+      );
       await runDedupedCallGraphSymbolCommand('showImplementationsForSymbol', symbolId, () =>
         showCallGraphImplementationResult(overlay, callGraph, symbolId, label));
     }),
     vscode.commands.registerCommand('intellijStyledSearch.showUsagesForSymbol', async (symbolId: string, label?: string) => {
+      callGraphLog.appendLine(
+        `[inlay-resolve] command=showUsagesForSymbol symbolId=${symbolId} label=${label ?? ''} kind=usages`,
+      );
       await runDedupedCallGraphSymbolCommand('showUsagesForSymbol', symbolId, () =>
         showCallGraphUsageResult(overlay, callGraph, callGraphLog, symbolId, label));
     }),
@@ -463,7 +474,13 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       uriString: string,
       line: number,
       column?: number,
+      inlayText?: string,
     ) => {
+      callGraphLog.appendLine(
+        `[inlay-resolve] command=activateCallGraphInlayAtPosition kind=${kind} uri=${uriString} line=${line} col=${column ?? '?'} ` +
+        `inlayText=${JSON.stringify(inlayText ?? '')} ` +
+        `(resolves to symbol via registry or line-based fallback — see activateCallGraphInlayAtPosition body)`,
+      );
       await activateCallGraphInlayAtPosition(
         overlay,
         callGraph,
@@ -473,14 +490,22 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
         uriString,
         line,
         column,
+        { inlayText },
       );
     }),
     vscode.commands.registerCommand('intellijStyledSearch.activateCallGraphInlayAtVisibleLine', async (
       kind: string,
       lineOrdinal: number,
       column?: number,
+      inlayText?: string,
     ) => {
       const editor = vscode.window.activeTextEditor;
+      const activeUriForLog = editor ? editor.document.uri.toString() : '(no active editor)';
+      callGraphLog.appendLine(
+        `[inlay-resolve] command=activateCallGraphInlayAtVisibleLine kind=${kind} ` +
+        `lineOrdinal=${lineOrdinal} col=${column ?? '?'} inlayText=${JSON.stringify(inlayText ?? '')} ` +
+        `activeEditor=${activeUriForLog}`,
+      );
       if (!editor) {
         callGraphLog.appendLine('call graph inlay click ignored: no active editor for visible-line resolution');
         return;
@@ -490,9 +515,17 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
         callGraphLog.appendLine(`call graph inlay click ignored: visible line ${lineOrdinal} is outside active editor ranges`);
         return;
       }
+      // #48: same fast-path — read InlayHintLabelPart.command Monaco
+      // rendered for this line and execute it directly. When inlayText
+      // is provided, allow a small window above/below the line so we
+      // recover from ordinal drift (overscan/wrap/fold) by matching the
+      // hint whose label-part text equals the clicked inlay.
+      if (await tryDispatchInlayLabelCommandAt(editor.document.uri, line, kind, callGraphLog, inlayText)) {
+        return;
+      }
       const registered = callGraphInlayRegistry.resolve(editor.document.uri, line, kind, column);
       if (registered) {
-        await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, registered, 'inlay registry visible-line');
+        await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, registered, 'inlay registry visible-line', undefined, editor.document.uri);
         return;
       }
       await activateCallGraphInlayAtPosition(
@@ -504,8 +537,72 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
         editor.document.uri.toString(),
         line,
         column,
-        { allowNearby: true },
+        { allowNearby: true, inlayText },
       );
+    }),
+    // #47 ground-truth probe. User invokes this from the command palette
+    // after their preview-pane hover fails. We run executeHoverProvider
+    // and executeCompletionItemProvider against the LAST previewed URI
+    // (from overlay state) at line 0 / col 0 and log the counts — if
+    // Pylance returns content here, the embed editor's IHoverService
+    // simply isn't picking it up (renderer-side). If it returns 0, the
+    // problem is extension-host / LSP doc tracking.
+    vscode.commands.registerCommand('intellijStyledSearch.diagnosePreviewIntellisense', async () => {
+      const uriStr = overlay.getLastPreviewUriForDiagnostics();
+      if (!uriStr) {
+        vscode.window.showInformationMessage('No preview URI yet — open a preview first.');
+        return;
+      }
+      const lineRaw = await vscode.window.showInputBox({
+        prompt: 'Line (0-based) to probe',
+        value: String(overlay.getLastPreviewLineForDiagnostics() ?? 0),
+      });
+      if (lineRaw === undefined) { return; }
+      const colRaw = await vscode.window.showInputBox({
+        prompt: 'Column (0-based) to probe',
+        value: '0',
+      });
+      if (colRaw === undefined) { return; }
+      const line = Math.max(0, parseInt(lineRaw, 10) || 0);
+      const col = Math.max(0, parseInt(colRaw, 10) || 0);
+      try {
+        const uri = vscode.Uri.parse(uriStr);
+        const pos = new vscode.Position(line, col);
+        const hovers = await vscode.commands.executeCommand<vscode.Hover[] | undefined>(
+          'vscode.executeHoverProvider', uri, pos,
+        ) || [];
+        const completions = await vscode.commands.executeCommand<vscode.CompletionList | undefined>(
+          'vscode.executeCompletionItemProvider', uri, pos,
+        );
+        const completionCount = completions && Array.isArray(completions.items) ? completions.items.length : 0;
+        const hoverSample = hovers
+          .slice(0, 2)
+          .map((h) => h.contents
+            .map((c) => typeof c === 'string'
+              ? c
+              : (c as vscode.MarkdownString).value || JSON.stringify(c))
+            .join(' | '))
+          .join(' // ').slice(0, 280);
+        const completionSample = (completions && completions.items ? completions.items : [])
+          .slice(0, 4)
+          .map((it) => it.label && typeof it.label === 'object' ? (it.label as { label: string }).label : String(it.label || ''))
+          .join(', ');
+        callGraphLog.appendLine(
+          `[diag] preview-intellisense probe uri=${uriStr} line=${line} col=${col} ` +
+          `hovers=${hovers.length} completions=${completionCount} ` +
+          `hoverSample="${hoverSample}" completionSample="${completionSample}"`,
+        );
+        vscode.window.showInformationMessage(
+          `Pylance probe at ${line}:${col} — hovers=${hovers.length}, completions=${completionCount} (see IJSS log)`,
+        );
+      } catch (err) {
+        callGraphLog.appendLine(
+          `[diag] preview-intellisense probe failed: ${err instanceof Error ? err.message : err}`,
+        );
+        vscode.window.showWarningMessage(
+          `Probe failed: ${err instanceof Error ? err.message : err}`,
+        );
+      }
     }),
     vscode.commands.registerCommand('intellijStyledSearch.startMcpServer', async () => {
       overlay.logCommand('startMcpServer');
@@ -534,6 +631,104 @@ export async function deactivate() {
   activeOverlay = undefined;
 }
 
+// #48 user-suggested fast-path: read the InlayHintLabelPart.command
+// that Monaco actually rendered on this line via the standard
+// `vscode.executeInlayHintProvider` API. That command carries the exact
+// symbolId/qualifiedName our CallGraphInlayHintsProvider attached when
+// building the hint — same one the inlay's "Execute command" hover
+// popup would invoke. Skips our registry/nearby-search entirely so the
+// click→search-result mapping is exact.
+// Returns true iff a matching label-part command was found and executed.
+async function tryDispatchInlayLabelCommandAt(
+  uri: vscode.Uri,
+  line: number,
+  kind: string,
+  callGraphLog: vscode.OutputChannel,
+  inlayText?: string,
+): Promise<boolean> {
+  const normalizedKind = String(kind || '').toLowerCase();
+  const expectedCommand = normalizedKind === 'callees'
+    ? 'intellijStyledSearch.showCalleesForSymbol'
+    : normalizedKind === 'impl'
+      ? 'intellijStyledSearch.showImplementationsForSymbol'
+      : 'intellijStyledSearch.showUsagesForSymbol';
+  const safeLine = Math.max(0, Math.floor(line));
+  // When inlayText is provided we widen the search range to recover from
+  // visible-line ordinal drift (overscan/wrap/fold in the renderer). The
+  // matching strategy is text-first: among hints whose label-part text
+  // equals inlayText, pick the one closest to safeLine. Without inlayText
+  // we keep the exact-line behavior for backward compatibility.
+  const normalizedInlayText = (inlayText || '').trim().replace(/\s+/g, ' ');
+  const searchHalfWindow = normalizedInlayText ? 6 : 0;
+  const rangeStart = Math.max(0, safeLine - searchHalfWindow);
+  const rangeEnd = safeLine + searchHalfWindow + 1;
+  const range = new vscode.Range(rangeStart, 0, rangeEnd, 0);
+  try {
+    const hints = await vscode.commands.executeCommand<vscode.InlayHint[] | undefined>(
+      'vscode.executeInlayHintProvider', uri, range,
+    ) || [];
+    type Candidate = { command: vscode.Command; hintLine: number; partValue: string };
+    const candidates: Candidate[] = [];
+    for (const hint of hints) {
+      const hintLine = (hint.position && hint.position.line) ?? -1;
+      const labelParts = Array.isArray(hint.label) ? hint.label : [];
+      const concatValue = labelParts.map((p) => (p as vscode.InlayHintLabelPart).value || '').join('').trim().replace(/\s+/g, ' ');
+      for (const part of labelParts) {
+        const labelPart = part as vscode.InlayHintLabelPart;
+        const cmd = labelPart.command;
+        if (!cmd || cmd.command !== expectedCommand) { continue; }
+        const partValue = (labelPart.value || '').trim().replace(/\s+/g, ' ');
+        candidates.push({
+          command: cmd,
+          hintLine,
+          partValue: partValue || concatValue,
+        });
+      }
+    }
+    let matched: Candidate | undefined;
+    if (normalizedInlayText) {
+      const textMatches = candidates.filter((c) => c.partValue === normalizedInlayText);
+      if (textMatches.length > 0) {
+        textMatches.sort((a, b) => Math.abs(a.hintLine - safeLine) - Math.abs(b.hintLine - safeLine));
+        matched = textMatches[0];
+        if (matched.hintLine !== safeLine) {
+          callGraphLog.appendLine(
+            `[inlay-resolve] label-part text-match resolved drift: requested line=${safeLine} ` +
+            `actualLine=${matched.hintLine} inlayText=${JSON.stringify(normalizedInlayText)} ` +
+            `candidatesByText=${textMatches.length}`,
+          );
+        }
+      }
+    }
+    if (!matched) {
+      // Fall back to exact-line match (original behavior).
+      matched = candidates.find((c) => c.hintLine === safeLine);
+    }
+    if (!matched) {
+      callGraphLog.appendLine(
+        `[inlay-resolve] label-part fast-path miss: uri=${uri.toString()} line=${safeLine} ` +
+        `kind=${normalizedKind} expected=${expectedCommand} candidatesInWindow=${candidates.length} ` +
+        `inlayText=${JSON.stringify(normalizedInlayText)} ` +
+        `windowLines=[${rangeStart}..${rangeEnd - 1}]`,
+      );
+      return false;
+    }
+    const args = Array.isArray(matched.command.arguments) ? matched.command.arguments : [];
+    callGraphLog.appendLine(
+      `[inlay-resolve] label-part fast-path hit: command=${matched.command.command} ` +
+      `args=${JSON.stringify(args)} line=${matched.hintLine} (requested=${safeLine}) kind=${normalizedKind} ` +
+      `matchedBy=${normalizedInlayText && matched.partValue === normalizedInlayText ? 'inlayText' : 'exactLine'}`,
+    );
+    await vscode.commands.executeCommand(matched.command.command, ...args);
+    return true;
+  } catch (err) {
+    callGraphLog.appendLine(
+      `[inlay-resolve] label-part fast-path threw: ${err instanceof Error ? err.message : err}`,
+    );
+    return false;
+  }
+}
+
 async function activateCallGraphInlayAtPosition(
   overlay: OverlayPanel,
   callGraph: CallGraphService,
@@ -543,7 +738,7 @@ async function activateCallGraphInlayAtPosition(
   uriString?: string,
   line?: number,
   column?: number,
-  options: { allowNearby?: boolean } = {},
+  options: { allowNearby?: boolean; inlayText?: string } = {},
 ): Promise<void> {
   const normalizedKind = normalizeCallGraphInlayKind(kind);
   const activeEditor = vscode.window.activeTextEditor;
@@ -559,15 +754,21 @@ async function activateCallGraphInlayAtPosition(
     callGraphLog.appendLine('call graph inlay click ignored: no active editor for fallback resolution');
     return;
   }
+  // #48: try Monaco's inlay-label command FIRST. That's what the
+  // inlay's "Execute command" hover popup would invoke — guaranteed
+  // exact symbolId, no nearby-fallback drift.
+  if (await tryDispatchInlayLabelCommandAt(uri, safeLine, normalizedKind, callGraphLog, options.inlayText)) {
+    return;
+  }
   const registered = registry.resolve(uri, safeLine, normalizedKind, safeColumn);
   if (registered) {
-    await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, registered, 'inlay registry position');
+    await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, registered, 'inlay registry position', undefined, uri);
     return;
   }
   if (options.allowNearby === true) {
     const nearby = registry.resolveNear(uri, safeLine, normalizedKind, safeColumn, 12);
     if (nearby) {
-      await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, nearby, 'inlay registry nearby');
+      await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, nearby, 'inlay registry nearby', undefined, uri);
       return;
     }
   }
@@ -593,6 +794,7 @@ async function activateCallGraphInlayAtPosition(
     },
     'symbol line fallback',
     symbol,
+    uri,
   );
 }
 
@@ -603,9 +805,23 @@ async function activateCallGraphInlayEntry(
   entry: CallGraphInlayRegistryEntry,
   source: string,
   symbol?: CallGraphSymbol,
+  clickUri?: vscode.Uri,
 ): Promise<void> {
+  // Per the operator request: log enough context that a future log.txt
+  // analysis can reconstruct exactly which inlay was clicked, what symbol
+  // it pointed at, and what search query was driven from it.
+  //   - clickFile: relative path of the file whose inlay was activated
+  //   - clickLine: 1-indexed line number where the inlay sat
+  //   - kind: usages | callees | impl
+  //   - symbolId: internal callgraph symbol id (language:relPath:qn:line)
+  //   - query: the text actually handed to the search panel
+  const clickFile = clickUri
+    ? vscode.workspace.asRelativePath(clickUri, false)
+    : '(unknown)';
   callGraphLog.appendLine(
-    `call graph inlay click source: ${source} kind=${entry.kind} query=${JSON.stringify(entry.label)}`,
+    `call graph inlay click source: ${source} ` +
+    `clickFile=${clickFile} clickLine=${entry.line + 1} kind=${entry.kind} ` +
+    `symbolId=${JSON.stringify(entry.symbolId)} query=${JSON.stringify(entry.label)}`,
   );
   const command = `activateCallGraphInlay:${entry.kind}`;
   await runDedupedCallGraphSymbolCommand(command, entry.symbolId, async () => {
@@ -876,6 +1092,17 @@ async function showCallGraphImplementationResult(
   }
 }
 
+function getConfiguredCallGraphMaxUsageResults(): number {
+  // The callGraph service helpers default to a 500-row cap, which
+  // truncates Find Usages results for heavy callers (e.g., a User model
+  // referenced from hundreds of files). Read the cap from config so users
+  // can dial it up without code changes.
+  const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+  const raw = cfg.get<number>('callGraphMaxUsageResults', 10_000);
+  if (!Number.isFinite(raw) || raw <= 0) { return 10_000; }
+  return Math.floor(raw);
+}
+
 async function showCallGraphUsageResult(
   overlay: OverlayPanel,
   callGraph: CallGraphService,
@@ -887,6 +1114,7 @@ async function showCallGraphUsageResult(
   try {
     const title = 'Find Usages';
     const showedPendingPanel = !!explicitQuery;
+    const limit = getConfiguredCallGraphMaxUsageResults();
     if (explicitQuery) {
       await showCallGraphPendingPanel(overlay, title, explicitLabel ?? explicitQuery);
     }
@@ -894,7 +1122,7 @@ async function showCallGraphUsageResult(
     if (explicitQuery) {
       const explicitSymbolId = explicitSymbol?.id ?? explicitQuery;
       if (explicitSymbol || isCallGraphSymbolId(explicitSymbolId)) {
-        const cachedUsages = await callGraph.findUsagesForSymbolIdFromCache(explicitSymbolId);
+        const cachedUsages = await callGraph.findUsagesForSymbolIdFromCache(explicitSymbolId, limit);
         if (cachedUsages) {
           await showCallGraphUsageMatches(
             overlay,
@@ -918,8 +1146,8 @@ async function showCallGraphUsageResult(
     if (!query) { return; }
     const targetSymbol = (await callGraph.resolveSymbolsResolved(query, 1))[0];
     const usages = targetSymbol && callGraph.isRustNativeIndexOnly()
-      ? await callGraph.findUsagesForSymbolIdFromCache(targetSymbol.id) ?? []
-      : callGraph.findUsages(query);
+      ? await callGraph.findUsagesForSymbolIdFromCache(targetSymbol.id, limit) ?? []
+      : callGraph.findUsages(query, limit);
     await showCallGraphUsageMatches(
       overlay,
       callGraphLog,
@@ -1516,11 +1744,15 @@ function buildCallGraphInlayHint(
   lineEndColumn = summary.symbol.range.endColumn,
 ): vscode.InlayHint | undefined {
   const parts: vscode.InlayHintLabelPart[] = [];
+  // Inlay command titles surface as VS Code's hover tooltip on the inlay
+  // label. We render the relation counts directly in the label text so a
+  // duplicated tooltip ("Show N usages") is noise; pass an empty title to
+  // keep just the underline affordance.
   if (showCalleeInlayHints && summary.calleeCount > 0) {
     appendInlaySeparator(parts);
     parts.push(makeInlayCommandPart(
       `callees ${summary.calleeCount}`,
-      `Show ${summary.calleeCount} callee${summary.calleeCount === 1 ? '' : 's'}`,
+      '',
       'intellijStyledSearch.showCalleesForSymbol',
       summary.symbol.id,
       summary.symbol.qualifiedName,
@@ -1530,7 +1762,7 @@ function buildCallGraphInlayHint(
     appendInlaySeparator(parts);
     parts.push(makeInlayCommandPart(
       `impl ${summary.implementationCount}`,
-      `Show ${summary.implementationCount} implementation${summary.implementationCount === 1 ? '' : 's'}`,
+      '',
       'intellijStyledSearch.showImplementationsForSymbol',
       summary.symbol.id,
       summary.symbol.qualifiedName,
@@ -1540,7 +1772,7 @@ function buildCallGraphInlayHint(
     appendInlaySeparator(parts);
     parts.push(makeInlayCommandPart(
       `usages ${summary.usageCount}`,
-      `Show ${summary.usageCount} usage${summary.usageCount === 1 ? '' : 's'}`,
+      '',
       'intellijStyledSearch.showUsagesForSymbol',
       summary.symbol.id,
       summary.symbol.qualifiedName,

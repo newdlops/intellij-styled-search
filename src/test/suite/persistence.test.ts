@@ -6,6 +6,7 @@ import * as vscode from 'vscode';
 import type { ExtensionTestApi } from '../../extension';
 import { TrigramIndex } from '../../trigramIndex';
 import { MAGIC, VERSION_V3 } from '../../codesearch/binaryIndex';
+import { workspaceHasOwnGit } from '../util/fixtureWorkspace';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 
@@ -34,8 +35,13 @@ suite('Persistence — v3 format round-trip', () => {
 
   suiteSetup(async function () {
     this.timeout(60_000);
+    // Each test rebuilds a TrigramIndex against the live workspace into a
+    // temp storage to exercise the binary format. That walk fundamentally
+    // exceeds the per-test 30s budget on large workspaces, so skip cleanly
+    // off the dedicated fixture workspace.
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
     const { overlay } = await getApi();
-    await overlay.rebuildIndex();
+    await overlay.ensureIndexBuiltForTests();
     await overlay.waitForIndexReady(30_000);
   });
 

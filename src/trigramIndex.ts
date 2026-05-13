@@ -722,6 +722,18 @@ export class TrigramIndex {
     // rewrites every posting cleanly anyway.
   }
 
+  /** @internal Test helper: index a single file synchronously. Mirrors the
+   *  file watcher's indexFile() call without depending on watcher debounce. */
+  async indexFileForTests(uri: vscode.Uri): Promise<void> {
+    await this.indexFile(uri);
+  }
+
+  /** @internal Test helper: drop a file from the index. Mirrors the
+   *  watcher's onDidDelete path without depending on watcher debounce. */
+  removeFileForTests(uri: vscode.Uri): void {
+    this.removeByUri(uri.toString());
+  }
+
   private async indexFile(uri: vscode.Uri): Promise<void> {
     const uriStr = uri.toString();
     // If the file is already known, ensure it's marked stale for the full

@@ -12,6 +12,7 @@ import {
   formatCallGraphProgressMessage,
   type ExtensionTestApi,
 } from '../../extension';
+import { workspaceHasOwnGit } from '../util/fixtureWorkspace';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 
@@ -50,6 +51,14 @@ async function useCallGraphBackend(backend: 'rust-native' | 'javascript'): Promi
 }
 
 suite('Call graph', () => {
+  suiteSetup(async function () {
+    // Tests in this suite write fixture files at workspace root and then
+    // walk the entire workspace through the call-graph indexer. On large
+    // checkouts that walk fundamentally exceeds the per-test 30s budget,
+    // so skip cleanly off the dedicated fixture workspace.
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+  });
+
   test('indexes Python and JavaScript symbols with caller/callee edges', async function () {
     this.timeout(30_000);
     const restoreBackend = await useCallGraphBackend('javascript');
@@ -2404,6 +2413,79 @@ suite('Call graph', () => {
       try { await vscode.workspace.fs.delete(mcpPythonModel); } catch {}
       try { await vscode.workspace.fs.delete(mcpExcluded); } catch {}
       try { await vscode.workspace.fs.delete(mcpGeneratedDir, { recursive: true, useTrash: false }); } catch {}
+    }
+  });
+
+  // User-reported regression: when a symbol has more than 500 usages the
+  // Find Usages panel only shows 500 rows. Root cause:
+  // callGraph.findUsages() / findUsagesForSymbolIdFromCache() both default
+  // to limit=500, and the inlay flow calls them without an explicit limit.
+  // The fix added `intellijStyledSearch.callGraphMaxUsageResults` config
+  // (default 10_000) and threads it through. This test:
+  //   1. seeds a Python function with 700 call sites,
+  //   2. asserts the cache index returns more than the old 500 cap when
+  //      asked for a higher limit,
+  //   3. asserts an explicit small cap (e.g. 7) is still honoured.
+  test('Find Usages respects the configured cap above the legacy 500 limit', async function () {
+    this.timeout(30_000);
+    const restoreBackend = await useCallGraphBackend('javascript');
+    const api = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const target = vscode.Uri.joinPath(folder.uri, 'usage_cap_target.py');
+    const consumer = vscode.Uri.joinPath(folder.uri, 'usage_cap_consumer.py');
+    const callCount = 700;
+    try {
+      await vscode.workspace.fs.writeFile(target, Buffer.from([
+        'def usage_cap_function() -> int:',
+        '    return 1',
+        '',
+      ].join('\n'), 'utf8'));
+      const consumerLines = [
+        'from usage_cap_target import usage_cap_function',
+        '',
+        'def consume_many():',
+        ...Array.from({ length: callCount }, () => '    usage_cap_function()'),
+        '    return 0',
+        '',
+      ];
+      await vscode.workspace.fs.writeFile(consumer, Buffer.from(consumerLines.join('\n'), 'utf8'));
+      await api.callGraph.rebuild(undefined, undefined, { force: true });
+
+      const symbols = await api.callGraph.resolveSymbolsResolved('usage_cap_function', 5);
+      const fn = symbols.find((s) => s.qualifiedName === 'usage_cap_function');
+      assert.ok(fn, `expected usage_cap_function in resolved symbols, got ${symbols.map((s) => s.qualifiedName).join(', ')}`);
+
+      // 1) Asking for 1000 should return more than the legacy 500 cap.
+      const wide = await api.callGraph.findUsagesForSymbolIdFromCache(fn!.id, 1000);
+      assert.ok(
+        wide && wide.length > 500,
+        `findUsagesForSymbolIdFromCache(limit=1000) should exceed the legacy 500 cap when the symbol has ${callCount} usages; got ${wide?.length ?? 'undefined'}`,
+      );
+      assert.ok(
+        wide!.length >= callCount,
+        `findUsagesForSymbolIdFromCache should return every call site under a sufficient limit; got ${wide!.length} expected >=${callCount}`,
+      );
+
+      // 2) An explicit small limit still pins the result count.
+      const trimmed = await api.callGraph.findUsagesForSymbolIdFromCache(fn!.id, 7);
+      assert.ok(trimmed, 'expected cache lookup to return a non-undefined slice for an explicit small limit');
+      assert.ok(
+        trimmed!.length <= 7,
+        `explicit small limit must clamp the result; got ${trimmed!.length} for limit=7`,
+      );
+
+      // 3) The default behaviour of findUsages() also respects an
+      // explicitly passed limit higher than the old 500.
+      const sync = api.callGraph.findUsages(fn!.qualifiedName, 1000);
+      assert.ok(
+        sync.length > 500,
+        `findUsages(limit=1000) should exceed the legacy 500 cap; got ${sync.length}`,
+      );
+    } finally {
+      try { await vscode.workspace.fs.delete(target); } catch {}
+      try { await vscode.workspace.fs.delete(consumer); } catch {}
+      await restoreBackend();
     }
   });
 });

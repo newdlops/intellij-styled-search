@@ -7,6 +7,12 @@ export function getRendererPatchScript(
   enableRendererInlayClickHook = true,
   disposeRendererPatchOnHide = true,
   installAdditionalSearchInstance = false,
+  // #47: opt-in to enable Pylance/LSP hover + autocomplete in preview by
+  // creating the embed editor with isSimpleWidget=false. Trade-off: the
+  // workbench's EditorService may try to take over the editor on focus
+  // (see rendererPatch.ts createPreviewEditor comment) — but #46-1 and
+  // hide/show preservation guards mitigate most user-visible damage.
+  enablePreviewLanguageFeatures = false,
 ): string {
   const enableMonacoPreviewCaptureLiteral = enableMonacoPreviewCapture ? 'true' : 'false';
   const enablePerfDiagnosticsLiteral = enablePerfDiagnostics ? 'true' : 'false';
@@ -14,6 +20,7 @@ export function getRendererPatchScript(
   const enableRendererInlayClickHookLiteral = enableRendererInlayClickHook ? 'true' : 'false';
   const disposeRendererPatchOnHideLiteral = disposeRendererPatchOnHide ? 'true' : 'false';
   const installAdditionalSearchInstanceLiteral = installAdditionalSearchInstance ? 'true' : 'false';
+  const enablePreviewLanguageFeaturesLiteral = enablePreviewLanguageFeatures ? 'true' : 'false';
   return `
 (function () {
   var __ijFindPatchVersion = ${RENDERER_PATCH_VERSION};
@@ -23,6 +30,7 @@ export function getRendererPatchScript(
   var __ijFindEnableRendererInlayClickHook = ${enableRendererInlayClickHookLiteral};
   var __ijFindDisposeRendererPatchOnHide = ${disposeRendererPatchOnHideLiteral};
   var __ijFindInstallAdditionalInstance = ${installAdditionalSearchInstanceLiteral};
+  var __ijFindEnablePreviewLanguageFeatures = ${enablePreviewLanguageFeaturesLiteral};
   try {
     if (!__ijFindInstallAdditionalInstance && typeof window.__ijFindDisposeAllSearchUi === 'function') {
       window.__ijFindDisposeAllSearchUi('patch-upgrade');
@@ -84,22 +92,89 @@ export function getRendererPatchScript(
       return 'guard-err:' + String(eGuard && eGuard.message || eGuard).slice(0, 120);
     }
   }
+  // Multi-reason recursion-capture suspend tracker. The IR capture is
+  // considered suspended while *any* reason is active. Each reason can be
+  // added or removed independently so different parts of the system (the
+  // search overlay being visible, a workbench-editor tab-switch, etc.) can
+  // hold their own slot without overwriting each other.
+  if (!window.__ijFindIrSuspendReasons || typeof window.__ijFindIrSuspendReasons !== 'object') {
+    try { window.__ijFindIrSuspendReasons = Object.create(null); } catch (eIrInit) {}
+  }
+  if (typeof window.__ijFindEditorActivityCount !== 'number') {
+    try { window.__ijFindEditorActivityCount = 0; } catch (eIrCount) {}
+  }
+  function listIrSuspendReasons() {
+    try {
+      var bag = window.__ijFindIrSuspendReasons || {};
+      var out = [];
+      for (var key in bag) { if (Object.prototype.hasOwnProperty.call(bag, key)) { out.push(key); } }
+      return out;
+    } catch (eListIr) { return []; }
+  }
   function setIntelliSenseRecursionCaptureSuspended(active, reason) {
     try {
       if (!window.__ijFindShouldSuspendIntelliSenseRecursionCapture) { return 'disabled'; }
       var guard = installIntelliSenseRecursionCaptureGuard();
-      window.__ijFindIrCaptureSuspended = !!active;
-      window.__ijFindIrCaptureSuspendReason = active ? String(reason || 'unknown') : '';
+      var key = String(reason || 'unknown');
+      try { if (!window.__ijFindIrSuspendReasons) { window.__ijFindIrSuspendReasons = Object.create(null); } } catch (eEnsureBag) {}
+      var bag = window.__ijFindIrSuspendReasons;
+      if (active) {
+        try { bag[key] = true; } catch (eAddReason) {}
+      } else {
+        try { delete bag[key]; } catch (eDelReason) {}
+        // 'search-ui-hidden' is the paired un-suspend for 'search-ui-visible'.
+        // Treat it as clearing the whole search-ui pair so callers that pass
+        // 'search-ui-hidden' don't have to know about both keys.
+        if (key === 'search-ui-hidden') {
+          try { delete bag['search-ui-visible']; } catch (eDelVisible) {}
+        }
+      }
+      var suspended = false;
+      try { for (var anyKey in bag) { if (Object.prototype.hasOwnProperty.call(bag, anyKey)) { suspended = true; break; } } } catch (eAnyKey) {}
+      window.__ijFindIrCaptureSuspended = suspended;
+      window.__ijFindIrCaptureSuspendReason = suspended ? listIrSuspendReasons().join(',') : '';
       var stopped = '';
-      if (active && window.__irCaptureActive && typeof window.__irStopCapture === 'function') {
-        try { stopped = String(window.__irStopCapture('ijss:' + String(reason || 'search-ui'))); }
+      if (suspended && window.__irCaptureActive && typeof window.__irStopCapture === 'function') {
+        try { stopped = String(window.__irStopCapture('ijss:' + key)); }
         catch (eStopIr) { stopped = 'stop-err:' + String(eStopIr && eStopIr.message || eStopIr).slice(0, 120); }
       }
-      return 'suspend=' + (!!active) + ' guard=' + guard + (stopped ? ' stop=' + stopped : '');
+      return 'suspend=' + suspended + ' guard=' + guard + (stopped ? ' stop=' + stopped : '');
     } catch (eSuspendIr) {
       return 'suspend-err:' + String(eSuspendIr && eSuspendIr.message || eSuspendIr).slice(0, 120);
     }
   }
+  window.__ijFindSetIntelliSenseRecursionCaptureSuspended = setIntelliSenseRecursionCaptureSuspended;
+  window.__ijFindIntelliSenseRecursionCaptureState = function () {
+    try {
+      return {
+        suspended: !!window.__ijFindIrCaptureSuspended,
+        reasons: listIrSuspendReasons(),
+        editorActivityCount: typeof window.__ijFindEditorActivityCount === 'number'
+          ? window.__ijFindEditorActivityCount
+          : 0,
+      };
+    } catch (eState) { return { err: String(eState && eState.message || eState).slice(0, 120) }; }
+  };
+  // editor-activity reason is reference-counted and auto-clears after 1s
+  // of quiescence so a tab-switch burst keeps the IR capture suppressed
+  // without permanently disabling it.
+  var __ijssEditorActivityTimer;
+  function noteEditorActivityFromWorkbench(reason) {
+    try {
+      window.__ijFindEditorActivityCount = (typeof window.__ijFindEditorActivityCount === 'number'
+        ? window.__ijFindEditorActivityCount
+        : 0) + 1;
+      setIntelliSenseRecursionCaptureSuspended(true, 'editor-activity');
+    } catch (eNote) {}
+    try { if (__ijssEditorActivityTimer) { clearTimeout(__ijssEditorActivityTimer); } } catch (eClearTimer) {}
+    try {
+      __ijssEditorActivityTimer = setTimeout(function () {
+        __ijssEditorActivityTimer = undefined;
+        try { setIntelliSenseRecursionCaptureSuspended(false, 'editor-activity'); } catch (eClearReason) {}
+      }, 1000);
+    } catch (eTimerSet) {}
+  }
+  window.__ijFindNoteWorkbenchEditorActivity = noteEditorActivityFromWorkbench;
 
   // Unique id per patch install (per window). Paired with __seq below so the
   // ext host can dedup duplicate deliveries from accumulated CDP listeners
@@ -218,7 +293,7 @@ export function getRendererPatchScript(
     __ijFindDisposers = [];
     try { if (typeof hideHover === 'function') { hideHover(); out.push('hover=hidden'); } } catch (eHover) {}
     try { if (typeof panel !== 'undefined' && panel && panel.parentElement) { panel.parentElement.removeChild(panel); out.push('panel=detached'); } } catch (ePanelDetach) {}
-    try { if (typeof $hoverTooltip !== 'undefined' && $hoverTooltip && $hoverTooltip.parentElement) { $hoverTooltip.parentElement.removeChild($hoverTooltip); out.push('hover=detached'); } } catch (eHoverDetach) {}
+    // $hoverTooltip removed in #32 — nothing to detach here.
     try {
       var previewOverflowRoot = findPreviewOverflowRootForInstance();
       if (previewOverflowRoot && previewOverflowRoot.parentElement) {
@@ -896,8 +971,21 @@ export function getRendererPatchScript(
   }
 
   function previewInlayHintsOptions() {
+    // Disabled in #45 (the user-reported "inlay 클릭 안 됨" + "두 inlay 겹침"
+    // combo). In captain, VSCode's native InlayHintsController DOES query
+    // our CallGraphInlayHintsProvider and renders inline inlay spans —
+    // but InlayHintLabelPart.command does NOT fire when clicked inside
+    // the embed preview editor (Monaco's mouse-click pipeline behaves
+    // differently for isSimpleWidget=true widgets). Result: user sees
+    // both our absolute layer AND the silent native inlays, and their
+    // clicks pick up the native one which dispatches nothing. Turning
+    // native InlayHints off here keeps the preview to a single,
+    // clickable source — our absolute callgraph layer. Trade-off: any
+    // language-server param/type hints (Pylance ":int" etc.) won't show
+    // in the preview pane. Hover popovers are independent and still
+    // work natively.
     return {
-      enabled: 'on',
+      enabled: 'off',
     };
   }
 
@@ -931,12 +1019,14 @@ export function getRendererPatchScript(
       overviewRulerLanes: 3,
       hideCursorInOverviewRuler: false,
     };
-    // Force isSimpleWidget=true so the workbench does not treat this editor
-    // as the active code editor when it gains focus. Without this the user
-    // clicking inside the preview triggered VSCode's EditorService to take
-    // over the widget: its DOM was detached from our host and its model was
-    // cleared, leaving the preview blank. Simple widgets stay opted out of
-    // that takeover while keeping hover/inlay/intellisense features intact.
+    // isSimpleWidget=true keeps VSCode's EditorService from taking over
+    // this widget on focus (it would otherwise detach the DOM and clear
+    // the model — "preview goes blank on click"). The original comment
+    // claimed this keeps hover/inlay/intellisense intact; #47 found that
+    // claim was wrong for LSP providers like Pylance — they need
+    // isSimpleWidget=false to fire hover + autocomplete in the embed.
+    // Opt-in via intellijStyledSearch.previewLanguageFeatures (default
+    // off so existing users don't hit the takeover regression).
     var widgetOptions = {};
     if (m.widgetOptions && typeof m.widgetOptions === 'object') {
       try {
@@ -947,7 +1037,7 @@ export function getRendererPatchScript(
         }
       } catch (eWidgetOpts) {}
     }
-    widgetOptions.isSimpleWidget = true;
+    widgetOptions.isSimpleWidget = !__ijFindEnablePreviewLanguageFeatures;
     var triedDirectNew = false;
     function tryDirectNew(label) {
       if (triedDirectNew) { return null; }
@@ -1011,10 +1101,257 @@ export function getRendererPatchScript(
     }
     if (!m || !m.modelSvc) { return null; }
     var lang = languageId || 'plaintext';
+    // Default: isolated model. Rapid-switch / pressure callers need to
+    // create-and-throw-away models without paying LSP startup cost. We
+    // upgrade to resource-bound asynchronously once the preview settles
+    // (see scheduleSettledPreviewHydrate). That gives hover/intellisense
+    // for the URI the user actually keeps reading without spamming LSP
+    // for 64 burst-clicked previews.
     var isolated = m.modelSvc.createModel(content || '', lang);
     state.previewIsolatedModelCreates++;
     send({ type: 'log', msg: 'setPreviewContent: isolated preview model for ' + uriStr });
     return isolated;
+  }
+
+  // Borrow Monaco's URI constructor from any live model so we can build a
+  // resource-bound model in the renderer without reaching for the bundled
+  // monaco namespace (which Trusted Types and the bundle structure make
+  // awkward to import directly).
+  function getMonacoUriClassFromState() {
+    try {
+      var m = getMonacoFactorySingleton();
+      var modelSvc = m && m.modelSvc;
+      var models = modelSvc && modelSvc.getModels && modelSvc.getModels();
+      if (models && models.length) {
+        for (var i = 0; i < models.length; i++) {
+          var uri = models[i] && models[i].uri;
+          if (uri && uri.constructor) { return uri.constructor; }
+        }
+      }
+    } catch (eFromService) {}
+    try {
+      var editor = state.previewMonacoEditor;
+      var editorModel = editor && editor.getModel && editor.getModel();
+      var editorUri = editorModel && editorModel.uri;
+      if (editorUri && editorUri.constructor) { return editorUri.constructor; }
+    } catch (eFromEditor) {}
+    return null;
+  }
+
+  function parseMonacoUri(uriStr) {
+    var URIClass = getMonacoUriClassFromState();
+    if (!URIClass) { return null; }
+    try { if (typeof URIClass.parse === 'function') { return URIClass.parse(uriStr); } } catch (eParse) {}
+    try { return new URIClass(uriStr); } catch (eCtor) {}
+    return null;
+  }
+
+  function hydrateResourcePreviewForPressureCooldown(reason) {
+    state.lspPressureHydrateTimer = null;
+    // Snapshot for trace: gives the next captain log a clean enter→exit pair
+    // for every hydrate attempt, with the URI scheme before/after the swap.
+    // The existing send({type:'log',...}) lines are filtered out of production
+    // logs by send() unless __ijFindDebugRendererLogs===true, so we route
+    // hydrate diagnostics through trace() (which survives in production logs
+    // when rendererPerfDiagnostics is on).
+    var traceEnterEditor = state.previewMonacoEditor;
+    var traceEnterModel = traceEnterEditor && traceEnterEditor.getModel && traceEnterEditor.getModel();
+    var traceEnterUri = '';
+    var traceEnterScheme = '';
+    try {
+      if (traceEnterModel && traceEnterModel.uri) {
+        traceEnterUri = String(traceEnterModel.uri.toString() || '');
+        traceEnterScheme = String(traceEnterModel.uri.scheme || '');
+      }
+    } catch (eTraceEnter) {}
+    var traceTargetUri = state.lastPreviewMsg && state.lastPreviewMsg.uri ? String(state.lastPreviewMsg.uri) : '';
+    trace('preview/hydrate/enter', {
+      reason: String(reason || ''),
+      currentUri: traceEnterUri,
+      currentScheme: traceEnterScheme,
+      targetUri: traceTargetUri,
+    });
+    try {
+      if (state.lspPressureUntil > Date.now()) {
+        // Pressure was extended after we scheduled; reschedule for the new
+        // deadline rather than hydrating mid-window.
+        trace('preview/hydrate/skip', { reason: 'pressure-window-extended', until: state.lspPressureUntil });
+        scheduleLspPressureHydrate();
+        return;
+      }
+      var editor = state.previewMonacoEditor;
+      var msg = state.lastPreviewMsg;
+      if (!editor || !msg || !msg.uri) {
+        trace('preview/hydrate/skip', { reason: 'no-editor-or-msg', hasEditor: !!editor, hasMsg: !!msg });
+        return;
+      }
+      var existingModel = editor.getModel && editor.getModel();
+      var existingUri = existingModel && existingModel.uri ? String(existingModel.uri.toString()) : '';
+      if (existingUri === msg.uri) {
+        trace('preview/hydrate/skip', { reason: 'already-bound', uri: existingUri });
+        return;
+      }
+      var m = getMonacoFactorySingleton();
+      if (!m || !m.modelSvc) {
+        trace('preview/hydrate/skip', { reason: 'no-monaco-or-modelsvc', hasFactory: !!m });
+        return;
+      }
+      var monacoUri = parseMonacoUri(msg.uri);
+      if (!monacoUri) {
+        send({ type: 'log', msg: 'lspPressure cooldown hydrate: could not construct Monaco URI for ' + msg.uri });
+        trace('preview/hydrate/skip', { reason: 'parse-uri-failed', targetUri: msg.uri });
+        return;
+      }
+      var fullText = (msg.lines || []).map(function (l) { return l.text; }).join('\\n');
+      var lang = msg.languageId || 'plaintext';
+      var resourceModel = null;
+      var reusedModel = false;
+      try {
+        resourceModel = m.modelSvc.getModel && m.modelSvc.getModel(monacoUri);
+      } catch (eGet) {}
+      if (resourceModel) {
+        reusedModel = true;
+        send({ type: 'log', msg: 'lspPressure cooldown hydrate: reused existing resource model for ' + msg.uri });
+      } else {
+        try {
+          resourceModel = m.modelSvc.createModel(fullText, lang, monacoUri, false);
+        } catch (eCreate) {
+          send({ type: 'log', msg: 'lspPressure cooldown hydrate create err: ' + (eCreate && eCreate.message) });
+          trace('preview/hydrate/error', { stage: 'createModel', err: String(eCreate && eCreate.message || eCreate).slice(0, 160) });
+          return;
+        }
+        if (!resourceModel) {
+          trace('preview/hydrate/skip', { reason: 'createModel-returned-null' });
+          return;
+        }
+        state.previewResourceModelCreates++;
+      }
+      var hydrateViewState = null;
+      try { hydrateViewState = editor.saveViewState && editor.saveViewState(); } catch (eHydrateSave) {}
+      try {
+        editor.setModel(resourceModel);
+        if (hydrateViewState) {
+          try { editor.restoreViewState && editor.restoreViewState(hydrateViewState); } catch (eHydrateRestore) {}
+        }
+        if (existingModel && existingModel !== resourceModel && existingModel.dispose) {
+          try { existingModel.dispose(); state.previewOwnedModelDisposes++; } catch (eDispose) {}
+        }
+        send({ type: 'log', msg: 'lspPressure cooldown hydrate: swapped to resource model for ' + msg.uri + ' (' + (reason || '') + ')' });
+        var newScheme = '';
+        try {
+          var nm = editor.getModel && editor.getModel();
+          if (nm && nm.uri) { newScheme = String(nm.uri.scheme || ''); }
+        } catch (eNewScheme) {}
+        // Mark hydrated. We previously also cleared the absolute callgraph
+        // layer here (#33) under the assumption that VSCode's native
+        // InlayHintsController would take over via our registered
+        // CallGraphInlayHintsProvider. E2E "native InlayHint click in
+        // embed preview" proved otherwise: the controller does NOT query
+        // our provider for the embed editor — so dropping our layer leaves
+        // the user with nothing to click. #44 revert: keep the absolute
+        // layer alive post-hydrate. The captain "두 inlay 겹쳐 보임"
+        // complaint that motivated #33 turns out to be our callgraph
+        // overlay coexisting with Pylance's native parameter/type hints,
+        // which is intentional — they're different information.
+        state.previewHydrated = true;
+        // The setModel above swapped the editor onto a fresh model, so the
+        // findMatch decorations applied earlier (during
+        // renderPreviewMonacoReal) have been dropped on the OLD model.
+        // Rebuild them on the new model so the user-visible yellow highlight
+        // survives the 250ms hydrate transition.
+        var matchDecorsReapplied = false;
+        try {
+          if (msg) {
+            // Old IDs belonged to the previous model; forget them so
+            // applyPreviewMatchDecorations doesn't waste a deltaDecorations
+            // call clearing IDs that don't apply to the new model.
+            state.previewMonacoMatchDecos = null;
+            applyPreviewMatchDecorations(editor, msg);
+            matchDecorsReapplied = true;
+          }
+        } catch (eReapplyDecos) {
+          send({ type: 'log', msg: 'hydrate reapply match decos err: ' + (eReapplyDecos && eReapplyDecos.message) });
+        }
+        trace('preview/hydrate/success', {
+          reason: String(reason || ''),
+          uri: msg.uri,
+          newScheme: newScheme,
+          reusedModel: reusedModel,
+          // clearedAbsoluteCallGraphLayer was retired in #44 revert. The
+          // field is kept emitting false so older log readers don't break.
+          clearedAbsoluteCallGraphLayer: false,
+          matchDecorsReapplied: matchDecorsReapplied,
+          intellisense: gatherEmbedEditorIntellisenseSnapshot(editor),
+        });
+        // #47 auto-probe at a KNOWN meaningful position: the search
+        // match's start column on focusLine. col=0 (line start) gives
+        // word-based fallback completions and 0 hovers (no symbol
+        // there); the match column actually sits on a symbol token so
+        // Pylance's intelligent providers should respond if they're
+        // bound to this URI. Dedupe is host-side per (uri, line, col).
+        try {
+          var probeLine0 = -1;
+          var probeCol0 = -1;
+          if (msg && typeof msg.focusLine === 'number') {
+            probeLine0 = Math.max(0, msg.focusLine);
+            if (Array.isArray(msg.ranges) && msg.ranges.length > 0 && typeof msg.ranges[0].start === 'number') {
+              probeCol0 = Math.max(0, msg.ranges[0].start);
+            } else {
+              probeCol0 = 0;
+            }
+          }
+          if (probeLine0 >= 0 && probeCol0 >= 0 && msg && msg.uri) {
+            send({
+              type: 'requestIntellisenseProbe',
+              uri: String(msg.uri),
+              line: probeLine0,
+              column: probeCol0,
+              source: 'hydrate-success-match-pos',
+            });
+          }
+        } catch (eAutoProbe) {}
+      } catch (eSet) {
+        send({ type: 'log', msg: 'lspPressure cooldown hydrate setModel err: ' + (eSet && eSet.message) });
+        trace('preview/hydrate/error', { stage: 'setModel', err: String(eSet && eSet.message || eSet).slice(0, 160) });
+      }
+    } catch (eOuter) {
+      send({ type: 'log', msg: 'lspPressure cooldown hydrate threw: ' + (eOuter && eOuter.message) });
+      trace('preview/hydrate/error', { stage: 'outer', err: String(eOuter && eOuter.message || eOuter).slice(0, 160) });
+    }
+  }
+
+  function scheduleLspPressureHydrate() {
+    if (state.lspPressureHydrateTimer) {
+      clearTimeout(state.lspPressureHydrateTimer);
+      state.lspPressureHydrateTimer = null;
+    }
+    var delay = Math.max(0, (state.lspPressureUntil || 0) - Date.now()) + 50;
+    state.lspPressureHydrateTimer = setTimeout(function () {
+      hydrateResourcePreviewForPressureCooldown('cooldown-timer');
+    }, delay);
+  }
+
+  // When the user lands on a preview and stops switching for SETTLE_MS, we
+  // upgrade the isolated model to a resource-bound model so hover /
+  // intellisense / go-to-definition work on the file they're actually
+  // reading. Rapid burst-clicks reset the timer, so we never create 64
+  // resource models for 64 transient previews.
+  var PREVIEW_SETTLE_HYDRATE_DELAY_MS = 250;
+  function scheduleSettledPreviewHydrate() {
+    var hadPrior = !!state.lspPressureHydrateTimer;
+    if (state.lspPressureHydrateTimer) {
+      clearTimeout(state.lspPressureHydrateTimer);
+      state.lspPressureHydrateTimer = null;
+    }
+    var lastUri = state.lastPreviewMsg && state.lastPreviewMsg.uri ? String(state.lastPreviewMsg.uri) : '';
+    trace('preview/hydrate/schedule', {
+      delayMs: PREVIEW_SETTLE_HYDRATE_DELAY_MS,
+      replacedPriorTimer: hadPrior,
+      lastUri: lastUri,
+    });
+    state.lspPressureHydrateTimer = setTimeout(function () {
+      hydrateResourcePreviewForPressureCooldown('settle-timer');
+    }, PREVIEW_SETTLE_HYDRATE_DELAY_MS);
   }
 
   function setPreviewContent(editor, content, languageId, uriStr, fullFile) {
@@ -1031,10 +1368,18 @@ export function getRendererPatchScript(
       if (!model) { return false; }
       editor.setModel(model);
       if (old && old.dispose && old !== model) {
-        try {
-          old.dispose();
-          state.previewOwnedModelDisposes++;
-        } catch (e) {}
+        // Only dispose models we own (isolated, scheme=inmemory). A
+        // resource-bound model (scheme=file) is shared with the workbench
+        // editor and other VS Code subsystems — disposing it tears down
+        // the open editor for that file. Leave file:// models alone.
+        var oldScheme = '';
+        try { oldScheme = old.uri && old.uri.scheme ? String(old.uri.scheme) : ''; } catch (eScheme) {}
+        if (oldScheme === 'inmemory' || oldScheme === '') {
+          try {
+            old.dispose();
+            state.previewOwnedModelDisposes++;
+          } catch (e) {}
+        }
       }
       return true;
     } catch (e) {
@@ -1496,20 +1841,11 @@ export function getRendererPatchScript(
       return document.body;
     }
   }
-  function isDomPreviewHoverEnabled() {
-    return window.__ijFindEnableDomPreviewHover === true;
-  }
-  function ensureHoverTooltipMounted() {
-    if (!isDomPreviewHoverEnabled()) { return false; }
-    try {
-      if (!$hoverTooltip.parentElement) {
-        document.body.appendChild($hoverTooltip);
-      }
-      return true;
-    } catch (e) {
-      return false;
-    }
-  }
+  // Legacy DIY hover tooltip was removed in #32 — VSCode's native Monaco
+  // hover handles all hover content now (#33 made the embed editor reuse
+  // the workbench hover service). Both helpers below are kept as stubs so
+  // any straggler references in the source compile, but they are no-ops.
+  function isDomPreviewHoverEnabled() { return false; }
 
   var style = document.createElement('style');
   style.textContent = [
@@ -2240,11 +2576,8 @@ export function getRendererPatchScript(
   try { panel.setAttribute('data-ij-find-src', __ijFindInstanceId); } catch (ePanelSrcAttr) {}
   wireSearchPanelFocus(panel);
 
-  var $hoverTooltip = el('div', { className: 'ij-find-hover-tooltip' });
-  markSearchUiRoot($hoverTooltip);
-  if (isDomPreviewHoverEnabled()) {
-    syncPreviewOverflowTheme($hoverTooltip);
-  }
+  // $hoverTooltip element (DIY hover) removed in #32 — Monaco's native
+  // hover infra handles all hover UX through our preview editor now.
 
   // When the preview pane is resized (panel corner drag or splitter), relayout
   // any stolen Monaco editor so it re-fits the available area.
@@ -2293,10 +2626,21 @@ export function getRendererPatchScript(
     searchTicker: null,        // setInterval handle refreshing the status with live elapsed time
     previewMode: '',           // 'monaco' | 'stolen' | 'dom'
     lastPreviewMsg: null,
+    // True once the settle hydrate has upgraded the preview model to a
+    // file://-bound resource model. At that point VSCode's
+    // InlayHintsController starts driving inlays via our registered
+    // CallGraphInlayHintsProvider, so our own absolutely-positioned
+    // callgraph layer must step aside — otherwise the same hints render
+    // twice on the same line. Reset to false on every new-URI preview
+    // render so the immediate inlay paint still uses our fast path.
+    previewHydrated: false,
     previewRecoveryTimer: null,
     previewResourceModelCreates: 0,
     previewIsolatedModelCreates: 0,
     previewOwnedModelDisposes: 0,
+    lspPressureUntil: 0,
+    lspPressureReason: '',
+    lspPressureHydrateTimer: null,
     editing: false,
     editTextarea: null,
     // DOM-move ("stolen editor") state: we physically relocate a real VSCode
@@ -2312,6 +2656,8 @@ export function getRendererPatchScript(
     stolenGroupOrigStyles: null,
     previewMonacoEditor: null,
     previewMonacoHost: null,
+    lastRenderedPreviewUri: '',
+    lastRenderedPreviewFocusLine: -1,
     previewMonacoInlayLayer: null,
     previewMonacoInlayDisposers: [],
     previewMonacoSaveEditor: null,
@@ -2370,8 +2716,6 @@ export function getRendererPatchScript(
       hasDebounce: false,
       hasTicker: false,
       hasHoverTimer: false,
-      hoverTooltipMounted: false,
-      domPreviewHoverEnabled: false,
       monacoProbeDisabled: !!window.__ijFindDisableMonacoProbes,
       rendererInlayClickHook: !!window.__ijFindEnableRendererInlayClickHook,
       disposeOnHide: !!window.__ijFindDisposeRendererPatchOnHide
@@ -2395,8 +2739,6 @@ export function getRendererPatchScript(
       out.hasDebounce = !!state.debounce;
       out.hasTicker = !!state.searchTicker;
       out.hasHoverTimer = !!state.hoverTimer;
-      out.hoverTooltipMounted = !!($hoverTooltip && $hoverTooltip.parentElement);
-      out.domPreviewHoverEnabled = isDomPreviewHoverEnabled();
     } catch (eState) {
       out.stateError = String(eState && eState.message || eState).slice(0, 160);
     }
@@ -3743,8 +4085,20 @@ export function getRendererPatchScript(
       state.previewRecoveryTimer = null;
     }
     if (state.stolenEditor) { restoreStolenEditor(); }
-    if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
-      // Keep editor in memory; just blank out its model contents.
+    // Preserve the embedded preview Monaco editor across clears so the
+    // next preview render reuses it (avoiding the 124ms cold create cost
+    // measured in captain log.txt). The match-decoration cleanup runs
+    // below so a stale findMatch highlight doesn't outlive its query.
+    if (state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody) {
+      try {
+        if (state.previewMonacoMatchDecos) {
+          state.previewMonacoEditor.deltaDecorations(state.previewMonacoMatchDecos, []);
+          state.previewMonacoMatchDecos = null;
+        }
+      } catch (eClearMatchDecos) {}
+      state.previewHydrated = false;
+    } else if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
+      // Legacy stolen-monaco path: keep editor in memory; blank out the model.
       try { state.monacoEditor.setValue(''); } catch (e) {}
     } else {
       clearChildren($previewBody);
@@ -4045,6 +4399,7 @@ export function getRendererPatchScript(
 
   function selectMatch(flatIdx) {
     if (flatIdx < 0 || flatIdx >= state.flat.length) { return; }
+    var selectT0 = perfNow();
     state.activeIndex = flatIdx;
     applyActive(true);
     var fm = state.flat[flatIdx];
@@ -4052,16 +4407,28 @@ export function getRendererPatchScript(
     // file at line 0 so the user can skim while rg catches up.
     if (fm.pendingUri) {
       var pkey = fm.pendingUri + '#pending';
-      if (pkey === state.lastPreviewKey && state.previewUri === fm.pendingUri) { return; }
+      if (pkey === state.lastPreviewKey && state.previewUri === fm.pendingUri) {
+        trace('preview/select', { path: 'pending-dedup', flatIdx: flatIdx, applyActiveMs: Math.round(perfNow() - selectT0) });
+        return;
+      }
       state.lastPreviewKey = pkey;
       state.activePreviewSeq++;
+      trace('preview/select', {
+        path: 'pending',
+        flatIdx: flatIdx,
+        previewSeq: state.activePreviewSeq,
+        applyActiveMs: Math.round(perfNow() - selectT0),
+      });
       send({ type: 'requestPreview', uri: fm.pendingUri, line: 0, contextLines: 0, previewSeq: state.activePreviewSeq });
       return;
     }
     var f = state.files[fm.fi];
     var m = f.matches[fm.mi];
     var key = f.uri + '#' + m.line;
-    if (key === state.lastPreviewKey && state.previewUri === f.uri) { return; }
+    if (key === state.lastPreviewKey && state.previewUri === f.uri) {
+      trace('preview/select', { path: 'dedup', flatIdx: flatIdx, applyActiveMs: Math.round(perfNow() - selectT0) });
+      return;
+    }
     state.lastPreviewKey = key;
     // When the user is in extension-typing mode, rg's m.ranges cover the
     // OLD (shorter) query. The preview should highlight what the user
@@ -4071,6 +4438,13 @@ export function getRendererPatchScript(
     // Only refresh the overlay's preview pane; do NOT touch VSCode's editor
     // area at all. Arrow-key browsing leaves no trace.
     state.activePreviewSeq++;
+    trace('preview/select', {
+      path: 'match',
+      flatIdx: flatIdx,
+      previewSeq: state.activePreviewSeq,
+      line: m.line,
+      applyActiveMs: Math.round(perfNow() - selectT0),
+    });
     send({ type: 'requestPreview', uri: f.uri, line: m.line, ranges: previewRanges, contextLines: 0, previewSeq: state.activePreviewSeq });
   }
 
@@ -5092,6 +5466,20 @@ export function getRendererPatchScript(
       try { monacoStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status'; }
       catch (eStatus) { monacoStatus = 'status-err:' + (eStatus && eStatus.message); }
       try { m = getMonacoFactorySingleton(); } catch (eRefreshMonaco) {}
+      // Cold-path warmup: when capture isn't ready yet but the workbench
+      // already has a real Monaco editor mounted, try a synchronous DOM scan
+      // + TEST widget promotion before falling back to renderPreviewDOM.
+      // Without this, the first preview after a cold extension start spends
+      // ~700-1500ms in DOM mode while the extension's capture diagnostic
+      // schedules force-open; that wasted hop is exactly the pattern that
+      // shows up in captain log.txt.
+      if (monacoStatus !== 'ready' || !m || !m.ctor) {
+        try { if (typeof window.__ijFindCaptureFromDom === 'function') { window.__ijFindCaptureFromDom(); } } catch (eDomScan) {}
+        try { if (typeof window.__ijFindTestCreateWidget === 'function') { window.__ijFindTestCreateWidget(); } } catch (ePromote) {}
+        try { monacoStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : monacoStatus; }
+        catch (eStatus2) {}
+        try { m = getMonacoFactorySingleton(); } catch (eRefresh2) {}
+      }
     }
     send({ type: 'log', msg: 'renderPreview uri=' + (msg.relPath || msg.uri).slice(0, 80) +
       ' hasMonaco=' + (!!m) +
@@ -5108,29 +5496,300 @@ export function getRendererPatchScript(
     scheduleDomPreviewRecovery(msg);
   }
 
+  // B-path warmup retry scheduling. Stores a single in-flight timer +
+  // attempt count; resets when prewarm succeeds or the panel hides.
+  var __ijFindPrewarmRetryTimer = null;
+  // First retry deliberately tight (50ms) — captain log 01:14 showed
+  // Monaco capture going ready right around the time the user fired
+  // their first click (~500ms after show). Anything longer and the user
+  // beats prewarm to it. Later retries back off normally so a tab that
+  // truly has no Monaco doesn't churn.
+  var __ijFindPrewarmRetryDelays = [50, 200, 400, 800, 1600];
+  function schedulePrewarmRetry(reason) {
+    try {
+      if (__ijFindPrewarmRetryTimer) { return; }
+      if (state.previewMonacoEditor) { return; }
+      if (!$previewBody || !$previewBody.isConnected) { return; }
+      var attempt = (state.previewPrewarmAttempts || 0);
+      if (attempt >= __ijFindPrewarmRetryDelays.length) {
+        trace('preview/prewarm/retry-give-up', { attempts: attempt, source: String(reason || '') });
+        return;
+      }
+      var delay = __ijFindPrewarmRetryDelays[attempt];
+      state.previewPrewarmAttempts = attempt + 1;
+      trace('preview/prewarm/retry-scheduled', { attempt: attempt + 1, delayMs: delay, source: String(reason || '') });
+      __ijFindPrewarmRetryTimer = setTimeout(function () {
+        __ijFindPrewarmRetryTimer = null;
+        try { prewarmPreviewMonacoEditor('retry#' + (attempt + 1) + ':' + (reason || '')); } catch (eRetry) {}
+      }, delay);
+    } catch (eSched) {}
+  }
+  function cancelPrewarmRetry() {
+    try {
+      if (__ijFindPrewarmRetryTimer) {
+        clearTimeout(__ijFindPrewarmRetryTimer);
+        __ijFindPrewarmRetryTimer = null;
+      }
+      state.previewPrewarmAttempts = 0;
+    } catch (eCancel) {}
+  }
+
+  // B-path warmup: create the preview Monaco editor up-front so the
+  // user's first result-row click does NOT pay the cold create cost
+  // (~124ms in captain). Subsequent renders take the reuse path via
+  // canReuse=true in renderPreviewMonacoReal. Safe to call multiple
+  // times; bails out if an editor already exists, Monaco is not yet
+  // captured, or $previewBody is unavailable. When Monaco is not ready,
+  // schedules a backoff retry — see schedulePrewarmRetry above.
+  function prewarmPreviewMonacoEditor(reason) {
+    try {
+      if (state.previewMonacoEditor) {
+        trace('preview/prewarm/skip', { reason: 'already-have-editor', source: String(reason || '') });
+        return;
+      }
+      if (!$previewBody || !$previewBody.isConnected) {
+        trace('preview/prewarm/skip', { reason: 'no-preview-body', source: String(reason || '') });
+        return;
+      }
+      if (window.__ijFindDisableMonacoProbes) {
+        trace('preview/prewarm/skip', { reason: 'monaco-probes-disabled', source: String(reason || '') });
+        return;
+      }
+      var monacoStatus = 'disabled';
+      try { monacoStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status'; }
+      catch (eStatus) { monacoStatus = 'status-err:' + (eStatus && eStatus.message); }
+      var factory = null;
+      try { factory = getMonacoFactorySingleton(); } catch (eFactory) {}
+      if (monacoStatus !== 'ready' || !factory || !factory.ctor) {
+        // Captain log 00:42 showed both first-show prewarms skip here:
+        // monacoStatus=not-ready:none, hasFactory=false. Capture is lazy
+        // and happens after the panel paints. Re-schedule a backoff retry
+        // so prewarm eventually fires once Monaco is captured — without
+        // this the first user click STILL pays the cold create cost.
+        // Cap at ~3s total (200, 400, 800, 1600ms) so a tab without any
+        // captured Monaco doesn't churn forever.
+        trace('preview/prewarm/skip', { reason: 'monaco-not-ready', monacoStatus: monacoStatus, hasFactory: !!factory, source: String(reason || '') });
+        schedulePrewarmRetry(reason);
+        return;
+      }
+      var warmT0 = perfNow();
+      var host = document.createElement('div');
+      host.className = 'ij-find-monaco-preview-host';
+      host.style.cssText = 'width:100%;height:100%;overflow:hidden;';
+      $previewBody.appendChild(host);
+      $previewBody.classList.add('ij-find-editor-mounted');
+      var editor = null;
+      try { editor = createPreviewEditor(host); } catch (eCreate) {
+        send({ type: 'log', msg: 'prewarm createPreviewEditor threw: ' + (eCreate && eCreate.message) });
+      }
+      if (!editor) {
+        try { $previewBody.removeChild(host); } catch (eRemoveHost) {}
+        $previewBody.classList.remove('ij-find-editor-mounted');
+        trace('preview/prewarm/skip', { reason: 'create-failed', source: String(reason || '') });
+        return;
+      }
+      state.previewMonacoEditor = editor;
+      state.previewMonacoHost = host;
+      // Leave previewMode empty so renderPreview() still treats the first
+      // real message as "first render" semantically — but canReuse is
+      // checked against (previewMonacoEditor && host && host.parentElement
+      // === $previewBody), which is now TRUE. The first real preview will
+      // take the reuse path: setPreviewContent swaps in the actual model.
+      try {
+        var rect = host.getBoundingClientRect();
+        editor.layout({ width: Math.max(0, Math.floor(rect.width)), height: Math.max(0, Math.floor(rect.height)) });
+      } catch (eLayout) {}
+      trace('preview/prewarm/done', {
+        source: String(reason || ''),
+        elapsedMs: Math.round(perfNow() - warmT0),
+        attempts: (state.previewPrewarmAttempts || 0),
+      });
+      cancelPrewarmRetry();
+    } catch (eOuter) {
+      send({ type: 'log', msg: 'prewarm outer err: ' + (eOuter && eOuter.message) });
+    }
+  }
+
+  // Test hook: lets E2E tests force a prewarm attempt without bouncing
+  // through showSearchPanel's setTimeout(0). Intentionally only exposed
+  // under the renderer test API namespace so production code paths
+  // continue to go through showSearchPanel.
+  try {
+    window.__ijFindForceTestPrewarm = function (reason) {
+      try { prewarmPreviewMonacoEditor(reason || 'test'); return 'ok'; }
+      catch (eForce) { return 'err:' + String(eForce && eForce.message || eForce).slice(0, 120); }
+    };
+  } catch (eExposePrewarm) {}
+
+  // Diagnostic snapshot of the embed preview editor's language-feature
+  // surface: isSimpleWidget flag, model URI scheme/language, line count,
+  // hover/contentHover contribution presence, and any contentHover widget
+  // currently in the DOM. Gives ground evidence for tracking #2
+  // (Pylance hover/autocomplete not appearing in preview). All checks
+  // are best-effort — Monaco internals shift across versions.
+  function gatherEmbedEditorIntellisenseSnapshot(editor) {
+    var out = {
+      enablePreviewLanguageFeatures: !!__ijFindEnablePreviewLanguageFeatures,
+      hasEditor: !!editor,
+      isSimpleWidget: null,
+      modelScheme: '',
+      modelLanguage: '',
+      modelLineCount: -1,
+      hasContentHoverContrib: false,
+      contentHoverWidgetCount: 0,
+    };
+    if (!editor) { return out; }
+    try {
+      // CodeEditorWidget exposes _configuration with options. The simple
+      // widget flag is on a separate option key (EditorOption isSimpleWidget
+      // in modern builds). Fall back to a direct property probe — recent
+      // VSCode keeps it on the widget instance under isSimpleWidget via
+      // the constructor option.
+      if (typeof editor.isSimpleWidget === 'boolean') {
+        out.isSimpleWidget = editor.isSimpleWidget;
+      } else if (editor._configuration && editor._configuration.options) {
+        // EditorOption.isSimpleWidget is an enum; try string key first.
+        try { out.isSimpleWidget = !!editor._configuration.options.get('isSimpleWidget'); }
+        catch (eOptGet) {}
+      }
+    } catch (eSimpleProbe) {}
+    try {
+      var model = editor.getModel && editor.getModel();
+      if (model && model.uri) { out.modelScheme = String(model.uri.scheme || ''); }
+      if (model && typeof model.getLanguageId === 'function') { out.modelLanguage = String(model.getLanguageId() || ''); }
+      else if (model && typeof model.getModeId === 'function') { out.modelLanguage = String(model.getModeId() || ''); }
+      if (model && typeof model.getLineCount === 'function') { out.modelLineCount = model.getLineCount(); }
+    } catch (eModelProbe) {}
+    try {
+      if (typeof editor.getContribution === 'function') {
+        out.hasContentHoverContrib = !!(editor.getContribution('editor.contrib.contentHover')
+          || editor.getContribution('editor.contrib.hover'));
+      }
+    } catch (eContribProbe) {}
+    try {
+      out.contentHoverWidgetCount = document.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget').length;
+    } catch (eHoverDomProbe) {}
+    return out;
+  }
+  // Expose for future test instrumentation (no production use).
+  try { window.__ijFindGatherEmbedEditorIntellisenseSnapshot = gatherEmbedEditorIntellisenseSnapshot; } catch (eExposeIs) {}
+
   function renderPreviewMonacoReal(msg) {
+    var renderT0 = perfNow();
     if (state.stolenEditor) { restoreStolenEditor(); }
     var fullText = (msg.lines || []).map(function (l) { return l.text; }).join('\\n');
     var lang = msg.languageId || 'plaintext';
-    send({ type: 'log', msg: 'monacoReal lines=' + (msg.lines ? msg.lines.length : 0) + ' lang=' + lang + ' reuse=' + !!(state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody) });
+    var canReuse = !!(state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody);
+    // Whenever the user lands on a different URI, the hydrate trip has to
+    // run again on the new model. Reset previewHydrated so our fast-path
+    // absolute callgraph layer renders inlays for the first 250ms before
+    // the native InlayHintsController takes over.
+    if (msg && msg.uri && msg.uri !== state.lastRenderedPreviewUri) {
+      state.previewHydrated = false;
+    }
+    send({ type: 'log', msg: 'monacoReal lines=' + (msg.lines ? msg.lines.length : 0) + ' lang=' + lang + ' reuse=' + canReuse });
+    // Snapshot the leak-prone counters BEFORE rendering so the trace can
+    // attribute any growth to this exact render.
+    var preMonacoHovers = 0;
+    var preIjRoots = 0;
+    try {
+      preMonacoHovers = document.querySelectorAll('.monaco-hover,.monaco-editor-hover').length;
+      preIjRoots = document.querySelectorAll('[data-ijss-root="true"]').length;
+    } catch (ePreDom) {}
+    trace('preview/render/start', {
+      uri: msg && msg.uri ? String(msg.uri) : '',
+      canReuse: canReuse,
+      lines: msg && msg.lines ? msg.lines.length : 0,
+      lang: lang,
+      preMonacoHovers: preMonacoHovers,
+      preIjRoots: preIjRoots,
+    });
     // Reuse existing widget if it's still mounted in our preview body.
-    if (state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody) {
+    if (canReuse) {
+      // Same-URI rerender (capture refresh, lspPressure hydrate, repeated
+      // requestPreview for the SAME match line, etc.) should not yank
+      // the user's scroll position back. Save the viewState before the
+      // model swap and restore it after instead of calling revealMatch.
+      // BUT if the user clicked a different result on the same file
+      // (different focusLine), the new match line might be 100 lines
+      // below — in that case we MUST scroll to it. #46 fix: only treat
+      // as "same refresh" when focusLine is also unchanged.
+      var msgFocusLine = (msg && typeof msg.focusLine === 'number') ? msg.focusLine : -1;
+      var isSameUriRefresh = state.lastRenderedPreviewUri === msg.uri
+        && state.lastRenderedPreviewFocusLine === msgFocusLine;
+      var savedViewState = null;
+      if (isSameUriRefresh) {
+        try { savedViewState = state.previewMonacoEditor.saveViewState && state.previewMonacoEditor.saveViewState(); }
+        catch (eSaveVs) {}
+      }
+      var setT0 = perfNow();
       var ok = setPreviewContent(state.previewMonacoEditor, fullText, lang, msg.uri, state.previewFullFile);
-      send({ type: 'log', msg: 'monacoReal reuse setModel=' + ok });
+      var setMs = Math.round(perfNow() - setT0);
+      send({ type: 'log', msg: 'monacoReal reuse setModel=' + ok + ' sameUriRefresh=' + isSameUriRefresh });
       if (ok) {
+        var layoutT0 = perfNow();
         try {
           var rect = state.previewMonacoHost.getBoundingClientRect();
           state.previewMonacoEditor.layout({ width: Math.floor(rect.width), height: Math.floor(rect.height) });
         } catch (e) {}
+        var layoutMs = Math.round(perfNow() - layoutT0);
         wirePreviewMonacoEditor(state.previewMonacoEditor);
+        var decoT0 = perfNow();
         applyPreviewMatchDecorations(state.previewMonacoEditor, msg);
-        try { revealMatchImmediate(state.previewMonacoEditor, msg); } catch (e) {}
-        placeCursorAtMatch(state.previewMonacoEditor, msg);
+        var decoMs = Math.round(perfNow() - decoT0);
+        if (isSameUriRefresh && savedViewState) {
+          try { state.previewMonacoEditor.restoreViewState && state.previewMonacoEditor.restoreViewState(savedViewState); }
+          catch (eRestoreVs) {}
+        } else {
+          try { revealMatchImmediate(state.previewMonacoEditor, msg); } catch (e) {}
+          placeCursorAtMatch(state.previewMonacoEditor, msg);
+        }
+        var inlayT0 = perfNow();
         renderPreviewMonacoCallGraphInlays(state.previewMonacoEditor, msg);
+        var inlayMs = Math.round(perfNow() - inlayT0);
         state.previewMode = 'monaco';
+        state.lastRenderedPreviewUri = msg.uri;
+        state.lastRenderedPreviewFocusLine = msgFocusLine;
+        scheduleSettledPreviewHydrate();
+        var postReuseMonacoHovers = 0;
+        var postReuseIjRoots = 0;
+        try {
+          postReuseMonacoHovers = document.querySelectorAll('.monaco-hover,.monaco-editor-hover').length;
+          postReuseIjRoots = document.querySelectorAll('[data-ijss-root="true"]').length;
+        } catch (ePostReuse) {}
+        trace('preview/render/done', {
+          path: 'reuse',
+          uri: msg && msg.uri ? String(msg.uri) : '',
+          sameUriRefresh: isSameUriRefresh,
+          totalMs: Math.round(perfNow() - renderT0),
+          setContentMs: setMs,
+          layoutMs: layoutMs,
+          decorationsMs: decoMs,
+          inlaysMs: inlayMs,
+          postMonacoHovers: postReuseMonacoHovers,
+          postIjRoots: postReuseIjRoots,
+          deltaHovers: postReuseMonacoHovers - preMonacoHovers,
+          deltaIjRoots: postReuseIjRoots - preIjRoots,
+          intellisense: gatherEmbedEditorIntellisenseSnapshot(state.previewMonacoEditor),
+        });
         return;
       }
     }
+    // CREATE path: about to replace the host with a fresh editor. If we
+    // had a previous Monaco preview editor, its hover/overflow widgets are
+    // anchored to a SHARED overflow host on document.body, NOT to
+    // $previewBody — so clearing $previewBody removes the editor's DOM but
+    // leaks the hover widget and view zones because we never call
+    // editor.dispose(). Trace this gap so we can measure how many leaks
+    // accumulate per session and prove the hypothesis before plugging it.
+    var hadPriorEditor = !!state.previewMonacoEditor;
+    trace('preview/render/create-prep', {
+      hadPriorEditor: hadPriorEditor,
+      // Intentionally NOT disposing the prior editor here yet — see [[project-preview-hover-arch]].
+      // We're instrumenting first so the leak shows up in the trace, then the
+      // E2E pins it, then we fix.
+      priorEditorDisposed: false,
+    });
     clearChildren($previewBody);
     $previewBody.classList.add('ij-find-editor-mounted');
     var host = document.createElement('div');
@@ -5139,11 +5798,19 @@ export function getRendererPatchScript(
     $previewBody.appendChild(host);
     var hostRect = host.getBoundingClientRect();
     send({ type: 'log', msg: 'monacoReal host rect=' + Math.round(hostRect.width) + 'x' + Math.round(hostRect.height) });
+    var createT0 = perfNow();
     var editor = createPreviewEditor(host);
+    var createMs = Math.round(perfNow() - createT0);
     send({ type: 'log', msg: 'monacoReal createPreviewEditor → ' + (editor ? 'OK ' + (editor.constructor && editor.constructor.name) : 'null') });
     if (!editor) {
       try { $previewBody.removeChild(host); } catch (e) {}
       $previewBody.classList.remove('ij-find-editor-mounted');
+      trace('preview/render/done', {
+        path: 'create-failed',
+        uri: msg && msg.uri ? String(msg.uri) : '',
+        totalMs: Math.round(perfNow() - renderT0),
+        createMs: createMs,
+      });
       renderPreviewDOM(msg);
       scheduleDomPreviewRecovery(msg);
       return;
@@ -5151,20 +5818,54 @@ export function getRendererPatchScript(
     state.previewMonacoEditor = editor;
     state.previewMonacoHost = host;
     state.previewMode = 'monaco';
+    var setNewT0 = perfNow();
     var setOk = setPreviewContent(editor, fullText, lang, msg.uri, state.previewFullFile);
+    var setNewMs = Math.round(perfNow() - setNewT0);
     send({ type: 'log', msg: 'monacoReal setPreviewContent=' + setOk });
     wirePreviewMonacoEditor(editor);
+    var layoutNewT0 = perfNow();
     try {
       var r2 = host.getBoundingClientRect();
       editor.layout({ width: Math.floor(r2.width), height: Math.floor(r2.height) });
     } catch (e) {}
+    var layoutNewMs = Math.round(perfNow() - layoutNewT0);
     // Apply decorations BEFORE reveal so they're painted in the same frame
     // the viewport lands — otherwise the user sees scrolling-to-match and
     // then a subsequent flash when highlights appear.
+    var decoNewT0 = perfNow();
     applyPreviewMatchDecorations(editor, msg);
+    var decoNewMs = Math.round(perfNow() - decoNewT0);
     try { revealMatchImmediate(editor, msg); } catch (e) {}
     placeCursorAtMatch(editor, msg);
+    var inlayNewT0 = perfNow();
     renderPreviewMonacoCallGraphInlays(editor, msg);
+    var inlayNewMs = Math.round(perfNow() - inlayNewT0);
+    state.lastRenderedPreviewUri = msg.uri;
+    state.lastRenderedPreviewFocusLine = msgFocusLine;
+    scheduleSettledPreviewHydrate();
+    var postCreateMonacoHovers = 0;
+    var postCreateIjRoots = 0;
+    try {
+      postCreateMonacoHovers = document.querySelectorAll('.monaco-hover,.monaco-editor-hover').length;
+      postCreateIjRoots = document.querySelectorAll('[data-ijss-root="true"]').length;
+    } catch (ePostCreate) {}
+    trace('preview/render/done', {
+      path: 'create',
+      uri: msg && msg.uri ? String(msg.uri) : '',
+      hadPriorEditor: hadPriorEditor,
+      priorEditorDisposed: false,
+      totalMs: Math.round(perfNow() - renderT0),
+      createMs: createMs,
+      setContentMs: setNewMs,
+      layoutMs: layoutNewMs,
+      decorationsMs: decoNewMs,
+      inlaysMs: inlayNewMs,
+      postMonacoHovers: postCreateMonacoHovers,
+      postIjRoots: postCreateIjRoots,
+      deltaHovers: postCreateMonacoHovers - preMonacoHovers,
+      deltaIjRoots: postCreateIjRoots - preIjRoots,
+      intellisense: gatherEmbedEditorIntellisenseSnapshot(editor),
+    });
     // Post-render check
     try {
       var vl = editor.getDomNode && editor.getDomNode() && editor.getDomNode().querySelectorAll('.view-line');
@@ -5519,6 +6220,99 @@ export function getRendererPatchScript(
     }
     wirePreviewMonacoDiagnostics(editor);
     wirePreviewMonacoHealObserver(editor, state.previewMonacoHost);
+    wirePreviewIntellisenseProbes(editor);
+  }
+
+  // Live signal for #47: when the user lingers >= 350ms over a token
+  // in the preview, do TWO things:
+  //   1. Emit a hover-linger trace with the embed editor's diagnostic
+  //      snapshot so the next captain log shows the editor state.
+  //   2. Ask the extension host (via requestIntellisenseProbe) to run
+  //      vscode.executeHoverProvider + executeCompletionItemProvider
+  //      against the SAME position — giving us automatic ground-truth
+  //      without the human needing to invoke a command. Output appears
+  //      as "[diag-auto] preview-intellisense ..." in the log.
+  //
+  // Renderer-side dedupe per (uri, line, col, 3s) so a single position
+  // doesn't generate dozens of probes when multiple listeners fire.
+  var __ijFindIntellisenseProbeRecent = Object.create(null);
+  function wirePreviewIntellisenseProbes(editor) {
+    try {
+      if (!editor || typeof editor.onMouseMove !== 'function') { return; }
+      // wirePreviewMonacoEditor runs on every render (both create and
+      // reuse paths). Without this guard each render adds another
+      // mouseMove listener, multiplying probes per real hover.
+      if (editor.__ijFindIntellisenseProbeWired === true) { return; }
+      try { editor.__ijFindIntellisenseProbeWired = true; } catch (eFlag) {}
+      var lingerTimer = null;
+      var lastPos = null;
+      function clearTimer() {
+        if (lingerTimer) {
+          try { clearTimeout(lingerTimer); } catch (eClearTm) {}
+          lingerTimer = null;
+        }
+      }
+      var disposable = editor.onMouseMove(function (e) {
+        var target = e && e.target;
+        var pos = target && target.position;
+        if (!pos || typeof pos.lineNumber !== 'number') { clearTimer(); return; }
+        if (lastPos && lastPos.lineNumber === pos.lineNumber && lastPos.column === pos.column) { return; }
+        lastPos = { lineNumber: pos.lineNumber, column: pos.column };
+        clearTimer();
+        lingerTimer = setTimeout(function () {
+          try {
+            var snapshot = gatherEmbedEditorIntellisenseSnapshot(editor);
+            var widgetVisible = false;
+            var widgetClasses = [];
+            try {
+              var hovers = document.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget');
+              for (var hi = 0; hi < hovers.length; hi++) {
+                var visible = (hovers[hi].offsetParent !== null) || (hovers[hi].getBoundingClientRect && hovers[hi].getBoundingClientRect().height > 0);
+                if (visible) {
+                  widgetVisible = true;
+                  widgetClasses.push(((hovers[hi].className || '') + '').slice(0, 80));
+                  break;
+                }
+              }
+            } catch (eHoverDom) {}
+            // Convert Monaco's 1-based lineNumber/column to extension
+            // host's 0-based line/character.
+            var line0 = Math.max(0, (pos.lineNumber || 1) - 1);
+            var col0 = Math.max(0, (pos.column || 1) - 1);
+            trace('preview/intellisense/hover-linger', {
+              line: pos.lineNumber,
+              column: pos.column,
+              hoverWidgetVisibleAfter350ms: widgetVisible,
+              hoverWidgetClasses: widgetClasses,
+              snapshot: snapshot,
+            });
+            // Auto ground-truth probe (host-side dedupe handles bursts).
+            try {
+              var uriStr = snapshot && snapshot.modelScheme === 'file' && state.previewUri ? state.previewUri : '';
+              if (uriStr) {
+                var probeKey = uriStr + '|' + line0 + '|' + col0;
+                var nowTs = Date.now();
+                var prev = __ijFindIntellisenseProbeRecent[probeKey] || 0;
+                if (nowTs - prev > 3000) {
+                  __ijFindIntellisenseProbeRecent[probeKey] = nowTs;
+                  send({
+                    type: 'requestIntellisenseProbe',
+                    uri: uriStr,
+                    line: line0,
+                    column: col0,
+                    source: 'hover-linger',
+                  });
+                }
+              }
+            } catch (eProbeReq) {}
+          } catch (eFire) {}
+        }, 350);
+      });
+      addDisposer(function () {
+        clearTimer();
+        try { disposable && disposable.dispose && disposable.dispose(); } catch (eDisp) {}
+      });
+    } catch (eWireProbe) {}
   }
 
   // Seat a real cursor at the match start so (a) the overview-ruler draws a
@@ -5898,7 +6692,7 @@ export function getRendererPatchScript(
       out.push('panel=hidden');
     } catch (ePanel) { out.push('panel=err'); }
     try { if (panel.parentElement) { panel.parentElement.removeChild(panel); out.push('panel=detached'); } } catch (ePanelDetach) {}
-    try { if ($hoverTooltip.parentElement) { $hoverTooltip.parentElement.removeChild($hoverTooltip); out.push('hover=detached'); } } catch (eHoverDetach) {}
+    // $hoverTooltip removed in #32 — nothing to detach here either.
     try {
       var previewOverflowRoot = findPreviewOverflowRootForInstance();
       if (previewOverflowRoot && previewOverflowRoot.parentElement) {
@@ -6312,6 +7106,211 @@ export function getRendererPatchScript(
     return null;
   }
 
+  // #49 user-requested: stamp every native Monaco inlay span with the
+  // (line, kind, text) the symbol it was rendered for, so the click
+  // handler can dispatch with exact precision instead of reconstructing
+  // line/col from click pixels (which drifts across virtual scroll,
+  // line-wrap, fold).
+  //
+  // Monaco renders inlays inside .view-line containers in the workbench
+  // editor. We walk view-lines in DOM order against the editor widget's
+  // visible ranges to derive the model line for each, then stamp every
+  // inlay-looking span on that line.
+  function tagNativeInlaysInViewLine(viewLine, widget, modelLine) {
+    if (!viewLine || typeof modelLine !== 'number' || modelLine < 0) { return { tagged: 0, scanned: 0, kindHits: 0, symbolHits: 0 }; }
+    var tagged = 0;
+    var scanned = 0;
+    var kindHits = 0;
+    var symbolHits = 0;
+    try {
+      // Generous filter — Monaco inlay class names vary across versions.
+      var candidates = viewLine.querySelectorAll('[class*="inlay" i], [class*="hint" i]');
+      for (var i = 0; i < candidates.length; i++) {
+        var span = candidates[i];
+        if (!span || span.getAttribute('data-ijss-render-line')) { continue; }
+        scanned++;
+        // Confirm callgraph-ownership by text — workbench's Pylance param
+        // hints also render here but use different text patterns.
+        var text = ((span.textContent || '') + '').trim();
+        var kind = callGraphInlayKindFromText(text);
+        if (!kind) { continue; }
+        kindHits++;
+        // Symbol/label extraction: ask Monaco directly which inlay hint
+        // is rendered at this span's center via getTargetAtClientPoint.
+        // target.detail.injectedText.options.attachedData carries the
+        // InlayHintLabelPart that holds command + arguments (symbolId,
+        // qualifiedName). #50 user request.
+        var symbolId = '';
+        var symbolLabel = '';
+        try {
+          var rect = span.getBoundingClientRect();
+          var cx = Math.round(rect.left + rect.width / 2);
+          var cy = Math.round(rect.top + rect.height / 2);
+          if (widget && typeof widget.getTargetAtClientPoint === 'function') {
+            var target = widget.getTargetAtClientPoint(cx, cy);
+            var injected = target && target.detail && target.detail.injectedText;
+            var attached = injected && ((injected.options && injected.options.attachedData) || injected.attachedData);
+            var part = attached && (attached.part || attached);
+            var command = part && part.command;
+            var args = command && command.arguments;
+            if (args && args.length >= 1 && typeof args[0] === 'string') {
+              symbolId = args[0];
+              symbolLabel = args.length >= 2 && typeof args[1] === 'string' ? args[1] : '';
+              symbolHits++;
+            }
+          }
+        } catch (eSymProbe) {}
+        try {
+          span.setAttribute('data-ijss-render-line', String(modelLine));
+          span.setAttribute('data-ijss-render-kind', kind);
+          span.setAttribute('data-ijss-render-text', text.slice(0, 60));
+          if (symbolId) {
+            span.setAttribute('data-ijss-render-symbol-id', symbolId);
+          }
+          if (symbolLabel) {
+            span.setAttribute('data-ijss-render-symbol-label', symbolLabel);
+          }
+          tagged++;
+        } catch (eAttr) {}
+      }
+    } catch (eScan) {}
+    return { tagged: tagged, scanned: scanned, kindHits: kindHits, symbolHits: symbolHits };
+  }
+
+  function tagNativeInlaysInEditor(editor) {
+    var summary = { tagged: 0, scanned: 0, kindHits: 0, symbolHits: 0, viewLines: 0, reason: '' };
+    try {
+      if (!editor || typeof editor.getDomNode !== 'function') { summary.reason = 'no-editor-or-getDomNode'; return summary; }
+      if (typeof editor.getVisibleRanges !== 'function') { summary.reason = 'no-getVisibleRanges'; return summary; }
+      var visible = editor.getVisibleRanges() || [];
+      if (!visible.length) { summary.reason = 'empty-visible-ranges'; return summary; }
+      var dom = editor.getDomNode();
+      if (!dom) { summary.reason = 'no-dom'; return summary; }
+      var linesRoots = dom.querySelectorAll('.view-lines');
+      if (!linesRoots || !linesRoots.length) { summary.reason = 'no-view-lines-root'; return summary; }
+      // Flatten visible ranges into ordered model lines; wrap/fold splits
+      // them into multiple ranges that we walk in sequence.
+      var flatLines = [];
+      for (var rIdx = 0; rIdx < visible.length; rIdx++) {
+        var range = visible[rIdx];
+        var start = Math.max(1, range.startLineNumber || 1);
+        var end = Math.max(start, range.endLineNumber || start);
+        for (var ln = start; ln <= end; ln++) { flatLines.push(ln); }
+      }
+      var domViewLines = linesRoots[0].querySelectorAll('.view-line');
+      summary.viewLines = domViewLines.length;
+      for (var i = 0; i < domViewLines.length && i < flatLines.length; i++) {
+        var modelLineMonaco = flatLines[i];                 // 1-based
+        var modelLineZero = Math.max(0, modelLineMonaco - 1);
+        var local = tagNativeInlaysInViewLine(domViewLines[i], editor, modelLineZero);
+        summary.tagged += local.tagged;
+        summary.scanned += local.scanned;
+        summary.kindHits += local.kindHits;
+        summary.symbolHits += local.symbolHits;
+      }
+      summary.reason = 'ok';
+      return summary;
+    } catch (eTagEditor) {
+      summary.reason = 'threw:' + String(eTagEditor && eTagEditor.message || eTagEditor).slice(0, 80);
+      return summary;
+    }
+  }
+
+  function setupNativeInlayTagObserver() {
+    if (window.__ijFindNativeInlayTagObserverInstalled === true) { return; }
+    try { window.__ijFindNativeInlayTagObserverInstalled = true; } catch (eFlag) {}
+    var pendingTag = null;
+    function scheduleTagAllEditors() {
+      if (pendingTag) { return; }
+      pendingTag = setTimeout(function () {
+        pendingTag = null;
+        var totalTagged = 0;
+        var totalScanned = 0;
+        var totalKindHits = 0;
+        var totalSymbolHits = 0;
+        var totalViewLines = 0;
+        var editorsTried = 0;
+        var editorDomsSeen = 0;
+        var widgetMisses = 0;
+        var reasons = [];
+        try {
+          var allEditorDoms = document.querySelectorAll('.monaco-editor');
+          for (var i = 0; i < allEditorDoms.length; i++) {
+            var dom = allEditorDoms[i];
+            if (dom.closest && dom.closest('.ij-find-overlay')) { continue; }
+            editorDomsSeen++;
+            try {
+              var widget = findMonacoWidgetOnQuiet(dom);
+              if (!widget) { widgetMisses++; continue; }
+              editorsTried++;
+              var sum = tagNativeInlaysInEditor(widget);
+              if (sum && typeof sum === 'object') {
+                totalTagged += sum.tagged || 0;
+                totalScanned += sum.scanned || 0;
+                totalKindHits += sum.kindHits || 0;
+                totalSymbolHits += sum.symbolHits || 0;
+                totalViewLines += sum.viewLines || 0;
+                if (sum.reason && sum.reason !== 'ok' && reasons.length < 6) {
+                  reasons.push(sum.reason);
+                }
+              }
+            } catch (eWidget) {}
+          }
+        } catch (eAllEditors) {}
+        // Only emit a trace when the tagging pipeline actually did
+        // something interesting — otherwise this fires on every DOM
+        // mutation (we observed 349 emissions in a single captain
+        // session) and drowns the log. Real signals: at least one
+        // span was tagged, OR an editor reported a non-ok failure
+        // reason that we want to diagnose.
+        var hasFailureReason = false;
+        for (var rI = 0; rI < reasons.length; rI++) {
+          if (reasons[rI] && reasons[rI] !== 'ok') { hasFailureReason = true; break; }
+        }
+        if (totalTagged > 0 || hasFailureReason) {
+          try {
+            trace('preview/inlay/render-tagged', {
+              editorDomsSeen: editorDomsSeen,
+              editorsTried: editorsTried,
+              widgetMisses: widgetMisses,
+              totalViewLines: totalViewLines,
+              totalScanned: totalScanned,
+              totalKindHits: totalKindHits,
+              totalSymbolHits: totalSymbolHits,
+              totalTagged: totalTagged,
+              reasons: reasons,
+            });
+          } catch (eTrace) {}
+        }
+      }, 80);
+    }
+    try {
+      var observer = trackObserver(new MutationObserver(function (mutations) {
+        for (var i = 0; i < mutations.length; i++) {
+          var added = mutations[i].addedNodes;
+          if (!added || !added.length) { continue; }
+          for (var j = 0; j < added.length; j++) {
+            var node = added[j];
+            if (!node || node.nodeType !== 1) { continue; }
+            // Cheap filter: only react to nodes likely to contain inlay
+            // text. Match on the class itself OR existence of children.
+            var cls = (node.className || '') + '';
+            if (/inlay|hint|view-line/i.test(cls) || (node.querySelector && node.querySelector('[class*="inlay" i], .view-line'))) {
+              scheduleTagAllEditors();
+              return;
+            }
+          }
+        }
+      }));
+      observer.observe(document.body, { childList: true, subtree: true });
+    } catch (eObsInstall) {}
+    // Tag any inlays already in the DOM right now.
+    scheduleTagAllEditors();
+  }
+  // Kick off tagging once Monaco capture is plausible — best-effort. Idle
+  // failures are harmless; the next mutation will retry.
+  try { setTimeout(setupNativeInlayTagObserver, 0); } catch (eKick) {}
+
   function visibleLineOrdinalFromInlayDom(el, event) {
     try {
       var viewLine = closestCallGraphEditorLine(el);
@@ -6331,6 +7330,104 @@ export function getRendererPatchScript(
       return { lineOrdinal: ordinal, column: 1000000 };
     } catch (eVisibleLineOrdinal) {
       return null;
+    }
+  }
+
+  // #48 user-suggested: Monaco's InlayHintsController stores the rendered
+  // InlayHintLabelPart reference on the injected-text option's attachedData.
+  // When the user clicks an inlay span, getTargetAtClientPoint gives us a
+  // target whose detail.injectedText.options.attachedData IS that label
+  // part — with command + arguments intact. Extracting it directly avoids
+  // re-deriving line/column and querying providers; we just dispatch the
+  // exact command Monaco's hover popup would.
+  function extractInlayHintLabelPartFromClick(widget, event) {
+    try {
+      if (!widget || typeof widget.getTargetAtClientPoint !== 'function') { return null; }
+      var target = widget.getTargetAtClientPoint(event.clientX, event.clientY);
+      if (!target) { return null; }
+      var injected = target.detail && target.detail.injectedText;
+      if (!injected) { return null; }
+      // Some Monaco versions surface attachedData under options, others
+      // directly. Walk both shapes defensively.
+      var attached = (injected.options && injected.options.attachedData)
+        || injected.attachedData
+        || null;
+      if (!attached) { return null; }
+      // attached is an instance of InlayHintLabelPart-like {part, item, ...}
+      // The label part with its command can be nested either as
+      // attached.part (current Code) or directly on attached.
+      var part = attached.part || attached;
+      var command = part && part.command;
+      if (!command || typeof command.command !== 'string') { return null; }
+      return {
+        commandId: String(command.command),
+        commandArguments: Array.isArray(command.arguments) ? command.arguments.slice() : [],
+        commandTitle: command.title ? String(command.title) : '',
+        partLabel: part && typeof part.label === 'string' ? part.label : '',
+      };
+    } catch (eExtractInlay) {
+      return null;
+    }
+  }
+
+  // VS Code's public InlayHint API exposes InlayHintLabelPart.command but
+  // ties it to cmd/ctrl+click (and the context-menu entry) — there's no
+  // plain-click hook. When the workbench main editor's Monaco widget
+  // isn't captured by our probe (so widget=null), our render-tag pipeline
+  // can't stamp the symbolId at draw time and our DOM->widget extraction
+  // path can't read it at click time either. The robust fallback is to
+  // synthesize a cmd/ctrl+click on the inlay span: Monaco's native
+  // InlayHintsController owns the label-part metadata internally and
+  // will resolve the exact symbolId regardless of whether we captured
+  // the widget. Our own document-level handler re-enters from the
+  // synthetic event but bails on metaKey/ctrlKey, so this can't recurse.
+  function simulateCmdClickOnInlay(inlayElement, sourceEvent) {
+    if (!inlayElement || typeof inlayElement.getBoundingClientRect !== 'function') { return false; }
+    try {
+      var isMac = (typeof navigator !== 'undefined' && navigator.platform && /mac|iphone|ipad/i.test(navigator.platform));
+      var rect = inlayElement.getBoundingClientRect();
+      var cx = (sourceEvent && Number.isFinite(sourceEvent.clientX)) ? sourceEvent.clientX : Math.round(rect.left + rect.width / 2);
+      var cy = (sourceEvent && Number.isFinite(sourceEvent.clientY)) ? sourceEvent.clientY : Math.round(rect.top + rect.height / 2);
+      var modMeta = isMac ? true : false;
+      var modCtrl = isMac ? false : true;
+      function dispatchEv(type, useBtn, isPointer) {
+        try {
+          var init = {
+            bubbles: true,
+            cancelable: true,
+            button: 0,
+            buttons: useBtn,
+            clientX: cx,
+            clientY: cy,
+            view: window,
+            metaKey: modMeta,
+            ctrlKey: modCtrl,
+            altKey: false,
+            shiftKey: false,
+          };
+          var ev;
+          if (isPointer && typeof PointerEvent === 'function') {
+            init.pointerType = 'mouse';
+            init.pointerId = 1;
+            init.isPrimary = true;
+            ev = new PointerEvent(type, init);
+          } else {
+            ev = new MouseEvent(type, init);
+          }
+          inlayElement.dispatchEvent(ev);
+        } catch (eDispatchOne) {}
+      }
+      // Monaco's gesture pipeline starts at pointerdown; the legacy
+      // mouse channel and a final click event cover handlers that only
+      // listen on one or the other.
+      dispatchEv('pointerdown', 1, true);
+      dispatchEv('mousedown', 1, false);
+      dispatchEv('pointerup', 0, true);
+      dispatchEv('mouseup', 0, false);
+      dispatchEv('click', 0, false);
+      return true;
+    } catch (eCmdSim) {
+      return false;
     }
   }
 
@@ -6456,6 +7553,277 @@ export function getRendererPatchScript(
       reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-modifier');
       return;
     }
+    // Decide whether this hit belongs to our absolutely-positioned
+    // callgraph layer OR to a VSCode native InlayHint span rendered
+    // inline by InlayHintsController (Pylance, our own provider, etc.).
+    //
+    // Our production span (rendererPatch.ts ~5937): class
+    // "ij-find-preview-inlay ijss-callgraph" + data-ijss-callgraph-
+    // symbol-id, inside .ij-find-preview-monaco-inlay-layer.
+    //
+    // Native inlay path: VSCode does NOT fire InlayHintLabelPart.command
+    // on a plain click — only on cmd/ctrl+click or via the
+    // hover-popup's "Execute command" button. Users expect plain click
+    // to work for our callgraph "usages N / impl N / callees N" inlays
+    // (#46 user report). We own those clicks too — but with
+    // line-based dispatch (column 0) so the extension host falls
+    // through to its line-based symbol resolution instead of trying to
+    // match an inlay column that doesn't exist for that symbol.
+    var isOwnInlay = false;
+    try {
+      var probe = hit.element;
+      for (var depth = 0; probe && depth < 6; depth++, probe = probe.parentElement) {
+        if (!probe || probe === document.body) { break; }
+        if (probe.getAttribute && probe.getAttribute('data-ijss-callgraph-symbol-id')) { isOwnInlay = true; break; }
+        if (probe.classList && probe.classList.contains('ijss-callgraph')) { isOwnInlay = true; break; }
+        if (probe.classList && probe.classList.contains('ij-find-preview-monaco-inlay-layer')) { isOwnInlay = true; break; }
+        if (probe.classList && (probe.classList.contains('view-line') || probe.classList.contains('monaco-editor'))) { break; }
+      }
+    } catch (eOwnProbe) {}
+    if (!isOwnInlay) {
+      // Native callgraph inlay (text pattern "usages N" etc.). Dispatch
+      // to the extension host. Two paths depending on what we can
+      // resolve:
+      //   1. widget + getTargetAtClientPoint → uri + line → dispatch
+      //      activateCallGraphInlayAtPosition with column 0 (extension
+      //      host falls back to line-based symbol resolution).
+      //   2. widget unavailable (workbench editor wasn't captured by our
+      //      Monaco probe, e.g., main editor in captain) → fall back to
+      //      visible-line + activateCallGraphInlayAtVisibleLine, which
+      //      uses vscode.window.activeTextEditor for URI.
+      if (hit.kind === 'usages' || hit.kind === 'impl' || hit.kind === 'callees') {
+        var widget = findEditorWidgetForInlayElement(hit.element);
+        // #49 user-suggested highest-priority path: at render time the
+        // MutationObserver stamps every native callgraph inlay with
+        // data-ijss-render-line / -kind / -text reflecting the EXACT
+        // (line, kind) the symbol was rendered for. If the clicked
+        // element (or any ancestor up to .view-line) carries these
+        // attrs, use them directly — no line/col reconstruction, no
+        // visible-line drift across virtual scroll / wrap / fold.
+        var renderTaggedSpan = null;
+        var renderLine = -1;
+        var renderKind = '';
+        var renderSymbolId = '';
+        var renderSymbolLabel = '';
+        try {
+          var walk = hit.element;
+          for (var depthRt = 0; walk && depthRt < 6; depthRt++, walk = walk.parentElement) {
+            if (!walk || walk === document.body) { break; }
+            if (walk.classList && walk.classList.contains('view-line')) { break; }
+            if (walk.getAttribute && walk.getAttribute('data-ijss-render-line')) {
+              renderTaggedSpan = walk;
+              renderLine = parseInt(walk.getAttribute('data-ijss-render-line'), 10);
+              renderKind = walk.getAttribute('data-ijss-render-kind') || hit.kind;
+              renderSymbolId = walk.getAttribute('data-ijss-render-symbol-id') || '';
+              renderSymbolLabel = walk.getAttribute('data-ijss-render-symbol-label') || '';
+              break;
+            }
+          }
+        } catch (eRtWalk) {}
+        // Highest-priority path: render-time tag carries symbolId — dispatch
+        // showXxxForSymbol directly, bypassing line/registry resolution.
+        if (renderTaggedSpan && renderSymbolId) {
+          try {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+          } catch (eStopSym) {}
+          rememberCallGraphInlayActivation(event, hit);
+          var symCommand = commandForPreviewCallGraphInlayKind(renderKind);
+          var symArgs = [renderSymbolId, renderSymbolLabel];
+          trace('preview/inlay/click', {
+            source: 'native-callgraph-render-tagged-symbol',
+            kind: renderKind,
+            symbolId: renderSymbolId,
+            label: renderSymbolLabel,
+            inlayText: (renderTaggedSpan.getAttribute('data-ijss-render-text') || '').slice(0, 80),
+            inlayClasses: ((renderTaggedSpan.className || '') + '').slice(0, 120),
+            command: symCommand,
+            args: symArgs,
+            renderLine: renderLine,
+          });
+          sendPersistent({
+            type: 'runCommand',
+            command: symCommand,
+            args: symArgs,
+          });
+          reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-callgraph-render-tagged-symbol');
+          return;
+        }
+        if (renderTaggedSpan && Number.isFinite(renderLine) && renderLine >= 0) {
+          try {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+          } catch (eStopTag) {}
+          rememberCallGraphInlayActivation(event, hit);
+          var renderUri = widget && widget.getModel && widget.getModel() && widget.getModel().uri
+            ? String(widget.getModel().uri.toString())
+            : '';
+          var renderArgs = renderUri
+            ? [renderKind, renderUri, renderLine, 1000000]
+            : null;
+          trace('preview/inlay/click', {
+            source: 'native-callgraph-render-tagged',
+            kind: renderKind,
+            symbolId: null,
+            label: null,
+            inlayText: (renderTaggedSpan.getAttribute('data-ijss-render-text') || '').slice(0, 80),
+            inlayClasses: ((renderTaggedSpan.className || '') + '').slice(0, 120),
+            command: renderUri ? 'intellijStyledSearch.activateCallGraphInlayAtPosition' : null,
+            args: renderArgs,
+            renderLine: renderLine,
+            renderUri: renderUri,
+          });
+          if (renderArgs) {
+            sendPersistent({
+              type: 'runCommand',
+              command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
+              args: renderArgs,
+            });
+            reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-callgraph-render-tagged');
+            return;
+          }
+          // No URI available — let the lower fallbacks run.
+        }
+        // #48 user-suggested fast-fast-path: Monaco already attached the
+        // exact InlayHintLabelPart (with command + symbolId arguments) to
+        // the mouse target's injectedText. Read it directly and dispatch
+        // — no line/col reconstruction, no provider re-query, no nearby
+        // fallback. This is the same path the inlay's hover-popup
+        // "Execute command" button takes.
+        var inlayLabel = extractInlayHintLabelPartFromClick(widget, event);
+        if (inlayLabel) {
+          try {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+          } catch (eStopInjected) {}
+          rememberCallGraphInlayActivation(event, hit);
+          trace('preview/inlay/click', {
+            source: 'native-callgraph-inlay-label',
+            kind: hit.kind,
+            symbolId: inlayLabel.commandArguments && inlayLabel.commandArguments[0] || null,
+            label: inlayLabel.commandArguments && inlayLabel.commandArguments[1] || null,
+            inlayText: ((hit.element && hit.element.textContent) || '').slice(0, 80),
+            inlayClasses: ((hit.element && hit.element.className) || '').slice(0, 120),
+            command: inlayLabel.commandId,
+            args: inlayLabel.commandArguments,
+          });
+          sendPersistent({
+            type: 'runCommand',
+            command: inlayLabel.commandId,
+            args: inlayLabel.commandArguments,
+          });
+          reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-callgraph-inlay-label');
+          return;
+        }
+        var pos = editorPositionFromInlayClick(widget, event);
+        if (widget && pos) {
+          try {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+          } catch (eStopNativePos) {}
+          rememberCallGraphInlayActivation(event, hit);
+          // Registry indexes inlays by (line, kind, *line-end column*).
+          // Sending pos.column (Monaco's line-end at the inlay) hits the
+          // exact entry instead of nearby-fallback (col=0 drift bug).
+          // The trailing inlayText arg lets the extension host disambiguate
+          // when line drift (overscan/wrap/fold) maps us to a neighbor line
+          // — it then scans hints in a small window and picks the one whose
+          // label-part text matches exactly (e.g., "usages 50").
+          var inlayTextForDispatch = ((hit.element && hit.element.textContent) || '').trim().slice(0, 120);
+          var posLineCol = [hit.kind, pos.uri, pos.line, pos.column, inlayTextForDispatch];
+          trace('preview/inlay/click', {
+            source: 'native-callgraph-dispatch',
+            kind: hit.kind,
+            symbolId: null,
+            label: null,
+            inlayText: inlayTextForDispatch,
+            inlayClasses: ((hit.element && hit.element.className) || '').slice(0, 120),
+            command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
+            args: posLineCol,
+          });
+          sendPersistent({
+            type: 'runCommand',
+            command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
+            args: posLineCol,
+          });
+          reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-callgraph-dispatch');
+          return;
+        }
+        // Cmd/Ctrl+click redispatch — try BEFORE the visible-line
+        // fallback. visible-line uses lineOrdinal + inlayText drift
+        // recovery, but when the inlay text is non-unique on a page
+        // (e.g., several "usages 1" or "usages 3" inlays) the drift
+        // matcher picks the closest line, which is wrong ~20% of the
+        // time per captain log. Cmd/Ctrl+click delegates the
+        // symbol-resolution to Monaco's own InlayHintsController which
+        // owns 100% accurate metadata regardless of widget capture or
+        // text uniqueness. Trigger this whenever the prior fast paths
+        // missed — not only when widget=null, since the widget+pos
+        // path also frequently misses on workbench inlays even when
+        // findEditorWidgetForInlayElement returns a stale capture.
+        if (simulateCmdClickOnInlay(hit.element, event)) {
+          try {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+          } catch (eStopCmdSim) {}
+          rememberCallGraphInlayActivation(event, hit);
+          trace('preview/inlay/click', {
+            source: 'native-callgraph-cmd-redispatch',
+            kind: hit.kind,
+            symbolId: null,
+            label: null,
+            inlayText: ((hit.element && hit.element.textContent) || '').slice(0, 80),
+            inlayClasses: ((hit.element && hit.element.className) || '').slice(0, 120),
+            command: '(synthetic cmd/ctrl+click -> Monaco native InlayHintsController)',
+            args: null,
+            widgetCaptured: !!widget,
+          });
+          reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-callgraph-cmd-redispatch');
+          return;
+        }
+        var visibleLine = visibleLineOrdinalFromInlayDom(hit.element, event);
+        if (visibleLine) {
+          try {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+          } catch (eStopNativeVl) {}
+          rememberCallGraphInlayActivation(event, hit);
+          // #48: pass the line-end column sentinel (1_000_000) that
+          // visibleLineOrdinalFromInlayDom already computed. Extension
+          // host then uses registry exact-match for (line, kind,
+          // line-end-col) instead of falling back to nearby-search.
+          // Pass inlay text so ext host can disambiguate when ordinal
+          // drifts (Monaco view-line recycle / overscan / wrap).
+          var inlayTextForVlDispatch = ((hit.element && hit.element.textContent) || '').trim().slice(0, 120);
+          var vlArgs = [hit.kind, visibleLine.lineOrdinal, visibleLine.column, inlayTextForVlDispatch];
+          trace('preview/inlay/click', {
+            source: 'native-callgraph-visible-line',
+            kind: hit.kind,
+            symbolId: null,
+            label: null,
+            inlayText: inlayTextForVlDispatch,
+            inlayClasses: ((hit.element && hit.element.className) || '').slice(0, 120),
+            command: 'intellijStyledSearch.activateCallGraphInlayAtVisibleLine',
+            args: vlArgs,
+          });
+          sendPersistent({
+            type: 'runCommand',
+            command: 'intellijStyledSearch.activateCallGraphInlayAtVisibleLine',
+            args: vlArgs,
+          });
+          reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-callgraph-visible-line');
+          return;
+        }
+      }
+      reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-pass-through');
+      return;
+    }
     var widget = findEditorWidgetForInlayElement(hit.element);
     var position = editorPositionFromInlayClick(widget, event);
     if (position) {
@@ -6465,6 +7833,18 @@ export function getRendererPatchScript(
         if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
       } catch (eStop) {}
       rememberCallGraphInlayActivation(event, hit);
+      var ownPosSymbolId = (hit.element && hit.element.getAttribute && hit.element.getAttribute('data-ijss-callgraph-symbol-id')) || null;
+      var ownPosLabel = (hit.element && hit.element.getAttribute && hit.element.getAttribute('data-ijss-callgraph-label')) || null;
+      trace('preview/inlay/click', {
+        source: 'own-position',
+        kind: hit.kind,
+        symbolId: ownPosSymbolId,
+        label: ownPosLabel,
+        inlayText: ((hit.element && hit.element.textContent) || '').slice(0, 80),
+        inlayClasses: ((hit.element && hit.element.className) || '').slice(0, 120),
+        command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
+        args: [hit.kind, position.uri, position.line, position.column],
+      });
       sendPersistent({
         type: 'runCommand',
         command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
@@ -6481,6 +7861,18 @@ export function getRendererPatchScript(
         if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
       } catch (eStopVisibleLine) {}
       rememberCallGraphInlayActivation(event, hit);
+      var ownVlSymbolId = (hit.element && hit.element.getAttribute && hit.element.getAttribute('data-ijss-callgraph-symbol-id')) || null;
+      var ownVlLabel = (hit.element && hit.element.getAttribute && hit.element.getAttribute('data-ijss-callgraph-label')) || null;
+      trace('preview/inlay/click', {
+        source: 'own-visible-line',
+        kind: hit.kind,
+        symbolId: ownVlSymbolId,
+        label: ownVlLabel,
+        inlayText: ((hit.element && hit.element.textContent) || '').slice(0, 80),
+        inlayClasses: ((hit.element && hit.element.className) || '').slice(0, 120),
+        command: 'intellijStyledSearch.activateCallGraphInlayAtVisibleLine',
+        args: [hit.kind, visibleLine.lineOrdinal, visibleLine.column],
+      });
       sendPersistent({
         type: 'runCommand',
         command: 'intellijStyledSearch.activateCallGraphInlayAtVisibleLine',
@@ -7450,61 +8842,14 @@ export function getRendererPatchScript(
     }
   }
 
-  // ── Hover lifecycle (matches editor behavior) ────────────────────────
+  // Hover lifecycle removed in #32 — Monaco's native hover handles all
+  // popovers via the embedded preview editor. The no-op stubs below let
+  // legacy call sites (clearPreview, minimize, disposeSearchUi recovery)
+  // keep their try/catch wrappers without churn.
   var hoverHideTimer = null;
   function cancelHoverHide() { if (hoverHideTimer) { clearTimeout(hoverHideTimer); hoverHideTimer = null; } }
-  function scheduleHoverHide(delayMs) {
-    cancelHoverHide();
-    hoverHideTimer = setTimeout(hideHover, typeof delayMs === 'number' ? delayMs : 200);
-  }
-  function hideHover() {
-    cancelHoverHide();
-    $hoverTooltip.classList.remove('visible');
-    clearChildren($hoverTooltip);
-    state.lastHoverKey = '';
-  }
-
-  function showHoverContents(msg) {
-    if (msg.reqId !== state.hoverReqId) { return; }
-    if (!msg.contents || msg.contents.length === 0) { hideHover(); return; }
-    if (!ensureHoverTooltipMounted()) { return; }
-    cancelHoverHide();
-    clearChildren($hoverTooltip);
-    // Build the inner structure with the SAME class names VSCode's real hover
-    // widget uses (\`monaco-hover-content\`, \`hover-row\`, \`markdown-hover\`,
-    // \`hover-contents\`, \`rendered-markdown\`). DOM-scanning hover plugins —
-    // e.g. intellisense-recursion's \`.rendered-markdown\` walker that injects
-    // \`.ir-type-link\` spans for cmd+click-to-definition — will then decorate
-    // our content automatically, identical to a real editor hover.
-    var hoverContent = el('div', { className: 'monaco-hover-content' });
-    for (var i = 0; i < msg.contents.length; i++) {
-      var entry = msg.contents[i];
-      // Backwards-compat: accept either string or { value, isTrusted, allowedCommands }.
-      var entryValue = (typeof entry === 'string') ? entry : (entry && entry.value) || '';
-      var entryTrusted = (typeof entry === 'object' && entry && !!entry.isTrusted);
-      var entryAllowed = (typeof entry === 'object' && entry && entry.allowedCommands) || undefined;
-      if (!entryValue) { continue; }
-      if (i > 0) { hoverContent.appendChild(el('hr', { className: 'ij-md-sep' })); }
-      var row = el('div', { className: 'hover-row markdown-hover' });
-      var contentsCell = el('div', { className: 'hover-contents' });
-      var group = el('div', { className: 'ij-md-group rendered-markdown' });
-      renderMarkdownInto(group, entryValue, { isTrusted: entryTrusted, allowedCommands: entryAllowed });
-      contentsCell.appendChild(group);
-      row.appendChild(contentsCell);
-      hoverContent.appendChild(row);
-    }
-    $hoverTooltip.appendChild(hoverContent);
-    if (!hoverContent.firstChild) { hideHover(); return; }
-    // Position, keeping inside viewport.
-    $hoverTooltip.style.left = '0px'; $hoverTooltip.style.top = '0px';
-    $hoverTooltip.classList.add('visible');
-    var rect = $hoverTooltip.getBoundingClientRect();
-    var x = msg.x + 14, y = msg.y + 18;
-    if (x + rect.width > window.innerWidth - 8) { x = Math.max(8, window.innerWidth - rect.width - 8); }
-    if (y + rect.height > window.innerHeight - 8) { y = Math.max(8, msg.y - rect.height - 12); }
-    $hoverTooltip.style.left = x + 'px';
-    $hoverTooltip.style.top = y + 'px';
-  }
+  function scheduleHoverHide(_delayMs) { /* no-op after #32 */ }
+  function hideHover() { cancelHoverHide(); state.lastHoverKey = ''; }
 
   var __ijFindLastDomPreviewInlayActivation = null;
   function closestDomPreviewCallGraphInlay(target) {
@@ -7567,9 +8912,20 @@ export function getRendererPatchScript(
         y: event.clientY || 0,
       };
     } catch (eRememberDomInlay) {}
+    var resolvedCommand = commandForPreviewCallGraphInlayKind(kind);
+    trace('preview/inlay/click', {
+      source: 'absolute-layer',
+      kind: kind,
+      symbolId: symbolId,
+      label: label,
+      inlayText: ((inlay.textContent || '') + '').slice(0, 80),
+      inlayClasses: ((inlay.className || '') + '').slice(0, 120),
+      command: resolvedCommand,
+      args: [symbolId, label],
+    });
     sendPersistent({
       type: 'runCommand',
-      command: commandForPreviewCallGraphInlayKind(kind),
+      command: resolvedCommand,
       args: [symbolId, label],
     });
   }
@@ -7593,47 +8949,10 @@ export function getRendererPatchScript(
     }
   }, true);
 
-  on($previewBody, 'mousemove', function (e) {
-    if (!state.previewUri) { return; }
-    // In Monaco mode, the embedded editor handles hover natively via VSCode
-    // language services — don't double-show a custom tooltip.
-    if (state.previewMode === 'monaco' || state.previewMode === 'stolen') { return; }
-    // DOM fallback previews must stay inert by default. Asking the extension
-    // host for hover content on mousemove can reopen CDP and run hover providers
-    // from the workbench renderer, which is exactly the path we avoid when
-    // Monaco capture is disabled.
-    if (window.__ijFindEnableDomPreviewHover !== true) { return; }
-    cancelHoverHide();
-    if (state.hoverTimer) { clearTimeout(state.hoverTimer); }
-    state.hoverTimer = setTimeout(function () {
-      var lineEl = e.target instanceof HTMLElement ? e.target.closest('.ij-find-preview-line') : null;
-      if (!lineEl) { scheduleHoverHide(150); return; }
-      var lineNum = parseInt(lineEl.getAttribute('data-line') || '-1', 10);
-      if (lineNum < 0) { scheduleHoverHide(150); return; }
-      var textSpan = lineEl.querySelector('.ij-find-preview-text');
-      if (!textSpan) { scheduleHoverHide(150); return; }
-      var col = getColumnInLine(textSpan, e);
-      if (col < 0) { scheduleHoverHide(150); return; }
-      var key = state.previewUri + ':' + lineNum + ':' + col;
-      if (key === state.lastHoverKey) { return; }
-      state.lastHoverKey = key;
-      state.hoverReqId++;
-      send({
-        type: 'requestHover',
-        reqId: state.hoverReqId,
-        uri: state.previewUri,
-        line: lineNum, column: col,
-        x: e.clientX, y: e.clientY,
-      });
-    }, 280);
-  });
-  on($previewBody, 'mouseleave', function () {
-    if (state.hoverTimer) { clearTimeout(state.hoverTimer); state.hoverTimer = null; }
-    scheduleHoverHide(220);
-  });
-  // Keep hover open while user moves into / interacts with the tooltip.
-  on($hoverTooltip, 'mouseenter', cancelHoverHide);
-  on($hoverTooltip, 'mouseleave', function () { scheduleHoverHide(180); });
+  // DOM-fallback mouse-hover dispatch was removed in #32. Monaco's
+  // native hover service drives all hover popovers in our preview now
+  // (#33 made the embed model resolve hover providers exactly like a
+  // workbench file editor would).
 
 	  function showSearchPanel(initialQuery, showOptions) {
 	    try {
@@ -7701,13 +9020,9 @@ export function getRendererPatchScript(
       if (!shouldShell) {
         syncPreviewOverflowTheme(panel);
       }
-      if (!shouldShell && isDomPreviewHoverEnabled()) {
-        syncPreviewOverflowTheme($hoverTooltip);
-      }
+      // $hoverTooltip theme sync + body mount were the DIY hover bring-up
+      // path; removed in #32 along with the rest of that subsystem.
       reportPerfPhase('show:themeSync', themeT0, { shouldShell: shouldShell }, 1);
-      if (!shouldShell && isDomPreviewHoverEnabled() && document.body.lastElementChild !== $hoverTooltip) {
-        document.body.appendChild($hoverTooltip);
-      }
       try {
         var previewOverflowRoot = findPreviewOverflowRootForInstance();
         if (previewOverflowRoot && !shouldShell) {
@@ -7716,6 +9031,20 @@ export function getRendererPatchScript(
         }
 	      } catch (e) {}
       trace('show:visible', { wasVisible: !!wasVisible });
+      // Background pre-warm of the preview Monaco editor (B-path). Captain
+      // log measured the first cold createPreviewEditor at ~124ms; once we
+      // pre-create the editor here, the user's first result-row click hits
+      // the reuse path (~13-37ms) instead. Gated to fire only when:
+      //  - we don't already have a preview editor (hide-preserved case),
+      //  - Monaco capture has captured a ctor + services,
+      //  - we're in the main (non-shell) layout so $previewBody is real.
+      // We schedule via setTimeout(0) so the show:visible paint happens
+      // first; the user sees the panel before we burn 100ms on warmup.
+      if (!shouldShell && !state.previewMonacoEditor) {
+        setTimeout(function () {
+          try { prewarmPreviewMonacoEditor('show'); } catch (ePrewarm) {}
+        }, 0);
+      }
       // Paint the overlay BEFORE firing the search — otherwise the browser
       // processes our JS (send to extension → runRgSearch → network roundtrip)
       // inside the same microtask and the panel appears only after the first
@@ -7838,8 +9167,35 @@ export function getRendererPatchScript(
     } catch (eHideDetachPanel) {}
     // Return any stolen VSCode editor to its editor group.
     if (state.stolenEditor) { restoreStolenEditor(); }
-    // Tear down preview monaco widget so its GPU/DOM resources are released.
-    disposePreviewMonacoEditor();
+    // Preserve the preview Monaco editor across hide/show cycles so the
+    // next show's first preview render hits the reuse path
+    // (~13-37ms in captain) instead of paying the 162ms cold create
+    // cost again. The panel itself is detached below; the preview host
+    // travels inside the panel subtree so previewMonacoHost.parentElement
+    // remains $previewBody and canReuse stays true. We DO clear any
+    // search-match decorations on hide so a stale highlight from the last
+    // result doesn't flash at the next show.
+    var preservedEditor = state.previewMonacoEditor;
+    try {
+      if (preservedEditor && state.previewMonacoMatchDecos) {
+        preservedEditor.deltaDecorations(state.previewMonacoMatchDecos, []);
+        state.previewMonacoMatchDecos = null;
+      }
+    } catch (eClearMatchDecos) {}
+    try { clearPreviewMonacoCallGraphInlays(); } catch (eClearInlays) {}
+    // Reset hydrate flag so the next preview's settle hydrate fires
+    // properly (the preserved editor's model might still be file:// from
+    // last time, but the next preview will bind a fresh model).
+    state.previewHydrated = false;
+    // Any in-flight prewarm retry from before this hide is no longer
+    // relevant — the next show will reschedule.
+    try { cancelPrewarmRetry(); } catch (eCancelWarm) {}
+    trace('hide:preserved-preview-editor', { hadEditor: !!preservedEditor });
+    // Each panel instance owns its own overflow root (overflow widgets
+    // anchored to document.body, separate from the panel's subtree). When
+    // a spawned/additional panel is closed forever, its overflow root must
+    // be torn down. The main instance's overflow root will be lazily
+    // recreated by getOrCreatePreviewOverflowHost on next show.
     try {
       var previewOverflowRoot = findPreviewOverflowRootForInstance();
       if (previewOverflowRoot && previewOverflowRoot.parentElement) {
@@ -7970,6 +9326,14 @@ export function getRendererPatchScript(
       return { err: String(eState && eState.message || eState).slice(0, 200) };
     }
   };
+  // Used by E2E only: gives tests direct access to the live preview editor
+  // widget so they can assert on scrollTop / viewState after refresh
+  // scenarios. Refresh on each call rather than caching — the editor
+  // instance is recreated on capture refresh / DOM fallback recovery.
+  Object.defineProperty(window, '__ijFindPreviewEditorForTests', {
+    configurable: true,
+    get: function () { return state.previewMonacoEditor; },
+  });
   window.__ijFindGetSearchState = function () {
     try {
       return {
@@ -7986,6 +9350,8 @@ export function getRendererPatchScript(
         previewResourceModelCreates: state.previewResourceModelCreates || 0,
         previewIsolatedModelCreates: state.previewIsolatedModelCreates || 0,
         previewOwnedModelDisposes: state.previewOwnedModelDisposes || 0,
+        lspPressureUntil: state.lspPressureUntil || 0,
+        lspPressureReason: state.lspPressureReason || '',
         lastPreviewKey: state.lastPreviewKey || null,
         inputValue: $q ? $q.value : null,
         scopeValue: $scope ? $scope.value : null,
@@ -8266,6 +9632,11 @@ export function getRendererPatchScript(
           try { state.lastPreviewMsg.callGraphInlays = Array.isArray(msg.callGraphInlays) ? msg.callGraphInlays : []; } catch (eInlayMsg) {}
         }
         if (state.previewMode === 'monaco' && state.previewMonacoEditor) {
+          // #44 revert: keep rendering our absolute callgraph layer even
+          // after hydrate. The native InlayHintsController does not
+          // actually consult our provider for the embedded editor
+          // (proven by the "native InlayHint click in embed preview" E2E),
+          // so handing off would leave the user with no clickable inlays.
           renderPreviewMonacoCallGraphInlays(state.previewMonacoEditor, msg);
         } else if (state.previewMode === 'dom' && state.lastPreviewMsg) {
           renderPreviewDOM(state.lastPreviewMsg);
@@ -8273,8 +9644,30 @@ export function getRendererPatchScript(
           send({ type: 'log', msg: 'preview inlays not rendered: mode=' + (state.previewMode || '') + ' hasMonaco=' + (!!state.previewMonacoEditor) + ' hasLast=' + (!!state.lastPreviewMsg) });
         }
         break;
-      case 'hover':
-        showHoverContents(msg);
+      case 'lspPressure':
+        // Diagnostics-driven backpressure: when LSP is overloaded the
+        // extension host pushes an until-window during which the renderer
+        // should avoid spawning resource-backed Monaco models. We track the
+        // ack so tests can assert the renderer is paying attention, and we
+        // schedule a one-shot hydrate to upgrade the latest isolated preview
+        // model to a resource-bound model once the pressure window expires.
+        if (msg && msg.active === false) {
+          state.lspPressureUntil = 0;
+          state.lspPressureReason = '';
+          if (state.lspPressureHydrateTimer) {
+            clearTimeout(state.lspPressureHydrateTimer);
+            state.lspPressureHydrateTimer = null;
+          }
+        } else if (msg) {
+          var pressureUntil = typeof msg.until === 'number' ? msg.until : 0;
+          if (pressureUntil > (state.lspPressureUntil || 0)) {
+            state.lspPressureUntil = pressureUntil;
+          }
+          if (typeof msg.reason === 'string') {
+            state.lspPressureReason = msg.reason;
+          }
+          scheduleLspPressureHydrate();
+        }
         break;
     }
       } finally {

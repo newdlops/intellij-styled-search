@@ -45,6 +45,11 @@
         "command": "intellijStyledSearch.rebuildIndex",
         "title": "Force Rebuild Search + Graph Index",
         "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.diagnosePreviewIntellisense",
+        "title": "Diagnose Preview Intellisense (probe Pylance for last previewed URI)",
+        "category": "IntelliJ Search"
       }
     ],
     "keybindings": [
@@ -217,6 +222,11 @@
           "default": false,
           "description": "Fully dispose the injected Search UI renderer patch when the panel is hidden. Disabled by default so direct inlay clicks can reuse the lightweight renderer hook without repeated CDP reinjection."
         },
+        "intellijStyledSearch.previewLanguageFeatures": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Pylance/LSP hover, autocomplete, and other language features inside the preview pane. Creates the embed Monaco editor with isSimpleWidget=false. Default ON because captain log analysis proved isSimpleWidget=true silently suppresses Pylance hover. If you see the preview go blank on click (workbench takeover regression), flip this to false."
+        },
         "intellijStyledSearch.keepCdpOpenWhileSearchUiVisible": {
           "type": "boolean",
           "default": true,
@@ -344,6 +354,12 @@
           "type": "boolean",
           "default": true,
           "description": "Show call graph relation links as inlay hints next to symbols. By default this surfaces callers, usages, and implementations."
+        },
+        "intellijStyledSearch.callGraphMaxUsageResults": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1,
+          "description": "Maximum number of usage results returned by Find Usages and the call graph inlay click flow. The previous hard cap of 500 truncated heavy callers like model classes; bump this if your repository still hits the new ceiling."
         },
         "intellijStyledSearch.callGraphShowCalleeInlayHints": {
           "type": "boolean",

@@ -1,2 +1,9 @@
 {
+    "intellijStyledSearch.engine": "zoekt",
+    "intellijStyledSearch.callGraphInlayHints": true,
+    "intellijStyledSearch.callGraphBackend": "javascript",
+    "intellijStyledSearch.excludeGlobs": [
+        "**/.vscode-test/**",
+        "**/.zoek-rs/**"
+    ]
 }

@@ -377,7 +377,16 @@ export class ZoektRuntime implements vscode.Disposable {
     if (!binary) {
       return { ready: false, reason: 'zoek-rs binary disappeared' };
     }
-    await this.syncWorkspaceIndexIfNeeded(workspaceRoot, binary, 'search');
+    // Race the workspace sync against a short budget so search doesn't get
+    // stuck behind a slow git/incremental update — better to search the
+    // slightly stale index now and let sync finish in the background than
+    // make the user wait. We still wait for any already-queued incremental
+    // file updates because those reflect known edits the user just made.
+    const syncBudgetMs = 1_500;
+    await Promise.race([
+      this.syncWorkspaceIndexIfNeeded(workspaceRoot, binary, 'search'),
+      new Promise<void>((resolve) => setTimeout(resolve, syncBudgetMs)),
+    ]);
     if (this.hasPendingUpdates()) {
       await this.flushPendingUpdates();
     }
@@ -801,6 +810,57 @@ export class ZoektRuntime implements vscode.Disposable {
     this.queueChanged(document.uri, 'save');
   }
 
+  /** @internal Deterministic file-change notification for tests. Queues
+   *  through the same path as the file watcher but does NOT auto-flush —
+   *  call `flushPendingUpdatesForTests()` once after queueing all the
+   *  changes for a single test step so the binary runs one batched update
+   *  instead of one per file. */
+  notifyFileChangedForTests(uri: vscode.Uri, kind: 'changed' | 'deleted' = 'changed'): void {
+    if (kind === 'deleted') {
+      this.queueDeleted(uri, 'test-notify');
+    } else {
+      this.queueChanged(uri, 'test-notify');
+    }
+  }
+
+  /** @internal Tests use this to decide whether to skip a full rebuild. */
+  async hasReadyIndexForTests(): Promise<boolean> {
+    const workspaceRoot = this.getWorkspaceRootPath();
+    if (!workspaceRoot) { return false; }
+    return this.hasReadyIndex(workspaceRoot);
+  }
+
+  /** @internal Immediately flush every queued change for tests, bypassing
+   *  the user-configured debounce/cooldown so the next searchForTests sees
+   *  the new state. The VS Code file watcher fires asynchronously after a
+   *  fs.writeFile/delete, so we drain it in a short loop: after flushing
+   *  what's already queued we yield to the event loop so any pending
+   *  watcher callbacks can enqueue their changes, then flush again. */
+  async flushPendingUpdatesForTests(): Promise<void> {
+    const yieldOnce = () => new Promise<void>((resolve) => setImmediate(resolve));
+    for (let attempt = 0; attempt < 8; attempt++) {
+      if (this.flushTimer) {
+        clearTimeout(this.flushTimer);
+        this.flushTimer = undefined;
+      }
+      const beforeChanged = this.pendingChanged.size;
+      const beforeDeleted = this.pendingDeleted.size;
+      const beforeRenamed = this.pendingRenames.length;
+      await this.flushPendingUpdates();
+      if (this.updatePromise) {
+        try { await this.updatePromise; } catch {}
+      }
+      await yieldOnce();
+      const stillPending = this.pendingChanged.size > 0 ||
+        this.pendingDeleted.size > 0 ||
+        this.pendingRenames.length > 0 ||
+        !!this.flushTimer;
+      const movedThisRound = beforeChanged + beforeDeleted + beforeRenamed > 0;
+      if (!stillPending && !movedThisRound) { return; }
+      if (!stillPending) { return; }
+    }
+  }
+
   private queueChanged(uri: vscode.Uri, reason: string): void {
     if (this.disposed) { return; }
     if (!this.shouldRunIncrementalFileUpdates()) { return; }
@@ -998,14 +1058,19 @@ export class ZoektRuntime implements vscode.Disposable {
 
     const previousHead = previousGitState ? this.gitHeadFromState(previousGitState) : undefined;
     const currentHead = gitState ? this.gitHeadFromState(gitState) : undefined;
+    // If we have a previous head and a different current head we may be
+    // able to ask git for the exact diff; otherwise (first observation of
+    // the repo OR git couldn't compute the diff) fall back to a workspace
+    // --sync so the index doesn't miss the change.
     const changes = previousHead && currentHead && previousHead !== currentHead
       ? await this.collectGitBranchChanges(workspaceRoot, previousHead, currentHead)
       : null;
+    const branchChangeNeedsSync = !!gitState && previousGitState !== gitState && !changes;
     const started = Date.now();
     try {
       if (changes && (changes.changed.length > 0 || changes.deleted.length > 0 || changes.renamed.length > 0)) {
         await this.invokeJson(this.buildUpdateArgs(binary, workspaceRoot, changes), this.lifecycleCts.token);
-      } else if (this.workspaceSyncNeeded) {
+      } else if (this.workspaceSyncNeeded || branchChangeNeedsSync) {
         await this.invokeJson([binary, 'update', workspaceRoot, '--sync'], this.lifecycleCts.token);
       }
       this.lastWorkspaceSyncAt.set(workspaceRoot, Date.now());
@@ -1339,11 +1404,20 @@ export class ZoektRuntime implements vscode.Disposable {
   }
 
   private effectiveExcludeArgs(options: SearchOptions): string[] {
-    const globs = toRipgrepGlobs(options.excludePatterns);
-    const args: string[] = [];
-    for (const glob of globs) {
-      args.push('--exclude', glob);
+    const perQueryGlobs = toRipgrepGlobs(options.excludePatterns);
+    // Configured workspace-wide excludes (intellijStyledSearch.excludeGlobs)
+    // must reach the zoekt search step too — the index itself stays
+    // unfiltered (full rebuild walks every file), so without this the user's
+    // configured cache paths would still surface in zoekt search results
+    // even though the codesearch fallback hides them.
+    let configuredGlobs: string[] = [];
+    if (!options.ignoreConfiguredExcludes) {
+      const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+      configuredGlobs = toRipgrepGlobs(cfg.get<string[]>('excludeGlobs', []));
     }
+    const args: string[] = [];
+    for (const glob of perQueryGlobs) { args.push('--exclude', glob); }
+    for (const glob of configuredGlobs) { args.push('--exclude', glob); }
     return args;
   }
 
@@ -1453,6 +1527,68 @@ export class ZoektRuntime implements vscode.Disposable {
     return candidate.replace(/\\/g, '/').includes('/target/debug/');
   }
 
+  /** Public entry point used by the "Install zoek-rs binaries" command and
+   *  by tests. Reports progress through the optional callback and returns
+   *  a structured result so the UI can show a clear "missing Rust" message
+   *  instead of a generic stack trace when cargo isn't on PATH. */
+  async installBinary(report?: (message: string) => void): Promise<{
+    ok: boolean;
+    alreadyInstalled?: boolean;
+    engineBinary?: string;
+    rebuildBinary?: string;
+    requiresCargoToolchain?: boolean;
+    message?: string;
+  }> {
+    const cached = {
+      engine: await this.resolveBinary(false, 'engine'),
+      rebuild: await this.resolveBinary(false, 'rebuild'),
+    };
+    if (cached.engine && cached.rebuild) {
+      return {
+        ok: true,
+        alreadyInstalled: true,
+        engineBinary: cached.engine,
+        rebuildBinary: cached.rebuild,
+      };
+    }
+    report?.('building zoek-rs binaries with Cargo');
+    let engineBinary: string | null;
+    let rebuildBinary: string | null;
+    try {
+      engineBinary = await this.resolveBinary(true, 'engine');
+      rebuildBinary = await this.resolveBinary(true, 'rebuild');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === 'ENOENT' || /spawn cargo ENOENT/.test(message)) {
+        return {
+          ok: false,
+          requiresCargoToolchain: true,
+          message:
+            'Rust/Cargo toolchain is not installed or not on PATH. Install it from https://rustup.rs/ and retry.',
+        };
+      }
+      return { ok: false, message };
+    }
+    if (!engineBinary || !rebuildBinary) {
+      // Build "succeeded" but the candidates still don't resolve — usually
+      // cargo missing from PATH so resolveBinary returned null silently.
+      return {
+        ok: false,
+        requiresCargoToolchain: true,
+        message:
+          'Rust/Cargo toolchain is not installed or not on PATH. Install it from https://rustup.rs/ and retry.',
+      };
+    }
+    report?.('zoek-rs binaries ready');
+    return {
+      ok: true,
+      alreadyInstalled: false,
+      engineBinary,
+      rebuildBinary,
+    };
+  }
+
   private async resolveBinary(allowBuild: boolean, target: BinaryTarget = 'engine'): Promise<string | null> {
     if (this.disposed) { return null; }
     const cached = target === 'rebuild' ? this.rebuildBinaryPath : this.binaryPath;
@@ -1559,7 +1695,32 @@ export class ZoektRuntime implements vscode.Disposable {
       if (/unknown (?:diagnose|search) flag: --exclude/.test(output)) {
         return false;
       }
-      return result.code === 0 || output.trim().length > 0;
+      if (!(result.code === 0 || output.trim().length > 0)) {
+        return false;
+      }
+      // Probe `capabilities` to catch binaries that predate the feature
+      // negotiation handshake. We only reject when the binary explicitly
+      // says "unknown command/subcommand" — older releases that respond
+      // with a generic usage banner (current behavior) still know enough
+      // of the CLI to be usable in practice.
+      try {
+        const caps = await this.invokeText([
+          candidate,
+          'capabilities',
+        ], this.extensionRoot, this.lifecycleCts.token);
+        const capsOutput = `${caps.stdout}\n${caps.stderr}`;
+        if (/unknown (?:command|subcommand)/i.test(capsOutput)) { return false; }
+        try {
+          const parsed = JSON.parse(caps.stdout.trim() || '{}') as { type?: string; ok?: boolean; message?: string };
+          if (parsed.ok === false && typeof parsed.message === 'string' && /unknown (?:command|subcommand)/i.test(parsed.message)) {
+            return false;
+          }
+        } catch {}
+      } catch (capsErr) {
+        this.log.appendLine(`zoek-rs capabilities probe failed for ${candidate}: ${capsErr instanceof Error ? capsErr.message : capsErr}`);
+        return false;
+      }
+      return true;
     } catch (err) {
       this.log.appendLine(`zoek-rs binary compatibility probe failed for ${candidate}: ${err instanceof Error ? err.message : err}`);
       return false;
@@ -1883,6 +2044,14 @@ export class ZoektRuntime implements vscode.Disposable {
   private async sweepExternalZoektProcesses(reason: string, patterns: string[]): Promise<void> {
     if (process.platform === 'win32') { return; }
     if (this.externalSweepPromise) { return this.externalSweepPromise; }
+    const workspaceRoot = this.getWorkspaceRootPath();
+    // Without a known workspace root we can't tell our zoekt processes from
+    // a sibling workspace's. Refuse to sweep — better to leak stragglers
+    // than to torpedo the developer's other VS Code window.
+    if (!workspaceRoot) {
+      this.log.appendLine(`zoek-rs sweep skipped: no workspace root (${reason})`);
+      return;
+    }
     const promise = (async () => {
       const lines = await this.listZoektProcesses(patterns);
       if (lines.length === 0) { return; }
@@ -1901,6 +2070,13 @@ export class ZoektRuntime implements vscode.Disposable {
         if (pid === process.pid) { continue; }
         if (trackedPids.has(pid)) { continue; }
         if (/\bpgrep\b/.test(command)) { continue; }
+        // Scope the sweep to processes targeting THIS workspace root. The
+        // developer's main VS Code instance may be running its own zoekt for
+        // a sibling workspace; killing those by pattern alone would torpedo
+        // an unrelated extension host.
+        if (!this.commandTargetsWorkspaceRoot(command, workspaceRoot)) {
+          continue;
+        }
         this.log.appendLine(`zoek-rs sweep kill: pid=${pid} (${reason}) cmd=${command}`);
         try {
           process.kill(pid, 'SIGTERM');
@@ -1916,6 +2092,28 @@ export class ZoektRuntime implements vscode.Disposable {
     });
     this.externalSweepPromise = promise;
     return promise;
+  }
+
+  /**
+   * Returns true iff `commandLine` contains `workspaceRoot` as a standalone
+   * positional argument (not as part of a longer path, a flag value like
+   * `--workspace=`, or a nested subdirectory). Used by sweep to avoid
+   * killing zoekt processes that belong to a different workspace.
+   */
+  commandTargetsWorkspaceRoot(commandLine: string, workspaceRoot: string): boolean {
+    if (!commandLine || !workspaceRoot) { return false; }
+    const tokens = this.tokenizeCommandLine(commandLine);
+    return tokens.includes(workspaceRoot);
+  }
+
+  private tokenizeCommandLine(line: string): string[] {
+    const tokens: string[] = [];
+    const re = /'([^']*)'|"([^"]*)"|(\S+)/g;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(line)) !== null) {
+      tokens.push(match[1] ?? match[2] ?? match[3] ?? '');
+    }
+    return tokens;
   }
 
   private async listZoektProcesses(patterns: string[]): Promise<string[]> {

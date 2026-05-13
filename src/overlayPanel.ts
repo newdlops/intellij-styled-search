@@ -36,9 +36,15 @@ type RendererEvent =
   | { type: 'revealFile'; uri: string }
   | { type: 'openInSideEditor'; uri: string; line: number; column: number }
   | { type: 'pinInSideEditor'; uri: string; line: number; column: number }
-  | { type: 'requestHover'; reqId: number; uri: string; line: number; column: number; x: number; y: number }
+  // 'requestHover' was removed in #32 along with the DIY $hoverTooltip.
   | { type: 'runCommand'; command: string; args: unknown[] }
   | { type: 'saveFile'; uri: string; content: string }
+  // #47 ground-truth auto-probe: renderer asks the extension host to
+  // query Pylance/LSP for the exact position the user just hovered.
+  // The host runs vscode.executeHoverProvider +
+  // executeCompletionItemProvider and logs the result. No human input
+  // (line/col) — driven entirely by the user's natural mouse movement.
+  | { type: 'requestIntellisenseProbe'; uri: string; line: number; column: number; source: string }
   | { type: 'log'; msg: string };
 
 type PreviewLine = { lineNumber: number; text: string };
@@ -56,7 +62,7 @@ export type PreviewCallGraphInlayProvider = (
   document: vscode.TextDocument,
   range: vscode.Range,
 ) => Promise<PreviewCallGraphInlay[]> | PreviewCallGraphInlay[];
-type HoverContent = { value: string; isTrusted: boolean; allowedCommands?: readonly string[] };
+// HoverContent type removed in #32 along with sendHover()/$hoverTooltip.
 
 type OverlayMessage =
   | { type: 'results:start'; searchId: number }
@@ -95,7 +101,8 @@ type OverlayMessage =
       previewSeq?: number;
       callGraphInlays: PreviewCallGraphInlay[];
     }
-  | { type: 'hover'; reqId: number; uri: string; line: number; column: number; x: number; y: number; contents: HoverContent[] };
+  // 'hover' renderer message was removed in #32 (DIY hover tooltip is gone).
+  ;
 
 type SearchSession = {
   searchId: number;
@@ -166,6 +173,10 @@ const SEARCH_HISTORY_KEY = 'intellijStyledSearch.searchHistory';
 const DEFAULT_SEARCH_HISTORY_LIMIT = 100;
 const HARD_SEARCH_HISTORY_LIMIT = 1000;
 const PREVIEW_FORCE_OPEN_DEBOUNCE_MS = 750;
+// Cold-start latency optimization: the first force-open after a session
+// starts has no burst to coalesce, so we run it almost immediately. Only
+// repeated attempts inside the same session pay the full 750ms debounce.
+const PREVIEW_FORCE_OPEN_FIRST_ATTEMPT_DEBOUNCE_MS = 30;
 const PREVIEW_FORCE_OPEN_COOLDOWN_MS = 2_000;
 const LARGE_LITERAL_MULTILINE_SEARCH_CHARS = 512;
 const LARGE_LITERAL_MULTILINE_SEARCH_LINES = 16;
@@ -286,6 +297,18 @@ export class OverlayPanel {
   private previewForceOpenSuppressedCount = 0;
   private lastPreviewForceOpenUri: string | undefined;
   private lastCaptureDiagnosticOpenUri: string | undefined;
+  // Spawn-instance injection telemetry. The renderer-side fast path runs
+  // `(0, eval)(__ijFindAdditionalPatchExpr)` inside the workbench window; on
+  // Code's Trusted Types policy that throws and we silently fall back to
+  // runPatchScript via webContents.executeJavaScript. Tests use these counters
+  // to assert when the fast path is unexpectedly broken.
+  private spawnInjectionAttempts = 0;
+  private spawnInjectionFastSuccess = 0;
+  private spawnInjectionFastSkipped = 0;
+  private spawnInjectionFallbackSuccess = 0;
+  private spawnInjectionFallbackFailed = 0;
+  private lastSpawnInjectionFastReport: string | undefined;
+  private lastSpawnInjectionFallbackReport: string | undefined;
   private cdpIdleCloseTimer: ReturnType<typeof setTimeout> | undefined;
   private cdpSearchIdleCloseTimer: ReturnType<typeof setTimeout> | undefined;
   private monacoCaptureDisabledLogged = false;
@@ -321,6 +344,14 @@ export class OverlayPanel {
   private activeRendererSrc: string | undefined;
   private currentSearchRendererSrc: string | undefined;
   private previewCallGraphInlayProvider: PreviewCallGraphInlayProvider | undefined;
+  // Dedup map for inlay fetches: a single user-driven preview event flows
+  // through both deliverLatestPreview() and refreshLatestPreviewAfterCapture()
+  // which each call sendPreview() → sendPreviewCallGraphInlays(). Without
+  // dedup the call graph provider runs the identical query twice. Key by
+  // `${uri}#${previewSeq}` and reuse the in-flight promise.
+  private inFlightInlayFetches = new Map<string, Promise<void>>();
+  private inlayFetchInitiatedCount = 0;
+  private inlayFetchSkippedDuplicatesCount = 0;
   // Per-source lastSeenSeq: each renderer patch install has its own instance
   // id (`__src`) and monotonic `__seq`. We dedup duplicates delivered by
   // accumulated CDP `message` listeners *within the same source*, but never
@@ -442,6 +473,38 @@ export class OverlayPanel {
     this.previewForceOpenSuppressedCount = 0;
     this.lastPreviewForceOpenUri = undefined;
     this.lastCaptureDiagnosticOpenUri = undefined;
+  }
+
+  /** @internal E2E diagnostics for spawn-instance fast-inject path. */
+  getSpawnInjectionStatsForTests(): {
+    attempts: number;
+    fastSuccess: number;
+    fastSkipped: number;
+    fallbackSuccess: number;
+    fallbackFailed: number;
+    lastFastReport?: string;
+    lastFallbackReport?: string;
+  } {
+    return {
+      attempts: this.spawnInjectionAttempts,
+      fastSuccess: this.spawnInjectionFastSuccess,
+      fastSkipped: this.spawnInjectionFastSkipped,
+      fallbackSuccess: this.spawnInjectionFallbackSuccess,
+      fallbackFailed: this.spawnInjectionFallbackFailed,
+      lastFastReport: this.lastSpawnInjectionFastReport,
+      lastFallbackReport: this.lastSpawnInjectionFallbackReport,
+    };
+  }
+
+  /** @internal E2E hook; do not use in production code paths. */
+  resetSpawnInjectionStatsForTests(): void {
+    this.spawnInjectionAttempts = 0;
+    this.spawnInjectionFastSuccess = 0;
+    this.spawnInjectionFastSkipped = 0;
+    this.spawnInjectionFallbackSuccess = 0;
+    this.spawnInjectionFallbackFailed = 0;
+    this.lastSpawnInjectionFastReport = undefined;
+    this.lastSpawnInjectionFallbackReport = undefined;
   }
 
   markRendererCommandPendingPanel(windowId: number | undefined): void {
@@ -778,6 +841,17 @@ export class OverlayPanel {
   private shouldEnableRendererInlayClickHook(): boolean {
     return vscode.workspace.getConfiguration('intellijStyledSearch')
       .get<boolean>('rendererInlayClickHook', true);
+  }
+
+  // #47 default ON: captain log proved isSimpleWidget=true silently
+  // suppresses Pylance hover (hoverWidgetVisibleAfter350ms=0/13). Users
+  // expect language features in preview, so isSimpleWidget=false is the
+  // right default. The workbench-takeover regression is now mitigated by
+  // #46/A-path preserving the editor across hide/show; if a takeover
+  // surfaces, users can flip this back to false in settings.json.
+  private shouldEnablePreviewLanguageFeatures(): boolean {
+    return vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<boolean>('previewLanguageFeatures', true);
   }
 
   private shouldDisposeRendererPatchOnHide(): boolean {
@@ -1712,6 +1786,27 @@ export class OverlayPanel {
   /** @internal Run the capture diagnostic synchronously (no lazy delay)
    *  and report what state `__ijFindMonaco` ended up in. Tests use this
    *  instead of relying on `scheduleLazyCapture` racing their setup. */
+  /** Notify the renderer that the workbench just observed an editor-side
+   *  activity burst (tab switch, group focus change, …). The renderer
+   *  suspends IntelliSense Recursion capture for ~1s after each call so
+   *  the LSP doesn't kick off a heavy re-index while the user is still
+   *  navigating. Exposed on the test API so e2e probes can simulate the
+   *  activity without subscribing to real workbench events. */
+  noteWorkbenchEditorActivity(reason: string): void {
+    const winId = this.activeWindowId;
+    if (winId === undefined) { return; }
+    const expr = `(function(){
+      try {
+        if (typeof window.__ijFindNoteWorkbenchEditorActivity === 'function') {
+          window.__ijFindNoteWorkbenchEditorActivity(${JSON.stringify(reason)});
+          return 'ok';
+        }
+        return 'no-handler';
+      } catch (e) { return 'err:' + (e && e.message); }
+    })()`;
+    void this.evalInWindow(winId, expr).catch(() => {});
+  }
+
   async forceCaptureForTests(): Promise<string> {
     const preferredWindowId = this.activeWindowId;
     try { await this.triggerCaptureDiagnostic(preferredWindowId); }
@@ -1763,13 +1858,13 @@ export class OverlayPanel {
    *  window and return its String() result. Used by renderer-level tests
    *  to probe `window.__ijFindStatus` and similar. Throws if the overlay
    *  hasn't latched onto a window yet (call `show()` first). */
-  async evalInActiveWindowForTests(jsExpr: string): Promise<string> {
+  async evalInActiveWindowForTests(jsExpr: string, timeoutMs?: number): Promise<string> {
     const resolved = await this.resolveTargetWorkbenchWindowId(this.activeWindowId);
     if (resolved === undefined) {
       throw new Error('no active workbench window — call overlay.show(...) first');
     }
     this.activeWindowId = resolved;
-    const result = await this.evalInWindow(resolved, jsExpr);
+    const result = await this.evalInWindow(resolved, jsExpr, timeoutMs);
     if (!/^no-window:|^err:No target with given id found\b/.test(result)) {
       return result;
     }
@@ -1779,7 +1874,7 @@ export class OverlayPanel {
       return result;
     }
     this.activeWindowId = retryWindowId;
-    return this.evalInWindow(retryWindowId, jsExpr);
+    return this.evalInWindow(retryWindowId, jsExpr, timeoutMs);
   }
 
   /** @internal Forcibly close the current CDP WebSocket — simulates the
@@ -2032,6 +2127,45 @@ export class OverlayPanel {
       this.closeCdpWebSocket(`safe release failed:${reason}`);
       return `bridge=release-failed:${err instanceof Error ? err.message : String(err)}`;
     }
+  }
+
+  /** @internal Test helper: queue a single-file change/delete notification
+   *  on both index pathways (zoekt incremental sync queue + trigram index)
+   *  without depending on the workspace file watcher's debounce. Pair with
+   *  waitForIndexReady() to flush the update before the next search. */
+  async notifyFileChangedForTests(uri: vscode.Uri, kind: 'changed' | 'deleted' = 'changed'): Promise<void> {
+    if (kind === 'deleted') {
+      this.trigramIndex.removeFileForTests(uri);
+    } else {
+      try { await this.trigramIndex.indexFileForTests(uri); } catch {}
+    }
+    this.zoektRuntime.notifyFileChangedForTests(uri, kind);
+  }
+
+  /** @internal Flush every queued zoekt incremental update right now. Pair
+   *  with notifyFileChangedForTests() to batch many file notifications into
+   *  a single index update step. */
+  async flushPendingUpdatesForTests(): Promise<void> {
+    await this.zoektRuntime.flushPendingUpdatesForTests();
+  }
+
+  /** @internal Build the search index only if no usable index exists yet.
+   *  When suites run together in one VSCode session, the dedicated
+   *  index-speed test (activation.test) does the rebuild and subsequent
+   *  suites short-circuit here. When a suite runs alone the workspace
+   *  has no prior index — this helper produces one so the suite isn't
+   *  blocked on a non-existent index. Engine-aware: zoekt persists to
+   *  disk, codesearch's trigram index lives in-memory and has to be
+   *  rebuilt on every cold start. */
+  async ensureIndexBuiltForTests(): Promise<void> {
+    const engine = getConfiguredSearchEngine();
+    if (engine === 'codesearch') {
+      if (this.trigramIndex.isReady) { return; }
+      await this.rebuildIndex();
+      return;
+    }
+    if (await this.zoektRuntime.hasReadyIndexForTests()) { return; }
+    await this.rebuildIndex();
   }
 
   private rebuildInFlight = false;
@@ -2468,41 +2602,57 @@ export class OverlayPanel {
     options: ShowOptions,
   ): Promise<{ fid: number; result: string } | undefined> {
     if (options.spawn) {
+      this.spawnInjectionAttempts++;
       let spawnedFast = false;
       try {
+        // Call the pre-installed installer function rather than eval'ing a
+        // cached source string. The installer was registered through main's
+        // privileged executeJavaScript and is just a normal JS function
+        // from the renderer's perspective, so Trusted Types doesn't object.
         const fastReport = await this.evalInWindow(windowId, `
           (function(){
             try {
               if (window.__ijFindAdditionalPatchVersion !== ${JSON.stringify(RENDERER_PATCH_VERSION)}) {
                 return 'missing:version';
               }
-              var expr = window.__ijFindAdditionalPatchExpr;
-              if (typeof expr !== 'string' || !expr) { return 'missing:expr'; }
-              var value = (0, eval)(expr);
+              var fn = window.__ijFindAdditionalPatchInstaller;
+              if (typeof fn !== 'function') { return 'missing:fn'; }
+              var value = fn();
               return String(value || '');
             } catch (e) {
               return 'err:' + (e && e.message);
             }
           })()
         `.trim());
+        this.lastSpawnInjectionFastReport = fastReport;
         if (fastReport === 'ij-find patch installed' || fastReport.indexOf('already patched') === 0) {
           this.log.appendLine(`Spawn instance fast injection(win=${windowId}): ${fastReport}`);
+          this.spawnInjectionFastSuccess++;
           spawnedFast = true;
         } else {
           this.log.appendLine(`Spawn instance fast injection skipped(win=${windowId}): ${fastReport}`);
+          this.spawnInjectionFastSkipped++;
         }
       } catch (err) {
-        this.log.appendLine(`Spawn instance fast injection failed(win=${windowId}): ${err instanceof Error ? err.message : err}`);
+        const message = err instanceof Error ? err.message : String(err);
+        this.lastSpawnInjectionFastReport = `throw:${message}`;
+        this.log.appendLine(`Spawn instance fast injection failed(win=${windowId}): ${message}`);
+        this.spawnInjectionFastSkipped++;
       }
       if (!spawnedFast) {
         try {
-        const report = await this.runPatchScript(windowId, {
-          additionalInstance: true,
-          ignoreTargetMarker: true,
-        });
-        this.log.appendLine(`Spawn instance injection(win=${windowId}): ${report}`);
+          const report = await this.runPatchScript(windowId, {
+            additionalInstance: true,
+            ignoreTargetMarker: true,
+          });
+          this.lastSpawnInjectionFallbackReport = report;
+          this.log.appendLine(`Spawn instance injection(win=${windowId}): ${report}`);
+          this.spawnInjectionFallbackSuccess++;
         } catch (err) {
-          this.log.appendLine(`Spawn instance injection failed(win=${windowId}): ${err instanceof Error ? err.message : err}`);
+          const message = err instanceof Error ? err.message : String(err);
+          this.lastSpawnInjectionFallbackReport = `throw:${message}`;
+          this.log.appendLine(`Spawn instance injection failed(win=${windowId}): ${message}`);
+          this.spawnInjectionFallbackFailed++;
         }
       }
     }
@@ -3002,6 +3152,7 @@ export class OverlayPanel {
       this.shouldEnableRendererInlayClickHook(),
       this.shouldDisposeRendererPatchOnHide(),
       !!options.additionalInstance,
+      this.shouldEnablePreviewLanguageFeatures(),
     );
     const additionalPatchExpr = getRendererPatchScript(
       this.isMonacoCaptureEnabled(),
@@ -3010,10 +3161,20 @@ export class OverlayPanel {
       this.shouldEnableRendererInlayClickHook(),
       this.shouldDisposeRendererPatchOnHide(),
       true,
+      this.shouldEnablePreviewLanguageFeatures(),
     );
+    // Readiness gate for the inject fast-path. Beyond the basic patch-version
+    // marker, also confirm that the renderer-side __ijFindDisableMonacoProbes
+    // flag matches what this inject would set (line 34/338 in rendererPatch).
+    // Recovery paths such as __ijFindForceStopMonacoCapture mutate that flag
+    // to true while leaving the patch version intact; without re-running the
+    // patch script we'd report 'ready' and never reset the flag back to its
+    // intended value.
+    const expectedDisableMonacoProbes = !this.isMonacoCaptureEnabled();
     const rendererReadyExpr =
       `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&` +
       `window.__ijFindLightStatus&&window.__ijFindPatchVersion===${RENDERER_PATCH_VERSION}` +
+      `&&window.__ijFindDisableMonacoProbes===${expectedDisableMonacoProbes ? 'true' : 'false'}` +
       `?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`;
     const workspaceName = this.getExpectedWorkspaceName();
     const markerText = options.ignoreTargetMarker ? '' : (this.targetWindowMarkerText || '');
@@ -3170,9 +3331,16 @@ export class OverlayPanel {
           try {
             installConsoleBridge(w);
             try {
+              // Cache the spawn-instance installer as a function so the
+              // renderer-side fast path can call it directly. Source-string
+              // + (0, eval)(expr) trips Trusted Types on every call; calling
+              // a real function is a regular invocation, not eval. Wrap the
+              // patch IIFE in parens so the surrounding return parses as one
+              // expression (the patch source begins with a newline, which
+              // would otherwise let ASI insert a semicolon after return).
               await w.webContents.executeJavaScript(
                 'window.__ijFindAdditionalPatchVersion=' + ${JSON.stringify(RENDERER_PATCH_VERSION)} + ';' +
-                'window.__ijFindAdditionalPatchExpr=' + JSON.stringify(additionalPatchExpr) + ';' +
+                'window.__ijFindAdditionalPatchInstaller=function(){return(' + additionalPatchExpr.trim() + ');};' +
                 '"cached"',
                 true
               );
@@ -3335,14 +3503,16 @@ export class OverlayPanel {
         if (typeof evt.__win === 'number') { this.activeWindowId = evt.__win; }
         void this.handlePreviewRequest(evt);
         break;
+      case 'requestIntellisenseProbe':
+        void this.runIntellisenseProbe(evt.uri, evt.line, evt.column, evt.source);
+        break;
       case 'revealFile': void this.revealFile(evt.uri); break;
       case 'openInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, true, true); break;
       case 'pinInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, false, false); break;
-	      case 'requestHover':
-	        if (evt.__src) { this.activeRendererSrc = evt.__src; }
-	        if (typeof evt.__win === 'number') { this.activeWindowId = evt.__win; }
-	        void this.sendHover(evt.reqId, evt.uri, evt.line, evt.column, evt.x, evt.y);
-	        break;
+	      // 'requestHover' message + sendHover() were removed in #32. The
+	      // embedded preview Monaco editor now drives hover natively
+	      // through VSCode's language services, so the renderer never
+	      // asks the extension host for hover content.
 	      case 'runCommand': void this.runHoverCommand(evt.command, evt.args, evt.__win); break;
 	      case 'saveFile': void this.saveFile(evt.uri, evt.content); break;
 	      case 'trace':
@@ -3562,10 +3732,20 @@ export class OverlayPanel {
     if (this.previewForceOpenTimer) {
       clearTimeout(this.previewForceOpenTimer);
     }
+    // The 750ms debounce coalesces burst navigation (rapid result-row
+    // clicks). On the very first cold force-open there is no burst to
+    // coalesce yet — debouncing for that long is pure latency. Run almost
+    // immediately when no prior attempts have happened; subsequent
+    // attempts keep the full burst-coalescing window.
+    const isFirstAttempt = this.previewForceOpenAttemptCount === 0 &&
+      this.previewForceOpenSuppressedCount === 0;
+    const debounceMs = isFirstAttempt
+      ? PREVIEW_FORCE_OPEN_FIRST_ATTEMPT_DEBOUNCE_MS
+      : PREVIEW_FORCE_OPEN_DEBOUNCE_MS;
     this.previewForceOpenTimer = setTimeout(() => {
       this.previewForceOpenTimer = undefined;
       void this.runPreviewForceOpen();
-    }, PREVIEW_FORCE_OPEN_DEBOUNCE_MS);
+    }, debounceMs);
   }
 
   private async runPreviewForceOpen(): Promise<void> {
@@ -3629,6 +3809,64 @@ export class OverlayPanel {
     this.scheduleCdpSearchIdleClose(reason);
   }
 
+  // #47 diagnostic: remember the last URI + line we sent into the
+  // preview so the manual probe command can target it.
+  private lastPreviewUriForDiagnostics: string | undefined;
+  private lastPreviewLineForDiagnostics: number | undefined;
+  getLastPreviewUriForDiagnostics(): string | undefined { return this.lastPreviewUriForDiagnostics; }
+  getLastPreviewLineForDiagnostics(): number | undefined { return this.lastPreviewLineForDiagnostics; }
+
+  // #47 auto-probe dedupe: don't fire executeHoverProvider /
+  // executeCompletionItemProvider for the same (uri, line, col) more
+  // than once per ~3s. The renderer-side hover-linger trace fires once
+  // per editor lifetime, but multiple rewires/renders can multiply
+  // listeners, so multiple probes can land for the same position.
+  private intellisenseProbeRecent: Map<string, number> = new Map();
+  private async runIntellisenseProbe(uriStr: string, line: number, column: number, source: string): Promise<void> {
+    const key = `${uriStr} ${line} ${column}`;
+    const now = Date.now();
+    const last = this.intellisenseProbeRecent.get(key);
+    if (last !== undefined && now - last < 3000) { return; }
+    this.intellisenseProbeRecent.set(key, now);
+    // GC the dedupe map occasionally so it doesn't grow unbounded.
+    if (this.intellisenseProbeRecent.size > 64) {
+      const cutoff = now - 60000;
+      for (const [k, t] of this.intellisenseProbeRecent) {
+        if (t < cutoff) { this.intellisenseProbeRecent.delete(k); }
+      }
+    }
+    try {
+      const uri = vscode.Uri.parse(uriStr);
+      const pos = new vscode.Position(Math.max(0, line), Math.max(0, column));
+      const hoversP = vscode.commands.executeCommand<vscode.Hover[] | undefined>('vscode.executeHoverProvider', uri, pos);
+      const compsP = vscode.commands.executeCommand<vscode.CompletionList | undefined>('vscode.executeCompletionItemProvider', uri, pos);
+      const hovers = (await hoversP) || [];
+      const completions = await compsP;
+      const completionCount = completions && Array.isArray(completions.items) ? completions.items.length : 0;
+      const hoverSample = hovers
+        .slice(0, 2)
+        .map((h) => h.contents
+          .map((c) => typeof c === 'string'
+            ? c
+            : (c as vscode.MarkdownString).value || JSON.stringify(c))
+          .join(' | '))
+        .join(' // ').slice(0, 220);
+      const completionSample = (completions && completions.items ? completions.items : [])
+        .slice(0, 4)
+        .map((it) => it.label && typeof it.label === 'object' ? (it.label as { label: string }).label : String(it.label || ''))
+        .join(', ').slice(0, 180);
+      this.log.appendLine(
+        `[diag-auto] preview-intellisense uri=${uriStr} line=${line} col=${column} source=${source} ` +
+        `hovers=${hovers.length} completions=${completionCount} ` +
+        `hoverSample="${hoverSample}" completionSample="${completionSample}"`,
+      );
+    } catch (err) {
+      this.log.appendLine(
+        `[diag-auto] preview-intellisense probe err: ${err instanceof Error ? err.message : err}`,
+      );
+    }
+  }
+
   private async sendPreview(
     uriStr: string,
     line: number,
@@ -3638,6 +3876,8 @@ export class OverlayPanel {
     shouldSend: () => boolean = () => true,
   ): Promise<boolean> {
     try {
+      this.lastPreviewUriForDiagnostics = uriStr;
+      this.lastPreviewLineForDiagnostics = line;
       const uri = vscode.Uri.parse(uriStr);
       const doc = await vscode.workspace.openTextDocument(uri);
       const allLines = doc.getText().split(/\r?\n/);
@@ -3685,7 +3925,19 @@ export class OverlayPanel {
       this.log.appendLine(`preview inlays skipped: no provider uri=${relPath} previewSeq=${seqLabel}`);
       return;
     }
-    void (async () => {
+    // Dedup key: same uri + same previewSeq means same user-driven preview
+    // event; the second sendPreview() (from refreshLatestPreviewAfterCapture)
+    // would otherwise duplicate the provider query.
+    const dedupKey = `${uri.toString()}#${previewSeq ?? 'none'}`;
+    if (this.inFlightInlayFetches.has(dedupKey)) {
+      this.inlayFetchSkippedDuplicatesCount++;
+      this.log.appendLine(
+        `preview inlays fetch dedup: uri=${relPath} previewSeq=${seqLabel} (in-flight)`,
+      );
+      return;
+    }
+    this.inlayFetchInitiatedCount++;
+    const fetchPromise = (async () => {
       const startedAt = Date.now();
       try {
         const rangeStart = new vscode.Position(start, 0);
@@ -3723,69 +3975,34 @@ export class OverlayPanel {
         this.log.appendLine(`preview call graph inlay fetch failed: ${err instanceof Error ? err.message : err}`);
       }
     })();
+    this.inFlightInlayFetches.set(dedupKey, fetchPromise);
+    void fetchPromise.finally(() => {
+      if (this.inFlightInlayFetches.get(dedupKey) === fetchPromise) {
+        this.inFlightInlayFetches.delete(dedupKey);
+      }
+    });
   }
 
-  private async sendHover(reqId: number, uriStr: string, line: number, column: number, x: number, y: number) {
-    if (this.isMonacoCaptureDisabled()) {
-      return;
-    }
-    try {
-      const uri = vscode.Uri.parse(uriStr);
-      // Make sure the document is loaded so language services pick it up.
-      await vscode.workspace.openTextDocument(uri);
-      const pos = new vscode.Position(line, column);
-      const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
-        'vscode.executeHoverProvider', uri, pos,
-      );
-      // Preserve markdown structure: each hover provider's contents become one
-      // group, joined into a single markdown string (with code-fences for
-      // MarkedString language hints). Groups are sent separately so the
-      // renderer can place a horizontal rule between them, matching the real
-      // hover widget.
-      // Build per-hover groups, preserving the trust flag for each
-      // MarkdownString. Trusted markdown gets its `command:` links activated;
-      // untrusted gets them rendered as inert text. This mirrors how VSCode's
-      // own hover widget treats command links.
-      const groups: HoverContent[] = [];
-      if (hovers) {
-        for (const h of hovers) {
-          const parts: HoverContent[] = [];
-          for (const c of h.contents) {
-            if (typeof c === 'string') {
-              parts.push({ value: c, isTrusted: false });
-            } else if (c instanceof vscode.MarkdownString) {
-              const trustedRaw = (c as any).isTrusted;
-              const isTrusted = trustedRaw === true ||
-                (typeof trustedRaw === 'object' && trustedRaw !== null);
-              const allowedCommands = (typeof trustedRaw === 'object' && trustedRaw !== null && Array.isArray(trustedRaw.enabledCommands))
-                ? trustedRaw.enabledCommands as readonly string[]
-                : undefined;
-              parts.push({ value: c.value, isTrusted, allowedCommands });
-            } else if (c && typeof (c as any).language === 'string' && typeof (c as any).value === 'string') {
-              parts.push({
-                value: '```' + (c as any).language + '\n' + (c as any).value + '\n```',
-                isTrusted: false,
-              });
-            } else if (c && typeof (c as any).value === 'string') {
-              parts.push({ value: (c as any).value, isTrusted: false });
-            }
-          }
-          const valid = parts.filter((p) => p.value && p.value.trim().length > 0);
-          if (valid.length === 0) { continue; }
-          groups.push({
-            value: valid.map((p) => p.value).join('\n\n').trim(),
-            isTrusted: valid.some((p) => p.isTrusted),
-            allowedCommands: valid.flatMap((p) => p.allowedCommands ?? []) as readonly string[],
-          });
-        }
-      }
-      const contents = groups.filter((g) => g.value.length > 0);
-      await this.postToRenderer({ type: 'hover', reqId, uri: uriStr, line, column, x, y, contents });
-    } catch (err) {
-      this.log.appendLine(`hover fetch failed: ${err instanceof Error ? err.message : err}`);
-      await this.postToRenderer({ type: 'hover', reqId, uri: uriStr, line, column, x, y, contents: [] });
-    }
+  /** @internal E2E diagnostics for preview inlay fetch dedup. */
+  getInlayFetchStatsForTests(): {
+    initiated: number;
+    skippedDuplicates: number;
+    inFlight: number;
+  } {
+    return {
+      initiated: this.inlayFetchInitiatedCount,
+      skippedDuplicates: this.inlayFetchSkippedDuplicatesCount,
+      inFlight: this.inFlightInlayFetches.size,
+    };
   }
+
+  /** @internal E2E hook; reset counters before a focused test. */
+  resetInlayFetchStatsForTests(): void {
+    this.inlayFetchInitiatedCount = 0;
+    this.inlayFetchSkippedDuplicatesCount = 0;
+  }
+
+  // sendHover() removed in #32 along with the renderer-side DIY hover tooltip.
 
   private cancelActive() {
     if (this.activeSearch) {
@@ -4317,6 +4534,17 @@ export class OverlayPanel {
   }
 
   private async closeStaleIjFindInspectorBlockingTarget(targetPid: number): Promise<boolean> {
+    // The default Node inspector port is 9229. The developer's own VS Code
+    // typically owns that port for THEIR extension host. Probing it from
+    // inside the test VS Code (which runs on a different port — we pass
+    // --inspect=9239 in .vscode-test.mjs) would target the dev VS Code's
+    // bridge listeners and start detaching them; the dev workbench loses
+    // its IJSS state or crashes outright. Refuse to run during tests.
+    const inTest = process.env.VSCODE_TEST === '1' || !!process.env.IJSS_E2E_WORKSPACE;
+    if (inTest) {
+      this.log.appendLine(`closeStaleIjFindInspector: skipping in test mode to protect dev VS Code`);
+      return false;
+    }
     let targets: any;
     try {
       targets = await fetchJson('http://127.0.0.1:9229/json/list', 150);
@@ -4546,11 +4774,21 @@ export class OverlayPanel {
         return directParent.pid;
       }
 
-      for (const proc of processes.values()) {
-        if (this.isVscodeMainProcessCommand(proc.cmd)) {
-          this.log.appendLine(`findMainPid: fallback global main pid=${proc.pid}`);
-          return proc.pid;
+      // When running under @vscode/test-electron, never fall back to a
+      // global VS Code main scan — the developer's own VS Code is usually
+      // running too and a fallback hit would SIGUSR1 that process (waking
+      // up its inspector, hijacking its CDP). Tests must stay inside their
+      // own ancestor chain.
+      const inTest = process.env.VSCODE_TEST === '1' || !!process.env.IJSS_E2E_WORKSPACE;
+      if (!inTest) {
+        for (const proc of processes.values()) {
+          if (this.isVscodeMainProcessCommand(proc.cmd)) {
+            this.log.appendLine(`findMainPid: fallback global main pid=${proc.pid}`);
+            return proc.pid;
+          }
         }
+      } else {
+        this.log.appendLine('findMainPid: test mode — skipping global fallback to protect dev VS Code');
       }
     } catch (e) {
       this.log.appendLine(`findMainPid ps error: ${e instanceof Error ? e.message : e}`);

@@ -1,6 +1,7 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import type { ExtensionTestApi } from '../../extension';
+import { workspaceHasOwnGit } from '../util/fixtureWorkspace';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 
@@ -22,6 +23,11 @@ let cdpAvailable = false;
 suite('Resilience — bridge auto-repair', () => {
   suiteSetup(async function () {
     this.timeout(30_000);
+    // The setup primes the search index. On a large external workspace
+    // where prior tests in unified runs have already churned the overlay,
+    // the wait can exceed the 30s spec. Skip cleanly off the dedicated
+    // fixture workspace.
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
     const api = await getApi();
     try {
       await api.overlay.awaitInjection();
@@ -30,7 +36,7 @@ suite('Resilience — bridge auto-repair', () => {
       cdpAvailable = false;
     }
     if (cdpAvailable) {
-      await api.overlay.rebuildIndex();
+      await api.overlay.ensureIndexBuiltForTests();
       await api.overlay.waitForIndexReady(30_000);
     }
   });
