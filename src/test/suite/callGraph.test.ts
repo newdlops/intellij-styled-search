@@ -41,6 +41,26 @@ function usageLocationKey(reference: { uri: string; range: { startLine: number; 
   return `${reference.uri}:${reference.range.startLine}:${reference.range.startColumn}`;
 }
 
+function inlayLabelParts(hints: vscode.InlayHint[] | undefined): Array<{ hint: vscode.InlayHint; part: vscode.InlayHintLabelPart }> {
+  return (hints ?? []).flatMap((hint) =>
+    Array.isArray(hint.label)
+      ? hint.label.map((part) => ({ hint, part: part as vscode.InlayHintLabelPart }))
+      : []);
+}
+
+function usageInlayPartForSymbol(
+  hints: vscode.InlayHint[] | undefined,
+  symbolLabel: string,
+): { hint: vscode.InlayHint; part: vscode.InlayHintLabelPart } | undefined {
+  return inlayLabelParts(hints).find((entry) =>
+    entry.part.command?.command === 'intellijStyledSearch.showUsagesForSymbol' &&
+    entry.part.command.arguments?.[1] === symbolLabel);
+}
+
+function usageInlayCount(entry: { part: vscode.InlayHintLabelPart } | undefined): number {
+  return Number((entry?.part.value.match(/\busages\s+(\d+)\b/) ?? [])[1] ?? 0);
+}
+
 async function useCallGraphBackend(backend: 'rust-native' | 'javascript'): Promise<() => Promise<void>> {
   const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
   const prior = cfg.inspect<string>('callGraphBackend');
@@ -787,6 +807,85 @@ suite('Call graph', () => {
       try { await vscode.workspace.fs.delete(kt); } catch {}
       await restoreBackend();
       await api.callGraph.rebuild();
+    }
+  });
+
+  test('incremental create refreshes usage index and usage inlays', async function () {
+    this.timeout(30_000);
+    const restoreBackend = await useCallGraphBackend('javascript');
+    const api = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorCallGraphInlayHints = cfg.inspect<boolean>('callGraphInlayHints');
+    const suffix = `${process.pid}_${Date.now()}`;
+    const targetRel = `callgraph_incremental_new_usage_target_${suffix}.py`;
+    const consumerRel = `callgraph_incremental_new_usage_consumer_${suffix}.py`;
+    const target = vscode.Uri.joinPath(folder.uri, targetRel);
+    const consumer = vscode.Uri.joinPath(folder.uri, consumerRel);
+    const moduleName = path.basename(targetRel, '.py');
+    const className = `IncrementalNewUsageTarget_${suffix}`;
+    const methodName = `target_method_${suffix}`;
+    try {
+      await cfg.update('callGraphInlayHints', true, vscode.ConfigurationTarget.Workspace);
+      await vscode.workspace.fs.writeFile(target, Buffer.from([
+        `class ${className}:`,
+        `    def ${methodName}(self):`,
+        '        return 1',
+        '',
+      ].join('\n'), 'utf8'));
+
+      await api.callGraph.rebuild(undefined, undefined, { force: true });
+      const document = await vscode.workspace.openTextDocument(target);
+      const fullRange = new vscode.Range(
+        new vscode.Position(0, 0),
+        new vscode.Position(document.lineCount, 0),
+      );
+
+      const initialHints = await vscode.commands.executeCommand<vscode.InlayHint[]>(
+        'vscode.executeInlayHintProvider',
+        target,
+        fullRange,
+      );
+      const initialUsageCount = usageInlayCount(usageInlayPartForSymbol(initialHints, className));
+
+      await vscode.workspace.fs.writeFile(consumer, Buffer.from([
+        `from ${moduleName} import ${className}`,
+        '',
+        `def incremental_new_usage_site_${suffix}():`,
+        `    helper = ${className}()`,
+        `    return helper.${methodName}()`,
+        '',
+      ].join('\n'), 'utf8'));
+      await api.callGraph.refreshChangedFilesForTests([consumer]);
+
+      const usages = await api.callGraph.findUsagesResolved(className, 20);
+      assert.ok(
+        usages.some((reference) => reference.relPath === consumerRel),
+        `expected incremental index to include the newly created usage file; got ${usages.map((reference) => `${reference.relPath}:${reference.range.startLine + 1}`).join(', ')}`,
+      );
+
+      const refreshedHints = await vscode.commands.executeCommand<vscode.InlayHint[]>(
+        'vscode.executeInlayHintProvider',
+        target,
+        fullRange,
+      );
+      const classUsagePart = usageInlayPartForSymbol(refreshedHints, className);
+      assert.ok(
+        classUsagePart,
+        `expected usage inlay for ${className} after incremental create; hints=${inlayLabelParts(refreshedHints).map((entry) => `${entry.part.value}:${entry.part.command?.arguments?.[1] ?? ''}`).join(', ')}`,
+      );
+      const usageCount = usageInlayCount(classUsagePart);
+      assert.ok(
+        usageCount > initialUsageCount,
+        `expected usage inlay count to increment after new file create, before=${initialUsageCount} after=${usageCount} label=${classUsagePart!.part.value}`,
+      );
+    } finally {
+      await cfg.update('callGraphInlayHints', priorCallGraphInlayHints?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      try { await vscode.workspace.fs.delete(consumer); } catch {}
+      try { await vscode.workspace.fs.delete(target); } catch {}
+      try { await api.callGraph.refreshChangedFilesForTests([consumer, target]); } catch {}
+      await restoreBackend();
     }
   });
 

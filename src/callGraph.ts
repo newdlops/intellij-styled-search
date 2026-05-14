@@ -1728,6 +1728,10 @@ export class CallGraphService implements vscode.Disposable {
       );
       return;
     }
+    // Cross-file relation counts can change for documents that were not
+    // themselves edited. Drop lazy document summaries so inlay requests for
+    // already-open definition files read fresh counts from the native index.
+    this.clearDocumentSummaryCache();
     for (const uri of uniqueUris) {
       const uriString = uri.toString();
       if (isSupportedSourceUri(uri) && fs.existsSync(uri.fsPath)) {

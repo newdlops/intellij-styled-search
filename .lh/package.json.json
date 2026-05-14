@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 59,
+            "activePatchIndex": 60,
             "patches": [
                 {
                     "date": 1776584800003,
@@ -244,6 +244,10 @@
                 {
                     "date": 1778667379996,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellij-styled-search\",\n   \"displayName\": \"IntelliJ Styled Search\",\n   \"description\": \"IntelliJ IDEA style project search — peek-like movable panel with workspace file results\",\n-  \"version\": \"0.1.7\",\n+  \"version\": \"0.1.701\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"resources/icon.png\",\n   \"repository\": {\n@@ -49,8 +49,23 @@\n       {\n         \"command\": \"intellijStyledSearch.diagnosePreviewIntellisense\",\n         \"title\": \"Diagnose Preview Intellisense (probe Pylance for last previewed URI)\",\n         \"category\": \"IntelliJ Search\"\n+      },\n+      {\n+        \"command\": \"intellijStyledSearch.startMcpServer\",\n+        \"title\": \"Start Codeidx MCP Server\",\n+        \"category\": \"IntelliJ Search\"\n+      },\n+      {\n+        \"command\": \"intellijStyledSearch.stopMcpServer\",\n+        \"title\": \"Stop Codeidx MCP Server\",\n+        \"category\": \"IntelliJ Search\"\n+      },\n+      {\n+        \"command\": \"intellijStyledSearch.restartMcpServer\",\n+        \"title\": \"Restart Codeidx MCP Server\",\n+        \"category\": \"IntelliJ Search\"\n       }\n     ],\n     \"keybindings\": [\n       {\n@@ -86,8 +101,20 @@\n         },\n         {\n           \"command\": \"intellijStyledSearch.rebuildIndex\",\n           \"group\": \"1_search@2\"\n+        },\n+        {\n+          \"command\": \"intellijStyledSearch.startMcpServer\",\n+          \"group\": \"2_mcp@1\"\n+        },\n+        {\n+          \"command\": \"intellijStyledSearch.restartMcpServer\",\n+          \"group\": \"2_mcp@2\"\n+        },\n+        {\n+          \"command\": \"intellijStyledSearch.stopMcpServer\",\n+          \"group\": \"2_mcp@3\"\n         }\n       ]\n     },\n     \"configuration\": {\n"
+                },
+                {
+                    "date": 1778752058554,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellij-styled-search\",\n   \"displayName\": \"IntelliJ Styled Search\",\n   \"description\": \"IntelliJ IDEA style project search — peek-like movable panel with workspace file results\",\n-  \"version\": \"0.1.701\",\n+  \"version\": \"0.1.703\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"resources/icon.png\",\n   \"repository\": {\n"
                 }
             ],
             "date": 1776584800003,
