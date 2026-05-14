@@ -25,6 +25,7 @@ const GRAPH_SYMBOL_HEADER_SIZE: usize = 40;
 const GRAPH_SYMBOL_INDEX_ENTRY_SIZE: usize = 12;
 const GRAPH_MANIFEST_NAME: &str = "callgraph-manifest.json";
 const MODULE_IMPORT_TARGET: &str = "__ijss_module__";
+const DEFAULT_IMPORT_TARGET: &str = "__ijss_default__";
 const FRAMEWORK_IMPL_PREFIX: &str = "__ijss_framework_impl__:";
 const GRAPH_DISCOVERY_PROGRESS_INTERVAL: usize = 16_384;
 const GRAPH_FILE_PROGRESS_INTERVAL: usize = 16_384;
@@ -34,6 +35,7 @@ const GRAPH_SYMBOL_PROGRESS_INTERVAL: usize = 262_144;
 const GRAPH_SHALLOW_REBUILD_SOURCE_FILE_THRESHOLD: usize = 50_000;
 const GRAPH_SHALLOW_REBUILD_MAX_DEEP_FILES: usize = 32_768;
 const GRAPH_SHALLOW_REBUILD_FALLBACK_DEEP_FILES: usize = 4_096;
+const GRAPH_FALLBACK_BY_NAME_CANDIDATE_LIMIT: usize = 24;
 
 #[derive(Clone, Debug)]
 pub struct GraphIndexSummary {
@@ -2239,6 +2241,8 @@ struct NativeGraphFile {
     byte_len: u64,
     symbols: Vec<NativeGraphSymbol>,
     imports: HashMap<String, Vec<ImportTarget>>,
+    star_reexport_rel_paths: Vec<String>,
+    default_export_name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2256,6 +2260,8 @@ struct GraphResolutionMaps {
     type_by_name: HashMap<String, Vec<usize>>,
     members_by_container_name: HashMap<String, Vec<usize>>,
     declaration_ranges_by_file: HashMap<String, Vec<DeclarationRange>>,
+    default_export_name_by_file: HashMap<String, String>,
+    star_reexports_by_file: HashMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2428,6 +2434,16 @@ fn parse_graph_source_file(
     } else {
         HashMap::new()
     };
+    let star_reexport_rel_paths = if language == "python" {
+        parse_python_star_reexports(&text, &rel_path)
+    } else {
+        Vec::new()
+    };
+    let default_export_name = if is_ts_like_language(&language) {
+        find_ts_default_export_name(&text)
+    } else {
+        None
+    };
     Ok(Some(NativeGraphFile {
         rel_path,
         uri,
@@ -2435,6 +2451,8 @@ fn parse_graph_source_file(
         byte_len: bytes.len() as u64,
         symbols,
         imports,
+        star_reexport_rel_paths,
+        default_export_name,
     }))
 }
 
@@ -3241,6 +3259,11 @@ fn parse_brace_graph_symbols(
         .map(|line| sanitize_code_line(line, &mut code_state))
         .collect();
     let code_line_refs: Vec<&str> = code_lines.iter().map(String::as_str).collect();
+    let commonjs_exports = if is_ts_like_language(language) {
+        commonjs_exported_names(&code_line_refs)
+    } else {
+        HashSet::new()
+    };
     for (line_idx, line) in lines.iter().enumerate() {
         let code_line = code_line_refs[line_idx];
         let trimmed = code_line.trim_start();
@@ -3561,7 +3584,7 @@ fn parse_brace_graph_symbols(
                 symbols.push(symbol);
             }
         } else if let Some((name, kind, column)) = if brace_depth == 0 {
-            ts_variable_symbol_from_line(&code_line, language)
+            ts_variable_symbol_from_line(&code_line, language, &commonjs_exports)
         } else {
             None
         } {
@@ -3780,6 +3803,16 @@ where
                 });
         }
     }
+    for file in files.iter() {
+        if let Some(name) = file.default_export_name.as_ref() {
+            maps.default_export_name_by_file
+                .insert(file.rel_path.clone(), name.clone());
+        }
+        if !file.star_reexport_rel_paths.is_empty() {
+            maps.star_reexports_by_file
+                .insert(file.rel_path.clone(), file.star_reexport_rel_paths.clone());
+        }
+    }
     let total_bytes = files.iter().map(|file| file.byte_len).sum::<u64>();
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
@@ -3885,6 +3918,16 @@ where
                     end_line: symbol.declaration_end_line,
                     end_column: symbol.declaration_end_column,
                 });
+        }
+    }
+    for file in files.iter() {
+        if let Some(name) = file.default_export_name.as_ref() {
+            maps.default_export_name_by_file
+                .insert(file.rel_path.clone(), name.clone());
+        }
+        if !file.star_reexport_rel_paths.is_empty() {
+            maps.star_reexports_by_file
+                .insert(file.rel_path.clone(), file.star_reexport_rel_paths.clone());
         }
     }
     let total_bytes = files.iter().map(|file| file.byte_len).sum::<u64>();
@@ -4001,46 +4044,95 @@ fn resolve_native_graph_references_for_file(
                     &class_by_line,
                 )
             });
-            let Some(symbol_idx) = member_symbol_idx.or_else(|| {
-                choose_reference_symbol_index(
+            let symbol_indices: Vec<usize> = if let Some(symbol_idx) =
+                member_symbol_idx.or_else(|| {
+                    choose_reference_symbol_index(
+                        &file.rel_path,
+                        &name,
+                        line_idx as u32,
+                        start as u32,
+                        &maps.by_file_name,
+                        &maps.by_name,
+                        &file.imports,
+                        &maps.default_export_name_by_file,
+                        &maps.star_reexports_by_file,
+                        symbols,
+                    )
+                }) {
+                vec![symbol_idx]
+            } else if should_use_low_confidence_identifier_fallback(&file.rel_path, line) {
+                fallback_reference_symbol_indices(
                     &file.rel_path,
                     &name,
                     line_idx as u32,
                     start as u32,
-                    &maps.by_file_name,
-                    &maps.by_name,
-                    &file.imports,
+                    maps,
                     symbols,
                 )
-            }) else {
-                continue;
+            } else {
+                Vec::new()
             };
-            let symbol = &symbols[symbol_idx];
-            let in_declaration_range = declaration_ranges
-                .iter()
-                .any(|range| declaration_range_contains(*range, line_idx as u32, start as u32));
-            if in_declaration_range
-                && !is_type_reference_symbol_kind(&symbol.kind)
-                && !is_ts_typeof_context(line, start)
-            {
+            if symbol_indices.is_empty() {
                 continue;
             }
-            if should_skip_reference_for_symbol(line, start, end, &file.rel_path, symbol) {
-                continue;
+            for symbol_idx in symbol_indices {
+                let symbol = &symbols[symbol_idx];
+                let in_declaration_range = declaration_ranges
+                    .iter()
+                    .any(|range| declaration_range_contains(*range, line_idx as u32, start as u32));
+                if in_declaration_range
+                    && !is_type_reference_symbol_kind(&symbol.kind)
+                    && !is_ts_typeof_context(line, start)
+                {
+                    continue;
+                }
+                if should_skip_reference_for_symbol(line, start, end, &file.rel_path, symbol) {
+                    continue;
+                }
+                push_reference_to_symbol(
+                    &file,
+                    symbol_idx,
+                    &name,
+                    line,
+                    line_idx,
+                    start,
+                    end,
+                    symbols,
+                    &enclosing_by_line,
+                    &mut out,
+                    &mut seen,
+                );
             }
-            push_reference_to_symbol(
-                &file,
-                symbol_idx,
-                &name,
-                line,
-                line_idx,
-                start,
-                end,
-                symbols,
-                &enclosing_by_line,
-                &mut out,
-                &mut seen,
-            );
+        }
+        if should_use_low_confidence_string_fallback(&file.rel_path, line) {
+            for (name, start, end) in string_literal_reference_tokens(line, &file.rel_path) {
+                for symbol_idx in fallback_reference_symbol_indices(
+                    &file.rel_path,
+                    &name,
+                    line_idx as u32,
+                    start as u32,
+                    maps,
+                    symbols,
+                ) {
+                    let symbol = &symbols[symbol_idx];
+                    if should_skip_reference_for_symbol(line, start, end, &file.rel_path, symbol) {
+                        continue;
+                    }
+                    push_reference_to_symbol(
+                        &file,
+                        symbol_idx,
+                        &name,
+                        line,
+                        line_idx,
+                        start,
+                        end,
+                        symbols,
+                        &enclosing_by_line,
+                        &mut out,
+                        &mut seen,
+                    );
+                }
+            }
         }
         if file.rel_path.ends_with(".py") {
             resolve_python_reflection_references(
@@ -4253,6 +4345,8 @@ fn resolve_graphql_references_for_text(
                 &maps.by_file_name,
                 &maps.by_name,
                 &file.imports,
+                &maps.default_export_name_by_file,
+                &maps.star_reexports_by_file,
                 symbols,
             ) {
                 push_reference_to_symbol(
@@ -4310,6 +4404,8 @@ fn resolve_graphql_references_for_text(
                 &maps.by_file_name,
                 &maps.by_name,
                 &file.imports,
+                &maps.default_export_name_by_file,
+                &maps.star_reexports_by_file,
                 symbols,
             ) {
                 let start = find_column(line, &fragment_name);
@@ -4343,6 +4439,8 @@ fn resolve_graphql_references_for_text(
                 &maps.by_file_name,
                 &maps.by_name,
                 &file.imports,
+                &maps.default_export_name_by_file,
+                &maps.star_reexports_by_file,
                 symbols,
             ) {
                 push_reference_to_symbol(
@@ -4452,6 +4550,8 @@ fn resolve_python_reflection_references(
             &maps.by_file_name,
             &maps.by_name,
             &file.imports,
+            &maps.default_export_name_by_file,
+            &maps.star_reexports_by_file,
             symbols,
         ) {
             push_reference_to_symbol(
@@ -4591,21 +4691,29 @@ fn choose_reference_symbol_index(
     by_file_name: &HashMap<String, Vec<usize>>,
     by_name: &HashMap<String, Vec<usize>>,
     imports: &HashMap<String, Vec<ImportTarget>>,
+    default_export_name_by_file: &HashMap<String, String>,
+    star_reexports_by_file: &HashMap<String, Vec<String>>,
     symbols: &[NativeGraphSymbol],
 ) -> Option<usize> {
-    if let Some(same_file) = by_file_name.get(&symbol_lookup_key(rel_path, name)) {
+    let imported = imported_reference_candidates(
+        name,
+        imports,
+        by_file_name,
+        default_export_name_by_file,
+        star_reexports_by_file,
+    );
+    if !imported.is_empty() {
         return choose_reference_from_candidates(
-            same_file.iter().copied(),
+            imported.iter().copied(),
             rel_path,
             line,
             column,
             symbols,
         );
     }
-    let imported = imported_reference_candidates(name, imports, by_file_name);
-    if !imported.is_empty() {
+    if let Some(same_file) = by_file_name.get(&symbol_lookup_key(rel_path, name)) {
         return choose_reference_from_candidates(
-            imported.iter().copied(),
+            same_file.iter().copied(),
             rel_path,
             line,
             column,
@@ -4660,22 +4768,196 @@ fn imported_reference_candidates(
     local_name: &str,
     imports: &HashMap<String, Vec<ImportTarget>>,
     by_file_name: &HashMap<String, Vec<usize>>,
+    default_export_name_by_file: &HashMap<String, String>,
+    star_reexports_by_file: &HashMap<String, Vec<String>>,
 ) -> Vec<usize> {
     let mut out = Vec::new();
     let Some(targets) = imports.get(local_name) else {
         return out;
     };
     for target in targets {
-        if let Some(candidates) = by_file_name.get(&symbol_lookup_key(
+        let lookup_name = if target.imported_name == DEFAULT_IMPORT_TARGET {
+            match default_export_name_by_file.get(&target.target_rel_path) {
+                Some(name) => name.as_str(),
+                None => continue,
+            }
+        } else {
+            target.imported_name.as_str()
+        };
+        extend_imported_file_candidates(
+            &mut out,
             &target.target_rel_path,
-            &target.imported_name,
-        )) {
-            out.extend(candidates.iter().copied());
-        }
+            lookup_name,
+            by_file_name,
+            star_reexports_by_file,
+        );
     }
     out.sort_unstable();
     out.dedup();
     out
+}
+
+fn fallback_reference_symbol_indices(
+    rel_path: &str,
+    name: &str,
+    line: u32,
+    column: u32,
+    maps: &GraphResolutionMaps,
+    symbols: &[NativeGraphSymbol],
+) -> Vec<usize> {
+    if !is_low_confidence_reference_name(name) {
+        return Vec::new();
+    }
+    let Some(candidates) = maps.by_name.get(name) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for symbol_idx in candidates.iter().copied() {
+        let symbol = &symbols[symbol_idx];
+        if !is_low_confidence_reference_target(symbol) {
+            continue;
+        }
+        if symbol.rel_path == rel_path
+            && symbol.start_line == line
+            && column >= symbol.start_column
+            && column <= symbol.end_column
+        {
+            continue;
+        }
+        out.push(symbol_idx);
+        if out.len() > GRAPH_FALLBACK_BY_NAME_CANDIDATE_LIMIT {
+            return Vec::new();
+        }
+    }
+    out
+}
+
+fn should_use_low_confidence_identifier_fallback(rel_path: &str, line: &str) -> bool {
+    supports_low_confidence_fallback(rel_path)
+        && !is_low_confidence_fallback_suppressed_line(line, rel_path)
+}
+
+fn should_use_low_confidence_string_fallback(rel_path: &str, line: &str) -> bool {
+    supports_low_confidence_fallback(rel_path)
+        && !is_low_confidence_fallback_suppressed_line(line, rel_path)
+}
+
+fn supports_low_confidence_fallback(rel_path: &str) -> bool {
+    rel_path.ends_with(".py") || is_ts_like_rel_path(rel_path) || is_jvm_like_rel_path(rel_path)
+}
+
+fn is_jvm_like_rel_path(rel_path: &str) -> bool {
+    matches!(
+        Path::new(rel_path)
+            .extension()
+            .and_then(|value| value.to_str()),
+        Some("java" | "kt" | "kts")
+    )
+}
+
+fn is_low_confidence_fallback_suppressed_line(line: &str, rel_path: &str) -> bool {
+    let trimmed = line.trim_start();
+    if is_ts_like_rel_path(rel_path) {
+        return trimmed.starts_with("import ")
+            || trimmed.starts_with("import type ")
+            || trimmed.starts_with("export {")
+            || trimmed.starts_with("export *")
+            || (trimmed.starts_with("export type ") && trimmed.contains(" from "))
+            || (trimmed.starts_with("export ") && trimmed.contains(" from "));
+    }
+    if is_jvm_like_rel_path(rel_path) {
+        return trimmed.starts_with("import ") || trimmed.starts_with("package ");
+    }
+    false
+}
+
+fn is_low_confidence_reference_name(name: &str) -> bool {
+    if !is_identifier(name) || is_ignored_reference_identifier(name) {
+        return false;
+    }
+    if matches!(
+        name,
+        "args"
+            | "data"
+            | "email"
+            | "error"
+            | "errors"
+            | "event"
+            | "full_name"
+            | "info"
+            | "input"
+            | "item"
+            | "items"
+            | "kwargs"
+            | "name"
+            | "obj"
+            | "parent"
+            | "password"
+            | "props"
+            | "query"
+            | "request"
+            | "response"
+            | "result"
+            | "results"
+            | "self"
+            | "staff"
+            | "state"
+            | "target"
+            | "user"
+            | "value"
+            | "values"
+    ) {
+        return false;
+    }
+    if name
+        .chars()
+        .next()
+        .map(|ch| ch.is_ascii_uppercase())
+        .unwrap_or(false)
+    {
+        return name.len() >= 3;
+    }
+    if name.contains('_') {
+        return name.len() >= 5;
+    }
+    name.len() >= 6
+}
+
+fn is_low_confidence_reference_target(symbol: &NativeGraphSymbol) -> bool {
+    matches!(
+        symbol.kind.as_str(),
+        "class" | "constructor" | "enum" | "function" | "interface" | "method" | "struct" | "type"
+    ) || (symbol.kind == "constant" && is_export_like_constant_name(&symbol.name))
+}
+
+fn is_export_like_constant_name(name: &str) -> bool {
+    name.len() >= 3
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        && name.chars().any(|ch| ch.is_ascii_uppercase())
+}
+
+fn extend_imported_file_candidates(
+    out: &mut Vec<usize>,
+    target_rel_path: &str,
+    lookup_name: &str,
+    by_file_name: &HashMap<String, Vec<usize>>,
+    star_reexports_by_file: &HashMap<String, Vec<String>>,
+) {
+    let mut queue = VecDeque::from([target_rel_path.to_string()]);
+    let mut seen = HashSet::new();
+    while let Some(rel_path) = queue.pop_front() {
+        if !seen.insert(rel_path.clone()) {
+            continue;
+        }
+        if let Some(candidates) = by_file_name.get(&symbol_lookup_key(&rel_path, lookup_name)) {
+            out.extend(candidates.iter().copied());
+        }
+        if let Some(reexport_rel_paths) = star_reexports_by_file.get(&rel_path) {
+            queue.extend(reexport_rel_paths.iter().cloned());
+        }
+    }
 }
 
 fn symbol_lookup_key(rel_path: &str, name: &str) -> String {
@@ -4845,7 +5127,13 @@ fn choose_type_reference_symbol_index(
             return Some(idx);
         }
     }
-    let imported = imported_reference_candidates(name, imports, &maps.by_file_name);
+    let imported = imported_reference_candidates(
+        name,
+        imports,
+        &maps.by_file_name,
+        &maps.default_export_name_by_file,
+        &maps.star_reexports_by_file,
+    );
     if let Some(idx) = single_type_candidate(imported.iter().copied(), symbols) {
         return Some(idx);
     }
@@ -5786,6 +6074,7 @@ fn ts_variable_function_symbol_from_lines(
 fn ts_variable_symbol_from_line(
     line: &str,
     language: &str,
+    commonjs_exports: &HashSet<String>,
 ) -> Option<(String, &'static str, usize)> {
     let (name, keyword) = ts_variable_declaration_name_from_line(line, language)?;
     let trimmed = line.trim_start();
@@ -5794,7 +6083,7 @@ fn ts_variable_symbol_from_line(
         && name
             .chars()
             .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_');
-    if !exported && !uppercase_like {
+    if !exported && !uppercase_like && !commonjs_exports.contains(&name) {
         return None;
     }
     let column = find_column(line, &name);
@@ -5804,6 +6093,78 @@ fn ts_variable_symbol_from_line(
         "variable"
     };
     Some((name, kind, column))
+}
+
+fn commonjs_exported_names(lines: &[&str]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for (line_idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if let Some(property) = trimmed
+            .strip_prefix("exports.")
+            .and_then(|tail| commonjs_export_property_from_assignment(tail))
+            .or_else(|| {
+                trimmed
+                    .strip_prefix("module.exports.")
+                    .and_then(|tail| commonjs_export_property_from_assignment(tail))
+            })
+        {
+            out.insert(property);
+        }
+        let Some(eq_idx) = trimmed.find("module.exports") else {
+            continue;
+        };
+        let Some(after_equals) = trimmed[eq_idx..].split_once('=') else {
+            continue;
+        };
+        if !after_equals.1.contains('{') {
+            continue;
+        }
+        let mut statement = after_equals.1.to_string();
+        let mut next_idx = line_idx;
+        while !statement.contains('}') && next_idx + 1 < lines.len() {
+            next_idx += 1;
+            statement.push(' ');
+            statement.push_str(lines[next_idx].trim());
+        }
+        let Some((start, end)) = brace_range(&statement) else {
+            continue;
+        };
+        for item in statement[start + 1..end].split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let local = if let Some(colon_idx) = item.find(':') {
+                item[colon_idx + 1..].trim()
+            } else {
+                item
+            };
+            let local: String = local
+                .chars()
+                .take_while(|ch| is_ident_continue(*ch))
+                .collect();
+            if is_identifier(&local) {
+                out.insert(local);
+            }
+        }
+    }
+    out
+}
+
+fn commonjs_export_property_from_assignment(tail: &str) -> Option<String> {
+    let property: String = tail
+        .chars()
+        .take_while(|ch| is_ident_continue(*ch))
+        .collect();
+    if property.is_empty() {
+        return None;
+    }
+    let after_property = tail.get(property.len()..)?.trim_start();
+    if after_property.starts_with('=') {
+        Some(property)
+    } else {
+        None
+    }
 }
 
 fn ts_variable_declaration_name_from_line(
@@ -6316,10 +6677,174 @@ fn should_skip_reference_token_before_symbol(
     {
         return true;
     }
+    if is_assignment_lhs_reference_token(line, start, end, rel_path) {
+        return true;
+    }
     if is_probable_jsx_attribute_name(line, name, start, end, rel_path) {
         return true;
     }
     false
+}
+
+fn is_assignment_lhs_reference_token(line: &str, start: usize, end: usize, rel_path: &str) -> bool {
+    let Some(assignment_idx) = find_top_level_assignment_operator(line, rel_path) else {
+        return false;
+    };
+    if start >= assignment_idx {
+        return false;
+    }
+    if next_nonspace_char(line, end) == Some('.') {
+        return false;
+    }
+    let target_end =
+        find_top_level_colon_before(line, assignment_idx, rel_path).unwrap_or(assignment_idx);
+    start < target_end
+}
+
+fn find_top_level_assignment_operator(line: &str, rel_path: &str) -> Option<usize> {
+    let mut scanner = TopLevelLineScanner::default();
+    let mut iter = line.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
+        if scanner.consume(line, idx, ch, iter.peek().copied(), rel_path) {
+            if matches!(ch, '/' | '*') {
+                iter.next();
+            }
+            continue;
+        }
+        if ch == '='
+            && scanner.depth == 0
+            && is_plain_assignment_equal(line, idx)
+            && !is_probable_jsx_attribute_equal(line, idx, rel_path)
+        {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn find_top_level_colon_before(line: &str, limit: usize, rel_path: &str) -> Option<usize> {
+    let mut scanner = TopLevelLineScanner::default();
+    let mut iter = line.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
+        if idx >= limit {
+            break;
+        }
+        if scanner.consume(line, idx, ch, iter.peek().copied(), rel_path) {
+            if matches!(ch, '/' | '*') {
+                iter.next();
+            }
+            continue;
+        }
+        if ch == ':' && scanner.depth == 0 {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn is_plain_assignment_equal(line: &str, idx: usize) -> bool {
+    let bytes = line.as_bytes();
+    let prev = idx.checked_sub(1).and_then(|prev| bytes.get(prev)).copied();
+    let next = bytes.get(idx + 1).copied();
+    !matches!(
+        prev,
+        Some(
+            b'=' | b'!'
+                | b'<'
+                | b'>'
+                | b'-'
+                | b':'
+                | b'+'
+                | b'*'
+                | b'/'
+                | b'%'
+                | b'&'
+                | b'|'
+                | b'^'
+        )
+    ) && !matches!(next, Some(b'=' | b'>'))
+}
+
+fn is_probable_jsx_attribute_equal(line: &str, idx: usize, rel_path: &str) -> bool {
+    if !(rel_path.ends_with(".tsx") || rel_path.ends_with(".jsx")) {
+        return false;
+    }
+    let before = line.get(..idx).unwrap_or("");
+    let Some(open) = before.rfind('<') else {
+        return false;
+    };
+    if before.rfind('>').map(|close| close > open).unwrap_or(false) {
+        return false;
+    }
+    let tag = before[open + 1..].trim_start();
+    tag.chars()
+        .next()
+        .map(|ch| ch == '/' || is_ident_start(ch))
+        .unwrap_or(false)
+}
+
+#[derive(Default)]
+struct TopLevelLineScanner {
+    quote: Option<char>,
+    escaped: bool,
+    in_block_comment: bool,
+    depth: i32,
+}
+
+impl TopLevelLineScanner {
+    fn consume(
+        &mut self,
+        _line: &str,
+        _idx: usize,
+        ch: char,
+        next: Option<(usize, char)>,
+        rel_path: &str,
+    ) -> bool {
+        if self.in_block_comment {
+            if ch == '*' && next.map(|(_, next)| next == '/').unwrap_or(false) {
+                self.in_block_comment = false;
+                return true;
+            }
+            return true;
+        }
+        if let Some(active_quote) = self.quote {
+            if self.escaped {
+                self.escaped = false;
+                return true;
+            }
+            if ch == '\\' {
+                self.escaped = true;
+                return true;
+            }
+            if ch == active_quote {
+                self.quote = None;
+            }
+            return true;
+        }
+        if rel_path.ends_with(".py") && ch == '#' {
+            self.in_block_comment = true;
+            return true;
+        }
+        if ch == '/' && next.map(|(_, next)| next == '/').unwrap_or(false) {
+            self.in_block_comment = true;
+            return true;
+        }
+        if ch == '/' && next.map(|(_, next)| next == '*').unwrap_or(false) {
+            self.in_block_comment = true;
+            return true;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            self.quote = Some(ch);
+            self.escaped = false;
+            return true;
+        }
+        match ch {
+            '(' | '[' | '{' => self.depth += 1,
+            ')' | ']' | '}' => self.depth = self.depth.saturating_sub(1),
+            _ => {}
+        }
+        false
+    }
 }
 
 fn should_skip_reference_for_symbol(
@@ -6549,6 +7074,136 @@ fn is_ignored_reference_identifier(name: &str) -> bool {
     )
 }
 
+fn string_literal_reference_tokens(line: &str, rel_path: &str) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    for (content_start, content_end) in string_literal_ranges(line, rel_path) {
+        let content = line.get(content_start..content_end).unwrap_or("");
+        if content.len() > 512 && !is_dynamic_string_reference_context(line, content) {
+            continue;
+        }
+        let dynamic_context = is_dynamic_string_reference_context(line, content);
+        for (name, start, end) in identifier_tokens_in_range(line, content_start, content_end) {
+            if !is_low_confidence_reference_name(&name) {
+                continue;
+            }
+            if !dynamic_context {
+                if !rel_path.ends_with(".py") {
+                    continue;
+                }
+                if !looks_like_symbol_string_name(&name) {
+                    continue;
+                }
+            }
+            out.push((name, start, end));
+        }
+    }
+    out
+}
+
+fn is_dynamic_string_reference_context(line: &str, content: &str) -> bool {
+    content.contains('.')
+        || [
+            "apps.get_model",
+            "get_model(",
+            "import_string(",
+            "lazy_import_by_name(",
+            "patch(",
+            "mock.patch",
+            "reverse(",
+            "send_task(",
+            "url(",
+        ]
+        .iter()
+        .any(|needle| line.contains(needle))
+}
+
+fn looks_like_symbol_string_name(name: &str) -> bool {
+    name.contains('_')
+        || name
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_uppercase())
+            .unwrap_or(false)
+}
+
+fn identifier_tokens_in_range(line: &str, start: usize, end: usize) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    let mut token_start: Option<usize> = None;
+    let mut idx = start;
+    while idx < end {
+        let Some(ch) = line[idx..end].chars().next() else {
+            break;
+        };
+        if token_start.is_none() {
+            if is_ident_start(ch) {
+                token_start = Some(idx);
+            }
+        } else if !is_ident_continue(ch) {
+            let token_start = token_start.take().unwrap();
+            out.push((line[token_start..idx].to_string(), token_start, idx));
+        }
+        idx += ch.len_utf8();
+    }
+    if let Some(token_start) = token_start {
+        out.push((line[token_start..end].to_string(), token_start, end));
+    }
+    out
+}
+
+fn string_literal_ranges(line: &str, rel_path: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while idx < line.len() {
+        let Some(ch) = line[idx..].chars().next() else {
+            break;
+        };
+        if rel_path.ends_with(".py") && ch == '#' {
+            break;
+        }
+        if ch == '/'
+            && line
+                .get(idx + 1..)
+                .is_some_and(|tail| tail.starts_with('/'))
+        {
+            break;
+        }
+        if !matches!(ch, '\'' | '"') {
+            idx += ch.len_utf8();
+            continue;
+        }
+        let triple = line[idx..].starts_with(&format!("{ch}{ch}{ch}"));
+        let delimiter_len = if triple { 3 } else { 1 };
+        let delimiter = &line[idx..idx + delimiter_len];
+        let content_start = idx + delimiter_len;
+        let mut search = content_start;
+        let mut escaped = false;
+        let mut found = None;
+        while search < line.len() {
+            if line[search..].starts_with(delimiter) && (triple || !escaped) {
+                found = Some(search);
+                break;
+            }
+            let Some(current) = line[search..].chars().next() else {
+                break;
+            };
+            if !triple {
+                if escaped {
+                    escaped = false;
+                } else if current == '\\' {
+                    escaped = true;
+                }
+            }
+            search += current.len_utf8();
+        }
+        let Some(content_end) = found else {
+            break;
+        };
+        out.push((content_start, content_end));
+        idx = content_end + delimiter_len;
+    }
+    out
+}
+
 fn sanitize_code_line(line: &str, state: &mut IdentifierLexState) -> String {
     let mut out = String::with_capacity(line.len());
     let mut iter = line.char_indices().peekable();
@@ -6776,6 +7431,81 @@ fn find_column(line: &str, name: &str) -> usize {
     line.find(name).unwrap_or(0)
 }
 
+fn find_ts_default_export_name(text: &str) -> Option<String> {
+    let mut code_state = IdentifierLexState::default();
+    let sanitized: Vec<String> = text
+        .lines()
+        .map(|line| sanitize_code_line(line, &mut code_state))
+        .collect();
+    for (idx, line) in sanitized.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(after_export) = strip_leading_word(trimmed, "export") else {
+            continue;
+        };
+        let after_export = after_export.trim_start();
+        if let Some(after_default) = strip_leading_word(after_export, "default") {
+            let mut rest = after_default.trim_start();
+            if let Some(after_async) = strip_leading_word(rest, "async") {
+                rest = after_async.trim_start();
+            }
+            if let Some(name) = identifier_after_keyword(rest, "function") {
+                return Some(name);
+            }
+            if let Some(name) = identifier_after_keyword(rest, "class") {
+                return Some(name);
+            }
+            if let Some(name) = identifier_after_keyword(rest, "abstract class") {
+                return Some(name);
+            }
+            if rest.chars().next().map(is_ident_start).unwrap_or(false) {
+                let name: String = rest
+                    .chars()
+                    .take_while(|ch| is_ident_continue(*ch))
+                    .collect();
+                let after = rest[name.len()..].trim_start();
+                let next_ch = after.chars().next();
+                if matches!(next_ch, None | Some(';'))
+                    && !matches!(
+                        name.as_str(),
+                        "function" | "class" | "async" | "interface" | "type" | "abstract" | "enum"
+                    )
+                {
+                    return Some(name);
+                }
+            }
+            continue;
+        }
+        if after_export.starts_with('{') {
+            let mut statement = String::new();
+            statement.push_str(line);
+            let mut j = idx;
+            while !statement.contains('}') && j + 1 < sanitized.len() {
+                j += 1;
+                statement.push(' ');
+                statement.push_str(&sanitized[j]);
+            }
+            if statement.contains(" from ") {
+                continue;
+            }
+            let Some((start, end)) = brace_range(&statement) else {
+                continue;
+            };
+            for item in statement[start + 1..end].split(',') {
+                let item = item.trim();
+                let Some(as_idx) = item.find(" as ") else {
+                    continue;
+                };
+                let imported = item[..as_idx].trim();
+                let alias = item[as_idx + 4..].trim();
+                if alias == "default" && is_identifier(imported) {
+                    return Some(imported.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn parse_ts_imports(text: &str, rel_path: &str) -> HashMap<String, Vec<ImportTarget>> {
     let mut imports: HashMap<String, Vec<ImportTarget>> = HashMap::new();
     let mut statement = String::new();
@@ -6786,6 +7516,7 @@ fn parse_ts_imports(text: &str, rel_path: &str) -> HashMap<String, Vec<ImportTar
             if (!is_import_declaration(trimmed) && !is_reexport_declaration(trimmed))
                 || trimmed.starts_with("import(")
             {
+                parse_ts_require_statement(trimmed, rel_path, &mut imports);
                 continue;
             }
             statement.clear();
@@ -6810,41 +7541,48 @@ fn parse_ts_imports(text: &str, rel_path: &str) -> HashMap<String, Vec<ImportTar
 
 fn parse_python_imports(text: &str, rel_path: &str) -> HashMap<String, Vec<ImportTarget>> {
     let mut imports: HashMap<String, Vec<ImportTarget>> = HashMap::new();
+    let mut statement = String::new();
+    let mut collecting = false;
+    let mut paren_depth = 0i32;
     for line in text.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("import ") {
-            for item in rest
-                .split('#')
-                .next()
-                .unwrap_or("")
-                .trim_end_matches(';')
-                .split(',')
-            {
-                let item = item.trim();
-                if item.is_empty() {
-                    continue;
-                }
-                let (module, local_name) = if let Some(as_idx) = item.find(" as ") {
-                    (item[..as_idx].trim(), item[as_idx + 4..].trim())
-                } else {
-                    let module = item;
-                    (module, module.rsplit('.').next().unwrap_or(module))
-                };
-                if !is_identifier(local_name) {
-                    continue;
-                }
-                let target_rel_paths = resolve_python_module_candidates(rel_path, module);
-                if !target_rel_paths.is_empty() {
-                    add_import_targets(
-                        &mut imports,
-                        local_name,
-                        MODULE_IMPORT_TARGET,
-                        &target_rel_paths,
-                    );
-                }
+        let trimmed = line.trim_start().split('#').next().unwrap_or("").trim_end();
+        if collecting {
+            statement.push(' ');
+            statement.push_str(trimmed.trim_end_matches('\\').trim_end());
+            paren_depth += python_import_paren_delta(trimmed);
+            if python_import_statement_continues(trimmed, paren_depth) {
+                continue;
             }
+            parse_python_import_statement(&statement, rel_path, &mut imports);
+            statement.clear();
+            collecting = false;
+            paren_depth = 0;
             continue;
         }
+        if !(trimmed.starts_with("import ") || trimmed.starts_with("from ")) {
+            continue;
+        };
+        statement.clear();
+        statement.push_str(trimmed.trim_end_matches('\\').trim_end());
+        paren_depth = python_import_paren_delta(trimmed);
+        if python_import_statement_continues(trimmed, paren_depth) {
+            collecting = true;
+            continue;
+        }
+        parse_python_import_statement(&statement, rel_path, &mut imports);
+        statement.clear();
+        paren_depth = 0;
+    }
+    if collecting && !statement.is_empty() {
+        parse_python_import_statement(&statement, rel_path, &mut imports);
+    }
+    imports
+}
+
+fn parse_python_star_reexports(text: &str, rel_path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start().split('#').next().unwrap_or("").trim_end();
         let Some(rest) = trimmed.strip_prefix("from ") else {
             continue;
         };
@@ -6852,47 +7590,113 @@ fn parse_python_imports(text: &str, rel_path: &str) -> HashMap<String, Vec<Impor
             continue;
         };
         let module = rest[..import_idx].trim();
-        let names = rest[import_idx + " import ".len()..]
-            .split('#')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_end_matches(';');
-        if names.starts_with('(') || names == "*" {
+        let names = strip_python_import_group_parens(
+            rest[import_idx + " import ".len()..]
+                .trim()
+                .trim_end_matches(';'),
+        );
+        if names != "*" {
             continue;
         }
-        let target_rel_paths = resolve_python_module_candidates(rel_path, module);
-        if target_rel_paths.is_empty() {
-            continue;
-        }
-        for item in names.split(',') {
+        out.extend(resolve_python_module_candidates(rel_path, module));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn python_import_paren_delta(line: &str) -> i32 {
+    line.matches('(').count() as i32 - line.matches(')').count() as i32
+}
+
+fn python_import_statement_continues(line: &str, paren_depth: i32) -> bool {
+    paren_depth > 0 || line.trim_end().ends_with('\\')
+}
+
+fn parse_python_import_statement(
+    statement: &str,
+    rel_path: &str,
+    imports: &mut HashMap<String, Vec<ImportTarget>>,
+) {
+    let trimmed = statement.trim();
+    if let Some(rest) = trimmed.strip_prefix("import ") {
+        for item in rest.trim_end_matches(';').split(',') {
             let item = item.trim();
             if item.is_empty() {
                 continue;
             }
-            let (imported_name, local_name) = if let Some(as_idx) = item.find(" as ") {
+            let (module, local_name) = if let Some(as_idx) = item.find(" as ") {
                 (item[..as_idx].trim(), item[as_idx + 4..].trim())
             } else {
-                (item, item)
+                let module = item;
+                (module, module.rsplit('.').next().unwrap_or(module))
             };
-            if is_identifier(imported_name) && is_identifier(local_name) {
-                let imported_target = if module.trim_start_matches('.').is_empty() {
-                    MODULE_IMPORT_TARGET
-                } else {
-                    imported_name
-                };
-                let import_paths = if module.trim_start_matches('.').is_empty() {
-                    resolve_python_module_candidates(rel_path, &format!("{module}{imported_name}"))
-                } else {
-                    target_rel_paths.clone()
-                };
-                if !import_paths.is_empty() {
-                    add_import_targets(&mut imports, local_name, imported_target, &import_paths);
-                }
+            if !is_identifier(local_name) {
+                continue;
+            }
+            let target_rel_paths = resolve_python_module_candidates(rel_path, module);
+            if !target_rel_paths.is_empty() {
+                add_import_targets(imports, local_name, MODULE_IMPORT_TARGET, &target_rel_paths);
+            }
+        }
+        return;
+    }
+    let Some(rest) = trimmed.strip_prefix("from ") else {
+        return;
+    };
+    let Some(import_idx) = rest.find(" import ") else {
+        return;
+    };
+    let module = rest[..import_idx].trim();
+    let names = rest[import_idx + " import ".len()..]
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let names = strip_python_import_group_parens(names);
+    if names == "*" {
+        return;
+    }
+    let target_rel_paths = resolve_python_module_candidates(rel_path, module);
+    if target_rel_paths.is_empty() {
+        return;
+    }
+    for item in names.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (imported_name, local_name) = if let Some(as_idx) = item.find(" as ") {
+            (item[..as_idx].trim(), item[as_idx + 4..].trim())
+        } else {
+            (item, item)
+        };
+        if is_identifier(imported_name) && is_identifier(local_name) {
+            let imported_target = if module.trim_start_matches('.').is_empty() {
+                MODULE_IMPORT_TARGET
+            } else {
+                imported_name
+            };
+            let import_paths = if module.trim_start_matches('.').is_empty() {
+                resolve_python_module_candidates(rel_path, &format!("{module}{imported_name}"))
+            } else {
+                target_rel_paths.clone()
+            };
+            if !import_paths.is_empty() {
+                add_import_targets(imports, local_name, imported_target, &import_paths);
             }
         }
     }
-    imports
+}
+
+fn strip_python_import_group_parens(value: &str) -> &str {
+    let mut names = value.trim();
+    if let Some(stripped) = names.strip_prefix('(') {
+        names = stripped.trim();
+    }
+    if let Some(stripped) = names.strip_suffix(')') {
+        names = stripped.trim();
+    }
+    names
 }
 
 fn resolve_python_module_candidates(rel_path: &str, module: &str) -> Vec<String> {
@@ -6946,8 +7750,13 @@ fn parse_ts_import_statement(
             } else {
                 (item, item)
             };
+            let imported_target_name = if imported_name == "default" {
+                DEFAULT_IMPORT_TARGET
+            } else {
+                imported_name
+            };
             if is_identifier(imported_name) && is_identifier(local_name) {
-                add_import_targets(imports, local_name, imported_name, &target_rel_paths);
+                add_import_targets(imports, local_name, imported_target_name, &target_rel_paths);
             }
         }
     }
@@ -7001,8 +7810,92 @@ fn parse_ts_import_statement(
         .unwrap_or("")
         .trim();
     if is_identifier(default_part) {
-        add_import_targets(imports, default_part, default_part, &target_rel_paths);
+        add_import_targets(
+            imports,
+            default_part,
+            DEFAULT_IMPORT_TARGET,
+            &target_rel_paths,
+        );
     }
+}
+
+fn parse_ts_require_statement(
+    statement: &str,
+    rel_path: &str,
+    imports: &mut HashMap<String, Vec<ImportTarget>>,
+) {
+    let Some(require_idx) = statement.find("require(") else {
+        return;
+    };
+    let Some(eq_idx) = statement[..require_idx].rfind('=') else {
+        return;
+    };
+    let binding = statement[..eq_idx].trim();
+    let binding = ["const", "let", "var"]
+        .iter()
+        .find_map(|keyword| strip_leading_word(binding, keyword))
+        .unwrap_or(binding)
+        .trim();
+    if binding.is_empty() {
+        return;
+    }
+    let after_require = &statement[require_idx + "require(".len()..];
+    let Some(module_specifier) = quoted_after(after_require) else {
+        return;
+    };
+    let target_rel_paths = resolve_relative_module_candidates(rel_path, module_specifier);
+    if target_rel_paths.is_empty() {
+        return;
+    }
+    let required_member = after_require
+        .find(')')
+        .and_then(|close| after_require.get(close + 1..))
+        .and_then(|tail| tail.trim_start().strip_prefix('.'))
+        .map(|tail| {
+            tail.chars()
+                .take_while(|ch| is_ident_continue(*ch))
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty());
+    if binding.starts_with('{') {
+        let Some((start, end)) = brace_range(binding) else {
+            return;
+        };
+        for item in binding[start + 1..end].split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let (imported_name, local_name) = if let Some(colon_idx) = item.find(':') {
+                (item[..colon_idx].trim(), item[colon_idx + 1..].trim())
+            } else {
+                (item, item)
+            };
+            let imported_target_name = if imported_name == "default" {
+                DEFAULT_IMPORT_TARGET
+            } else {
+                imported_name
+            };
+            if is_identifier(imported_name) && is_identifier(local_name) {
+                add_import_targets(imports, local_name, imported_target_name, &target_rel_paths);
+            }
+        }
+        return;
+    }
+    if !is_identifier(binding) {
+        return;
+    }
+    let imported_name = required_member
+        .as_deref()
+        .map(|name| {
+            if name == "default" {
+                DEFAULT_IMPORT_TARGET
+            } else {
+                name
+            }
+        })
+        .unwrap_or(MODULE_IMPORT_TARGET);
+    add_import_targets(imports, binding, imported_name, &target_rel_paths);
 }
 
 fn add_import_targets(
@@ -9607,6 +10500,867 @@ record UserRecord(String id) implements Handler {
             .find(|symbol| symbol.name == "tick")
             .expect("scheduled method");
         assert_eq!(tick.implementation_count, Some(1));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_links_renamed_default_import_to_named_default_export() -> io::Result<()> {
+        let root = temp_dir("graph-default-rebind-named");
+        let src = root.join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(
+            src.join("provider.ts"),
+            r#"export default function defaultNamedFn() {
+  return 1;
+}
+"#,
+        )?;
+        fs::write(
+            src.join("consumer.ts"),
+            r#"import renamedDefault from "./provider";
+
+renamedDefault();
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 320, &config, 8, &mut |_| {})?;
+        let provider_uri = file_uri(&root.join("src/provider.ts"));
+        let provider_doc =
+            query_graph_document_symbols(&root, &provider_uri, None, None, 50, &config)?
+                .expect("provider document symbols");
+        let default_named = provider_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "defaultNamedFn")
+            .expect("defaultNamedFn symbol");
+        let refs = query_graph(&root, &default_named.id, 20, &config)?
+            .expect("defaultNamedFn references")
+            .references;
+        assert!(
+            refs.iter()
+                .any(|reference| reference.rel_path == "src/consumer.ts"
+                    && reference.raw_text == "renamedDefault"),
+            "expected default-import rebind to link the call back to defaultNamedFn: {refs:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_links_renamed_default_import_to_anonymous_const_default_export(
+    ) -> io::Result<()> {
+        let root = temp_dir("graph-default-rebind-const");
+        let src = root.join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(
+            src.join("provider.ts"),
+            r#"const handler = () => 1;
+export default handler;
+"#,
+        )?;
+        fs::write(
+            src.join("consumer.ts"),
+            r#"import otherName from "./provider";
+
+otherName();
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 321, &config, 8, &mut |_| {})?;
+        let provider_uri = file_uri(&root.join("src/provider.ts"));
+        let provider_doc =
+            query_graph_document_symbols(&root, &provider_uri, None, None, 50, &config)?
+                .expect("provider document symbols");
+        let handler = provider_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "handler")
+            .expect("handler symbol");
+        let refs = query_graph(&root, &handler.id, 20, &config)?
+            .expect("handler references")
+            .references;
+        assert!(
+            refs.iter().any(|reference| reference.rel_path == "src/consumer.ts"
+                && reference.raw_text == "otherName"),
+            "expected `export default <ident>;` to link `import otherName from` to handler: {refs:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_links_default_import_to_aliased_default_reexport() -> io::Result<()> {
+        let root = temp_dir("graph-default-as-reexport");
+        let src = root.join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(
+            src.join("provider.ts"),
+            r#"function namedHelper() {
+  return 2;
+}
+export { namedHelper as default };
+"#,
+        )?;
+        fs::write(
+            src.join("consumer.ts"),
+            r#"import helperRenamed from "./provider";
+
+helperRenamed();
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 322, &config, 8, &mut |_| {})?;
+        let provider_uri = file_uri(&root.join("src/provider.ts"));
+        let provider_doc =
+            query_graph_document_symbols(&root, &provider_uri, None, None, 50, &config)?
+                .expect("provider document symbols");
+        let named_helper = provider_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "namedHelper")
+            .expect("namedHelper symbol");
+        let refs = query_graph(&root, &named_helper.id, 20, &config)?
+            .expect("namedHelper references")
+            .references;
+        assert!(
+            refs.iter().any(|reference| reference.rel_path == "src/consumer.ts"
+                && reference.raw_text == "helperRenamed"),
+            "expected `export {{ namedHelper as default }}` to link `import helperRenamed from` to namedHelper: {refs:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_handles_jsdoc_and_inline_comments_in_multiline_signature() -> io::Result<()> {
+        let root = temp_dir("graph-jsdoc-multiline");
+        let src = root.join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(
+            src.join("provider.ts"),
+            r#"/**
+ * Adds two numbers.
+ *
+ * @param a first
+ * @param b second
+ */
+export const longArrow = (
+  /* inline comment with )( weird stuff */
+  a: number,
+  b: number,
+): number => {
+  return a + b;
+};
+
+export function multilineFn(
+  // leading param comment
+  first: number,
+  second: number, /* trailing param comment */
+): number {
+  return first + second;
+}
+"#,
+        )?;
+        fs::write(
+            src.join("consumer.ts"),
+            r#"import { longArrow, multilineFn } from "./provider";
+
+longArrow(5, 6);
+multilineFn(7, 8);
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 330, &config, 8, &mut |_| {})?;
+        let provider_uri = file_uri(&root.join("src/provider.ts"));
+        let provider_doc =
+            query_graph_document_symbols(&root, &provider_uri, None, None, 50, &config)?
+                .expect("provider document symbols");
+        let names: BTreeSet<String> = provider_doc
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.clone())
+            .collect();
+        for expected in ["longArrow", "multilineFn"] {
+            assert!(
+                names.contains(expected),
+                "missing TS multiline symbol {expected}: {names:?}"
+            );
+        }
+        let long_arrow = provider_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "longArrow")
+            .expect("longArrow");
+        let long_arrow_refs = query_graph(&root, &long_arrow.id, 20, &config)?
+            .expect("longArrow refs")
+            .references;
+        assert!(
+            long_arrow_refs
+                .iter()
+                .any(|reference| reference.rel_path == "src/consumer.ts"),
+            "multiline arrow with JSDoc/inline comments should be reachable from consumer: {long_arrow_refs:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_handles_python_decorator_with_runtime_call_and_inline_comment(
+    ) -> io::Result<()> {
+        let root = temp_dir("graph-python-decorator-runtime");
+        let src = root.join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(
+            src.join("api.py"),
+            r#"from typing import Optional
+
+router = object()
+
+
+@router.get("/users")
+async def list_users(
+    # leading parameter comment
+    limit: int = 10,
+    *,
+    cursor: Optional[str] = None,
+) -> Optional[list]:  # type: ignore[no-untyped-def]
+    return await fetch_users(limit, cursor)
+
+
+def fetch_users(limit: int, cursor: Optional[str]) -> Optional[list]:
+    return None
+
+
+def runtime_usage_via_reflection():
+    handler = globals()["fetch_users"]
+    return handler(5, None)
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 340, &config, 8, &mut |_| {})?;
+        let api_uri = file_uri(&root.join("src/api.py"));
+        let api_doc = query_graph_document_symbols(&root, &api_uri, None, None, 50, &config)?
+            .expect("api document symbols");
+        let api_names: BTreeSet<String> = api_doc
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.clone())
+            .collect();
+        for expected in ["list_users", "fetch_users", "runtime_usage_via_reflection"] {
+            assert!(
+                api_names.contains(expected),
+                "missing Python def {expected}: {api_names:?}"
+            );
+        }
+        let fetch_users = api_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "fetch_users")
+            .expect("fetch_users symbol");
+        let fetch_refs = query_graph(&root, &fetch_users.id, 20, &config)?
+            .expect("fetch_users references")
+            .references;
+        assert!(
+            fetch_refs
+                .iter()
+                .any(|reference| reference.rel_path == "src/api.py"
+                    && reference.raw_text.contains("fetch_users")
+                    && reference.start_line < 14),
+            "expected `await fetch_users(...)` inside multi-line async def to be tracked: {fetch_refs:?}"
+        );
+        assert!(
+            fetch_refs
+                .iter()
+                .any(|reference| reference.rel_path == "src/api.py"
+                    && reference.start_line >= 18),
+            "expected globals()[\"fetch_users\"] runtime reflection to count as a usage: {fetch_refs:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_handles_jsx_usage_of_default_exported_component() -> io::Result<()> {
+        let root = temp_dir("graph-jsx-default");
+        let src = root.join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(
+            src.join("LazyLoaded.tsx"),
+            r#"export default function LazyLoaded(props: { title: string }) {
+  return <h1>{props.title}</h1>;
+}
+"#,
+        )?;
+        fs::write(
+            src.join("page.tsx"),
+            r#"import LazyLoaded from "./LazyLoaded";
+
+export const Page = () => {
+  return <LazyLoaded title="hi" />;
+};
+
+export default Page;
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 350, &config, 8, &mut |_| {})?;
+        let lazy_uri = file_uri(&root.join("src/LazyLoaded.tsx"));
+        let lazy_doc = query_graph_document_symbols(&root, &lazy_uri, None, None, 50, &config)?
+            .expect("LazyLoaded document symbols");
+        let lazy_loaded = lazy_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "LazyLoaded")
+            .expect("LazyLoaded symbol");
+        let lazy_refs = query_graph(&root, &lazy_loaded.id, 20, &config)?
+            .expect("LazyLoaded references")
+            .references;
+        assert!(
+            lazy_refs
+                .iter()
+                .any(|reference| reference.rel_path == "src/page.tsx"),
+            "expected JSX `<LazyLoaded />` usage to count toward the default-exported component: {lazy_refs:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_indexes_captain_user_service_symbols() -> io::Result<()> {
+        let root = temp_dir("graph-captain-user-service");
+        let pkg = root.join("zuzu/packages/user/services");
+        fs::create_dir_all(&pkg)?;
+        fs::write(
+            pkg.join("user_service.py"),
+            include_str!("../tests/fixtures/captain_user_service.py"),
+        )?;
+        fs::write(
+            root.join("zuzu/packages/user/services/caller_site.py"),
+            r#"from zuzu.packages.user.services.user_service import (
+    edit_user,
+    edit_user_signup_channel,
+    edit_user_slack_member_id,
+    edit_user_should_authenticate_two_factor,
+    edit_user_profile_images,
+    signup,
+    get_user,
+    get_active_user_by_email,
+)
+
+
+def use_all():
+    user = get_user(1)
+    user2 = get_active_user_by_email("a@b.c")
+    edit_user_slack_member_id(user, "m")
+    edit_user_should_authenticate_two_factor(
+        staff=user,
+        target_user=user2,
+        should_authenticate_two_factor=True,
+    )
+    edit_user_profile_images(
+        user=user,
+        profile_image=None,
+        profile_image_for_email=None,
+        is_profile_image_changed=False,
+        is_profile_image_for_email_changed=False,
+    )
+    edit_user_signup_channel(user, None)
+    signup(
+        email="x",
+        password="passw0rd",
+        full_name="x",
+        signup_path="web",
+        signup_channel_creator=None,
+    )
+    edit_user(user=user2)
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 410, &config, 8, &mut |_| {})?;
+        let svc_uri = file_uri(&pkg.join("user_service.py"));
+        let svc_doc = query_graph_document_symbols(&root, &svc_uri, None, None, 200, &config)?
+            .expect("user_service document symbols");
+        let names: BTreeSet<String> = svc_doc
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.clone())
+            .collect();
+        for expected in [
+            "get_user",
+            "get_active_user_by_email",
+            "edit_user_should_authenticate_two_factor",
+            "edit_user_slack_member_id",
+            "edit_user_profile_images",
+            "edit_user_signup_channel",
+            "signup",
+            "edit_user",
+            "_save_user_survey",
+        ] {
+            assert!(
+                names.contains(expected),
+                "missing Python def {expected}: {names:?}"
+            );
+        }
+        for func in [
+            "edit_user_should_authenticate_two_factor",
+            "edit_user_profile_images",
+            "edit_user_signup_channel",
+            "signup",
+            "edit_user",
+            "get_user",
+            "get_active_user_by_email",
+            "edit_user_slack_member_id",
+        ] {
+            let symbol = svc_doc
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == func)
+                .unwrap_or_else(|| panic!("expected symbol {func}"));
+            let refs = query_graph(&root, &symbol.id, 20, &config)?
+                .expect("function references")
+                .references;
+            assert!(
+                refs.iter()
+                    .any(|reference| reference.rel_path.ends_with("caller_site.py")),
+                "expected {func} to have usage from caller_site.py: {refs:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_resolves_parenthesized_python_import_aliases() -> io::Result<()> {
+        let root = temp_dir("graph-python-multiline-import-alias");
+        let app = root.join("app");
+        fs::create_dir_all(&app)?;
+        fs::write(
+            app.join("service.py"),
+            r#"def make_user():
+    return 1
+
+
+class UserService:
+    def run(self):
+        return make_user()
+"#,
+        )?;
+        fs::write(
+            app.join("other.py"),
+            r#"def make_user():
+    return 2
+"#,
+        )?;
+        fs::write(
+            app.join("consumer.py"),
+            r#"from app.service import (
+    make_user as make_user_alias,
+    UserService as RenamedService,
+)
+
+
+def use_service():
+    svc = RenamedService()
+    make_user_alias()
+    return svc.run()
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 420, &config, 8, &mut |_| {})?;
+        let service_uri = file_uri(&app.join("service.py"));
+        let service_doc =
+            query_graph_document_symbols(&root, &service_uri, None, None, 50, &config)?
+                .expect("service document symbols");
+        let make_user = service_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "make_user")
+            .expect("make_user symbol");
+        let make_user_refs = query_graph(&root, &make_user.id, 20, &config)?
+            .expect("make_user references")
+            .references;
+        assert!(
+            make_user_refs.iter().any(|reference| reference.rel_path == "app/consumer.py"
+                && reference.raw_text == "make_user_alias"),
+            "parenthesized Python import alias should resolve back to app.service.make_user: {make_user_refs:?}"
+        );
+        let run = service_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "run")
+            .expect("UserService.run symbol");
+        let run_refs = query_graph(&root, &run.id, 20, &config)?
+            .expect("run references")
+            .references;
+        assert!(
+            run_refs
+                .iter()
+                .any(|reference| reference.rel_path == "app/consumer.py"),
+            "constructor alias from parenthesized Python import should type svc.run(): {run_refs:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_uses_low_confidence_ts_usage_fallbacks() -> io::Result<()> {
+        let root = temp_dir("graph-ts-low-confidence-fallbacks");
+        let src = root.join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(
+            src.join("provider.ts"),
+            r#"export function renderDashboard() {
+  return 1;
+}
+"#,
+        )?;
+        fs::write(
+            src.join("consumer.ts"),
+            r#"export function run() {
+  return renderDashboard();
+}
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 424, &config, 8, &mut |_| {})?;
+        let provider_uri = file_uri(&src.join("provider.ts"));
+        let provider_doc =
+            query_graph_document_symbols(&root, &provider_uri, None, None, 50, &config)?
+                .expect("provider document symbols");
+        let render_dashboard = provider_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "renderDashboard")
+            .expect("renderDashboard symbol");
+        let refs = query_graph(&root, &render_dashboard.id, 20, &config)?
+            .expect("renderDashboard refs")
+            .references;
+        assert!(
+            refs.iter()
+                .any(|reference| reference.rel_path == "src/consumer.ts"
+                    && reference.start_line == 1
+                    && reference.raw_text == "renderDashboard"),
+            "unresolved TS calls should still become low-confidence usages: {refs:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_uses_low_confidence_java_string_fallbacks() -> io::Result<()> {
+        let root = temp_dir("graph-java-low-confidence-fallbacks");
+        let src = root.join("src/main/java/app");
+        fs::create_dir_all(&src)?;
+        fs::write(
+            src.join("UserController.java"),
+            r#"package app;
+
+public class UserController {
+    public String handleSignup() {
+        return "ok";
+    }
+}
+"#,
+        )?;
+        fs::write(
+            src.join("Registry.java"),
+            r#"package app;
+
+public class Registry {
+    public void load() throws Exception {
+        Class.forName("app.UserController");
+    }
+}
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 425, &config, 8, &mut |_| {})?;
+        let controller_uri = file_uri(&src.join("UserController.java"));
+        let controller_doc =
+            query_graph_document_symbols(&root, &controller_uri, None, None, 50, &config)?
+                .expect("controller document symbols");
+        let controller = controller_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "UserController")
+            .expect("UserController symbol");
+        let controller_refs = query_graph(&root, &controller.id, 20, &config)?
+            .expect("UserController refs")
+            .references;
+        assert!(
+            controller_refs
+                .iter()
+                .any(|reference| reference.rel_path.ends_with("Registry.java")
+                    && reference.start_line == 4
+                    && reference.raw_text == "UserController"),
+            "dotted Java reflection strings should count as low-confidence class usages: {controller_refs:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_uses_low_confidence_python_usage_fallbacks() -> io::Result<()> {
+        let root = temp_dir("graph-python-low-confidence-fallbacks");
+        let app = root.join("app");
+        fs::create_dir_all(&app)?;
+        fs::write(
+            app.join("service.py"),
+            r#"def signup(email: str) -> str:
+    return email
+
+
+class UserSettingsType:
+    pass
+"#,
+        )?;
+        fs::write(
+            app.join("other.py"),
+            r#"def signup(email: str) -> str:
+    return email
+"#,
+        )?;
+        fs::write(
+            app.join("consumer.py"),
+            r#"def execute():
+    return signup(email="a@example.com")
+
+
+def dynamic_refs():
+    lazy_import_by_name("UserSettingsType")
+    patch("app.service.signup")
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 423, &config, 8, &mut |_| {})?;
+        let service_uri = file_uri(&app.join("service.py"));
+        let service_doc =
+            query_graph_document_symbols(&root, &service_uri, None, None, 50, &config)?
+                .expect("service document symbols");
+        let signup = service_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "signup")
+            .expect("signup symbol");
+        let signup_refs = query_graph(&root, &signup.id, 20, &config)?
+            .expect("signup refs")
+            .references;
+        assert!(
+            signup_refs
+                .iter()
+                .any(|reference| reference.rel_path == "app/consumer.py"
+                    && reference.start_line == 1
+                    && reference.raw_text == "signup"),
+            "unresolved direct call should still become a low-confidence usage: {signup_refs:?}"
+        );
+        assert!(
+            signup_refs
+                .iter()
+                .any(|reference| reference.rel_path == "app/consumer.py"
+                    && reference.start_line == 6
+                    && reference.raw_text == "signup"),
+            "dotted string references should count as low-confidence usages: {signup_refs:?}"
+        );
+        let user_settings_type = service_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "UserSettingsType")
+            .expect("UserSettingsType symbol");
+        let type_refs = query_graph(&root, &user_settings_type.id, 20, &config)?
+            .expect("UserSettingsType refs")
+            .references;
+        assert!(
+            type_refs
+                .iter()
+                .any(|reference| reference.rel_path == "app/consumer.py"
+                    && reference.start_line == 5
+                    && reference.raw_text == "UserSettingsType"),
+            "dynamic import string should count as a low-confidence type usage: {type_refs:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_resolves_python_package_star_reexports() -> io::Result<()> {
+        let root = temp_dir("graph-python-star-reexport");
+        let services = root.join("zuzu/packages/user/services");
+        let mutations = root.join("zuzu/packages/user/mutations");
+        fs::create_dir_all(&services)?;
+        fs::create_dir_all(&mutations)?;
+        fs::write(
+            services.join("__init__.py"),
+            "from .user_service import *\n",
+        )?;
+        fs::write(
+            services.join("user_service.py"),
+            r#"__all__ = ["signup"]
+
+
+def signup(
+    *,
+    email: str,
+    password: str,
+) -> str:
+    return email
+"#,
+        )?;
+        fs::write(
+            mutations.join("signup_mutation.py"),
+            r#"from ..services import signup
+
+
+def execute():
+    return signup(
+        email="a@example.com",
+        password="test1234",
+    )
+
+
+class SignupMutation:
+    signup = "graphql field"
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 422, &config, 8, &mut |_| {})?;
+        let service_uri = file_uri(&services.join("user_service.py"));
+        let service_doc =
+            query_graph_document_symbols(&root, &service_uri, None, None, 50, &config)?
+                .expect("user_service document symbols");
+        let signup = service_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "signup")
+            .expect("signup symbol");
+        let refs = query_graph(&root, &signup.id, 20, &config)?
+            .expect("signup refs")
+            .references;
+        assert!(
+            refs.iter()
+                .any(|reference| reference.rel_path.ends_with("signup_mutation.py")
+                    && reference.start_line == 4),
+            "package star re-export should resolve the call, not the same-file SignupMutation.signup field: {refs:?}"
+        );
+        let mutation_ref_lines: BTreeSet<u32> = refs
+            .iter()
+            .filter(|reference| reference.rel_path.ends_with("signup_mutation.py"))
+            .map(|reference| reference.start_line)
+            .collect();
+        assert_eq!(
+            mutation_ref_lines,
+            [0_u32, 4].into_iter().collect(),
+            "assignment targets should not be counted as imported function usages: {refs:?}"
+        );
+        let mutation_uri = file_uri(&mutations.join("signup_mutation.py"));
+        let mutation_doc =
+            query_graph_document_symbols(&root, &mutation_uri, None, None, 50, &config)?
+                .expect("mutation document symbols");
+        let field = mutation_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "SignupMutation.signup")
+            .expect("SignupMutation.signup field symbol");
+        let field_refs = query_graph(&root, &field.id, 20, &config)?
+            .expect("field refs")
+            .references;
+        assert!(
+            field_refs.is_empty(),
+            "imported call should not be misrouted to same-file field: {field_refs:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_resolves_commonjs_require_aliases() -> io::Result<()> {
+        let root = temp_dir("graph-commonjs-require-alias");
+        let src = root.join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(
+            src.join("api.js"),
+            r#"function exportedFn() {
+  return 1;
+}
+
+const exportedValue = 2;
+
+class ExportedService {
+  run() {
+    return exportedValue;
+  }
+}
+
+module.exports = { exportedFn, exportedValue, ExportedService };
+"#,
+        )?;
+        fs::write(
+            src.join("consumer.js"),
+            r#"const api = require("./api");
+const { exportedFn: renamedFn, exportedValue } = require("./api");
+const Service = require("./api").ExportedService;
+
+function useAll() {
+  const svc = new Service();
+  renamedFn();
+  api.exportedFn();
+  exportedValue;
+  return svc.run();
+}
+"#,
+        )?;
+        let config = EngineConfig::default();
+        let _ = rebuild_graph_native(&root, 421, &config, 8, &mut |_| {})?;
+        let api_uri = file_uri(&src.join("api.js"));
+        let api_doc = query_graph_document_symbols(&root, &api_uri, None, None, 50, &config)?
+            .expect("api document symbols");
+        let exported_fn = api_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "exportedFn")
+            .expect("exportedFn symbol");
+        let exported_fn_refs = query_graph(&root, &exported_fn.id, 20, &config)?
+            .expect("exportedFn refs")
+            .references;
+        assert!(
+            exported_fn_refs
+                .iter()
+                .any(|reference| reference.rel_path == "src/consumer.js"
+                    && reference.raw_text == "renamedFn")
+                && exported_fn_refs
+                    .iter()
+                    .any(|reference| reference.rel_path == "src/consumer.js"
+                        && reference.raw_text == "exportedFn"),
+            "CommonJS destructuring and namespace require usages should resolve to exportedFn: {exported_fn_refs:?}"
+        );
+        let exported_value = api_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "exportedValue")
+            .expect("exportedValue symbol");
+        let value_refs = query_graph(&root, &exported_value.id, 20, &config)?
+            .expect("exportedValue refs")
+            .references;
+        assert!(
+            value_refs
+                .iter()
+                .any(|reference| reference.rel_path == "src/consumer.js"),
+            "CommonJS destructured value usage should resolve to exportedValue: {value_refs:?}"
+        );
+        let run = api_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "run")
+            .expect("ExportedService.run symbol");
+        let run_refs = query_graph(&root, &run.id, 20, &config)?
+            .expect("run refs")
+            .references;
+        assert!(
+            run_refs
+                .iter()
+                .any(|reference| reference.rel_path == "src/consumer.js"),
+            "CommonJS member require should type constructed service receivers: {run_refs:?}"
+        );
         let _ = fs::remove_dir_all(root);
         Ok(())
     }

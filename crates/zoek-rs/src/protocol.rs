@@ -638,13 +638,16 @@ impl GraphSymbolResponse {
         let extends_names = if self.extends_names.is_empty() {
             String::new()
         } else {
-            format!(",\"extendsNames\":{}", json_string_vec(&self.extends_names))
+            format!(
+                ",\"extendsNames\":[{}]",
+                json_string_vec(&self.extends_names)
+            )
         };
         let implements_names = if self.implements_names.is_empty() {
             String::new()
         } else {
             format!(
-                ",\"implementsNames\":{}",
+                ",\"implementsNames\":[{}]",
                 json_string_vec(&self.implements_names)
             )
         };
@@ -760,4 +763,97 @@ pub fn json_string(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_symbol_response_serializes_relation_name_lists_as_json_arrays() {
+        let symbol = GraphSymbolResponse {
+            id: "python:pkg/user_service.py:UserProfileImageUpdateDict:91".to_string(),
+            name: "UserProfileImageUpdateDict".to_string(),
+            qualified_name: "UserProfileImageUpdateDict".to_string(),
+            kind: "class".to_string(),
+            language: "python".to_string(),
+            uri: "file:///workspace/pkg/user_service.py".to_string(),
+            rel_path: "pkg/user_service.py".to_string(),
+            start_line: 90,
+            start_column: 10,
+            end_line: 90,
+            end_column: 36,
+            body_start_line: 90,
+            body_start_column: 10,
+            body_end_line: 96,
+            body_end_column: u32::MAX,
+            container_id: None,
+            container_name: None,
+            package_name: None,
+            extends_names: vec!["TypedDict".to_string(), "total=False".to_string()],
+            implements_names: vec!["PythonFramework".to_string(), "RuntimeHook".to_string()],
+            usage_count: Some(1),
+            implementation_count: Some(0),
+        };
+
+        let json = symbol.to_json();
+        assert!(
+            json.contains("\"extendsNames\":[\"TypedDict\",\"total=False\"]"),
+            "extendsNames must be a JSON array: {json}"
+        );
+        assert!(
+            json.contains("\"implementsNames\":[\"PythonFramework\",\"RuntimeHook\"]"),
+            "implementsNames must be a JSON array: {json}"
+        );
+        assert!(
+            !json.contains("\"extendsNames\":\"TypedDict\",\"total=False\""),
+            "extendsNames must not be serialized as adjacent object fields: {json}"
+        );
+    }
+
+    #[test]
+    fn graph_symbol_query_response_keeps_symbol_arrays_parseable() {
+        let response = GraphSymbolQueryResponse {
+            ok: true,
+            engine: EngineInfo::current(),
+            workspace_root: "/workspace".to_string(),
+            built_at_unix_ms: 42,
+            total_symbols: 1,
+            symbols: vec![GraphSymbolResponse {
+                id: "python:pkg/user_service.py:UserProfileImageUpdateDict:91".to_string(),
+                name: "UserProfileImageUpdateDict".to_string(),
+                qualified_name: "UserProfileImageUpdateDict".to_string(),
+                kind: "class".to_string(),
+                language: "python".to_string(),
+                uri: "file:///workspace/pkg/user_service.py".to_string(),
+                rel_path: "pkg/user_service.py".to_string(),
+                start_line: 90,
+                start_column: 10,
+                end_line: 90,
+                end_column: 36,
+                body_start_line: 90,
+                body_start_column: 10,
+                body_end_line: 96,
+                body_end_column: u32::MAX,
+                container_id: None,
+                container_name: None,
+                package_name: None,
+                extends_names: vec!["TypedDict".to_string(), "total=False".to_string()],
+                implements_names: Vec::new(),
+                usage_count: Some(1),
+                implementation_count: Some(0),
+            }],
+            warnings: Vec::new(),
+        };
+
+        let json = response.to_json();
+        assert!(
+            json.contains("\"symbols\":[{"),
+            "response should contain a symbols array: {json}"
+        );
+        assert!(
+            json.contains("\"extendsNames\":[\"TypedDict\",\"total=False\"]"),
+            "nested symbol list fields must stay valid inside graph-symbol-query response: {json}"
+        );
+    }
 }

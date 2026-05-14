@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.7",
+  "version": "0.1.702",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -50,6 +50,21 @@
         "command": "intellijStyledSearch.diagnosePreviewIntellisense",
         "title": "Diagnose Preview Intellisense (probe Pylance for last previewed URI)",
         "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.startMcpServer",
+        "title": "Start Codeidx MCP Server",
+        "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.stopMcpServer",
+        "title": "Stop Codeidx MCP Server",
+        "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.restartMcpServer",
+        "title": "Restart Codeidx MCP Server",
+        "category": "IntelliJ Search"
       }
     ],
     "keybindings": [
@@ -87,6 +102,18 @@
         {
           "command": "intellijStyledSearch.rebuildIndex",
           "group": "1_search@2"
+        },
+        {
+          "command": "intellijStyledSearch.startMcpServer",
+          "group": "2_mcp@1"
+        },
+        {
+          "command": "intellijStyledSearch.restartMcpServer",
+          "group": "2_mcp@2"
+        },
+        {
+          "command": "intellijStyledSearch.stopMcpServer",
+          "group": "2_mcp@3"
         }
       ]
     },

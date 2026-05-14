@@ -621,6 +621,19 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       mcpServer.stop();
       vscode.window.showInformationMessage('IntelliJ Styled Search MCP server stopped.');
     }),
+    vscode.commands.registerCommand('intellijStyledSearch.restartMcpServer', async () => {
+      overlay.logCommand('restartMcpServer');
+      try {
+        mcpServer.stop();
+        const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+        const port = cfg.get<number>('mcpPort', 0);
+        const url = await mcpServer.start(port);
+        vscode.window.showInformationMessage(`IntelliJ Styled Search MCP server restarted: ${url}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(`MCP server restart failed: ${msg}`);
+      }
+    }),
   );
 
   return { overlay, callGraph, mcpServer };
