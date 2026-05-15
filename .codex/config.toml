@@ -1,6 +1,6 @@
 [mcp_servers.codeidx]
 command = "node"
-args = ["out/codeidxMcpCli.js", "stdio", "--workspace", "."]
+args = [".codeidx/codeidx-mcp-stdio.js", "stdio", "--workspace", "."]
 cwd = "."
 startup_timeout_sec = 10
 tool_timeout_sec = 60

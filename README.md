@@ -35,7 +35,7 @@ This repository includes project MCP config files:
 - `.mcp.json` for Claude Code project-scoped MCP discovery.
 - `.codex/config.toml` for Codex project-scoped MCP configuration when supported by the installed Codex CLI.
 
-The MCP clients spawn a stdio proxy, but the proxy still needs the VS Code extension's localhost endpoint. In trusted workspaces the extension auto-starts that endpoint by default. Each VS Code window binds an OS-assigned free port and writes the actual URL to `.codeidx/mcp-server.json`, so multiple projects can run at the same time without sharing a fixed port.
+The MCP clients spawn a stdio proxy, but the proxy still needs the VS Code extension's localhost endpoint. In trusted workspaces the extension auto-starts that endpoint by default. Each VS Code window binds an OS-assigned free port and writes the actual URL to `.codeidx/mcp-server.json`, so multiple projects can run at the same time without sharing a fixed port. The extension also writes `.codeidx/codeidx-mcp-stdio.js`, which lets project MCP configs launch the proxy through `node` without depending on a global `codeidx-mcp` binary.
 
 Manual stdio proxy command:
 
@@ -43,10 +43,10 @@ Manual stdio proxy command:
 codeidx-mcp stdio --workspace .
 ```
 
-From a development checkout without `npm link`, use the compiled entrypoint directly:
+From a workspace where the extension has started, use the generated project launcher:
 
 ```bash
-node out/codeidxMcpCli.js stdio --workspace .
+node .codeidx/codeidx-mcp-stdio.js stdio --workspace .
 ```
 
 The proxy discovers the VS Code endpoint from `.codeidx/mcp-server.json`. If you disable `intellijStyledSearch.mcpAutoStart`, run `IntelliJ Search: Start Codeidx MCP Server` in that VS Code window before starting Codex or Claude Code. You can also pass the URL explicitly:
@@ -58,7 +58,7 @@ codeidx-mcp stdio --url http://127.0.0.1:<port>/mcp
 Codex example:
 
 ```bash
-codex mcp add codeidx -- codeidx-mcp stdio --workspace .
+codex mcp add codeidx -- node .codeidx/codeidx-mcp-stdio.js stdio --workspace .
 ```
 
 If your Codex CLI does not load project-scoped `.codex/config.toml`, run the `codex mcp add` command once to register it in your user config.
@@ -66,7 +66,7 @@ If your Codex CLI does not load project-scoped `.codex/config.toml`, run the `co
 Claude Code example:
 
 ```bash
-claude mcp add --transport stdio codeidx -- codeidx-mcp stdio --workspace .
+claude mcp add --transport stdio codeidx -- node .codeidx/codeidx-mcp-stdio.js stdio --workspace .
 ```
 
 Claude Code also auto-detects the checked-in `.mcp.json` after you approve the project-scoped MCP server.

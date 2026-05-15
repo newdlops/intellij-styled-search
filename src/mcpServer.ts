@@ -145,6 +145,7 @@ const MCP_SEARCH_CONCURRENCY = 4;
 const MCP_FULL_SCAN_CONCURRENCY = 1;
 const MCP_TEST_CONCURRENCY = 1;
 const MCP_GENERATED_MAX_FILE_SIZE_BYTES = 16 * 1024 * 1024;
+const STDIO_LAUNCHER_FILE = 'codeidx-mcp-stdio.js';
 
 const SENSITIVE_EXCLUDE_GLOBS = [
   '**/.env',
@@ -2942,14 +2943,25 @@ export class CallGraphMcpServer implements vscode.Disposable {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   }
 
-  private discoveryFilePath(): string | undefined {
+  private codeidxDirPath(): string | undefined {
     const root = this.workspaceRootPath();
-    return root ? path.join(root, '.codeidx', 'mcp-server.json') : undefined;
+    return root ? path.join(root, '.codeidx') : undefined;
+  }
+
+  private discoveryFilePath(): string | undefined {
+    const dir = this.codeidxDirPath();
+    return dir ? path.join(dir, 'mcp-server.json') : undefined;
+  }
+
+  private stdioLauncherPath(): string | undefined {
+    const dir = this.codeidxDirPath();
+    return dir ? path.join(dir, STDIO_LAUNCHER_FILE) : undefined;
   }
 
   private async writeDiscoveryFile(url: string): Promise<void> {
     const filePath = this.discoveryFilePath();
     if (!filePath) { return; }
+    const dirPath = path.dirname(filePath);
     const payload = {
       schema_version: SCHEMA_VERSION,
       server: 'codeidx-mcp',
@@ -2960,10 +2972,23 @@ export class CallGraphMcpServer implements vscode.Disposable {
       started_at: new Date().toISOString(),
     };
     try {
-      await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.promises.mkdir(dirPath, { recursive: true });
+      await this.writeStdioLauncher(dirPath);
       await fs.promises.writeFile(filePath, JSON.stringify(payload, null, 2) + '\n', 'utf8');
     } catch (err) {
       this.log.appendLine(`codeidx MCP discovery write failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private async writeStdioLauncher(dirPath: string): Promise<void> {
+    const launcherPath = path.join(dirPath, STDIO_LAUNCHER_FILE);
+    const cliPath = path.join(__dirname, 'codeidxMcpCli.js');
+    try {
+      await fs.promises.access(cliPath, fs.constants.R_OK);
+      await fs.promises.writeFile(launcherPath, stdioLauncherContent(cliPath), 'utf8');
+      await fs.promises.chmod(launcherPath, 0o755);
+    } catch (err) {
+      this.log.appendLine(`codeidx MCP stdio launcher write failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -2981,8 +3006,9 @@ export class CallGraphMcpServer implements vscode.Disposable {
 
   private async readDiscoveryStatus(): Promise<Record<string, unknown>> {
     const filePath = this.discoveryFilePath();
+    const launcher = await this.readStdioLauncherStatus();
     if (!filePath) {
-      return { exists: false, path: null };
+      return { exists: false, path: null, stdio_launcher: launcher };
     }
     try {
       const raw = await fs.promises.readFile(filePath, 'utf8');
@@ -2994,14 +3020,36 @@ export class CallGraphMcpServer implements vscode.Disposable {
         matches_current_endpoint: typeof parsed.url === 'string' && parsed.url === this.getAddress(),
         pid: typeof parsed.pid === 'number' ? parsed.pid : null,
         started_at: typeof parsed.started_at === 'string' ? parsed.started_at : null,
+        stdio_launcher: launcher,
       };
     } catch (err) {
       return {
         exists: false,
         path: filePath,
         error: err instanceof Error ? err.message : String(err),
+        stdio_launcher: launcher,
       };
     }
+  }
+
+  private async readStdioLauncherStatus(): Promise<Record<string, unknown>> {
+    const launcherPath = this.stdioLauncherPath();
+    const root = this.workspaceRootPath();
+    if (!launcherPath || !root) {
+      return { exists: false, path: null };
+    }
+    let exists = false;
+    try {
+      await fs.promises.access(launcherPath, fs.constants.R_OK);
+      exists = true;
+    } catch {}
+    return {
+      exists,
+      path: launcherPath,
+      type: 'stdio',
+      command: 'node',
+      args: [path.relative(root, launcherPath).replace(/\\/g, '/'), 'stdio', '--workspace', '.'],
+    };
   }
 
   private async defaultMcpTestQuery(): Promise<string> {
@@ -4212,6 +4260,22 @@ function confidenceForEdge(edge: CallGraphEdge): string {
 
 function stableHash(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function stdioLauncherContent(cliPath: string): string {
+  return [
+    '#!/usr/bin/env node',
+    "'use strict';",
+    `const cli = ${JSON.stringify(cliPath)};`,
+    'try {',
+    '  require(cli);',
+    '} catch (err) {',
+    "  const message = err && err.stack ? err.stack : String(err);",
+    "  process.stderr.write(`[codeidx-mcp] failed to load CLI ${cli}: ${message}\\n`);",
+    '  process.exitCode = 1;',
+    '}',
+    '',
+  ].join('\n');
 }
 
 function inferFrameworks(snapshot: CallGraphSnapshot | undefined): string[] {

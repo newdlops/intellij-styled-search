@@ -1901,6 +1901,13 @@ suite('Call graph', () => {
       assert.strictEqual(health.result?.structuredContent?.health?.endpoint, url);
       assert.strictEqual(health.result?.structuredContent?.discovery?.exists, true);
       assert.strictEqual(health.result?.structuredContent?.discovery?.matches_current_endpoint, true);
+      assert.strictEqual(health.result?.structuredContent?.discovery?.stdio_launcher?.exists, true);
+      assert.strictEqual(health.result?.structuredContent?.discovery?.stdio_launcher?.type, 'stdio');
+      assert.strictEqual(health.result?.structuredContent?.discovery?.stdio_launcher?.command, 'node');
+      assert.deepStrictEqual(
+        health.result?.structuredContent?.discovery?.stdio_launcher?.args,
+        ['.codeidx/codeidx-mcp-stdio.js', 'stdio', '--workspace', '.'],
+      );
       assert.ok(
         health.result?.structuredContent?.tools?.includes('mcp_test'),
         'expected health check to include mcp_test when include_tools=true',
@@ -2472,10 +2479,11 @@ suite('Call graph', () => {
         readOverview.result?.contents?.[0]?.text?.includes('"schema_version"'),
         'expected resources/read to return JSON text content',
       );
-      const cliPath = path.resolve(__dirname, '..', '..', 'codeidxMcpCli.js');
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
       assert.ok(workspaceRoot, 'expected test workspace root');
-      const stdioProxy = spawn(process.execPath, [cliPath, 'stdio', '--workspace', workspaceRoot], {
+      const cliPath = path.join(workspaceRoot, '.codeidx', 'codeidx-mcp-stdio.js');
+      await vscode.workspace.fs.stat(vscode.Uri.file(cliPath));
+      const stdioProxy = spawn(process.execPath, [cliPath, 'stdio', '--workspace', '.'], {
         cwd: workspaceRoot,
         stdio: 'pipe',
       });
