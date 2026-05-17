@@ -2558,7 +2558,11 @@ fn parse_python_graph_symbols(
     let mut pending_decorators: Vec<String> = Vec::new();
     let mut code_state = IdentifierLexState::default();
     let lines: Vec<&str> = text.lines().collect();
+    let mut skip_header_until_line = 0usize;
     for (line_idx, line) in lines.iter().copied().enumerate() {
+        if line_idx < skip_header_until_line {
+            continue;
+        }
         let code_line = sanitize_code_line(line, &mut code_state);
         let indent = line
             .chars()
@@ -2590,9 +2594,19 @@ fn parse_python_graph_symbols(
             continue;
         }
         if let Some(name) = identifier_after_keyword(trimmed, "class") {
-            let header = collect_python_class_header(&lines, line_idx);
+            let (header, header_end_line) = collect_python_class_header_span(&lines, line_idx);
             let column = find_column(line, &name);
-            let qualified = name.clone();
+            let qualified = class_stack
+                .last()
+                .map(|(_, class_name, _)| format!("{class_name}.{name}"))
+                .unwrap_or_else(|| name.clone());
+            let container_name = class_stack
+                .last()
+                .map(|(_, class_name, _)| class_name.as_str());
+            let container_id = class_stack
+                .last()
+                .and_then(|(_, _, symbol_idx)| symbols.get(*symbol_idx))
+                .map(|symbol| symbol.id.clone());
             let mut symbol = make_native_graph_symbol(
                 language,
                 uri,
@@ -2602,11 +2616,12 @@ fn parse_python_graph_symbols(
                 &qualified,
                 line_idx,
                 column,
-                None,
+                container_name,
                 None,
                 line_idx as u32,
                 column.saturating_add(name.len()) as u32,
             );
+            symbol.container_id = container_id;
             symbol.extends_names = python_class_bases_from_line(&header);
             symbol
                 .implements_names
@@ -2618,6 +2633,7 @@ fn parse_python_graph_symbols(
             let symbol_idx = symbols.len();
             symbols.push(symbol);
             class_stack.push((indent, qualified, symbol_idx));
+            skip_header_until_line = header_end_line.saturating_add(1);
             continue;
         }
         if let Some(name) = python_function_name_from_line(trimmed) {
@@ -5915,11 +5931,13 @@ fn python_class_bases_from_line(line: &str) -> Vec<String> {
     parse_type_reference_list(line.get(open + 1..close).unwrap_or(""))
 }
 
-fn collect_python_class_header(lines: &[&str], start_line: usize) -> String {
+fn collect_python_class_header_span(lines: &[&str], start_line: usize) -> (String, usize) {
     let mut out = String::new();
     let mut paren_depth = 0i32;
     let mut saw_open = false;
-    for raw_line in lines.iter().skip(start_line).take(40) {
+    let mut end_line = start_line;
+    for (idx, raw_line) in lines.iter().enumerate().skip(start_line).take(40) {
+        end_line = idx;
         let trimmed = raw_line.trim();
         if !out.is_empty() {
             out.push(' ');
@@ -5941,7 +5959,7 @@ fn collect_python_class_header(lines: &[&str], start_line: usize) -> String {
             break;
         }
     }
-    out
+    (out, end_line)
 }
 
 fn parse_type_reference_list(value: &str) -> Vec<String> {
@@ -10162,6 +10180,100 @@ schema = graphene.Schema(query=Query)
             .expect("Query references")
             .references;
         assert_eq!(query_refs.len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_rebuild_python_multiline_class_body_range_covers_block() -> io::Result<()> {
+        let root = temp_dir("graph-python-multiline-class-body");
+        let src = root.join("app");
+        fs::create_dir_all(&src)?;
+        fs::write(
+            src.join("models.py"),
+            r#"@registered
+class WhtBook(
+    TimestampedModel,
+    SoftDeletableModel,
+    metaclass=ModelProtocolMeta,
+):
+    title = Field()
+    code = Field()
+
+    class Meta:
+        verbose_name = "Book"
+
+    @property
+    def label(self):
+        return self.title
+
+async def after_class():
+    return None
+
+class SingleLine(Base):
+    value = 1
+
+def after_single():
+    return None
+"#,
+        )?;
+        let config = EngineConfig::default();
+        rebuild_graph_native(&root, 252, &config, 8, &mut |_| {})?;
+
+        let document = query_graph_document_symbols(
+            &root,
+            &file_uri(&root.join("app/models.py")),
+            None,
+            None,
+            50,
+            &config,
+        )?
+        .expect("models document symbols");
+        let wht_book = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "WhtBook")
+            .expect("WhtBook symbol");
+        assert_eq!(wht_book.start_line, 1);
+        assert_eq!(
+            wht_book.body_end_line, 15,
+            "multiline class header must not close the class before its body: {wht_book:?}"
+        );
+        let meta = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Meta")
+            .expect("nested Meta symbol");
+        assert_eq!(meta.container_name.as_deref(), Some("WhtBook"));
+        let label = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "label")
+            .expect("property method symbol");
+        assert_eq!(label.container_name.as_deref(), Some("WhtBook"));
+        let after_class = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "after_class")
+            .expect("async function after class");
+        assert_eq!(after_class.start_line, 16);
+        assert!(after_class.container_name.is_none());
+        let single_line = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "SingleLine")
+            .expect("single-line class symbol");
+        assert_eq!(single_line.start_line, 19);
+        assert_eq!(single_line.body_end_line, 21);
+        assert!(single_line.container_name.is_none());
+        let after_single = document
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "after_single")
+            .expect("function after single-line class");
+        assert_eq!(after_single.start_line, 22);
+        assert!(after_single.container_name.is_none());
 
         let _ = fs::remove_dir_all(root);
         Ok(())

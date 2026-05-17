@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.704",
+  "version": "0.1.705",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -44,6 +44,21 @@
       {
         "command": "intellijStyledSearch.rebuildIndex",
         "title": "Force Rebuild Search + Graph Index",
+        "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.showIndexHealth",
+        "title": "Show Index Health",
+        "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.selectSearchMode",
+        "title": "Select Search Mode",
+        "category": "IntelliJ Search"
+      },
+      {
+        "command": "intellijStyledSearch.benchmarkAgainstRg",
+        "title": "Benchmark Against rg",
         "category": "IntelliJ Search"
       },
       {
@@ -104,6 +119,18 @@
           "group": "1_search@2"
         },
         {
+          "command": "intellijStyledSearch.showIndexHealth",
+          "group": "1_search@3"
+        },
+        {
+          "command": "intellijStyledSearch.selectSearchMode",
+          "group": "1_search@4"
+        },
+        {
+          "command": "intellijStyledSearch.benchmarkAgainstRg",
+          "group": "1_search@5"
+        },
+        {
           "command": "intellijStyledSearch.startMcpServer",
           "group": "2_mcp@1"
         },
@@ -128,6 +155,51 @@
           ],
           "default": "zoekt",
           "markdownDescription": "Search engine to use. `zoekt` runs the Rust local shard/mmap engine with automatic codesearch fallback when the runtime is unavailable or still warming up. `codesearch` uses the existing TypeScript planner plus ripgrep verifier."
+        },
+        "intellijStyledSearch.search.mode": {
+          "type": "string",
+          "enum": [
+            "indexed",
+            "indexed_bounded_fallback",
+            "rg_fallback",
+            "symbol",
+            "reference"
+          ],
+          "default": "indexed_bounded_fallback",
+          "markdownDescription": "Agent-facing search mode preset. Indexed modes use zoek-rs, rg fallback uses the ripgrep-backed codesearch path, and symbol/reference modes keep semantic lookup as the primary navigation path."
+        },
+        "intellijStyledSearch.search.timeoutMs": {
+          "type": "number",
+          "default": 3000,
+          "minimum": 100,
+          "maximum": 120000,
+          "description": "Default timeout in milliseconds for fast indexed search probes before returning a diagnostic response."
+        },
+        "intellijStyledSearch.search.fallbackPolicy": {
+          "type": "string",
+          "enum": [
+            "bounded",
+            "never",
+            "always"
+          ],
+          "default": "bounded",
+          "markdownDescription": "Default fallback policy for agent-facing search_code. `never` trusts only the index, `bounded` uses rg only for small candidate sets, and `always` allows full scan fallback."
+        },
+        "intellijStyledSearch.search.defaultOutputMode": {
+          "type": "string",
+          "enum": [
+            "minimal",
+            "rg_like",
+            "snippet",
+            "structured"
+          ],
+          "default": "minimal",
+          "description": "Default codeidx_search_code output shape for MCP clients. Minimal is token-first path:line output; request rg_like or snippet when previews are needed."
+        },
+        "intellijStyledSearch.search.includeResourceLinks": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include MCP resource links in search_code structured results by default. Disabled to keep agent search responses compact."
         },
         "intellijStyledSearch.excludeGlobs": {
           "type": "array",
@@ -175,8 +247,8 @@
         },
         "intellijStyledSearch.zoektWatchExternalFileDeletes": {
           "type": "boolean",
-          "default": false,
-          "description": "Watch external filesystem delete events for zoekt incremental updates. Disabled by default so the extension does not subscribe to every workspace file event; saved editor documents and VS Code delete/rename operations are still tracked."
+          "default": true,
+          "description": "Watch external filesystem delete events for zoekt incremental updates. Enabled by default so search results do not keep deleted files after terminal/agent file operations."
         },
         "intellijStyledSearch.zoektWatchExternalFileChanges": {
           "type": "boolean",
@@ -283,8 +355,8 @@
         },
         "intellijStyledSearch.callGraphWatchExternalFileChanges": {
           "type": "boolean",
-          "default": false,
-          "description": "Watch external filesystem create/change/delete events for call graph incremental updates. Disabled by default so call graph updates only follow confirmed VS Code save/create/delete/rename operations."
+          "default": true,
+          "description": "Watch external filesystem create/change/delete events for call graph incremental updates. Enabled by default so semantic symbol/reference results follow terminal and agent file operations."
         },
         "intellijStyledSearch.callGraphBackend": {
           "type": "string",

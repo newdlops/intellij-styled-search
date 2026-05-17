@@ -11,7 +11,7 @@ import { decodeTextBytes, hasBinaryFileExtension, looksBinaryContent } from '../
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 const CAPTAIN_WORKSPACE_SUFFIX = path.join('captain2', 'captain');
-const ZOEKT_SCHEMA_VERSION = 17;
+const ZOEKT_SCHEMA_VERSION = 19;
 const SEARCH_INDEX_BUDGET_MS = 8_000;
 const SEARCH_INDEX_SEED_TIMEOUT_MS = 120_000;
 const GRAPH_INDEX_BUDGET_MS = 8_000;
@@ -34,6 +34,8 @@ const RANDOM_SEARCH_BATCH_SIZE = 50;
 const LONG_QUERY_LENGTH = 10_000;
 const RG_TIMEOUT_MS = 120_000;
 const CAPTAIN_QUERY_TERMS_FALLBACK_LITERAL = 'rn GetResultValue(self.basic_auth.get().SerializeToStr';
+const CAPTAIN_UNICODE_MIGRATION_QUERY = '전자등기';
+const CAPTAIN_UNICODE_MIGRATION_RESULT = 'zuzu/db/migrations/0001_initial.py:3177';
 
 type AccuracyFixture = {
   queries: string[];
@@ -557,7 +559,8 @@ async function runZoektSearchJson(
   root: string,
   query: string,
   pathRegex?: string,
-): Promise<{ totalFilesMatched: number; totalMatches: number; files: Array<{ relPath: string }> }> {
+  limit = 20,
+): Promise<{ totalFilesScanned: number; totalFilesMatched: number; totalMatches: number; files: Array<{ relPath: string }> }> {
   const binary = getZoekRsBinaryForTests();
   const pathArgs = pathRegex ? ['--path-regex', pathRegex] : [];
   const result = await runProcess(
@@ -568,7 +571,7 @@ async function runZoektSearchJson(
       query,
       '--case-sensitive',
       '--limit',
-      '20',
+      String(limit),
       '--offset',
       '0',
       ...pathArgs,
@@ -581,12 +584,14 @@ async function runZoektSearchJson(
     ok?: boolean;
     type?: string;
     totalFilesMatched?: number;
+    totalFilesScanned?: number;
     totalMatches?: number;
     files?: Array<{ relPath: string }>;
   };
   assert.strictEqual(response.type, 'search');
   assert.strictEqual(response.ok, true);
   return {
+    totalFilesScanned: response.totalFilesScanned ?? 0,
     totalFilesMatched: response.totalFilesMatched ?? 0,
     totalMatches: response.totalMatches ?? 0,
     files: response.files ?? [],
@@ -1105,6 +1110,78 @@ suite('Captain E2E index gates', () => {
     const elapsedMs = captainSearchRebuildElapsedMs ?? await runCaptainSearchRebuildGate();
     assert.ok(elapsedMs <= SEARCH_INDEX_BUDGET_MS, `captain search index clean reuse took ${elapsedMs}ms`);
     console.log(`[captain-e2e] search index clean reuse already verified ${elapsedMs}ms`);
+  });
+
+  test('zoekt matches rg for short unicode literals in captain migrations without broad scanning', async function () {
+    this.timeout(RG_TIMEOUT_MS);
+    const api = await getApi();
+    const root = workspaceRoot();
+    assertCaptainWorkspace(root);
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorEngine = cfg.inspect<string>('engine');
+
+    try {
+      await cfg.update('engine', 'zoekt', vscode.ConfigurationTarget.Workspace);
+      await api.overlay.waitForIndexReady(30_000);
+      const runtime = (api.overlay as any).zoektRuntime as {
+        getSearchReadiness: () => Promise<{ ready: boolean; reason?: string }>;
+      };
+      assert.deepStrictEqual(await runtime.getSearchReadiness(), { ready: true });
+
+      const rgPath = await getRipgrepForTests();
+      const expected = await rgBaselineForSingleQuery(root, rgPath, CAPTAIN_UNICODE_MIGRATION_QUERY);
+      assert.ok(
+        expected.has(CAPTAIN_UNICODE_MIGRATION_RESULT),
+        `rg baseline should include captain migration result ${CAPTAIN_UNICODE_MIGRATION_RESULT}`,
+      );
+
+      const result = await api.overlay.searchForTestsDetailed({
+        query: CAPTAIN_UNICODE_MIGRATION_QUERY,
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+        ignoreConfiguredExcludes: true,
+        maxFileSizeBytes: MAX_FILE_SIZE_BYTES,
+        resultLimit: 10_000,
+      });
+      assert.strictEqual(
+        result.effectiveEngine,
+        'zoekt',
+        `unicode migration search did not use zoekt; ${formatEngineRoute(result)}`,
+      );
+      assertSameLineSet(
+        resultLineSet(result),
+        expected,
+        `unicode migration rg mismatch query=${JSON.stringify(CAPTAIN_UNICODE_MIGRATION_QUERY)}`,
+      );
+
+      const stats = await runZoektSearchJson(root, CAPTAIN_UNICODE_MIGRATION_QUERY, undefined, 1_000);
+      assert.ok(
+        stats.totalFilesScanned <= 80,
+        `unicode migration query scanned too many files; scanned=${stats.totalFilesScanned} matched=${stats.totalFilesMatched}`,
+      );
+    } finally {
+      await cfg.update('engine', priorEngine?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+    }
+  });
+
+  test('zoekt scoped no-match search returns without fallback scanning', async function () {
+    this.timeout(SEARCH_SPEED_QUERY_TIMEOUT_MS + TIMEOUT_GRACE_MS);
+    const api = await getApi();
+    const root = workspaceRoot();
+    assertCaptainWorkspace(root);
+    const runtime = (api.overlay as any).zoektRuntime as {
+      getSearchReadiness: () => Promise<{ ready: boolean; reason?: string }>;
+    };
+    assert.deepStrictEqual(await runtime.getSearchReadiness(), { ready: true });
+
+    const started = Date.now();
+    const stats = await runZoektSearchJson(root, 'ZZZ_NOPE', '^zuzu/db/.*\\.py$', 1);
+    const elapsedMs = Date.now() - started;
+    assert.strictEqual(stats.totalFilesScanned, 0, `no-match search should not scan fallback files; stats=${JSON.stringify(stats)}`);
+    assert.strictEqual(stats.totalFilesMatched, 0);
+    assert.strictEqual(stats.totalMatches, 0);
+    assert.ok(elapsedMs < 1_500, `scoped no-match search took ${elapsedMs}ms`);
   });
 
   test('zoekt incremental create, modify, and delete updates stay within 1000ms', async function () {

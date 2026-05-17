@@ -21,7 +21,7 @@ fn main() {
 
 fn run(args: Vec<String>) -> Result<EngineResponse, String> {
     let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
-    let mut config = EngineConfig::default();
+    let mut config = EngineConfig::for_workspace(&workspace_root);
     let mut request = IndexRequest {
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         index_dir: None,

@@ -19,10 +19,11 @@ import {
 } from './search';
 import { configureRipgrepInstall, ensureRipgrepInstalled, findRipgrepPath, runRgSearch } from './rgSearch';
 import { getRendererPatchScript, RENDERER_PATCH_VERSION } from './rendererPatch';
+import { runMonacoCaptureDiagnostic, type CaptureDiagnosticOptions } from './preview/monacoCapture';
 import { TrigramIndex, extractTrigramsLower } from './trigramIndex';
 import { compilePathScopeMatcher } from './pathScope';
-import { ZoektRuntime } from './zoekRuntime';
-import { findWorkspaceFilesDirect } from './fileDiscovery';
+import { ZoektRuntime, type ZoektFreshnessStatus } from './zoekRuntime';
+import type { ZoektInfoResponse } from './zoekProtocol';
 
 type RendererEvent =
   | { type: 'search'; options: SearchOptions; recordHistory?: boolean }
@@ -153,13 +154,6 @@ type PendingStaticResults = {
   sourceWindowId?: number;
   resolve: () => void;
   reject: (err: unknown) => void;
-};
-
-type CaptureDiagnosticOptions = {
-  allowForceOpen?: boolean;
-  forceOpenUri?: vscode.Uri;
-  holdForceOpenedTab?: boolean;
-  reason?: string;
 };
 
 type PatchScriptOptions = {
@@ -1246,384 +1240,14 @@ export class OverlayPanel {
   }
 
   private async triggerCaptureDiagnostic(preferredWindowId?: number, options?: CaptureDiagnosticOptions): Promise<void> {
-    const allowForceOpen = options?.allowForceOpen !== false;
-    const forceOpenUri = options?.forceOpenUri;
-    const holdForceOpenedTab = options?.holdForceOpenedTab === true;
-    const reason = options?.reason || 'foreground';
-    this.log.appendLine(
-      `Capture diagnostic: starting (reason=${reason}, forceOpen=${allowForceOpen ? 'yes' : 'no'}` +
-      (forceOpenUri ? `, forceOpenUri=${forceOpenUri.toString()}` : '') + ')...',
-    );
-    const targetWindowId = await this.resolveTargetWorkbenchWindowId(preferredWindowId);
-    const windowIds = targetWindowId === undefined ? [] : [targetWindowId];
-    this.log.appendLine(
-      `Target workbench windows: [${windowIds.join(', ')}]` +
-      (preferredWindowId !== undefined ? ` preferred=${preferredWindowId}` : ''),
-    );
-    if (windowIds.length === 0) { return; }
-
-    // Renderer globals persist across extension-host restarts. If a previous
-    // session already captured the real CodeEditorWidget class + services,
-    // there's nothing to redo — skip force-open + TEST widget entirely.
-    const monacoPeek = `(function(){
-      try {
-        var m = window.__ijFindMonaco;
-        var f = window.__ijFindMonacoFactory;
-        var status = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'not-ready:no-status';
-        if (!m) return 'status=' + status + ' none';
-        return 'status=' + status +
-          ' ctor=' + (!!(m.ctor)) +
-          ' inst=' + (!!(m.inst)) +
-          ' modelSvc=' + (!!(m.modelSvc)) +
-          ' factory=' + (!!(f && f.ctor)) +
-          ' instCandidates=' + ((m.instCandidates || []).length) +
-          ' modelSvcCandidates=' + ((m.modelSvcCandidates || []).length);
-      } catch(e){ return 'peek-err:' + (e && e.message); }
-    })()`;
-    // Check all windows in parallel — if ANY already has globals populated
-    // (renderer persisted them across the extension-host restart), we skip
-    // the whole diagnostic. Serial check added ~150ms before we could bail.
-    const monacoVals = new Map<number, string>();
-    await Promise.all(windowIds.map(async (id) => {
-      try { monacoVals.set(id, await this.evalInWindow(id, monacoPeek)); }
-      catch {}
-    }));
-    let alreadyReadyWin: number | null = null;
-    for (const [id, v] of monacoVals) {
-      this.log.appendLine(`Monaco globals win=${id}: ${v}`);
-      // Monaco globals are per-renderer-window, so a ready state in some
-      // OTHER window can't satisfy a preview pane living in
-      // preferredWindowId. Only treat as already-ready when the ready
-      // window is (or could be) the preview window.
-      if (alreadyReadyWin === null &&
-          (preferredWindowId === undefined || id === preferredWindowId) &&
-          /status=ready\b/.test(v)) {
-        alreadyReadyWin = id;
-      }
-    }
-    if (alreadyReadyWin !== null) {
-      this.log.appendLine(`Monaco globals already present in win=${alreadyReadyWin} — skipping capture diagnostic.`);
-      return;
-    }
-
-    const peek = `(function(){
-      try {
-        var c = window.__ijFindCaptures || {};
-        return 'widgets=' + ((c.widgets||[]).length) +
-          ' services=' + ((c.services||[]).length) +
-          ' ctors=' + ((c.widgetCtors||[]).length) +
-          ' installed=' + !!window.__ijFindCaptureInstalled;
-      } catch(e){ return 'peek-err:' + (e && e.message); }
-    })()`;
-
-    const peekAll = async (stage: string, silent = false) => {
-      const results = new Map<number, string>();
-      // Run peeks in parallel — one CDP eval per window; serial would add
-      // ~50ms per additional window for no reason.
-      await Promise.all(windowIds.map(async (id) => {
-        try { results.set(id, await this.evalInWindow(id, peek)); }
-        catch (err) { results.set(id, 'err:' + (err instanceof Error ? err.message : err)); }
-      }));
-      if (!silent) {
-        this.log.appendLine(`${stage}: ${[...results.entries()].map(([id, v]) => `win=${id} ${v}`).join(' | ')}`);
-      }
-      return results;
-    };
-    const stopCaptureAll = async () => {
-      // Stop capture in every window so prototype monkey-patches revert.
-      const stopExpr = `(function(){ try { return window.__ijFindStopCapture && window.__ijFindStopCapture(); } catch(e){ return 'stop-err:' + (e && e.message); } })()`;
-      await Promise.all(windowIds.map(async (id) => {
-        try {
-          const r = await this.evalInWindow(id, stopExpr);
-          this.log.appendLine(`Capture stop win=${id}: ${r}`);
-        } catch {}
-      }));
-    };
-    const refreshCaptureAll = async () => {
-      // A previous diagnostic may have stopped the prototype hooks after a
-      // successful capture attempt. Re-arm them before DOM scan / force-open,
-      // otherwise opening a real editor produces no fresh captures.
-      const captureReason = JSON.stringify(`diagnostic:${reason}`);
-      const refreshExpr = `(function(){
-        try {
-          if (window.__ijFindRefreshCapture) { return window.__ijFindRefreshCapture(${captureReason}); }
-          if (window.__ijFindStartCapture) { return window.__ijFindStartCapture(${captureReason}); }
-          return 'no-capture-fn';
-        } catch(e){ return 'refresh-err:' + (e && e.message); }
-      })()`;
-      const summaries: string[] = [];
-      await Promise.all(windowIds.map(async (id) => {
-        try {
-          const r = await this.evalInWindow(id, refreshExpr);
-          summaries.push(`win=${id} ${r}`);
-        } catch (err) {
-          summaries.push(`win=${id} err:${err instanceof Error ? err.message : err}`);
-        }
-      }));
-      this.log.appendLine(`Capture refresh: ${summaries.join(' | ')}`);
-    };
-    const runWidgetCreateTest = async (winId: number, label: string): Promise<boolean> => {
-      const testExpr = `(function(){ try { return window.__ijFindTestCreateWidget ? window.__ijFindTestCreateWidget() : 'no-test-fn'; } catch(e){ return 'test-throw:' + (e && e.message); } })()`;
-      try {
-        const testResult = await this.evalInWindow(winId, testExpr);
-        this.log.appendLine(`TEST widget create (win=${winId}, ${label}): ${String(testResult).slice(0, 2000)}`);
-      } catch (err) {
-        this.log.appendLine(`TEST widget eval failed: ${err instanceof Error ? err.message : err}`);
-      }
-      return this.isMonacoReadyInWindow(winId);
-    };
-    const findBestCapturedWindow = (peeked: Map<number, string>): { id: number; widgets: number; services: number; ctors: number } | null => {
-      let best: { id: number; widgets: number; services: number; ctors: number } | null = null;
-      for (const [id, v] of peeked) {
-        const widgetsMatch = /widgets=(\d+)/.exec(v);
-        const servicesMatch = /services=(\d+)/.exec(v);
-        const ctorsMatch = /ctors=(\d+)/.exec(v);
-        const widgets = widgetsMatch ? parseInt(widgetsMatch[1], 10) : 0;
-        const services = servicesMatch ? parseInt(servicesMatch[1], 10) : 0;
-        const ctors = ctorsMatch ? parseInt(ctorsMatch[1], 10) : 0;
-        if (services <= 0) { continue; }
-        if (preferredWindowId !== undefined && id === preferredWindowId) {
-          return { id, widgets, services, ctors };
-        }
-        if (preferredWindowId !== undefined) { continue; }
-        if (!best || widgets + services + ctors > best.widgets + best.services + best.ctors) {
-          best = { id, widgets, services, ctors };
-        }
-      }
-      return best;
-    };
-
-    try {
-      const initialPeek = await peekAll('Capture peek initial');
-      const existingCapture = findBestCapturedWindow(initialPeek);
-      if (existingCapture) {
-        this.log.appendLine(
-          `Existing captures in win=${existingCapture.id} ` +
-          `(widgets=${existingCapture.widgets} services=${existingCapture.services} ctors=${existingCapture.ctors}) — testing before refresh.`,
-        );
-        const promoted = await runWidgetCreateTest(existingCapture.id, 'existing-capture');
-        if (promoted) {
-          await stopCaptureAll();
-          return;
-        }
-        this.log.appendLine('Existing captures did not promote to Monaco — refreshing capture buffer.');
-      }
-      await refreshCaptureAll();
-      // Keep the refreshed capture buffer for the DOM scan. On warm VS Code
-      // windows it can already contain editor services that make an existing
-      // visible editor promotable without opening any capture file.
-      //
-      // If this path still cannot promote and force-open is allowed, we clear
-      // the buffer immediately before the force-open phase so fresh Map/Array/
-      // Set writes from the introduced editor land in a clean capture buffer.
-      const clearExpr = `(function(){
-        try {
-          if (window.__ijFindCaptures) {
-            window.__ijFindCaptures.widgets = [];
-            window.__ijFindCaptures.services = [];
-            window.__ijFindCaptures.widgetCtors = [];
-            window.__ijFindCaptures.serviceMaps = [];
-          }
-          return 'cleared';
-        } catch (e) { return 'clear-err:' + (e && e.message); }
-      })()`;
-      // First try to grab widget/service refs from any editor the user
-      // already has open, straight from the live DOM. Success here means
-      // we can skip the file force-open entirely — no `client.md` (or
-      // whatever the first .md in the workspace is) gets briefly opened
-      // and torn down.
-      const domCaptureExpr = `(function(){try{return window.__ijFindCaptureFromDom?window.__ijFindCaptureFromDom():'no-fn'}catch(e){return 'throw:'+(e&&e.message)}})()`;
-      let domCaptureSummaries: string[] = [];
-      await Promise.all(windowIds.map(async (id) => {
-        try {
-          const r = await this.evalInWindow(id, domCaptureExpr);
-          domCaptureSummaries.push(`win=${id} ${r}`);
-        } catch (err) { domCaptureSummaries.push(`win=${id} err:${err instanceof Error ? err.message : err}`); }
-      }));
-      this.log.appendLine(`Capture via DOM scan: ${domCaptureSummaries.join(' | ')}`);
-
-      // Peek again to see if DOM scan gave us enough to run the widget-
-      // creation test without needing to force-open a file.
-      const afterDomPeek = await peekAll('Capture peek after DOM scan', true);
-      const domCapture = findBestCapturedWindow(afterDomPeek);
-      if (domCapture) {
-        this.log.appendLine(
-          `DOM/captured services in win=${domCapture.id} ` +
-          `(widgets=${domCapture.widgets} services=${domCapture.services} ctors=${domCapture.ctors}) — testing before force-open.`,
-        );
-        const promoted = await runWidgetCreateTest(domCapture.id, 'DOM/service path');
-        if (promoted) {
-          await stopCaptureAll();
-          return;
-        }
-        this.log.appendLine('DOM/service captures did not promote to Monaco.');
-      }
-      if (!allowForceOpen) {
-        this.log.appendLine(
-          'Capture warmup: DOM scan did not yield a ready Monaco; skipping force-open and leaving capture hooks armed for the history capture path.',
-        );
-        return;
-      }
-      await Promise.all(windowIds.map(async (id) => {
-        try { await this.evalInWindow(id, clearExpr); } catch {}
-      }));
-      this.log.appendLine('Captures cleared — no DOM-visible widgets, forcing real editor creation via file open/close...');
-      const t0 = Date.now();
-      let tFind = 0, tShow = 0, tPoll = 0, tClose = 0, pollIters = 0, pollPeekMaxMs = 0;
-      const forceOpenedCloseTargets: vscode.Tab[] = [];
-      try {
-        const tFind0 = Date.now();
-        const preExistingUris = new Set<string>();
-        for (const group of vscode.window.tabGroups.all) {
-          for (const tab of group.tabs) {
-            const input = tab.input as unknown as { uri?: vscode.Uri };
-            if (input && input.uri && typeof input.uri.toString === 'function') {
-              preExistingUris.add(input.uri.toString());
-            }
-          }
-        }
-
-        let fileUri: vscode.Uri | undefined;
-        if (forceOpenUri) {
-          fileUri = forceOpenUri;
-        } else {
-          const candidates = await findWorkspaceFilesDirect({
-            excludeGlobs: [
-              '**/node_modules/**',
-              '**/.git/**',
-              '**/out/**',
-              '**/dist/**',
-              '**/build/**',
-              '**/.vscode/.auto-import-cache/**',
-              '**/*.vsix',
-            ],
-            extensions: new Set(['.json', '.md', '.txt', '.ts', '.js', '.py']),
-            maxResults: 128,
-          });
-          fileUri = candidates.find((candidate) => !preExistingUris.has(candidate.toString()));
-        }
-        tFind = Date.now() - tFind0;
-
-        let captureDoc: vscode.TextDocument | undefined;
-        if (fileUri) {
-          const userAlreadyHadThisTab = preExistingUris.has(fileUri.toString());
-          captureDoc = userAlreadyHadThisTab
-            ? await vscode.workspace.openTextDocument({
-              language: 'typescript',
-              content: '// IntelliJ Styled Search capture buffer\n',
-            })
-            : await vscode.workspace.openTextDocument(fileUri);
-          const captureUriStr = captureDoc.uri.toString();
-          this.lastCaptureDiagnosticOpenUri = captureUriStr;
-          this.log.appendLine(
-            `Capture diagnostic: opening ${captureUriStr}` +
-            (userAlreadyHadThisTab ? ` (capture-only fallback; requested ${fileUri.toString()} is already open)` : ''),
-          );
-          const tShow0 = Date.now();
-          await vscode.window.showTextDocument(captureDoc, {
-            viewColumn: vscode.ViewColumn.Beside,
-            preserveFocus: true,
-            preview: true,
-          });
-          tShow = Date.now() - tShow0;
-          // Poll every 100ms instead of sleeping a flat 1s. As soon as ANY
-          // window has enough real widgets + services, run the widget-
-          // creation test while that source editor is still alive.
-          const tPoll0 = Date.now();
-          let sawCaptures = false;
-          for (let i = 0; i < 20; i++) {
-            await new Promise((r) => setTimeout(r, 100));
-            const tPeek0 = Date.now();
-            const p = await peekAll('poll', true);
-            const peekMs = Date.now() - tPeek0;
-            if (peekMs > pollPeekMaxMs) { pollPeekMaxMs = peekMs; }
-            pollIters = i + 1;
-            for (const v of p.values()) {
-              const m = /widgets=(\d+)/.exec(v);
-              if (m && parseInt(m[1], 10) >= 5) { sawCaptures = true; break; }
-            }
-            if (sawCaptures) { break; }
-          }
-          tPoll = Date.now() - tPoll0;
-          const tCollectClose0 = Date.now();
-          // Record ONLY tabs we introduced, leaving every pre-existing tab
-          // (including the one we landed beside) intact. We close/hold them
-          // after the widget-creation test, not before; closing first disposes
-          // the exact InstantiationService we need to create the overlay editor.
-          for (const group of vscode.window.tabGroups.all) {
-            for (const tab of group.tabs) {
-              const input = tab.input as unknown as { uri?: vscode.Uri };
-              if (input && input.uri && typeof input.uri.toString === 'function' &&
-                  input.uri.toString() === captureUriStr && !preExistingUris.has(input.uri.toString())) {
-                // Above condition is strict: URI matches AND it wasn't in
-                // the preExistingUris snapshot — i.e., the tab we created
-                // purely to make VS Code instantiate a fresh editor widget.
-                forceOpenedCloseTargets.push(tab);
-              }
-            }
-          }
-          tClose = Date.now() - tCollectClose0;
-        } else {
-          this.log.appendLine('Capture diagnostic: no files found to open');
-        }
-      } catch (err) {
-        this.log.appendLine(`Capture trigger failed: ${err instanceof Error ? err.message : err}`);
-      }
-      const peeked = await peekAll('Capture peek after clear+force');
-
-      // Find the window with most captures and run the widget-creation test there.
-      let bestWin: number | null = null;
-      let bestScore = 0;
-      for (const [id, peekStr] of peeked) {
-        const widgetMatch = /widgets=(\d+)/.exec(peekStr);
-        const serviceMatch = /services=(\d+)/.exec(peekStr);
-        const ctorMatch = /ctors=(\d+)/.exec(peekStr);
-        const widgetCount = widgetMatch ? parseInt(widgetMatch[1], 10) : 0;
-        const svcCount = serviceMatch ? parseInt(serviceMatch[1], 10) : 0;
-        const ctorCount = ctorMatch ? parseInt(ctorMatch[1], 10) : 0;
-        const score = widgetCount + svcCount + ctorCount;
-        if (preferredWindowId !== undefined && id === preferredWindowId && widgetCount > 0 && svcCount > 0) {
-          bestWin = id;
-          bestScore = score;
-          break;
-        }
-        if (widgetCount > 0 && svcCount > 0 && score > bestScore) { bestScore = score; bestWin = id; }
-      }
-      if (bestWin !== null && bestScore > 0) {
-        this.log.appendLine(`Running TEST widget create in win=${bestWin} (score=${bestScore})...`);
-        await runWidgetCreateTest(bestWin, 'force-open');
-      } else {
-        this.log.appendLine('No window has captures — skipping widget creation test.');
-      }
-
-      if (forceOpenedCloseTargets.length > 0) {
-        const tClose0 = Date.now();
-        if (holdForceOpenedTab) {
-          this.holdPreviewCaptureTabs(forceOpenedCloseTargets);
-          this.log.appendLine(
-            `Capture diagnostic: holding ${forceOpenedCloseTargets.length} introduced tab(s) until preview render completes.`,
-          );
-        } else {
-          try { await vscode.window.tabGroups.close(forceOpenedCloseTargets, true); }
-          catch (errClose) { this.log.appendLine(`Capture close tab failed: ${errClose instanceof Error ? errClose.message : errClose}`); }
-        }
-        tClose += Date.now() - tClose0;
-      }
-
-      this.log.appendLine(
-        `Capture force-open phase: ${Date.now() - t0}ms ` +
-        `(findFiles=${tFind}ms showTextDocument=${tShow}ms ` +
-        `poll=${tPoll}ms iters=${pollIters} peekMax=${pollPeekMaxMs}ms ` +
-        `closeEditors=${tClose}ms)`,
-      );
-
-      // Stop capture in every window (best-effort) so Map.prototype etc.
-      // are back to normal. Parallel for a small (~100ms) additional win.
-      await stopCaptureAll();
-    } catch (err) {
-      this.log.appendLine(`Capture diagnostic failed: ${err instanceof Error ? err.message : err}`);
-      try { await stopCaptureAll(); } catch {}
-    }
+    await runMonacoCaptureDiagnostic({
+      resolveTargetWorkbenchWindowId: (preferred) => this.resolveTargetWorkbenchWindowId(preferred),
+      evalInWindow: (winId, expr) => this.evalInWindow(winId, expr),
+      isMonacoReadyInWindow: (winId) => this.isMonacoReadyInWindow(winId),
+      log: (message) => this.log.appendLine(message),
+      setLastCaptureDiagnosticOpenUri: (uri) => { this.lastCaptureDiagnosticOpenUri = uri; },
+      holdPreviewCaptureTabs: (tabs) => this.holdPreviewCaptureTabs(tabs),
+    }, preferredWindowId, options);
   }
 
   /** @internal Used by E2E tests to wait for the index to finish its
@@ -1644,13 +1268,28 @@ export class OverlayPanel {
     }
   }
 
+  async getSearchReadinessForHealth(): Promise<{ ready: boolean; reason?: string }> {
+    if (getConfiguredSearchEngine() === 'zoekt') {
+      return this.zoektRuntime.getSearchReadiness();
+    }
+    return { ready: this.trigramIndex.isReady, reason: this.trigramIndex.isReady ? undefined : 'codesearch trigram index not ready' };
+  }
+
+  collectZoektFreshnessForHealth(): ZoektFreshnessStatus {
+    return this.zoektRuntime.getFreshnessStatus();
+  }
+
   /** @internal Run the same search pipeline runSearch() uses, but collect
    *  FileMatch events synchronously and return them. Skips the overlay UI
    *  (no CDP, no renderer) — tests get deterministic results independent
    *  of the VSCode window state. */
-  async searchForTestsDetailed(options: SearchOptions): Promise<SearchForTestsResult> {
+  async searchForTestsDetailed(options: SearchOptions, token?: vscode.CancellationToken): Promise<SearchForTestsResult> {
     const folders = vscode.workspace.workspaceFolders;
     const requestedEngine = getConfiguredSearchEngine();
+    const ownedCts = token ? undefined : new vscode.CancellationTokenSource();
+    const effectiveToken = token ?? ownedCts!.token;
+    const fallbackPolicy: SearchFallbackPolicy = options.fallbackPolicy ?? 'always';
+    try {
     if (!folders || folders.length === 0) {
       return {
         matches: [],
@@ -1673,7 +1312,7 @@ export class OverlayPanel {
     if (requestedEngine === 'zoekt' && !options.forceFullScan) {
       const readiness = await this.zoektRuntime.runSearch(
         options,
-        new vscode.CancellationTokenSource().token,
+        effectiveToken,
         {
           onFile: (m) => { matches.push(m); },
           onDone: () => {},
@@ -1687,9 +1326,25 @@ export class OverlayPanel {
           effectiveEngine,
         };
       }
+      if (fallbackPolicy === 'never') {
+        return {
+          matches: mergeFileMatches(matches),
+          requestedEngine,
+          effectiveEngine: requestedEngine,
+          fallbackReason: appendFallbackReason(readiness.reason, fallbackPolicySkipReason(fallbackPolicy, null)),
+        };
+      }
       effectiveEngine = 'codesearch';
       fallbackReason = readiness.reason;
     } else if (requestedEngine === 'zoekt' && options.forceFullScan) {
+      if (!shouldUseSearchFallback(fallbackPolicy, null)) {
+        return {
+          matches: [],
+          requestedEngine,
+          effectiveEngine: requestedEngine,
+          fallbackReason: appendFallbackReason('scope override requires full workspace scan', fallbackPolicySkipReason(fallbackPolicy, null)),
+        };
+      }
       effectiveEngine = 'codesearch';
       fallbackReason = 'scope override requires full workspace scan';
     }
@@ -1709,17 +1364,31 @@ export class OverlayPanel {
           fallbackReason,
         };
       }
+      if (fallbackReason && !shouldUseSearchFallback(fallbackPolicy, candidates.size)) {
+        return {
+          matches: mergeFileMatches(matches),
+          requestedEngine,
+          effectiveEngine: requestedEngine,
+          fallbackReason: appendFallbackReason(fallbackReason, fallbackPolicySkipReason(fallbackPolicy, candidates.size)),
+        };
+      }
       const uris: vscode.Uri[] = [];
       for (const u of candidates) {
         try { uris.push(vscode.Uri.parse(u)); } catch {}
       }
       paths = prioritizeFiles(uris).map((u) => u.fsPath);
+    } else if (fallbackReason && !shouldUseSearchFallback(fallbackPolicy, null)) {
+      return {
+        matches: mergeFileMatches(matches),
+        requestedEngine,
+        effectiveEngine: requestedEngine,
+        fallbackReason: appendFallbackReason(fallbackReason, fallbackPolicySkipReason(fallbackPolicy, null)),
+      };
     }
-    const cts = new vscode.CancellationTokenSource();
     await new Promise<void>((resolve, reject) => {
       runRgSearch(
         options,
-        cts.token,
+        effectiveToken,
         {
           onFile: (m) => { matches.push(m); },
           onDone: () => { resolve(); },
@@ -1729,12 +1398,19 @@ export class OverlayPanel {
       ).catch(reject);
     });
     if (paths && countFileMatches(matches) < getRequestedResultLimit(options)) {
+      if (fallbackReason && fallbackPolicy !== 'always') {
+        return {
+          matches: mergeFileMatches(matches),
+          requestedEngine,
+          effectiveEngine,
+          fallbackReason: appendFallbackReason(fallbackReason, fallbackPolicySkipReason(fallbackPolicy, null)),
+        };
+      }
       const verifiedMatches: FileMatch[] = [];
-      const verifyCts = new vscode.CancellationTokenSource();
       await new Promise<void>((resolve, reject) => {
         runRgSearch(
           options,
-          verifyCts.token,
+          effectiveToken,
           {
             onFile: (m) => { verifiedMatches.push(m); },
             onDone: () => { resolve(); },
@@ -1756,6 +1432,9 @@ export class OverlayPanel {
       effectiveEngine,
       fallbackReason,
     };
+    } finally {
+      ownedCts?.dispose();
+    }
   }
 
   async searchForTests(options: SearchOptions): Promise<FileMatch[]> {
@@ -2302,6 +1981,123 @@ export class OverlayPanel {
     }
     this.log.show(true);
     this.log.appendLine(this.zoektRuntime.formatInfoReport(info));
+  }
+
+  async collectZoektInfoForHealth(): Promise<ZoektInfoResponse | null> {
+    return this.zoektRuntime.collectInfo();
+  }
+
+  formatZoektInfoForHealth(info: ZoektInfoResponse): string {
+    return this.zoektRuntime.formatInfoReport(info);
+  }
+
+  async benchmarkAgainstRgForCommand(token?: vscode.CancellationToken): Promise<string> {
+    const cases: Array<{ name: string; query: string; useRegex: boolean; includePatterns: string[] }> = [
+      { name: 'common_literal', query: 'useQuery', useRegex: false, includePatterns: ['**/*.ts', '**/*.tsx'] },
+      { name: 'rare_literal', query: 'WhtBook', useRegex: false, includePatterns: ['**/*.py'] },
+      { name: 'regex_class_view', query: 'class\\s+\\w+View', useRegex: true, includePatterns: ['**/*.py', '**/*.ts', '**/*.tsx'] },
+      { name: 'no_match', query: 'ZZZ_NOPE', useRegex: false, includePatterns: ['**/*.py', '**/*.ts', '**/*.tsx', '**/*.js', '**/*.jsx'] },
+    ];
+    const lines = ['query | tool | matches | files | latency_ms | chars | verdict'];
+    for (const item of cases) {
+      if (token?.isCancellationRequested) {
+        lines.push(`${item.name} | cancelled | 0 | 0 | 0 | 0 | cancelled`);
+        break;
+      }
+      const options: SearchOptions = {
+        query: item.query,
+        caseSensitive: false,
+        wholeWord: false,
+        useRegex: item.useRegex,
+        regexMultiline: item.useRegex,
+        includePatterns: item.includePatterns,
+        excludePatterns: [],
+        resultLimit: 200,
+        fallbackPolicy: 'never',
+      };
+      const indexed = await this.runIndexedBenchmarkCase(options, token);
+      const rg = await this.runRgBenchmarkCase({ ...options, fallbackPolicy: 'always' }, token);
+      lines.push(formatBenchmarkRow(item.name, 'indexed', indexed, verdictForBenchmark(indexed, rg)));
+      lines.push(formatBenchmarkRow(item.name, 'rg', rg, rg.cancelled ? 'cancelled' : 'baseline'));
+    }
+    return lines.join('\n');
+  }
+
+  private async runIndexedBenchmarkCase(
+    options: SearchOptions,
+    token?: vscode.CancellationToken,
+  ): Promise<SearchBenchmarkMeasurement> {
+    const started = Date.now();
+    const matches: FileMatch[] = [];
+    const ownedCts = token ? undefined : new vscode.CancellationTokenSource();
+    try {
+      const readiness = await this.zoektRuntime.runSearch(options, token ?? ownedCts!.token, {
+        onFile: (match) => { matches.push(match); },
+        onDone: () => {},
+        onError: (err) => { throw err; },
+      });
+      const merged = mergeFileMatches(matches);
+      return {
+        files: merged.length,
+        matches: countFileMatches(merged),
+        latencyMs: Date.now() - started,
+        chars: benchmarkOutputChars(merged),
+        warning: readiness.ready ? undefined : readiness.reason ?? 'index unavailable',
+      };
+    } catch (err) {
+      return {
+        files: 0,
+        matches: 0,
+        latencyMs: Date.now() - started,
+        chars: 0,
+        warning: err instanceof Error ? err.message : String(err),
+        cancelled: token?.isCancellationRequested,
+      };
+    } finally {
+      ownedCts?.dispose();
+    }
+  }
+
+  private async runRgBenchmarkCase(
+    options: SearchOptions,
+    token?: vscode.CancellationToken,
+  ): Promise<SearchBenchmarkMeasurement> {
+    const started = Date.now();
+    const matches: FileMatch[] = [];
+    const ownedCts = token ? undefined : new vscode.CancellationTokenSource();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        runRgSearch(
+          options,
+          token ?? ownedCts!.token,
+          {
+            onFile: (match) => { matches.push(match); },
+            onDone: () => { resolve(); },
+            onError: (err) => { reject(err); },
+          },
+          null,
+        ).catch(reject);
+      });
+      const merged = mergeFileMatches(matches);
+      return {
+        files: merged.length,
+        matches: countFileMatches(merged),
+        latencyMs: Date.now() - started,
+        chars: benchmarkOutputChars(merged),
+        cancelled: token?.isCancellationRequested,
+      };
+    } catch (err) {
+      return {
+        files: 0,
+        matches: 0,
+        latencyMs: Date.now() - started,
+        chars: 0,
+        warning: err instanceof Error ? err.message : String(err),
+        cancelled: token?.isCancellationRequested,
+      };
+    } finally {
+      ownedCts?.dispose();
+    }
   }
 
   async explainZoektQuery(options: SearchOptions): Promise<void> {
@@ -4797,12 +4593,67 @@ export class OverlayPanel {
   }
 }
 
+type SearchBenchmarkMeasurement = {
+  files: number;
+  matches: number;
+  latencyMs: number;
+  chars: number;
+  warning?: string;
+  cancelled?: boolean;
+};
+
+function benchmarkOutputChars(matches: FileMatch[]): number {
+  let chars = 0;
+  for (const file of matches) {
+    for (const match of file.matches) {
+      chars += `${file.relPath}:${match.line + 1}:${match.preview}\n`.length;
+    }
+  }
+  return chars;
+}
+
+function formatBenchmarkRow(
+  queryName: string,
+  tool: string,
+  measurement: SearchBenchmarkMeasurement,
+  verdict: string,
+): string {
+  const warning = measurement.warning ? ` (${measurement.warning.slice(0, 80)})` : '';
+  return `${queryName} | ${tool} | ${measurement.matches} | ${measurement.files} | ${measurement.latencyMs} | ${measurement.chars} | ${verdict}${warning}`;
+}
+
+function verdictForBenchmark(indexed: SearchBenchmarkMeasurement, rg: SearchBenchmarkMeasurement): string {
+  if (indexed.cancelled || rg.cancelled) { return 'cancelled'; }
+  if (indexed.warning) { return 'check'; }
+  if (indexed.matches !== rg.matches || indexed.files !== rg.files) { return 'accuracy_check'; }
+  if (rg.latencyMs <= 0) { return 'ok'; }
+  return indexed.latencyMs <= Math.max(50, rg.latencyMs * 1.25) ? 'ok' : 'slower';
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function countFileMatches(matches: FileMatch[]): number {
   return matches.reduce((sum, match) => sum + match.matches.length, 0);
+}
+
+type SearchFallbackPolicy = NonNullable<SearchOptions['fallbackPolicy']>;
+
+const BOUNDED_SEARCH_FALLBACK_FILE_THRESHOLD = 2_000;
+
+function shouldUseSearchFallback(policy: SearchFallbackPolicy, estimatedFiles: number | null): boolean {
+  if (policy === 'always') { return true; }
+  if (policy === 'never') { return false; }
+  return estimatedFiles !== null && estimatedFiles <= BOUNDED_SEARCH_FALLBACK_FILE_THRESHOLD;
+}
+
+function fallbackPolicySkipReason(policy: SearchFallbackPolicy, estimatedFiles: number | null): string {
+  if (policy === 'bounded') {
+    const estimate = estimatedFiles === null ? 'unknown' : String(estimatedFiles);
+    return `fallback skipped by policy=bounded estimated_candidate_files=${estimate} threshold=${BOUNDED_SEARCH_FALLBACK_FILE_THRESHOLD}`;
+  }
+  return `fallback skipped by policy=${policy}`;
 }
 
 function appendFallbackReason(existing: string | undefined, reason: string): string {

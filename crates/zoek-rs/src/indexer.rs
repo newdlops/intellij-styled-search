@@ -744,7 +744,9 @@ where
             metadata_known: false,
         });
     }
-    records.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    // Keep rg's file enumeration order in shard document ids. Search uses
+    // those ids as its rg-like result order; sorting here would make broad
+    // Top-N queries drift away from ripgrep even when counts match.
     progress(IndexProgress {
         phase: "scan",
         current: stats.visited_files,
@@ -919,6 +921,9 @@ fn scan_index_dir_one_level(
             let name = file_name.to_string_lossy();
             if config.is_internal_index_dir_name(&name)
                 || config.is_excluded_dir_name(&name)
+                || config.is_excluded_normalized_relative_path(&normalize_rel_path(
+                    path.strip_prefix(workspace_root).unwrap_or(&path),
+                ))
                 || path == index_root
             {
                 stats.skipped_dirs += 1;
@@ -934,6 +939,10 @@ fn scan_index_dir_one_level(
             continue;
         }
 
+        let rel_path = normalize_rel_path(path.strip_prefix(workspace_root).unwrap_or(&path));
+        if config.is_excluded_normalized_relative_path(&rel_path) {
+            continue;
+        }
         stats.visited_files += 1;
         let global_visited = visited_files.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         if global_visited == 1 || global_visited % 4096 == 0 {
@@ -963,7 +972,7 @@ fn scan_index_dir_one_level(
             .map(|value| value.as_secs())
             .unwrap_or(0);
         records.push(IndexFileRecord {
-            rel_path: normalize_rel_path(path.strip_prefix(workspace_root).unwrap_or(&path)),
+            rel_path,
             abs_path: path,
             size_bytes: metadata.len(),
             modified_unix_secs,
@@ -994,6 +1003,9 @@ where
             let name = file_name.to_string_lossy();
             if config.is_internal_index_dir_name(&name)
                 || config.is_excluded_dir_name(&name)
+                || config.is_excluded_normalized_relative_path(&normalize_rel_path(
+                    path.strip_prefix(workspace_root).unwrap_or(&path),
+                ))
                 || path == config.index_root(workspace_root)
             {
                 stats.skipped_dirs += 1;
@@ -1006,6 +1018,10 @@ where
             continue;
         }
 
+        let rel_path = normalize_rel_path(path.strip_prefix(workspace_root).unwrap_or(&path));
+        if config.is_excluded_normalized_relative_path(&rel_path) {
+            continue;
+        }
         stats.visited_files += 1;
         if stats.visited_files == 1 || stats.visited_files % 4096 == 0 {
             progress(IndexProgress {
@@ -1037,7 +1053,7 @@ where
             .map(|value| value.as_secs())
             .unwrap_or(0);
         records.push(IndexFileRecord {
-            rel_path: normalize_rel_path(path.strip_prefix(workspace_root).unwrap_or(&path)),
+            rel_path,
             abs_path: path,
             size_bytes: metadata.len(),
             modified_unix_secs,
@@ -1162,9 +1178,9 @@ fn read_index_bytes_from_file_if_not_binary(
         return read_file_bytes_if_not_binary(path, size_bytes).map(|outcome| (outcome, false));
     }
 
-    append_index_sample_chunk(file, size_bytes / 4, &mut bytes)?;
-    append_index_sample_chunk(file, size_bytes / 2, &mut bytes)?;
-    append_index_sample_chunk(file, (size_bytes * 3) / 4, &mut bytes)?;
+    append_centered_index_sample_chunk(file, size_bytes / 4, &mut bytes)?;
+    append_centered_index_sample_chunk(file, size_bytes / 2, &mut bytes)?;
+    append_centered_index_sample_chunk(file, (size_bytes * 3) / 4, &mut bytes)?;
     append_index_sample_chunk(
         file,
         size_bytes.saturating_sub(SAMPLED_INDEX_CHUNK_BYTES as u64),
@@ -1239,9 +1255,9 @@ fn read_index_bytes_from_unknown_size_file_if_not_binary(
         return Ok((ReadTextBytesOutcome::Text(full_bytes), size_bytes, false));
     }
 
-    append_index_sample_chunk(file, size_bytes / 4, &mut bytes)?;
-    append_index_sample_chunk(file, size_bytes / 2, &mut bytes)?;
-    append_index_sample_chunk(file, (size_bytes * 3) / 4, &mut bytes)?;
+    append_centered_index_sample_chunk(file, size_bytes / 4, &mut bytes)?;
+    append_centered_index_sample_chunk(file, size_bytes / 2, &mut bytes)?;
+    append_centered_index_sample_chunk(file, (size_bytes * 3) / 4, &mut bytes)?;
     append_index_sample_chunk(
         file,
         size_bytes.saturating_sub(SAMPLED_INDEX_CHUNK_BYTES as u64),
@@ -1256,6 +1272,18 @@ fn append_index_sample_chunk(file: &mut File, offset: u64, out: &mut Vec<u8>) ->
     let mut reader = file.take(SAMPLED_INDEX_CHUNK_BYTES as u64);
     reader.read_to_end(out)?;
     Ok(())
+}
+
+fn append_centered_index_sample_chunk(
+    file: &mut File,
+    center_offset: u64,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    append_index_sample_chunk(
+        file,
+        center_offset.saturating_sub((SAMPLED_INDEX_CHUNK_BYTES / 2) as u64),
+        out,
+    )
 }
 
 fn max_grams_for_file(config: &EngineConfig, size_bytes: u64, _rel_path: &str) -> usize {
@@ -1322,10 +1350,10 @@ fn append_overflow_sample_grams(text: &str, grams: &mut Vec<u64>) {
         grams,
     );
     for numerator in 1..16 {
-        let start = (text.len() * numerator) / 16;
-        append_sample_grams(
+        let center = (text.len() * numerator) / 16;
+        append_centered_sample_grams(
             text,
-            start,
+            center,
             SAMPLE_BYTES,
             EXTRA_GRAMS_PER_SAMPLE,
             &mut seen,
@@ -1352,6 +1380,7 @@ fn append_overflow_selective_token_grams(
     if text.is_empty() {
         return;
     }
+    let has_non_ascii = !text.is_ascii();
     for segment_idx in 0..SELECTIVE_TOKEN_SEGMENTS {
         let mut start = (text.len() * segment_idx) / SELECTIVE_TOKEN_SEGMENTS;
         let mut end = (text.len() * (segment_idx + 1)) / SELECTIVE_TOKEN_SEGMENTS;
@@ -1364,8 +1393,10 @@ fn append_overflow_selective_token_grams(
         if start >= end {
             continue;
         }
+        let segment = &text[start..end];
         let _ = crate::gram::append_selective_token_hashes(
-            &text[start..end],
+            segment,
+            has_non_ascii && !segment.is_ascii(),
             seen,
             grams,
             SELECTIVE_TOKEN_GRAMS_PER_SEGMENT,
@@ -1400,6 +1431,24 @@ fn append_sample_grams(
             grams.push(gram);
         }
     }
+}
+
+fn append_centered_sample_grams(
+    text: &str,
+    center: usize,
+    max_bytes: usize,
+    max_grams: usize,
+    seen: &mut HashSet<u64>,
+    grams: &mut Vec<u64>,
+) {
+    append_sample_grams(
+        text,
+        center.saturating_sub(max_bytes / 2),
+        max_bytes,
+        max_grams,
+        seen,
+        grams,
+    );
 }
 
 fn merge_corpus_stats(target: &mut CorpusStats, source: CorpusStats) {
@@ -1618,7 +1667,7 @@ mod tests {
         let artifacts = index_directory(&root, &config)?;
         assert_eq!(artifacts.summary.shard_count, 3);
         let manifest = fs::read_to_string(root.join(".zoek-rs/manifest.json"))?;
-        assert!(manifest.contains("\"schemaVersion\":17"));
+        assert!(manifest.contains("\"schemaVersion\":19"));
         assert!(manifest.contains("base-shard-0000.zrs"));
 
         let reader = ShardReader::open(&root.join(".zoek-rs/base-shard-0000.zrs"))?;

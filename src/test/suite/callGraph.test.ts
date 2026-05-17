@@ -1157,13 +1157,27 @@ suite('Call graph', () => {
     const folder = vscode.workspace.workspaceFolders?.[0];
     assert.ok(folder, 'expected fixture workspace folder');
     const mcpTarget = vscode.Uri.joinPath(folder.uri, 'mcp_graph_target.ts');
+    const mcpTargetTest = vscode.Uri.joinPath(folder.uri, 'mcp_graph_target.test.ts');
     const mcpConsumer = vscode.Uri.joinPath(folder.uri, 'mcp_graph_consumer.ts');
+    const mcpRankSource = vscode.Uri.joinPath(folder.uri, 'mcp_rank_source.ts');
+    const mcpRankTest = vscode.Uri.joinPath(folder.uri, 'mcp_rank_source.test.ts');
+    const mcpMigrationDir = vscode.Uri.joinPath(folder.uri, 'migrations');
+    const mcpMigration = vscode.Uri.joinPath(mcpMigrationDir, '0001_mcp_rank.py');
     const mcpLate = vscode.Uri.joinPath(folder.uri, 'mcp_late_symbol.ts');
+    const mcpFreshOverlay = vscode.Uri.joinPath(folder.uri, 'aaa_mcp_fresh_overlay.ts');
+    const mcpDeletedSymbol = vscode.Uri.joinPath(folder.uri, 'mcp_deleted_symbol.ts');
     const mcpPythonModel = vscode.Uri.joinPath(folder.uri, 'mcp_python_model.py');
     const mcpExcludedDir = vscode.Uri.joinPath(folder.uri, 'out');
     const mcpExcluded = vscode.Uri.joinPath(mcpExcludedDir, 'mcp_excluded_probe.js');
     const mcpGeneratedDir = vscode.Uri.joinPath(folder.uri, 'src', 'client', 'graphql-codegen');
+    const mcpGeneratedRank = vscode.Uri.joinPath(mcpGeneratedDir, 'mcp_rank_generated.ts');
     const mcpGeneratedLarge = vscode.Uri.joinPath(mcpGeneratedDir, 'graphql.ts');
+    const mcpLibraryDir = vscode.Uri.joinPath(folder.uri, 'vendor');
+    const mcpLibraryRank = vscode.Uri.joinPath(mcpLibraryDir, 'mcp_rank_library.ts');
+    const mcpEditOtherDir = vscode.Uri.joinPath(folder.uri, 'aaa_mcp_edit_other');
+    const mcpEditOther = vscode.Uri.joinPath(mcpEditOtherDir, 'mcp_edit_rank.ts');
+    const mcpEditActiveDir = vscode.Uri.joinPath(folder.uri, 'zzz_mcp_edit_active');
+    const mcpEditActive = vscode.Uri.joinPath(mcpEditActiveDir, 'mcp_edit_rank.ts');
     try {
       await vscode.workspace.fs.writeFile(mcpTarget, Buffer.from([
         'export function mcpGraphTarget() {',
@@ -1188,6 +1202,44 @@ suite('Call graph', () => {
         'const mcpDuplicateNeedle = "mcpDuplicateNeedle mcpDuplicateNeedle";',
         '',
       ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.writeFile(mcpTargetTest, Buffer.from([
+        'import { mcpGraphTarget } from "./mcp_graph_target";',
+        '',
+        'test("mcpGraphTarget returns stable value", () => {',
+        '  expect(mcpGraphTarget()).toBe(1);',
+        '});',
+        '',
+      ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.writeFile(mcpRankSource, Buffer.from([
+        'export const mcpRankNeedle = "mcpRankNeedle";',
+        '',
+      ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.writeFile(mcpRankTest, Buffer.from([
+        'test("rank test", () => {',
+        '  expect("mcpRankNeedle").toBeTruthy();',
+        '});',
+        '',
+      ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.createDirectory(mcpMigrationDir);
+      await vscode.workspace.fs.writeFile(mcpMigration, Buffer.from([
+        'MCP_RANK_MIGRATION = "mcpRankNeedle"',
+        '',
+      ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.createDirectory(mcpLibraryDir);
+      await vscode.workspace.fs.writeFile(mcpLibraryRank, Buffer.from([
+        'export const mcpRankVendorNeedle = "mcpRankNeedle";',
+        '',
+      ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.createDirectory(mcpEditOtherDir);
+      await vscode.workspace.fs.writeFile(mcpEditOther, Buffer.from([
+        'export const mcpOtherEditRankNeedle = "mcpUserEditRankNeedle";',
+        '',
+      ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.createDirectory(mcpEditActiveDir);
+      await vscode.workspace.fs.writeFile(mcpEditActive, Buffer.from([
+        'export const mcpActiveEditRankNeedle = "mcpUserEditRankNeedle";',
+        '',
+      ].join('\n'), 'utf8'));
       await vscode.workspace.fs.writeFile(mcpPythonModel, Buffer.from([
         'class TimestampedModel:',
         '    pass',
@@ -1201,6 +1253,16 @@ suite('Call graph', () => {
         '        return self.status',
         '',
       ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.writeFile(mcpFreshOverlay, Buffer.from([
+        'export const mcpFreshOverlayValue = "mcpFreshOverlayOldNeedle";',
+        '',
+      ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.writeFile(mcpDeletedSymbol, Buffer.from([
+        'export class McpDeletedSymbolFreshness {',
+        '  value = 1;',
+        '}',
+        '',
+      ].join('\n'), 'utf8'));
       await vscode.workspace.fs.createDirectory(mcpExcludedDir);
       await vscode.workspace.fs.writeFile(mcpExcluded, Buffer.from([
         'export const mcpExcludedNeedle = "mcpExcludedNeedle";',
@@ -1209,6 +1271,10 @@ suite('Call graph', () => {
       await api.callGraph.rebuild(undefined, undefined, { force: true });
       const url = await api.mcpServer.start(0);
       await vscode.workspace.fs.createDirectory(mcpGeneratedDir);
+      await vscode.workspace.fs.writeFile(mcpGeneratedRank, Buffer.from([
+        'export const mcpRankGeneratedNeedle = "mcpRankNeedle";',
+        '',
+      ].join('\n'), 'utf8'));
       await vscode.workspace.fs.writeFile(mcpGeneratedLarge, Buffer.from([
         'export const generatedNeedleA = "mcpLargeGeneratedNeedle";',
         'export const generatedNeedleB = "mcpLargeGeneratedOtherNeedle";',
@@ -1225,6 +1291,12 @@ suite('Call graph', () => {
       assert.strictEqual(init.result?.serverInfo?.name, 'codeidx-mcp');
       assert.ok(init.result?.capabilities?.resources, 'expected resources capability');
       assert.ok(init.result?.capabilities?.prompts, 'expected prompts capability');
+      assert.match(String(init.result?.instructions ?? ''), /Unless higher-priority user\/project policy/);
+      assert.match(String(init.result?.instructions ?? ''), /automatically use codeidx/);
+      assert.match(String(init.result?.instructions ?? ''), /mcp_health\(include_agent_policy=true/);
+      assert.match(String(init.result?.instructions ?? ''), /codeidx_probe\/codeidx_exists/);
+      assert.match(String(init.result?.instructions ?? ''), /output_mode="minimal"/);
+      assert.match(String(init.result?.instructions ?? ''), /do not request index refresh\/rebuild/i);
       const compatInit = await postJson(url, {
         jsonrpc: '2.0',
         id: 7,
@@ -1237,6 +1309,10 @@ suite('Call graph', () => {
         method: 'notifications/initialized',
         params: {},
       });
+      await vscode.workspace.fs.writeFile(mcpFreshOverlay, Buffer.from([
+        'export const mcpFreshOverlayValue = "mcpFreshOverlayNewNeedle";',
+        '',
+      ].join('\n'), 'utf8'));
       const response = await postJson(url, {
         jsonrpc: '2.0',
         id: 2,
@@ -1272,7 +1348,26 @@ suite('Call graph', () => {
       assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_find_implementations'), 'expected codeidx_find_implementations tool');
       assert.ok(tools.some((tool: { name?: string }) => tool.name === 'codeidx_get_context_bundle'), 'expected codeidx_get_context_bundle tool');
       assert.ok(tools.some((tool: { name?: string }) => tool.name === 'mcp_health'), 'expected mcp_health tool');
-      assert.ok(tools.some((tool: { name?: string }) => tool.name === 'mcp_test'), 'expected mcp_test tool');
+      assert.ok(
+        !tools.some((tool: { name?: string }) => tool.name === 'mcp_test'),
+        'MCP must not advertise mcp_test because it is not a reliable benchmark tool',
+      );
+      assert.ok(
+        !tools.some((tool: { name?: string }) => tool.name === 'codeidx_refresh_index'),
+        'MCP must not advertise index refresh/rebuild tools',
+      );
+      const rejectedRefresh = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 108,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_refresh_index',
+          arguments: { scope: 'workspace', wait: true },
+        },
+      });
+      assert.strictEqual(rejectedRefresh.result?.isError, true);
+      assert.strictEqual(rejectedRefresh.result?.structuredContent?.ok, false);
+      assert.strictEqual(rejectedRefresh.result?.structuredContent?.error?.code, 'unknown_tool');
       const resources = await postJson(url, {
         jsonrpc: '2.0',
         id: 3,
@@ -1323,6 +1418,24 @@ suite('Call graph', () => {
           overview.result.content[0].text.includes('"schema_version"'),
         'expected MCP text content alongside structuredContent for client compatibility',
       );
+      const indexStatus = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 101,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_index_status',
+          arguments: { include_counts: true },
+        },
+      });
+      assert.strictEqual(indexStatus.result?.isError, false);
+      assert.strictEqual(indexStatus.result?.structuredContent?.confidence?.symbol_index, 'fresh');
+      assert.strictEqual(typeof indexStatus.result?.structuredContent?.counts?.usage_edges, 'number');
+      assert.strictEqual(typeof indexStatus.result?.structuredContent?.counts?.call_edges, 'number');
+      assert.strictEqual(typeof indexStatus.result?.structuredContent?.counts?.construct_edges, 'number');
+      assert.strictEqual(typeof indexStatus.result?.structuredContent?.storage?.total_bytes, 'number');
+      assert.strictEqual(typeof indexStatus.result?.structuredContent?.storage?.content_index_bytes, 'number');
+      assert.strictEqual(typeof indexStatus.result?.structuredContent?.storage?.symbol_index_bytes, 'number');
+      assert.strictEqual(typeof indexStatus.result?.structuredContent?.storage?.reference_index_bytes, 'number');
       const queryExplain = await postJson(url, {
         jsonrpc: '2.0',
         id: 9,
@@ -1354,6 +1467,8 @@ suite('Call graph', () => {
           arguments: {
             query: 'mcpSearchCapNeedle\\d+',
             query_kind: 'auto',
+            output_mode: 'rg_like',
+            include_diagnostics: true,
             limit: 5,
             max_chars: 20_000,
           },
@@ -1361,9 +1476,383 @@ suite('Call graph', () => {
       });
       assert.strictEqual(autoRegexSearch.result?.isError, false);
       assert.strictEqual(autoRegexSearch.result?.structuredContent?.query_diagnostics?.effective_query_kind, 'regex');
+      assert.strictEqual(autoRegexSearch.result?.structuredContent?.output_mode, 'rg_like');
+      assert.strictEqual(autoRegexSearch.result?.structuredContent?.results, undefined);
+      assert.strictEqual(autoRegexSearch.result?.structuredContent?.result_window?.returned, 5);
       assert.ok(
-        autoRegexSearch.result?.structuredContent?.results?.length > 0,
-        `expected query_kind=auto to infer regex syntax, got ${JSON.stringify(autoRegexSearch.result?.structuredContent)}`,
+        /^mcp_graph_consumer\.ts:\d+:/.test(autoRegexSearch.result?.content?.[0]?.text ?? ''),
+        `expected explicit rg_like search_code to return compact preview rows, got ${JSON.stringify(autoRegexSearch.result?.content ?? [])}`,
+      );
+      const tokenFirstDefaultSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 116,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpSearchCapNeedle\\d+',
+            query_kind: 'auto',
+            limit: 5,
+            max_chars: 20_000,
+          },
+        },
+      });
+      assert.strictEqual(tokenFirstDefaultSearch.result?.isError, false);
+      assert.strictEqual(tokenFirstDefaultSearch.result?.structuredContent, undefined);
+      assert.ok(
+        /^mcp_graph_consumer\.ts:\d+$/m.test(tokenFirstDefaultSearch.result?.content?.[0]?.text ?? ''),
+        `expected default search_code to return token-first path:line rows, got ${JSON.stringify(tokenFirstDefaultSearch.result?.content ?? [])}`,
+      );
+      assert.ok(
+        String(tokenFirstDefaultSearch.result?.content?.[0]?.text ?? '').length <
+          String(autoRegexSearch.result?.content?.[0]?.text ?? '').length,
+        'expected default minimal search output to be smaller than rg_like preview output',
+      );
+      assert.ok(
+        String(tokenFirstDefaultSearch.result?.content?.[0]?.text ?? '').length <=
+          Math.ceil(String(autoRegexSearch.result?.content?.[0]?.text ?? '').length / 2),
+        `expected default minimal search output to be at most half of rg_like preview output, minimal=${JSON.stringify(tokenFirstDefaultSearch.result?.content?.[0]?.text)} rg_like=${JSON.stringify(autoRegexSearch.result?.content?.[0]?.text)}`,
+      );
+      const staleOverlayProbe = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 117,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_probe',
+          arguments: {
+            query: 'mcpFreshOverlayOldNeedle',
+            query_kind: 'literal',
+            include_globs: ['aaa_mcp_fresh_overlay.ts'],
+            fallback_policy: 'never',
+            by_file_limit: 1,
+          },
+        },
+      });
+      assert.strictEqual(staleOverlayProbe.result?.isError, false);
+      assert.match(
+        staleOverlayProbe.result?.content?.[0]?.text ?? '',
+        /^0\t0\texact\tzoekt$/,
+        `expected dirty overlay to suppress stale indexed matches after an edit, got ${JSON.stringify(staleOverlayProbe.result?.content ?? [])}`,
+      );
+      const freshOverlayCount = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 118,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_count',
+          arguments: {
+            query: 'mcpFreshOverlayNewNeedle',
+            query_kind: 'literal',
+            include_globs: ['aaa_mcp_fresh_overlay.ts'],
+            fallback_policy: 'never',
+            max_matches: 10,
+            max_files: 10,
+          },
+        },
+      });
+      assert.strictEqual(freshOverlayCount.result?.isError, false);
+      assert.strictEqual(
+        freshOverlayCount.result?.structuredContent?.count?.total_matches,
+        1,
+        `expected count/probe path to include immediate post-edit dirty overlay matches, got ${JSON.stringify(freshOverlayCount.result?.structuredContent)}`,
+      );
+      assert.strictEqual(freshOverlayCount.result?.structuredContent?.query_diagnostics?.dirty_overlay?.checked, true);
+      assert.strictEqual(freshOverlayCount.result?.structuredContent?.query_diagnostics?.dirty_overlay?.matched_results, 1);
+      const freshOverlaySearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 119,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpFreshOverlayNewNeedle',
+            query_kind: 'literal',
+            include_globs: ['aaa_mcp_fresh_overlay.ts'],
+            fallback_policy: 'never',
+            limit: 5,
+            include_diagnostics: true,
+          },
+        },
+      });
+      assert.strictEqual(freshOverlaySearch.result?.isError, false);
+      assert.match(
+        freshOverlaySearch.result?.content?.[0]?.text ?? '',
+        /^aaa_mcp_fresh_overlay\.ts:1$/,
+        `expected search_code default minimal output to include immediate post-edit dirty overlay result, got ${JSON.stringify(freshOverlaySearch.result?.content ?? [])}`,
+      );
+      assert.strictEqual(freshOverlaySearch.result?.structuredContent?.query_diagnostics?.dirty_overlay?.checked, true);
+      const compactTwentySearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 100,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpSearchCapNeedle',
+            query_kind: 'literal',
+            include_diagnostics: true,
+            limit: 20,
+            max_chars: 6000,
+          },
+        },
+      });
+      assert.strictEqual(compactTwentySearch.result?.isError, false);
+      const compactRows = String(compactTwentySearch.result?.content?.[0]?.text ?? '')
+        .split(/\n/)
+        .filter(Boolean);
+      assert.strictEqual(
+        compactRows.length,
+        20,
+        `expected compact search_code limit=20 max_chars=6000 to return 20 rows, got ${JSON.stringify(compactTwentySearch.result)}`,
+      );
+      assert.strictEqual(compactTwentySearch.result?.structuredContent?.result_window?.returned, 20);
+      const rankedSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 102,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpRankNeedle',
+            query_kind: 'literal',
+            file_globs: ['**/*.{ts,tsx,py}'],
+            exclude_policy: 'default',
+            fallback_policy: 'bounded',
+            output_mode: 'structured',
+            limit: 3,
+            max_chars: 20_000,
+          },
+        },
+      });
+      assert.strictEqual(rankedSearch.result?.isError, false);
+      assert.strictEqual(
+        rankedSearch.result?.structuredContent?.query_diagnostics?.ranking?.mode,
+        'agent_path_priority_then_engine_order',
+      );
+      assert.strictEqual(rankedSearch.result?.structuredContent?.diagnostic_level, 'compact');
+      assert.strictEqual(rankedSearch.result?.structuredContent?.query_diagnostics?.diagnostic_level, 'compact');
+      assert.strictEqual(
+        typeof rankedSearch.result?.structuredContent?.query_diagnostics?.timings?.phases_ms?.backend_search,
+        'number',
+        `expected search_code diagnostics to include phase timings, got ${JSON.stringify(rankedSearch.result?.structuredContent?.query_diagnostics?.timings)}`,
+      );
+      assert.strictEqual(
+        rankedSearch.result?.structuredContent?.query_diagnostics?.query_terms,
+        undefined,
+        'expected compact diagnostics to omit full query term metadata',
+      );
+      assert.deepStrictEqual(
+        rankedSearch.result?.structuredContent?.query_diagnostics?.scope?.include_patterns,
+        ['**/*.ts', '**/*.tsx', '**/*.py'],
+        'expected MCP file_globs brace alternation to normalize before it reaches the search backend',
+      );
+      const rankedPaths = rankedSearch.result?.structuredContent?.results?.map((item: { path?: string }) => item.path) ?? [];
+      assert.strictEqual(
+        rankedPaths[0],
+        'mcp_rank_source.ts',
+        `expected source file to rank before tests/migrations, got ${JSON.stringify(rankedPaths)}`,
+      );
+      assert.ok(
+        rankedPaths.includes('mcp_rank_source.test.ts') && rankedPaths.includes('migrations/0001_mcp_rank.py'),
+        `expected overfetched ranked results to keep lower-value hits after source, got ${JSON.stringify(rankedPaths)}`,
+      );
+      const lowValueIncludedRankedSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 105,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpRankNeedle',
+            query_kind: 'literal',
+            file_globs: ['**/*.{ts,tsx,py}'],
+            include_generated: true,
+            include_dependencies: true,
+            exclude_policy: 'none',
+            fallback_policy: 'always',
+            output_mode: 'structured',
+            limit: 5,
+            max_chars: 30_000,
+          },
+        },
+      });
+      assert.strictEqual(lowValueIncludedRankedSearch.result?.isError, false);
+      const lowValueIncludedPaths = lowValueIncludedRankedSearch.result?.structuredContent?.results?.map((item: { path?: string }) => item.path) ?? [];
+      assert.strictEqual(
+        lowValueIncludedPaths[0],
+        'mcp_rank_source.ts',
+        `expected source file to rank before generated/vendor/test/migration hits, got ${JSON.stringify(lowValueIncludedPaths)}`,
+      );
+      assert.ok(
+        lowValueIncludedPaths.indexOf('mcp_rank_source.ts') <
+          lowValueIncludedPaths.indexOf('src/client/graphql-codegen/mcp_rank_generated.ts') &&
+          lowValueIncludedPaths.indexOf('mcp_rank_source.ts') <
+          lowValueIncludedPaths.indexOf('vendor/mcp_rank_library.ts'),
+        `expected generated/vendor hits to be demoted after source, got ${JSON.stringify(lowValueIncludedPaths)}`,
+      );
+      const fullDiagnosticsSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 112,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpRankNeedle',
+            query_kind: 'literal',
+            file_globs: ['**/*.{ts,tsx,py}'],
+            output_mode: 'structured',
+            diagnostic_level: 'full',
+            limit: 1,
+            max_chars: 20_000,
+          },
+        },
+      });
+      assert.strictEqual(fullDiagnosticsSearch.result?.isError, false);
+      assert.strictEqual(fullDiagnosticsSearch.result?.structuredContent?.diagnostic_level, 'full');
+      assert.deepStrictEqual(
+        fullDiagnosticsSearch.result?.structuredContent?.query_diagnostics?.query_terms,
+        ['mcpRankNeedle'],
+        `expected diagnostic_level=full to include query_terms, got ${JSON.stringify(fullDiagnosticsSearch.result?.structuredContent?.query_diagnostics)}`,
+      );
+      const directoryTopFiles = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 115,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_top_files',
+          arguments: {
+            query: 'mcpRankNeedle',
+            query_kind: 'literal',
+            file_globs: ['**/*.{ts,tsx,py}'],
+            include_generated: true,
+            include_dependencies: true,
+            exclude_policy: 'none',
+            fallback_policy: 'always',
+            group_by: 'directory',
+            directory_depth: 0,
+            max_files: 20,
+            limit: 10,
+            structured: true,
+          },
+        },
+      });
+      assert.strictEqual(directoryTopFiles.result?.isError, false);
+      const topDirectories = directoryTopFiles.result?.structuredContent?.top_directories ?? [];
+      assert.ok(
+        topDirectories.some((item: { path?: string; count?: number; files?: number }) => item.path === '.' && item.count === 3 && item.files === 2) &&
+          topDirectories.some((item: { path?: string }) => item.path === 'src/client/graphql-codegen') &&
+          topDirectories.some((item: { path?: string }) => item.path === 'vendor'),
+        `expected top_files group_by=directory to summarize matching architecture directories, got ${JSON.stringify(directoryTopFiles.result?.structuredContent)}`,
+      );
+      await vscode.window.showTextDocument(mcpEditActive, { preview: false });
+      const activeEditRankedSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 109,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpUserEditRankNeedle',
+            query_kind: 'literal',
+            file_globs: ['*_mcp_edit_*/*.ts'],
+            output_mode: 'structured',
+            limit: 2,
+            max_chars: 20_000,
+          },
+        },
+      });
+      assert.strictEqual(activeEditRankedSearch.result?.isError, false);
+      const activeEditPaths = activeEditRankedSearch.result?.structuredContent?.results?.map((item: { path?: string }) => item.path) ?? [];
+      assert.strictEqual(
+        activeEditPaths[0],
+        'zzz_mcp_edit_active/mcp_edit_rank.ts',
+        `expected active user edit directory to rank first, got ${JSON.stringify(activeEditPaths)}`,
+      );
+      assert.strictEqual(
+        activeEditRankedSearch.result?.structuredContent?.query_diagnostics?.ranking?.user_edit_directories_first,
+        true,
+      );
+      const productionRankedSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 106,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpRankNeedle',
+            query_kind: 'literal',
+            file_globs: ['**/*.{ts,tsx,py}'],
+            scope_preset: 'production',
+            output_mode: 'structured',
+            limit: 10,
+            max_chars: 20_000,
+          },
+        },
+      });
+      assert.strictEqual(productionRankedSearch.result?.isError, false);
+      const productionPaths = productionRankedSearch.result?.structuredContent?.results?.map((item: { path?: string }) => item.path) ?? [];
+      assert.deepStrictEqual(
+        productionPaths,
+        ['mcp_rank_source.ts'],
+        `expected production scope to exclude tests and migrations, got ${JSON.stringify(productionPaths)}`,
+      );
+      assert.strictEqual(
+        productionRankedSearch.result?.structuredContent?.query_diagnostics?.scope?.semantics?.includes_tests,
+        false,
+        `expected production scope diagnostics to explain test exclusion, got ${JSON.stringify(productionRankedSearch.result?.structuredContent?.query_diagnostics?.scope)}`,
+      );
+      const duplicateLineSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 107,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpDuplicateNeedle',
+            query_kind: 'literal',
+            include_globs: ['mcp_graph_consumer.ts'],
+            output_mode: 'structured',
+            limit: 5,
+            max_chars: 20_000,
+          },
+        },
+      });
+      assert.strictEqual(duplicateLineSearch.result?.isError, false);
+      assert.strictEqual(
+        duplicateLineSearch.result?.structuredContent?.results?.length,
+        1,
+        `expected same-line duplicate matches to consume one result slot, got ${JSON.stringify(duplicateLineSearch.result?.structuredContent?.results ?? [])}`,
+      );
+      const noMatchStarted = Date.now();
+      const noMatchSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 98,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'ZZZ_NOPE_MCP_NO_MATCH',
+            query_kind: 'literal',
+            include_globs: ['mcp_graph_*.ts'],
+            fallback_policy: 'never',
+            include_diagnostics: true,
+            timeout_ms: 500,
+            limit: 5,
+          },
+        },
+      });
+      const noMatchElapsed = Date.now() - noMatchStarted;
+      assert.strictEqual(noMatchSearch.result?.isError, false);
+      assert.strictEqual(noMatchSearch.result?.content?.[0]?.text, '0');
+      assert.strictEqual(noMatchSearch.result?.structuredContent?.result_window?.returned, 0);
+      assert.strictEqual(noMatchSearch.result?.structuredContent?.query_diagnostics?.fallback_used, false);
+      assert.match(
+        noMatchSearch.result?.structuredContent?.query_diagnostics?.fallback_skipped_reason ?? '',
+        /^(no_candidate_files|.*fallback skipped by policy=never.*)$/,
+      );
+      assert.ok(
+        noMatchElapsed < 1500,
+        `expected no-match MCP search to return before transport timeout, took ${noMatchElapsed}ms`,
       );
       const contextSearch = await postJson(url, {
         jsonrpc: '2.0',
@@ -1376,6 +1865,7 @@ suite('Call graph', () => {
             query_kind: 'literal',
             include_globs: ['mcp_graph_target.ts'],
             context_lines: 1,
+            output_mode: 'structured',
             limit: 1,
             max_chars: 20_000,
           },
@@ -1398,6 +1888,7 @@ suite('Call graph', () => {
           arguments: {
             query: 'mcpSearchCapNeedle\\d+',
             query_kind: 'auto',
+            fallback_policy: 'always',
             max_matches: 100,
             max_files: 10,
           },
@@ -1424,6 +1915,7 @@ suite('Call graph', () => {
           arguments: {
             query: 'mcpGraphTarget',
             query_kind: 'literal',
+            fallback_policy: 'always',
             max_matches: 100,
             max_files: 1,
           },
@@ -1450,6 +1942,7 @@ suite('Call graph', () => {
           arguments: {
             query: 'mcpDuplicateNeedle',
             query_kind: 'literal',
+            fallback_policy: 'always',
             max_matches: 10,
             max_files: 10,
           },
@@ -1470,6 +1963,7 @@ suite('Call graph', () => {
           arguments: {
             query: 'mcpDuplicateNeedle',
             query_kind: 'literal',
+            fallback_policy: 'always',
             by_file_limit: 1,
           },
         },
@@ -1490,6 +1984,7 @@ suite('Call graph', () => {
           arguments: {
             query: 'mcpDuplicateNeedle',
             query_kind: 'literal',
+            fallback_policy: 'always',
           },
         },
       });
@@ -1504,6 +1999,7 @@ suite('Call graph', () => {
           arguments: {
             query: 'mcpDuplicateNeedle',
             query_kind: 'literal',
+            fallback_policy: 'always',
             include_counts: true,
           },
         },
@@ -1519,6 +2015,7 @@ suite('Call graph', () => {
           arguments: {
             query: 'mcpDuplicateNeedle',
             query_kind: 'literal',
+            fallback_policy: 'always',
           },
         },
       });
@@ -1533,6 +2030,7 @@ suite('Call graph', () => {
           arguments: {
             query: 'mcpDuplicateNeedle',
             query_kind: 'literal',
+            fallback_policy: 'always',
             limit: 2,
           },
         },
@@ -1617,6 +2115,7 @@ suite('Call graph', () => {
           arguments: {
             query: 'f:mcp_graph_consumer\\.ts$ mcpGraphTarget',
             query_kind: 'zoekt',
+            output_mode: 'structured',
             limit: 10,
             max_chars: 20_000,
           },
@@ -1719,6 +2218,7 @@ suite('Call graph', () => {
           arguments: {
             query: 'mcpSearchCapNeedle',
             query_kind: 'literal',
+            output_mode: 'structured',
             limit: 200,
             max_chars: 1000,
           },
@@ -1742,8 +2242,30 @@ suite('Call graph', () => {
       );
       assert.strictEqual(
         cappedLinks.length,
-        cappedResults.length,
-        `expected capped search_code resource_links to match returned result window, got ${JSON.stringify(cappedSearch.result?.structuredContent)}`,
+        0,
+        `expected search_code resource_links to be opt-in, got ${JSON.stringify(cappedSearch.result?.structuredContent)}`,
+      );
+      const explicitLinksSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 99,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpSearchCapNeedle',
+            query_kind: 'literal',
+            output_mode: 'structured',
+            include_resource_links: true,
+            limit: 3,
+            max_chars: 20_000,
+          },
+        },
+      });
+      assert.strictEqual(explicitLinksSearch.result?.isError, false);
+      assert.strictEqual(
+        explicitLinksSearch.result?.structuredContent?.resource_links?.length,
+        explicitLinksSearch.result?.structuredContent?.results?.length,
+        `expected include_resource_links=true to emit links, got ${JSON.stringify(explicitLinksSearch.result?.structuredContent)}`,
       );
       const excludedDefaultSearch = await postJson(url, {
         jsonrpc: '2.0',
@@ -1755,6 +2277,7 @@ suite('Call graph', () => {
             query: 'mcpExcludedNeedle',
             query_kind: 'literal',
             include_globs: ['out/**/*.js'],
+            output_mode: 'structured',
             limit: 10,
           },
         },
@@ -1776,6 +2299,8 @@ suite('Call graph', () => {
             query_kind: 'literal',
             include_globs: ['out/**/*.js'],
             exclude_policy: 'custom_only',
+            output_mode: 'structured',
+            fallback_policy: 'always',
             limit: 10,
           },
         },
@@ -1806,6 +2331,7 @@ suite('Call graph', () => {
             query: 'mcpLargeGeneratedNeedle',
             query_kind: 'literal',
             include_globs: ['src/**/graphql-codegen/**'],
+            output_mode: 'structured',
             limit: 10,
           },
         },
@@ -1827,6 +2353,7 @@ suite('Call graph', () => {
             query_kind: 'literal',
             include_globs: ['src/**/graphql-codegen/**'],
             include_generated: true,
+            output_mode: 'structured',
             limit: 10,
           },
         },
@@ -1837,11 +2364,39 @@ suite('Call graph', () => {
         true,
         'expected include_generated=true to force full scan for generated files that may be outside the Zoekt index or file-size cap',
       );
+      assert.strictEqual(
+        generatedIncludedSearch.result?.structuredContent?.query_diagnostics?.fallback_policy,
+        'always',
+        'expected include_generated=true to promote the implicit fallback policy instead of returning a false zero',
+      );
       assert.ok(
         generatedIncludedSearch.result?.structuredContent?.results?.some(
           (item: { path?: string }) => item.path === 'src/client/graphql-codegen/graphql.ts',
         ),
         `expected include_generated=true to search large graphql-codegen files, got ${JSON.stringify(generatedIncludedSearch.result?.structuredContent?.results ?? [])}`,
+      );
+      const generatedBoundedSearch = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 110,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_code',
+          arguments: {
+            query: 'mcpLargeGeneratedNeedle',
+            query_kind: 'literal',
+            include_globs: ['src/**/graphql-codegen/**'],
+            include_generated: true,
+            fallback_policy: 'bounded',
+            output_mode: 'structured',
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(generatedBoundedSearch.result?.isError, true);
+      assert.strictEqual(
+        generatedBoundedSearch.result?.structuredContent?.error?.code,
+        'fallback_policy_requires_full_scan',
+        `expected include_generated=true with explicit bounded fallback to fail loudly instead of returning a false zero, got ${JSON.stringify(generatedBoundedSearch.result?.structuredContent)}`,
       );
       const generatedOrCount = await postJson(url, {
         jsonrpc: '2.0',
@@ -1861,6 +2416,7 @@ suite('Call graph', () => {
       });
       assert.strictEqual(generatedOrCount.result?.isError, false);
       assert.strictEqual(generatedOrCount.result?.structuredContent?.query_diagnostics?.query_operator, 'any');
+      assert.strictEqual(generatedOrCount.result?.structuredContent?.query_diagnostics?.fallback_policy, 'always');
       assert.strictEqual(
         generatedOrCount.result?.structuredContent?.count?.total_matches,
         2,
@@ -1877,6 +2433,7 @@ suite('Call graph', () => {
             query_kind: 'literal',
             include_globs: ['mcp_graph_consumer.ts'],
             exclude_policy: 'custom_only',
+            output_mode: 'structured',
             limit: 10,
           },
         },
@@ -1908,10 +2465,69 @@ suite('Call graph', () => {
         health.result?.structuredContent?.discovery?.stdio_launcher?.args,
         ['.codeidx/codeidx-mcp-stdio.js', 'stdio', '--workspace', '.'],
       );
-      assert.ok(
-        health.result?.structuredContent?.tools?.includes('mcp_test'),
-        'expected health check to include mcp_test when include_tools=true',
+      assert.strictEqual(
+        health.result?.structuredContent?.agent_policy?.role,
+        'agent_search_layer_not_rg_replacement',
       );
+      assert.strictEqual(
+        health.result?.structuredContent?.agent_policy?.default_behavior?.auto_use_mcp,
+        true,
+      );
+      assert.ok(
+        health.result?.structuredContent?.agent_policy?.default_behavior?.overridden_by?.includes('AGENTS.md'),
+        `expected agent policy to document project-policy override, got ${JSON.stringify(health.result?.structuredContent?.agent_policy)}`,
+      );
+      assert.ok(
+        health.result?.structuredContent?.agent_policy?.token_first_flow?.some((step: string) => step.includes('codeidx_probe')),
+        `expected agent policy to recommend probe-first flow, got ${JSON.stringify(health.result?.structuredContent?.agent_policy)}`,
+      );
+      assert.strictEqual(
+        health.result?.structuredContent?.agent_policy?.default_arguments?.codeidx_search_code?.output_mode,
+        'minimal',
+      );
+      assert.ok(
+        health.result?.structuredContent?.agent_policy?.fallback_rules?.some((rule: string) => rule.includes('Use rg')),
+        `expected agent policy to keep rg fallback guidance, got ${JSON.stringify(health.result?.structuredContent?.agent_policy)}`,
+      );
+      assert.ok(
+        !health.result?.structuredContent?.tools?.includes('mcp_test'),
+        'expected health check to omit mcp_test when include_tools=true',
+      );
+      assert.ok(
+        !health.result?.structuredContent?.tools?.includes('codeidx_refresh_index'),
+        'expected health check to omit index refresh/rebuild tools when include_tools=true',
+      );
+      assert.ok(
+        health.result?.structuredContent?.tools?.includes('codeidx_symbol_slice'),
+        'expected health check to include codeidx_symbol_slice when include_tools=true',
+      );
+      assert.ok(
+        health.result?.structuredContent?.tools?.includes('codeidx_find_references'),
+        'expected health check to include codeidx_find_references when include_tools=true',
+      );
+      const discoveryPath = health.result?.structuredContent?.discovery?.path;
+      assert.strictEqual(typeof discoveryPath, 'string');
+      await vscode.workspace.fs.writeFile(vscode.Uri.file(discoveryPath), Buffer.from(JSON.stringify({
+        schema_version: 'codeidx.mcp/0.1',
+        server: 'codeidx-mcp',
+        transport: 'http',
+        url: 'http://127.0.0.1:1/mcp',
+        workspace_id: 'stale_test',
+        pid: 999_999_999,
+        started_at: new Date(0).toISOString(),
+      }, null, 2) + '\n', 'utf8'));
+      const repairedHealth = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 111,
+        method: 'tools/call',
+        params: {
+          name: 'mcp_health',
+          arguments: { include_tools: true },
+        },
+      });
+      assert.strictEqual(repairedHealth.result?.isError, false);
+      assert.strictEqual(repairedHealth.result?.structuredContent?.discovery?.matches_current_endpoint, true);
+      assert.strictEqual(repairedHealth.result?.structuredContent?.discovery?.repaired_stale_discovery, true);
       const parallelHealth = await Promise.all(Array.from({ length: 12 }, (_, index) => postJson(url, {
         jsonrpc: '2.0',
         id: 70 + index,
@@ -1925,7 +2541,7 @@ suite('Call graph', () => {
         parallelHealth.every((item) => item.result?.structuredContent?.health?.mcp_connection === 'ok'),
         `expected parallel MCP health calls to stay stable, got ${JSON.stringify(parallelHealth.map((item) => item.error ?? item.result?.structuredContent?.health))}`,
       );
-      const mcpTest = await postJson(url, {
+      const rejectedMcpTest = await postJson(url, {
         jsonrpc: '2.0',
         id: 14,
         method: 'tools/call',
@@ -1934,35 +2550,11 @@ suite('Call graph', () => {
           arguments: {
             query: '한국어 지원',
             query_kind: 'literal',
-            limit: 5,
           },
         },
       });
-      assert.strictEqual(mcpTest.result?.isError, false);
-      assert.strictEqual(mcpTest.result?.structuredContent?.test?.accuracy?.missing_from_mcp?.length, 0);
-      assert.ok(
-        typeof mcpTest.result?.structuredContent?.test?.efficiency?.estimated_mcp_tokens === 'number',
-        'expected mcp_test to report token estimates',
-      );
-      const parallelMcpTests = await Promise.all(Array.from({ length: 4 }, (_, index) => postJson(url, {
-        jsonrpc: '2.0',
-        id: 90 + index,
-        method: 'tools/call',
-        params: {
-          name: 'mcp_test',
-          arguments: {
-            query: index % 2 === 0 ? 'mcpGraphTarget' : 'mcpGraphBox',
-            query_kind: 'literal',
-            include_globs: ['mcp_graph_*.ts'],
-            limit: 10,
-            max_chars: 40_000,
-          },
-        },
-      })));
-      assert.ok(
-        parallelMcpTests.every((item) => item.result?.isError === false),
-        `expected parallel mcp_test calls to be queued and complete, got ${JSON.stringify(parallelMcpTests.map((item) => item.error ?? item.result?.structuredContent?.error))}`,
-      );
+      assert.strictEqual(rejectedMcpTest.result?.isError, true);
+      assert.strictEqual(rejectedMcpTest.result?.structuredContent?.error?.code, 'unknown_tool');
       const postParallelHealth = await postJson(url, {
         jsonrpc: '2.0',
         id: 94,
@@ -1973,26 +2565,6 @@ suite('Call graph', () => {
         },
       });
       assert.strictEqual(postParallelHealth.result?.structuredContent?.health?.mcp_connection, 'ok');
-      const mcpBroadRecallTest = await postJson(url, {
-        jsonrpc: '2.0',
-        id: 26,
-        method: 'tools/call',
-        params: {
-          name: 'mcp_test',
-          arguments: {
-            query: 'buildCallGraph',
-            query_kind: 'literal',
-            limit: 100,
-            max_chars: 100000,
-          },
-        },
-      });
-      assert.strictEqual(mcpBroadRecallTest.result?.isError, false);
-      assert.strictEqual(
-        mcpBroadRecallTest.result?.structuredContent?.test?.accuracy?.missing_from_mcp?.length,
-        0,
-        `expected broad mcp_test search to preserve recall, got ${JSON.stringify(mcpBroadRecallTest.result?.structuredContent?.test?.accuracy ?? {})}`,
-      );
       const exactSymbolMiss = await postJson(url, {
         jsonrpc: '2.0',
         id: 62,
@@ -2011,6 +2583,49 @@ suite('Call graph', () => {
         exactSymbolMiss.result?.structuredContent?.results?.length,
         0,
         `expected exact symbol search to reject prefix/substring matches, got ${JSON.stringify(exactSymbolMiss.result?.structuredContent?.results ?? [])}`,
+      );
+      const deletedSymbolBefore = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 120,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_symbols',
+          arguments: {
+            query: 'McpDeletedSymbolFreshness',
+            match: 'exact',
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(deletedSymbolBefore.result?.isError, false);
+      assert.strictEqual(
+        deletedSymbolBefore.result?.structuredContent?.results?.length,
+        1,
+        `expected deleted-symbol fixture to be indexed before deletion, got ${JSON.stringify(deletedSymbolBefore.result?.structuredContent)}`,
+      );
+      await vscode.workspace.fs.delete(mcpDeletedSymbol);
+      const deletedSymbolAfter = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 121,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_search_symbols',
+          arguments: {
+            query: 'McpDeletedSymbolFreshness',
+            match: 'exact',
+            limit: 10,
+          },
+        },
+      });
+      assert.strictEqual(deletedSymbolAfter.result?.isError, false);
+      assert.strictEqual(
+        deletedSymbolAfter.result?.structuredContent?.results?.length,
+        0,
+        `expected search_symbols to hide stale symbols from deleted files, got ${JSON.stringify(deletedSymbolAfter.result?.structuredContent)}`,
+      );
+      assert.ok(
+        (deletedSymbolAfter.result?.structuredContent?.warnings ?? []).some((warning: string) => /stale symbol/.test(warning)),
+        `expected stale symbol warning after deletion, got ${JSON.stringify(deletedSymbolAfter.result?.structuredContent?.warnings ?? [])}`,
       );
       const symbolSearch = await postJson(url, {
         jsonrpc: '2.0',
@@ -2140,6 +2755,26 @@ suite('Call graph', () => {
             entry.label === 'mcpGraphTarget' && entry.reason === 'seed symbol',
         ),
         `expected get_context_bundle to resolve external seed symbol ids, got ${JSON.stringify(seededContextBundle.result?.structuredContent?.entry_points ?? [])}`,
+      );
+      assert.ok(
+        seededContextBundle.result?.structuredContent?.snippets?.some(
+          (snippet: { reason?: string; text?: string }) =>
+            snippet.reason === 'seed_symbol_body' && snippet.text?.includes('return 1;'),
+        ),
+        `expected get_context_bundle to include full seed symbol body, got ${JSON.stringify(seededContextBundle.result?.structuredContent?.snippets ?? [])}`,
+      );
+      assert.ok(
+        seededContextBundle.result?.structuredContent?.tests?.some(
+          (snippet: { path?: string; text?: string }) =>
+            snippet.path === 'mcp_graph_target.test.ts' && snippet.text?.includes('mcpGraphTarget returns stable value'),
+        ),
+        `expected get_context_bundle to include path/content-affinity tests, got ${JSON.stringify(seededContextBundle.result?.structuredContent?.tests ?? [])}`,
+      );
+      assert.ok(
+        seededContextBundle.result?.structuredContent?.selection_trace?.some(
+          (entry: { reason?: string }) => entry.reason === 'seed_symbol_body',
+        ),
+        `expected get_context_bundle selection_trace to explain seed body selection, got ${JSON.stringify(seededContextBundle.result?.structuredContent?.selection_trace ?? [])}`,
       );
       const symbolSlice = await postJson(url, {
         jsonrpc: '2.0',
@@ -2308,6 +2943,61 @@ suite('Call graph', () => {
           referenceLocations.includes('mcp_graph_consumer.ts:5'),
         `expected MCP references to include imported callback fixture call sites, got ${referenceLocations.join(', ')}`,
       );
+      assert.strictEqual(
+        references.result?.structuredContent?.scope?.semantics?.includes_tests,
+        true,
+        `expected source scope diagnostics to explain that source includes tests, got ${JSON.stringify(references.result?.structuredContent?.scope)}`,
+      );
+      const productionReferences = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 113,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_find_references',
+          arguments: {
+            symbol_id: quickPickSymbol.symbol_id,
+            scope_preset: 'production',
+            limit: 20,
+          },
+        },
+      });
+      assert.strictEqual(productionReferences.result?.isError, false);
+      const productionReferenceFiles = productionReferences.result?.structuredContent?.groups
+        ?.flatMap((group: { references?: Array<{ location?: { file?: string } }> }) => group.references ?? [])
+        .map((item: { location?: { file?: string } }) => item.location?.file)
+        .filter(Boolean) ?? [];
+      assert.ok(
+        productionReferenceFiles.every((file: string) => !file.endsWith('.test.ts') && !file.includes('/tests/')),
+        `expected production references to exclude test files, got ${productionReferenceFiles.join(', ')}`,
+      );
+      assert.strictEqual(
+        productionReferences.result?.structuredContent?.scope?.semantics?.includes_tests,
+        false,
+        `expected production reference scope diagnostics to explain test exclusion, got ${JSON.stringify(productionReferences.result?.structuredContent?.scope)}`,
+      );
+      const testReferences = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 114,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_find_references',
+          arguments: {
+            symbol_id: quickPickSymbol.symbol_id,
+            scope_preset: 'tests',
+            limit: 20,
+          },
+        },
+      });
+      assert.strictEqual(testReferences.result?.isError, false);
+      const testReferenceFiles = testReferences.result?.structuredContent?.groups
+        ?.flatMap((group: { references?: Array<{ location?: { file?: string } }> }) => group.references ?? [])
+        .map((item: { location?: { file?: string } }) => item.location?.file)
+        .filter(Boolean) ?? [];
+      assert.ok(testReferenceFiles.length > 0, `expected tests scope to return test references, got ${JSON.stringify(testReferences.result?.structuredContent)}`);
+      assert.ok(
+        testReferenceFiles.every((file: string) => file.endsWith('.test.ts') || file.includes('/tests/')),
+        `expected tests scope references to include only test files, got ${testReferenceFiles.join(', ')}`,
+      );
       const constructOnlyReferences = await postJson(url, {
         jsonrpc: '2.0',
         id: 34,
@@ -2468,7 +3158,12 @@ suite('Call graph', () => {
         listedResources.result?.resources?.some((resource: { uri?: string }) => resource.uri?.includes('/overview')),
         'expected workspace overview resource',
       );
+      assert.ok(
+        listedResources.result?.resources?.some((resource: { uri?: string }) => resource.uri?.includes('/agent-policy')),
+        'expected agent policy resource',
+      );
       const overviewResource = listedResources.result.resources.find((resource: { uri?: string }) => resource.uri?.includes('/overview'));
+      const agentPolicyResource = listedResources.result.resources.find((resource: { uri?: string }) => resource.uri?.includes('/agent-policy'));
       const readOverview = await postJson(url, {
         jsonrpc: '2.0',
         id: 10,
@@ -2478,6 +3173,16 @@ suite('Call graph', () => {
       assert.ok(
         readOverview.result?.contents?.[0]?.text?.includes('"schema_version"'),
         'expected resources/read to return JSON text content',
+      );
+      const readAgentPolicy = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 18,
+        method: 'resources/read',
+        params: { uri: agentPolicyResource.uri },
+      });
+      assert.ok(
+        readAgentPolicy.result?.contents?.[0]?.text?.includes('"auto_use_mcp":true'),
+        `expected agent policy resource to expose auto_use_mcp, got ${readAgentPolicy.result?.contents?.[0]?.text}`,
       );
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
       assert.ok(workspaceRoot, 'expected test workspace root');
@@ -2515,8 +3220,21 @@ suite('Call graph', () => {
     } finally {
       api.mcpServer.stop();
       try { await vscode.workspace.fs.delete(mcpTarget); } catch {}
+      try { await vscode.workspace.fs.delete(mcpTargetTest); } catch {}
       try { await vscode.workspace.fs.delete(mcpConsumer); } catch {}
+      try { await vscode.workspace.fs.delete(mcpRankSource); } catch {}
+      try { await vscode.workspace.fs.delete(mcpRankTest); } catch {}
+      try { await vscode.workspace.fs.delete(mcpMigration); } catch {}
+      try { await vscode.workspace.fs.delete(mcpMigrationDir); } catch {}
+      try { await vscode.workspace.fs.delete(mcpLibraryRank); } catch {}
+      try { await vscode.workspace.fs.delete(mcpLibraryDir); } catch {}
+      try { await vscode.workspace.fs.delete(mcpEditOther); } catch {}
+      try { await vscode.workspace.fs.delete(mcpEditOtherDir); } catch {}
+      try { await vscode.workspace.fs.delete(mcpEditActive); } catch {}
+      try { await vscode.workspace.fs.delete(mcpEditActiveDir); } catch {}
       try { await vscode.workspace.fs.delete(mcpLate); } catch {}
+      try { await vscode.workspace.fs.delete(mcpFreshOverlay); } catch {}
+      try { await vscode.workspace.fs.delete(mcpDeletedSymbol); } catch {}
       try { await vscode.workspace.fs.delete(mcpPythonModel); } catch {}
       try { await vscode.workspace.fs.delete(mcpExcluded); } catch {}
       try { await vscode.workspace.fs.delete(mcpGeneratedDir, { recursive: true, useTrash: false }); } catch {}

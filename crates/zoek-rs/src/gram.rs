@@ -350,13 +350,39 @@ pub(crate) fn append_url_literal_hashes<S: BuildHasher>(
 
 pub(crate) fn append_selective_token_hashes<S: BuildHasher>(
     text: &str,
+    prioritize_non_ascii: bool,
     seen: &mut HashSet<u64, S>,
     out: &mut Vec<u64>,
     max_new_grams: usize,
     max_total_grams: usize,
 ) -> bool {
     let mut emitted = 0usize;
+    if prioritize_non_ascii {
+        // Preserve short localized literals in token-heavy generated files
+        // before ASCII identifiers consume the per-segment overflow budget.
+        for token in tokenize(text) {
+            if token.is_ascii() || token.chars().count() < 2 {
+                continue;
+            }
+            for hash in selective_hashes_for_token(token, 3) {
+                if !seen.insert(hash) {
+                    continue;
+                }
+                if out.len() >= max_total_grams {
+                    return true;
+                }
+                out.push(hash);
+                emitted += 1;
+                if emitted >= max_new_grams {
+                    return false;
+                }
+            }
+        }
+    }
     for token in tokenize(text) {
+        if prioritize_non_ascii && !token.is_ascii() && token.chars().count() >= 2 {
+            continue;
+        }
         if !is_selective_overflow_token(token) {
             continue;
         }
@@ -379,7 +405,10 @@ pub(crate) fn append_selective_token_hashes<S: BuildHasher>(
 
 fn is_selective_overflow_token(token: &str) -> bool {
     let char_len = token.chars().count();
-    char_len >= 8
+    // Short CJK/Korean terms are often meaningful whole search literals.
+    // Keep them eligible in overflow files; the per-segment cap bounds cost.
+    (!token.is_ascii() && char_len >= 2)
+        || char_len >= 8
         || (char_len >= 5
             && token
                 .bytes()

@@ -33,6 +33,17 @@ type SearchReadiness = {
   reason?: string;
 };
 
+export type ZoektFreshnessStatus = {
+  dirty_open_files: number;
+  pending_changed_files: number;
+  pending_deleted_files: number;
+  pending_renames: number;
+  update_in_flight: boolean;
+  update_scheduled: boolean;
+  updates_paused: boolean;
+  last_update_finished_at: string | null;
+};
+
 type QueuedRename = {
   oldRelPath: string;
   newRelPath: string;
@@ -57,7 +68,7 @@ const AUTO_BASE_REFRESH_MIN_INTERVAL_MS = 60_000;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
 const ZOEKT_PROGRESS_PREFIX = '__ZOEK_PROGRESS__';
 const ZOEKT_SEARCH_EVENT_PREFIX = '__ZOEK_SEARCH__';
-const ZOEKT_SCHEMA_VERSION = 17;
+const ZOEKT_SCHEMA_VERSION = 19;
 const ZOEKT_UPDATE_IGNORED_DIR_NAMES = new Set([
   '.zoek-rs',
   '.zoekt-rs',
@@ -174,6 +185,11 @@ export class ZoektRuntime implements vscode.Disposable {
     }
     this.disposables.push(
       ...(this.watcher ? [this.watcher] : []),
+      vscode.workspace.onDidCreateFiles((event) => {
+        for (const uri of event.files) {
+          this.queueChanged(uri, 'create');
+        }
+      }),
       vscode.workspace.onDidSaveTextDocument((document) => {
         this.queueSavedDocument(document);
       }),
@@ -360,6 +376,23 @@ export class ZoektRuntime implements vscode.Disposable {
     return { ready: false, reason: 'zoek-rs index incomplete; run Rebuild Search Index to build it' };
   }
 
+  getFreshnessStatus(): ZoektFreshnessStatus {
+    return {
+      dirty_open_files: vscode.workspace.textDocuments
+        .filter((document) => document.uri.scheme === 'file' && document.isDirty)
+        .length,
+      pending_changed_files: this.pendingChanged.size,
+      pending_deleted_files: this.pendingDeleted.size,
+      pending_renames: this.pendingRenames.length,
+      update_in_flight: this.updateInFlight,
+      update_scheduled: !!this.flushTimer,
+      updates_paused: this.updatePauseDepth > 0,
+      last_update_finished_at: this.lastUpdateFinishedAt > 0
+        ? new Date(this.lastUpdateFinishedAt).toISOString()
+        : null,
+    };
+  }
+
   async runSearch(
     options: SearchOptions,
     token: vscode.CancellationToken,
@@ -390,6 +423,7 @@ export class ZoektRuntime implements vscode.Disposable {
     if (this.hasPendingUpdates()) {
       await this.flushPendingUpdates();
     }
+    await this.drainPendingUpdatesBeforeSearch(token);
     try {
       const limit = getRequestedResultLimit(options);
       const offset = getRequestedResultOffset(options);
@@ -942,6 +976,22 @@ export class ZoektRuntime implements vscode.Disposable {
       this.flushTimer = undefined;
       void this.flushPendingUpdates();
     }, delayMs);
+  }
+
+  private async drainPendingUpdatesBeforeSearch(token: vscode.CancellationToken): Promise<void> {
+    if (token.isCancellationRequested || this.disposed) { return; }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (token.isCancellationRequested || this.disposed) { return; }
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = undefined;
+    }
+    if (this.hasPendingUpdates()) {
+      await this.flushPendingUpdates();
+    }
+    if (this.updateInFlight) {
+      try { await this.updatePromise; } catch {}
+    }
   }
 
   private async flushPendingUpdates(): Promise<void> {

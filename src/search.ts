@@ -14,6 +14,7 @@ export interface SearchOptions {
   excludePatterns?: string[];
   pathRegex?: string;
   forceFullScan?: boolean;
+  fallbackPolicy?: 'never' | 'bounded' | 'always';
   ignoreConfiguredExcludes?: boolean;
   maxFileSizeBytes?: number;
   resultOffset?: number;

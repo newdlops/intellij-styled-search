@@ -33,6 +33,18 @@ suite('Path scope matcher', () => {
     assert.deepStrictEqual(toRipgrepGlobs(['nested']), ['**/nested', '**/nested/**']);
   });
 
+  test('ripgrep globs expand simple brace alternation', () => {
+    assert.deepStrictEqual(
+      toRipgrepGlobs(['zuzu/client/src/**/*.{ts,tsx}']),
+      ['zuzu/client/src/**/*.ts', 'zuzu/client/src/**/*.tsx'],
+    );
+    const matcher = compilePathScopeMatcher(['zuzu/client/src/**/*.{ts,tsx}'], []);
+    assert.ok(matcher, 'matcher should be created');
+    assert.strictEqual(matcher!('zuzu/client/src/app/query.ts'), true);
+    assert.strictEqual(matcher!('zuzu/client/src/app/query.tsx'), true);
+    assert.strictEqual(matcher!('zuzu/client/src/app/query.js'), false);
+  });
+
   test('parses scope whitelist and blacklist patterns', () => {
     assert.deepStrictEqual(
       parsePathScopePatternInput('src/**, !src/**/*.test.ts\n-docs/'),

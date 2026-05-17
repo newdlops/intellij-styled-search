@@ -835,6 +835,84 @@ suite('Activation', () => {
     }
   });
 
+  test('zoekt search drains queued file updates before querying the index', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+
+    const originalGetSearchReadiness = runtime.getSearchReadiness.bind(runtime);
+    const originalResolveBinary = runtime.resolveBinary.bind(runtime);
+    const originalHasReadyIndex = runtime.hasReadyIndex.bind(runtime);
+    const originalSyncWorkspaceIndexIfNeeded = runtime.syncWorkspaceIndexIfNeeded.bind(runtime);
+    const originalInvokeJson = runtime.invokeJson.bind(runtime);
+    const invoked: string[][] = [];
+
+    runtime.pendingChanged.add('docs.md');
+    runtime.getSearchReadiness = async () => ({ ready: true });
+    runtime.resolveBinary = async () => '/tmp/zoek-rs';
+    runtime.hasReadyIndex = async () => true;
+    runtime.syncWorkspaceIndexIfNeeded = async () => {};
+    runtime.invokeJson = async (args: string[]) => {
+      invoked.push(args);
+      if (args[1] === 'update') {
+        return {
+          type: 'update',
+          ok: true,
+          generation: 10,
+          entriesWritten: 1,
+          liveEntries: 1,
+          tombstones: 0,
+          overlayTotalEntries: 1,
+          latestVisibleEntries: 1,
+          journalBytes: 128,
+          compactionSuggested: false,
+          warnings: [],
+        };
+      }
+      return {
+        type: 'search',
+        ok: true,
+        engine: { name: 'zoek-rs', protocolVersion: 2, schemaVersion: 3 },
+        queryMode: 'literal',
+        totalFilesScanned: 0,
+        totalFilesMatched: 0,
+        totalMatches: 0,
+        truncated: false,
+        warnings: [],
+        files: [],
+      };
+    };
+
+    try {
+      const cts = new vscode.CancellationTokenSource();
+      const result = await runtime.runSearch({
+        query: 'FreshnessDrainNeedle',
+        caseSensitive: true,
+        wholeWord: false,
+        useRegex: false,
+      }, cts.token, {
+        onFile: () => {},
+        onDone: () => {},
+        onError: (err: Error) => { throw err; },
+      });
+      cts.dispose();
+      assert.strictEqual(result.ready, true);
+      assert.deepStrictEqual(invoked[0], ['/tmp/zoek-rs', 'update', workspaceRoot, 'docs.md']);
+      assert.strictEqual(invoked[1]?.[1], 'search');
+      assert.strictEqual(runtime.pendingChanged.size, 0);
+    } finally {
+      runtime.pendingChanged.clear();
+      runtime.pendingDeleted.clear();
+      runtime.pendingRenames = [];
+      runtime.getSearchReadiness = originalGetSearchReadiness;
+      runtime.resolveBinary = originalResolveBinary;
+      runtime.hasReadyIndex = originalHasReadyIndex;
+      runtime.syncWorkspaceIndexIfNeeded = originalSyncWorkspaceIndexIfNeeded;
+      runtime.invokeJson = originalInvokeJson;
+    }
+  });
+
   test('zoekt search starts within budget when workspace sync is slow', async () => {
     const { overlay } = await getApi();
     const runtime = (overlay as any).zoektRuntime as any;

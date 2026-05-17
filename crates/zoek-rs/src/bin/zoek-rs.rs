@@ -66,7 +66,7 @@ fn run(args: Vec<String>) -> Result<EngineResponse, String> {
 
 fn run_index(args: &[String]) -> Result<EngineResponse, String> {
     let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
-    let mut config = EngineConfig::default();
+    let mut config = EngineConfig::for_workspace(&workspace_root);
     let mut request = IndexRequest {
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         index_dir: None,
@@ -120,7 +120,7 @@ fn run_index(args: &[String]) -> Result<EngineResponse, String> {
 
 fn run_compact(args: &[String]) -> Result<EngineResponse, String> {
     let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
-    let config = EngineConfig::default();
+    let config = EngineConfig::for_workspace(&workspace_root);
     let artifacts = index_directory_with_progress(&workspace_root, &config, &mut |progress| {
         eprintln!("{}", progress.to_stderr_line());
     })
@@ -150,7 +150,7 @@ fn run_compact(args: &[String]) -> Result<EngineResponse, String> {
 fn run_update(args: &[String]) -> Result<EngineResponse, String> {
     let started = Instant::now();
     let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
-    let config = EngineConfig::default();
+    let config = EngineConfig::for_workspace(&workspace_root);
     let layout = StoreLayout::for_workspace(&workspace_root, &config);
     let current_generation = load_overlay_with_recovery(&layout)
         .map(|result| result.manifest.generation)
@@ -701,7 +701,7 @@ fn run_graph_rebuild(args: &[String]) -> Result<EngineResponse, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_millis() as u64)
         .unwrap_or(0);
-    let mut config = EngineConfig::default();
+    let mut config = EngineConfig::for_workspace(&workspace_root);
     let mut worker_count = 64usize;
     let mut idx = 1usize;
     while idx < args.len() {
@@ -768,7 +768,7 @@ fn run_graph_rebuild(args: &[String]) -> Result<EngineResponse, String> {
 
 fn run_graph_update(args: &[String]) -> Result<EngineResponse, String> {
     let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
-    let mut config = EngineConfig::default();
+    let mut config = EngineConfig::for_workspace(&workspace_root);
     let mut built_at_unix_ms = 0u64;
     let mut max_file_size: Option<u64> = None;
     let mut workers = 0usize;

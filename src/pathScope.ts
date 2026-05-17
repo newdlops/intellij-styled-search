@@ -85,6 +85,16 @@ function expandPattern(rawPattern: string): string[] {
   if (!pattern) { return []; }
 
   const out = new Set<string>();
+  for (const expandedBrace of expandBracePattern(pattern)) {
+    for (const expandedPattern of expandSinglePattern(expandedBrace)) {
+      out.add(expandedPattern);
+    }
+  }
+  return Array.from(out);
+}
+
+function expandSinglePattern(pattern: string): string[] {
+  const out = new Set<string>();
   const dirPattern = pattern.endsWith('/');
   const base = dirPattern ? pattern.slice(0, -1) : pattern;
   const withAnyDepth = base.includes('/') ? base : '**/' + base;
@@ -103,6 +113,22 @@ function expandPattern(rawPattern: string): string[] {
 
   out.add(base.includes('/') ? base : '**/' + base);
   return Array.from(out);
+}
+
+function expandBracePattern(pattern: string): string[] {
+  const match = pattern.match(/\{([^{}]+)\}/);
+  if (!match || match.index === undefined) { return [pattern]; }
+  const parts = match[1].split(',').map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 0) { return [pattern]; }
+  const before = pattern.slice(0, match.index);
+  const after = pattern.slice(match.index + match[0].length);
+  const out: string[] = [];
+  for (const part of parts) {
+    for (const expanded of expandBracePattern(`${before}${part}${after}`)) {
+      out.push(expanded);
+    }
+  }
+  return out;
 }
 
 export function parseIncludePatternInput(input: string | readonly string[] | undefined | null): string[] {

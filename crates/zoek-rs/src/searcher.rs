@@ -20,6 +20,7 @@ struct CandidateDocument {
     rel_path: String,
     absolute_path: PathBuf,
     rank: u16,
+    order: usize,
 }
 
 const COMPLETE_CANDIDATE_RANK_BONUS: u16 = 1_000;
@@ -103,6 +104,7 @@ where
         right
             .rank
             .cmp(&left.rank)
+            .then_with(|| left.order.cmp(&right.order))
             .then_with(|| left.rel_path.cmp(&right.rel_path))
     });
 
@@ -172,82 +174,78 @@ where
         }
     }
 
-    if let Some(fallback_request) =
-        literal_fallback_request_for_missing_terms(request, &plan, &matched_terms)
-    {
-        let latest_overlay = load_overlay_with_recovery(&layout)
-            .map(|result| result.manifest.latest_entries())
-            .unwrap_or_default();
-        let fallback = fallback_candidates(workspace_root, &fallback_request, &mut warnings)
-            .map_err(|err| err.to_string())?;
-        for (rel_path, candidate) in fallback {
-            if candidates.contains_key(&rel_path) {
-                continue;
-            }
-            if latest_overlay
-                .get(&rel_path)
-                .map(|entry| entry.tombstone)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            if let Some(regex) = &path_regex {
-                if !regex.is_match(&candidate.rel_path) {
+    if !candidates.is_empty() && matched_terms.iter().any(|matched| *matched) {
+        if let Some(fallback_request) =
+            literal_fallback_request_for_missing_terms(request, &plan, &matched_terms)
+        {
+            let latest_overlay = load_overlay_with_recovery(&layout)
+                .map(|result| result.manifest.latest_entries())
+                .unwrap_or_default();
+            let fallback = fallback_candidates(workspace_root, &fallback_request, &mut warnings)
+                .map_err(|err| err.to_string())?;
+            for (rel_path, candidate) in fallback {
+                if candidates.contains_key(&rel_path) {
                     continue;
                 }
-            }
-            if total_matches >= target_matches {
-                stopped_early = true;
-                break;
-            }
-            total_files_scanned += 1;
-            let Some(current) = load_current_text(&candidate.absolute_path, config)
-                .map_err(|err| err.to_string())?
-            else {
-                continue;
-            };
-            let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
-            let (matches, term_coverage) = verify_plan_terms_with_coverage(
-                &current.text,
-                &plan,
-                request,
-                remaining_match_budget,
-            )
-            .map_err(|err| err.to_string())?;
-            if matches.is_empty() {
-                continue;
-            }
-            merge_term_coverage(&mut matched_terms, &term_coverage);
-            let file_match_start = total_matches;
-            total_matches += matches.len();
-            let score = score_file(&candidate.rel_path, &matches);
-            let file_result = build_file_result(
-                candidate.rel_path.clone(),
-                current.byte_len,
-                current.modified_unix_secs,
-                score,
-                matches,
-            );
-            if stream_files {
-                if let Some(paged_file) = page_file_by_global_match_offset(
-                    &file_result,
-                    file_match_start,
-                    request.offset,
-                    request.limit,
-                ) {
-                    on_file(&paged_file)?;
+                if latest_overlay
+                    .get(&rel_path)
+                    .map(|entry| entry.tombstone)
+                    .unwrap_or(false)
+                {
+                    continue;
                 }
+                if let Some(regex) = &path_regex {
+                    if !regex.is_match(&candidate.rel_path) {
+                        continue;
+                    }
+                }
+                if total_matches >= target_matches {
+                    stopped_early = true;
+                    break;
+                }
+                total_files_scanned += 1;
+                let Some(current) = load_current_text(&candidate.absolute_path, config)
+                    .map_err(|err| err.to_string())?
+                else {
+                    continue;
+                };
+                let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
+                let (matches, term_coverage) = verify_plan_terms_with_coverage(
+                    &current.text,
+                    &plan,
+                    request,
+                    remaining_match_budget,
+                )
+                .map_err(|err| err.to_string())?;
+                if matches.is_empty() {
+                    continue;
+                }
+                merge_term_coverage(&mut matched_terms, &term_coverage);
+                let file_match_start = total_matches;
+                total_matches += matches.len();
+                let score = score_file(&candidate.rel_path, &matches);
+                let file_result = build_file_result(
+                    candidate.rel_path.clone(),
+                    current.byte_len,
+                    current.modified_unix_secs,
+                    score,
+                    matches,
+                );
+                if stream_files {
+                    if let Some(paged_file) = page_file_by_global_match_offset(
+                        &file_result,
+                        file_match_start,
+                        request.offset,
+                        request.limit,
+                    ) {
+                        on_file(&paged_file)?;
+                    }
+                }
+                verified_files.push(file_result);
             }
-            verified_files.push(file_result);
         }
     }
 
-    verified_files.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.rel_path.cmp(&right.rel_path))
-    });
     let total_files_matched = verified_files.len();
     let files = page_files_by_match_offset(&verified_files, request.offset, request.limit);
     let paged_matches = files.iter().map(|file| file.matches.len()).sum::<usize>();
@@ -372,6 +370,7 @@ fn collect_index_candidates(
         .map_err(|err| err.to_string())?;
 
     let mut candidates = BTreeMap::new();
+    let mut shard_order_base = 0usize;
     for shard_path in shard_paths {
         let reader = ShardReader::open(&shard_path).map_err(|err| err.to_string())?;
         let docs = reader.documents().map_err(|err| err.to_string())?;
@@ -395,9 +394,11 @@ fn collect_index_candidates(
                     rel_path: doc.rel_path.clone(),
                     absolute_path: workspace_root.join(&doc.rel_path),
                     rank,
+                    order: shard_order_base.saturating_add(doc.doc_id as usize),
                 },
             );
         }
+        shard_order_base = shard_order_base.saturating_add(docs.len());
     }
 
     for overlay_entry in latest_overlay.values() {
@@ -422,6 +423,7 @@ fn collect_index_candidates(
                 rel_path: overlay_entry.rel_path.clone(),
                 absolute_path: workspace_root.join(&overlay_entry.rel_path),
                 rank: u16::MAX,
+                order: 0,
             },
         );
     }
@@ -764,6 +766,7 @@ fn fallback_candidates(
                 rel_path,
                 absolute_path,
                 rank: 0,
+                order: 0,
             },
         )]));
     }
@@ -787,13 +790,15 @@ fn fallback_candidates(
                 .map(|regex| regex.is_match(&entry.rel_path))
                 .unwrap_or(true)
         })
-        .map(|entry| {
+        .enumerate()
+        .map(|(order, entry)| {
             (
                 entry.rel_path.clone(),
                 CandidateDocument {
                     rel_path: entry.rel_path,
                     absolute_path: entry.abs_path,
                     rank: 0,
+                    order,
                 },
             )
         })
@@ -859,7 +864,7 @@ fn rg_literal_fallback_candidates(
         .transpose()
         .map_err(std::io::Error::other)?;
     let mut out = BTreeMap::new();
-    for line in stdout.lines() {
+    for (order, line) in stdout.lines().enumerate() {
         let rel_path = line
             .trim()
             .strip_prefix("./")
@@ -883,6 +888,7 @@ fn rg_literal_fallback_candidates(
                 absolute_path: workspace_root.join(&rel_path),
                 rel_path,
                 rank: 0,
+                order,
             },
         );
     }
@@ -1057,6 +1063,47 @@ mod tests {
         assert!(
             rel_paths.contains(&"src/b.txt"),
             "missing query_terms must trigger a literal fallback even when the primary query matched"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn no_match_literal_with_no_index_candidates_does_not_fallback_scan() -> io::Result<()> {
+        let root = temp_dir("searcher-no-match-no-fallback");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/target.txt"), "alpha beta gamma\n")?;
+        index_directory(&root, &EngineConfig::default())?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "ZZZ_NOPE".to_string(),
+                query_terms: Vec::new(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec!["src/*".to_string()],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &EngineConfig::default(),
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(response.total_files_scanned, 0);
+        assert_eq!(response.total_files_matched, 0);
+        assert_eq!(response.total_matches, 0);
+        assert!(
+            !response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("fallback")),
+            "no-candidate no-match should not invoke fallback: {:?}",
+            response.warnings
         );
 
         fs::remove_dir_all(root)?;
@@ -1258,6 +1305,71 @@ mod tests {
         .map_err(io::Error::other)?;
         assert_eq!(response.total_files_matched, 1);
         assert_eq!(response.files[0].rel_path, "src/target.txt");
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn overflow_samples_cover_short_unicode_token_before_segment_boundary() -> io::Result<()> {
+        let root = temp_dir("overflow-unicode-boundary");
+        fs::create_dir_all(root.join("src"))?;
+        let target = "전자등기";
+        let total_len = (512 * 1024) - 128;
+        let target_offset = ((total_len * 4) / 16) - 512;
+        let mut large = String::new();
+        let mut idx = 0usize;
+        while large.len() + 96 < target_offset {
+            large.push_str(&format!(
+                "unique_prefix_token_{idx}_with_long_suffix_{idx}_and_more_noise_{idx}\n"
+            ));
+            idx += 1;
+        }
+        while large.len() < target_offset {
+            large.push('x');
+        }
+        large.push_str(target);
+        large.push('\n');
+        while large.len() < total_len {
+            large.push('y');
+        }
+        fs::write(root.join("src/large_migration.py"), large)?;
+        fs::write(root.join("src/indexed.py"), format!("{target}\n"))?;
+        index_directory(&root, &EngineConfig::default())?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: target.to_string(),
+                query_terms: Vec::new(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec!["src/*".to_string()],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &EngineConfig::default(),
+        )
+        .map_err(io::Error::other)?;
+        let rel_paths = response
+            .files
+            .iter()
+            .map(|file| file.rel_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(rel_paths.contains(&"src/indexed.py"));
+        assert!(
+            rel_paths.contains(&"src/large_migration.py"),
+            "short unicode token near an overflow sample boundary must remain searchable without rg fallback"
+        );
+        assert!(
+            response.total_files_scanned <= 4,
+            "boundary recall fix must not turn short literals into broad incomplete-doc scans; scanned {}",
+            response.total_files_scanned,
+        );
 
         fs::remove_dir_all(root)?;
         Ok(())
@@ -1544,6 +1656,47 @@ mod tests {
             response.total_files_scanned < 10,
             "expected broad literal query to stop early; scanned {} files",
             response.total_files_scanned,
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn search_order_is_not_overridden_by_file_match_count_score() -> io::Result<()> {
+        let root = temp_dir("search-order-not-score");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/a_first.rs"), "needle\n")?;
+        fs::write(
+            root.join("src/b_many.rs"),
+            "needle\nneedle\nneedle\nneedle\nneedle\n",
+        )?;
+        index_directory(&root, &EngineConfig::default())?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "needle".to_string(),
+                query_terms: Vec::new(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec!["src/*".to_string()],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &EngineConfig::default(),
+        )
+        .map_err(io::Error::other)?;
+
+        assert_eq!(response.total_files_matched, 2);
+        assert_eq!(
+            response.files.first().map(|file| file.rel_path.as_str()),
+            Some("src/a_first.rs"),
+            "file match count score must not reorder broad search results ahead of rg-like candidate order",
         );
 
         fs::remove_dir_all(root)?;

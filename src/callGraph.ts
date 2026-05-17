@@ -1672,7 +1672,7 @@ export class CallGraphService implements vscode.Disposable {
     return cfg.get<boolean>('callGraphWatchExternalFileChanges', false);
   }
 
-  private async refreshChangedFiles(uris: vscode.Uri[], reason: string): Promise<void> {
+  async refreshChangedFiles(uris: vscode.Uri[], reason: string): Promise<void> {
     if (uris.length === 0 || this.disposed) { return; }
     if (this.rebuildPromise) {
       await this.rebuildPromise;

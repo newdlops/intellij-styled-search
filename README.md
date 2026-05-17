@@ -73,8 +73,9 @@ Claude Code also auto-detects the checked-in `.mcp.json` after you approve the p
 
 Useful MCP self-check tools:
 
-- `mcp_health`: verifies the MCP connection and reports endpoint, discovery file, capabilities, and index status.
-- `mcp_test`: compares `codeidx_search_code` against a bounded grep-like workspace scan and reports result overlap plus estimated token savings.
+- `mcp_health`: verifies the MCP connection and reports endpoint, discovery file, capabilities, index status, and the agent startup policy.
+
+Agents should initialize codeidx with `mcp_health({ "include_agent_policy": true, "include_discovery": true })`, then follow the policy returned in `agent_policy`. Unless higher-priority user or project policy such as `AGENTS.md`, `CLAUDE.md`, or direct user instructions says otherwise, agents should automatically use codeidx before broad grep or whole-file reads: use `codeidx_probe`/`codeidx_exists` for cardinality, `codeidx_search_code` with `output_mode: "minimal"` for path:line candidates, and only then expand selected ranges with `codeidx_read_snippets` or `codeidx_symbol_slice`. MCP intentionally does not expose index refresh/rebuild tools; if the index is not ready, a full scan is required, or final audit ordering matters, fall back to `rg` or ask the user to prepare the index.
 
 Native OR search is available through `queries`; the engine unions per-term index candidates before verification, so this avoids broad regex alternation for simple keyword sets:
 
@@ -99,11 +100,18 @@ By default, `codeidx_search_code` protects common dependency/generated/sensitive
 Use `exclude_policy: "none"` only when you intentionally want to ignore both default excludes and `exclude_globs`.
 Both override modes bypass `intellijStyledSearch.excludeGlobs` for that MCP request; keep `include_globs` narrow when searching dependency or generated trees.
 For generated/codegen searches, `include_generated: true` disables generated excludes and uses a bounded full scan with a larger MCP file-size cap so large generated files are not silently missed.
+If a generated/full-scan request explicitly forbids fallback, MCP returns `fallback_policy_requires_full_scan` instead of pretending the indexed search found zero results.
+
+`codeidx_search_code` defaults to token-first `output_mode: "minimal"` and returns only `path:line` rows. Use `output_mode: "rg_like"` when you need line previews, and `codeidx_read_snippets` for selected ranges instead of paying snippet cost in the broad search response.
+Compact search diagnostics are opt-in for compact text calls: pass `"include_diagnostics": true` when you need engine/fallback/scope/timing metadata in `structuredContent`. Pass `"structured": true` or `"output_mode": "structured"` only for full JSON-rich search results.
+Pass `"diagnostic_level": "full"` only when you need full query terms and verbose ranking metadata.
+Scope presets are explicit: `source` means production plus tests while excluding migrations/generated/dependencies/local editor context, `production` excludes tests too, `tests` keeps only tests, and `all` disables those preset filters.
+For architectural inventories, `codeidx_top_files` supports `group_by: "directory"` plus `directory_depth`; this is useful for summarizing where notification implementations, senders, or callers are concentrated before reading files.
 
 Example prompt for Codex or Claude:
 
 ```text
-Use the codeidx MCP mcp_health tool, then run mcp_test with query "UserService".
+Use the codeidx MCP mcp_health tool, then search for "UserService" with codeidx_search_symbols first and codeidx_search_code if text locations are needed.
 ```
 
 ## Keybindings
@@ -126,6 +134,8 @@ Use the codeidx MCP mcp_health tool, then run mcp_test with query "UserService".
 ## Runtime Notes
 
 On first activation, the extension attempts to install a platform-specific ripgrep binary into VS Code's extension global storage. If that install fails or the platform is unsupported, it falls back to VS Code's bundled ripgrep when available, and finally to the JavaScript search path.
+
+Zoekt indexes are kept fresh with incremental updates for VS Code create/save/delete/rename operations plus external filesystem create/change/delete events. A search drains queued updates before querying the index; unsaved editor buffers are reported as dirty overlay state because they are not yet durable index input. Symbol search also filters deleted/missing-file results before returning them and queues a semantic incremental update when stale symbols are observed.
 
 The editable preview relies on VS Code renderer internals. If the overlay appears but the preview falls back to plain DOM rendering, run `IntelliJ Search: Reinject Renderer Patch (Recovery)`.
 

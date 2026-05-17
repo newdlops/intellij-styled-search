@@ -388,6 +388,18 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       overlay.logCommand('showZoektInfo');
       await overlay.showZoektInfo();
     }),
+    vscode.commands.registerCommand('intellijStyledSearch.showIndexHealth', async () => {
+      overlay.logCommand('showIndexHealth');
+      await showIndexHealth(overlay, callGraph, mcpServer, callGraphLog);
+    }),
+    vscode.commands.registerCommand('intellijStyledSearch.selectSearchMode', async () => {
+      overlay.logCommand('selectSearchMode');
+      await selectSearchMode();
+    }),
+    vscode.commands.registerCommand('intellijStyledSearch.benchmarkAgainstRg', async () => {
+      overlay.logCommand('benchmarkAgainstRg');
+      await runBenchmarkAgainstRg(overlay, callGraphLog);
+    }),
     vscode.commands.registerCommand('intellijStyledSearch.explainZoektQuery', async () => {
       overlay.logCommand('explainZoektQuery');
       const query = await vscode.window.showInputBox({
@@ -915,6 +927,161 @@ async function runDedupedCallGraphSymbolCommand(
   });
   callGraphSymbolCommandDedupe.set(key, { startedAt: now, promise });
   return promise;
+}
+
+async function showIndexHealth(
+  overlay: OverlayPanel,
+  callGraph: CallGraphService,
+  mcpServer: CallGraphMcpServer,
+  log: vscode.OutputChannel,
+): Promise<void> {
+  try {
+    const [snapshot, zoektInfo] = await Promise.all([
+      callGraph.ensureRestoredSnapshot(),
+      overlay.collectZoektInfoForHealth(),
+    ]);
+    const zoektFreshness = overlay.collectZoektFreshnessForHealth();
+    const dirtyDocuments = vscode.workspace.textDocuments
+      .filter((document) => document.uri.scheme === 'file' && document.isDirty);
+    const callEdges = snapshot?.edges.filter((edge) => edge.callKind !== 'constructor').length ?? 0;
+    const constructEdges = snapshot?.edges.filter((edge) => edge.callKind === 'constructor').length ?? 0;
+    const warnings = [
+      ...(zoektInfo?.warnings ?? []),
+      ...(snapshot?.warnings ?? []),
+    ];
+    const totalStorageBytes = zoektInfo
+      ? zoektInfo.totalShardBytes + zoektInfo.journalBytes
+      : undefined;
+    const lines = [
+      'IntelliJ Styled Search: Index Health',
+      `workspace: ${vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? 'none'}`,
+      `indexed_documents: ${zoektInfo?.totalDocumentCount ?? snapshot?.stats.fileCount ?? 0}`,
+      `symbols: ${snapshot?.stats.symbolCount ?? 0}`,
+      `references: ${snapshot?.stats.referenceCount ?? 0}`,
+      `call_edges: ${callEdges}`,
+      `construct_edges: ${constructEdges}`,
+      `freshness: symbol=${snapshot ? 'fresh' : 'not_ready'} reference=${snapshot ? 'fresh' : 'not_ready'} zoekt=${zoektInfo ? 'fresh' : 'unknown'}`,
+      `last_rebuild_time: ${snapshot ? new Date(snapshot.builtAtUnixMs).toISOString() : 'unknown'}`,
+      `storage_size: ${totalStorageBytes === undefined ? 'unknown' : `${formatHealthBytes(totalStorageBytes)} (${totalStorageBytes} bytes)`}`,
+      `content_index_bytes: ${zoektInfo?.totalShardBytes ?? 0}`,
+      `overlay_journal_bytes: ${zoektInfo?.journalBytes ?? 0}`,
+      `mcp_endpoint: ${mcpServer.getAddress() ?? 'stopped'}`,
+      `dirty_files: ${dirtyDocuments.length}`,
+      `pending_search_changed_files: ${zoektFreshness.pending_changed_files}`,
+      `pending_search_deleted_files: ${zoektFreshness.pending_deleted_files}`,
+      `pending_search_renames: ${zoektFreshness.pending_renames}`,
+      `search_update_in_flight: ${zoektFreshness.update_in_flight}`,
+      `search_update_scheduled: ${zoektFreshness.update_scheduled}`,
+      `last_search_incremental_update: ${zoektFreshness.last_update_finished_at ?? 'never'}`,
+      `warnings: ${warnings.length}`,
+    ];
+    for (const document of dirtyDocuments.slice(0, 20)) {
+      lines.push(`dirty: ${document.uri.fsPath}`);
+    }
+    for (const warning of warnings.slice(0, 50)) {
+      lines.push(`warning: ${warning}`);
+    }
+    if (zoektInfo) {
+      lines.push('', overlay.formatZoektInfoForHealth(zoektInfo));
+    }
+    log.show(true);
+    log.appendLine(lines.join('\n'));
+    vscode.window.showInformationMessage('IntelliJ Styled Search: index health written to the output log.');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`Index health failed: ${msg}`);
+  }
+}
+
+async function selectSearchMode(): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+  const current = cfg.get<string>('search.mode', 'indexed_bounded_fallback');
+  const picked = await vscode.window.showQuickPick(
+    [
+      {
+        label: 'Indexed Search',
+        description: current === 'indexed' ? 'Current' : 'zoek-rs only, no rg fallback',
+        mode: 'indexed',
+        engine: 'zoekt' as SearchEngine,
+        fallbackPolicy: 'never',
+      },
+      {
+        label: 'Indexed Search + bounded fallback',
+        description: current === 'indexed_bounded_fallback' ? 'Current' : 'zoek-rs with rg only for bounded candidate sets',
+        mode: 'indexed_bounded_fallback',
+        engine: 'zoekt' as SearchEngine,
+        fallbackPolicy: 'bounded',
+      },
+      {
+        label: 'rg fallback',
+        description: current === 'rg_fallback' ? 'Current' : 'ripgrep-backed codesearch path',
+        mode: 'rg_fallback',
+        engine: 'codesearch' as SearchEngine,
+        fallbackPolicy: 'always',
+      },
+      {
+        label: 'Symbol Search',
+        description: current === 'symbol' ? 'Current' : 'prefer symbol lookup/navigation tools',
+        mode: 'symbol',
+        engine: undefined,
+        fallbackPolicy: 'bounded',
+      },
+      {
+        label: 'Reference Search',
+        description: current === 'reference' ? 'Current' : 'prefer semantic reference tools',
+        mode: 'reference',
+        engine: undefined,
+        fallbackPolicy: 'bounded',
+      },
+    ],
+    {
+      title: 'IntelliJ Styled Search: Select Search Mode',
+      placeHolder: `Current mode: ${current}`,
+    },
+  );
+  if (!picked) { return; }
+  const target = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+    ? vscode.ConfigurationTarget.Workspace
+    : vscode.ConfigurationTarget.Global;
+  await cfg.update('search.mode', picked.mode, target);
+  await cfg.update('search.fallbackPolicy', picked.fallbackPolicy, target);
+  if (picked.engine) {
+    await cfg.update('engine', picked.engine, target);
+  }
+  vscode.window.showInformationMessage(`IntelliJ Styled Search: search mode set to ${picked.label}.`);
+}
+
+async function runBenchmarkAgainstRg(
+  overlay: OverlayPanel,
+  log: vscode.OutputChannel,
+): Promise<void> {
+  try {
+    const report = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: 'IntelliJ Styled Search: benchmarking against rg',
+        cancellable: true,
+      },
+      async (_progress, token) => overlay.benchmarkAgainstRgForCommand(token),
+    );
+    log.show(true);
+    log.appendLine(report);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`Benchmark against rg failed: ${msg}`);
+  }
+}
+
+function formatHealthBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) { return 'unknown'; }
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
 function getQueryFromActiveEditor(): string {
