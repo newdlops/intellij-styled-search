@@ -1256,7 +1256,7 @@ async function showCallGraphImplementationResult(
     if (!await ensureCallGraphReadyForUi(callGraph, title)) { return; }
     const query = explicitQuery ?? await getCallGraphQuery(callGraph, title);
     if (!query) { return; }
-    const implementations = callGraph.findImplementations(query);
+    const implementations = await callGraph.findImplementationsResolved(query);
     if (implementations.length === 0) {
       if (explicitQuery) {
         await overlay.showStaticResults(`${title}: ${explicitLabel ?? query}`, []);
@@ -1264,7 +1264,7 @@ async function showCallGraphImplementationResult(
       vscode.window.showInformationMessage('No implementations found for the selected call graph symbol.');
       return;
     }
-    const targetLabel = callGraph.resolveSymbols(query, 1)[0]?.qualifiedName ?? 'selected symbol';
+    const targetLabel = (await callGraph.resolveSymbolsResolved(query, 1))[0]?.qualifiedName ?? explicitLabel ?? 'selected symbol';
     const matches = await buildCallGraphImplementationFileMatches(implementations);
     await overlay.showStaticResults(`${title}: ${targetLabel}`, matches);
   } catch (err) {
@@ -1400,6 +1400,7 @@ function labelFromCallGraphSymbolId(symbolId: string): string {
 }
 
 function isCallGraphSymbolId(value: string): boolean {
+  if (/^sym:[A-Za-z0-9_-]+$/.test(value)) { return true; }
   const parts = value.split(':');
   return parts.length >= 4 && /^(?:python|java|kotlin|typescript|javascript)$/.test(parts[0] ?? '');
 }

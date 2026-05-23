@@ -3,22 +3,34 @@ use crate::corpus::{
     decode_bytes, read_file_bytes_with_limit_if_not_binary, CorpusEntry, ReadTextBytesOutcome,
 };
 use crate::mmap_store::write_atomically;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use ahash::{AHashSet, HashMapExt, HashSetExt};
+use std::collections::{BTreeMap, BTreeSet};
+type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
+type HashSet<T> = std::collections::HashSet<T, ahash::RandomState>;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const GRAPH_VERSION: u32 = 4;
+const GRAPH_VERSION: u32 = 5;
 const GRAPH_FILE_NAME: &str = "callgraph-relations.tsv";
 const GRAPH_SYMBOL_FILE_NAME: &str = "callgraph-symbols.tsv";
 const GRAPH_COUNT_FILE_NAME: &str = "callgraph-counts.tsv";
 const GRAPH_MANIFEST_NAME: &str = "callgraph-manifest.json";
+const GRAPH_REFERENCE_TARGET_SHARD_PREFIX: &str = "callgraph-reference-targets";
+const GRAPH_REFERENCE_ENCLOSING_SHARD_PREFIX: &str = "callgraph-reference-enclosing";
+const GRAPH_SYMBOL_ID_SHARD_PREFIX: &str = "callgraph-symbols-by-id";
+const GRAPH_SYMBOL_URI_SHARD_PREFIX: &str = "callgraph-symbols-by-uri";
+const GRAPH_COUNT_ID_SHARD_PREFIX: &str = "callgraph-counts-by-id";
+const GRAPH_HIERARCHY_PARENT_SHARD_PREFIX: &str = "callgraph-hierarchy-by-parent";
+const GRAPH_METHOD_CONTAINER_SHARD_PREFIX: &str = "callgraph-methods-by-container";
+const GRAPH_SHARD_COUNT: usize = 128;
 
 const BOUND_MAY: u8 = 0b0001;
 const BOUND_MUST: u8 = 0b0010;
 const _BOUND_OBSERVED: u8 = 0b0100;
 const MAX_EAGER_IMPLEMENTATION_SYMBOLS: usize = 50_000;
+const MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY: usize = 512;
 const RETURN_TYPE_FACT_PREFIX: &str = "__ijss_return_of__:";
 const DJANGO_MODEL_MANAGER_FACT_PREFIX: &str = "__ijss_django_model_manager_of__:";
 
@@ -217,7 +229,6 @@ struct GraphStore {
     workspace_root: String,
     built_at_unix_ms: u64,
     symbols: Vec<GraphSymbol>,
-    references: Vec<GraphReference>,
     hierarchy_facts: Vec<HierarchyFact>,
     counts: HashMap<String, GraphCount>,
 }
@@ -258,8 +269,156 @@ fn graph_count_index_path(workspace_root: &Path, config: &EngineConfig) -> PathB
         .join(GRAPH_COUNT_FILE_NAME)
 }
 
+fn graph_shard_path(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    prefix: &str,
+    shard: usize,
+) -> PathBuf {
+    config
+        .index_root(workspace_root)
+        .join(format!("{prefix}-{shard:03}.tsv"))
+}
+
+fn graph_reference_target_shard_path(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbol_id: &str,
+) -> PathBuf {
+    let shard_key = symbol_id.to_ascii_lowercase();
+    graph_shard_path(
+        workspace_root,
+        config,
+        GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
+        shard_index_for_key(&shard_key),
+    )
+}
+
+fn graph_reference_enclosing_shard_path(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbol_id: &str,
+) -> PathBuf {
+    let shard_key = symbol_id.to_ascii_lowercase();
+    graph_shard_path(
+        workspace_root,
+        config,
+        GRAPH_REFERENCE_ENCLOSING_SHARD_PREFIX,
+        shard_index_for_key(&shard_key),
+    )
+}
+
+fn graph_symbol_id_shard_path(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbol_id: &str,
+) -> PathBuf {
+    let shard_key = symbol_id.to_ascii_lowercase();
+    graph_shard_path(
+        workspace_root,
+        config,
+        GRAPH_SYMBOL_ID_SHARD_PREFIX,
+        shard_index_for_key(&shard_key),
+    )
+}
+
+fn graph_symbol_uri_shard_path(workspace_root: &Path, config: &EngineConfig, uri: &str) -> PathBuf {
+    graph_shard_path(
+        workspace_root,
+        config,
+        GRAPH_SYMBOL_URI_SHARD_PREFIX,
+        shard_index_for_key(uri),
+    )
+}
+
+fn graph_count_id_shard_path(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbol_id: &str,
+) -> PathBuf {
+    let shard_key = symbol_id.to_ascii_lowercase();
+    graph_shard_path(
+        workspace_root,
+        config,
+        GRAPH_COUNT_ID_SHARD_PREFIX,
+        shard_index_for_key(&shard_key),
+    )
+}
+
+fn graph_hierarchy_parent_shard_path(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    parent_key: &str,
+) -> PathBuf {
+    graph_shard_path(
+        workspace_root,
+        config,
+        GRAPH_HIERARCHY_PARENT_SHARD_PREFIX,
+        shard_index_for_key(parent_key),
+    )
+}
+
+fn graph_method_container_shard_path(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    container_key: &str,
+) -> PathBuf {
+    graph_shard_path(
+        workspace_root,
+        config,
+        GRAPH_METHOD_CONTAINER_SHARD_PREFIX,
+        shard_index_for_key(container_key),
+    )
+}
+
+fn graph_shard_family_available(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    prefix: &str,
+) -> bool {
+    graph_shard_path(workspace_root, config, prefix, 0).exists()
+}
+
 fn graph_manifest_path(workspace_root: &Path, config: &EngineConfig) -> PathBuf {
     config.index_root(workspace_root).join(GRAPH_MANIFEST_NAME)
+}
+
+fn graph_index_available(workspace_root: &Path, config: &EngineConfig) -> bool {
+    graph_manifest_path(workspace_root, config).exists()
+        || graph_symbol_index_path(workspace_root, config).exists()
+        || graph_shard_family_available(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX)
+}
+
+fn read_all_symbols_from_id_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+) -> io::Result<Vec<GraphSymbol>> {
+    let mut out = Vec::new();
+    for shard in 0..GRAPH_SHARD_COUNT {
+        let path = graph_shard_path(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
+        if !path.exists() {
+            continue;
+        }
+        out.extend(read_symbols(&path)?);
+    }
+    Ok(out)
+}
+
+fn read_all_counts_from_id_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+) -> io::Result<HashMap<String, GraphCount>> {
+    let mut out = HashMap::new();
+    for shard in 0..GRAPH_SHARD_COUNT {
+        let path = graph_shard_path(workspace_root, config, GRAPH_COUNT_ID_SHARD_PREFIX, shard);
+        if !path.exists() {
+            continue;
+        }
+        for (k, v) in read_counts(&path)? {
+            out.insert(k, v);
+        }
+    }
+    Ok(out)
 }
 
 pub fn index_graph_from_tsv(
@@ -324,6 +483,13 @@ pub fn index_graph_from_tsv(
     )
 }
 
+struct GraphSourceCandidate {
+    rel_path: String,
+    abs_path: PathBuf,
+    size_bytes: u64,
+    modified_unix_secs: u64,
+}
+
 fn discover_graph_source_files_with_progress<F>(
     workspace_root: &Path,
     config: &EngineConfig,
@@ -333,7 +499,7 @@ where
     F: FnMut(GraphRebuildProgress),
 {
     let total = count_graph_source_candidates(workspace_root, workspace_root, config).unwrap_or(0);
-    let mut entries = Vec::new();
+    let mut candidates = Vec::new();
     let mut visited = 0usize;
     walk_graph_source_dir(
         workspace_root,
@@ -341,11 +507,76 @@ where
         config,
         total,
         &mut visited,
-        &mut entries,
+        &mut candidates,
         progress,
     )?;
+    let total_candidates = candidates.len();
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(total_candidates.max(1));
+    let mut entries: Vec<CorpusEntry> = if total_candidates == 0 || worker_count <= 1 {
+        let mut out = Vec::with_capacity(total_candidates);
+        for cand in &candidates {
+            if let Some(entry) = read_graph_source_candidate(cand, config)? {
+                out.push(entry);
+            }
+        }
+        out
+    } else {
+        let chunk_size = total_candidates.div_ceil(worker_count);
+        let candidates_ref: &[GraphSourceCandidate] = &candidates;
+        std::thread::scope(|s| -> io::Result<Vec<CorpusEntry>> {
+            let mut handles = Vec::with_capacity(worker_count);
+            for w in 0..worker_count {
+                let start = w * chunk_size;
+                let end = ((w + 1) * chunk_size).min(total_candidates);
+                if start >= end {
+                    continue;
+                }
+                let chunk_slice = &candidates_ref[start..end];
+                handles.push(s.spawn(move || -> io::Result<Vec<CorpusEntry>> {
+                    let mut local = Vec::with_capacity(chunk_slice.len());
+                    for cand in chunk_slice {
+                        if let Some(entry) = read_graph_source_candidate(cand, config)? {
+                            local.push(entry);
+                        }
+                    }
+                    Ok(local)
+                }));
+            }
+            let mut combined = Vec::with_capacity(total_candidates);
+            for h in handles {
+                combined.extend(h.join().expect("discover read worker panicked")?);
+            }
+            Ok(combined)
+        })?
+    };
     entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
     Ok(entries)
+}
+
+fn read_graph_source_candidate(
+    cand: &GraphSourceCandidate,
+    config: &EngineConfig,
+) -> io::Result<Option<CorpusEntry>> {
+    let bytes = match read_file_bytes_with_limit_if_not_binary(
+        &cand.abs_path,
+        config.max_file_size_bytes,
+        Some(cand.size_bytes),
+    )? {
+        ReadTextBytesOutcome::Text(bytes) => bytes,
+        ReadTextBytesOutcome::Binary | ReadTextBytesOutcome::TooLarge => return Ok(None),
+    };
+    let (text, encoding) = decode_bytes(&bytes);
+    Ok(Some(CorpusEntry {
+        rel_path: cand.rel_path.clone(),
+        abs_path: cand.abs_path.clone(),
+        text,
+        size_bytes: cand.size_bytes,
+        modified_unix_secs: cand.modified_unix_secs,
+        encoding,
+    }))
 }
 
 fn walk_graph_source_dir<F>(
@@ -354,7 +585,7 @@ fn walk_graph_source_dir<F>(
     config: &EngineConfig,
     total: usize,
     visited: &mut usize,
-    entries: &mut Vec<CorpusEntry>,
+    candidates: &mut Vec<GraphSourceCandidate>,
     progress: &mut F,
 ) -> io::Result<()>
 where
@@ -370,7 +601,6 @@ where
             if path == config.index_root(workspace_root)
                 || config.is_internal_index_dir_name(&name)
                 || config.is_excluded_dir_name(&name)
-                || is_graph_dependency_or_artifact_dir(&name)
             {
                 continue;
             }
@@ -380,7 +610,7 @@ where
                 config,
                 total,
                 visited,
-                entries,
+                candidates,
                 progress,
             )?;
             continue;
@@ -399,7 +629,7 @@ where
         *visited += 1;
         if *visited == 1 || *visited % 128 == 0 || *visited == total {
             progress(GraphRebuildProgress {
-                stage: "discover",
+                stage: "discovering",
                 current: *visited,
                 total,
                 message: "discovering graph source files".to_string(),
@@ -410,28 +640,17 @@ where
             continue;
         }
 
-        let bytes = match read_file_bytes_with_limit_if_not_binary(
-            &path,
-            config.max_file_size_bytes,
-            Some(metadata.len()),
-        )? {
-            ReadTextBytesOutcome::Text(bytes) => bytes,
-            ReadTextBytesOutcome::Binary | ReadTextBytesOutcome::TooLarge => continue,
-        };
-        let (text, encoding) = decode_bytes(&bytes);
         let modified_unix_secs = metadata
             .modified()
             .ok()
             .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
             .map(|value| value.as_secs())
             .unwrap_or(0);
-        entries.push(CorpusEntry {
+        candidates.push(GraphSourceCandidate {
             rel_path,
             abs_path: path,
-            text,
             size_bytes: metadata.len(),
             modified_unix_secs,
-            encoding,
         });
     }
     Ok(())
@@ -453,7 +672,6 @@ fn count_graph_source_candidates(
             if path == config.index_root(workspace_root)
                 || config.is_internal_index_dir_name(&name)
                 || config.is_excluded_dir_name(&name)
-                || is_graph_dependency_or_artifact_dir(&name)
             {
                 continue;
             }
@@ -483,39 +701,72 @@ pub fn rebuild_graph_native<F>(
 where
     F: FnMut(GraphRebuildProgress),
 {
+    let started = std::time::Instant::now();
     progress(GraphRebuildProgress {
-        stage: "discover",
+        stage: "discovering",
         current: 0,
         total: 0,
         message: "discovering source files".to_string(),
     });
     let source_entries =
         discover_graph_source_files_with_progress(workspace_root, config, progress)?;
+    let discover_ms = started.elapsed().as_millis();
 
+    let parsing_started = std::time::Instant::now();
+    let total_entries = source_entries.len();
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(total_entries.max(1));
     progress(GraphRebuildProgress {
-        stage: "file-graph",
+        stage: "parsing",
         current: 0,
-        total: source_entries.len(),
-        message: "extracting file graphs".to_string(),
+        total: total_entries,
+        message: format!(
+            "extracting file graphs with {worker_count} workers (discover {discover_ms}ms)"
+        ),
     });
-    let mut file_graphs = Vec::with_capacity(source_entries.len());
-    for (idx, entry) in source_entries.iter().enumerate() {
-        if idx == 0 || idx + 1 == source_entries.len() || (idx + 1) % 1024 == 0 {
-            progress(GraphRebuildProgress {
-                stage: "file-graph",
-                current: idx + 1,
-                total: source_entries.len(),
-                message: entry.rel_path.clone(),
-            });
-        }
-        file_graphs.push(build_file_graph(entry));
-    }
-
+    let file_graphs: Vec<FileGraph> = if total_entries == 0 || worker_count <= 1 {
+        source_entries.iter().map(build_file_graph).collect()
+    } else {
+        let chunk = total_entries.div_ceil(worker_count);
+        let entries_ref: &[CorpusEntry] = &source_entries;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for w in 0..worker_count {
+                let start = w * chunk;
+                let end = ((w + 1) * chunk).min(total_entries);
+                if start >= end {
+                    continue;
+                }
+                handles.push(scope.spawn(move || {
+                    entries_ref[start..end]
+                        .iter()
+                        .map(build_file_graph)
+                        .collect::<Vec<FileGraph>>()
+                }));
+            }
+            let mut combined = Vec::with_capacity(total_entries);
+            for handle in handles {
+                combined.append(&mut handle.join().expect("parse worker panicked"));
+            }
+            combined
+        })
+    };
+    let parsing_ms = parsing_started.elapsed().as_millis();
     progress(GraphRebuildProgress {
-        stage: "resolve",
+        stage: "parsing",
+        current: total_entries,
+        total: total_entries,
+        message: format!("parsed {total_entries} files in {parsing_ms}ms"),
+    });
+
+    let resolving_started = std::time::Instant::now();
+    progress(GraphRebuildProgress {
+        stage: "resolving",
         current: 0,
         total: source_entries.len(),
-        message: "materializing serving graph".to_string(),
+        message: format!("materializing serving graph (parsing {parsing_ms}ms)"),
     });
     let mut symbols = Vec::new();
     let mut ref_sites = Vec::new();
@@ -545,17 +796,19 @@ where
         &function_return_facts,
         &hierarchy_facts,
     );
+    let resolving_ms = resolving_started.elapsed().as_millis();
 
+    let indexing_started = std::time::Instant::now();
     progress(GraphRebuildProgress {
-        stage: "aggregate",
+        stage: "indexing",
         current: resolution.references.len(),
         total: resolution.references.len(),
         message: format!(
-            "building count sidecar symbol_defs={symbol_def_count} fact_generation={fact_generation_hash:016x}"
+            "building count sidecar symbol_defs={symbol_def_count} fact_generation={fact_generation_hash:016x} (resolve {resolving_ms}ms)"
         ),
     });
     let counts = compute_native_counts(&symbols, &resolution.counts, &hierarchy_facts);
-    write_store(
+    let summary = write_store(
         workspace_root,
         built_at_unix_ms,
         config,
@@ -563,7 +816,19 @@ where
         &symbols,
         &resolution.references,
         &counts,
-    )
+    )?;
+    let indexing_ms = indexing_started.elapsed().as_millis();
+    let total_ms = started.elapsed().as_millis();
+    progress(GraphRebuildProgress {
+        stage: "done",
+        current: resolution.references.len(),
+        total: resolution.references.len(),
+        message: format!(
+            "wrote graph index files={} symbols={} references={} discover={discover_ms}ms parse={parsing_ms}ms resolve={resolving_ms}ms index={indexing_ms}ms total={total_ms}ms",
+            summary.file_count, summary.symbol_count, summary.reference_count
+        ),
+    });
+    Ok(summary)
 }
 
 pub fn update_graph_native(
@@ -605,7 +870,10 @@ pub fn query_graph_symbols_with_options(
     config: &EngineConfig,
     options: GraphSymbolQueryOptions,
 ) -> io::Result<Option<GraphSymbolQueryResult>> {
-    let Some(store) = read_store(workspace_root, config)? else {
+    if query.starts_with("sym:") {
+        return query_graph_symbol_id_with_options(workspace_root, query, limit, config, options);
+    }
+    let Some(store) = read_symbol_store(workspace_root, config)? else {
         return Ok(None);
     };
     let query_lower = query.to_ascii_lowercase();
@@ -614,6 +882,7 @@ pub fn query_graph_symbols_with_options(
         .iter()
         .filter(|symbol| {
             query.is_empty()
+                || symbol.id.eq_ignore_ascii_case(query)
                 || symbol.name.eq_ignore_ascii_case(query)
                 || symbol.qualified_name.eq_ignore_ascii_case(query)
                 || symbol.name.to_ascii_lowercase().contains(&query_lower)
@@ -639,6 +908,45 @@ pub fn query_graph_symbols_with_options(
     Ok(Some(GraphSymbolQueryResult {
         workspace_root: store.workspace_root,
         built_at_unix_ms: store.built_at_unix_ms,
+        total_symbols,
+        symbols,
+    }))
+}
+
+fn query_graph_symbol_id_with_options(
+    workspace_root: &Path,
+    symbol_id: &str,
+    limit: usize,
+    config: &EngineConfig,
+    options: GraphSymbolQueryOptions,
+) -> io::Result<Option<GraphSymbolQueryResult>> {
+    if !graph_index_available(workspace_root, config) {
+        return Ok(None);
+    }
+    let built_at_unix_ms = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config))?;
+    let symbol_path = graph_symbol_index_path(workspace_root, config);
+    let id_shard_path = graph_symbol_id_shard_path(workspace_root, config, symbol_id);
+    let read_path = if id_shard_path.exists() {
+        id_shard_path.as_path()
+    } else {
+        symbol_path.as_path()
+    };
+    let mut symbols = read_symbols_matching(read_path, |fields| {
+        Ok(fields[1].eq_ignore_ascii_case(symbol_id))
+    })?;
+    apply_count_options_for_symbols(workspace_root, config, &mut symbols, options)?;
+    symbols.sort_by(|left, right| {
+        score_symbol_match(left, symbol_id)
+            .cmp(&score_symbol_match(right, symbol_id))
+            .reverse()
+            .then_with(|| left.qualified_name.cmp(&right.qualified_name))
+            .then_with(|| left.rel_path.cmp(&right.rel_path))
+    });
+    let total_symbols = symbols.len();
+    symbols.truncate(limit);
+    Ok(Some(GraphSymbolQueryResult {
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        built_at_unix_ms,
         total_symbols,
         symbols,
     }))
@@ -672,20 +980,28 @@ pub fn query_graph_document_symbols_with_options(
     config: &EngineConfig,
     options: GraphSymbolQueryOptions,
 ) -> io::Result<Option<GraphSymbolQueryResult>> {
-    let Some(store) = read_store(workspace_root, config)? else {
+    if !graph_index_available(workspace_root, config) {
         return Ok(None);
-    };
+    }
+    let built_at_unix_ms = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config))?;
+    let symbol_path = graph_symbol_index_path(workspace_root, config);
     let start = start_line.unwrap_or(0);
     let end = end_line.unwrap_or(u32::MAX);
-    let mut symbols: Vec<GraphSymbol> = store
-        .symbols
-        .iter()
-        .filter(|symbol| symbol.uri == uri && symbol.start_line <= end && symbol.end_line >= start)
-        .cloned()
-        .collect();
-    for symbol in &mut symbols {
-        apply_count_options(symbol, &store.counts, options);
-    }
+    let uri_shard_path = graph_symbol_uri_shard_path(workspace_root, config, uri);
+    let read_path = if uri_shard_path.exists() {
+        uri_shard_path.as_path()
+    } else {
+        symbol_path.as_path()
+    };
+    let mut symbols = read_symbols_matching(read_path, |fields| {
+        if decode_field(fields[6])? != uri {
+            return Ok(false);
+        }
+        let symbol_start = parse_u32(fields[8], "startLine")?;
+        let symbol_end = parse_u32(fields[10], "endLine")?;
+        Ok(symbol_start <= end && symbol_end >= start)
+    })?;
+    apply_count_options_for_symbols(workspace_root, config, &mut symbols, options)?;
     symbols.sort_by(|left, right| {
         left.start_line
             .cmp(&right.start_line)
@@ -695,10 +1011,106 @@ pub fn query_graph_document_symbols_with_options(
     let total_symbols = symbols.len();
     symbols.truncate(limit);
     Ok(Some(GraphSymbolQueryResult {
-        workspace_root: store.workspace_root,
-        built_at_unix_ms: store.built_at_unix_ms,
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        built_at_unix_ms,
         total_symbols,
         symbols,
+    }))
+}
+
+fn query_graph_implementations_from_shards(
+    workspace_root: &Path,
+    symbol_id: &str,
+    limit: usize,
+    config: &EngineConfig,
+) -> io::Result<Option<GraphSymbolQueryResult>> {
+    if !graph_index_available(workspace_root, config)
+        || !graph_shard_family_available(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX)
+        || !graph_shard_family_available(
+            workspace_root,
+            config,
+            GRAPH_HIERARCHY_PARENT_SHARD_PREFIX,
+        )
+    {
+        return Ok(None);
+    }
+    let built_at_unix_ms = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config))?;
+    let target_ids: HashSet<String> = [symbol_id.to_string()].into_iter().collect();
+    let target_symbols = read_symbols_for_symbol_ids_indexed(workspace_root, config, &target_ids)?;
+    let Some(target) = target_symbols
+        .into_iter()
+        .find(|symbol| symbol.id.eq_ignore_ascii_case(symbol_id))
+    else {
+        return Ok(Some(GraphSymbolQueryResult {
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            built_at_unix_ms,
+            total_symbols: 0,
+            symbols: Vec::new(),
+        }));
+    };
+
+    let mut out = if is_type_kind(&target.kind) {
+        let (descendant_ids, _) =
+            descendant_type_ids_and_names_indexed(workspace_root, config, &target)?;
+        read_symbols_for_symbol_ids_indexed(workspace_root, config, &descendant_ids)?
+            .into_iter()
+            .filter(|symbol| symbol.id != target.id && is_type_kind(&symbol.kind))
+            .collect()
+    } else if target.kind == "method" {
+        let Some(container_id) = target.container_id.as_deref() else {
+            return Ok(None);
+        };
+        if !graph_shard_family_available(
+            workspace_root,
+            config,
+            GRAPH_METHOD_CONTAINER_SHARD_PREFIX,
+        ) {
+            return Ok(None);
+        }
+        let container_ids: HashSet<String> = [container_id.to_string()].into_iter().collect();
+        let container_symbols =
+            read_symbols_for_symbol_ids_indexed(workspace_root, config, &container_ids)?;
+        let Some(container) = container_symbols
+            .into_iter()
+            .find(|symbol| symbol.id == container_id)
+        else {
+            return Ok(None);
+        };
+        let (_, descendant_names) =
+            descendant_type_ids_and_names_indexed(workspace_root, config, &container)?;
+        read_methods_for_container_names_indexed(
+            workspace_root,
+            config,
+            &descendant_names,
+            target.name.as_str(),
+        )?
+        .into_iter()
+        .filter(|symbol| symbol.id != target.id)
+        .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut seen = HashSet::new();
+    out.retain(|symbol| seen.insert(symbol.id.clone()));
+    apply_count_options_for_symbols(
+        workspace_root,
+        config,
+        &mut out,
+        GraphSymbolQueryOptions::default(),
+    )?;
+    out.sort_by(|left, right| {
+        left.qualified_name
+            .cmp(&right.qualified_name)
+            .then_with(|| left.rel_path.cmp(&right.rel_path))
+    });
+    let total_symbols = out.len();
+    out.truncate(limit);
+    Ok(Some(GraphSymbolQueryResult {
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        built_at_unix_ms,
+        total_symbols,
+        symbols: out,
     }))
 }
 
@@ -708,7 +1120,12 @@ pub fn query_graph_implementations(
     limit: usize,
     config: &EngineConfig,
 ) -> io::Result<Option<GraphSymbolQueryResult>> {
-    let Some(store) = read_store(workspace_root, config)? else {
+    if let Some(result) =
+        query_graph_implementations_from_shards(workspace_root, symbol_id, limit, config)?
+    {
+        return Ok(Some(result));
+    }
+    let Some(store) = read_symbol_store(workspace_root, config)? else {
         return Ok(None);
     };
     let Some(target) = store.symbols.iter().find(|symbol| symbol.id == symbol_id) else {
@@ -765,15 +1182,26 @@ pub fn query_graph(
     limit: usize,
     config: &EngineConfig,
 ) -> io::Result<Option<GraphQueryResult>> {
-    let Some(store) = read_store(workspace_root, config)? else {
+    if !graph_index_available(workspace_root, config) {
         return Ok(None);
+    }
+    let relation_path = graph_index_path(workspace_root, config);
+    let built_at_unix_ms = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config))?;
+    let target_shard_path = graph_reference_target_shard_path(workspace_root, config, symbol_id);
+    let read_path = if target_shard_path.exists() {
+        Some(target_shard_path.as_path())
+    } else if relation_path.exists() {
+        Some(relation_path.as_path())
+    } else {
+        None
     };
-    let mut references: Vec<GraphReference> = store
-        .references
-        .iter()
-        .filter(|reference| reference.target_symbol_id.as_deref() == Some(symbol_id))
-        .cloned()
-        .collect();
+    let mut references = if let Some(read_path) = read_path {
+        read_references_matching(read_path, |fields, offset| {
+            Ok(fields[1 + offset].eq_ignore_ascii_case(symbol_id))
+        })?
+    } else {
+        Vec::new()
+    };
     references.sort_by(|left, right| {
         left.rel_path
             .cmp(&right.rel_path)
@@ -783,10 +1211,11 @@ pub fn query_graph(
     });
     let total_references = references.len();
     references.truncate(limit);
+    rebuild_reference_uris(workspace_root, &mut references);
     Ok(Some(GraphQueryResult {
-        workspace_root: store.workspace_root,
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
         symbol_id: symbol_id.to_string(),
-        built_at_unix_ms: store.built_at_unix_ms,
+        built_at_unix_ms,
         total_references,
         references,
     }))
@@ -798,18 +1227,28 @@ pub fn query_graph_callees(
     limit: usize,
     config: &EngineConfig,
 ) -> io::Result<Option<GraphQueryResult>> {
-    let Some(store) = read_store(workspace_root, config)? else {
+    if !graph_index_available(workspace_root, config) {
         return Ok(None);
+    }
+    let relation_path = graph_index_path(workspace_root, config);
+    let built_at_unix_ms = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config))?;
+    let enclosing_shard_path =
+        graph_reference_enclosing_shard_path(workspace_root, config, symbol_id);
+    let read_path = if enclosing_shard_path.exists() {
+        Some(enclosing_shard_path.as_path())
+    } else if relation_path.exists() {
+        Some(relation_path.as_path())
+    } else {
+        None
     };
-    let mut references: Vec<GraphReference> = store
-        .references
-        .iter()
-        .filter(|reference| {
-            reference.enclosing_symbol_id.as_deref() == Some(symbol_id)
-                && matches!(reference.edge_kind.as_str(), "call" | "construct")
-        })
-        .cloned()
-        .collect();
+    let mut references = if let Some(read_path) = read_path {
+        read_references_matching(read_path, |fields, offset| {
+            Ok(fields[11 + offset].eq_ignore_ascii_case(symbol_id)
+                && matches!(fields[2 + offset], "call" | "construct"))
+        })?
+    } else {
+        Vec::new()
+    };
     references.sort_by(|left, right| {
         left.rel_path
             .cmp(&right.rel_path)
@@ -818,10 +1257,11 @@ pub fn query_graph_callees(
     });
     let total_references = references.len();
     references.truncate(limit);
+    rebuild_reference_uris(workspace_root, &mut references);
     Ok(Some(GraphQueryResult {
-        workspace_root: store.workspace_root,
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
         symbol_id: symbol_id.to_string(),
-        built_at_unix_ms: store.built_at_unix_ms,
+        built_at_unix_ms,
         total_references,
         references,
     }))
@@ -2758,6 +3198,35 @@ fn resolve_ref_sites(
     let type_facts_by_file_local = type_facts_by_file_local(type_facts);
     let function_return_facts_by_file_name =
         function_return_facts_by_file_name(function_return_facts);
+    let phase_c_total = ref_sites.len();
+    let phase_c_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(phase_c_total.max(1));
+    let symbols_by_name_ref = &symbols_by_name;
+    let phase_c_outputs = if phase_c_total == 0 || phase_c_workers <= 1 {
+        vec![phase_c_process_chunk(ref_sites, symbols_by_name_ref)]
+    } else {
+        let chunk_size = phase_c_total.div_ceil(phase_c_workers);
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(phase_c_workers);
+            for w in 0..phase_c_workers {
+                let start = w * chunk_size;
+                let end = ((w + 1) * chunk_size).min(phase_c_total);
+                if start >= end {
+                    continue;
+                }
+                let chunk_slice = &ref_sites[start..end];
+                handles.push(s.spawn(move || {
+                    phase_c_process_chunk(chunk_slice, symbols_by_name_ref)
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("phase C worker panicked"))
+                .collect()
+        })
+    };
     let mut bare_usage_may_by_name: HashMap<&str, usize> = HashMap::new();
     let mut bare_call_may_by_name: HashMap<&str, usize> = HashMap::new();
     let mut member_usage_may_by_name: HashMap<&str, usize> = HashMap::new();
@@ -2769,50 +3238,58 @@ fn resolve_ref_sites(
         HashMap::new();
     let mut member_call_likely_by_scope_and_name: HashMap<(&str, &str, &str), usize> =
         HashMap::new();
-    for site in ref_sites {
-        if site.access_kind == "bare" && symbols_by_name.contains_key(site.name.as_str()) {
-            *bare_usage_may_by_name
-                .entry(site.name.as_str())
-                .or_default() += 1;
-            if matches!(site.edge_kind.as_str(), "call" | "construct") {
-                *bare_call_may_by_name.entry(site.name.as_str()).or_default() += 1;
-            }
-        } else if site.access_kind == "member" && symbols_by_name.contains_key(site.name.as_str()) {
-            *member_usage_may_by_name
-                .entry(site.name.as_str())
-                .or_default() += 1;
-            if matches!(site.edge_kind.as_str(), "call" | "construct") {
-                *member_call_may_by_name
-                    .entry(site.name.as_str())
-                    .or_default() += 1;
-            }
+    let mut bare_likely_sites_by_scope_and_name: HashMap<(&str, &str, &str), Vec<&RefSite>> =
+        HashMap::new();
+    let mut member_likely_sites_by_scope_and_name: HashMap<(&str, &str, &str), Vec<&RefSite>> =
+        HashMap::new();
+    for (
+        w_bare_usage_may,
+        w_bare_call_may,
+        w_member_usage_may,
+        w_member_call_may,
+        w_bare_usage_likely,
+        w_bare_call_likely,
+        w_member_usage_likely,
+        w_member_call_likely,
+        w_bare_likely_sites,
+        w_member_likely_sites,
+    ) in phase_c_outputs
+    {
+        for (k, v) in w_bare_usage_may {
+            *bare_usage_may_by_name.entry(k).or_default() += v;
         }
-        if site.is_definition || is_likely_count_derived_context(&site.rel_path) {
-            continue;
+        for (k, v) in w_bare_call_may {
+            *bare_call_may_by_name.entry(k).or_default() += v;
         }
-        let scope_name = (
-            site.language.as_str(),
-            source_scope_key(&site.rel_path),
-            site.name.as_str(),
-        );
-        if site.access_kind == "bare" {
-            *bare_usage_likely_by_scope_and_name
-                .entry(scope_name)
-                .or_default() += 1;
-            if matches!(site.edge_kind.as_str(), "call" | "construct") {
-                *bare_call_likely_by_scope_and_name
-                    .entry(scope_name)
-                    .or_default() += 1;
-            }
-        } else if site.access_kind == "member" {
-            *member_usage_likely_by_scope_and_name
-                .entry(scope_name)
-                .or_default() += 1;
-            if matches!(site.edge_kind.as_str(), "call" | "construct") {
-                *member_call_likely_by_scope_and_name
-                    .entry(scope_name)
-                    .or_default() += 1;
-            }
+        for (k, v) in w_member_usage_may {
+            *member_usage_may_by_name.entry(k).or_default() += v;
+        }
+        for (k, v) in w_member_call_may {
+            *member_call_may_by_name.entry(k).or_default() += v;
+        }
+        for (k, v) in w_bare_usage_likely {
+            *bare_usage_likely_by_scope_and_name.entry(k).or_default() += v;
+        }
+        for (k, v) in w_bare_call_likely {
+            *bare_call_likely_by_scope_and_name.entry(k).or_default() += v;
+        }
+        for (k, v) in w_member_usage_likely {
+            *member_usage_likely_by_scope_and_name.entry(k).or_default() += v;
+        }
+        for (k, v) in w_member_call_likely {
+            *member_call_likely_by_scope_and_name.entry(k).or_default() += v;
+        }
+        for (k, sites) in w_bare_likely_sites {
+            bare_likely_sites_by_scope_and_name
+                .entry(k)
+                .or_default()
+                .extend(sites);
+        }
+        for (k, sites) in w_member_likely_sites {
+            member_likely_sites_by_scope_and_name
+                .entry(k)
+                .or_default()
+                .extend(sites);
         }
     }
 
@@ -2837,111 +3314,201 @@ fn resolve_ref_sites(
             .unwrap_or(0);
     }
 
-    let mut dedup = BTreeSet::new();
-    let mut references = Vec::new();
-    let mut counted_likely = BTreeSet::new();
-    let mut counted_exact = BTreeSet::new();
-    for site in ref_sites {
-        if site.is_definition {
-            continue;
-        }
-        let fallback_candidates = if site.access_kind == "member" {
-            member_fallback_candidates(
-                site,
-                &symbols_by_id,
-                &types_by_name,
-                &members_by_container_and_name,
-                &symbols_by_file_and_name,
-                &import_targets,
-                &import_facts_by_file_local,
-                &type_facts_by_file_local,
-                &function_return_facts_by_file_name,
-                hierarchy_facts,
-            )
-        } else {
-            bare_symbols_by_name
-                .get(site.name.as_str())
-                .cloned()
-                .unwrap_or_default()
-        };
-        let (imported_candidates, star_imported_candidates) = if site.access_kind == "bare" {
-            let imported = import_targets
-                .get(&(site.rel_path.as_str(), site.name.as_str()))
-                .cloned()
-                .unwrap_or_default();
-            let star_imported =
-                star_import_candidates(site, &star_import_facts_by_file, &symbols_by_file_and_name);
-            (imported, star_imported)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let unique_member_candidate = if site.access_kind == "member"
-            && !site.is_import_context
-            && site.receiver_name.is_some()
-            && fallback_candidates.is_empty()
-        {
-            unique_symbol_by_language_and_name(
-                &member_symbols_by_language_and_name,
-                site.language.as_str(),
-                site.name.as_str(),
-            )
-        } else {
-            None
-        };
-        if fallback_candidates.is_empty()
-            && imported_candidates.is_empty()
-            && star_imported_candidates.is_empty()
-            && unique_member_candidate.is_none()
-        {
-            continue;
-        }
-        if site.access_kind == "member" {
-            let exact_member_candidates = exact_member_candidates(
-                site,
-                &symbols_by_id,
-                &types_by_name,
-                &members_by_container_and_name,
-                &symbols_by_file_and_name,
-                &import_targets,
-                &import_facts_by_file_local,
-                &type_facts_by_file_local,
-                &function_return_facts_by_file_name,
-                hierarchy_facts,
-            );
-            for target in fallback_candidates.iter() {
+    let total_refs = ref_sites.len();
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(total_refs.max(1));
+    let process_chunk = |chunk: &[RefSite]| -> (
+        HashMap<String, GraphCount>,
+        AHashSet<(String, String, String)>,
+        AHashSet<(String, String, String)>,
+        Vec<GraphReference>,
+        AHashSet<(String, String, String)>,
+    ) {
+        let mut counts: HashMap<String, GraphCount> = HashMap::new();
+        let mut counted_likely: AHashSet<(String, String, String)> = AHashSet::default();
+        let mut counted_exact: AHashSet<(String, String, String)> = AHashSet::default();
+        let mut references: Vec<GraphReference> = Vec::new();
+        let mut dedup: AHashSet<(String, String, String)> = AHashSet::default();
+        for site in chunk {
+            if site.is_definition {
+                continue;
+            }
+            let fallback_candidates = if site.access_kind == "member" {
+                member_fallback_candidates(
+                    site,
+                    &symbols_by_id,
+                    &types_by_name,
+                    &members_by_container_and_name,
+                    &symbols_by_file_and_name,
+                    &import_targets,
+                    &import_facts_by_file_local,
+                    &type_facts_by_file_local,
+                    &function_return_facts_by_file_name,
+                    hierarchy_facts,
+                )
+            } else {
+                bare_symbols_by_name
+                    .get(site.name.as_str())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let (imported_candidates, star_imported_candidates) = if site.access_kind == "bare" {
+                let imported = import_targets
+                    .get(&(site.rel_path.as_str(), site.name.as_str()))
+                    .cloned()
+                    .unwrap_or_default();
+                let star_imported = star_import_candidates(
+                    site,
+                    &star_import_facts_by_file,
+                    &symbols_by_file_and_name,
+                );
+                (imported, star_imported)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let unique_member_candidate = if site.access_kind == "member"
+                && !site.is_import_context
+                && site.receiver_name.is_some()
+                && fallback_candidates.is_empty()
+            {
+                unique_symbol_by_language_and_name(
+                    &member_symbols_by_language_and_name,
+                    site.language.as_str(),
+                    site.name.as_str(),
+                )
+            } else {
+                None
+            };
+            if fallback_candidates.is_empty()
+                && imported_candidates.is_empty()
+                && star_imported_candidates.is_empty()
+                && unique_member_candidate.is_none()
+            {
+                continue;
+            }
+            if site.access_kind == "member" {
+                let exact_member_candidates = exact_member_candidates(
+                    site,
+                    &symbols_by_id,
+                    &types_by_name,
+                    &members_by_container_and_name,
+                    &symbols_by_file_and_name,
+                    &import_targets,
+                    &import_facts_by_file_local,
+                    &type_facts_by_file_local,
+                    &function_return_facts_by_file_name,
+                    hierarchy_facts,
+                );
+                for target in fallback_candidates.iter() {
+                    add_resolution_count(
+                        &mut counts,
+                        &mut counted_likely,
+                        &mut counted_exact,
+                        site,
+                        target,
+                        BOUND_MAY,
+                        true,
+                        true,
+                    );
+                }
+                for candidate in exact_member_candidates {
+                    add_resolution_count(
+                        &mut counts,
+                        &mut counted_likely,
+                        &mut counted_exact,
+                        site,
+                        candidate.target,
+                        BOUND_MAY | BOUND_MUST,
+                        true,
+                        true,
+                    );
+                    push_resolved_reference(
+                        &mut references,
+                        &mut dedup,
+                        site,
+                        candidate.target,
+                        BOUND_MAY | BOUND_MUST,
+                        "exact",
+                        candidate.provenance,
+                    );
+                }
+                if let Some(target) = unique_member_candidate {
+                    add_resolution_count(
+                        &mut counts,
+                        &mut counted_likely,
+                        &mut counted_exact,
+                        site,
+                        target,
+                        BOUND_MAY,
+                        true,
+                        true,
+                    );
+                    push_resolved_reference(
+                        &mut references,
+                        &mut dedup,
+                        site,
+                        target,
+                        BOUND_MAY,
+                        "possible",
+                        "unique-name",
+                    );
+                }
+                continue;
+            }
+            let same_file_count = fallback_candidates
+                .iter()
+                .filter(|symbol| symbol.rel_path == site.rel_path)
+                .count();
+            let unique_bare_candidate = if site.access_kind == "bare"
+                && !site.is_import_context
+                && same_file_count == 0
+                && imported_candidates.is_empty()
+                && star_imported_candidates.is_empty()
+            {
+                unique_symbol_by_language_and_name(
+                    &bare_symbols_by_language_and_name,
+                    site.language.as_str(),
+                    site.name.as_str(),
+                )
+            } else {
+                None
+            };
+            let import_is_exact = !imported_candidates.is_empty()
+                && imported_candidates.len() == 1
+                && same_file_count == 0;
+            for target in imported_candidates.iter() {
+                let bound_mask = if import_is_exact {
+                    BOUND_MAY | BOUND_MUST
+                } else {
+                    BOUND_MAY
+                };
+                let fallback_already_counts_may =
+                    site.access_kind == "bare" && target.name == site.name;
                 add_resolution_count(
                     &mut counts,
                     &mut counted_likely,
                     &mut counted_exact,
                     site,
                     target,
-                    BOUND_MAY,
-                    true,
+                    bound_mask,
+                    fallback_already_counts_may,
                     true,
                 );
+                if import_is_exact {
+                    push_resolved_reference(
+                        &mut references,
+                        &mut dedup,
+                        site,
+                        target,
+                        bound_mask,
+                        if import_is_exact { "exact" } else { "possible" },
+                        "import",
+                    );
+                }
             }
-            for candidate in exact_member_candidates {
-                add_resolution_count(
-                    &mut counts,
-                    &mut counted_likely,
-                    &mut counted_exact,
-                    site,
-                    candidate.target,
-                    BOUND_MAY | BOUND_MUST,
-                    true,
-                    true,
-                );
-                push_resolved_reference(
-                    &mut references,
-                    &mut dedup,
-                    site,
-                    candidate.target,
-                    BOUND_MAY | BOUND_MUST,
-                    "exact",
-                    candidate.provenance,
-                );
-            }
-            if let Some(target) = unique_member_candidate {
+            for target in star_imported_candidates.iter() {
                 add_resolution_count(
                     &mut counts,
                     &mut counted_likely,
@@ -2959,132 +3526,109 @@ fn resolve_ref_sites(
                     target,
                     BOUND_MAY,
                     "possible",
-                    "unique-name",
+                    "import-star",
                 );
             }
-            continue;
-        }
-        let same_file_count = fallback_candidates
-            .iter()
-            .filter(|symbol| symbol.rel_path == site.rel_path)
-            .count();
-        let unique_bare_candidate = if site.access_kind == "bare"
-            && !site.is_import_context
-            && same_file_count == 0
-            && imported_candidates.is_empty()
-            && star_imported_candidates.is_empty()
-        {
-            unique_symbol_by_language_and_name(
-                &bare_symbols_by_language_and_name,
-                site.language.as_str(),
-                site.name.as_str(),
-            )
-        } else {
-            None
-        };
-        let import_is_exact = !imported_candidates.is_empty()
-            && imported_candidates.len() == 1
-            && same_file_count == 0;
-        for target in imported_candidates.iter() {
-            let bound_mask = if import_is_exact {
-                BOUND_MAY | BOUND_MUST
-            } else {
-                BOUND_MAY
-            };
-            let fallback_already_counts_may =
-                site.access_kind == "bare" && target.name == site.name;
-            add_resolution_count(
-                &mut counts,
-                &mut counted_likely,
-                &mut counted_exact,
-                site,
-                target,
-                bound_mask,
-                fallback_already_counts_may,
-                true,
-            );
-            if import_is_exact {
+            for target in fallback_candidates.iter() {
+                let is_same_file_unique = site.access_kind == "bare"
+                    && same_file_count == 1
+                    && target.rel_path == site.rel_path;
+                let is_workspace_unique = site.access_kind == "bare"
+                    && unique_bare_candidate.is_some_and(|unique| unique.id == target.id);
+                let bound_mask = if is_same_file_unique {
+                    BOUND_MAY | BOUND_MUST
+                } else {
+                    BOUND_MAY
+                };
+                if is_same_file_unique || is_workspace_unique {
+                    add_resolution_count(
+                        &mut counts,
+                        &mut counted_likely,
+                        &mut counted_exact,
+                        site,
+                        target,
+                        bound_mask,
+                        true,
+                        true,
+                    );
+                }
+                if !is_same_file_unique && !is_workspace_unique {
+                    continue;
+                }
+                let confidence = if bound_mask & BOUND_MUST != 0 {
+                    "exact"
+                } else {
+                    "possible"
+                };
+                let provenance = if is_same_file_unique {
+                    "lexical"
+                } else if is_workspace_unique {
+                    "unique-name"
+                } else {
+                    "fallback"
+                };
                 push_resolved_reference(
                     &mut references,
                     &mut dedup,
                     site,
                     target,
                     bound_mask,
-                    if import_is_exact { "exact" } else { "possible" },
-                    "import",
+                    confidence,
+                    provenance,
                 );
             }
         }
-        for target in star_imported_candidates.iter() {
-            add_resolution_count(
-                &mut counts,
-                &mut counted_likely,
-                &mut counted_exact,
-                site,
-                target,
-                BOUND_MAY,
-                true,
-                true,
-            );
-            push_resolved_reference(
-                &mut references,
-                &mut dedup,
-                site,
-                target,
-                BOUND_MAY,
-                "possible",
-                "import-star",
-            );
-        }
-        for target in fallback_candidates.iter() {
-            let is_same_file_unique = site.access_kind == "bare"
-                && same_file_count == 1
-                && target.rel_path == site.rel_path;
-            let is_workspace_unique = site.access_kind == "bare"
-                && unique_bare_candidate.is_some_and(|unique| unique.id == target.id);
-            let bound_mask = if is_same_file_unique {
-                BOUND_MAY | BOUND_MUST
-            } else {
-                BOUND_MAY
-            };
-            if is_same_file_unique || is_workspace_unique {
-                add_resolution_count(
-                    &mut counts,
-                    &mut counted_likely,
-                    &mut counted_exact,
-                    site,
-                    target,
-                    bound_mask,
-                    true,
-                    true,
-                );
+        (counts, counted_likely, counted_exact, references, dedup)
+    };
+
+    let worker_outputs: Vec<_> = if total_refs == 0 || worker_count <= 1 {
+        vec![process_chunk(ref_sites)]
+    } else {
+        let chunk_size = total_refs.div_ceil(worker_count);
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for w in 0..worker_count {
+                let start = w * chunk_size;
+                let end = ((w + 1) * chunk_size).min(total_refs);
+                if start >= end {
+                    continue;
+                }
+                let chunk_slice = &ref_sites[start..end];
+                let pc = &process_chunk;
+                handles.push(s.spawn(move || pc(chunk_slice)));
             }
-            if !is_same_file_unique && !is_workspace_unique {
-                continue;
-            }
-            let confidence = if bound_mask & BOUND_MUST != 0 {
-                "exact"
-            } else {
-                "possible"
-            };
-            let provenance = if is_same_file_unique {
-                "lexical"
-            } else if is_workspace_unique {
-                "unique-name"
-            } else {
-                "fallback"
-            };
-            push_resolved_reference(
-                &mut references,
-                &mut dedup,
-                site,
-                target,
-                bound_mask,
-                confidence,
-                provenance,
-            );
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("phase E worker panicked"))
+                .collect()
+        })
+    };
+
+    let mut counted_likely: AHashSet<(String, String, String)> = AHashSet::default();
+    let mut counted_exact: AHashSet<(String, String, String)> = AHashSet::default();
+    let mut references: Vec<GraphReference> = Vec::new();
+    let mut dedup: AHashSet<(String, String, String)> = AHashSet::default();
+    for (w_counts, w_likely, w_exact, mut w_refs, w_dedup) in worker_outputs {
+        for (k, v) in w_counts {
+            let entry = counts.entry(k).or_default();
+            entry.usage_likely += v.usage_likely;
+            entry.usage_must += v.usage_must;
+            entry.usage_may += v.usage_may;
+            entry.calls_in_likely += v.calls_in_likely;
+            entry.calls_in_must += v.calls_in_must;
+            entry.calls_in_may += v.calls_in_may;
+            entry.calls_out_must += v.calls_out_must;
+            entry.calls_out_may += v.calls_out_may;
+            entry.impl_must += v.impl_must;
+            entry.impl_may += v.impl_may;
         }
+        counted_likely.extend(w_likely);
+        counted_exact.extend(w_exact);
+        references.append(&mut w_refs);
+        dedup.extend(w_dedup);
     }
+    let _ = counted_likely;
+    let _ = counted_exact;
     apply_token_shape_likely_count_baseline(
         symbols,
         &mut counts,
@@ -3092,6 +3636,10 @@ fn resolve_ref_sites(
         &bare_call_likely_by_scope_and_name,
         &member_usage_likely_by_scope_and_name,
         &member_call_likely_by_scope_and_name,
+        &bare_likely_sites_by_scope_and_name,
+        &member_likely_sites_by_scope_and_name,
+        &mut references,
+        &mut dedup,
     );
     ResolutionResult { references, counts }
 }
@@ -3641,10 +4189,90 @@ fn sort_dedup_member_exact_candidates(candidates: &mut Vec<MemberExactCandidate<
     candidates.dedup_by(|left, right| left.target.id == right.target.id);
 }
 
+type PhaseCAccums<'a> = (
+    HashMap<&'a str, usize>,
+    HashMap<&'a str, usize>,
+    HashMap<&'a str, usize>,
+    HashMap<&'a str, usize>,
+    HashMap<(&'a str, &'a str, &'a str), usize>,
+    HashMap<(&'a str, &'a str, &'a str), usize>,
+    HashMap<(&'a str, &'a str, &'a str), usize>,
+    HashMap<(&'a str, &'a str, &'a str), usize>,
+    HashMap<(&'a str, &'a str, &'a str), Vec<&'a RefSite>>,
+    HashMap<(&'a str, &'a str, &'a str), Vec<&'a RefSite>>,
+);
+
+fn phase_c_process_chunk<'a>(
+    chunk: &'a [RefSite],
+    symbols_by_name: &HashMap<&str, Vec<&'a GraphSymbol>>,
+) -> PhaseCAccums<'a> {
+    let mut bare_usage_may: HashMap<&str, usize> = HashMap::new();
+    let mut bare_call_may: HashMap<&str, usize> = HashMap::new();
+    let mut member_usage_may: HashMap<&str, usize> = HashMap::new();
+    let mut member_call_may: HashMap<&str, usize> = HashMap::new();
+    let mut bare_usage_likely: HashMap<(&str, &str, &str), usize> = HashMap::new();
+    let mut bare_call_likely: HashMap<(&str, &str, &str), usize> = HashMap::new();
+    let mut member_usage_likely: HashMap<(&str, &str, &str), usize> = HashMap::new();
+    let mut member_call_likely: HashMap<(&str, &str, &str), usize> = HashMap::new();
+    let mut bare_likely_sites: HashMap<(&str, &str, &str), Vec<&RefSite>> = HashMap::new();
+    let mut member_likely_sites: HashMap<(&str, &str, &str), Vec<&RefSite>> = HashMap::new();
+    for site in chunk {
+        if site.access_kind == "bare" && symbols_by_name.contains_key(site.name.as_str()) {
+            *bare_usage_may.entry(site.name.as_str()).or_default() += 1;
+            if matches!(site.edge_kind.as_str(), "call" | "construct") {
+                *bare_call_may.entry(site.name.as_str()).or_default() += 1;
+            }
+        } else if site.access_kind == "member"
+            && symbols_by_name.contains_key(site.name.as_str())
+        {
+            *member_usage_may.entry(site.name.as_str()).or_default() += 1;
+            if matches!(site.edge_kind.as_str(), "call" | "construct") {
+                *member_call_may.entry(site.name.as_str()).or_default() += 1;
+            }
+        }
+        if site.is_definition {
+            continue;
+        }
+        let scope_name = (
+            site.language.as_str(),
+            source_scope_key(&site.rel_path),
+            site.name.as_str(),
+        );
+        if site.access_kind == "bare" {
+            *bare_usage_likely.entry(scope_name).or_default() += 1;
+            bare_likely_sites.entry(scope_name).or_default().push(site);
+            if matches!(site.edge_kind.as_str(), "call" | "construct") {
+                *bare_call_likely.entry(scope_name).or_default() += 1;
+            }
+        } else if site.access_kind == "member" {
+            *member_usage_likely.entry(scope_name).or_default() += 1;
+            member_likely_sites
+                .entry(scope_name)
+                .or_default()
+                .push(site);
+            if matches!(site.edge_kind.as_str(), "call" | "construct") {
+                *member_call_likely.entry(scope_name).or_default() += 1;
+            }
+        }
+    }
+    (
+        bare_usage_may,
+        bare_call_may,
+        member_usage_may,
+        member_call_may,
+        bare_usage_likely,
+        bare_call_likely,
+        member_usage_likely,
+        member_call_likely,
+        bare_likely_sites,
+        member_likely_sites,
+    )
+}
+
 fn add_resolution_count(
     counts: &mut HashMap<String, GraphCount>,
-    counted_likely: &mut BTreeSet<(String, String, String)>,
-    counted_exact: &mut BTreeSet<(String, String, String)>,
+    counted_likely: &mut AHashSet<(String, String, String)>,
+    counted_exact: &mut AHashSet<(String, String, String)>,
     site: &RefSite,
     target: &GraphSymbol,
     bound_mask: u8,
@@ -3684,33 +4312,149 @@ fn apply_token_shape_likely_count_baseline(
     bare_call_by_scope_and_name: &HashMap<(&str, &str, &str), usize>,
     member_usage_by_scope_and_name: &HashMap<(&str, &str, &str), usize>,
     member_call_by_scope_and_name: &HashMap<(&str, &str, &str), usize>,
+    bare_sites_by_scope_and_name: &HashMap<(&str, &str, &str), Vec<&RefSite>>,
+    member_sites_by_scope_and_name: &HashMap<(&str, &str, &str), Vec<&RefSite>>,
+    references: &mut Vec<GraphReference>,
+    dedup: &mut AHashSet<(String, String, String)>,
 ) {
+    let mut reference_counts_by_symbol_id: HashMap<String, usize> = HashMap::new();
+    for reference in references.iter() {
+        if let Some(target_symbol_id) = reference.target_symbol_id.as_deref() {
+            *reference_counts_by_symbol_id
+                .entry(target_symbol_id.to_string())
+                .or_default() += 1;
+        }
+    }
+    let mut bare_symbol_count_by_scope_and_name: HashMap<(&str, &str, &str), usize> =
+        HashMap::new();
+    let mut member_symbol_count_by_scope_and_name: HashMap<(&str, &str, &str), usize> =
+        HashMap::new();
     for symbol in symbols {
         let key = (
             symbol.language.as_str(),
             source_scope_key(&symbol.rel_path),
             symbol.name.as_str(),
         );
-        let (usage_baseline, call_baseline) = if uses_member_token_shape_for_likely_count(symbol) {
-            (
-                member_usage_by_scope_and_name
-                    .get(&key)
-                    .copied()
-                    .unwrap_or(0),
-                member_call_by_scope_and_name
-                    .get(&key)
-                    .copied()
-                    .unwrap_or(0),
-            )
+        if uses_member_token_shape_for_likely_count(symbol) {
+            *member_symbol_count_by_scope_and_name
+                .entry(key)
+                .or_default() += 1;
         } else {
-            (
-                bare_usage_by_scope_and_name.get(&key).copied().unwrap_or(0),
-                bare_call_by_scope_and_name.get(&key).copied().unwrap_or(0),
-            )
-        };
-        let count = counts.entry(symbol.id.clone()).or_default();
-        count.usage_likely = count.usage_must.max(usage_baseline);
-        count.calls_in_likely = count.calls_in_must.max(call_baseline);
+            *bare_symbol_count_by_scope_and_name.entry(key).or_default() += 1;
+        }
+    }
+    let symbols_total = symbols.len();
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(symbols_total.max(1));
+    let bare_symbol_count_ref = &bare_symbol_count_by_scope_and_name;
+    let member_symbol_count_ref = &member_symbol_count_by_scope_and_name;
+    let reference_counts_ref = &reference_counts_by_symbol_id;
+    let counts_snapshot = &*counts;
+    let process_chunk = |symbol_slice: &[GraphSymbol]| -> (
+        Vec<(String, GraphCount)>,
+        Vec<GraphReference>,
+        AHashSet<(String, String, String)>,
+    ) {
+        let mut local_counts: Vec<(String, GraphCount)> = Vec::with_capacity(symbol_slice.len());
+        let mut local_refs: Vec<GraphReference> = Vec::new();
+        let mut local_dedup: AHashSet<(String, String, String)> = AHashSet::default();
+        for symbol in symbol_slice {
+            let key = (
+                symbol.language.as_str(),
+                source_scope_key(&symbol.rel_path),
+                symbol.name.as_str(),
+            );
+            let (usage_baseline, call_baseline, baseline_sites, symbol_count_for_key) =
+                if uses_member_token_shape_for_likely_count(symbol) {
+                    (
+                        member_usage_by_scope_and_name
+                            .get(&key)
+                            .copied()
+                            .unwrap_or(0),
+                        member_call_by_scope_and_name
+                            .get(&key)
+                            .copied()
+                            .unwrap_or(0),
+                        member_sites_by_scope_and_name.get(&key),
+                        member_symbol_count_ref.get(&key).copied().unwrap_or(0),
+                    )
+                } else {
+                    (
+                        bare_usage_by_scope_and_name.get(&key).copied().unwrap_or(0),
+                        bare_call_by_scope_and_name.get(&key).copied().unwrap_or(0),
+                        bare_sites_by_scope_and_name.get(&key),
+                        bare_symbol_count_ref.get(&key).copied().unwrap_or(0),
+                    )
+                };
+            let mut count = counts_snapshot
+                .get(&symbol.id)
+                .copied()
+                .unwrap_or_default();
+            count.usage_likely = count.usage_must.max(usage_baseline);
+            count.calls_in_likely = count.calls_in_must.max(call_baseline);
+            let mut reference_count = reference_counts_ref
+                .get(symbol.id.as_str())
+                .copied()
+                .unwrap_or(0);
+            if reference_count < count.usage_likely {
+                if let Some(sites) = baseline_sites {
+                    let fanout = sites.len().saturating_mul(symbol_count_for_key);
+                    if fanout <= MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY {
+                        for site in sites {
+                            if reference_count >= count.usage_likely {
+                                break;
+                            }
+                            let before = local_refs.len();
+                            push_resolved_reference(
+                                &mut local_refs,
+                                &mut local_dedup,
+                                site,
+                                symbol,
+                                BOUND_MAY,
+                                "possible",
+                                "token-shape",
+                            );
+                            if local_refs.len() > before {
+                                reference_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            local_counts.push((symbol.id.clone(), count));
+        }
+        (local_counts, local_refs, local_dedup)
+    };
+    let worker_outputs: Vec<_> = if symbols_total == 0 || worker_count <= 1 {
+        vec![process_chunk(symbols)]
+    } else {
+        let chunk_size = symbols_total.div_ceil(worker_count);
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for w in 0..worker_count {
+                let start = w * chunk_size;
+                let end = ((w + 1) * chunk_size).min(symbols_total);
+                if start >= end {
+                    continue;
+                }
+                let chunk_slice = &symbols[start..end];
+                let pc = &process_chunk;
+                handles.push(s.spawn(move || pc(chunk_slice)));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("phase F worker panicked"))
+                .collect()
+        })
+    };
+    for (local_counts, mut local_refs, local_dedup) in worker_outputs {
+        for (id, c) in local_counts {
+            counts.insert(id, c);
+        }
+        references.append(&mut local_refs);
+        dedup.extend(local_dedup);
     }
 }
 
@@ -3720,43 +4464,6 @@ fn uses_member_token_shape_for_likely_count(symbol: &GraphSymbol) -> bool {
 
 fn source_scope_key(rel_path: &str) -> &str {
     rel_path.split('/').next().unwrap_or(rel_path)
-}
-
-fn is_likely_count_derived_context(rel_path: &str) -> bool {
-    if rel_path.ends_with(".pyi") {
-        return true;
-    }
-    if rel_path.split('/').any(|segment| {
-        is_graph_dependency_or_artifact_dir(segment) || is_generated_context_segment(segment)
-    }) {
-        return true;
-    }
-    Path::new(rel_path)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(is_generated_source_file_name)
-}
-
-fn is_generated_context_segment(segment: &str) -> bool {
-    let lower = segment.to_ascii_lowercase();
-    matches!(lower.as_str(), "migrations" | "generated" | "__generated__")
-        || lower.ends_with("_generated")
-        || lower.ends_with("-generated")
-}
-
-fn is_generated_source_file_name(file_name: &str) -> bool {
-    let lower = file_name.to_ascii_lowercase();
-    lower.contains(".generated.")
-        || lower.contains("_generated.")
-        || lower.contains(".gen.")
-        || lower.contains("_gen.")
-        || lower.ends_with("_pb2.py")
-        || lower.ends_with("_pb2_grpc.py")
-        || lower.ends_with(".pb.go")
-        || lower.ends_with(".pb.cc")
-        || lower.ends_with(".pb.h")
-        || lower.ends_with(".g.dart")
-        || lower.ends_with(".designer.cs")
 }
 
 fn resolve_import_targets<'a>(
@@ -3791,7 +4498,7 @@ fn resolve_import_targets<'a>(
 
 fn push_resolved_reference(
     references: &mut Vec<GraphReference>,
-    dedup: &mut BTreeSet<(String, String, String)>,
+    dedup: &mut AHashSet<(String, String, String)>,
     site: &RefSite,
     target: &GraphSymbol,
     bound_mask: u8,
@@ -3936,15 +4643,19 @@ fn write_store(
 ) -> io::Result<GraphIndexSummary> {
     let layout_root = config.index_root(workspace_root);
     fs::create_dir_all(&layout_root)?;
+    clear_graph_shard_families(&layout_root)?;
     let symbol_path = graph_symbol_index_path(workspace_root, config);
     let relation_path = graph_index_path(workspace_root, config);
     let count_path = graph_count_index_path(workspace_root, config);
-    write_atomically(&symbol_path, serialize_symbols(symbols).as_bytes())?;
-    write_atomically(&relation_path, serialize_references(references).as_bytes())?;
-    write_atomically(&count_path, serialize_counts(counts).as_bytes())?;
+    for legacy_path in [&symbol_path, &relation_path, &count_path] {
+        if legacy_path.exists() {
+            let _ = fs::remove_file(legacy_path);
+        }
+    }
+    let shard_bytes = write_graph_shards(workspace_root, config, symbols, references, counts)?;
 
     let indexed_at_unix_secs = unix_secs_now();
-    let bytes = file_len(&symbol_path)? + file_len(&relation_path)? + file_len(&count_path)?;
+    let bytes = shard_bytes;
     let manifest = format!(
         "{{\"engine\":\"zoek-rs\",\"type\":\"semantic-serving-graph\",\"version\":{},\"workspaceRoot\":{},\"indexedAtUnixSecs\":{},\"builtAtUnixMs\":{},\"fileCount\":{},\"symbolCount\":{},\"referenceCount\":{},\"bytes\":{}}}",
         GRAPH_VERSION,
@@ -3972,128 +4683,472 @@ fn write_store(
     })
 }
 
-fn read_store(workspace_root: &Path, config: &EngineConfig) -> io::Result<Option<GraphStore>> {
-    let relation_path = graph_index_path(workspace_root, config);
-    let symbol_path = graph_symbol_index_path(workspace_root, config);
-    if !relation_path.exists() && !symbol_path.exists() {
+fn read_symbol_store(
+    workspace_root: &Path,
+    config: &EngineConfig,
+) -> io::Result<Option<GraphStore>> {
+    if !graph_index_available(workspace_root, config) {
         return Ok(None);
     }
     let built_at_unix_ms = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config))?;
+    let symbol_path = graph_symbol_index_path(workspace_root, config);
     let symbols = if symbol_path.exists() {
         read_symbols(&symbol_path)?
     } else {
-        Vec::new()
-    };
-    let references = if relation_path.exists() {
-        read_references(&relation_path)?
-    } else {
-        Vec::new()
+        read_all_symbols_from_id_shards(workspace_root, config)?
     };
     let hierarchy_facts = hierarchy_facts_from_symbols(&symbols);
     let count_path = graph_count_index_path(workspace_root, config);
     let counts = if count_path.exists() {
         read_counts(&count_path)?
+    } else if graph_shard_family_available(workspace_root, config, GRAPH_COUNT_ID_SHARD_PREFIX) {
+        read_all_counts_from_id_shards(workspace_root, config)?
     } else {
-        compute_counts(&symbols, &references, &hierarchy_facts)
+        HashMap::new()
     };
     Ok(Some(GraphStore {
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         built_at_unix_ms,
         symbols,
-        references,
         hierarchy_facts,
         counts,
     }))
 }
 
-fn serialize_symbols(symbols: &[GraphSymbol]) -> String {
-    let mut out = String::new();
-    for symbol in symbols {
-        out.push_str(
-            &[
-                "S".to_string(),
-                encode_field(&symbol.id),
-                encode_field(&symbol.name),
-                encode_field(&symbol.qualified_name),
-                encode_field(&symbol.kind),
-                encode_field(&symbol.language),
-                encode_field(&symbol.uri),
-                encode_field(&symbol.rel_path),
-                symbol.start_line.to_string(),
-                symbol.start_column.to_string(),
-                symbol.end_line.to_string(),
-                symbol.end_column.to_string(),
-                symbol.body_start_line.to_string(),
-                symbol.body_start_column.to_string(),
-                symbol.body_end_line.to_string(),
-                symbol.body_end_column.to_string(),
-                encode_field(symbol.container_id.as_deref().unwrap_or("")),
-                encode_field(symbol.container_name.as_deref().unwrap_or("")),
-                encode_field(symbol.package_name.as_deref().unwrap_or("")),
-                encode_list(&symbol.extends_names),
-                encode_list(&symbol.implements_names),
-            ]
-            .join("\t"),
-        );
-        out.push('\n');
+fn clear_graph_shard_families(layout_root: &Path) -> io::Result<()> {
+    if !layout_root.exists() {
+        return Ok(());
     }
-    out
+    for entry in fs::read_dir(layout_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if is_graph_shard_file_name(name) {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
 }
 
-fn serialize_references(references: &[GraphReference]) -> String {
-    let mut out = String::new();
-    for reference in references {
-        out.push_str(
-            &[
-                "E".to_string(),
-                encode_field(&reference.source_ref_id),
-                encode_field(reference.target_symbol_id.as_deref().unwrap_or("")),
-                encode_field(&reference.edge_kind),
-                encode_field(&reference.name),
-                encode_field(&reference.raw_text),
-                encode_field(&reference.uri),
-                encode_field(&reference.rel_path),
-                reference.start_line.to_string(),
-                reference.start_column.to_string(),
-                reference.end_line.to_string(),
-                reference.end_column.to_string(),
-                encode_field(reference.enclosing_symbol_id.as_deref().unwrap_or("")),
-                reference.bound_mask.to_string(),
-                encode_field(&reference.confidence),
-                encode_field(&reference.provenance),
-            ]
-            .join("\t"),
-        );
-        out.push('\n');
-    }
-    out
+fn is_graph_shard_file_name(name: &str) -> bool {
+    let shard_suffix = name.ends_with(".tsv") || name.ends_with(".tsv.tmp");
+    shard_suffix
+        && [
+            GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
+            GRAPH_REFERENCE_ENCLOSING_SHARD_PREFIX,
+            GRAPH_SYMBOL_ID_SHARD_PREFIX,
+            GRAPH_SYMBOL_URI_SHARD_PREFIX,
+            GRAPH_COUNT_ID_SHARD_PREFIX,
+            GRAPH_HIERARCHY_PARENT_SHARD_PREFIX,
+            GRAPH_METHOD_CONTAINER_SHARD_PREFIX,
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(*prefix))
 }
 
-fn serialize_counts(counts: &HashMap<String, GraphCount>) -> String {
+struct GraphShardWriter {
+    final_path: PathBuf,
+    temp_path: PathBuf,
+    writer: BufWriter<fs::File>,
+}
+
+fn open_graph_shard_writers(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    prefix: &str,
+) -> io::Result<Vec<GraphShardWriter>> {
+    let mut writers = Vec::with_capacity(GRAPH_SHARD_COUNT);
+    for shard in 0..GRAPH_SHARD_COUNT {
+        let final_path = graph_shard_path(workspace_root, config, prefix, shard);
+        let temp_path = final_path.with_file_name(format!("{prefix}-{shard:03}.tsv.tmp"));
+        let writer = BufWriter::new(fs::File::create(&temp_path)?);
+        writers.push(GraphShardWriter {
+            final_path,
+            temp_path,
+            writer,
+        });
+    }
+    Ok(writers)
+}
+
+fn finish_graph_shard_writers(writers: Vec<GraphShardWriter>) -> io::Result<u64> {
+    let mut bytes = 0;
+    for mut shard in writers {
+        shard.writer.flush()?;
+        drop(shard.writer);
+        fs::rename(&shard.temp_path, &shard.final_path)?;
+        bytes += file_len(&shard.final_path)?;
+    }
+    Ok(bytes)
+}
+
+fn write_graph_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &[GraphSymbol],
+    references: &[GraphReference],
+    counts: &HashMap<String, GraphCount>,
+) -> io::Result<u64> {
+    std::thread::scope(|s| -> io::Result<u64> {
+        let symbol_id_h = s.spawn(|| write_symbol_id_shards(workspace_root, config, symbols));
+        let symbol_uri_h = s.spawn(|| write_symbol_uri_shards(workspace_root, config, symbols));
+        let ref_target_h =
+            s.spawn(|| write_reference_target_shards(workspace_root, config, references));
+        let ref_enclosing_h =
+            s.spawn(|| write_reference_enclosing_shards(workspace_root, config, references));
+        let count_id_h = s.spawn(|| write_count_id_shards(workspace_root, config, counts));
+        let hierarchy_h =
+            s.spawn(|| write_hierarchy_parent_shards(workspace_root, config, symbols));
+        let method_h = s.spawn(|| write_method_container_shards(workspace_root, config, symbols));
+        let mut bytes = 0;
+        bytes += symbol_id_h.join().expect("symbol-id shard writer panicked")?;
+        bytes += symbol_uri_h.join().expect("symbol-uri shard writer panicked")?;
+        bytes += ref_target_h.join().expect("reference-target shard writer panicked")?;
+        bytes += ref_enclosing_h.join().expect("reference-enclosing shard writer panicked")?;
+        bytes += count_id_h.join().expect("count-id shard writer panicked")?;
+        bytes += hierarchy_h.join().expect("hierarchy-parent shard writer panicked")?;
+        bytes += method_h.join().expect("method-container shard writer panicked")?;
+        Ok(bytes)
+    })
+}
+
+fn write_symbol_id_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &[GraphSymbol],
+) -> io::Result<u64> {
+    parallel_sharded_write(
+        workspace_root,
+        config,
+        GRAPH_SYMBOL_ID_SHARD_PREFIX,
+        symbols,
+        |symbol| {
+            Some((
+                shard_index_for_key(&symbol.id),
+                serialize_symbol_row(symbol),
+            ))
+        },
+    )
+}
+
+fn write_symbol_uri_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &[GraphSymbol],
+) -> io::Result<u64> {
+    parallel_sharded_write(
+        workspace_root,
+        config,
+        GRAPH_SYMBOL_URI_SHARD_PREFIX,
+        symbols,
+        |symbol| {
+            Some((
+                shard_index_for_key(&symbol.uri),
+                serialize_symbol_row(symbol),
+            ))
+        },
+    )
+}
+
+fn write_reference_target_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    references: &[GraphReference],
+) -> io::Result<u64> {
+    parallel_sharded_write(
+        workspace_root,
+        config,
+        GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
+        references,
+        |reference| {
+            reference.target_symbol_id.as_deref().map(|target| {
+                (
+                    shard_index_for_key(target),
+                    serialize_reference_row(reference),
+                )
+            })
+        },
+    )
+}
+
+fn parallel_sharded_write<T, F>(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    prefix: &str,
+    items: &[T],
+    shard_for_item: F,
+) -> io::Result<u64>
+where
+    T: Sync,
+    F: Fn(&T) -> Option<(usize, String)> + Sync,
+{
+    let total = items.len();
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(total.max(1));
+    if total == 0 || worker_count <= 1 {
+        let mut shards = open_graph_shard_writers(workspace_root, config, prefix)?;
+        for item in items {
+            if let Some((shard, row)) = shard_for_item(item) {
+                shards[shard].writer.write_all(row.as_bytes())?;
+            }
+        }
+        return finish_graph_shard_writers(shards);
+    }
+    let chunk_size = total.div_ceil(worker_count);
+    let shard_for_item_ref = &shard_for_item;
+    let worker_buffers: Vec<Vec<Vec<u8>>> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for w in 0..worker_count {
+            let start = w * chunk_size;
+            let end = ((w + 1) * chunk_size).min(total);
+            if start >= end {
+                continue;
+            }
+            let slice = &items[start..end];
+            handles.push(s.spawn(move || {
+                let mut bufs: Vec<Vec<u8>> =
+                    (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+                for item in slice {
+                    if let Some((shard, row)) = shard_for_item_ref(item) {
+                        bufs[shard].extend_from_slice(row.as_bytes());
+                    }
+                }
+                bufs
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("group worker panicked"))
+            .collect()
+    });
+    let writers = open_graph_shard_writers(workspace_root, config, prefix)?;
+    let total_writers = writers.len();
+    let writers_per_worker = total_writers.div_ceil(worker_count);
+    let mut writer_iter = writers.into_iter();
+    let worker_buffers_ref = &worker_buffers;
+    std::thread::scope(|s| -> io::Result<u64> {
+        let mut handles = Vec::with_capacity(worker_count);
+        let mut next_shard_idx = 0;
+        for _ in 0..worker_count {
+            if next_shard_idx >= total_writers {
+                break;
+            }
+            let take = writers_per_worker.min(total_writers - next_shard_idx);
+            let chunk: Vec<(usize, GraphShardWriter)> = (0..take)
+                .map(|i| {
+                    let shard_idx = next_shard_idx + i;
+                    (shard_idx, writer_iter.next().expect("writer count mismatch"))
+                })
+                .collect();
+            next_shard_idx += take;
+            handles.push(s.spawn(move || -> io::Result<u64> {
+                let mut total_bytes = 0;
+                for (shard_idx, mut writer) in chunk {
+                    for w_bufs in worker_buffers_ref {
+                        writer.writer.write_all(&w_bufs[shard_idx])?;
+                    }
+                    writer.writer.flush()?;
+                    drop(writer.writer);
+                    fs::rename(&writer.temp_path, &writer.final_path)?;
+                    total_bytes += file_len(&writer.final_path)?;
+                }
+                Ok(total_bytes)
+            }));
+        }
+        let mut total_bytes = 0;
+        for h in handles {
+            total_bytes += h.join().expect("shard writer panicked")?;
+        }
+        Ok(total_bytes)
+    })
+}
+
+fn write_reference_enclosing_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    references: &[GraphReference],
+) -> io::Result<u64> {
+    parallel_sharded_write(
+        workspace_root,
+        config,
+        GRAPH_REFERENCE_ENCLOSING_SHARD_PREFIX,
+        references,
+        |reference| {
+            if !matches!(reference.edge_kind.as_str(), "call" | "construct") {
+                return None;
+            }
+            reference.enclosing_symbol_id.as_deref().map(|enclosing| {
+                (
+                    shard_index_for_key(enclosing),
+                    serialize_reference_row(reference),
+                )
+            })
+        },
+    )
+}
+
+fn write_count_id_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    counts: &HashMap<String, GraphCount>,
+) -> io::Result<u64> {
+    let mut shards = open_graph_shard_writers(workspace_root, config, GRAPH_COUNT_ID_SHARD_PREFIX)?;
     let mut rows: Vec<_> = counts.iter().collect();
     rows.sort_by(|left, right| left.0.cmp(right.0));
-    let mut out = String::new();
     for (symbol_id, count) in rows {
-        out.push_str(
-            &[
-                "C".to_string(),
-                encode_field(symbol_id),
-                count.usage_likely.to_string(),
-                count.usage_must.to_string(),
-                count.usage_may.to_string(),
-                count.calls_in_likely.to_string(),
-                count.calls_in_must.to_string(),
-                count.calls_in_may.to_string(),
-                count.calls_out_must.to_string(),
-                count.calls_out_may.to_string(),
-                count.impl_must.to_string(),
-                count.impl_may.to_string(),
-            ]
-            .join("\t"),
-        );
-        out.push('\n');
+        let row = serialize_count_row(symbol_id, count);
+        let shard = shard_index_for_key(symbol_id);
+        shards[shard].writer.write_all(row.as_bytes())?;
     }
-    out
+    finish_graph_shard_writers(shards)
+}
+
+fn write_hierarchy_parent_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &[GraphSymbol],
+) -> io::Result<u64> {
+    let mut shards =
+        open_graph_shard_writers(workspace_root, config, GRAPH_HIERARCHY_PARENT_SHARD_PREFIX)?;
+    for symbol in symbols {
+        if !is_type_kind(&symbol.kind) {
+            continue;
+        }
+        for parent_name in symbol.extends_names.iter().chain(&symbol.implements_names) {
+            for lookup_key in graph_name_lookup_keys(parent_name) {
+                let row = serialize_hierarchy_child_row(
+                    &lookup_key,
+                    parent_name,
+                    &symbol.id,
+                    &symbol.qualified_name,
+                );
+                let shard = shard_index_for_key(&lookup_key);
+                shards[shard].writer.write_all(row.as_bytes())?;
+            }
+        }
+    }
+    finish_graph_shard_writers(shards)
+}
+
+fn write_method_container_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &[GraphSymbol],
+) -> io::Result<u64> {
+    let mut shards =
+        open_graph_shard_writers(workspace_root, config, GRAPH_METHOD_CONTAINER_SHARD_PREFIX)?;
+    for symbol in symbols {
+        if symbol.kind != "method" {
+            continue;
+        }
+        let Some(container_name) = symbol.container_name.as_deref() else {
+            continue;
+        };
+        let row = serialize_symbol_row(symbol);
+        for lookup_key in graph_name_lookup_keys(container_name) {
+            let shard = shard_index_for_key(&lookup_key);
+            shards[shard].writer.write_all(row.as_bytes())?;
+        }
+    }
+    finish_graph_shard_writers(shards)
+}
+
+fn serialize_symbol_row(symbol: &GraphSymbol) -> String {
+    let mut row = [
+        "S".to_string(),
+        encode_field(&symbol.id),
+        encode_field(&symbol.name),
+        encode_field(&symbol.qualified_name),
+        encode_field(&symbol.kind),
+        encode_field(&symbol.language),
+        encode_field(&symbol.uri),
+        encode_field(&symbol.rel_path),
+        symbol.start_line.to_string(),
+        symbol.start_column.to_string(),
+        symbol.end_line.to_string(),
+        symbol.end_column.to_string(),
+        symbol.body_start_line.to_string(),
+        symbol.body_start_column.to_string(),
+        symbol.body_end_line.to_string(),
+        symbol.body_end_column.to_string(),
+        encode_field(symbol.container_id.as_deref().unwrap_or("")),
+        encode_field(symbol.container_name.as_deref().unwrap_or("")),
+        encode_field(symbol.package_name.as_deref().unwrap_or("")),
+        encode_list(&symbol.extends_names),
+        encode_list(&symbol.implements_names),
+    ]
+    .join("\t");
+    row.push('\n');
+    row
+}
+
+fn serialize_reference_row(reference: &GraphReference) -> String {
+    let mut row = [
+        "E",
+        &encode_field(&reference.source_ref_id),
+        &encode_field(reference.target_symbol_id.as_deref().unwrap_or("")),
+        &encode_field(&reference.edge_kind),
+        &encode_field(&reference.name),
+        &encode_field(&reference.raw_text),
+        "",
+        &encode_field(&reference.rel_path),
+        &reference.start_line.to_string(),
+        &reference.start_column.to_string(),
+        &reference.end_line.to_string(),
+        &reference.end_column.to_string(),
+        &encode_field(reference.enclosing_symbol_id.as_deref().unwrap_or("")),
+        &reference.bound_mask.to_string(),
+        &encode_field(&reference.confidence),
+        &encode_field(&reference.provenance),
+    ]
+    .join("\t");
+    row.push('\n');
+    row
+}
+
+fn serialize_count_row(symbol_id: &str, count: &GraphCount) -> String {
+    let mut row = [
+        "C".to_string(),
+        encode_field(symbol_id),
+        count.usage_likely.to_string(),
+        count.usage_must.to_string(),
+        count.usage_may.to_string(),
+        count.calls_in_likely.to_string(),
+        count.calls_in_must.to_string(),
+        count.calls_in_may.to_string(),
+        count.calls_out_must.to_string(),
+        count.calls_out_may.to_string(),
+        count.impl_must.to_string(),
+        count.impl_may.to_string(),
+    ]
+    .join("\t");
+    row.push('\n');
+    row
+}
+
+fn serialize_hierarchy_child_row(
+    lookup_key: &str,
+    parent_name: &str,
+    child_symbol_id: &str,
+    child_qualified_name: &str,
+) -> String {
+    let mut row = [
+        "H".to_string(),
+        encode_field(lookup_key),
+        encode_field(parent_name),
+        encode_field(child_symbol_id),
+        encode_field(child_qualified_name),
+    ]
+    .join("\t");
+    row.push('\n');
+    row
 }
 
 fn read_symbols(path: &Path) -> io::Result<Vec<GraphSymbol>> {
@@ -4105,45 +5160,214 @@ fn read_symbols(path: &Path) -> io::Result<Vec<GraphSymbol>> {
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 21 || fields[0] != "S" {
-            return Err(invalid_data(format!(
-                "invalid graph symbol row with {} fields",
-                fields.len()
-            )));
-        }
-        symbols.push(GraphSymbol {
-            id: decode_field(fields[1])?,
-            name: decode_field(fields[2])?,
-            qualified_name: decode_field(fields[3])?,
-            kind: decode_field(fields[4])?,
-            language: decode_field(fields[5])?,
-            uri: decode_field(fields[6])?,
-            rel_path: decode_field(fields[7])?,
-            start_line: parse_u32(fields[8], "startLine")?,
-            start_column: parse_u32(fields[9], "startColumn")?,
-            end_line: parse_u32(fields[10], "endLine")?,
-            end_column: parse_u32(fields[11], "endColumn")?,
-            body_start_line: parse_u32(fields[12], "bodyStartLine")?,
-            body_start_column: parse_u32(fields[13], "bodyStartColumn")?,
-            body_end_line: parse_u32(fields[14], "bodyEndLine")?,
-            body_end_column: parse_u32(fields[15], "bodyEndColumn")?,
-            container_id: empty_string_to_none(decode_field(fields[16])?),
-            container_name: empty_string_to_none(decode_field(fields[17])?),
-            package_name: empty_string_to_none(decode_field(fields[18])?),
-            extends_names: decode_list(fields[19])?,
-            implements_names: decode_list(fields[20])?,
-            usage_count: None,
-            usage_must_count: None,
-            usage_may_count: None,
-            implementation_count: None,
-            implementation_must_count: None,
-            implementation_may_count: None,
-        });
+        validate_symbol_fields(&fields)?;
+        symbols.push(parse_symbol_fields(&fields)?);
     }
     Ok(symbols)
 }
 
-fn read_references(path: &Path) -> io::Result<Vec<GraphReference>> {
+fn read_symbols_matching<F>(path: &Path, mut matches: F) -> io::Result<Vec<GraphSymbol>>
+where
+    F: FnMut(&[&str]) -> io::Result<bool>,
+{
+    let mut symbols = Vec::new();
+    let input = fs::File::open(path)?;
+    for line in BufReader::new(input).lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        validate_symbol_fields(&fields)?;
+        if matches(&fields)? {
+            symbols.push(parse_symbol_fields(&fields)?);
+        }
+    }
+    Ok(symbols)
+}
+
+fn read_symbols_for_symbol_ids_indexed(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbol_ids: &HashSet<String>,
+) -> io::Result<Vec<GraphSymbol>> {
+    if symbol_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !graph_shard_family_available(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX) {
+        let symbol_path = graph_symbol_index_path(workspace_root, config);
+        if !symbol_path.exists() {
+            return Ok(Vec::new());
+        }
+        return read_symbols_matching(&symbol_path, |fields| Ok(symbol_ids.contains(fields[1])));
+    }
+
+    let mut by_shard: BTreeMap<usize, HashSet<String>> = BTreeMap::new();
+    for symbol_id in symbol_ids {
+        let shard_key = symbol_id.to_ascii_lowercase();
+        by_shard
+            .entry(shard_index_for_key(&shard_key))
+            .or_default()
+            .insert(symbol_id.clone());
+    }
+
+    let mut symbols = Vec::new();
+    for (_, shard_symbol_ids) in by_shard {
+        let Some(first_symbol_id) = shard_symbol_ids.iter().next() else {
+            continue;
+        };
+        let shard_path = graph_symbol_id_shard_path(workspace_root, config, first_symbol_id);
+        if !shard_path.exists() {
+            let symbol_path = graph_symbol_index_path(workspace_root, config);
+            if !symbol_path.exists() {
+                continue;
+            }
+            return read_symbols_matching(
+                &symbol_path,
+                |fields| Ok(symbol_ids.contains(fields[1])),
+            );
+        }
+        symbols.extend(read_symbols_matching(&shard_path, |fields| {
+            Ok(shard_symbol_ids.contains(fields[1]))
+        })?);
+    }
+    Ok(symbols)
+}
+
+fn read_methods_for_container_names_indexed(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    container_names: &HashSet<String>,
+    method_name: &str,
+) -> io::Result<Vec<GraphSymbol>> {
+    if container_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut by_shard: BTreeMap<usize, HashSet<String>> = BTreeMap::new();
+    for container_name in container_names {
+        for lookup_key in graph_name_lookup_keys(container_name) {
+            by_shard
+                .entry(shard_index_for_key(&lookup_key))
+                .or_default()
+                .insert(lookup_key);
+        }
+    }
+
+    let mut symbols = Vec::new();
+    for (_, shard_keys) in by_shard {
+        let Some(first_key) = shard_keys.iter().next() else {
+            continue;
+        };
+        let shard_path = graph_method_container_shard_path(workspace_root, config, first_key);
+        if !shard_path.exists() {
+            continue;
+        }
+        symbols.extend(read_symbols_matching(&shard_path, |fields| {
+            if fields[2] != method_name || fields[4] != "method" {
+                return Ok(false);
+            }
+            let container_name = decode_field(fields[17])?;
+            Ok(container_names.contains(&container_name)
+                || container_names.contains(type_tail(&container_name)))
+        })?);
+    }
+    Ok(symbols)
+}
+
+fn read_hierarchy_children_for_parent_keys_indexed(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    parent_keys: &HashSet<String>,
+) -> io::Result<Vec<(String, String)>> {
+    if parent_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut by_shard: BTreeMap<usize, HashSet<String>> = BTreeMap::new();
+    for parent_key in parent_keys {
+        by_shard
+            .entry(shard_index_for_key(parent_key))
+            .or_default()
+            .insert(parent_key.clone());
+    }
+
+    let mut children = Vec::new();
+    for (_, shard_keys) in by_shard {
+        let Some(first_key) = shard_keys.iter().next() else {
+            continue;
+        };
+        let shard_path = graph_hierarchy_parent_shard_path(workspace_root, config, first_key);
+        if !shard_path.exists() {
+            continue;
+        }
+        let input = fs::File::open(&shard_path)?;
+        for line in BufReader::new(input).lines() {
+            let line = line?;
+            if line.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() != 5 || fields[0] != "H" {
+                return Err(invalid_data(format!(
+                    "invalid graph hierarchy row with {} fields",
+                    fields.len()
+                )));
+            }
+            let lookup_key = decode_field(fields[1])?;
+            if !shard_keys.contains(&lookup_key) {
+                continue;
+            }
+            children.push((decode_field(fields[3])?, decode_field(fields[4])?));
+        }
+    }
+    Ok(children)
+}
+
+fn validate_symbol_fields(fields: &[&str]) -> io::Result<()> {
+    if fields.len() != 21 || fields[0] != "S" {
+        return Err(invalid_data(format!(
+            "invalid graph symbol row with {} fields",
+            fields.len()
+        )));
+    }
+    Ok(())
+}
+
+fn parse_symbol_fields(fields: &[&str]) -> io::Result<GraphSymbol> {
+    validate_symbol_fields(fields)?;
+    Ok(GraphSymbol {
+        id: decode_field(fields[1])?,
+        name: decode_field(fields[2])?,
+        qualified_name: decode_field(fields[3])?,
+        kind: decode_field(fields[4])?,
+        language: decode_field(fields[5])?,
+        uri: decode_field(fields[6])?,
+        rel_path: decode_field(fields[7])?,
+        start_line: parse_u32(fields[8], "startLine")?,
+        start_column: parse_u32(fields[9], "startColumn")?,
+        end_line: parse_u32(fields[10], "endLine")?,
+        end_column: parse_u32(fields[11], "endColumn")?,
+        body_start_line: parse_u32(fields[12], "bodyStartLine")?,
+        body_start_column: parse_u32(fields[13], "bodyStartColumn")?,
+        body_end_line: parse_u32(fields[14], "bodyEndLine")?,
+        body_end_column: parse_u32(fields[15], "bodyEndColumn")?,
+        container_id: empty_string_to_none(decode_field(fields[16])?),
+        container_name: empty_string_to_none(decode_field(fields[17])?),
+        package_name: empty_string_to_none(decode_field(fields[18])?),
+        extends_names: decode_list(fields[19])?,
+        implements_names: decode_list(fields[20])?,
+        usage_count: None,
+        usage_must_count: None,
+        usage_may_count: None,
+        implementation_count: None,
+        implementation_must_count: None,
+        implementation_may_count: None,
+    })
+}
+
+fn read_references_matching<F>(path: &Path, mut matches: F) -> io::Result<Vec<GraphReference>>
+where
+    F: FnMut(&[&str], usize) -> io::Result<bool>,
+{
     let mut references = Vec::new();
     let input = fs::File::open(path)?;
     for line in BufReader::new(input).lines() {
@@ -4152,43 +5376,53 @@ fn read_references(path: &Path) -> io::Result<Vec<GraphReference>> {
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if !(fields.len() == 15 || fields.len() == 16) || fields[0] != "E" {
-            return Err(invalid_data(format!(
-                "invalid graph edge row with {} fields",
-                fields.len()
-            )));
+        let offset = validate_reference_fields(&fields)?;
+        if matches(&fields, offset)? {
+            references.push(parse_reference_fields(&fields, offset)?);
         }
-        let offset = if fields.len() == 16 { 1 } else { 0 };
-        let name = decode_field(fields[3 + offset])?;
-        let rel_path = decode_field(fields[6 + offset])?;
-        let start_line = parse_u32(fields[7 + offset], "startLine")?;
-        let start_column = parse_u32(fields[8 + offset], "startColumn")?;
-        let source_ref_id = if offset == 1 {
-            decode_field(fields[1])?
-        } else {
-            stable_ref_id(&rel_path, start_line, start_column, &name)
-        };
-        references.push(GraphReference {
-            source_ref_id,
-            target_symbol_id: empty_string_to_none(decode_field(fields[1 + offset])?),
-            edge_kind: decode_field(fields[2 + offset])?,
-            name,
-            raw_text: decode_field(fields[4 + offset])?,
-            uri: decode_field(fields[5 + offset])?,
-            rel_path,
-            start_line,
-            start_column,
-            end_line: parse_u32(fields[9 + offset], "endLine")?,
-            end_column: parse_u32(fields[10 + offset], "endColumn")?,
-            enclosing_symbol_id: empty_string_to_none(decode_field(fields[11 + offset])?),
-            bound_mask: fields[12 + offset]
-                .parse::<u8>()
-                .map_err(|_| invalid_data("invalid bound mask"))?,
-            confidence: decode_field(fields[13 + offset])?,
-            provenance: decode_field(fields[14 + offset])?,
-        });
     }
     Ok(references)
+}
+
+fn validate_reference_fields(fields: &[&str]) -> io::Result<usize> {
+    if !(fields.len() == 15 || fields.len() == 16) || fields[0] != "E" {
+        return Err(invalid_data(format!(
+            "invalid graph edge row with {} fields",
+            fields.len()
+        )));
+    }
+    Ok(if fields.len() == 16 { 1 } else { 0 })
+}
+
+fn parse_reference_fields(fields: &[&str], offset: usize) -> io::Result<GraphReference> {
+    let name = decode_field(fields[3 + offset])?;
+    let rel_path = decode_field(fields[6 + offset])?;
+    let start_line = parse_u32(fields[7 + offset], "startLine")?;
+    let start_column = parse_u32(fields[8 + offset], "startColumn")?;
+    let source_ref_id = if offset == 1 {
+        decode_field(fields[1])?
+    } else {
+        stable_ref_id(&rel_path, start_line, start_column, &name)
+    };
+    Ok(GraphReference {
+        source_ref_id,
+        target_symbol_id: empty_string_to_none(decode_field(fields[1 + offset])?),
+        edge_kind: decode_field(fields[2 + offset])?,
+        name,
+        raw_text: decode_field(fields[4 + offset])?,
+        uri: decode_field(fields[5 + offset])?,
+        rel_path,
+        start_line,
+        start_column,
+        end_line: parse_u32(fields[9 + offset], "endLine")?,
+        end_column: parse_u32(fields[10 + offset], "endColumn")?,
+        enclosing_symbol_id: empty_string_to_none(decode_field(fields[11 + offset])?),
+        bound_mask: fields[12 + offset]
+            .parse::<u8>()
+            .map_err(|_| invalid_data("invalid bound mask"))?,
+        confidence: decode_field(fields[13 + offset])?,
+        provenance: decode_field(fields[14 + offset])?,
+    })
 }
 
 fn read_counts(path: &Path) -> io::Result<HashMap<String, GraphCount>> {
@@ -4200,48 +5434,156 @@ fn read_counts(path: &Path) -> io::Result<HashMap<String, GraphCount>> {
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if !(fields.len() == 10 || fields.len() == 12) || fields[0] != "C" {
-            return Err(invalid_data(format!(
-                "invalid graph count row with {} fields",
-                fields.len()
-            )));
-        }
-        let has_likely = fields.len() == 12;
-        let usage_likely = if has_likely {
-            parse_usize(fields[2], "usageLikely")?
-        } else {
-            parse_usize(fields[3], "usageMay")?
-        };
-        let usage_must_idx = if has_likely { 3 } else { 2 };
-        let usage_may_idx = if has_likely { 4 } else { 3 };
-        let calls_in_likely = if has_likely {
-            parse_usize(fields[5], "callsInLikely")?
-        } else {
-            parse_usize(fields[5], "callsInMay")?
-        };
-        let calls_in_must_idx = if has_likely { 6 } else { 4 };
-        let calls_in_may_idx = if has_likely { 7 } else { 5 };
-        let calls_out_must_idx = if has_likely { 8 } else { 6 };
-        let calls_out_may_idx = if has_likely { 9 } else { 7 };
-        let impl_must_idx = if has_likely { 10 } else { 8 };
-        let impl_may_idx = if has_likely { 11 } else { 9 };
-        counts.insert(
-            decode_field(fields[1])?,
-            GraphCount {
-                usage_likely,
-                usage_must: parse_usize(fields[usage_must_idx], "usageMust")?,
-                usage_may: parse_usize(fields[usage_may_idx], "usageMay")?,
-                calls_in_likely,
-                calls_in_must: parse_usize(fields[calls_in_must_idx], "callsInMust")?,
-                calls_in_may: parse_usize(fields[calls_in_may_idx], "callsInMay")?,
-                calls_out_must: parse_usize(fields[calls_out_must_idx], "callsOutMust")?,
-                calls_out_may: parse_usize(fields[calls_out_may_idx], "callsOutMay")?,
-                impl_must: parse_usize(fields[impl_must_idx], "implMust")?,
-                impl_may: parse_usize(fields[impl_may_idx], "implMay")?,
-            },
-        );
+        let (symbol_id, count) = parse_count_fields(&fields)?;
+        counts.insert(symbol_id, count);
     }
     Ok(counts)
+}
+
+fn read_counts_for_symbol_ids(
+    path: &Path,
+    symbol_ids: &HashSet<String>,
+) -> io::Result<HashMap<String, GraphCount>> {
+    let mut counts = HashMap::new();
+    if symbol_ids.is_empty() {
+        return Ok(counts);
+    }
+    let input = fs::File::open(path)?;
+    for line in BufReader::new(input).lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        validate_count_fields(&fields)?;
+        if !symbol_ids.contains(fields[1]) {
+            continue;
+        }
+        let (symbol_id, count) = parse_count_fields(&fields)?;
+        counts.insert(symbol_id, count);
+        if counts.len() >= symbol_ids.len() {
+            break;
+        }
+    }
+    Ok(counts)
+}
+
+fn read_counts_for_symbol_ids_indexed(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbol_ids: &HashSet<String>,
+) -> io::Result<HashMap<String, GraphCount>> {
+    if symbol_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if !graph_shard_family_available(workspace_root, config, GRAPH_COUNT_ID_SHARD_PREFIX) {
+        let count_path = graph_count_index_path(workspace_root, config);
+        if !count_path.exists() {
+            return Ok(HashMap::new());
+        }
+        return read_counts_for_symbol_ids(&count_path, symbol_ids);
+    }
+
+    let mut by_shard: BTreeMap<usize, HashSet<String>> = BTreeMap::new();
+    for symbol_id in symbol_ids {
+        let shard_key = symbol_id.to_ascii_lowercase();
+        by_shard
+            .entry(shard_index_for_key(&shard_key))
+            .or_default()
+            .insert(symbol_id.clone());
+    }
+
+    let mut counts = HashMap::new();
+    for (shard, shard_symbol_ids) in by_shard {
+        let Some(first_symbol_id) = shard_symbol_ids.iter().next() else {
+            continue;
+        };
+        let shard_path = graph_count_id_shard_path(workspace_root, config, first_symbol_id);
+        debug_assert_eq!(
+            shard,
+            shard_index_for_key(&first_symbol_id.to_ascii_lowercase())
+        );
+        if !shard_path.exists() {
+            let count_path = graph_count_index_path(workspace_root, config);
+            if !count_path.exists() {
+                continue;
+            }
+            return read_counts_for_symbol_ids(&count_path, symbol_ids);
+        }
+        counts.extend(read_counts_for_symbol_ids(&shard_path, &shard_symbol_ids)?);
+    }
+    Ok(counts)
+}
+
+fn validate_count_fields(fields: &[&str]) -> io::Result<()> {
+    if !(fields.len() == 10 || fields.len() == 12) || fields[0] != "C" {
+        return Err(invalid_data(format!(
+            "invalid graph count row with {} fields",
+            fields.len()
+        )));
+    }
+    Ok(())
+}
+
+fn parse_count_fields(fields: &[&str]) -> io::Result<(String, GraphCount)> {
+    validate_count_fields(fields)?;
+    let has_likely = fields.len() == 12;
+    let usage_likely = if has_likely {
+        parse_usize(fields[2], "usageLikely")?
+    } else {
+        parse_usize(fields[3], "usageMay")?
+    };
+    let usage_must_idx = if has_likely { 3 } else { 2 };
+    let usage_may_idx = if has_likely { 4 } else { 3 };
+    let calls_in_likely = if has_likely {
+        parse_usize(fields[5], "callsInLikely")?
+    } else {
+        parse_usize(fields[5], "callsInMay")?
+    };
+    let calls_in_must_idx = if has_likely { 6 } else { 4 };
+    let calls_in_may_idx = if has_likely { 7 } else { 5 };
+    let calls_out_must_idx = if has_likely { 8 } else { 6 };
+    let calls_out_may_idx = if has_likely { 9 } else { 7 };
+    let impl_must_idx = if has_likely { 10 } else { 8 };
+    let impl_may_idx = if has_likely { 11 } else { 9 };
+    Ok((
+        decode_field(fields[1])?,
+        GraphCount {
+            usage_likely,
+            usage_must: parse_usize(fields[usage_must_idx], "usageMust")?,
+            usage_may: parse_usize(fields[usage_may_idx], "usageMay")?,
+            calls_in_likely,
+            calls_in_must: parse_usize(fields[calls_in_must_idx], "callsInMust")?,
+            calls_in_may: parse_usize(fields[calls_in_may_idx], "callsInMay")?,
+            calls_out_must: parse_usize(fields[calls_out_must_idx], "callsOutMust")?,
+            calls_out_may: parse_usize(fields[calls_out_may_idx], "callsOutMay")?,
+            impl_must: parse_usize(fields[impl_must_idx], "implMust")?,
+            impl_may: parse_usize(fields[impl_may_idx], "implMay")?,
+        },
+    ))
+}
+
+fn apply_count_options_for_symbols(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &mut [GraphSymbol],
+    options: GraphSymbolQueryOptions,
+) -> io::Result<()> {
+    if !options.include_usage_counts && !options.include_implementation_counts {
+        return Ok(());
+    }
+    let count_path = graph_count_index_path(workspace_root, config);
+    if !count_path.exists()
+        && !graph_shard_family_available(workspace_root, config, GRAPH_COUNT_ID_SHARD_PREFIX)
+    {
+        return Ok(());
+    }
+    let symbol_ids: HashSet<String> = symbols.iter().map(|symbol| symbol.id.clone()).collect();
+    let counts = read_counts_for_symbol_ids_indexed(workspace_root, config, &symbol_ids)?;
+    for symbol in symbols {
+        apply_count_options(symbol, &counts, options);
+    }
+    Ok(())
 }
 
 fn apply_count_options(
@@ -4303,6 +5645,58 @@ fn descendant_type_names(
     descendants
 }
 
+fn descendant_type_ids_and_names_indexed(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    target: &GraphSymbol,
+) -> io::Result<(HashSet<String>, HashSet<String>)> {
+    let mut descendant_ids = HashSet::new();
+    let mut descendant_names = HashSet::new();
+    let mut visited_keys = HashSet::new();
+    let mut frontier: Vec<String> = graph_name_lookup_keys(&target.qualified_name)
+        .into_iter()
+        .chain(graph_name_lookup_keys(&target.name))
+        .collect();
+
+    while !frontier.is_empty() {
+        let mut keys = HashSet::new();
+        while let Some(key) = frontier.pop() {
+            if visited_keys.insert(key.clone()) {
+                keys.insert(key);
+            }
+        }
+        if keys.is_empty() {
+            continue;
+        }
+        for (child_id, child_qualified_name) in
+            read_hierarchy_children_for_parent_keys_indexed(workspace_root, config, &keys)?
+        {
+            if child_qualified_name == target.qualified_name {
+                continue;
+            }
+            if descendant_ids.insert(child_id) {
+                for lookup_key in graph_name_lookup_keys(&child_qualified_name) {
+                    if !visited_keys.contains(&lookup_key) {
+                        frontier.push(lookup_key);
+                    }
+                }
+                descendant_names.insert(child_qualified_name.clone());
+                descendant_names.insert(type_tail(&child_qualified_name).to_string());
+            }
+        }
+    }
+    Ok((descendant_ids, descendant_names))
+}
+
+fn graph_name_lookup_keys(name: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    if !name.is_empty() {
+        keys.insert(name.to_string());
+        keys.insert(type_tail(name).to_string());
+    }
+    keys
+}
+
 fn fact_parent_matches_symbol(fact: &HierarchyFact, target: &GraphSymbol) -> bool {
     fact.parent_name == target.name
         || fact.parent_name == target.qualified_name
@@ -4314,7 +5708,11 @@ fn score_symbol_match(symbol: &GraphSymbol, query: &str) -> i32 {
     if query.is_empty() {
         return 0;
     }
-    if symbol.qualified_name == query {
+    if symbol.id == query {
+        110
+    } else if symbol.id.eq_ignore_ascii_case(query) {
+        105
+    } else if symbol.qualified_name == query {
         100
     } else if symbol.name == query {
         90
@@ -5157,45 +6555,15 @@ fn stable_hash(value: &str) -> u64 {
     hash
 }
 
+fn shard_index_for_key(value: &str) -> usize {
+    (stable_hash(value) as usize) % GRAPH_SHARD_COUNT
+}
+
 fn normalize_graph_rel_path(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy().replace('\\', "/"))
         .collect::<Vec<_>>()
         .join("/")
-}
-
-fn is_graph_dependency_or_artifact_dir(name: &str) -> bool {
-    matches!(
-        name,
-        ".cache"
-            | ".dart_tool"
-            | ".git"
-            | ".gradle"
-            | ".hg"
-            | ".mypy_cache"
-            | ".next"
-            | ".nox"
-            | ".nuxt"
-            | ".parcel-cache"
-            | ".pytest_cache"
-            | ".ruff_cache"
-            | ".svn"
-            | ".tox"
-            | ".turbo"
-            | ".venv"
-            | "__pycache__"
-            | "bower_components"
-            | "coverage"
-            | "DerivedData"
-            | "dist"
-            | "env"
-            | "node_modules"
-            | "out"
-            | "Pods"
-            | "site-packages"
-            | "target"
-            | "venv"
-    )
 }
 
 fn is_graph_source_path(rel_path: &str) -> bool {
@@ -5307,6 +6675,16 @@ fn is_ident_continue(ch: char) -> bool {
 
 fn file_uri(path: &Path) -> String {
     format!("file://{}", percent_encode_path(&path.to_string_lossy()))
+}
+
+fn rebuild_reference_uris(workspace_root: &Path, references: &mut [GraphReference]) {
+    for reference in references {
+        if reference.uri.is_empty() && !reference.rel_path.is_empty() {
+            let mut abs_path = workspace_root.to_path_buf();
+            abs_path.push(&reference.rel_path);
+            reference.uri = file_uri(&abs_path);
+        }
+    }
 }
 
 fn percent_encode_path(value: &str) -> String {
@@ -5467,63 +6845,6 @@ def use(client):
     }
 
     #[test]
-    fn token_shape_likely_baseline_ignores_derived_code_contexts() {
-        let provider = test_entry(
-            "pkg/provider.py",
-            r#"
-class Worker:
-    def unique_run(self):
-        return 1
-"#,
-        );
-        let consumer = test_entry(
-            "pkg/consumer.py",
-            r#"
-def use(client):
-    client.unique_run()
-"#,
-        );
-        let migration = test_entry(
-            "pkg/migrations/0001_initial.py",
-            r#"
-def migrate(client):
-    client.unique_run()
-"#,
-        );
-        let generated = test_entry(
-            "pkg/generated/api_client.py",
-            r#"
-def replay(client):
-    client.unique_run()
-"#,
-        );
-        let stub = test_entry(
-            "pkg/types.pyi",
-            r#"
-def replay(client):
-    client.unique_run()
-"#,
-        );
-        let (symbols, result) =
-            resolve_test_entries(&[provider, consumer, migration, generated, stub]);
-        let unique_run_id = symbol_id(&symbols, "Worker.unique_run");
-        let count = result
-            .counts
-            .get(unique_run_id)
-            .copied()
-            .unwrap_or_default();
-
-        assert_eq!(
-            count.usage_likely, 1,
-            "derived source paths should not inflate token-shape likely counts"
-        );
-        assert!(
-            count.usage_may >= 3,
-            "derived source paths remain inside the conservative MAY envelope"
-        );
-    }
-
-    #[test]
     fn token_shape_likely_baseline_is_scoped_to_source_root() {
         let provider = test_entry(
             "pkg/provider.py",
@@ -5559,6 +6880,51 @@ def use(client):
             count.usage_may >= 2,
             "cross-root tokens stay in the conservative MAY envelope"
         );
+    }
+
+    #[test]
+    fn token_shape_likely_baseline_materializes_bounded_possible_references() {
+        let provider = test_entry(
+            "pkg/provider.py",
+            r#"
+class FirstProvider:
+    def collect_items(self):
+        return []
+
+class SecondProvider:
+    def collect_items(self):
+        return []
+"#,
+        );
+        let consumer = test_entry(
+            "pkg/consumer.py",
+            r#"
+def use_collection(first, second):
+    first.collect_items()
+    second.collect_items()
+"#,
+        );
+        let (symbols, result) = resolve_test_entries(&[provider, consumer]);
+        let first_id = symbol_id(&symbols, "FirstProvider.collect_items");
+        let count = result.counts.get(first_id).copied().unwrap_or_default();
+        assert_eq!(count.usage_likely, 2);
+        assert_eq!(count.usage_must, 0);
+        let refs: Vec<_> = result
+            .references
+            .iter()
+            .filter(|reference| reference.target_symbol_id.as_deref() == Some(first_id))
+            .collect();
+        assert_eq!(
+            refs.len(),
+            2,
+            "bounded token-shape fallback counts should have detail references for UI panels"
+        );
+        assert!(refs
+            .iter()
+            .all(|reference| reference.confidence == "possible"));
+        assert!(refs
+            .iter()
+            .all(|reference| reference.provenance == "token-shape"));
     }
 
     #[test]

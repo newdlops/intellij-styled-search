@@ -19,3 +19,4 @@ path = "src/bin/ijss-rebuild.rs"
 
 [dependencies]
 regex = "1.11.1"
+ahash = "0.8"

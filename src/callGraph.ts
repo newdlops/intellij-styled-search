@@ -1129,13 +1129,47 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   async getCallersResolved(symbolOrQuery: string, limit = 200): Promise<CallGraphQueryResult[]> {
+    if (this.isRustNativeIndexOnly()) {
+      return this.getRustNativeReferenceEdgeResults(symbolOrQuery, 'callers', limit);
+    }
     const base = this.getCallers(symbolOrQuery, limit);
     return this.mergeProviderResults(base, 'callers', limit);
   }
 
   async getCalleesResolved(symbolOrQuery: string, limit = 200): Promise<CallGraphQueryResult[]> {
+    if (this.isRustNativeIndexOnly()) {
+      return this.getRustNativeReferenceEdgeResults(symbolOrQuery, 'callees', limit);
+    }
     const base = this.getCallees(symbolOrQuery, limit);
     return this.mergeProviderResults(base, 'callees', limit);
+  }
+
+  private async getRustNativeReferenceEdgeResults(
+    symbolOrQuery: string,
+    direction: 'callers' | 'callees',
+    limit: number,
+  ): Promise<CallGraphQueryResult[]> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const manifest = this.cacheManifest;
+    if (!folder || !manifest?.builtAtUnixMs || !symbolOrQuery.trim()) { return []; }
+    const symbols = await this.resolveSymbolsResolved(symbolOrQuery, Math.min(Math.max(limit, 1), 200));
+    if (symbols.length === 0) { return []; }
+    const results: CallGraphQueryResult[] = [];
+    for (const symbol of symbols) {
+      const remaining = Math.max(1, limit);
+      const references = direction === 'callers'
+        ? await this.queryRustGraphUsageIndex(folder.uri.fsPath, symbol.id, remaining, manifest.builtAtUnixMs)
+        : await this.queryRustGraphOutgoingUsageIndex(folder.uri.fsPath, symbol.id, remaining, manifest.builtAtUnixMs);
+      if (!references) { continue; }
+      results.push({
+        symbol,
+        edges: references
+          .slice(0, limit)
+          .map((reference) => callGraphEdgeFromRustReference(reference, symbol, direction)),
+        relatedSymbols: [],
+      });
+    }
+    return results;
   }
 
   findUsages(symbolOrQuery: string, limit = 500): CallGraphReference[] {
@@ -7866,6 +7900,63 @@ function callsiteReferenceFromEdge(edge: CallGraphEdge, symbolId: string): CallG
     range: edge.callsite.range,
     enclosingSymbolId: edge.callerId,
   };
+}
+
+function callGraphEdgeFromRustReference(
+  reference: CallGraphReference,
+  target: CallGraphSymbol,
+  direction: 'callers' | 'callees',
+): CallGraphEdge {
+  const rawText = reference.rawText || reference.name || target.name;
+  const calleeId = direction === 'callers' ? target.id : reference.symbolId;
+  const calleeName = direction === 'callers'
+    ? target.qualifiedName
+    : reference.name || reference.rawText || reference.symbolId;
+  const callerId = direction === 'callees'
+    ? target.id
+    : reference.enclosingSymbolId || `${reference.uri}:${reference.range.startLine}:${reference.range.startColumn}`;
+  return {
+    id: `rust-reference:${direction}:${referenceLocationKey(reference)}`,
+    callerId,
+    ...(calleeId ? { calleeId } : {}),
+    calleeName,
+    callKind: callGraphEdgeKindFromRustReference(reference),
+    confidence: callGraphConfidenceFromRustReference(reference),
+    source: 'semantic',
+    callsite: {
+      name: reference.name || calleeName,
+      rawText,
+      uri: reference.uri,
+      relPath: reference.relPath,
+      range: reference.range,
+      enclosingSymbolId: callerId,
+    },
+    evidence: [
+      'rust-native graph reference',
+      ...(reference.edgeKind ? [`edgeKind=${reference.edgeKind}`] : []),
+      ...(reference.provenance ? [`provenance=${reference.provenance}`] : []),
+    ],
+  };
+}
+
+function callGraphEdgeKindFromRustReference(reference: CallGraphReference): CallGraphEdgeKind {
+  switch (reference.edgeKind) {
+    case 'construct': return 'constructor';
+    case 'method': return 'method';
+    case 'static': return 'static';
+    case 'virtual': return 'virtual';
+    case 'dynamic': return 'dynamic';
+    default: return 'direct';
+  }
+}
+
+function callGraphConfidenceFromRustReference(reference: CallGraphReference): CallGraphConfidence {
+  switch (reference.confidence) {
+    case 'exact': return 'exact';
+    case 'resolved': return 'resolved';
+    case 'unresolved': return 'unresolved';
+    default: return 'possible';
+  }
 }
 
 function referenceLocationKey(reference: CallGraphReference): string {

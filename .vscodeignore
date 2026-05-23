@@ -20,3 +20,6 @@ tests/**
 .vscode-test.mjs
 vscode_monacoeditor_monkeypatch.md
 target/**
+reports
+.django-shell
+resources/monaco.bundle.js
