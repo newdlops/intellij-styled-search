@@ -5,6 +5,11 @@ export const BINARY_FILE_EXTENSIONS = new Set([
   '.woff', '.woff2', '.ttf', '.eot', '.otf',
   '.exe', '.dll', '.so', '.dylib', '.class', '.o', '.a',
   '.wasm', '.node', '.pyc', '.pyo', '.rmeta', '.rlib',
+  '.mo', '.bcmap', '.mat', '.sav', '.npy', '.pfb', '.bare',
+  '.npz', '.xlsx', '.dat', '.pkl', '.bfbs', '.docx', '.cur',
+  '.bplist', '.bz2', '.parquet', '.gzip', '.xz', '.lzma',
+  '.orc', '.nc', '.z', '.oxt', '.obj', '.bin', '.feather',
+  '.jar', '.ani', '.plist', '.aep', '.mod', '.egg', '.icc',
 ]);
 
 export function getFileExtension(fsPath: string): string {

@@ -1,0 +1,96 @@
+# Inlay Usage Accuracy Rerun
+
+- Date: 2026-05-19
+- Workspace: `/Users/lky/project/captain`
+- Current zoek-rs: `/Users/lky/project/intellij-styled-search/target/release/zoek-rs`
+- Pyright: `/Users/lky/project/captain/.venv/bin/pyright-langserver` (unavailable)
+- django-stubs: django-stubs 5.0.2
+- Census mode: stratified sample
+- Valid LSP usage sample: **10000**
+- Skipped/unknown LSP candidates: 14
+- Conservative 95% proportion margin at n=10000: +/-1.0%
+- Current graph usage refresh: changed=55, missing=0, errors=0
+- Graph usage changed from cached baseline: 8004/10000
+
+## Usage Signal
+
+- Exact match: **6446/10000 = 64.5%**
+- Within +/-1: 74.7%
+- Within +/-5: 85.2%
+- Mean absolute error: 6.66
+- Inlay mean: 10.18
+- Pyright mean: 3.53
+
+## Per Kind
+
+| kind | n | exact% | +/-1% | +/-5% | MAE | inlay_mean | pyright_mean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| method | 4000 | 61.2 | 70.2 | 84.6 | 6.89 | 9.65 | 2.77 |
+| class | 2000 | 75.9 | 92.7 | 98.0 | 0.87 | 6.96 | 6.10 |
+| function | 2000 | 91.8 | 96.2 | 98.0 | 0.85 | 4.56 | 3.71 |
+| constant | 2000 | 32.2 | 44.3 | 60.6 | 17.79 | 20.10 | 2.31 |
+
+## Error Pattern Distribution
+
+| tag | n | percent |
+|---|---:|---:|
+| match | 6446 | 64.5% |
+| inlay_over_no_lsp_refs | 1362 | 13.6% |
+| inlay_over_by_1-5 | 1239 | 12.4% |
+| inlay_over_by_6-50 | 724 | 7.2% |
+| inlay_over_by_50plus | 225 | 2.2% |
+| inlay_under_by_1-5 | 2 | 0.0% |
+| inlay_under_by_6-50 | 1 | 0.0% |
+| inlay_missed | 1 | 0.0% |
+
+## Top Over Counts
+
+| diff | file:line | name | kind | inlay | pyright |
+|---:|---|---|---|---:|---:|
+| +420 | `zuzu/packages/option/graphql/mutations/option_pause_mutation.py:39` | `date` | constant | 420 | 0 |
+| +420 | `zuzu/packages/company/capital/capital_service.py:86` | `date` | method | 420 | 0 |
+| +419 | `zuzu/db/models/meeting_document/shareholders_meeting_audit_report_document.py:65` | `date` | method | 422 | 3 |
+| +419 | `zuzu/packages/investment_association/document/services/ia_partner_certificate_of_investment_document_service.py:96` | `date` | constant | 422 | 3 |
+| +419 | `zuzu/packages/document/options/predefined_options.py:123` | `date` | function | 423 | 4 |
+| +418 | `zuzu/common/factory/company/company_option_rule_factory.py:31` | `date` | constant | 418 | 0 |
+| +418 | `zuzu/packages/investment_association/consent_form_or_meeting/types.py:76` | `date` | constant | 418 | 0 |
+| +418 | `zuzu/db/models/meeting_document/shareholders_written_resolution_document.py:67` | `date` | method | 420 | 2 |
+| +418 | `zuzu/packages/with_shareholder_role/shareholder/types.py:52` | `date` | constant | 418 | 0 |
+| +418 | `zuzu/db/models/meeting_document/shareholders_meeting_power_of_attorney_document.py:63` | `date` | method | 418 | 0 |
+| +418 | `zuzu/packages/with_shareholder_role/employee_stock/types.py:97` | `date` | constant | 418 | 0 |
+| +418 | `zuzu/packages/phantom_stock/graphql/types/types.py:161` | `date` | constant | 418 | 0 |
+| +418 | `zuzu/app/graphql/types/company_type.py:232` | `date` | constant | 418 | 0 |
+| +418 | `zuzu/db/models/meeting_document/new_issue_stock_acceptance_document.py:79` | `date` | method | 418 | 0 |
+| +418 | `zuzu/db/models/meeting_document/debt_confirmation_and_offset_contract_document.py:84` | `date` | method | 418 | 0 |
+| +418 | `zuzu/db/models/meeting_document/new_issue_stock_unissued_confirmation_document.py:74` | `date` | method | 418 | 0 |
+| +418 | `zuzu/db/models/meeting_document/shareholders_meeting_power_of_attorney_individual_document.py:85` | `date` | method | 418 | 0 |
+| +418 | `zuzu/db/models/meeting_document/shareholders_meeting_minutes_document.py:96` | `date` | method | 418 | 0 |
+| +417 | `zuzu/db/models/investment_association/document/ia_explanation_form_for_electronic_signature_document.py:49` | `date` | constant | 420 | 3 |
+| +417 | `zuzu/app/graphql/types/co_ceo_system_change_input.py:5` | `date` | constant | 418 | 1 |
+| +368 | `zuzu/common/models/fixed_inheritance.py:22` | `annotate` | method | 377 | 9 |
+| +300 | `zuzu/common/management/commands/render_test_timing_tree.py:40` | `add` | method | 302 | 2 |
+| +284 | `zuzu/packages/document_ai/services/common_document_ai_service.py:29` | `value` | constant | 284 | 0 |
+| +269 | `zuzu/packages/ms_word/services/utils/docx_replace_image.py:226` | `replace` | method | 270 | 1 |
+| +265 | `zuzu/packages/with_shareholder_role/payroll/graphql/queries/portal_cash_compensations_query.py:27` | `count` | constant | 265 | 0 |
+| +262 | `zuzu/packages/question_thread/mutations/add_question_thread_tag_mutation.py:37` | `question_thread` | constant | 265 | 3 |
+| +262 | `zuzu/packages/ms_word/services/field_tracker_service.py:46` | `count` | method | 266 | 4 |
+| +254 | `zuzu/packages/company/meeting/graphql/queries/meeting_list_query.py:20` | `per_page` | constant | 254 | 0 |
+| +253 | `zuzu/packages/option/tests/services/test_vesting_traceable_create_service_data.py:34` | `vesting_remaining_period` | constant | 261 | 8 |
+| +244 | `zuzu/packages/ms_word/services/utils/types.py:101` | `cell` | method | 282 | 38 |
+
+## Top Under Counts
+
+| diff | file:line | name | kind | inlay | pyright |
+|---:|---|---|---|---:|---:|
+| -6 | `zuzu/db/models/meeting_document/new_issue_stock_subscription_document.py:28` | `NewIssueStockSubscriptionDocument` | class | 18 | 24 |
+| -2 | `zuzu/db/models/registration_form_text/registration_form_text_new_issue.py:80` | `items` | method | 9 | 11 |
+| -2 | `zuzu/packages/option/services/option_list_export_service/option_grant_status_detail_excel_writer.py:52` | `_S1_COL_OPTION_ID` | constant | 2 | 4 |
+| -2 | `zuzu/packages/company/payroll/services/seal_stamp_strategy.py:15` | `_TARGET_KEYWORD` | constant | 0 | 2 |
+
+## Artifacts
+
+- Population: `/tmp/inlay_usage_10000_20260520_resample_1/population.jsonl`
+- Candidate pool: `/tmp/inlay_usage_10000_20260520_resample_1/sample_candidates.jsonl`
+- Valid LSP results: `/tmp/inlay_usage_10000_20260520_resample_1/lsp_usage_results.jsonl`
+- Skipped LSP candidates: `/tmp/inlay_usage_10000_20260520_resample_1/lsp_usage_skipped.jsonl`
+- Discrepancies: `reports/inlay-usage-10000-2026-05-20-resample-1-noisy-member-pruned/discrepancies.jsonl`

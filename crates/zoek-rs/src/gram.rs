@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn extracts_text_grams() {
-        let grams = extract_dynamic_grams("src/demo/file.rs", "AlphaService handles users", 32);
+        let grams = extract_dynamic_grams("src/demo/file.rs", "AlphaService handles records", 32);
         assert!(grams
             .iter()
             .any(|gram| gram.value.contains("alph") || gram.value.contains("vice")));
@@ -973,14 +973,14 @@ mod tests {
 
     #[test]
     fn selective_grams_cap_long_pasted_literals() {
-        let literal = "def _update_directors_meeting_minutes_with_all_approvals(self, \
-             directors_meeting, chairperson): DirectorsMeetingMinutesService";
+        let literal = "def _update_records_with_all_approvals(self, \
+             record_batch, approver): RecordApprovalService";
         let grams = selective_grams_for_query_literal(literal, 4, 12);
         assert!(grams.len() <= 12);
         assert!(!grams.is_empty());
         assert!(grams
             .iter()
-            .any(|gram| gram.contains("_upd") || gram.contains("dire")));
+            .any(|gram| gram.contains("_upd") || gram.contains("reco")));
     }
 
     #[test]

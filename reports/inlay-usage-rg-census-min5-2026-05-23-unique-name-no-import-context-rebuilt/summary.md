@@ -1,0 +1,83 @@
+# Fast RG Usage Census
+
+- Date: 2026-05-23
+- Workspace: `/Users/lky/project/captain`
+- Current zoek-rs: `/Users/lky/project/intellij-styled-search/target/release/zoek-rs`
+- Census minimum graph usage: 5
+- Python files tokenized: 11026
+- Python files failed: 0
+- Census rows: **158547**
+- Elapsed: 12.1s
+
+## Proxy Result
+
+- Exact likely/proxy match: **38925/158547 = 24.6%**
+- MAY undercount risk: **0/158547 = 0.0%**
+- Likely below proxy but MAY safe: **117497/158547 = 74.1%**
+- Proxy overcount: **2125/158547 = 1.3%**
+
+The proxy uses Python NAME tokens, excludes known symbol definition tokens, uses bare tokens for classes/functions and member tokens for methods/fields.
+
+## Per Kind
+
+| kind | n | exact% | may_under% | likely_under_may_safe% | proxy_over% |
+|---|---:|---:|---:|---:|---:|
+| class | 10244 | 52.0 | 0.0 | 32.6 | 15.4 |
+| field | 131054 | 23.0 | 0.0 | 76.7 | 0.3 |
+| function | 4113 | 54.7 | 0.0 | 42.1 | 3.2 |
+| method | 13136 | 9.6 | 0.0 | 90.2 | 0.2 |
+
+## Top MAY Under Risk
+
+| diff | file:line | name | kind | graph | proxy | bare | member |
+|---:|---|---|---|---:|---:|---:|---:|
+
+## Top Proxy Over
+
+| diff | file:line | name | kind | graph | proxy | bare | member |
+|---:|---|---|---|---:|---:|---:|---:|
+| +292 | `zuzu/db/models/company/user_relation/company_user_relation.py:67` | `Role` | class | 297 | 5 | 5 | 443 |
+| +219 | `zuzu/packages/ms_word/services/utils/docx_replace_image.py:226` | `replace` | method | 472 | 253 | 26 | 253 |
+| +182 | `zuzu/db/models/meeting_draft/meeting_draft.py:56` | `AgendaType` | class | 183 | 1 | 1 | 180 |
+| +176 | `zuzu/common/management/commands/render_test_timing_tree.py:31` | `Node` | class | 180 | 4 | 4 | 0 |
+| +149 | `zuzu/packages/modusign/services/modusign_client/apis/types/document.py:42` | `locale` | field | 149 | 0 | 19 | 0 |
+| +145 | `zuzu/packages/hrm/emp/types.py:49` | `employeeNumber` | field | 145 | 0 | 0 | 0 |
+| +138 | `zuzu/db/models/purchase/purchase_status_history.py:189` | `Status` | class | 229 | 91 | 91 | 1343 |
+| +137 | `zuzu/db/models/subscription/subscription_plan.py:64` | `Name` | class | 143 | 6 | 6 | 149 |
+| +120 | `zuzu/common/types/env_collection.py:25` | `env` | method | 121 | 1 | 146 | 1 |
+| +117 | `zuzu/fi_sta/models/fi_sta_user.py:43` | `Role` | class | 122 | 5 | 5 | 443 |
+| +115 | `zuzu/db/models/subscription/subscription_perk.py:159` | `PerkType` | class | 116 | 1 | 1 | 107 |
+| +114 | `zuzu/db/models/modusign/modusign_document_action_history.py:119` | `Status` | class | 205 | 91 | 91 | 1343 |
+| +93 | `zuzu/db/models/subscription/subscription.py:915` | `Status` | class | 184 | 91 | 91 | 1343 |
+| +91 | `zuzu/db/models/subscription/subscription_perk.py:172` | `PerkMethod` | class | 92 | 1 | 1 | 85 |
+| +88 | `zuzu/packages/sendgrid/views.py:35` | `ZUZU_ENV` | method | 209 | 121 | 18 | 121 |
+| +86 | `zuzu/packages/modusign/services/modusign_client/apis/types/document.py:26` | `datetime` | field | 1786 | 1700 | 11705 | 1700 |
+| +82 | `zuzu/db/models/question_thread/question_thread_message_profile.py:13` | `ProfileType` | class | 84 | 2 | 2 | 81 |
+| +81 | `zuzu/db/models/events/option/option_exercise_event.py:116` | `ExerciseType` | class | 83 | 2 | 2 | 79 |
+| +65 | `zuzu/db/models/incorporation_request/incorporation_request.py:232` | `Status` | class | 156 | 91 | 91 | 1343 |
+| +65 | `zuzu/packages/corporate_registration/services/infotech_client.py:285` | `api` | field | 74 | 9 | 40 | 9 |
+| +62 | `zuzu/db/models/stock_transfer_agreement/stock_transfer_agreement_management.py:82` | `Status` | class | 153 | 91 | 91 | 1343 |
+| +60 | `zuzu/packages/subscription/types/subscription_types.py:433` | `SubscriptionPlanType` | class | 68 | 8 | 8 | 0 |
+| +54 | `zuzu/packages/incorporation/tests/mutations/test_create_incorporated_company.py:94` | `establishmentDate` | field | 54 | 0 | 0 | 0 |
+| +54 | `zuzu/packages/document/base.py:51` | `NextAction` | class | 55 | 1 | 1 | 54 |
+| +54 | `zuzu/db/models/hrm/document/form/hrm_document_form_field_definition.py:27` | `TEXT` | field | 54 | 0 | 0 | 0 |
+| +53 | `zuzu/packages/captable/excel_writers/shareholder_register_excel_writer.py:21` | `origin` | field | 123 | 70 | 0 | 70 |
+| +51 | `zuzu/db/models/purchase/payment/credit_card_payment/payment_status_history.py:21` | `Status` | class | 142 | 91 | 91 | 1343 |
+| +50 | `zuzu/db/models/stakeholder/employee/employment_status.py:58` | `Status` | class | 141 | 91 | 91 | 1343 |
+| +50 | `zuzu/db/models/registration_assistance.py:31` | `Status` | class | 141 | 91 | 91 | 1343 |
+| +49 | `zuzu/db/models/stock_transfer_agreement/stock_transfer_agreement.py:129` | `Method` | class | 54 | 5 | 5 | 133 |
+| +47 | `zuzu/tests/meeting/test_meeting_draft.py:96` | `registrationAssistance` | field | 47 | 0 | 0 | 0 |
+| +47 | `zuzu/db/models/share_class.py:52` | `COMMON_STOCK` | field | 51 | 4 | 50 | 4 |
+| +46 | `zuzu/db/models/self_registration.py:17` | `Status` | class | 137 | 91 | 91 | 1343 |
+| +45 | `zuzu/db/models/agenda/new_issue/agenda_new_issue_item.py:162` | `CapitalSource` | class | 46 | 1 | 1 | 45 |
+| +45 | `zuzu/db/models/investment_association/owner/ia_owner.py:56` | `Role` | class | 50 | 5 | 5 | 443 |
+| +42 | `zuzu/tests/meeting/test_meeting_draft.py:94` | `isRegistrationAssistance` | field | 42 | 0 | 0 | 0 |
+| +42 | `zuzu/db/models/company/company.py:1337` | `branches` | function | 45 | 3 | 3 | 8 |
+| +40 | `zuzu/db/models/captable_request.py:74` | `Status` | class | 131 | 91 | 91 | 1343 |
+| +40 | `zuzu/db/models/share_class.py:53` | `CLASS_STOCK` | field | 41 | 1 | 41 | 1 |
+| +39 | `zuzu/db/models/signup_log.py:12` | `Path` | class | 127 | 88 | 88 | 16 |
+
+## Artifacts
+
+- Population: `/private/tmp/inlay_usage_rg_census_min5_20260523_unique_name_no_import_context_rebuilt/population.jsonl`
+- Discrepancies: `reports/inlay-usage-rg-census-min5-2026-05-23-unique-name-no-import-context-rebuilt/discrepancies.jsonl`

@@ -19,6 +19,8 @@ suite('Text file detection', () => {
 
   test('recognizes common binary extensions', () => {
     assert.strictEqual(hasBinaryFileExtension('/tmp/addon.node'), true);
+    assert.strictEqual(hasBinaryFileExtension('/tmp/.vscode/.auto-import-cache/index.bin'), true);
+    assert.strictEqual(hasBinaryFileExtension('/tmp/preview.webp'), true);
     assert.strictEqual(hasBinaryFileExtension('/tmp/source.ts'), false);
   });
 });

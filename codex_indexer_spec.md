@@ -6,6 +6,9 @@
 
 이 문서는 실제 구현 코드가 아니라 Codex가 구현해야 할 구조, 데이터 모델, 분석 패스, 언어별 검사 항목, 런타임 관찰 요구사항, 테스트 기준을 정의한다.
 
+Usage/caller/callee/implementation 그래프의 정확도 모델, count 성능 목표, confidence/provenance 저장 방식은
+`graph_accuracy_performance_spec.md`를 우선 기준으로 삼는다.
+
 ---
 
 ## 1. 핵심 목표

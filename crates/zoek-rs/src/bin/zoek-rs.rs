@@ -735,6 +735,13 @@ fn run_graph_rebuild(args: &[String]) -> Result<EngineResponse, String> {
                     .min(64);
                 idx += 2;
             }
+            "--exclude" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--exclude requires a value".to_string())?;
+                config.add_exclude_pattern(value.clone());
+                idx += 2;
+            }
             other => return Err(format!("unknown graph-rebuild flag: {other}")),
         }
     }
@@ -800,6 +807,13 @@ fn run_graph_update(args: &[String]) -> Result<EngineResponse, String> {
                     .ok_or_else(|| "--workers requires a value".to_string())?
                     .parse::<usize>()
                     .map_err(|err| format!("invalid --workers: {err}"))?;
+                idx += 2;
+            }
+            "--exclude" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--exclude requires a value".to_string())?;
+                config.add_exclude_pattern(value.clone());
                 idx += 2;
             }
             "--delete" => {
@@ -895,6 +909,7 @@ fn run_graph_query(args: &[String]) -> Result<EngineResponse, String> {
             .references
             .into_iter()
             .map(|reference| GraphQueryReference {
+                source_ref_id: Some(reference.source_ref_id),
                 target_symbol_id: reference.target_symbol_id,
                 edge_kind: reference.edge_kind,
                 name: reference.name,
@@ -906,6 +921,9 @@ fn run_graph_query(args: &[String]) -> Result<EngineResponse, String> {
                 end_line: reference.end_line,
                 end_column: reference.end_column,
                 enclosing_symbol_id: reference.enclosing_symbol_id,
+                bound_mask: Some(reference.bound_mask),
+                confidence: Some(reference.confidence),
+                provenance: Some(reference.provenance),
             })
             .collect(),
         warnings: Vec::new(),
@@ -965,6 +983,7 @@ fn run_graph_callees(args: &[String]) -> Result<EngineResponse, String> {
             .references
             .into_iter()
             .map(|reference| GraphQueryReference {
+                source_ref_id: Some(reference.source_ref_id),
                 target_symbol_id: reference.target_symbol_id,
                 edge_kind: reference.edge_kind,
                 name: reference.name,
@@ -976,6 +995,9 @@ fn run_graph_callees(args: &[String]) -> Result<EngineResponse, String> {
                 end_line: reference.end_line,
                 end_column: reference.end_column,
                 enclosing_symbol_id: reference.enclosing_symbol_id,
+                bound_mask: Some(reference.bound_mask),
+                confidence: Some(reference.confidence),
+                provenance: Some(reference.provenance),
             })
             .collect(),
         warnings: Vec::new(),
@@ -1172,7 +1194,11 @@ fn graph_symbol_response_from_symbol(symbol: GraphSymbol) -> GraphSymbolResponse
         extends_names: symbol.extends_names,
         implements_names: symbol.implements_names,
         usage_count: symbol.usage_count,
+        usage_must_count: symbol.usage_must_count,
+        usage_may_count: symbol.usage_may_count,
         implementation_count: symbol.implementation_count,
+        implementation_must_count: symbol.implementation_must_count,
+        implementation_may_count: symbol.implementation_may_count,
     }
 }
 

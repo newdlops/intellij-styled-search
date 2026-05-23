@@ -1027,6 +1027,163 @@ suite('Call graph', () => {
     }
   });
 
+  test('keeps Django QuerySet method fallback when receiver type is unknown', async function () {
+    this.timeout(10_000);
+    const restoreBackend = await useCallGraphBackend('javascript');
+    const api = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const models = vscode.Uri.joinPath(folder.uri, 'django_orm_queryset_methods.py');
+    const consumer = vscode.Uri.joinPath(folder.uri, 'django_orm_queryset_consumer.py');
+    try {
+      await vscode.workspace.fs.writeFile(models, Buffer.from([
+        'from typing import Self',
+        '',
+        'from django.db import models',
+        'from django.db.models.query import QuerySet',
+        '',
+        'class Employee(models.Model):',
+        '    pass',
+        '',
+        'class WhtCertificateQuerySet(QuerySet["WhtCertificate"]):',
+        '    def get_latest_versions(self):',
+        '        return self.filter()',
+        '',
+        '    def chain_latest(self) -> Self:',
+        '        return self.filter().get_latest_versions()',
+        '',
+        'class WhtBookQuerySet(QuerySet["WhtBook"]):',
+        '    def get_latest_versions(self):',
+        '        return self.filter()',
+        '',
+        'class WhtReceiptQuerySet(QuerySet["WhtReceipt"]):',
+        '    def get_latest_versions(self):',
+        '        return self.filter()',
+        '',
+        '    def chain_latest(self) -> Self:',
+        '        return self.filter().get_latest_versions()',
+        '',
+        'class DerivedWhtManager(models.Manager["WhtCertificate"]):',
+        '    def get_latest_versions(self):',
+        '        return self.get_queryset()',
+        '',
+      ].join('\n'), 'utf8'));
+      await vscode.workspace.fs.writeFile(consumer, Buffer.from([
+        'from django_orm_queryset_methods import DerivedWhtManager, Employee, WhtCertificateQuerySet',
+        '',
+        'def typed_certificate(qs: WhtCertificateQuerySet):',
+        '    return qs.get_latest_versions()',
+        '',
+        'def typed_manager(manager: DerivedWhtManager):',
+        '    return manager.get_latest_versions()',
+        '',
+        'def return_annotated(source) -> WhtCertificateQuerySet:',
+        '    return (',
+        '        source',
+        '        .filter()',
+        '        .get_latest_versions()',
+        '    )',
+        '',
+        'def single_line_chain(source) -> WhtCertificateQuerySet:',
+        '    return source.get_queryset().get_latest_versions()',
+        '',
+        'def related_manager_chain(employee: Employee):',
+        '    return employee.wht_certificate_set.get_queryset().get_latest_versions()',
+        '',
+        'class NotAQuerySet:',
+        '    def get_latest_versions(self):',
+        '        return self',
+        '',
+        'def non_queryset_return(source) -> NotAQuerySet:',
+        '    return source.get_latest_versions()',
+        '',
+        'def unknown_receivers(a, b, c, d, e, f, g):',
+        '    a.get_latest_versions()',
+        '    b.get_latest_versions()',
+        '    c.get_latest_versions()',
+        '    d.get_latest_versions()',
+        '    e.get_latest_versions()',
+        '    f.get_latest_versions()',
+        '    g.get_latest_versions()',
+        '',
+      ].join('\n'), 'utf8'));
+
+      await api.callGraph.rebuild();
+      const certificateCallers = api.callGraph.getCallers('WhtCertificateQuerySet.get_latest_versions');
+      assert.ok(
+        certificateCallers.some((result) => result.edges.some((edge) =>
+          edge.callerId.includes('typed_certificate') &&
+          edge.confidence === 'exact')),
+        `expected typed QuerySet receiver to resolve exactly, got ${certificateCallers.flatMap((result) => result.edges.map((edge) => `${edge.callerId}:${edge.confidence}`)).join(', ')}`,
+      );
+      assert.ok(
+        certificateCallers.some((result) => result.edges.some((edge) =>
+          edge.callerId.includes('unknown_receivers'))),
+        `unknown receivers should retain Django QuerySet fallback usages to avoid false negatives: ${certificateCallers.flatMap((result) => result.edges.map((edge) => `${edge.callerId}:${edge.callsite.range.startLine + 1}`)).join(', ')}`,
+      );
+      assert.ok(
+        !certificateCallers.some((result) => result.edges.some((edge) =>
+          edge.callerId.includes('non_queryset_return'))),
+        `explicit non-QuerySet return annotations should suppress Django QuerySet fallback: ${certificateCallers.flatMap((result) => result.edges.map((edge) => `${edge.callerId}:${edge.callsite.range.startLine + 1}`)).join(', ')}`,
+      );
+      assert.ok(
+        certificateCallers.some((result) => result.edges.some((edge) =>
+          edge.callerId.includes('return_annotated') &&
+          edge.confidence !== 'possible')),
+        `expected Python return annotation to resolve Django QuerySet method usage, got ${certificateCallers.flatMap((result) => result.edges.map((edge) => `${edge.callerId}:${edge.confidence}`)).join(', ')}`,
+      );
+      assert.ok(
+        certificateCallers.some((result) => result.edges.some((edge) =>
+          edge.callerId.includes('single_line_chain') &&
+          edge.confidence !== 'possible')),
+        `expected Python single-line QuerySet chain to resolve Django QuerySet method usage, got ${certificateCallers.flatMap((result) => result.edges.map((edge) => `${edge.callerId}:${edge.confidence}`)).join(', ')}`,
+      );
+      assert.ok(
+        certificateCallers.some((result) => result.edges.some((edge) =>
+          edge.callerId.includes('related_manager_chain') &&
+          edge.confidence !== 'possible')),
+        `expected Django reverse relation manager chain to resolve QuerySet method usage, got ${certificateCallers.flatMap((result) => result.edges.map((edge) => `${edge.callerId}:${edge.confidence}`)).join(', ')}`,
+      );
+      assert.ok(
+        certificateCallers.some((result) => result.edges.some((edge) =>
+          edge.callerId.includes('WhtCertificateQuerySet.chain_latest') &&
+          edge.confidence !== 'possible')),
+        `expected typing.Self to resolve to the enclosing QuerySet type, got ${certificateCallers.flatMap((result) => result.edges.map((edge) => `${edge.callerId}:${edge.confidence}`)).join(', ')}`,
+      );
+      assert.ok(
+        !certificateCallers.some((result) => result.edges.some((edge) =>
+          edge.callerId.includes('WhtReceiptQuerySet.chain_latest'))),
+        `typing.Self from another QuerySet class must not resolve as the same type: ${certificateCallers.flatMap((result) => result.edges.map((edge) => `${edge.callerId}:${edge.confidence}`)).join(', ')}`,
+      );
+
+      const summaries = api.callGraph.getSymbolRelationSummariesForDocument(models);
+      const certificateSummary = summaries.find((item) =>
+        item.symbol.qualifiedName === 'WhtCertificateQuerySet.get_latest_versions');
+      assert.strictEqual(
+        certificateSummary?.usageCount,
+        12,
+        `expected typed/return-annotated calls plus unknown receiver Django fallback usages, got ${summaries.map((item) => `${item.symbol.qualifiedName}:${item.usageCount}`).join(', ')}`,
+      );
+      const managerCallers = api.callGraph.getCallers('DerivedWhtManager.get_latest_versions');
+      assert.ok(
+        managerCallers.some((result) => result.edges.some((edge) =>
+          edge.callerId.includes('typed_manager') &&
+          edge.confidence === 'exact')),
+        `expected typed Manager receiver to resolve exactly, got ${managerCallers.flatMap((result) => result.edges.map((edge) => `${edge.callerId}:${edge.confidence}`)).join(', ')}`,
+      );
+      assert.ok(
+        managerCallers.some((result) => result.edges.some((edge) =>
+          edge.callerId.includes('unknown_receivers'))),
+        `unknown receivers should retain Django Manager fallback usages to avoid false negatives: ${managerCallers.flatMap((result) => result.edges.map((edge) => `${edge.callerId}:${edge.callsite.range.startLine + 1}`)).join(', ')}`,
+      );
+    } finally {
+      try { await vscode.workspace.fs.delete(models); } catch {}
+      try { await vscode.workspace.fs.delete(consumer); } catch {}
+      await restoreBackend();
+      await api.callGraph.rebuild();
+    }
+  });
+
   test('links interface and abstract implementations', async function () {
     this.timeout(30_000);
     const restoreBackend = await useCallGraphBackend('javascript');

@@ -176,6 +176,11 @@ impl EngineConfig {
         name == self.index_dir_name || name == ".zoekt-rs"
     }
 
+    pub fn add_exclude_pattern(&mut self, pattern: String) {
+        self.exclude_patterns.push(pattern);
+        self.refresh_excluded_dir_names();
+    }
+
     pub fn is_overlay_update_excluded_relative_path(&self, rel_path: &str) -> bool {
         let normalized = normalize_relative_path(rel_path);
         normalized
@@ -400,11 +405,11 @@ mod tests {
         )?;
 
         let config = EngineConfig::for_workspace(&root);
-        assert!(config.is_excluded_relative_path("zuzu/db/migrations/0001_initial.py"));
-        assert!(config.is_excluded_relative_path("zuzu/client/src/generated/api.ts"));
+        assert!(config.is_excluded_relative_path("samplepkg/app/migrations/0001_initial.py"));
+        assert!(config.is_excluded_relative_path("samplepkg/client/src/generated/api.ts"));
         assert!(config.is_excluded_relative_path(".vscode/django-shell-editor/context.py"));
-        assert!(config.is_excluded_relative_path("zuzu/client/node_modules/react/index.js"));
-        assert!(!config.is_excluded_relative_path("zuzu/db/models.py"));
+        assert!(config.is_excluded_relative_path("samplepkg/client/node_modules/react/index.js"));
+        assert!(!config.is_excluded_relative_path("samplepkg/app/models.py"));
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
@@ -413,8 +418,8 @@ mod tests {
     #[test]
     fn default_config_keeps_migrations_and_generated_files_indexable() {
         let config = EngineConfig::default();
-        assert!(!config.is_excluded_relative_path("zuzu/db/migrations/0001_initial.py"));
-        assert!(!config.is_excluded_relative_path("zuzu/client/src/generated/api.ts"));
+        assert!(!config.is_excluded_relative_path("samplepkg/app/migrations/0001_initial.py"));
+        assert!(!config.is_excluded_relative_path("samplepkg/client/src/generated/api.ts"));
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {

@@ -37,6 +37,7 @@ const CALL_GRAPH_USAGE_SEARCH_INCLUDE_PATTERNS = [
   '**/*.mjs',
   '**/*.cjs',
 ];
+const CALL_GRAPH_IMPL_INLAY_LARGE_COUNT_THRESHOLD = 50;
 
 let activeOverlay: OverlayPanel | undefined;
 
@@ -1800,7 +1801,7 @@ function buildPreviewCallGraphInlayEntries(
   if (showCalleeInlayHints && summary.calleeCount > 0) {
     entries.push({ ...base, kind: 'callees', text: `callees ${summary.calleeCount}`, count: summary.calleeCount });
   }
-  if (summary.implementationCount > 0) {
+  if (shouldShowImplementationInlay(summary)) {
     entries.push({ ...base, kind: 'impl', text: `impl ${summary.implementationCount}`, count: summary.implementationCount });
   }
   if (summary.usageCount > 0) {
@@ -1938,7 +1939,7 @@ function buildCallGraphInlayHint(
       summary.symbol.qualifiedName,
     ));
   }
-  if (summary.implementationCount > 0) {
+  if (shouldShowImplementationInlay(summary)) {
     appendInlaySeparator(parts);
     parts.push(makeInlayCommandPart(
       `impl ${summary.implementationCount}`,
@@ -1982,13 +1983,30 @@ function buildCallGraphInlayRegistryEntries(
   if (showCalleeInlayHints && summary.calleeCount > 0) {
     entries.push({ ...base, kind: 'callees' });
   }
-  if (summary.implementationCount > 0) {
+  if (shouldShowImplementationInlay(summary)) {
     entries.push({ ...base, kind: 'impl' });
   }
   if (summary.usageCount > 0) {
     entries.push({ ...base, kind: 'usages' });
   }
   return entries;
+}
+
+function shouldShowImplementationInlay(summary: CallGraphSymbolRelationSummary): boolean {
+  if (summary.implementationCount <= 0) { return false; }
+  if (summary.implementationCount < CALL_GRAPH_IMPL_INLAY_LARGE_COUNT_THRESHOLD) { return true; }
+  return isAbstractOrProtocolLikeSymbol(summary.symbol);
+}
+
+function isAbstractOrProtocolLikeSymbol(symbol: CallGraphSymbol): boolean {
+  if (symbol.modifiers?.some((modifier) => modifier === 'abstract' || modifier === 'interface')) {
+    return true;
+  }
+  return [...symbol.extendsNames ?? [], ...symbol.implementsNames ?? []]
+    .some((name) => {
+      const tail = name.split('.').pop() ?? name;
+      return tail === 'Protocol' || tail === 'ABC' || tail === 'ABCMeta';
+    });
 }
 
 function makeInlayCommandPart(

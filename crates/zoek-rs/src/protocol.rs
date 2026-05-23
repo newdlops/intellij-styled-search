@@ -230,6 +230,7 @@ pub struct GraphIndexResponse {
 
 #[derive(Clone, Debug)]
 pub struct GraphQueryReference {
+    pub source_ref_id: Option<String>,
     pub target_symbol_id: Option<String>,
     pub edge_kind: String,
     pub name: String,
@@ -241,6 +242,9 @@ pub struct GraphQueryReference {
     pub end_line: u32,
     pub end_column: u32,
     pub enclosing_symbol_id: Option<String>,
+    pub bound_mask: Option<u8>,
+    pub confidence: Option<String>,
+    pub provenance: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -278,7 +282,11 @@ pub struct GraphSymbolResponse {
     pub extends_names: Vec<String>,
     pub implements_names: Vec<String>,
     pub usage_count: Option<usize>,
+    pub usage_must_count: Option<usize>,
+    pub usage_may_count: Option<usize>,
     pub implementation_count: Option<usize>,
+    pub implementation_must_count: Option<usize>,
+    pub implementation_may_count: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -573,8 +581,27 @@ impl GraphQueryReference {
             .as_ref()
             .map(|value| format!(",\"targetSymbolId\":{}", json_string(value)))
             .unwrap_or_default();
+        let source_ref = self
+            .source_ref_id
+            .as_ref()
+            .map(|value| format!(",\"sourceRefId\":{}", json_string(value)))
+            .unwrap_or_default();
+        let bound_mask = self
+            .bound_mask
+            .map(|value| format!(",\"boundMask\":{}", value))
+            .unwrap_or_default();
+        let confidence = self
+            .confidence
+            .as_ref()
+            .map(|value| format!(",\"confidence\":{}", json_string(value)))
+            .unwrap_or_default();
+        let provenance = self
+            .provenance
+            .as_ref()
+            .map(|value| format!(",\"provenance\":{}", json_string(value)))
+            .unwrap_or_default();
         format!(
-            "{{\"edgeKind\":{},\"name\":{},\"rawText\":{},\"uri\":{},\"relPath\":{},\"range\":{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}}}{}{}}}",
+            "{{\"edgeKind\":{},\"name\":{},\"rawText\":{},\"uri\":{},\"relPath\":{},\"range\":{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}}}{}{}{}{}{}{}}}",
             json_string(&self.edge_kind),
             json_string(&self.name),
             json_string(&self.raw_text),
@@ -584,8 +611,12 @@ impl GraphQueryReference {
             self.start_column,
             self.end_line,
             self.end_column,
+            source_ref,
             target,
-            enclosing
+            enclosing,
+            bound_mask,
+            confidence,
+            provenance
         )
     }
 }
@@ -631,9 +662,25 @@ impl GraphSymbolResponse {
             .usage_count
             .map(|value| format!(",\"usageCount\":{value}"))
             .unwrap_or_default();
+        let usage_must_count = self
+            .usage_must_count
+            .map(|value| format!(",\"usageMustCount\":{value}"))
+            .unwrap_or_default();
+        let usage_may_count = self
+            .usage_may_count
+            .map(|value| format!(",\"usageMayCount\":{value}"))
+            .unwrap_or_default();
         let implementation_count = self
             .implementation_count
             .map(|value| format!(",\"implementationCount\":{value}"))
+            .unwrap_or_default();
+        let implementation_must_count = self
+            .implementation_must_count
+            .map(|value| format!(",\"implementationMustCount\":{value}"))
+            .unwrap_or_default();
+        let implementation_may_count = self
+            .implementation_may_count
+            .map(|value| format!(",\"implementationMayCount\":{value}"))
             .unwrap_or_default();
         let extends_names = if self.extends_names.is_empty() {
             String::new()
@@ -652,7 +699,7 @@ impl GraphSymbolResponse {
             )
         };
         format!(
-            "{{\"id\":{},\"name\":{},\"qualifiedName\":{},\"kind\":{},\"language\":{},\"uri\":{},\"relPath\":{},\"range\":{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}}},\"bodyRange\":{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}}}{}{}{}{}{}{}{}}}",
+            "{{\"id\":{},\"name\":{},\"qualifiedName\":{},\"kind\":{},\"language\":{},\"uri\":{},\"relPath\":{},\"range\":{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}}},\"bodyRange\":{{\"startLine\":{},\"startColumn\":{},\"endLine\":{},\"endColumn\":{}}}{}{}{}{}{}{}{}{}{}{}{}}}",
             json_string(&self.id),
             json_string(&self.name),
             json_string(&self.qualified_name),
@@ -674,7 +721,11 @@ impl GraphSymbolResponse {
             extends_names,
             implements_names,
             usage_count,
-            implementation_count
+            usage_must_count,
+            usage_may_count,
+            implementation_count,
+            implementation_must_count,
+            implementation_may_count
         )
     }
 }
@@ -772,13 +823,13 @@ mod tests {
     #[test]
     fn graph_symbol_response_serializes_relation_name_lists_as_json_arrays() {
         let symbol = GraphSymbolResponse {
-            id: "python:pkg/user_service.py:UserProfileImageUpdateDict:91".to_string(),
-            name: "UserProfileImageUpdateDict".to_string(),
-            qualified_name: "UserProfileImageUpdateDict".to_string(),
+            id: "python:pkg/service.py:PayloadRecordA:91".to_string(),
+            name: "PayloadRecordA".to_string(),
+            qualified_name: "PayloadRecordA".to_string(),
             kind: "class".to_string(),
             language: "python".to_string(),
-            uri: "file:///workspace/pkg/user_service.py".to_string(),
-            rel_path: "pkg/user_service.py".to_string(),
+            uri: "file:///workspace/pkg/service.py".to_string(),
+            rel_path: "pkg/service.py".to_string(),
             start_line: 90,
             start_column: 10,
             end_line: 90,
@@ -793,7 +844,11 @@ mod tests {
             extends_names: vec!["TypedDict".to_string(), "total=False".to_string()],
             implements_names: vec!["PythonFramework".to_string(), "RuntimeHook".to_string()],
             usage_count: Some(1),
+            usage_must_count: Some(1),
+            usage_may_count: Some(1),
             implementation_count: Some(0),
+            implementation_must_count: Some(0),
+            implementation_may_count: Some(0),
         };
 
         let json = symbol.to_json();
@@ -820,13 +875,13 @@ mod tests {
             built_at_unix_ms: 42,
             total_symbols: 1,
             symbols: vec![GraphSymbolResponse {
-                id: "python:pkg/user_service.py:UserProfileImageUpdateDict:91".to_string(),
-                name: "UserProfileImageUpdateDict".to_string(),
-                qualified_name: "UserProfileImageUpdateDict".to_string(),
+                id: "python:pkg/service.py:PayloadRecordA:91".to_string(),
+                name: "PayloadRecordA".to_string(),
+                qualified_name: "PayloadRecordA".to_string(),
                 kind: "class".to_string(),
                 language: "python".to_string(),
-                uri: "file:///workspace/pkg/user_service.py".to_string(),
-                rel_path: "pkg/user_service.py".to_string(),
+                uri: "file:///workspace/pkg/service.py".to_string(),
+                rel_path: "pkg/service.py".to_string(),
                 start_line: 90,
                 start_column: 10,
                 end_line: 90,
@@ -841,7 +896,11 @@ mod tests {
                 extends_names: vec!["TypedDict".to_string(), "total=False".to_string()],
                 implements_names: Vec::new(),
                 usage_count: Some(1),
+                usage_must_count: Some(1),
+                usage_may_count: Some(1),
                 implementation_count: Some(0),
+                implementation_must_count: Some(0),
+                implementation_may_count: Some(0),
             }],
             warnings: Vec::new(),
         };

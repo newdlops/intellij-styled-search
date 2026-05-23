@@ -8,7 +8,7 @@ import { pathToFileURL } from 'url';
 import { gzip, gunzip } from 'zlib';
 import * as vscode from 'vscode';
 import { compilePathScopeMatcher } from './pathScope';
-import { decodeTextBytes, looksBinaryContent } from './textFiles';
+import { decodeTextBytes, hasBinaryFileExtension, looksBinaryContent } from './textFiles';
 
 export type CallGraphLanguage = 'python' | 'java' | 'kotlin' | 'typescript' | 'javascript' | 'graphql';
 export type CallGraphSymbolKind = 'class' | 'interface' | 'enum' | 'type' | 'struct' | 'function' | 'method' | 'constructor' | 'constant' | 'variable' | 'field' | 'property';
@@ -41,6 +41,12 @@ export interface CallGraphSymbol {
   modifiers?: CallGraphSymbolModifier[];
   extendsNames?: string[];
   implementsNames?: string[];
+  usageCount?: number;
+  usageMustCount?: number;
+  usageMayCount?: number;
+  implementationCount?: number;
+  implementationMustCount?: number;
+  implementationMayCount?: number;
 }
 
 export interface CallGraphCallSite {
@@ -68,6 +74,7 @@ export interface CallGraphEdge {
 
 export interface CallGraphReference {
   symbolId: string;
+  sourceRefId?: string;
   edgeKind?: string;
   name: string;
   rawText: string;
@@ -75,6 +82,9 @@ export interface CallGraphReference {
   relPath: string;
   range: CallGraphRange;
   enclosingSymbolId?: string;
+  boundMask?: number;
+  confidence?: string;
+  provenance?: string;
 }
 
 export interface CallGraphStats {
@@ -303,6 +313,7 @@ type CallGraphDocumentSummaryFileChunk = CallGraphCacheChunk & {
 };
 
 type RustGraphQueryReference = {
+  sourceRefId?: string;
   targetSymbolId?: string;
   edgeKind?: string;
   name: string;
@@ -311,6 +322,9 @@ type RustGraphQueryReference = {
   relPath: string;
   range: CallGraphRange;
   enclosingSymbolId?: string;
+  boundMask?: number;
+  confidence?: string;
+  provenance?: string;
 };
 
 type RustGraphQueryResponse = {
@@ -349,7 +363,11 @@ type RustGraphSymbol = {
   extendsNames?: string[];
   implementsNames?: string[];
   usageCount?: number;
+  usageMustCount?: number;
+  usageMayCount?: number;
   implementationCount?: number;
+  implementationMustCount?: number;
+  implementationMayCount?: number;
 };
 
 type RustGraphSymbolQueryResponse = {
@@ -655,6 +673,10 @@ const RUST_GRAPH_PROCESS_KILL_TIMEOUT_MS = 2_000;
 const INTERNAL_CALL_GRAPH_EXCLUDE_GLOBS = [
   '**/.zoek-rs/**',
   '**/.zoekt-rs/**',
+  '**/.codeidx/**',
+  '**/.vscode/**',
+  '**/.vscode-test/**',
+  '**/.lh/**',
 ];
 const gzipAsync = promisify(gzip);
 const gunzipAsync = promisify(gunzip);
@@ -1712,7 +1734,7 @@ export class CallGraphService implements vscode.Disposable {
     }
     const uniqueUris = dedupeStrings(uris.map((uri) => uri.toString()))
       .map((value) => vscode.Uri.parse(value))
-      .filter((uri) => uri.scheme === 'file');
+      .filter((uri) => uri.scheme === 'file' && isSupportedSourceUri(uri) && !hasBinaryFileExtension(uri.fsPath));
     if (uniqueUris.length === 0) { return; }
     const started = Date.now();
     let updated = false;
@@ -1767,8 +1789,14 @@ export class CallGraphService implements vscode.Disposable {
     const excludeMatcher = createCallGraphExcludeMatcher(cfg);
     const changedPaths: string[] = [];
     const deletedPaths: string[] = [];
+    let ignoredPaths = 0;
     for (const uri of uris) {
-      if (!isSupportedSourceUri(uri) || isUriExcludedFromCallGraph(uri, workspaceRoot, excludeMatcher) || !fs.existsSync(uri.fsPath)) {
+      const supported = isSupportedSourceUri(uri) && !hasBinaryFileExtension(uri.fsPath);
+      if (!supported) {
+        ignoredPaths += 1;
+        continue;
+      }
+      if (isUriExcludedFromCallGraph(uri, workspaceRoot, excludeMatcher) || !fs.existsSync(uri.fsPath)) {
         deletedPaths.push(uri.fsPath);
       } else {
         changedPaths.push(uri.fsPath);
@@ -1787,11 +1815,15 @@ export class CallGraphService implements vscode.Disposable {
       String(getConfiguredCallGraphConcurrency(cfg)),
       ...changedPaths,
     ];
+    for (const glob of getConfiguredCallGraphExcludeGlobs(cfg)) {
+      args.push('--exclude', glob);
+    }
     for (const deletedPath of deletedPaths) {
       args.push('--delete', deletedPath);
     }
     this.log.appendLine(
-      `call graph rust-native incremental start: reason=${reason} changed=${changedPaths.length} deleted=${deletedPaths.length}`,
+      `call graph rust-native incremental start: reason=${reason} changed=${changedPaths.length} ` +
+      `deleted=${deletedPaths.length} ignored=${ignoredPaths}`,
     );
     const response = await this.invokeRustGraphJson(args) as RustGraphIndexResponse;
     if (response.type !== 'graph-index' || response.ok !== true || response.builtAtUnixMs !== manifest.builtAtUnixMs) {
@@ -3026,6 +3058,7 @@ export class CallGraphService implements vscode.Disposable {
       }
       return response.references.map((reference) => ({
         symbolId: String(reference.targetSymbolId ?? symbolId),
+        ...(reference.sourceRefId ? { sourceRefId: String(reference.sourceRefId) } : {}),
         ...(reference.edgeKind ? { edgeKind: String(reference.edgeKind) } : {}),
         name: String(reference.name ?? ''),
         rawText: String(reference.rawText ?? ''),
@@ -3033,6 +3066,9 @@ export class CallGraphService implements vscode.Disposable {
         relPath: String(reference.relPath ?? ''),
         range: normalizeGraphRange(reference.range),
         ...(reference.enclosingSymbolId ? { enclosingSymbolId: String(reference.enclosingSymbolId) } : {}),
+        ...(typeof reference.boundMask === 'number' ? { boundMask: reference.boundMask } : {}),
+        ...(reference.confidence ? { confidence: String(reference.confidence) } : {}),
+        ...(reference.provenance ? { provenance: String(reference.provenance) } : {}),
       }));
     } catch (err) {
       this.log.appendLine(`call graph rust graph query skipped: ${err instanceof Error ? err.message : String(err)}`);
@@ -3086,6 +3122,7 @@ export class CallGraphService implements vscode.Disposable {
       }
       return response.references.map((reference) => ({
         symbolId: String(reference.targetSymbolId ?? ''),
+        ...(reference.sourceRefId ? { sourceRefId: String(reference.sourceRefId) } : {}),
         ...(reference.edgeKind ? { edgeKind: String(reference.edgeKind) } : {}),
         name: String(reference.name ?? ''),
         rawText: String(reference.rawText ?? ''),
@@ -3093,6 +3130,9 @@ export class CallGraphService implements vscode.Disposable {
         relPath: String(reference.relPath ?? ''),
         range: normalizeGraphRange(reference.range),
         ...(reference.enclosingSymbolId ? { enclosingSymbolId: String(reference.enclosingSymbolId) } : {}),
+        ...(typeof reference.boundMask === 'number' ? { boundMask: reference.boundMask } : {}),
+        ...(reference.confidence ? { confidence: String(reference.confidence) } : {}),
+        ...(reference.provenance ? { provenance: String(reference.provenance) } : {}),
       })).filter((reference) => reference.symbolId.length > 0);
     } catch (err) {
       this.log.appendLine(`call graph rust graph callees query skipped: ${err instanceof Error ? err.message : String(err)}`);
@@ -3950,6 +3990,7 @@ export class CallGraphService implements vscode.Disposable {
   private async rebuildInRustGraphProcess(input: {
     workspaceRoot: string;
     maxFileSize: number;
+    excludeGlobs: string[];
     parseConcurrency: number;
     configSignature: string;
     token?: vscode.CancellationToken;
@@ -3984,6 +4025,9 @@ export class CallGraphService implements vscode.Disposable {
       '--workers',
       String(Math.max(1, Math.min(MAX_CALL_GRAPH_CONCURRENCY, Math.floor(input.parseConcurrency)))),
     ];
+    for (const glob of input.excludeGlobs) {
+      args.push('--exclude', glob);
+    }
     this.log.appendLine(`call graph rust-native rebuild start: binary=${binary} args=${JSON.stringify(args.slice(1))}`);
     const response = await this.invokeRustGraphJson(args, {
       token: input.token,
@@ -4148,6 +4192,7 @@ export class CallGraphService implements vscode.Disposable {
     return this.rebuildInRustGraphProcess({
       workspaceRoot,
       maxFileSize,
+      excludeGlobs: getConfiguredCallGraphExcludeGlobs(cfg),
       parseConcurrency,
       configSignature,
       token,
@@ -4383,7 +4428,11 @@ function rustGraphSymbolToCallGraphSymbol(symbol: RustGraphSymbol): CallGraphSym
     ...(Array.isArray(symbol.extendsNames) ? { extendsNames: symbol.extendsNames.map(String).filter(Boolean) } : {}),
     ...(Array.isArray(symbol.implementsNames) ? { implementsNames: symbol.implementsNames.map(String).filter(Boolean) } : {}),
     ...(Number.isFinite(symbol.usageCount) ? { usageCount: Math.max(0, Math.floor(symbol.usageCount as number)) } : {}),
+    ...(Number.isFinite(symbol.usageMustCount) ? { usageMustCount: Math.max(0, Math.floor(symbol.usageMustCount as number)) } : {}),
+    ...(Number.isFinite(symbol.usageMayCount) ? { usageMayCount: Math.max(0, Math.floor(symbol.usageMayCount as number)) } : {}),
     ...(Number.isFinite(symbol.implementationCount) ? { implementationCount: Math.max(0, Math.floor(symbol.implementationCount as number)) } : {}),
+    ...(Number.isFinite(symbol.implementationMustCount) ? { implementationMustCount: Math.max(0, Math.floor(symbol.implementationMustCount as number)) } : {}),
+    ...(Number.isFinite(symbol.implementationMayCount) ? { implementationMayCount: Math.max(0, Math.floor(symbol.implementationMayCount as number)) } : {}),
   };
 }
 
@@ -4650,6 +4699,9 @@ async function parseSourceFileRecord(
   limits: CallGraphParseLimits = DEFAULT_CALL_GRAPH_PARSE_LIMITS,
 ): Promise<ParsedSourceFileResult> {
   if (!isSupportedSourceUri(uri)) {
+    return { skipped: true, warnings: [] };
+  }
+  if (hasBinaryFileExtension(uri.fsPath)) {
     return { skipped: true, warnings: [] };
   }
   const stat = await vscode.workspace.fs.stat(uri);
@@ -5084,6 +5136,7 @@ async function walkCallGraphSourceFilesNode(
       if (!entry.isFile()) { continue; }
       const ext = path.extname(entry.name).toLowerCase();
       if (!SOURCE_EXTENSIONS.has(ext) || entry.name.endsWith('.d.ts')) { continue; }
+      if (hasBinaryFileExtension(entry.name)) { continue; }
       if (excludeMatcher && !excludeMatcher(relPath)) { continue; }
       out.push(nodeFileUri(path.join(workspaceRoot, relPath)));
       onProgress(out.length);
@@ -5101,6 +5154,9 @@ async function parseSourceFileRecordFromFs(
 ): Promise<ParsedSourceFileResult> {
   const stat = await fs.promises.stat(uri.fsPath);
   if (stat.isDirectory()) {
+    return { skipped: true, warnings: [] };
+  }
+  if (hasBinaryFileExtension(uri.fsPath)) {
     return { skipped: true, warnings: [] };
   }
   if (maxFileSize > 0 && stat.size > maxFileSize) {
@@ -5690,7 +5746,7 @@ function extractVariableBindings(
     for (let lineNo = owner.bodyRange.startLine; lineNo <= owner.bodyRange.endLine && lineNo < lines.length; lineNo++) {
       const rawLine = lines[lineNo];
       const line = stripInlineCommentsAndStrings(rawLine, language);
-      for (const binding of findVariableBindingsInLine(line, lineNo, owner.id, language)) {
+      for (const binding of findVariableBindingsInLine(line, lineNo, owner.id, language, owner.containerName)) {
         bindings.push(binding);
       }
     }
@@ -5961,11 +6017,13 @@ function extractParameterBindings(
     const signature = owner.signature ?? '';
     const parameterList = readParameterList(signature);
     if (!parameterList) { continue; }
-    for (const candidate of findParameterBindingCandidates(parameterList, owner.range.startLine, language)) {
+    for (const candidate of findParameterBindingCandidates(parameterList, owner.range.startLine, language, owner.containerName)) {
       for (const variableName of candidate.variableNames) {
+        const className = contextualBindingClassName(candidate.className, owner.containerName);
+        if (!className) { continue; }
         bindings.push({
           variableName: normalizeReceiver(variableName),
-          className: normalizeBindingClassName(candidate.className),
+          className,
           enclosingSymbolId: owner.id,
           range: candidate.range,
         });
@@ -6012,6 +6070,7 @@ function findParameterBindingCandidates(
   parameterList: string,
   lineNo: number,
   language: CallGraphLanguage,
+  selfType?: string,
 ): VariableBindingCandidate[] {
   const candidates: VariableBindingCandidate[] = [];
   for (const rawParameter of splitParameterList(parameterList)) {
@@ -6020,7 +6079,7 @@ function findParameterBindingCandidates(
     let match: RegExpExecArray | null = null;
     const add = (variableName: string, className: string | undefined, column: number, width?: number) => {
       if (!variableName || variableName === 'self' || variableName === 'cls') { return; }
-      const normalizedClassName = extractLikelyBindingClassName(className);
+      const normalizedClassName = extractLikelyBindingClassName(className, selfType);
       if (!normalizedClassName) { return; }
       candidates.push(variableCandidate([variableName], normalizedClassName, lineNo, column, width ?? variableName.length));
     };
@@ -6164,11 +6223,12 @@ function findVariableBindingsInLine(
   lineNo: number,
   enclosingSymbolId: string,
   language: CallGraphLanguage,
+  selfType?: string,
 ): CallGraphVariableBinding[] {
   const out: CallGraphVariableBinding[] = [];
   const add = (variableName: string, className: string, column: number) => {
     if (!variableName || !className) { return; }
-    const normalizedClassName = normalizeBindingClassName(className);
+    const normalizedClassName = contextualBindingClassName(className, selfType);
     if (!normalizedClassName) { return; }
     out.push({
       variableName: normalizeReceiver(variableName),
@@ -6247,6 +6307,30 @@ function findCallsInLine(
       enclosingSymbolId,
       range: { startLine: lineNo, startColumn: start, endLine: lineNo, endColumn: start + match[0].length },
     });
+  }
+  if (language === 'python') {
+    const chainedMemberRegex = /\.\s*([A-Za-z_$][\w$]*)\s*(?:\(|\?\.\()/g;
+    for (const match of line.matchAll(chainedMemberRegex)) {
+      const name = match[1];
+      if (CALL_KEYWORDS.has(name)) { continue; }
+      const start = (match.index ?? 0) + match[0].indexOf(name);
+      const alreadyCall = calls.some((call) =>
+        call.name === name &&
+        call.range.startLine === lineNo &&
+        start >= call.range.startColumn &&
+        start <= call.range.endColumn);
+      if (alreadyCall) { continue; }
+      const end = (match.index ?? 0) + match[0].length;
+      calls.push({
+        name,
+        receiver: '<chain>',
+        rawText: rawLine.slice(start, Math.min(rawLine.length, end)),
+        uri: uri.toString(),
+        relPath,
+        enclosingSymbolId,
+        range: { startLine: lineNo, startColumn: start, endLine: lineNo, endColumn: end },
+      });
+    }
   }
 
   if (language === 'python' && propertyNames.size > 0) {
@@ -6359,6 +6443,13 @@ function resolveReferenceTarget(
   symbolsByFileAndName: Map<string, CallGraphSymbol[]>,
   index: SymbolIndex,
 ): CallGraphSymbol | undefined {
+  if (candidate.name === 'Self' && languageFromRelPath(candidate.relPath) === 'python') {
+    const owner = candidate.enclosingSymbolId ? index.byId.get(candidate.enclosingSymbolId) : undefined;
+    if (owner?.containerName) {
+      const selfType = findTypeSymbolsByName(owner.containerName, index)[0];
+      if (selfType) { return selfType; }
+    }
+  }
   const sameFile = symbolsByFileAndName.get(`${candidate.relPath}:${candidate.name}`) ?? [];
   if (candidate.receiver) {
     const receiverTypes = index.byClassName.get(lastQualifiedPart(candidate.receiver)) ?? [];
@@ -6368,11 +6459,18 @@ function resolveReferenceTarget(
       if (match) { return match; }
     }
   }
-  if (sameFile.length === 1) { return sameFile[0]; }
+  if (sameFile.length === 1) {
+    return isPythonDjangoOrmMethodSymbol(sameFile[0], index) ? undefined : sameFile[0];
+  }
   const global = symbolsByName.get(candidate.name) ?? [];
   const sameLanguage = global.filter((symbol) => symbol.language === languageFromRelPath(candidate.relPath));
-  if (sameLanguage.length === 1) { return sameLanguage[0]; }
-  return global.length === 1 ? global[0] : undefined;
+  if (sameLanguage.length === 1) {
+    return isPythonDjangoOrmMethodSymbol(sameLanguage[0], index) ? undefined : sameLanguage[0];
+  }
+  if (global.length === 1) {
+    return isPythonDjangoOrmMethodSymbol(global[0], index) ? undefined : global[0];
+  }
+  return undefined;
 }
 
 async function resolveCallsAsync(
@@ -6510,10 +6608,43 @@ function resolveCall(
           : `receiver ${receiver} matched indexed class`],
       }));
     }
+    const relatedTargets = findPythonDjangoRelatedReceiverMethodMatches(call, index);
+    if (relatedTargets.length > 0) {
+      return relatedTargets.map((match) => ({
+        symbol: match.symbol,
+        kind: 'method' as const,
+        confidence: match.inherited ? 'resolved' as const : 'exact' as const,
+        evidence: [match.inherited
+          ? `receiver ${receiver} resolved from Django reverse relation through inherited method from ${match.owner.qualifiedName}`
+          : `receiver ${receiver} resolved from Django reverse relation ${match.owner.qualifiedName}`],
+      }));
+    }
+    const returnTypeTargets = findPythonDjangoReturnTypeMethodMatches(caller, call, index);
+    if (returnTypeTargets.length > 0) {
+      return returnTypeTargets.map((match) => ({
+        symbol: match.symbol,
+        kind: 'method' as const,
+        confidence: match.inherited ? 'resolved' as const : 'exact' as const,
+        evidence: [match.inherited
+          ? `receiver ${receiver} resolved from Python Django return type through inherited method from ${match.owner.qualifiedName}`
+          : `receiver ${receiver} resolved from Python Django return type ${match.owner.qualifiedName}`],
+      }));
+    }
+    const djangoFallbackTargets = findPythonDjangoOrmFallbackMethodMatches(caller, call, index);
+    if (djangoFallbackTargets.length > 0) {
+      return djangoFallbackTargets.map((symbol) => ({
+        symbol,
+        kind: 'virtual' as const,
+        confidence: 'resolved' as const,
+        evidence: [`receiver ${receiver} type is unknown; retained Django ORM method fallback by name`],
+      }));
+    }
     if (!options.includePossibleEdges) {
       return [];
     }
-    const possibleMethods = collectMethodNameMatches(call.name, index).slice(0, options.maxPossibleTargetsPerCall);
+    const possibleMethods = collectMethodNameMatches(call.name, index)
+      .filter((symbol) => !isPythonDjangoOrmMethodSymbol(symbol, index))
+      .slice(0, options.maxPossibleTargetsPerCall);
     return possibleMethods.map((symbol) => ({
       symbol,
       kind: 'virtual' as const,
@@ -6548,7 +6679,11 @@ function resolveCall(
   }
 
   const sameFile = (index.byName.get(call.name) ?? [])
-    .filter((symbol) => isCallableSymbol(symbol) && symbol.relPath === caller.relPath && symbol.id !== caller.id);
+    .filter((symbol) =>
+      isCallableSymbol(symbol) &&
+      symbol.relPath === caller.relPath &&
+      symbol.id !== caller.id &&
+      !isPythonDjangoOrmMethodSymbol(symbol, index));
   if (sameFile.length === 1) {
     return [{
       symbol: sameFile[0],
@@ -6569,7 +6704,11 @@ function resolveCall(
     }));
   }
 
-  const globalMatches = (index.byName.get(call.name) ?? []).filter((symbol) => isCallableSymbol(symbol) && symbol.id !== caller.id);
+  const globalMatches = (index.byName.get(call.name) ?? [])
+    .filter((symbol) =>
+      isCallableSymbol(symbol) &&
+      symbol.id !== caller.id &&
+      !isPythonDjangoOrmMethodSymbol(symbol, index));
   if (globalMatches.length === 1) {
     return [{
       symbol: globalMatches[0],
@@ -6684,6 +6823,149 @@ function buildSymbolIndex(symbols: CallGraphSymbol[], bindings: CallGraphVariabl
 
 function collectMethodNameMatches(name: string, index: SymbolIndex): CallGraphSymbol[] {
   return index.methodsByName.get(name) ?? [];
+}
+
+function findPythonDjangoReturnTypeMethodMatches(
+  caller: CallGraphSymbol,
+  call: CallGraphCallSite,
+  index: SymbolIndex,
+): MethodTargetMatch[] {
+  if (caller.language !== 'python' || !call.receiver) {
+    return [];
+  }
+  const returnType = pythonReturnTypeFromSignature(caller.signature, caller.containerName);
+  if (!returnType) {
+    return [];
+  }
+  const returnTypes = findTypeSymbolsByName(returnType, index)
+    .filter((typeSymbol) => isPythonDjangoOrmCollectionType(typeSymbol, index, new Set<string>()));
+  if (returnTypes.length === 0) {
+    return [];
+  }
+  return dedupeMethodMatches(
+    returnTypes.flatMap((typeSymbol) => findMethodMatchesForType(typeSymbol, call.name, index, true)),
+  );
+}
+
+function findPythonDjangoRelatedReceiverMethodMatches(
+  call: CallGraphCallSite,
+  index: SymbolIndex,
+): MethodTargetMatch[] {
+  if (!call.receiver) {
+    return [];
+  }
+  const matches: MethodTargetMatch[] = [];
+  for (const segment of receiverIdentifierSegments(call.receiver).reverse()) {
+    const querysetType = djangoQuerySetTypeNameFromRelatedSegment(segment);
+    if (!querysetType) { continue; }
+    const typeSymbols = findTypeSymbolsByName(querysetType, index)
+      .filter((typeSymbol) => isPythonDjangoOrmCollectionType(typeSymbol, index, new Set<string>()));
+    for (const typeSymbol of typeSymbols) {
+      matches.push(...findMethodMatchesForType(typeSymbol, call.name, index, true));
+    }
+  }
+  return dedupeMethodMatches(matches);
+}
+
+function findPythonDjangoOrmFallbackMethodMatches(
+  caller: CallGraphSymbol,
+  call: CallGraphCallSite,
+  index: SymbolIndex,
+): CallGraphSymbol[] {
+  if (caller.language !== 'python' || !call.receiver) {
+    return [];
+  }
+  const returnType = pythonReturnTypeFromSignature(caller.signature, caller.containerName);
+  if (returnType) {
+    const returnTypes = findTypeSymbolsByName(returnType, index);
+    if (returnTypes.length > 0 &&
+      !returnTypes.some((typeSymbol) => isPythonDjangoOrmCollectionType(typeSymbol, index, new Set<string>()))) {
+      return [];
+    }
+  }
+  return collectMethodNameMatches(call.name, index)
+    .filter((symbol) => isPythonDjangoOrmMethodSymbol(symbol, index));
+}
+
+function receiverIdentifierSegments(receiver: string): string[] {
+  return receiver
+    .split(/[^\w$]+/g)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function djangoQuerySetTypeNameFromRelatedSegment(segment: string): string {
+  const stem = segment.endsWith('_set') ? segment.slice(0, -'_set'.length) : '';
+  if (!stem) { return ''; }
+  const pascal = stem
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
+    .join('');
+  return pascal ? `${pascal}QuerySet` : '';
+}
+
+function pythonReturnTypeFromSignature(signature: string | undefined, selfType?: string): string {
+  if (!signature) { return ''; }
+  const arrow = signature.lastIndexOf('->');
+  if (arrow < 0) { return ''; }
+  const tail = signature.slice(arrow + 2);
+  const beforeColon = tail.includes(':') ? tail.slice(0, tail.lastIndexOf(':')) : tail;
+  return extractLikelyBindingClassName(beforeColon, selfType);
+}
+
+function isPythonDjangoOrmMethodSymbol(symbol: CallGraphSymbol, index: SymbolIndex): boolean {
+  if (symbol.language !== 'python' || symbol.kind !== 'method' || !symbol.containerName) {
+    return false;
+  }
+  const seen = new Set<string>();
+  return findTypeSymbolsByName(symbol.containerName, index)
+    .some((typeSymbol) => isPythonDjangoOrmCollectionType(typeSymbol, index, seen));
+}
+
+function isPythonDjangoOrmCollectionType(
+  symbol: CallGraphSymbol,
+  index: SymbolIndex,
+  seen: Set<string>,
+): boolean {
+  if (symbol.language !== 'python' || !isTypeSymbol(symbol) || seen.has(symbol.id)) {
+    return false;
+  }
+  seen.add(symbol.id);
+  for (const baseName of symbol.extendsNames ?? []) {
+    if (isDjangoOrmCollectionBaseName(baseName)) {
+      return true;
+    }
+    if (findTypeSymbolsByName(baseName, index)
+      .some((parent) => isPythonDjangoOrmCollectionType(parent, index, seen))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isDjangoOrmCollectionBaseName(name: string): boolean {
+  const stripped = stripGenericSuffix(name).replace(/\([^)]*\)/g, '').trim();
+  const tail = lastQualifiedPart(stripped);
+  return tail === 'QuerySet' ||
+    tail === 'Manager' ||
+    tail === 'BaseManager' ||
+    tail === 'BaseUserManager' ||
+    stripped === 'Manager.from_queryset' ||
+    stripped === 'BaseManager.from_queryset' ||
+    stripped.endsWith('.Manager.from_queryset') ||
+    stripped.endsWith('.BaseManager.from_queryset');
+}
+
+function findTypeSymbolsByName(nameOrQualifiedName: string, index: SymbolIndex): CallGraphSymbol[] {
+  const exact = (index.byQualifiedName.get(nameOrQualifiedName) ?? []).filter(isTypeSymbol);
+  const simple = lastQualifiedPart(nameOrQualifiedName);
+  const simpleMatches = (index.byClassName.get(simple) ?? []).filter(isTypeSymbol);
+  const qualifiedSimpleMatches = simpleMatches.filter((symbol) => symbol.qualifiedName === nameOrQualifiedName);
+  return dedupeSymbols([
+    ...exact,
+    ...(qualifiedSimpleMatches.length > 0 ? qualifiedSimpleMatches : simpleMatches),
+  ]);
 }
 
 function findMethodMatchesForTypeName(
@@ -7587,6 +7869,9 @@ function callsiteReferenceFromEdge(edge: CallGraphEdge, symbolId: string): CallG
 }
 
 function referenceLocationKey(reference: CallGraphReference): string {
+  if (reference.sourceRefId) {
+    return `${reference.symbolId}:ref:${reference.sourceRefId}`;
+  }
   return [
     reference.symbolId,
     reference.uri,
@@ -7861,17 +8146,28 @@ function stripParameterDefault(parameter: string): string {
   return parameter;
 }
 
-function extractLikelyBindingClassName(typeText: string | undefined): string {
+function extractLikelyBindingClassName(typeText: string | undefined, selfType?: string): string {
   if (!typeText) { return ''; }
   const tokens = [...typeText.matchAll(/\b([A-Z][\w$.]*)\b/g)]
     .map((match) => lastQualifiedPart(match[1]))
     .filter((token) => !COLLECTION_BINDING_TYPE_NAMES.has(token) && !VALUE_BINDING_TYPE_NAMES.has(token));
   if (tokens.length > 0) {
-    return normalizeBindingClassName(tokens[0]);
+    return contextualBindingClassName(tokens[0], selfType);
   }
   const normalized = normalizeBindingClassName(typeText);
+  if (normalized === 'Self' && selfType) {
+    return lastQualifiedPart(selfType);
+  }
   if (COLLECTION_BINDING_TYPE_NAMES.has(normalized) || VALUE_BINDING_TYPE_NAMES.has(normalized)) {
     return '';
+  }
+  return normalized;
+}
+
+function contextualBindingClassName(className: string | undefined, selfType?: string): string {
+  const normalized = normalizeBindingClassName(className);
+  if (normalized === 'Self' && selfType) {
+    return lastQualifiedPart(selfType);
   }
   return normalized;
 }
@@ -7913,6 +8209,7 @@ function parseTypeReferenceList(value: string): string[] {
     const normalized = rawPart
       .replace(/\([^)]*\)/g, '')
       .replace(/<[^<>]*>/g, '')
+      .replace(/\[[^\]]*\]/g, '')
       .replace(/\bwhere\b.*$/i, '')
       .replace(/[{};:].*$/g, '')
       .trim()
