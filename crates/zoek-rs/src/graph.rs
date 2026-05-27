@@ -9,19 +9,87 @@ use std::sync::Arc;
 
 pub type ArcStr = Arc<str>;
 
+/// Phase 1: string interning infrastructure.
+///
+/// `StrTable` assigns a stable `u32` id to each unique string. After Phase 2
+/// migrates the hot loops, HashMap probes that currently key on `&str` will
+/// key on `u32` instead — ahash on a 4-byte integer is ~10× faster than on
+/// a variable-length string, and per-record memory drops from ~24 bytes (a
+/// `String` field) to 4 bytes.
+///
+/// Workers intern into local tables during parse; tables merge at the end
+/// of parse into a canonical table, and worker-local ids are remapped
+/// in-place to canonical ids via a per-worker translation table.
+///
+/// For the initial commit this is foundation only — no callers yet. The
+/// follow-up turns add interning at parse time (kind, language, edge_kind,
+/// access_kind first, then rel_path/name/id) and read the interned form
+/// in resolve.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StrTable {
+    /// Canonical strings indexed by id. `strings[id as usize]` is the
+    /// owning copy; everything else holds the id.
+    strings: Vec<String>,
+    /// id lookup. Uses ahash for fast `&str` probes.
+    map: AHashMap<String, u32>,
+}
+
+#[allow(dead_code)]
+impl StrTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Intern `s` and return its id. Allocates a `String` only if the
+    /// entry is new.
+    pub fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.map.get(s) {
+            return id;
+        }
+        let id = self.strings.len() as u32;
+        let owned = s.to_string();
+        self.strings.push(owned.clone());
+        self.map.insert(owned, id);
+        id
+    }
+
+    /// Resolve `id` back to its canonical string. Panics if `id` is out
+    /// of range — callers must use ids from the same table.
+    pub fn get(&self, id: u32) -> &str {
+        &self.strings[id as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.strings.len()
+    }
+
+    /// Merge another table into this one, returning a translation map
+    /// `other.id -> self.id`. Used when worker-local tables roll up into
+    /// the canonical table.
+    pub fn merge_from(&mut self, other: &StrTable) -> Vec<u32> {
+        let mut translation: Vec<u32> = Vec::with_capacity(other.strings.len());
+        for s in &other.strings {
+            translation.push(self.intern(s));
+        }
+        translation
+    }
+}
+
 /// Hard cap on worker count. With streaming spill+merge each worker stays
 /// under the spill threshold (~512MB), so 32 workers keep peak at ~16GB
 /// plus the main-thread overhead — right at the process budget.
 const MAX_GRAPH_WORKERS: usize = 128;
 
-/// Memory-aware worker count. Default 16; raise with ZOEK_GRAPH_WORKERS=N
-/// up to MAX_GRAPH_WORKERS.
+/// Memory-aware worker count. Default 64 (2× physical cores on a 32-core
+/// box) — rayon work-stealing handles oversubscription well, and benchmarks
+/// on captain2 show resolve drops ~7s going from 32 → 64. Override with
+/// ZOEK_GRAPH_WORKERS=N up to MAX_GRAPH_WORKERS.
 fn graph_worker_count(total: usize) -> usize {
     let workers = std::env::var("ZOEK_GRAPH_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(16);
+        .unwrap_or(64);
     workers.min(MAX_GRAPH_WORKERS).min(total.max(1))
 }
 
@@ -86,6 +154,26 @@ fn acquire_graph_lock(workspace_root: &Path) -> io::Result<fs::File> {
 /// Cap virtual address space for the indexer process. Default 16GB; override
 /// with ZOEK_MEMORY_CAP_BYTES. Best-effort: silently ignored on platforms
 /// that don't honor RLIMIT_AS (macOS may ignore).
+/// Configure the global rayon thread pool. Sized to ZOEK_GRAPH_WORKERS (or
+/// the same 64 default as graph_worker_count) so par_iter / par_sort_by_key
+/// scale across more threads than the OS reports as physical cores —
+/// captain2 sees a ~7s resolve drop going from 32 → 64 because phase E is
+/// HashMap-heavy and benefits from oversubscription.
+fn apply_rayon_pool_size() {
+    static APPLIED: std::sync::Once = std::sync::Once::new();
+    APPLIED.call_once(|| {
+        let workers = std::env::var("ZOEK_GRAPH_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(64)
+            .min(MAX_GRAPH_WORKERS);
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build_global();
+    });
+}
+
 fn apply_memory_cap() {
     static APPLIED: std::sync::Once = std::sync::Once::new();
     APPLIED.call_once(|| {
@@ -1235,6 +1323,7 @@ where
     F: FnMut(GraphRebuildProgress),
 {
     apply_memory_cap();
+    apply_rayon_pool_size();
     let _graph_lock = acquire_graph_lock(workspace_root)?;
     let started = std::time::Instant::now();
     progress(GraphRebuildProgress {
@@ -1361,74 +1450,73 @@ where
         }
         a
     } else {
-        let chunk = total_entries.div_ceil(worker_count);
+        // Parse with rayon work-stealing — splits into ~8× more chunks than
+        // workers so faster cores can grab additional candidate ranges as
+        // slower ones finish (large generated files etc.). Each chunk runs
+        // its own ParseAccum + spill logic exactly as before.
+        use rayon::prelude::*;
         let candidates_ref: &[GraphSourceCandidate] = &candidates;
-        let worker_accums: io::Result<Vec<(ParseAccum, Vec<PathBuf>)>> = std::thread::scope(|scope| -> io::Result<Vec<(ParseAccum, Vec<PathBuf>)>> {
-            let mut handles = Vec::with_capacity(worker_count);
-            for w in 0..worker_count {
-                let start = w * chunk;
-                let end = ((w + 1) * chunk).min(total_entries);
-                if start >= end {
-                    continue;
-                }
-                let memory_limit = worker_memory_limit();
-                let spill_threshold = std::env::var("ZOEK_PARSE_SPILL_BYTES")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .filter(|n| *n > 0)
-                    .unwrap_or(512 * 1024 * 1024);
-                let spill_dir = workspace_root.join(".zoek-rs").join("graph-spill");
-                let _ = fs::create_dir_all(&spill_dir);
-                let spill_dir_for_worker = spill_dir.clone();
-                handles.push(scope.spawn(move || -> io::Result<(ParseAccum, Vec<PathBuf>)> {
-                    let mut a = ParseAccum::new();
-                    let mut partial_paths: Vec<PathBuf> = Vec::new();
-                    let probe = std::env::var("ZOEK_MEM_PROBE").is_ok();
-                    let mut check_counter = 0usize;
-                    let mut partial_idx = 0usize;
-                    for cand in &candidates_ref[start..end] {
-                        if let Some(entry) = read_graph_source_candidate(cand, config)? {
-                            a.ingest(build_file_graph(&entry));
+        let memory_limit = worker_memory_limit();
+        let spill_threshold = std::env::var("ZOEK_PARSE_SPILL_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(512 * 1024 * 1024);
+        let spill_dir = workspace_root.join(".zoek-rs").join("graph-spill");
+        let _ = fs::create_dir_all(&spill_dir);
+        let spill_dir_for_workers = spill_dir.clone();
+        let chunks_per_worker = 8usize;
+        let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
+        let chunk_size = total_entries.div_ceil(target_chunks).max(1);
+        let ranges: Vec<(usize, usize, usize)> = (0..)
+            .map(|i| (i, i * chunk_size, ((i + 1) * chunk_size).min(total_entries)))
+            .take_while(|(_, s, _)| *s < total_entries)
+            .collect();
+        let worker_accums: io::Result<Vec<(ParseAccum, Vec<PathBuf>)>> = ranges
+            .into_par_iter()
+            .map(|(w, start, end)| -> io::Result<(ParseAccum, Vec<PathBuf>)> {
+                let mut a = ParseAccum::new();
+                let mut partial_paths: Vec<PathBuf> = Vec::new();
+                let probe = std::env::var("ZOEK_MEM_PROBE").is_ok();
+                let mut check_counter = 0usize;
+                let mut partial_idx = 0usize;
+                for cand in &candidates_ref[start..end] {
+                    if let Some(entry) = read_graph_source_candidate(cand, config)? {
+                        a.ingest(build_file_graph(&entry));
+                    }
+                    check_counter += 1;
+                    if check_counter % 100 == 0 {
+                        let used = a.estimated_bytes();
+                        if memory_limit > 0 && used > memory_limit {
+                            eprintln!(
+                                "[fatal] chunk {} exceeded ZOEK_WORKER_MEMORY_LIMIT_BYTES ({} > {}); aborting to protect host",
+                                w, used, memory_limit
+                            );
+                            std::process::abort();
                         }
-                        check_counter += 1;
-                        if check_counter % 100 == 0 {
-                            let used = a.estimated_bytes();
-                            if memory_limit > 0 && used > memory_limit {
+                        if used > spill_threshold {
+                            let path = spill_dir_for_workers
+                                .join(format!("chunk_{w}_partial_{partial_idx}.bin"));
+                            a.spill_to_file(&path)?;
+                            if probe {
                                 eprintln!(
-                                    "[fatal] worker {} exceeded ZOEK_WORKER_MEMORY_LIMIT_BYTES ({} > {}); aborting to protect host",
-                                    w, used, memory_limit
-                                );
-                                std::process::abort();
-                            }
-                            if used > spill_threshold {
-                                let path = spill_dir_for_worker
-                                    .join(format!("worker_{w}_partial_{partial_idx}.bin"));
-                                a.spill_to_file(&path)?;
-                                if probe {
-                                    eprintln!(
-                                        "[mem-probe] worker {} spilled partial_{} bytes={}",
-                                        w, partial_idx, used
-                                    );
-                                }
-                                partial_paths.push(path);
-                                partial_idx += 1;
-                            } else if probe {
-                                eprintln!(
-                                    "[mem-probe] worker {} symbols={} ref_sites={} est_bytes={}",
-                                    w, a.symbols.len(), a.ref_sites.len(), used
+                                    "[mem-probe] chunk {} spilled partial_{} bytes={}",
+                                    w, partial_idx, used
                                 );
                             }
+                            partial_paths.push(path);
+                            partial_idx += 1;
+                        } else if probe {
+                            eprintln!(
+                                "[mem-probe] chunk {} symbols={} ref_sites={} est_bytes={}",
+                                w, a.symbols.len(), a.ref_sites.len(), used
+                            );
                         }
                     }
-                    Ok((a, partial_paths))
-                }));
-            }
-            let mut combined = Vec::with_capacity(worker_count);
-            for h in handles {
-                combined.push(h.join().expect("parse worker panicked")?);
-            }
-            Ok(combined)
-        });
+                }
+                Ok((a, partial_paths))
+            })
+            .collect();
         let skip_resolve_fast_path = std::env::var("ZOEK_SKIP_RESOLVE").is_ok();
         if skip_resolve_fast_path {
             // Streaming fast path: never build a full in-memory total.
@@ -4712,6 +4800,28 @@ fn resolve_ref_sites_a_to_e<'a>(
     hierarchy_facts: &'a [HierarchyFact],
 ) -> ResolveIntermediate<'a> {
     let probe = std::env::var("ZOEK_RESOLVE_PROBE").is_ok();
+    // Phase 1.2: build interning tables for hot small-set fields (kind,
+    // language). Phase 2 will use these to replace `symbol.kind.as_str() ==
+    // "method"` lookups with `symbol_kind_id == KIND_METHOD`.
+    let t_intern = std::time::Instant::now();
+    let mut kind_table = StrTable::new();
+    let mut language_table = StrTable::new();
+    let mut symbol_kind_ids: Vec<u32> = Vec::with_capacity(symbols.len());
+    let mut symbol_language_ids: Vec<u32> = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
+        symbol_kind_ids.push(kind_table.intern(&symbol.kind));
+        symbol_language_ids.push(language_table.intern(&symbol.language));
+    }
+    let _ = (&symbol_kind_ids, &symbol_language_ids, &kind_table, &language_table);
+    if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
+        eprintln!(
+            "[resolve] phase_a_intern={}ms kind_unique={} language_unique={}",
+            t_intern.elapsed().as_millis(),
+            kind_table.len(),
+            language_table.len(),
+        );
+    }
+
     let t_a = std::time::Instant::now();
     let mut symbols_by_name: AHashMap<&str, Vec<&GraphSymbol>> = AHashMap::default();
     let mut bare_symbols_by_name: AHashMap<&str, Vec<&GraphSymbol>> = AHashMap::default();
@@ -4776,25 +4886,20 @@ fn resolve_ref_sites_a_to_e<'a>(
     let phase_c_outputs = if phase_c_total == 0 || phase_c_workers <= 1 {
         vec![phase_c_process_chunk(ref_sites, symbols_by_name_ref)]
     } else {
-        let chunk_size = phase_c_total.div_ceil(phase_c_workers);
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(phase_c_workers);
-            for w in 0..phase_c_workers {
-                let start = w * chunk_size;
-                let end = ((w + 1) * chunk_size).min(phase_c_total);
-                if start >= end {
-                    continue;
-                }
-                let chunk_slice = &ref_sites[start..end];
-                handles.push(s.spawn(move || {
-                    phase_c_process_chunk(chunk_slice, symbols_by_name_ref)
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("phase C worker panicked"))
-                .collect()
-        })
+        use rayon::prelude::*;
+        let chunks_per_worker = 8usize;
+        let target_chunks = phase_c_workers.saturating_mul(chunks_per_worker).max(phase_c_workers);
+        let chunk_size = phase_c_total.div_ceil(target_chunks).max(1);
+        let ranges: Vec<(usize, usize)> = (0..)
+            .map(|i| (i * chunk_size, ((i + 1) * chunk_size).min(phase_c_total)))
+            .take_while(|(s, _)| *s < phase_c_total)
+            .collect();
+        ranges
+            .into_par_iter()
+            .map(|(start, end)| {
+                phase_c_process_chunk(&ref_sites[start..end], symbols_by_name_ref)
+            })
+            .collect()
     };
     let mut bare_usage_may_by_name: HashMap<&str, usize> = HashMap::new();
     let mut bare_call_may_by_name: HashMap<&str, usize> = HashMap::new();
@@ -4888,9 +4993,93 @@ fn resolve_ref_sites_a_to_e<'a>(
             .unwrap_or(0);
     }
     if probe { eprintln!("[resolve] phase_d={}ms", t_d.elapsed().as_millis()); }
+    // Phase E pre-filter v2: drop sites that cannot emit a ref. Matches
+    // ALL the worker's productive paths including unique_member /
+    // unique_bare candidate via the *_by_language_and_name maps. References
+    // count is unchanged after pre-filter (validated by test suite).
+    let t_pf = std::time::Instant::now();
+    let owned_filtered_indices: Vec<u32>;
+    let phase_e_indices_effective: Option<&[u32]> = match phase_e_indices {
+        Some(existing) => Some(existing),
+        None => {
+            use rayon::prelude::*;
+            let chunks_per_worker = 8usize;
+            let total = ref_sites.len();
+            let workers = graph_resolve_e_worker_count(total.max(1));
+            let target_chunks = workers.saturating_mul(chunks_per_worker).max(workers);
+            let chunk_size = total.div_ceil(target_chunks).max(1);
+            let ranges: Vec<(usize, usize)> = (0..)
+                .map(|i| (i * chunk_size, ((i + 1) * chunk_size).min(total)))
+                .take_while(|(s, _)| *s < total)
+                .collect();
+            let types_by_name_pf = &types_by_name;
+            let import_targets_pf = &import_targets;
+            let import_facts_pf = &import_facts_by_file_local;
+            let type_facts_pf = &type_facts_by_file_local;
+            let bare_symbols_pf = &bare_symbols_by_name;
+            let bare_lang_pf = &bare_symbols_by_language_and_name;
+            let member_lang_pf = &member_symbols_by_language_and_name;
+            let star_imports_pf = &star_import_facts_by_file;
+            let mut chunk_outputs: Vec<Vec<u32>> = ranges
+                .into_par_iter()
+                .map(|(start, end)| {
+                    let mut buf: Vec<u32> = Vec::with_capacity((end - start) / 4);
+                    for i in start..end {
+                        let site = &ref_sites[i];
+                        if site.is_definition {
+                            continue;
+                        }
+                        let access_kind = site.access_kind.as_str();
+                        let rel_path = site.rel_path.as_str();
+                        let name = site.name.as_str();
+                        let language = site.language.as_str();
+                        let productive = if access_kind == "member" {
+                            if let Some(receiver) = site.receiver_name.as_deref() {
+                                let has_receiver_match = matches!(receiver, "self" | "cls")
+                                    || types_by_name_pf.contains_key(receiver)
+                                    || import_targets_pf.contains_key(&(rel_path, receiver))
+                                    || import_facts_pf.contains_key(&(rel_path, receiver))
+                                    || type_facts_pf.contains_key(&(rel_path, receiver));
+                                has_receiver_match
+                                    || member_lang_pf.contains_key(&(language, name))
+                            } else {
+                                false
+                            }
+                        } else if access_kind == "bare" {
+                            bare_symbols_pf.contains_key(name)
+                                || import_targets_pf.contains_key(&(rel_path, name))
+                                || star_imports_pf.contains_key(rel_path)
+                                || bare_lang_pf.contains_key(&(language, name))
+                        } else {
+                            false
+                        };
+                        if productive {
+                            buf.push(i as u32);
+                        }
+                    }
+                    buf
+                })
+                .collect();
+            let total_filtered: usize = chunk_outputs.iter().map(|c| c.len()).sum();
+            let mut indices: Vec<u32> = Vec::with_capacity(total_filtered);
+            for c in &mut chunk_outputs {
+                indices.append(c);
+            }
+            owned_filtered_indices = indices;
+            Some(owned_filtered_indices.as_slice())
+        }
+    };
+    if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
+        let total_pre = ref_sites.len();
+        let total_post = phase_e_indices_effective.map(|i| i.len()).unwrap_or(total_pre);
+        eprintln!(
+            "[resolve] phase_e_prefilter={}ms before={total_pre} after={total_post}",
+            t_pf.elapsed().as_millis()
+        );
+    }
     let t_e = std::time::Instant::now();
 
-    let total_refs = phase_e_indices.map(|i| i.len()).unwrap_or(ref_sites.len());
+    let total_refs = phase_e_indices_effective.map(|i| i.len()).unwrap_or(ref_sites.len());
     let worker_count = graph_resolve_e_worker_count(total_refs.max(1));
     let spill_threshold = std::env::var("ZOEK_RESOLVE_SPILL_REFS")
         .ok()
@@ -4953,7 +5142,7 @@ fn resolve_ref_sites_a_to_e<'a>(
             // `site_idx` is the canonical index into the owning `ref_sites`
             // slice; LightRef stores it so the writer can look up site
             // fields without duplicating them per-record.
-            let site_idx: u32 = match phase_e_indices {
+            let site_idx: u32 = match phase_e_indices_effective {
                 Some(indices) => indices[pos],
                 None => pos as u32,
             };
@@ -5246,29 +5435,31 @@ fn resolve_ref_sites_a_to_e<'a>(
     )>> = if total_refs == 0 || worker_count <= 1 {
         process_chunk(0, total_refs, 0).map(|t| vec![t])
     } else {
-        let chunk_size = total_refs.div_ceil(worker_count);
-        std::thread::scope(|s| -> io::Result<Vec<_>> {
-            let mut handles = Vec::with_capacity(worker_count);
-            for w in 0..worker_count {
-                let start = w * chunk_size;
-                let end = ((w + 1) * chunk_size).min(total_refs);
-                if start >= end {
-                    continue;
-                }
-                let pc = &process_chunk;
-                handles.push(s.spawn(move || pc(start, end, w)));
-            }
-            let mut out = Vec::with_capacity(worker_count);
-            for h in handles {
-                out.push(h.join().expect("phase E worker panicked")?);
-            }
-            Ok(out)
-        })
+        // Rayon work-stealing: split into more chunks than threads so faster
+        // cores can grab additional work as slower ones finish. Helps when
+        // some chunks contain mostly member sites (heavier resolution) and
+        // others bare-only.
+        use rayon::prelude::*;
+        let chunks_per_worker = 8usize;
+        let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
+        let chunk_size = total_refs.div_ceil(target_chunks).max(1);
+        let ranges: Vec<(usize, usize, usize)> = (0..)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = (start + chunk_size).min(total_refs);
+                (i, start, end)
+            })
+            .take_while(|(_, start, _)| *start < total_refs)
+            .collect();
+        let pc = &process_chunk;
+        let collected: Result<Vec<_>, _> = ranges
+            .into_par_iter()
+            .map(|(idx, start, end)| pc(start, end, idx))
+            .collect();
+        collected
     };
     let worker_outputs = worker_outputs.expect("phase E spill failed");
 
-    let mut counted_likely: AHashSet<u64> = AHashSet::default();
-    let mut counted_exact: AHashSet<u64> = AHashSet::default();
     // Pre-size to the sum of worker outputs; phase F appends ~2x more after this,
     // so reserve generous headroom to avoid in-flight reallocs.
     let total_phase_e_refs: usize = worker_outputs.iter().map(|t| t.3.len()).sum();
@@ -5276,7 +5467,7 @@ fn resolve_ref_sites_a_to_e<'a>(
     let mut light_references: Vec<LightRef> = Vec::with_capacity(total_phase_e_refs);
     let mut dedup: AHashSet<u64> = AHashSet::default();
     let mut reference_partials: Vec<PathBuf> = Vec::new();
-    for (w_counts, w_likely, w_exact, mut w_refs, w_dedup, mut w_spill_paths, mut w_light_refs) in worker_outputs {
+    for (w_counts, _w_likely, _w_exact, mut w_refs, w_dedup, mut w_spill_paths, mut w_light_refs) in worker_outputs {
         // Hand spill paths up to the caller; the streaming sidecar writer
         // will consume them once. The in-memory tail (w_refs) stays for
         // phase F to process and ultimately also be streamed.
@@ -5294,14 +5485,14 @@ fn resolve_ref_sites_a_to_e<'a>(
             entry.impl_must += v.impl_must;
             entry.impl_may += v.impl_may;
         }
-        counted_likely.extend(w_likely);
-        counted_exact.extend(w_exact);
+        // counted_likely/counted_exact were per-worker dedup sets — only
+        // used inside add_resolution_count. The merged set is discarded
+        // below; drop the worker copies without extending into a shared
+        // set (the extend was a ~14M-entry waste of time).
         references.append(&mut w_refs);
         light_references.append(&mut w_light_refs);
         dedup.extend(w_dedup);
     }
-    let _ = counted_likely;
-    let _ = counted_exact;
     // Phase 4-Q: phase E workers skip materialization. References stays
     // empty; LightRef holds the data. resolve_ref_sites materializes for
     // legacy/test callers at its boundary.
@@ -5408,8 +5599,11 @@ fn function_return_facts_by_file_name<'a>(
 /// across `RefSite`s. Avoids duplicate hashmap lookups and duplicate
 /// `resolve_type_fact_targets` calls when the same `RefSite` needs both
 /// candidate sets.
+/// Wrapper that pulls the four pieces of `site` we actually need and
+/// delegates to `combined_member_candidates_by_key`. Kept for any
+/// remaining caller that still passes a full `&RefSite`.
 fn combined_member_candidates<'a>(
-    site: &RefSite,
+    site: &'a RefSite,
     symbols_by_id: &HashMap<&'a str, &'a GraphSymbol>,
     types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
     members_by_container_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
@@ -5419,33 +5613,81 @@ fn combined_member_candidates<'a>(
     type_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a TypeFact>>,
     function_return_facts_by_file_name: &HashMap<(&'a str, &'a str), Vec<&'a FunctionReturnFact>>,
     hierarchy_facts: &[HierarchyFact],
-    mut fallback: &mut Vec<&'a GraphSymbol>,
-    mut exact: &mut Vec<MemberExactCandidate<'a>>,
+    fallback: &mut Vec<&'a GraphSymbol>,
+    exact: &mut Vec<MemberExactCandidate<'a>>,
+) {
+    let Some(receiver) = site.receiver_name.as_deref() else {
+        fallback.clear();
+        exact.clear();
+        return;
+    };
+    combined_member_candidates_by_key(
+        site.rel_path.as_str(),
+        receiver,
+        site.name.as_str(),
+        site.enclosing_symbol_id.as_deref(),
+        symbols_by_id,
+        types_by_name,
+        members_by_container_and_name,
+        symbols_by_file_and_name,
+        import_targets,
+        import_facts_by_file_local,
+        type_facts_by_file_local,
+        function_return_facts_by_file_name,
+        hierarchy_facts,
+        fallback,
+        exact,
+    );
+}
+
+/// Same logic as `combined_member_candidates` but parameterized by the
+/// individual fields of the source site (rel_path, receiver, name,
+/// enclosing_symbol_id). Lets the pre-resolve build step compute results
+/// keyed on those four fields without constructing a synthetic `RefSite`.
+fn combined_member_candidates_by_key<'a>(
+    rel_path: &'a str,
+    receiver: &'a str,
+    name: &'a str,
+    site_enclosing_id: Option<&'a str>,
+    symbols_by_id: &HashMap<&'a str, &'a GraphSymbol>,
+    types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
+    members_by_container_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    import_targets: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    import_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a ImportFact>>,
+    type_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a TypeFact>>,
+    function_return_facts_by_file_name: &HashMap<(&'a str, &'a str), Vec<&'a FunctionReturnFact>>,
+    hierarchy_facts: &[HierarchyFact],
+    fallback: &mut Vec<&'a GraphSymbol>,
+    exact: &mut Vec<MemberExactCandidate<'a>>,
 ) {
     fallback.clear();
     exact.clear();
-    let Some(receiver) = site.receiver_name.as_deref() else {
-        return;
-    };
+
+    if !matches!(receiver, "self" | "cls") {
+        let has_any = types_by_name.contains_key(receiver)
+            || import_targets.contains_key(&(rel_path, receiver))
+            || import_facts_by_file_local.contains_key(&(rel_path, receiver))
+            || type_facts_by_file_local.contains_key(&(rel_path, receiver));
+        if !has_any {
+            return;
+        }
+    }
 
     if matches!(receiver, "self" | "cls") {
-        if let Some(source) = site
-            .enclosing_symbol_id
-            .as_deref()
-            .and_then(|id| symbols_by_id.get(id))
-        {
+        if let Some(source) = site_enclosing_id.and_then(|id| symbols_by_id.get(id)) {
             if let Some(container_name) = source.container_name.as_deref() {
                 extend_members_for_container(
                     fallback,
                     members_by_container_and_name,
                     container_name,
-                    &site.name,
+                    name,
                 );
                 collect_exact_members_for_container(
                     exact,
                     members_by_container_and_name,
                     container_name,
-                    &site.name,
+                    name,
                     "receiver-self",
                 );
             } else if is_type_kind(&source.kind) {
@@ -5453,7 +5695,7 @@ fn combined_member_candidates<'a>(
                     fallback,
                     members_by_container_and_name,
                     source,
-                    &site.name,
+                    name,
                 );
             }
         }
@@ -5465,44 +5707,44 @@ fn combined_member_candidates<'a>(
                 fallback,
                 members_by_container_and_name,
                 symbol,
-                &site.name,
+                name,
             );
             collect_exact_members_for_type(
                 exact,
                 members_by_container_and_name,
                 symbol,
-                &site.name,
+                name,
                 "receiver-type",
             );
         }
     }
 
-    if let Some(targets) = import_targets.get(&(site.rel_path.as_str(), receiver)) {
+    if let Some(targets) = import_targets.get(&(rel_path, receiver)) {
         for target in targets {
             if is_type_kind(&target.kind) {
                 extend_members_for_type(
                     fallback,
                     members_by_container_and_name,
                     target,
-                    &site.name,
+                    name,
                 );
                 collect_exact_members_for_type(
                     exact,
                     members_by_container_and_name,
                     target,
-                    &site.name,
+                    name,
                     "imported-type",
                 );
             }
         }
     }
 
-    if let Some(facts) = import_facts_by_file_local.get(&(site.rel_path.as_str(), receiver)) {
+    if let Some(facts) = import_facts_by_file_local.get(&(rel_path, receiver)) {
         for fact in facts {
             let is_star = fact.imported_name == "*";
             for module_path in &fact.module_candidates {
                 if let Some(symbols) =
-                    symbols_by_file_and_name.get(&(module_path.as_str(), site.name.as_str()))
+                    symbols_by_file_and_name.get(&(module_path.as_str(), name))
                 {
                     fallback.extend(symbols.iter().copied());
                     if is_star {
@@ -5518,14 +5760,15 @@ fn combined_member_candidates<'a>(
         }
     }
 
-    if let Some(facts) = type_facts_by_file_local.get(&(site.rel_path.as_str(), receiver)) {
+    if let Some(facts) = type_facts_by_file_local.get(&(rel_path, receiver)) {
         for fact in facts {
-            if !type_fact_applies_to_site(fact, site) {
+            if !type_fact_applies_by_enclosing(fact, site_enclosing_id) {
                 continue;
             }
-            let targets = resolve_type_fact_targets(
+            let targets = resolve_type_fact_targets_by_key(
                 fact,
-                site,
+                rel_path,
+                site_enclosing_id,
                 symbols_by_id,
                 types_by_name,
                 symbols_by_file_and_name,
@@ -5538,13 +5781,13 @@ fn combined_member_candidates<'a>(
                     fallback,
                     members_by_container_and_name,
                     target_type,
-                    &site.name,
+                    name,
                 );
                 collect_exact_members_for_type(
                     exact,
                     members_by_container_and_name,
                     target_type,
-                    &site.name,
+                    name,
                     "type-fact",
                 );
             }
@@ -5557,6 +5800,145 @@ fn combined_member_candidates<'a>(
     if exact.len() != 1 {
         exact.clear();
     }
+}
+
+/// `type_fact_applies_to_site` parameterized by enclosing only.
+fn type_fact_applies_by_enclosing(fact: &TypeFact, site_enclosing_id: Option<&str>) -> bool {
+    match (fact.enclosing_symbol_id.as_deref(), site_enclosing_id) {
+        (Some(fact_scope), Some(site_scope)) => fact_scope == site_scope,
+        (None, _) => true,
+        _ => false,
+    }
+}
+
+/// `resolve_type_fact_targets` parameterized by rel_path/enclosing only.
+fn resolve_type_fact_targets_by_key<'a>(
+    fact: &TypeFact,
+    site_rel_path: &'a str,
+    site_enclosing_id: Option<&'a str>,
+    symbols_by_id: &HashMap<&'a str, &'a GraphSymbol>,
+    types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
+    symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    import_targets: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    function_return_facts_by_file_name: &HashMap<(&'a str, &'a str), Vec<&'a FunctionReturnFact>>,
+    hierarchy_facts: &[HierarchyFact],
+) -> Vec<&'a GraphSymbol> {
+    if let Some(model_name) = fact
+        .type_name
+        .strip_prefix(DJANGO_MODEL_MANAGER_FACT_PREFIX)
+    {
+        let mut out: Vec<_> = resolve_type_name_targets_by_key(
+            model_name,
+            site_rel_path,
+            site_enclosing_id,
+            symbols_by_id,
+            types_by_name,
+            symbols_by_file_and_name,
+            import_targets,
+        )
+        .into_iter()
+        .filter(|symbol| is_django_model_type(symbol, hierarchy_facts))
+        .collect();
+        sort_dedup_symbols(&mut out);
+        return out;
+    }
+    if let Some(callee) = fact.type_name.strip_prefix(RETURN_TYPE_FACT_PREFIX) {
+        let mut out = Vec::new();
+        if let Some(facts) = function_return_facts_by_file_name.get(&(site_rel_path, callee)) {
+            for return_fact in facts {
+                out.extend(resolve_type_name_targets_by_key(
+                    &return_fact.type_name,
+                    return_fact.rel_path.as_str(),
+                    site_enclosing_id,
+                    symbols_by_id,
+                    types_by_name,
+                    symbols_by_file_and_name,
+                    import_targets,
+                ));
+            }
+        }
+        if let Some(targets) = import_targets.get(&(site_rel_path, callee)) {
+            for target in targets {
+                if !matches!(target.kind.as_str(), "function" | "method") {
+                    continue;
+                }
+                if let Some(facts) = function_return_facts_by_file_name
+                    .get(&(target.rel_path.as_str(), target.name.as_str()))
+                {
+                    for return_fact in facts {
+                        out.extend(resolve_type_name_targets_by_key(
+                            &return_fact.type_name,
+                            return_fact.rel_path.as_str(),
+                            site_enclosing_id,
+                            symbols_by_id,
+                            types_by_name,
+                            symbols_by_file_and_name,
+                            import_targets,
+                        ));
+                    }
+                }
+            }
+        }
+        sort_dedup_symbols(&mut out);
+        return out;
+    }
+    resolve_type_name_targets_by_key(
+        &fact.type_name,
+        site_rel_path,
+        site_enclosing_id,
+        symbols_by_id,
+        types_by_name,
+        symbols_by_file_and_name,
+        import_targets,
+    )
+}
+
+fn resolve_type_name_targets_by_key<'a>(
+    type_expr: &str,
+    context_rel_path: &'a str,
+    site_enclosing_id: Option<&'a str>,
+    symbols_by_id: &HashMap<&'a str, &'a GraphSymbol>,
+    types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
+    symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    import_targets: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+) -> Vec<&'a GraphSymbol> {
+    let type_name = type_tail(type_expr);
+    if type_name == "Self" {
+        if let Some(container_name) = site_enclosing_id
+            .and_then(|id| symbols_by_id.get(id))
+            .and_then(|symbol| symbol.container_name.as_deref())
+        {
+            return types_by_name
+                .get(container_name)
+                .cloned()
+                .unwrap_or_default();
+        }
+        return Vec::new();
+    }
+    if let Some(targets) = symbols_by_file_and_name.get(&(context_rel_path, type_name)) {
+        let same_file_types: Vec<_> = targets
+            .iter()
+            .copied()
+            .filter(|symbol| is_type_kind(&symbol.kind))
+            .collect();
+        if !same_file_types.is_empty() {
+            return same_file_types;
+        }
+    }
+    if let Some(targets) = import_targets.get(&(context_rel_path, type_name)) {
+        let imported_types: Vec<_> = targets
+            .iter()
+            .copied()
+            .filter(|symbol| is_type_kind(&symbol.kind))
+            .collect();
+        if !imported_types.is_empty() {
+            return imported_types;
+        }
+    }
+    types_by_name
+        .get(type_name)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn type_fact_applies_to_site(fact: &TypeFact, site: &RefSite) -> bool {
@@ -6129,25 +6511,25 @@ fn apply_token_shape_likely_count_baseline(
     )>> = if symbols_total == 0 || worker_count <= 1 {
         process_chunk(symbols, 0).map(|t| vec![t])
     } else {
-        let chunk_size = symbols_total.div_ceil(worker_count);
-        std::thread::scope(|s| -> io::Result<Vec<_>> {
-            let mut handles = Vec::with_capacity(worker_count);
-            for w in 0..worker_count {
-                let start = w * chunk_size;
-                let end = ((w + 1) * chunk_size).min(symbols_total);
-                if start >= end {
-                    continue;
-                }
-                let chunk_slice = &symbols[start..end];
-                let pc = &process_chunk;
-                handles.push(s.spawn(move || pc(chunk_slice, w)));
-            }
-            let mut out = Vec::with_capacity(worker_count);
-            for h in handles {
-                out.push(h.join().expect("phase F worker panicked")?);
-            }
-            Ok(out)
-        })
+        // Rayon work-stealing: split into more chunks than threads so faster
+        // workers can grab additional work (same pattern as phase E).
+        use rayon::prelude::*;
+        let chunks_per_worker = 8usize;
+        let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
+        let chunk_size = symbols_total.div_ceil(target_chunks).max(1);
+        let ranges: Vec<(usize, usize, usize)> = (0..)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = (start + chunk_size).min(symbols_total);
+                (i, start, end)
+            })
+            .take_while(|(_, start, _)| *start < symbols_total)
+            .collect();
+        let pc = &process_chunk;
+        ranges
+            .into_par_iter()
+            .map(|(idx, start, end)| pc(&symbols[start..end], idx))
+            .collect()
     };
     let worker_outputs = worker_outputs.expect("phase F spill failed");
     for (local_counts, mut local_refs, local_dedup, mut spill_paths, mut local_light_refs) in worker_outputs {
@@ -6870,45 +7252,48 @@ fn append_lights_to_both_shards(
     enclosing_shards: &mut [GraphShardWriter],
     file_table: &FileTable,
 ) -> io::Result<()> {
-    std::thread::scope(|s| -> io::Result<()> {
-        let target_handle = s.spawn(move || -> io::Result<()> {
+    use rayon::prelude::*;
+    let n_target = target_shards.len();
+    let n_encl = enclosing_shards.len();
+    if lights.is_empty() {
+        return Ok(());
+    }
+    // Stage 1 — parallel per-chunk serialize into per-shard byte buffers.
+    // Each chunk worker emits two Vec<Vec<u8>> (one per side, length =
+    // shard count). Single serialize per ref; bytes dispatched to whichever
+    // sides apply. With 32 chunks × 128 shards × ~10KB per shard slot the
+    // intermediate buffers stay well under 100MB total.
+    let worker_count = graph_worker_count(lights.len()).max(1);
+    let chunks_per_worker = 8usize;
+    let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
+    let chunk_size = lights.len().div_ceil(target_chunks).max(1);
+    let ranges: Vec<(usize, usize)> = (0..)
+        .map(|i| {
+            let start = i * chunk_size;
+            let end = (start + chunk_size).min(lights.len());
+            (start, end)
+        })
+        .take_while(|(start, _)| *start < lights.len())
+        .collect();
+    let per_chunk: Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)> = ranges
+        .into_par_iter()
+        .map(|(start, end)| {
+            let mut tgt_bufs: Vec<Vec<u8>> = (0..n_target).map(|_| Vec::new()).collect();
+            let mut enc_bufs: Vec<Vec<u8>> = (0..n_encl).map(|_| Vec::new()).collect();
             let mut scratch: Vec<u8> = Vec::with_capacity(200);
             let mut cached_path: &str = "";
             let mut cached_id: u32 = u32::MAX;
-            for light in lights {
-                let Some(target_id) = light.target_symbol_id.as_deref() else {
-                    continue;
-                };
+            for light in &lights[start..end] {
                 let site = &ref_sites[light.site_idx as usize];
-                scratch.clear();
-                let path = site.rel_path.as_str();
-                let id = if path == cached_path {
-                    cached_id
+                let target_id = light.target_symbol_id.as_deref();
+                let enclosing_id = if matches!(&*site.edge_kind, "call" | "construct") {
+                    site.enclosing_symbol_id.as_deref()
                 } else {
-                    let new_id = file_table.get_id(path).unwrap_or(u32::MAX);
-                    cached_path = path;
-                    cached_id = new_id;
-                    new_id
+                    None
                 };
-                serialize_reference_binary_from_light(light, site, id, &mut scratch);
-                let shard = shard_index_for_key(target_id);
-                target_shards[shard].writer.write_all(&scratch)?;
-            }
-            Ok(())
-        });
-        let enclosing_handle = s.spawn(move || -> io::Result<()> {
-            let mut scratch: Vec<u8> = Vec::with_capacity(200);
-            let mut cached_path: &str = "";
-            let mut cached_id: u32 = u32::MAX;
-            for light in lights {
-                let site = &ref_sites[light.site_idx as usize];
-                if !matches!(&*site.edge_kind, "call" | "construct") {
+                if target_id.is_none() && enclosing_id.is_none() {
                     continue;
                 }
-                let Some(enc) = site.enclosing_symbol_id.as_deref() else {
-                    continue;
-                };
-                scratch.clear();
                 let path = site.rel_path.as_str();
                 let id = if path == cached_path {
                     cached_id
@@ -6918,16 +7303,47 @@ fn append_lights_to_both_shards(
                     cached_id = new_id;
                     new_id
                 };
+                scratch.clear();
                 serialize_reference_binary_from_light(light, site, id, &mut scratch);
-                let shard = shard_index_for_key(enc);
-                enclosing_shards[shard].writer.write_all(&scratch)?;
+                if let Some(t) = target_id {
+                    let s = shard_index_for_key(t);
+                    tgt_bufs[s].extend_from_slice(&scratch);
+                }
+                if let Some(e) = enclosing_id {
+                    let s = shard_index_for_key(e);
+                    enc_bufs[s].extend_from_slice(&scratch);
+                }
+            }
+            (tgt_bufs, enc_bufs)
+        })
+        .collect();
+    // Stage 2 — per-shard parallel merge into the actual writer slices.
+    // rayon par_iter_mut hands each thread an exclusive `&mut
+    // GraphShardWriter`, so writes have no synchronization cost.
+    let per_chunk_ref = &per_chunk;
+    target_shards
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(shard, w)| -> io::Result<()> {
+            for c in per_chunk_ref {
+                if !c.0[shard].is_empty() {
+                    w.writer.write_all(&c.0[shard])?;
+                }
             }
             Ok(())
-        });
-        target_handle.join().expect("target shard writer panicked")?;
-        enclosing_handle.join().expect("enclosing shard writer panicked")?;
-        Ok(())
-    })
+        })?;
+    enclosing_shards
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(shard, w)| -> io::Result<()> {
+            for c in per_chunk_ref {
+                if !c.1[shard].is_empty() {
+                    w.writer.write_all(&c.1[shard])?;
+                }
+            }
+            Ok(())
+        })?;
+    Ok(())
 }
 
 /// Foundation for the channel-driven write pipeline (Option 1 / Phase 5-A).
@@ -7288,73 +7704,48 @@ where
         }
         return finish_graph_shard_writers(shards);
     }
-    let chunk_size = total.div_ceil(worker_count);
+    // Rayon: work-stealing chunks + per-shard parallel merge. Replaces the
+    // previous std::thread::scope fixed-chunk pattern. More chunks than
+    // workers lets faster cores steal slow chunks; merge phase runs one
+    // task per shard so no writer is shared between threads.
+    use rayon::prelude::*;
+    let chunks_per_worker = 8usize;
+    let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
+    let chunk_size = total.div_ceil(target_chunks).max(1);
+    let ranges: Vec<(usize, usize)> = (0..)
+        .map(|i| {
+            let start = i * chunk_size;
+            let end = (start + chunk_size).min(total);
+            (start, end)
+        })
+        .take_while(|(start, _)| *start < total)
+        .collect();
     let shard_for_item_ref = &shard_for_item;
-    let worker_buffers: Vec<Vec<Vec<u8>>> = std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for w in 0..worker_count {
-            let start = w * chunk_size;
-            let end = ((w + 1) * chunk_size).min(total);
-            if start >= end {
-                continue;
-            }
-            let slice = &items[start..end];
-            handles.push(s.spawn(move || {
-                let mut bufs: Vec<Vec<u8>> =
-                    (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
-                for item in slice {
-                    if let Some((shard, row)) = shard_for_item_ref(item) {
-                        bufs[shard].extend_from_slice(row.as_ref());
-                    }
+    let worker_buffers: Vec<Vec<Vec<u8>>> = ranges
+        .into_par_iter()
+        .map(|(start, end)| {
+            let mut bufs: Vec<Vec<u8>> = (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+            for item in &items[start..end] {
+                if let Some((shard, row)) = shard_for_item_ref(item) {
+                    bufs[shard].extend_from_slice(row.as_ref());
                 }
-                bufs
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("group worker panicked"))
-            .collect()
-    });
-    let writers = open_graph_shard_writers(workspace_root, config, prefix)?;
-    let total_writers = writers.len();
-    let writers_per_worker = total_writers.div_ceil(worker_count);
-    let mut writer_iter = writers.into_iter();
+            }
+            bufs
+        })
+        .collect();
+    let mut writers = open_graph_shard_writers(workspace_root, config, prefix)?;
     let worker_buffers_ref = &worker_buffers;
-    std::thread::scope(|s| -> io::Result<u64> {
-        let mut handles = Vec::with_capacity(worker_count);
-        let mut next_shard_idx = 0;
-        for _ in 0..worker_count {
-            if next_shard_idx >= total_writers {
-                break;
+    writers
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(shard_idx, w)| -> io::Result<()> {
+            for w_bufs in worker_buffers_ref {
+                w.writer.write_all(&w_bufs[shard_idx])?;
             }
-            let take = writers_per_worker.min(total_writers - next_shard_idx);
-            let chunk: Vec<(usize, GraphShardWriter)> = (0..take)
-                .map(|i| {
-                    let shard_idx = next_shard_idx + i;
-                    (shard_idx, writer_iter.next().expect("writer count mismatch"))
-                })
-                .collect();
-            next_shard_idx += take;
-            handles.push(s.spawn(move || -> io::Result<u64> {
-                let mut total_bytes = 0;
-                for (shard_idx, mut writer) in chunk {
-                    for w_bufs in worker_buffers_ref {
-                        writer.writer.write_all(&w_bufs[shard_idx])?;
-                    }
-                    writer.writer.flush()?;
-                    drop(writer.writer);
-                    fs::rename(&writer.temp_path, &writer.final_path)?;
-                    total_bytes += file_len(&writer.final_path)?;
-                }
-                Ok(total_bytes)
-            }));
-        }
-        let mut total_bytes = 0;
-        for h in handles {
-            total_bytes += h.join().expect("shard writer panicked")?;
-        }
-        Ok(total_bytes)
-    })
+            w.writer.flush()?;
+            Ok(())
+        })?;
+    finish_graph_shard_writers(writers)
 }
 
 fn parallel_write_shard_entries(
@@ -7372,70 +7763,41 @@ fn parallel_write_shard_entries(
         }
         return finish_graph_shard_writers(shards);
     }
-    let chunk_size = total.div_ceil(worker_count);
-    let worker_buffers: Vec<Vec<Vec<u8>>> = std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for w in 0..worker_count {
-            let start = w * chunk_size;
-            let end = ((w + 1) * chunk_size).min(total);
-            if start >= end {
-                continue;
+    use rayon::prelude::*;
+    let chunks_per_worker = 8usize;
+    let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
+    let chunk_size = total.div_ceil(target_chunks).max(1);
+    let ranges: Vec<(usize, usize)> = (0..)
+        .map(|i| {
+            let start = i * chunk_size;
+            let end = (start + chunk_size).min(total);
+            (start, end)
+        })
+        .take_while(|(start, _)| *start < total)
+        .collect();
+    let worker_buffers: Vec<Vec<Vec<u8>>> = ranges
+        .into_par_iter()
+        .map(|(start, end)| {
+            let mut bufs: Vec<Vec<u8>> = (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+            for (shard, row) in &entries[start..end] {
+                bufs[*shard].extend_from_slice(row);
             }
-            let slice = &entries[start..end];
-            handles.push(s.spawn(move || {
-                let mut bufs: Vec<Vec<u8>> =
-                    (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
-                for (shard, row) in slice {
-                    bufs[*shard].extend_from_slice(row);
-                }
-                bufs
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("shard buffer worker panicked"))
-            .collect()
-    });
-    let writers = open_graph_shard_writers(workspace_root, config, prefix)?;
-    let total_writers = writers.len();
-    let writers_per_worker = total_writers.div_ceil(worker_count);
-    let mut writer_iter = writers.into_iter();
+            bufs
+        })
+        .collect();
+    let mut writers = open_graph_shard_writers(workspace_root, config, prefix)?;
     let worker_buffers_ref = &worker_buffers;
-    std::thread::scope(|s| -> io::Result<u64> {
-        let mut handles = Vec::with_capacity(worker_count);
-        let mut next_shard_idx = 0;
-        for _ in 0..worker_count {
-            if next_shard_idx >= total_writers {
-                break;
+    writers
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(shard_idx, w)| -> io::Result<()> {
+            for w_bufs in worker_buffers_ref {
+                w.writer.write_all(&w_bufs[shard_idx])?;
             }
-            let take = writers_per_worker.min(total_writers - next_shard_idx);
-            let chunk: Vec<(usize, GraphShardWriter)> = (0..take)
-                .map(|i| {
-                    let shard_idx = next_shard_idx + i;
-                    (shard_idx, writer_iter.next().expect("writer count mismatch"))
-                })
-                .collect();
-            next_shard_idx += take;
-            handles.push(s.spawn(move || -> io::Result<u64> {
-                let mut total_bytes = 0;
-                for (shard_idx, mut writer) in chunk {
-                    for w_bufs in worker_buffers_ref {
-                        writer.writer.write_all(&w_bufs[shard_idx])?;
-                    }
-                    writer.writer.flush()?;
-                    drop(writer.writer);
-                    fs::rename(&writer.temp_path, &writer.final_path)?;
-                    total_bytes += file_len(&writer.final_path)?;
-                }
-                Ok(total_bytes)
-            }));
-        }
-        let mut total_bytes = 0;
-        for h in handles {
-            total_bytes += h.join().expect("shard writer panicked")?;
-        }
-        Ok(total_bytes)
-    })
+            w.writer.flush()?;
+            Ok(())
+        })?;
+    finish_graph_shard_writers(writers)
 }
 
 fn write_reference_enclosing_shards(
@@ -7593,72 +7955,43 @@ fn write_ref_sites_by_file_shards(
         }
         return finish_graph_shard_writers(shards);
     }
-    let chunk_size = total.div_ceil(worker_count);
-    let worker_buffers: Vec<Vec<Vec<u8>>> = std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for w in 0..worker_count {
-            let start = w * chunk_size;
-            let end = ((w + 1) * chunk_size).min(total);
-            if start >= end {
-                continue;
+    use rayon::prelude::*;
+    let chunks_per_worker = 8usize;
+    let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
+    let chunk_size = total.div_ceil(target_chunks).max(1);
+    let ranges: Vec<(usize, usize)> = (0..)
+        .map(|i| {
+            let start = i * chunk_size;
+            let end = (start + chunk_size).min(total);
+            (start, end)
+        })
+        .take_while(|(start, _)| *start < total)
+        .collect();
+    let worker_buffers: Vec<Vec<Vec<u8>>> = ranges
+        .into_par_iter()
+        .map(|(start, end)| {
+            let mut bufs: Vec<Vec<u8>> = (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+            for site in &ref_sites[start..end] {
+                let id = file_table.get_id(&site.rel_path).unwrap_or(u32::MAX);
+                let shard = shard_index_for_key(&site.rel_path);
+                serialize_ref_site_binary(site, id, &mut bufs[shard]);
             }
-            let slice = &ref_sites[start..end];
-            handles.push(s.spawn(move || {
-                let mut bufs: Vec<Vec<u8>> =
-                    (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
-                for site in slice {
-                    let id = file_table.get_id(&site.rel_path).unwrap_or(u32::MAX);
-                    let shard = shard_index_for_key(&site.rel_path);
-                    serialize_ref_site_binary(site, id, &mut bufs[shard]);
-                }
-                bufs
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("ref_sites worker panicked"))
-            .collect()
-    });
-    let writers = open_graph_shard_writers(workspace_root, config, GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX)?;
-    let total_writers = writers.len();
-    let writers_per_worker = total_writers.div_ceil(worker_count);
-    let mut writer_iter = writers.into_iter();
+            bufs
+        })
+        .collect();
+    let mut writers = open_graph_shard_writers(workspace_root, config, GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX)?;
     let worker_buffers_ref = &worker_buffers;
-    std::thread::scope(|s| -> io::Result<u64> {
-        let mut handles = Vec::with_capacity(worker_count);
-        let mut next_shard_idx = 0;
-        for _ in 0..worker_count {
-            if next_shard_idx >= total_writers {
-                break;
+    writers
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(shard_idx, w)| -> io::Result<()> {
+            for w_bufs in worker_buffers_ref {
+                w.writer.write_all(&w_bufs[shard_idx])?;
             }
-            let take = writers_per_worker.min(total_writers - next_shard_idx);
-            let chunk: Vec<(usize, GraphShardWriter)> = (0..take)
-                .map(|i| {
-                    let shard_idx = next_shard_idx + i;
-                    (shard_idx, writer_iter.next().expect("writer count mismatch"))
-                })
-                .collect();
-            next_shard_idx += take;
-            handles.push(s.spawn(move || -> io::Result<u64> {
-                let mut total_bytes = 0;
-                for (shard_idx, mut writer) in chunk {
-                    for w_bufs in worker_buffers_ref {
-                        writer.writer.write_all(&w_bufs[shard_idx])?;
-                    }
-                    writer.writer.flush()?;
-                    drop(writer.writer);
-                    fs::rename(&writer.temp_path, &writer.final_path)?;
-                    total_bytes += file_len(&writer.final_path)?;
-                }
-                Ok(total_bytes)
-            }));
-        }
-        let mut total_bytes = 0;
-        for h in handles {
-            total_bytes += h.join().expect("shard writer panicked")?;
-        }
-        Ok(total_bytes)
-    })
+            w.writer.flush()?;
+            Ok(())
+        })?;
+    finish_graph_shard_writers(writers)
 }
 
 fn write_facts_by_file_shards(
@@ -7716,32 +8049,130 @@ fn write_facts_by_file_shards(
         }
         return Ok(total_bytes);
     }
+    // Rayon: serialize each fact category into per-shard byte buffers in
+    // parallel chunks, then merge per-shard into the writer slice.
+    use rayon::prelude::*;
+    let worker_count = graph_worker_count(
+        (import_facts.len() + type_facts.len() + function_return_facts.len()).max(1),
+    )
+    .max(1);
+    let chunks_per_worker = 8usize;
+    let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
+
+    let import_buffers: Vec<Vec<Vec<u8>>> = if import_facts.is_empty() {
+        Vec::new()
+    } else {
+        let total = import_facts.len();
+        let chunk_size = total.div_ceil(target_chunks).max(1);
+        let ranges: Vec<(usize, usize)> = (0..)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = (start + chunk_size).min(total);
+                (start, end)
+            })
+            .take_while(|(start, _)| *start < total)
+            .collect();
+        ranges
+            .into_par_iter()
+            .map(|(start, end)| {
+                let mut bufs: Vec<Vec<u8>> =
+                    (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+                let mut scratch: Vec<u8> = Vec::with_capacity(150);
+                for fact in &import_facts[start..end] {
+                    let shard = shard_index_for_key(&fact.rel_path);
+                    let id = file_table.get_id(&fact.rel_path).unwrap_or(u32::MAX);
+                    scratch.clear();
+                    serialize_import_fact_binary(fact, id, &mut scratch);
+                    bufs[shard].push(b'I');
+                    bufs[shard].extend_from_slice(&scratch);
+                }
+                bufs
+            })
+            .collect()
+    };
+    let type_buffers: Vec<Vec<Vec<u8>>> = if type_facts.is_empty() {
+        Vec::new()
+    } else {
+        let total = type_facts.len();
+        let chunk_size = total.div_ceil(target_chunks).max(1);
+        let ranges: Vec<(usize, usize)> = (0..)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = (start + chunk_size).min(total);
+                (start, end)
+            })
+            .take_while(|(start, _)| *start < total)
+            .collect();
+        ranges
+            .into_par_iter()
+            .map(|(start, end)| {
+                let mut bufs: Vec<Vec<u8>> =
+                    (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+                let mut scratch: Vec<u8> = Vec::with_capacity(80);
+                for fact in &type_facts[start..end] {
+                    let shard = shard_index_for_key(&fact.rel_path);
+                    let id = file_table.get_id(&fact.rel_path).unwrap_or(u32::MAX);
+                    scratch.clear();
+                    serialize_type_fact_binary(fact, id, &mut scratch);
+                    bufs[shard].push(b'T');
+                    bufs[shard].extend_from_slice(&scratch);
+                }
+                bufs
+            })
+            .collect()
+    };
+    let return_buffers: Vec<Vec<Vec<u8>>> = if function_return_facts.is_empty() {
+        Vec::new()
+    } else {
+        let total = function_return_facts.len();
+        let chunk_size = total.div_ceil(target_chunks).max(1);
+        let ranges: Vec<(usize, usize)> = (0..)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = (start + chunk_size).min(total);
+                (start, end)
+            })
+            .take_while(|(start, _)| *start < total)
+            .collect();
+        ranges
+            .into_par_iter()
+            .map(|(start, end)| {
+                let mut bufs: Vec<Vec<u8>> =
+                    (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+                let mut scratch: Vec<u8> = Vec::with_capacity(60);
+                for fact in &function_return_facts[start..end] {
+                    let shard = shard_index_for_key(&fact.rel_path);
+                    let id = file_table.get_id(&fact.rel_path).unwrap_or(u32::MAX);
+                    scratch.clear();
+                    serialize_function_return_fact_binary(fact, id, &mut scratch);
+                    bufs[shard].push(b'F');
+                    bufs[shard].extend_from_slice(&scratch);
+                }
+                bufs
+            })
+            .collect()
+    };
     let mut shards =
         open_graph_shard_writers(workspace_root, config, GRAPH_FACTS_BY_FILE_SHARD_PREFIX)?;
-    for fact in import_facts {
-        let shard = shard_index_for_key(&fact.rel_path);
-        let id = file_table.get_id(&fact.rel_path).unwrap_or(u32::MAX);
-        shards[shard].writer.write_all(&[b'I'])?;
-        let mut buf: Vec<u8> = Vec::with_capacity(150);
-        serialize_import_fact_binary(fact, id, &mut buf);
-        shards[shard].writer.write_all(&buf)?;
-    }
-    for fact in type_facts {
-        let shard = shard_index_for_key(&fact.rel_path);
-        let id = file_table.get_id(&fact.rel_path).unwrap_or(u32::MAX);
-        shards[shard].writer.write_all(&[b'T'])?;
-        let mut buf: Vec<u8> = Vec::with_capacity(80);
-        serialize_type_fact_binary(fact, id, &mut buf);
-        shards[shard].writer.write_all(&buf)?;
-    }
-    for fact in function_return_facts {
-        let shard = shard_index_for_key(&fact.rel_path);
-        let id = file_table.get_id(&fact.rel_path).unwrap_or(u32::MAX);
-        shards[shard].writer.write_all(&[b'F'])?;
-        let mut buf: Vec<u8> = Vec::with_capacity(60);
-        serialize_function_return_fact_binary(fact, id, &mut buf);
-        shards[shard].writer.write_all(&buf)?;
-    }
+    let import_ref = &import_buffers;
+    let type_ref = &type_buffers;
+    let return_ref = &return_buffers;
+    shards
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(shard_idx, w)| -> io::Result<()> {
+            for b in import_ref {
+                w.writer.write_all(&b[shard_idx])?;
+            }
+            for b in type_ref {
+                w.writer.write_all(&b[shard_idx])?;
+            }
+            for b in return_ref {
+                w.writer.write_all(&b[shard_idx])?;
+            }
+            w.writer.flush()?;
+            Ok(())
+        })?;
     finish_graph_shard_writers(shards)
 }
 
