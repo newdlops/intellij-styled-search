@@ -176,6 +176,17 @@ impl EngineConfig {
         name == self.index_dir_name || name == ".zoekt-rs"
     }
 
+    /// Extension/tool state directories that should never be indexed regardless
+    /// of user config. These hold transient state from sibling tools and
+    /// extensions whose churn would otherwise dominate incremental updates
+    /// (`.lh` = VSCode "Local History"; `.codeidx` = our own config; etc.).
+    pub fn is_extension_state_dir_name(&self, name: &str) -> bool {
+        matches!(
+            name,
+            ".codeidx" | ".lh" | ".django-shell" | ".zoek-rs" | ".zoekt-rs"
+        )
+    }
+
     pub fn add_exclude_pattern(&mut self, pattern: String) {
         self.exclude_patterns.push(pattern);
         self.refresh_excluded_dir_names();
@@ -185,7 +196,7 @@ impl EngineConfig {
         let normalized = normalize_relative_path(rel_path);
         normalized
             .split('/')
-            .any(|segment| self.is_internal_index_dir_name(segment))
+            .any(|segment| self.is_extension_state_dir_name(segment))
             || self.is_excluded_relative_path(&normalized)
     }
 

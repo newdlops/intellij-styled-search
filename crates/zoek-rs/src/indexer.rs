@@ -919,7 +919,7 @@ fn scan_index_dir_one_level(
         if file_type.is_dir() {
             let file_name = item.file_name();
             let name = file_name.to_string_lossy();
-            if config.is_internal_index_dir_name(&name)
+            if config.is_extension_state_dir_name(&name)
                 || config.is_excluded_dir_name(&name)
                 || config.is_excluded_normalized_relative_path(&normalize_rel_path(
                     path.strip_prefix(workspace_root).unwrap_or(&path),

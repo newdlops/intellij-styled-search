@@ -5,6 +5,31 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+/// Size threshold above which we mmap the source file instead of `fs::read`.
+/// For small files the per-call mmap setup (one syscall + VMA bookkeeping)
+/// outweighs the avoided heap allocation; for larger files mmap wins by
+/// skipping the kernel-buffer → user-heap copy and by letting the OS lazily
+/// fault in only the pages we touch.
+const MMAP_READ_THRESHOLD_BYTES: u64 = 64 * 1024;
+
+/// Read a file's bytes into an owned `Vec<u8>`, choosing mmap when the file
+/// is large enough to amortize the syscall overhead. Returns the same
+/// `Vec<u8>` contract as `fs::read` so callers downstream are unchanged.
+fn read_file_bytes(path: &Path, len_hint: u64) -> io::Result<Vec<u8>> {
+    if len_hint < MMAP_READ_THRESHOLD_BYTES {
+        return fs::read(path);
+    }
+    let file = fs::File::open(path)?;
+    // SAFETY: We copy out immediately, so the OS-mapped region lives only
+    // for the duration of this call. The file is owned by us here and not
+    // shared, so no external truncation can race the slice read.
+    let mmap = unsafe { memmap2::Mmap::map(&file) };
+    match mmap {
+        Ok(map) => Ok(map.to_vec()),
+        Err(_) => fs::read(path),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextEncoding {
     Utf8,
@@ -112,7 +137,7 @@ fn walk_dir(
         if metadata.is_dir() {
             let file_name = item.file_name();
             let name = file_name.to_string_lossy();
-            if config.is_internal_index_dir_name(&name)
+            if config.is_extension_state_dir_name(&name)
                 || config.is_excluded_dir_name(&name)
                 || path == config.index_root(workspace_root)
             {
@@ -157,7 +182,7 @@ fn walk_dir(
             continue;
         }
 
-        let bytes = fs::read(&path)?;
+        let bytes = read_file_bytes(&path, metadata.len())?;
         if looks_binary_bytes(&bytes) {
             stats.skipped_binary += 1;
             continue;
@@ -197,7 +222,7 @@ fn count_files_dir(dir: &Path, workspace_root: &Path, config: &EngineConfig) -> 
         if metadata.is_dir() {
             let file_name = item.file_name();
             let name = file_name.to_string_lossy();
-            if config.is_internal_index_dir_name(&name)
+            if config.is_extension_state_dir_name(&name)
                 || config.is_excluded_dir_name(&name)
                 || path == config.index_root(workspace_root)
             {
@@ -246,7 +271,7 @@ pub fn read_file_bytes_with_limit_if_not_binary(
     const BINARY_PROBE_BYTES: usize = 4096;
 
     if size_hint.is_some_and(|size| size <= 128 * 1024 && size <= max_size_bytes) {
-        let bytes = fs::read(path)?;
+        let bytes = read_file_bytes(path, size_hint.unwrap_or(0))?;
         if bytes.len() as u64 > max_size_bytes {
             return Ok(ReadTextBytesOutcome::TooLarge);
         }

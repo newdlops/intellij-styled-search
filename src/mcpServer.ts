@@ -1934,7 +1934,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const folder = vscode.workspace.workspaceFolders?.[0];
     if (!folder) { return []; }
     const pattern = target.relPath ? `${target.relPath.replace(/\/+$/, '')}/**/*` : '**/*';
-    const exclude = '{**/.git/**,**/node_modules/**,**/.vscode-test/**,**/out/**,**/dist/**,**/build/**,**/target/**,**/coverage/**}';
+    const exclude = '{**/.git/**,**/.vscode-test/**,**/out/**,**/dist/**,**/build/**,**/target/**,**/coverage/**}';
     const uris = await vscode.workspace.findFiles(new vscode.RelativePattern(folder, pattern), exclude, Math.max(maxFiles * 20, maxFiles));
     const out: CallGraphSymbol[] = [];
     let filesWithSymbols = 0;
@@ -5339,7 +5339,7 @@ function readMcpSearchScope(args: Record<string, unknown>): McpSearchScope {
   const userExcludeGlobs = normalizeMcpGlobPatterns(readStringArrayArg(args, 'exclude_globs'));
   const excludePolicy = readEnumArg(args, 'exclude_policy', EXCLUDE_POLICIES, 'default');
   const includeSensitive = readBoolArg(args, 'include_sensitive', false);
-  const includeDependencies = readBoolArg(args, 'include_dependencies', false);
+  const includeDependencies = readBoolArg(args, 'include_dependencies', true);
   const includeGenerated = readBoolArg(args, 'include_generated', false);
   const scopePreset = readEnumArg(args, 'scope_preset', MCP_SCOPE_PRESETS, 'all');
   const defaultExcludePatterns: string[] = [];
