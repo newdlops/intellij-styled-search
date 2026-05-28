@@ -515,6 +515,15 @@ pub struct GraphSymbol {
     /// per-insert string hash + clone. Falls back to 0 for non-standard ids.
     #[serde(skip, default)]
     pub id_u64: u64,
+    /// W2: precomputed FNV-1a hash of rel_path. Phase E hot loop uses
+    /// this for file-locality comparisons instead of per-element string
+    /// memcmp (which was the dominant phase E CPU cost — see optimization.md).
+    #[serde(skip, default)]
+    pub rel_path_hash: u64,
+    /// W2c: precomputed FNV-1a hash of name. Used by the imported-candidate
+    /// `fallback_already_counts_may` check in phase E (was per-import string compare).
+    #[serde(skip, default)]
+    pub name_hash: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -636,6 +645,21 @@ struct RefSite {
     is_import_context: bool,
     receiver_name: Option<String>,
     enclosing_symbol_id: Option<String>,
+    /// W2: precomputed FNV-1a hash of rel_path. See GraphSymbol::rel_path_hash.
+    #[serde(skip, default)]
+    rel_path_hash: u64,
+    /// W2c: precomputed FNV-1a hash of name. See GraphSymbol::name_hash.
+    #[serde(skip, default)]
+    name_hash: u64,
+    /// W9a: precomputed FNV-1a hash of receiver_name (0 if None). Used as
+    /// receiver_cache key in phase E so the per-site cache probe is a
+    /// u64-triple hash + compare instead of 3 string hashes + memcmps.
+    #[serde(skip, default)]
+    receiver_name_hash: u64,
+    /// W9a: precomputed FNV-1a hash of enclosing_symbol_id (0 if None).
+    /// Same purpose as receiver_name_hash.
+    #[serde(skip, default)]
+    enclosing_symbol_id_hash: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -688,12 +712,18 @@ struct ResolveIntermediate<'a> {
     reference_partials: Vec<PathBuf>,
     counts: HashMap<String, GraphCount>,
     dedup: AHashSet<u64>,
-    bare_usage_likely_by_scope_and_name: HashMap<(&'a str, &'a str, &'a str), usize>,
-    bare_call_likely_by_scope_and_name: HashMap<(&'a str, &'a str, &'a str), usize>,
-    member_usage_likely_by_scope_and_name: HashMap<(&'a str, &'a str, &'a str), usize>,
-    member_call_likely_by_scope_and_name: HashMap<(&'a str, &'a str, &'a str), usize>,
-    bare_likely_sites_by_scope_and_name: HashMap<(&'a str, &'a str, &'a str), Vec<&'a RefSite>>,
-    member_likely_sites_by_scope_and_name: HashMap<(&'a str, &'a str, &'a str), Vec<&'a RefSite>>,
+    // W10: keys changed from (&str language, &str scope, &str name) to
+    // (u64 lang_hash, u64 scope_hash, u64 name_hash). Built by
+    // phase_c_process_chunk with a micro-cache so each site's hashes are
+    // computed at most a handful of times across the chunk; previously the
+    // dominant phase F leaf-CPU cost was hashing/comparing 3-string tuples in
+    // HashMap lookups (75K leaf samples vs ~17K next contender).
+    bare_usage_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize>,
+    bare_call_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize>,
+    member_usage_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize>,
+    member_call_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize>,
+    bare_likely_sites_by_scope_and_name: HashMap<(u64, u64, u64), Vec<&'a RefSite>>,
+    member_likely_sites_by_scope_and_name: HashMap<(u64, u64, u64), Vec<&'a RefSite>>,
 }
 
 pub fn graph_index_path(workspace_root: &Path, config: &EngineConfig) -> PathBuf {
@@ -1562,9 +1592,29 @@ where
         fn load_from_file(path: &Path) -> io::Result<Self> {
             let f = std::fs::File::open(path)?;
             let r = std::io::BufReader::with_capacity(1024 * 1024, f);
-            bincode::deserialize_from(r).map_err(|e| {
+            let mut accum: ParseAccum = bincode::deserialize_from(r).map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("load: {e}"))
-            })
+            })?;
+            // W2/W9a: hash fields are #[serde(skip)], so re-populate after deserialize.
+            for sym in &mut accum.symbols {
+                sym.rel_path_hash = stable_hash(&sym.rel_path);
+                sym.name_hash = stable_hash(&sym.name);
+            }
+            for site in &mut accum.ref_sites {
+                site.rel_path_hash = stable_hash(&site.rel_path);
+                site.name_hash = stable_hash(&site.name);
+                site.receiver_name_hash = site
+                    .receiver_name
+                    .as_deref()
+                    .map(stable_hash)
+                    .unwrap_or(0);
+                site.enclosing_symbol_id_hash = site
+                    .enclosing_symbol_id
+                    .as_deref()
+                    .map(stable_hash)
+                    .unwrap_or(0);
+            }
+            Ok(accum)
         }
     }
     let mut accum = if total_entries == 0 || worker_count <= 1 {
@@ -3169,6 +3219,8 @@ fn materialize_symbols(symbol_defs: Vec<SymbolDef>, line_count: u32) -> Vec<Grap
         let kind_flags = compute_kind_flags(&draft.kind);
         let language_id = compute_language_id(&draft.language);
         let id_u64 = parse_stable_symbol_id_to_u64(&id).unwrap_or(0);
+        let rel_path_hash = stable_hash(&draft.rel_path);
+        let name_hash = stable_hash(&draft.name);
         symbols.push(GraphSymbol {
             id,
             name: draft.name,
@@ -3199,6 +3251,8 @@ fn materialize_symbols(symbol_defs: Vec<SymbolDef>, line_count: u32) -> Vec<Grap
             kind_flags,
             language_id,
             id_u64,
+            rel_path_hash,
+            name_hash,
         });
     }
     symbols
@@ -4735,6 +4789,7 @@ fn extract_ref_sites(
         .map(|symbol| (symbol.start_line, symbol.start_column, symbol.name.as_str()))
         .collect();
     let mut ref_sites = Vec::new();
+    let rel_path_hash = stable_hash(&entry.rel_path);
     let mut python_multiline_string_quote = None;
     let line_count = entry.text.lines().count().max(1) as u32;
     let line_enclosing_cache = precompute_enclosing_per_line(symbols, line_count);
@@ -4766,6 +4821,15 @@ fn extract_ref_sites(
             };
             let source_ref_id =
                 stable_ref_id(&entry.rel_path, line_idx as u32, start as u32, &name);
+            let name_hash = stable_hash(&name);
+            let receiver_name_hash = receiver_name
+                .as_deref()
+                .map(stable_hash)
+                .unwrap_or(0);
+            let enclosing_symbol_id_hash = line_enclosing
+                .as_deref()
+                .map(stable_hash)
+                .unwrap_or(0);
             ref_sites.push(RefSite {
                 source_ref_id,
                 name: name.clone(),
@@ -4783,6 +4847,10 @@ fn extract_ref_sites(
                 is_import_context,
                 receiver_name,
                 enclosing_symbol_id: line_enclosing.clone(),
+                rel_path_hash,
+                name_hash,
+                receiver_name_hash,
+                enclosing_symbol_id_hash,
             });
         }
     }
@@ -4885,6 +4953,7 @@ fn resolve_ref_sites_for_rebuild(
     // the read-only tally, give phase_f a fresh Vec, then concat.
     let light_in = std::mem::take(&mut intermediate.light_references);
     let mut light_out_f: Vec<LightRef> = Vec::new();
+    let _t_pf = std::time::Instant::now();
     apply_token_shape_likely_count_baseline(
         symbols,
         ref_sites,
@@ -4901,6 +4970,14 @@ fn resolve_ref_sites_for_rebuild(
         &mut intermediate.dedup,
         &mut intermediate.reference_partials,
     );
+    if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
+        eprintln!(
+            "[resolve] phase_f={}ms light_out={} f_partials={}",
+            _t_pf.elapsed().as_millis(),
+            light_out_f.len(),
+            intermediate.reference_partials.len()
+        );
+    }
     intermediate.light_references = light_in;
     intermediate.light_references.append(&mut light_out_f);
     ResolutionResult {
@@ -4950,7 +5027,10 @@ fn resolve_ref_sites_a_to_e<'a>(
 
     let t_a = std::time::Instant::now();
     let mut symbols_by_name: AHashMap<&str, Vec<&GraphSymbol>> = AHashMap::default();
-    let mut bare_symbols_by_name: AHashMap<&str, Vec<&GraphSymbol>> = AHashMap::default();
+    // W9b: bare_symbols_by_name keyed by name_hash (u64) instead of &str.
+    // Phase E hot loop and prefilter probe this per bare site; the u64
+    // lookup is ~5x cheaper than the prior string hash + memcmp.
+    let mut bare_symbols_by_name: AHashMap<u64, Vec<&GraphSymbol>> = AHashMap::default();
     let mut bare_symbols_by_language_and_name: AHashMap<(u16, &str), Vec<&GraphSymbol>> =
         AHashMap::default();
     let mut member_symbols_by_language_and_name: AHashMap<(u16, &str), Vec<&GraphSymbol>> =
@@ -4960,6 +5040,10 @@ fn resolve_ref_sites_a_to_e<'a>(
     let mut members_by_container_and_name: AHashMap<(&str, &str), Vec<&GraphSymbol>> =
         AHashMap::default();
     let mut symbols_by_file_and_name: AHashMap<(&str, &str), Vec<&GraphSymbol>> = AHashMap::default();
+    // W5: count bare-fallback definitions per (name_hash, rel_path_hash). The
+    // phase E hot loop uses this O(1) lookup instead of scanning the per-name
+    // candidate Vec with a rel_path filter (was 208K closure samples).
+    let mut same_file_bare_count: AHashMap<(u64, u64), u32> = AHashMap::with_capacity(1 << 20);
     for symbol in symbols {
         let flags = symbol.kind_flags;
         symbols_by_id.insert(&symbol.id, symbol);
@@ -4978,13 +5062,16 @@ fn resolve_ref_sites_a_to_e<'a>(
         }
         if flags & KF_BARE_FB != 0 {
             bare_symbols_by_name
-                .entry(&symbol.name)
+                .entry(symbol.name_hash)
                 .or_default()
                 .push(symbol);
             bare_symbols_by_language_and_name
                 .entry((symbol.language_id, symbol.name.as_str()))
                 .or_default()
                 .push(symbol);
+            *same_file_bare_count
+                .entry((symbol.name_hash, symbol.rel_path_hash))
+                .or_default() += 1;
         }
         if flags & KF_MEMBER_FB != 0 {
             member_symbols_by_language_and_name
@@ -4997,7 +5084,7 @@ fn resolve_ref_sites_a_to_e<'a>(
             .or_default()
             .push(symbol);
     }
-    if probe { eprintln!("[resolve] phase_a={}ms", t_a.elapsed().as_millis()); }
+    if probe { eprintln!("[resolve] phase_a={}ms same_file_bare_count_entries={}", t_a.elapsed().as_millis(), same_file_bare_count.len()); }
     let t_b = std::time::Instant::now();
     let import_targets = resolve_import_targets(import_facts, &symbols_by_file_and_name);
     let import_facts_by_file_local = import_facts_by_file_local(import_facts);
@@ -5032,16 +5119,16 @@ fn resolve_ref_sites_a_to_e<'a>(
     let mut bare_call_may_by_name: HashMap<&str, usize> = HashMap::new();
     let mut member_usage_may_by_name: HashMap<&str, usize> = HashMap::new();
     let mut member_call_may_by_name: HashMap<&str, usize> = HashMap::new();
-    let mut bare_usage_likely_by_scope_and_name: HashMap<(&str, &str, &str), usize> =
+    let mut bare_usage_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize> =
         HashMap::new();
-    let mut bare_call_likely_by_scope_and_name: HashMap<(&str, &str, &str), usize> = HashMap::new();
-    let mut member_usage_likely_by_scope_and_name: HashMap<(&str, &str, &str), usize> =
+    let mut bare_call_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize> = HashMap::new();
+    let mut member_usage_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize> =
         HashMap::new();
-    let mut member_call_likely_by_scope_and_name: HashMap<(&str, &str, &str), usize> =
+    let mut member_call_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize> =
         HashMap::new();
-    let mut bare_likely_sites_by_scope_and_name: HashMap<(&str, &str, &str), Vec<&RefSite>> =
+    let mut bare_likely_sites_by_scope_and_name: HashMap<(u64, u64, u64), Vec<&RefSite>> =
         HashMap::new();
-    let mut member_likely_sites_by_scope_and_name: HashMap<(&str, &str, &str), Vec<&RefSite>> =
+    let mut member_likely_sites_by_scope_and_name: HashMap<(u64, u64, u64), Vec<&RefSite>> =
         HashMap::new();
     for (
         w_bare_usage_may,
@@ -5185,7 +5272,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                                 false
                             }
                         } else if access_kind == "bare" {
-                            bare_symbols_pf.contains_key(name)
+                            bare_symbols_pf.contains_key(&site.name_hash)
                                 || import_targets_pf.contains_key(&(rel_path, name))
                                 || star_imports_pf.contains_key(rel_path)
                                 || bare_lang_pf.contains_key(&(language_id, name))
@@ -5274,7 +5361,11 @@ fn resolve_ref_sites_a_to_e<'a>(
         // Phase 3 (Receiver Memoization): cache receiver-side resolution per
         // (rel_path, receiver, enclosing_id). Within a chunk many sites share
         // the same triplet — typical hit rate >70% on member-heavy corpora.
-        let mut receiver_cache: AHashMap<(&str, &str, Option<&str>), ReceiverResolution<'_>> =
+        // W9a: key is now (u64, u64, u64) hash triple — eliminates the
+        // 3-string hash + memcmp on every cache probe (line 5363 was the
+        // single biggest active hotspot at 60K samples). enclosing=0 sentinel
+        // for None; collision probability negligible for u64-cubed.
+        let mut receiver_cache: AHashMap<(u64, u64, u64), ReceiverResolution<'_>> =
             AHashMap::default();
         let mut maybe_spill = |refs: &mut Vec<GraphReference>, paths: &mut Vec<PathBuf>| -> io::Result<()> {
             if refs.len() < spill_threshold {
@@ -5316,9 +5407,9 @@ fn resolve_ref_sites_a_to_e<'a>(
             if is_member {
                 if let Some(receiver) = site.receiver_name.as_deref() {
                     let key = (
-                        site.rel_path.as_str(),
-                        receiver,
-                        site.enclosing_symbol_id.as_deref(),
+                        site.rel_path_hash,
+                        site.receiver_name_hash,
+                        site.enclosing_symbol_id_hash,
                     );
                     let res = receiver_cache.entry(key).or_insert_with(|| {
                         compute_receiver_resolution(
@@ -5344,7 +5435,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                         &mut exact_buf,
                     );
                 }
-            } else if let Some(bare) = bare_symbols_by_name.get(site.name.as_str()) {
+            } else if let Some(bare) = bare_symbols_by_name.get(&site.name_hash) {
                 fallback_buf.extend(bare.iter().copied());
             }
             let fallback_candidates: &[&GraphSymbol] = &fallback_buf;
@@ -5456,10 +5547,17 @@ fn resolve_ref_sites_a_to_e<'a>(
                 }
                 continue;
             }
-            let same_file_count = fallback_candidates
-                .iter()
-                .filter(|symbol| symbol.rel_path == site.rel_path.as_str())
-                .count();
+            // W2/W5: file-locality count via precomputed (name_hash, rel_path_hash)
+            // table. Replaces the prior per-site filter over fallback_candidates
+            // (208K closure samples). For bare sites, fallback_candidates is
+            // `bare_symbols_by_name[name]`, so counting bare-fb symbols with
+            // matching name + file is equivalent. Member sites already
+            // `continue` above, so this branch only runs for bare.
+            let site_rel_path_hash = site.rel_path_hash;
+            let same_file_count = same_file_bare_count
+                .get(&(site.name_hash, site_rel_path_hash))
+                .copied()
+                .unwrap_or(0) as usize;
             let unique_bare_candidate = if is_bare
                 && !site.is_import_context
                 && same_file_count == 0
@@ -5484,7 +5582,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                     BOUND_MAY
                 };
                 let fallback_already_counts_may =
-                    is_bare && target.name == site.name.as_str();
+                    is_bare && target.name_hash == site.name_hash;
                 let edge_key = edge_key_from_partial_u64(site_partial, target.id_u64);
                 add_resolution_count(
                     &mut counts,
@@ -5539,7 +5637,7 @@ fn resolve_ref_sites_a_to_e<'a>(
             for target in fallback_candidates.iter() {
                 let is_same_file_unique = is_bare
                     && same_file_count == 1
-                    && target.rel_path == site.rel_path.as_str();
+                    && target.rel_path_hash == site_rel_path_hash;
                 let is_workspace_unique = is_bare
                     && unique_bare_candidate.is_some_and(|unique| unique.id == target.id);
                 let bound_mask = if is_same_file_unique {
@@ -5584,20 +5682,16 @@ fn resolve_ref_sites_a_to_e<'a>(
                 }
             }
         }
-        // Materialize LightRefs into GraphReferences at the worker boundary.
-        // Downstream (phase F, spill, write) still consumes Vec<GraphReference>.
-        // Each materialize allocates the per-record strings via shared site
-        // lookups; pushes inside the loop only allocated the target_id Box<str>.
-        let mut references: Vec<GraphReference> = Vec::with_capacity(light_refs.len());
-        for light in &light_refs {
-            references.push(materialize_light_ref(light, ref_sites));
-        }
         // Phase 4-Q: skip worker GraphReference materialization. The data
         // lives in `light_refs`; downstream code uses light_references for
         // the count tally and stream_lights for the write. `resolve_ref_sites`
         // materializes at its boundary for test/legacy callers (small wall
         // cost for test-sized workloads; bypassed by rebuild_graph_native).
         // Saves ~14.4M × 200B ≈ 2.9GB peak memory.
+        //
+        // W1: the prior materialize-into-references loop was dead code — the
+        // Vec it built was immediately shadowed by `let mut references = Vec::new()`
+        // below, then dropped. Sampling showed ~6% of phase E CPU spent here.
         let mut references: Vec<GraphReference> = Vec::new();
         maybe_spill(&mut references, &mut spill_paths)?;
         // Convert hashbrown → std HashMap at the worker boundary so the
@@ -5635,8 +5729,17 @@ fn resolve_ref_sites_a_to_e<'a>(
         // cores can grab additional work as slower ones finish. Helps when
         // some chunks contain mostly member sites (heavier resolution) and
         // others bare-only.
+        //
+        // W6: bumped from 8 → 32. After W5 the per-site cost dropped 60%,
+        // exposing load imbalance (cvwait dominated leaf samples at 362K).
+        // Finer chunks let work-stealing recover tail latency from
+        // member-heavy chunks. Override with ZOEK_PHASE_E_CHUNKS_PER_WORKER.
         use rayon::prelude::*;
-        let chunks_per_worker = 8usize;
+        let chunks_per_worker = std::env::var("ZOEK_PHASE_E_CHUNKS_PER_WORKER")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(32);
         let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
         let chunk_size = total_refs.div_ceil(target_chunks).max(1);
         let ranges: Vec<(usize, usize, usize)> = (0..)
@@ -6676,12 +6779,12 @@ type PhaseCAccums<'a> = (
     AHashMap<&'a str, usize>,
     AHashMap<&'a str, usize>,
     AHashMap<&'a str, usize>,
-    AHashMap<(&'a str, &'a str, &'a str), usize>,
-    AHashMap<(&'a str, &'a str, &'a str), usize>,
-    AHashMap<(&'a str, &'a str, &'a str), usize>,
-    AHashMap<(&'a str, &'a str, &'a str), usize>,
-    AHashMap<(&'a str, &'a str, &'a str), Vec<&'a RefSite>>,
-    AHashMap<(&'a str, &'a str, &'a str), Vec<&'a RefSite>>,
+    AHashMap<(u64, u64, u64), usize>,
+    AHashMap<(u64, u64, u64), usize>,
+    AHashMap<(u64, u64, u64), usize>,
+    AHashMap<(u64, u64, u64), usize>,
+    AHashMap<(u64, u64, u64), Vec<&'a RefSite>>,
+    AHashMap<(u64, u64, u64), Vec<&'a RefSite>>,
 );
 
 fn phase_c_process_chunk<'a>(
@@ -6692,12 +6795,21 @@ fn phase_c_process_chunk<'a>(
     let mut bare_call_may: AHashMap<&str, usize> = AHashMap::default();
     let mut member_usage_may: AHashMap<&str, usize> = AHashMap::default();
     let mut member_call_may: AHashMap<&str, usize> = AHashMap::default();
-    let mut bare_usage_likely: AHashMap<(&str, &str, &str), usize> = AHashMap::default();
-    let mut bare_call_likely: AHashMap<(&str, &str, &str), usize> = AHashMap::default();
-    let mut member_usage_likely: AHashMap<(&str, &str, &str), usize> = AHashMap::default();
-    let mut member_call_likely: AHashMap<(&str, &str, &str), usize> = AHashMap::default();
-    let mut bare_likely_sites: AHashMap<(&str, &str, &str), Vec<&RefSite>> = AHashMap::default();
-    let mut member_likely_sites: AHashMap<(&str, &str, &str), Vec<&RefSite>> = AHashMap::default();
+    let mut bare_usage_likely: AHashMap<(u64, u64, u64), usize> = AHashMap::default();
+    let mut bare_call_likely: AHashMap<(u64, u64, u64), usize> = AHashMap::default();
+    let mut member_usage_likely: AHashMap<(u64, u64, u64), usize> = AHashMap::default();
+    let mut member_call_likely: AHashMap<(u64, u64, u64), usize> = AHashMap::default();
+    let mut bare_likely_sites: AHashMap<(u64, u64, u64), Vec<&RefSite>> = AHashMap::default();
+    let mut member_likely_sites: AHashMap<(u64, u64, u64), Vec<&RefSite>> = AHashMap::default();
+    // W10: micro-cache rel_path → scope_hash and language → lang_hash. ref_sites
+    // arrive grouped by file, so the same (rel_path, language) pair runs for
+    // consecutive sites; the cache hit rate is ~99%. Avoids stable_hash of
+    // source_scope_key and language per site, which was the dominant cost when
+    // building (&str, &str, &str) tuple keys.
+    let mut cached_rel_path: &str = "";
+    let mut cached_scope_hash: u64 = 0;
+    let mut cached_language: &str = "";
+    let mut cached_lang_hash: u64 = 0;
     for site in chunk {
         if site.access_kind.as_str() == "bare" && symbols_by_name.contains_key(site.name.as_str()) {
             *bare_usage_may.entry(site.name.as_str()).or_default() += 1;
@@ -6715,11 +6827,17 @@ fn phase_c_process_chunk<'a>(
         if site.is_definition {
             continue;
         }
-        let scope_name = (
-            site.language.as_str(),
-            source_scope_key(&site.rel_path),
-            site.name.as_str(),
-        );
+        let path = site.rel_path.as_str();
+        if path != cached_rel_path {
+            cached_rel_path = path;
+            cached_scope_hash = stable_hash(source_scope_key(path));
+        }
+        let lang = site.language.as_str();
+        if lang != cached_language {
+            cached_language = lang;
+            cached_lang_hash = stable_hash(lang);
+        }
+        let scope_name = (cached_lang_hash, cached_scope_hash, site.name_hash);
         if site.access_kind.as_str() == "bare" {
             *bare_usage_likely.entry(scope_name).or_default() += 1;
             bare_likely_sites.entry(scope_name).or_default().push(site);
@@ -6799,12 +6917,12 @@ fn apply_token_shape_likely_count_baseline(
     symbols: &[GraphSymbol],
     ref_sites: &[RefSite],
     counts: &mut HashMap<String, GraphCount>,
-    bare_usage_by_scope_and_name: &HashMap<(&str, &str, &str), usize>,
-    bare_call_by_scope_and_name: &HashMap<(&str, &str, &str), usize>,
-    member_usage_by_scope_and_name: &HashMap<(&str, &str, &str), usize>,
-    member_call_by_scope_and_name: &HashMap<(&str, &str, &str), usize>,
-    bare_sites_by_scope_and_name: &HashMap<(&str, &str, &str), Vec<&RefSite>>,
-    member_sites_by_scope_and_name: &HashMap<(&str, &str, &str), Vec<&RefSite>>,
+    bare_usage_by_scope_and_name: &HashMap<(u64, u64, u64), usize>,
+    bare_call_by_scope_and_name: &HashMap<(u64, u64, u64), usize>,
+    member_usage_by_scope_and_name: &HashMap<(u64, u64, u64), usize>,
+    member_call_by_scope_and_name: &HashMap<(u64, u64, u64), usize>,
+    bare_sites_by_scope_and_name: &HashMap<(u64, u64, u64), Vec<&RefSite>>,
+    member_sites_by_scope_and_name: &HashMap<(u64, u64, u64), Vec<&RefSite>>,
     references: &mut Vec<GraphReference>,
     // light_in_for_tally: read-only source for the per-target tally (phase E's LightRef output).
     // light_out: phase F's new LightRef records (separate Vec — lets rebuild_graph_native
@@ -6822,16 +6940,28 @@ fn apply_token_shape_likely_count_baseline(
                 .or_default() += 1;
         }
     }
-    let mut bare_symbol_count_by_scope_and_name: AHashMap<(&str, &str, &str), usize> =
+    let mut bare_symbol_count_by_scope_and_name: AHashMap<(u64, u64, u64), usize> =
         AHashMap::default();
-    let mut member_symbol_count_by_scope_and_name: AHashMap<(&str, &str, &str), usize> =
+    let mut member_symbol_count_by_scope_and_name: AHashMap<(u64, u64, u64), usize> =
         AHashMap::default();
+    // W10: same micro-cache as phase_c_process_chunk. Symbols arrive grouped by
+    // file so the (rel_path, language) pair runs for consecutive symbols.
+    let mut cached_rel_path: &str = "";
+    let mut cached_scope_hash: u64 = 0;
+    let mut cached_language: &str = "";
+    let mut cached_lang_hash: u64 = 0;
     for symbol in symbols {
-        let key = (
-            symbol.language.as_str(),
-            source_scope_key(&symbol.rel_path),
-            symbol.name.as_str(),
-        );
+        let path = symbol.rel_path.as_str();
+        if path != cached_rel_path {
+            cached_rel_path = path;
+            cached_scope_hash = stable_hash(source_scope_key(path));
+        }
+        let lang = symbol.language.as_str();
+        if lang != cached_language {
+            cached_language = lang;
+            cached_lang_hash = stable_hash(lang);
+        }
+        let key = (cached_lang_hash, cached_scope_hash, symbol.name_hash);
         if uses_member_token_shape_for_likely_count(symbol) {
             *member_symbol_count_by_scope_and_name
                 .entry(key)
@@ -6897,12 +7027,25 @@ fn apply_token_shape_likely_count_baseline(
             paths.push(path);
             Ok(())
         };
+        // W10: micro-cache for (rel_path → scope_hash) and (language →
+        // lang_hash). Matches the build-side cache so the lookup keys are
+        // computed once per file/language group.
+        let mut cached_rel_path: &str = "";
+        let mut cached_scope_hash: u64 = 0;
+        let mut cached_language: &str = "";
+        let mut cached_lang_hash: u64 = 0;
         for symbol in symbol_slice {
-            let key = (
-                symbol.language.as_str(),
-                source_scope_key(&symbol.rel_path),
-                symbol.name.as_str(),
-            );
+            let path = symbol.rel_path.as_str();
+            if path != cached_rel_path {
+                cached_rel_path = path;
+                cached_scope_hash = stable_hash(source_scope_key(path));
+            }
+            let lang = symbol.language.as_str();
+            if lang != cached_language {
+                cached_language = lang;
+                cached_lang_hash = stable_hash(lang);
+            }
+            let key = (cached_lang_hash, cached_scope_hash, symbol.name_hash);
             let (usage_baseline, call_baseline, baseline_sites, symbol_count_for_key) =
                 if uses_member_token_shape_for_likely_count(symbol) {
                     (
@@ -9398,6 +9541,8 @@ fn parse_symbol_binary(
     let kind_flags = compute_kind_flags(&kind);
     let language_id = compute_language_id(&language);
     let id_u64 = parse_stable_symbol_id_to_u64(&id).unwrap_or(0);
+    let rel_path_hash = stable_hash(&rel_path);
+    let name_hash = stable_hash(&name);
     Ok(GraphSymbol {
         id,
         name,
@@ -9428,6 +9573,8 @@ fn parse_symbol_binary(
         kind_flags,
         language_id,
         id_u64,
+        rel_path_hash,
+        name_hash,
     })
 }
 
@@ -9602,6 +9749,10 @@ fn parse_ref_site_binary(
         2 => Some(read_u16_str(bytes, cursor)?),
         _ => return Err(invalid_data("ref_site invalid enclosing marker")),
     };
+    let rel_path_hash = stable_hash(&rel_path);
+    let name_hash = stable_hash(&name);
+    let receiver_name_hash = receiver_name.as_deref().map(stable_hash).unwrap_or(0);
+    let enclosing_symbol_id_hash = enclosing_symbol_id.as_deref().map(stable_hash).unwrap_or(0);
     Ok(RefSite {
         source_ref_id,
         name,
@@ -9619,6 +9770,10 @@ fn parse_ref_site_binary(
         is_import_context,
         receiver_name,
         enclosing_symbol_id,
+        rel_path_hash,
+        name_hash,
+        receiver_name_hash,
+        enclosing_symbol_id_hash,
     })
 }
 
@@ -9953,14 +10108,18 @@ fn parse_symbol_fields(fields: &[&str]) -> io::Result<GraphSymbol> {
     let language_id = compute_language_id(&language);
     let id_field: String = decode_field(fields[1])?;
     let id_u64 = parse_stable_symbol_id_to_u64(&id_field).unwrap_or(0);
+    let rel_path: String = decode_field(fields[7])?;
+    let rel_path_hash = stable_hash(&rel_path);
+    let name: String = decode_field(fields[2])?;
+    let name_hash = stable_hash(&name);
     Ok(GraphSymbol {
         id: id_field,
-        name: decode_field(fields[2])?,
+        name,
         qualified_name: decode_field(fields[3])?,
         kind,
         language,
         uri: decode_field(fields[6])?,
-        rel_path: decode_field(fields[7])?,
+        rel_path,
         start_line: parse_u32(fields[8], "startLine")?,
         start_column: parse_u32(fields[9], "startColumn")?,
         end_line: parse_u32(fields[10], "endLine")?,
@@ -9983,6 +10142,8 @@ fn parse_symbol_fields(fields: &[&str]) -> io::Result<GraphSymbol> {
         kind_flags,
         language_id,
         id_u64,
+        rel_path_hash,
+        name_hash,
     })
 }
 
