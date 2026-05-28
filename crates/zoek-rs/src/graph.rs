@@ -362,6 +362,55 @@ impl LightProvenance {
     }
 }
 
+// Phase 1.4: kind classification cache flags. Stored as u8 on GraphSymbol so
+// hot resolve paths can do `sym.kind_flags & KF_TYPE != 0` instead of a
+// string match against `sym.kind`. Skipped by serde — recomputed at every
+// construction site via compute_kind_flags().
+pub(crate) const KF_TYPE: u8 = 1 << 0;
+pub(crate) const KF_BARE_FB: u8 = 1 << 1;
+pub(crate) const KF_MEMBER_FB: u8 = 1 << 2;
+
+pub(crate) fn compute_kind_flags(kind: &str) -> u8 {
+    let mut f = 0u8;
+    if is_type_kind(kind) {
+        f |= KF_TYPE;
+    }
+    if is_bare_identifier_fallback_symbol(kind) {
+        f |= KF_BARE_FB;
+    }
+    if is_member_identifier_fallback_symbol(kind) {
+        f |= KF_MEMBER_FB;
+    }
+    f
+}
+
+// Phase 1.5: language id interning. Closed set of language strings produced
+// by language_for_path(). Mapping these to a small u16 lets HashMap keys go
+// from `(&str, &str)` (two string hashes) to `(u16, &str)` (one int + one
+// string hash). 0 = unknown (collisions OK since unknown languages don't
+// match any real symbol in maps that use this key).
+pub(crate) const LANG_UNKNOWN: u16 = 0;
+pub(crate) fn compute_language_id(language: &str) -> u16 {
+    match language {
+        "python" => 1,
+        "javascript" => 2,
+        "typescript" => 3,
+        "java" => 4,
+        "kotlin" => 5,
+        "graphql" => 6,
+        "rust" => 7,
+        "go" => 8,
+        "csharp" => 9,
+        "ruby" => 10,
+        "php" => 11,
+        "swift" => 12,
+        "scala" => 13,
+        "cpp" => 14,
+        "text" => 15,
+        _ => LANG_UNKNOWN,
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GraphSymbol {
     pub id: String,
@@ -390,6 +439,10 @@ pub struct GraphSymbol {
     pub implementation_count: Option<usize>,
     pub implementation_must_count: Option<usize>,
     pub implementation_may_count: Option<usize>,
+    #[serde(skip, default)]
+    pub kind_flags: u8,
+    #[serde(skip, default)]
+    pub language_id: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -2335,12 +2388,12 @@ fn query_graph_implementations_from_shards(
         }));
     };
 
-    let mut out = if is_type_kind(&target.kind) {
+    let mut out = if is_type_kind_sym(&target) {
         let (descendant_ids, _) =
             descendant_type_ids_and_names_indexed(workspace_root, config, &target)?;
         read_symbols_for_symbol_ids_indexed(workspace_root, config, &descendant_ids)?
             .into_iter()
-            .filter(|symbol| symbol.id != target.id && is_type_kind(&symbol.kind))
+            .filter(|symbol| symbol.id != target.id && is_type_kind_sym(symbol))
             .collect()
     } else if target.kind == "method" {
         let Some(container_id) = target.container_id.as_deref() else {
@@ -2425,7 +2478,7 @@ pub fn query_graph_implementations(
 
     let descendants = descendant_type_names(target, &store.symbols, &store.hierarchy_facts);
     let mut out = Vec::new();
-    if is_type_kind(&target.kind) {
+    if is_type_kind_sym(target) {
         for symbol in &store.symbols {
             if symbol.id != target.id && descendants.contains(&symbol.qualified_name) {
                 out.push(symbol.clone());
@@ -3028,6 +3081,8 @@ fn materialize_symbols(symbol_defs: Vec<SymbolDef>, line_count: u32) -> Vec<Grap
             .as_ref()
             .and_then(|name| by_qualified_name.get(name))
             .cloned();
+        let kind_flags = compute_kind_flags(&draft.kind);
+        let language_id = compute_language_id(&draft.language);
         symbols.push(GraphSymbol {
             id,
             name: draft.name,
@@ -3055,6 +3110,8 @@ fn materialize_symbols(symbol_defs: Vec<SymbolDef>, line_count: u32) -> Vec<Grap
             implementation_count: None,
             implementation_must_count: None,
             implementation_may_count: None,
+            kind_flags,
+            language_id,
         });
     }
     symbols
@@ -4800,34 +4857,16 @@ fn resolve_ref_sites_a_to_e<'a>(
     hierarchy_facts: &'a [HierarchyFact],
 ) -> ResolveIntermediate<'a> {
     let probe = std::env::var("ZOEK_RESOLVE_PROBE").is_ok();
-    // Phase 1.2: build interning tables for hot small-set fields (kind,
-    // language). Phase 2 will use these to replace `symbol.kind.as_str() ==
-    // "method"` lookups with `symbol_kind_id == KIND_METHOD`.
-    let t_intern = std::time::Instant::now();
-    let mut kind_table = StrTable::new();
-    let mut language_table = StrTable::new();
-    let mut symbol_kind_ids: Vec<u32> = Vec::with_capacity(symbols.len());
-    let mut symbol_language_ids: Vec<u32> = Vec::with_capacity(symbols.len());
-    for symbol in symbols {
-        symbol_kind_ids.push(kind_table.intern(&symbol.kind));
-        symbol_language_ids.push(language_table.intern(&symbol.language));
-    }
-    let _ = (&symbol_kind_ids, &symbol_language_ids, &kind_table, &language_table);
-    if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
-        eprintln!(
-            "[resolve] phase_a_intern={}ms kind_unique={} language_unique={}",
-            t_intern.elapsed().as_millis(),
-            kind_table.len(),
-            language_table.len(),
-        );
-    }
+    // Phase 1.4: GraphSymbol.kind_flags carries the cached classification
+    // flags. Phase A reads them directly off the struct (no parallel side
+    // vector needed). Hot resolve paths elsewhere also use the field.
 
     let t_a = std::time::Instant::now();
     let mut symbols_by_name: AHashMap<&str, Vec<&GraphSymbol>> = AHashMap::default();
     let mut bare_symbols_by_name: AHashMap<&str, Vec<&GraphSymbol>> = AHashMap::default();
-    let mut bare_symbols_by_language_and_name: AHashMap<(&str, &str), Vec<&GraphSymbol>> =
+    let mut bare_symbols_by_language_and_name: AHashMap<(u16, &str), Vec<&GraphSymbol>> =
         AHashMap::default();
-    let mut member_symbols_by_language_and_name: AHashMap<(&str, &str), Vec<&GraphSymbol>> =
+    let mut member_symbols_by_language_and_name: AHashMap<(u16, &str), Vec<&GraphSymbol>> =
         AHashMap::default();
     let mut symbols_by_id: AHashMap<&str, &GraphSymbol> = AHashMap::default();
     let mut types_by_name: AHashMap<&str, Vec<&GraphSymbol>> = AHashMap::default();
@@ -4835,12 +4874,13 @@ fn resolve_ref_sites_a_to_e<'a>(
         AHashMap::default();
     let mut symbols_by_file_and_name: AHashMap<(&str, &str), Vec<&GraphSymbol>> = AHashMap::default();
     for symbol in symbols {
+        let flags = symbol.kind_flags;
         symbols_by_id.insert(&symbol.id, symbol);
         symbols_by_name
             .entry(&symbol.name)
             .or_default()
             .push(symbol);
-        if is_type_kind(&symbol.kind) {
+        if flags & KF_TYPE != 0 {
             types_by_name.entry(&symbol.name).or_default().push(symbol);
         }
         if let Some(container_name) = symbol.container_name.as_deref() {
@@ -4849,19 +4889,19 @@ fn resolve_ref_sites_a_to_e<'a>(
                 .or_default()
                 .push(symbol);
         }
-        if is_bare_identifier_fallback_symbol(&symbol.kind) {
+        if flags & KF_BARE_FB != 0 {
             bare_symbols_by_name
                 .entry(&symbol.name)
                 .or_default()
                 .push(symbol);
             bare_symbols_by_language_and_name
-                .entry((symbol.language.as_str(), symbol.name.as_str()))
+                .entry((symbol.language_id, symbol.name.as_str()))
                 .or_default()
                 .push(symbol);
         }
-        if is_member_identifier_fallback_symbol(&symbol.kind) {
+        if flags & KF_MEMBER_FB != 0 {
             member_symbols_by_language_and_name
-                .entry((symbol.language.as_str(), symbol.name.as_str()))
+                .entry((symbol.language_id, symbol.name.as_str()))
                 .or_default()
                 .push(symbol);
         }
@@ -4993,6 +5033,18 @@ fn resolve_ref_sites_a_to_e<'a>(
             .unwrap_or(0);
     }
     if probe { eprintln!("[resolve] phase_d={}ms", t_d.elapsed().as_millis()); }
+    // Phase 1.5A pre-cache: build site language_id once (parallel) so the
+    // pre-filter and phase E workers can do O(1) array lookups instead of
+    // repeatedly running compute_language_id (a ~15-arm string match).
+    let t_slang = std::time::Instant::now();
+    let site_language_ids: Vec<u16> = {
+        use rayon::prelude::*;
+        ref_sites
+            .par_iter()
+            .map(|s| compute_language_id(s.language.as_str()))
+            .collect()
+    };
+    if probe { eprintln!("[resolve] site_lang_id_cache={}ms n={}", t_slang.elapsed().as_millis(), site_language_ids.len()); }
     // Phase E pre-filter v2: drop sites that cannot emit a ref. Matches
     // ALL the worker's productive paths including unique_member /
     // unique_bare candidate via the *_by_language_and_name maps. References
@@ -5032,7 +5084,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                         let access_kind = site.access_kind.as_str();
                         let rel_path = site.rel_path.as_str();
                         let name = site.name.as_str();
-                        let language = site.language.as_str();
+                        let language_id = site_language_ids[i];
                         let productive = if access_kind == "member" {
                             if let Some(receiver) = site.receiver_name.as_deref() {
                                 let has_receiver_match = matches!(receiver, "self" | "cls")
@@ -5041,7 +5093,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                                     || import_facts_pf.contains_key(&(rel_path, receiver))
                                     || type_facts_pf.contains_key(&(rel_path, receiver));
                                 has_receiver_match
-                                    || member_lang_pf.contains_key(&(language, name))
+                                    || member_lang_pf.contains_key(&(language_id, name))
                             } else {
                                 false
                             }
@@ -5049,7 +5101,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                             bare_symbols_pf.contains_key(name)
                                 || import_targets_pf.contains_key(&(rel_path, name))
                                 || star_imports_pf.contains_key(rel_path)
-                                || bare_lang_pf.contains_key(&(language, name))
+                                || bare_lang_pf.contains_key(&(language_id, name))
                         } else {
                             false
                         };
@@ -5102,23 +5154,34 @@ fn resolve_ref_sites_a_to_e<'a>(
     )> {
         // hashbrown::HashMap exposes `entry_ref` (probe by &str without
         // pre-allocating a String key). std::HashMap does not.
-        let mut counts: hashbrown::HashMap<String, GraphCount> = hashbrown::HashMap::new();
-        let mut counted_likely: AHashSet<u64> = AHashSet::default();
-        let mut counted_exact: AHashSet<u64> = AHashSet::default();
         // Pre-size: empirically ~36% of sites in a chunk push a reference here.
         // Cap at spill_threshold to avoid wasted reservation when chunk is huge.
         let chunk_estimate = ((end - start) / 3).min(spill_threshold).max(64);
+        let mut counts: hashbrown::HashMap<String, GraphCount> = hashbrown::HashMap::new();
+        // Phase 3 (sizing): pre-allocate the three edge-key dedup sets to a
+        // multiple of expected unique edges per chunk. Avoids ~20 growths each
+        // (each growth rehashes everything). 2x chunk_estimate covers typical
+        // candidate fan-out per site.
+        let dedup_cap = chunk_estimate.saturating_mul(2).max(64);
+        let mut counted_likely: AHashSet<u64> = AHashSet::with_capacity(dedup_cap);
+        let mut counted_exact: AHashSet<u64> = AHashSet::with_capacity(dedup_cap);
         // LightRef is the in-flight representation during the resolve loop:
         // ~24 bytes per record vs ~200 for GraphReference (8 String fields
         // collapse to a single u32 site_idx and small enums). At the end of
         // the worker we materialize once into Vec<GraphReference> so the
         // existing downstream path (phase F, write, spill) is unchanged.
         let mut light_refs: Vec<LightRef> = Vec::with_capacity(chunk_estimate);
-        let mut dedup: AHashSet<u64> = AHashSet::default();
+        let mut dedup: AHashSet<u64> = AHashSet::with_capacity(dedup_cap);
         let mut spill_paths: Vec<PathBuf> = Vec::new();
         // Reused per-site candidate buffers; capacity is retained across iterations.
         let mut fallback_buf: Vec<&GraphSymbol> = Vec::new();
         let mut exact_buf: Vec<MemberExactCandidate<'_>> = Vec::new();
+        let mut star_imported_buf: Vec<&GraphSymbol> = Vec::new();
+        // Phase 3 (Receiver Memoization): cache receiver-side resolution per
+        // (rel_path, receiver, enclosing_id). Within a chunk many sites share
+        // the same triplet — typical hit rate >70% on member-heavy corpora.
+        let mut receiver_cache: AHashMap<(&str, &str, Option<&str>), ReceiverResolution<'_>> =
+            AHashMap::default();
         let mut maybe_spill = |refs: &mut Vec<GraphReference>, paths: &mut Vec<PathBuf>| -> io::Result<()> {
             if refs.len() < spill_threshold {
                 return Ok(());
@@ -5157,37 +5220,55 @@ fn resolve_ref_sites_a_to_e<'a>(
             fallback_buf.clear();
             exact_buf.clear();
             if is_member {
-                combined_member_candidates(
-                    site,
-                    &symbols_by_id,
-                    &types_by_name,
-                    &members_by_container_and_name,
-                    &symbols_by_file_and_name,
-                    &import_targets,
-                    &import_facts_by_file_local,
-                    &type_facts_by_file_local,
-                    &function_return_facts_by_file_name,
-                    hierarchy_facts,
-                    &mut fallback_buf,
-                    &mut exact_buf,
-                );
+                if let Some(receiver) = site.receiver_name.as_deref() {
+                    let key = (
+                        site.rel_path.as_str(),
+                        receiver,
+                        site.enclosing_symbol_id.as_deref(),
+                    );
+                    let res = receiver_cache.entry(key).or_insert_with(|| {
+                        compute_receiver_resolution(
+                            site.rel_path.as_str(),
+                            receiver,
+                            site.enclosing_symbol_id.as_deref(),
+                            &symbols_by_id,
+                            &types_by_name,
+                            &import_targets,
+                            &import_facts_by_file_local,
+                            &type_facts_by_file_local,
+                            &symbols_by_file_and_name,
+                            &function_return_facts_by_file_name,
+                            hierarchy_facts,
+                        )
+                    });
+                    expand_receiver_for_name(
+                        res,
+                        site.name.as_str(),
+                        &members_by_container_and_name,
+                        &symbols_by_file_and_name,
+                        &mut fallback_buf,
+                        &mut exact_buf,
+                    );
+                }
             } else if let Some(bare) = bare_symbols_by_name.get(site.name.as_str()) {
                 fallback_buf.extend(bare.iter().copied());
             }
             let fallback_candidates: &[&GraphSymbol] = &fallback_buf;
-            let (imported_candidates, star_imported_candidates): (&[&GraphSymbol], Vec<&GraphSymbol>) = if is_bare {
+            let (imported_candidates, star_imported_candidates): (&[&GraphSymbol], &[&GraphSymbol]) = if is_bare {
                 let imported = import_targets
                     .get(&(site.rel_path.as_str(), site.name.as_str()))
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
-                let star_imported = star_import_candidates(
+                star_import_candidates_into(
                     site,
                     &star_import_facts_by_file,
                     &symbols_by_file_and_name,
+                    &mut star_imported_buf,
                 );
-                (imported, star_imported)
+                (imported, star_imported_buf.as_slice())
             } else {
-                (&[], Vec::new())
+                star_imported_buf.clear();
+                (&[], &[])
             };
             let unique_member_candidate = if is_member
                 && !site.is_import_context
@@ -5196,7 +5277,7 @@ fn resolve_ref_sites_a_to_e<'a>(
             {
                 unique_symbol_by_language_and_name(
                     &member_symbols_by_language_and_name,
-                    site.language.as_str(),
+                    site_language_ids[site_idx as usize],
                     site.name.as_str(),
                 )
             } else {
@@ -5209,9 +5290,13 @@ fn resolve_ref_sites_a_to_e<'a>(
             {
                 continue;
             }
+            // Phase 3: site-invariant partial hash (source_ref_id + edge_kind)
+            // computed once per site. Each candidate's edge_key only needs an
+            // additional u64 + target_id hash instead of 3 string hashes.
+            let site_partial = site_partial_hash(&site.source_ref_id, &site.edge_kind);
             if is_member {
                 for target in fallback_candidates.iter() {
-                    let edge_key = edge_key_hash(&site.source_ref_id, &target.id, &site.edge_kind);
+                    let edge_key = edge_key_from_partial(site_partial, &target.id);
                     add_resolution_count(
                         &mut counts,
                         &mut counted_likely,
@@ -5225,7 +5310,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                     );
                 }
                 for candidate in exact_buf.drain(..) {
-                    let edge_key = edge_key_hash(&site.source_ref_id, &candidate.target.id, &site.edge_kind);
+                    let edge_key = edge_key_from_partial(site_partial, &candidate.target.id);
                     add_resolution_count(
                         &mut counts,
                         &mut counted_likely,
@@ -5249,7 +5334,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                     );
                 }
                 if let Some(target) = unique_member_candidate {
-                    let edge_key = edge_key_hash(&site.source_ref_id, &target.id, &site.edge_kind);
+                    let edge_key = edge_key_from_partial(site_partial, &target.id);
                     add_resolution_count(
                         &mut counts,
                         &mut counted_likely,
@@ -5278,7 +5363,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                 .iter()
                 .filter(|symbol| symbol.rel_path == site.rel_path.as_str())
                 .count();
-            let unique_bare_candidate = if site.access_kind.as_str() == "bare"
+            let unique_bare_candidate = if is_bare
                 && !site.is_import_context
                 && same_file_count == 0
                 && imported_candidates.is_empty()
@@ -5286,7 +5371,7 @@ fn resolve_ref_sites_a_to_e<'a>(
             {
                 unique_symbol_by_language_and_name(
                     &bare_symbols_by_language_and_name,
-                    site.language.as_str(),
+                    site_language_ids[site_idx as usize],
                     site.name.as_str(),
                 )
             } else {
@@ -5302,8 +5387,8 @@ fn resolve_ref_sites_a_to_e<'a>(
                     BOUND_MAY
                 };
                 let fallback_already_counts_may =
-                    site.access_kind.as_str() == "bare" && target.name == site.name.as_str();
-                let edge_key = edge_key_hash(&site.source_ref_id, &target.id, &site.edge_kind);
+                    is_bare && target.name == site.name.as_str();
+                let edge_key = edge_key_from_partial(site_partial, &target.id);
                 add_resolution_count(
                     &mut counts,
                     &mut counted_likely,
@@ -5329,7 +5414,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                 }
             }
             for target in star_imported_candidates.iter() {
-                let edge_key = edge_key_hash(&site.source_ref_id, &target.id, &site.edge_kind);
+                let edge_key = edge_key_from_partial(site_partial, &target.id);
                 add_resolution_count(
                     &mut counts,
                     &mut counted_likely,
@@ -5353,10 +5438,10 @@ fn resolve_ref_sites_a_to_e<'a>(
                 );
             }
             for target in fallback_candidates.iter() {
-                let is_same_file_unique = site.access_kind.as_str() == "bare"
+                let is_same_file_unique = is_bare
                     && same_file_count == 1
                     && target.rel_path == site.rel_path.as_str();
-                let is_workspace_unique = site.access_kind.as_str() == "bare"
+                let is_workspace_unique = is_bare
                     && unique_bare_candidate.is_some_and(|unique| unique.id == target.id);
                 let bound_mask = if is_same_file_unique {
                     BOUND_MAY | BOUND_MUST
@@ -5364,7 +5449,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                     BOUND_MAY
                 };
                 if is_same_file_unique || is_workspace_unique {
-                    let edge_key = edge_key_hash(&site.source_ref_id, &target.id, &site.edge_kind);
+                    let edge_key = edge_key_from_partial(site_partial, &target.id);
                     add_resolution_count(
                         &mut counts,
                         &mut counted_likely,
@@ -5548,15 +5633,19 @@ fn star_import_facts_by_file<'a>(
     out
 }
 
-fn star_import_candidates<'a>(
+/// Phase 3: caller-provided buffer variant. Used in the phase E worker loop
+/// where this is called per bare ref site (~16M times). Avoids a fresh Vec
+/// allocation per call.
+fn star_import_candidates_into<'a>(
     site: &RefSite,
     star_import_facts_by_file: &HashMap<&'a str, Vec<&'a ImportFact>>,
     symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
-) -> Vec<&'a GraphSymbol> {
+    out: &mut Vec<&'a GraphSymbol>,
+) {
+    out.clear();
     let Some(facts) = star_import_facts_by_file.get(site.rel_path.as_str()) else {
-        return Vec::new();
+        return;
     };
-    let mut out = Vec::new();
     for fact in facts {
         for module_path in &fact.module_candidates {
             if let Some(symbols) =
@@ -5566,7 +5655,20 @@ fn star_import_candidates<'a>(
             }
         }
     }
-    sort_dedup_symbols(&mut out);
+    if out.len() > 1 {
+        out.sort_unstable_by_key(sym_ptr);
+        out.dedup_by_key(|s| sym_ptr(s));
+    }
+}
+
+#[allow(dead_code)]
+fn star_import_candidates<'a>(
+    site: &RefSite,
+    star_import_facts_by_file: &HashMap<&'a str, Vec<&'a ImportFact>>,
+    symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+) -> Vec<&'a GraphSymbol> {
+    let mut out = Vec::new();
+    star_import_candidates_into(site, star_import_facts_by_file, symbols_by_file_and_name, &mut out);
     out
 }
 
@@ -5690,7 +5792,7 @@ fn combined_member_candidates_by_key<'a>(
                     name,
                     "receiver-self",
                 );
-            } else if is_type_kind(&source.kind) {
+            } else if is_type_kind_sym(source) {
                 extend_members_for_type(
                     fallback,
                     members_by_container_and_name,
@@ -5721,7 +5823,7 @@ fn combined_member_candidates_by_key<'a>(
 
     if let Some(targets) = import_targets.get(&(rel_path, receiver)) {
         for target in targets {
-            if is_type_kind(&target.kind) {
+            if is_type_kind_sym(target) {
                 extend_members_for_type(
                     fallback,
                     members_by_container_and_name,
@@ -5794,8 +5896,194 @@ fn combined_member_candidates_by_key<'a>(
         }
     }
 
-    fallback.sort_by(|left, right| left.id.cmp(&right.id));
-    fallback.dedup_by(|left, right| left.id == right.id);
+    if fallback.len() > 1 {
+        fallback.sort_unstable_by_key(sym_ptr);
+        fallback.dedup_by_key(|s| sym_ptr(s));
+    }
+    sort_dedup_member_exact_candidates(exact);
+    if exact.len() != 1 {
+        exact.clear();
+    }
+}
+
+/// Phase 3 (Receiver Memoization): the receiver-side resolution that
+/// `combined_member_candidates_by_key` does is independent of the ref site's
+/// `name`. Within a chunk many sites share the same (rel_path, receiver,
+/// enclosing_id) triplet, so we precompute the receiver-side info once and
+/// reuse it across all sites with the same key.
+#[derive(Clone, Copy)]
+struct TypeTarget<'a> {
+    sym: &'a GraphSymbol,
+    provenance: &'static str,
+}
+
+struct ReceiverResolution<'a> {
+    has_any: bool,
+    /// For receiver="self"|"cls" where source has container_name
+    self_container: Option<&'a str>,
+    /// For receiver="self"|"cls" where source itself is a type kind
+    self_type_symbol: Option<&'a GraphSymbol>,
+    /// Type symbols whose members we expand by name
+    type_targets: Vec<TypeTarget<'a>>,
+    /// Raw import facts (need name to expand module_candidates)
+    import_facts: Vec<&'a ImportFact>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_receiver_resolution<'a>(
+    rel_path: &'a str,
+    receiver: &'a str,
+    site_enclosing_id: Option<&'a str>,
+    symbols_by_id: &HashMap<&'a str, &'a GraphSymbol>,
+    types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
+    import_targets: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    import_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a ImportFact>>,
+    type_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a TypeFact>>,
+    symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    function_return_facts_by_file_name: &HashMap<(&'a str, &'a str), Vec<&'a FunctionReturnFact>>,
+    hierarchy_facts: &[HierarchyFact],
+) -> ReceiverResolution<'a> {
+    let mut type_targets: Vec<TypeTarget<'a>> = Vec::new();
+    let mut import_facts_out: Vec<&'a ImportFact> = Vec::new();
+    let mut self_container: Option<&'a str> = None;
+    let mut self_type_symbol: Option<&'a GraphSymbol> = None;
+
+    let is_self_kind = matches!(receiver, "self" | "cls");
+    let has_any = is_self_kind
+        || types_by_name.contains_key(receiver)
+        || import_targets.contains_key(&(rel_path, receiver))
+        || import_facts_by_file_local.contains_key(&(rel_path, receiver))
+        || type_facts_by_file_local.contains_key(&(rel_path, receiver));
+    if !has_any {
+        return ReceiverResolution {
+            has_any: false,
+            self_container,
+            self_type_symbol,
+            type_targets,
+            import_facts: import_facts_out,
+        };
+    }
+
+    if is_self_kind {
+        if let Some(source) = site_enclosing_id.and_then(|id| symbols_by_id.get(id)) {
+            if let Some(c) = source.container_name.as_deref() {
+                self_container = Some(c);
+            } else if is_type_kind_sym(source) {
+                self_type_symbol = Some(source);
+            }
+        }
+    }
+
+    if let Some(types) = types_by_name.get(receiver) {
+        for t in types {
+            type_targets.push(TypeTarget { sym: *t, provenance: "receiver-type" });
+        }
+    }
+
+    if let Some(targets) = import_targets.get(&(rel_path, receiver)) {
+        for t in targets {
+            if is_type_kind_sym(t) {
+                type_targets.push(TypeTarget { sym: *t, provenance: "imported-type" });
+            }
+        }
+    }
+
+    if let Some(facts) = import_facts_by_file_local.get(&(rel_path, receiver)) {
+        import_facts_out.extend(facts.iter().copied());
+    }
+
+    if let Some(facts) = type_facts_by_file_local.get(&(rel_path, receiver)) {
+        for fact in facts {
+            if !type_fact_applies_by_enclosing(fact, site_enclosing_id) {
+                continue;
+            }
+            let targets = resolve_type_fact_targets_by_key(
+                fact,
+                rel_path,
+                site_enclosing_id,
+                symbols_by_id,
+                types_by_name,
+                symbols_by_file_and_name,
+                import_targets,
+                function_return_facts_by_file_name,
+                hierarchy_facts,
+            );
+            for t in targets {
+                type_targets.push(TypeTarget { sym: t, provenance: "type-fact" });
+            }
+        }
+    }
+
+    ReceiverResolution {
+        has_any: true,
+        self_container,
+        self_type_symbol,
+        type_targets,
+        import_facts: import_facts_out,
+    }
+}
+
+/// Per-name expansion of a cached `ReceiverResolution`. Splits the
+/// name-dependent work out of `combined_member_candidates_by_key` so we can
+/// reuse receiver-side state across sites that share (rel_path, receiver,
+/// enclosing_id).
+fn expand_receiver_for_name<'a>(
+    res: &ReceiverResolution<'a>,
+    name: &'a str,
+    members_by_container_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    fallback: &mut Vec<&'a GraphSymbol>,
+    exact: &mut Vec<MemberExactCandidate<'a>>,
+) {
+    fallback.clear();
+    exact.clear();
+    if !res.has_any {
+        return;
+    }
+    if let Some(c) = res.self_container {
+        extend_and_collect_members_for_container(
+            fallback,
+            exact,
+            members_by_container_and_name,
+            c,
+            name,
+            "receiver-self",
+        );
+    } else if let Some(sym) = res.self_type_symbol {
+        extend_members_for_type(fallback, members_by_container_and_name, sym, name);
+    }
+    for tt in &res.type_targets {
+        extend_and_collect_members_for_type(
+            fallback,
+            exact,
+            members_by_container_and_name,
+            tt.sym,
+            name,
+            tt.provenance,
+        );
+    }
+    for fact in &res.import_facts {
+        let is_star = fact.imported_name == "*";
+        for module_path in &fact.module_candidates {
+            if let Some(symbols) =
+                symbols_by_file_and_name.get(&(module_path.as_str(), name))
+            {
+                fallback.extend(symbols.iter().copied());
+                if is_star {
+                    for symbol in symbols {
+                        exact.push(MemberExactCandidate {
+                            target: *symbol,
+                            provenance: "import-namespace",
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if fallback.len() > 1 {
+        fallback.sort_unstable_by_key(sym_ptr);
+        fallback.dedup_by_key(|s| sym_ptr(s));
+    }
     sort_dedup_member_exact_candidates(exact);
     if exact.len() != 1 {
         exact.clear();
@@ -5919,7 +6207,7 @@ fn resolve_type_name_targets_by_key<'a>(
         let same_file_types: Vec<_> = targets
             .iter()
             .copied()
-            .filter(|symbol| is_type_kind(&symbol.kind))
+            .filter(|symbol| is_type_kind_sym(symbol))
             .collect();
         if !same_file_types.is_empty() {
             return same_file_types;
@@ -5929,7 +6217,7 @@ fn resolve_type_name_targets_by_key<'a>(
         let imported_types: Vec<_> = targets
             .iter()
             .copied()
-            .filter(|symbol| is_type_kind(&symbol.kind))
+            .filter(|symbol| is_type_kind_sym(symbol))
             .collect();
         if !imported_types.is_empty() {
             return imported_types;
@@ -6062,7 +6350,7 @@ fn resolve_type_name_targets<'a>(
         let same_file_types: Vec<_> = targets
             .iter()
             .copied()
-            .filter(|symbol| is_type_kind(&symbol.kind))
+            .filter(|symbol| is_type_kind_sym(symbol))
             .collect();
         if !same_file_types.is_empty() {
             return same_file_types;
@@ -6072,7 +6360,7 @@ fn resolve_type_name_targets<'a>(
         let imported_types: Vec<_> = targets
             .iter()
             .copied()
-            .filter(|symbol| is_type_kind(&symbol.kind))
+            .filter(|symbol| is_type_kind_sym(symbol))
             .collect();
         if !imported_types.is_empty() {
             return imported_types;
@@ -6128,18 +6416,12 @@ fn extend_members_for_type<'a>(
     type_symbol: &'a GraphSymbol,
     member_name: &str,
 ) {
-    extend_members_for_container(
-        out,
-        members_by_container_and_name,
-        type_symbol.qualified_name.as_str(),
-        member_name,
-    );
-    extend_members_for_container(
-        out,
-        members_by_container_and_name,
-        type_symbol.name.as_str(),
-        member_name,
-    );
+    let qual = type_symbol.qualified_name.as_str();
+    let name = type_symbol.name.as_str();
+    extend_members_for_container(out, members_by_container_and_name, qual, member_name);
+    if qual != name {
+        extend_members_for_container(out, members_by_container_and_name, name, member_name);
+    }
 }
 
 fn collect_exact_members_for_type<'a>(
@@ -6191,14 +6473,82 @@ fn collect_exact_members_for_container<'a>(
     }
 }
 
+/// Phase 3 optimization: combined extend + collect that does ONE HashMap
+/// lookup instead of two. Used by `expand_receiver_for_name` where each
+/// type target needs both fallback and exact members for the same
+/// (container, name) keys.
+fn extend_and_collect_members_for_container<'a>(
+    fallback: &mut Vec<&'a GraphSymbol>,
+    exact: &mut Vec<MemberExactCandidate<'a>>,
+    members_by_container_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    container_name: &str,
+    member_name: &str,
+    provenance: &'static str,
+) {
+    if let Some(symbols) = members_by_container_and_name.get(&(container_name, member_name)) {
+        for sym in symbols {
+            fallback.push(*sym);
+            exact.push(MemberExactCandidate { target: *sym, provenance });
+        }
+    }
+}
+
+fn extend_and_collect_members_for_type<'a>(
+    fallback: &mut Vec<&'a GraphSymbol>,
+    exact: &mut Vec<MemberExactCandidate<'a>>,
+    members_by_container_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    type_symbol: &'a GraphSymbol,
+    member_name: &str,
+    provenance: &'static str,
+) {
+    let qual = type_symbol.qualified_name.as_str();
+    let name = type_symbol.name.as_str();
+    extend_and_collect_members_for_container(
+        fallback,
+        exact,
+        members_by_container_and_name,
+        qual,
+        member_name,
+        provenance,
+    );
+    // Phase 3 optimization: top-level symbols have qualified_name == name;
+    // the second lookup would return the same Vec. Skip when equal.
+    if qual != name {
+        extend_and_collect_members_for_container(
+            fallback,
+            exact,
+            members_by_container_and_name,
+            name,
+            member_name,
+            provenance,
+        );
+    }
+}
+
+// Phase 3 optimization: dedup `&GraphSymbol` by pointer instead of by id
+// string. Within resolve, every `&GraphSymbol` points into the single owning
+// `symbols` slice, so pointer equality is symbol identity. Pointer compares
+// are integer ops (~1ns) vs String ord/eq on id (10-50ns), and we hit this
+// per member ref site.
+#[inline]
+fn sym_ptr(s: &&GraphSymbol) -> usize {
+    *s as *const GraphSymbol as usize
+}
+
 fn sort_dedup_symbols(symbols: &mut Vec<&GraphSymbol>) {
-    symbols.sort_by(|left, right| left.id.cmp(&right.id));
-    symbols.dedup_by(|left, right| left.id == right.id);
+    if symbols.len() <= 1 {
+        return;
+    }
+    symbols.sort_unstable_by_key(sym_ptr);
+    symbols.dedup_by_key(|s| sym_ptr(s));
 }
 
 fn sort_dedup_member_exact_candidates(candidates: &mut Vec<MemberExactCandidate<'_>>) {
-    candidates.sort_by(|left, right| left.target.id.cmp(&right.target.id));
-    candidates.dedup_by(|left, right| left.target.id == right.target.id);
+    if candidates.len() <= 1 {
+        return;
+    }
+    candidates.sort_unstable_by_key(|c| c.target as *const GraphSymbol as usize);
+    candidates.dedup_by_key(|c| c.target as *const GraphSymbol as usize);
 }
 
 type PhaseCAccums<'a> = (
@@ -6292,6 +6642,10 @@ fn add_resolution_count(
     likely: bool,
     edge_key: u64,
 ) {
+    // Phase 3: cache the edge_kind classification once. Old code re-ran
+    // `matches!(site.edge_kind.as_str(), "call" | "construct")` up to 3
+    // times per call (with ~5 calls per site → 15 string matches/site).
+    let is_callish = matches!(site.edge_kind.as_str(), "call" | "construct");
     // `entry_ref` (hashbrown-only) probes by `&str` and allocates a String
     // key only when the entry is genuinely new — a single lookup on hit,
     // vs the prior contains_key+get_mut two-lookup pattern. ~14M calls in
@@ -6299,19 +6653,19 @@ fn add_resolution_count(
     let count = counts.entry_ref(target.id.as_str()).or_default();
     if likely && counted_likely.insert(edge_key) {
         count.usage_likely += 1;
-        if matches!(site.edge_kind.as_str(), "call" | "construct") {
+        if is_callish {
             count.calls_in_likely += 1;
         }
     }
     if !may_already_counted && bound_mask & BOUND_MAY != 0 {
         count.usage_may += 1;
-        if matches!(site.edge_kind.as_str(), "call" | "construct") {
+        if is_callish {
             count.calls_in_may += 1;
         }
     }
     if bound_mask & BOUND_MUST != 0 && counted_exact.insert(edge_key) {
         count.usage_must += 1;
-        if matches!(site.edge_kind.as_str(), "call" | "construct") {
+        if is_callish {
             count.calls_in_must += 1;
         }
     }
@@ -6583,11 +6937,31 @@ fn resolve_import_targets<'a>(
 }
 
 fn edge_key_hash(source_ref_id: &str, target_id: &str, edge_kind: &str) -> u64 {
+    edge_key_from_partial(
+        site_partial_hash(source_ref_id, edge_kind),
+        target_id,
+    )
+}
+
+/// Phase 3 optimization: per-site partial hash (source_ref_id + edge_kind).
+/// Same source ref produces multiple resolutions with different targets;
+/// hashing the site-invariant components once saves N-1 string hashes for
+/// the candidate fan-out.
+#[inline]
+fn site_partial_hash(source_ref_id: &str, edge_kind: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = ahash::AHasher::default();
     source_ref_id.hash(&mut h);
-    target_id.hash(&mut h);
     edge_kind.hash(&mut h);
+    h.finish()
+}
+
+#[inline]
+fn edge_key_from_partial(site_partial: u64, target_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = ahash::AHasher::default();
+    h.write_u64(site_partial);
+    target_id.hash(&mut h);
     h.finish()
 }
 
@@ -6809,8 +7183,14 @@ fn compute_native_counts(
     counts: &mut HashMap<String, GraphCount>,
     hierarchy_facts: &[HierarchyFact],
 ) {
+    // Phase 3: pre-size to avoid HashMap grow/rehash on 4M symbols. Skip the
+    // clone when the key is already present (~50% of symbols on the
+    // captain2 corpus already have counts from phase E).
+    counts.reserve(symbols.len().saturating_sub(counts.len()));
     for symbol in symbols {
-        counts.entry(symbol.id.clone()).or_default();
+        if !counts.contains_key(symbol.id.as_str()) {
+            counts.insert(symbol.id.clone(), GraphCount::default());
+        }
     }
     if symbols.len() <= MAX_EAGER_IMPLEMENTATION_SYMBOLS {
         apply_implementation_counts(symbols, hierarchy_facts, counts);
@@ -6823,16 +7203,16 @@ fn apply_implementation_counts(
     counts: &mut HashMap<String, GraphCount>,
 ) {
     for symbol in symbols {
-        if !is_type_kind(&symbol.kind) && symbol.kind != "method" {
+        if !is_type_kind_sym(symbol) && symbol.kind != "method" {
             continue;
         }
         let descendants = descendant_type_names(symbol, symbols, hierarchy_facts);
-        let implementations = if is_type_kind(&symbol.kind) {
+        let implementations = if is_type_kind_sym(symbol) {
             symbols
                 .iter()
                 .filter(|candidate| {
                     candidate.id != symbol.id
-                        && is_type_kind(&candidate.kind)
+                        && is_type_kind_sym(candidate)
                         && descendants.contains(&candidate.qualified_name)
                 })
                 .count()
@@ -7148,7 +7528,7 @@ fn append_hierarchy_to_parent_shards(
 ) -> io::Result<()> {
     let mut scratch: Vec<u8> = Vec::with_capacity(120);
     for symbol in symbols {
-        if !is_type_kind(&symbol.kind) {
+        if !is_type_kind_sym(symbol) {
             continue;
         }
         for parent_name in symbol.extends_names.iter().chain(&symbol.implements_names) {
@@ -7624,16 +8004,15 @@ fn write_symbol_id_shards(
     symbols: &[GraphSymbol],
     file_table: &FileTable,
 ) -> io::Result<u64> {
-    parallel_sharded_write(
+    parallel_sharded_write_serialize(
         workspace_root,
         config,
         GRAPH_SYMBOL_ID_SHARD_PREFIX,
         symbols,
-        |symbol| {
+        |symbol, buf| {
             let id = file_table.get_id(&symbol.rel_path).unwrap_or(u32::MAX);
-            let mut buf: Vec<u8> = Vec::with_capacity(300);
-            serialize_symbol_binary(symbol, id, &mut buf);
-            Some((shard_index_for_key(&symbol.id), buf))
+            serialize_symbol_binary(symbol, id, buf);
+            Some(shard_index_for_key(&symbol.id))
         },
     )
 }
@@ -7644,16 +8023,15 @@ fn write_symbol_uri_shards(
     symbols: &[GraphSymbol],
     file_table: &FileTable,
 ) -> io::Result<u64> {
-    parallel_sharded_write(
+    parallel_sharded_write_serialize(
         workspace_root,
         config,
         GRAPH_SYMBOL_URI_SHARD_PREFIX,
         symbols,
-        |symbol| {
+        |symbol, buf| {
             let id = file_table.get_id(&symbol.rel_path).unwrap_or(u32::MAX);
-            let mut buf: Vec<u8> = Vec::with_capacity(300);
-            serialize_symbol_binary(symbol, id, &mut buf);
-            Some((shard_index_for_key(&symbol.uri), buf))
+            serialize_symbol_binary(symbol, id, buf);
+            Some(shard_index_for_key(&symbol.uri))
         },
     )
 }
@@ -7665,20 +8043,88 @@ fn write_reference_target_shards(
     file_table: &FileTable,
     _incremental: Option<&HashSet<String>>,
 ) -> io::Result<u64> {
-    parallel_sharded_write(
+    parallel_sharded_write_serialize(
         workspace_root,
         config,
         GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
         references,
-        |reference| {
-            reference.target_symbol_id.as_deref().map(|target| {
-                let id = file_table.get_id(&reference.rel_path).unwrap_or(u32::MAX);
-                let mut buf: Vec<u8> = Vec::with_capacity(200);
-                serialize_reference_binary(reference, id, &mut buf);
-                (shard_index_for_key(target), buf)
-            })
+        |reference, buf| {
+            let target = reference.target_symbol_id.as_deref()?;
+            let id = file_table.get_id(&reference.rel_path).unwrap_or(u32::MAX);
+            serialize_reference_binary(reference, id, buf);
+            Some(shard_index_for_key(target))
         },
     )
+}
+
+/// Phase 3 (write opt): variant of `parallel_sharded_write` that lets the
+/// caller fill a reusable byte buffer instead of allocating a fresh `Vec` per
+/// item. For symbol shards alone this avoids ~8M `Vec::with_capacity(300)`
+/// alloc/free pairs per index build.
+fn parallel_sharded_write_serialize<T, F>(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    prefix: &str,
+    items: &[T],
+    serialize_into: F,
+) -> io::Result<u64>
+where
+    T: Sync,
+    F: Fn(&T, &mut Vec<u8>) -> Option<usize> + Sync,
+{
+    let total = items.len();
+    let worker_count = graph_worker_count(total.max(1));
+    if total == 0 || worker_count <= 1 {
+        let mut shards = open_graph_shard_writers(workspace_root, config, prefix)?;
+        let mut buf: Vec<u8> = Vec::with_capacity(512);
+        for item in items {
+            buf.clear();
+            if let Some(shard) = serialize_into(item, &mut buf) {
+                shards[shard].writer.write_all(&buf)?;
+            }
+        }
+        return finish_graph_shard_writers(shards);
+    }
+    use rayon::prelude::*;
+    let chunks_per_worker = 8usize;
+    let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
+    let chunk_size = total.div_ceil(target_chunks).max(1);
+    let ranges: Vec<(usize, usize)> = (0..)
+        .map(|i| {
+            let start = i * chunk_size;
+            let end = (start + chunk_size).min(total);
+            (start, end)
+        })
+        .take_while(|(start, _)| *start < total)
+        .collect();
+    let serialize_into_ref = &serialize_into;
+    let worker_buffers: Vec<Vec<Vec<u8>>> = ranges
+        .into_par_iter()
+        .map(|(start, end)| {
+            let mut bufs: Vec<Vec<u8>> = (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+            let mut scratch: Vec<u8> = Vec::with_capacity(512);
+            for item in &items[start..end] {
+                scratch.clear();
+                if let Some(shard) = serialize_into_ref(item, &mut scratch) {
+                    bufs[shard].extend_from_slice(&scratch);
+                }
+            }
+            bufs
+        })
+        .collect();
+    let mut writers = open_graph_shard_writers(workspace_root, config, prefix)?;
+    let worker_buffers_ref = &worker_buffers;
+    writers
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(shard_idx, w)| -> io::Result<()> {
+            for w_bufs in worker_buffers_ref {
+                w.writer.write_all(&w_bufs[shard_idx])?;
+            }
+            w.writer.flush()?;
+            Ok(())
+        })?;
+    finish_graph_shard_writers(writers)
 }
 
 fn parallel_sharded_write<T, F, B>(
@@ -7806,21 +8252,19 @@ fn write_reference_enclosing_shards(
     references: &[GraphReference],
     file_table: &FileTable,
 ) -> io::Result<u64> {
-    parallel_sharded_write(
+    parallel_sharded_write_serialize(
         workspace_root,
         config,
         GRAPH_REFERENCE_ENCLOSING_SHARD_PREFIX,
         references,
-        |reference| {
+        |reference, buf| {
             if !matches!(reference.edge_kind.as_ref(), "call" | "construct") {
                 return None;
             }
-            reference.enclosing_symbol_id.as_deref().map(|enclosing| {
-                let id = file_table.get_id(&reference.rel_path).unwrap_or(u32::MAX);
-                let mut buf: Vec<u8> = Vec::with_capacity(200);
-                serialize_reference_binary(reference, id, &mut buf);
-                (shard_index_for_key(enclosing), buf)
-            })
+            let enclosing = reference.enclosing_symbol_id.as_deref()?;
+            let id = file_table.get_id(&reference.rel_path).unwrap_or(u32::MAX);
+            serialize_reference_binary(reference, id, buf);
+            Some(shard_index_for_key(enclosing))
         },
     )
 }
@@ -7831,15 +8275,14 @@ fn write_count_id_shards(
     counts: &HashMap<String, GraphCount>,
 ) -> io::Result<u64> {
     let rows: Vec<(&String, &GraphCount)> = counts.iter().collect();
-    parallel_sharded_write(
+    parallel_sharded_write_serialize(
         workspace_root,
         config,
         GRAPH_COUNT_ID_SHARD_PREFIX,
         &rows,
-        |(symbol_id, count)| {
-            let mut buf: Vec<u8> = Vec::with_capacity(80);
-            serialize_count_binary(symbol_id, count, &mut buf);
-            Some((shard_index_for_key(symbol_id), buf))
+        |(symbol_id, count), buf| {
+            serialize_count_binary(symbol_id, count, buf);
+            Some(shard_index_for_key(symbol_id))
         },
     )
 }
@@ -7851,7 +8294,7 @@ fn write_hierarchy_parent_shards(
 ) -> io::Result<u64> {
     let mut entries: Vec<(usize, Vec<u8>)> = Vec::new();
     for symbol in symbols {
-        if !is_type_kind(&symbol.kind) {
+        if !is_type_kind_sym(symbol) {
             continue;
         }
         for parent_name in symbol.extends_names.iter().chain(&symbol.implements_names) {
@@ -8747,6 +9190,8 @@ fn parse_symbol_binary(
     let implementation_count = read_opt_u64(bytes, cursor)?;
     let implementation_must_count = read_opt_u64(bytes, cursor)?;
     let implementation_may_count = read_opt_u64(bytes, cursor)?;
+    let kind_flags = compute_kind_flags(&kind);
+    let language_id = compute_language_id(&language);
     Ok(GraphSymbol {
         id,
         name,
@@ -8774,6 +9219,8 @@ fn parse_symbol_binary(
         implementation_count,
         implementation_must_count,
         implementation_may_count,
+        kind_flags,
+        language_id,
     })
 }
 
@@ -9197,12 +9644,16 @@ fn validate_symbol_fields(fields: &[&str]) -> io::Result<()> {
 
 fn parse_symbol_fields(fields: &[&str]) -> io::Result<GraphSymbol> {
     validate_symbol_fields(fields)?;
+    let kind = decode_field(fields[4])?;
+    let kind_flags = compute_kind_flags(&kind);
+    let language = decode_field(fields[5])?;
+    let language_id = compute_language_id(&language);
     Ok(GraphSymbol {
         id: decode_field(fields[1])?,
         name: decode_field(fields[2])?,
         qualified_name: decode_field(fields[3])?,
-        kind: decode_field(fields[4])?,
-        language: decode_field(fields[5])?,
+        kind,
+        language,
         uri: decode_field(fields[6])?,
         rel_path: decode_field(fields[7])?,
         start_line: parse_u32(fields[8], "startLine")?,
@@ -9224,6 +9675,8 @@ fn parse_symbol_fields(fields: &[&str]) -> io::Result<GraphSymbol> {
         implementation_count: None,
         implementation_must_count: None,
         implementation_may_count: None,
+        kind_flags,
+        language_id,
     })
 }
 
@@ -9467,7 +9920,7 @@ fn descendant_type_names(
 ) -> HashSet<String> {
     let type_names: HashSet<&str> = symbols
         .iter()
-        .filter(|symbol| is_type_kind(&symbol.kind))
+        .filter(|symbol| is_type_kind_sym(symbol))
         .flat_map(|symbol| [symbol.qualified_name.as_str(), symbol.name.as_str()])
         .collect();
     let mut descendants = HashSet::new();
@@ -10524,12 +10977,27 @@ fn is_member_identifier_fallback_symbol(kind: &str) -> bool {
     matches!(kind, "method" | "field" | "property")
 }
 
+#[inline(always)]
+pub(crate) fn is_type_kind_sym(s: &GraphSymbol) -> bool {
+    s.kind_flags & KF_TYPE != 0
+}
+
+#[inline(always)]
+pub(crate) fn is_bare_fallback_sym(s: &GraphSymbol) -> bool {
+    s.kind_flags & KF_BARE_FB != 0
+}
+
+#[inline(always)]
+pub(crate) fn is_member_fallback_sym(s: &GraphSymbol) -> bool {
+    s.kind_flags & KF_MEMBER_FB != 0
+}
+
 fn unique_symbol_by_language_and_name<'a>(
-    symbols_by_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
-    language: &str,
+    symbols_by_name: &HashMap<(u16, &'a str), Vec<&'a GraphSymbol>>,
+    language_id: u16,
     name: &str,
 ) -> Option<&'a GraphSymbol> {
-    let symbols = symbols_by_name.get(&(language, name))?;
+    let symbols = symbols_by_name.get(&(language_id, name))?;
     if symbols.len() == 1 {
         symbols.first().copied()
     } else {
