@@ -210,7 +210,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const GRAPH_VERSION: u32 = 5;
+const GRAPH_VERSION: u32 = 6;
 const GRAPH_FILE_NAME: &str = "callgraph-relations.tsv";
 const GRAPH_SYMBOL_FILE_NAME: &str = "callgraph-symbols.tsv";
 const GRAPH_COUNT_FILE_NAME: &str = "callgraph-counts.tsv";
@@ -411,6 +411,73 @@ pub(crate) fn compute_language_id(language: &str) -> u16 {
     }
 }
 
+/// Inverse of `compute_language_id` for shard parse paths.
+/// Returns None for unknown ids (caller must fall back to in-band string).
+fn language_str_from_id(id: u16) -> Option<&'static str> {
+    Some(match id {
+        1 => "python",
+        2 => "javascript",
+        3 => "typescript",
+        4 => "java",
+        5 => "kotlin",
+        6 => "graphql",
+        7 => "rust",
+        8 => "go",
+        9 => "csharp",
+        10 => "ruby",
+        11 => "php",
+        12 => "swift",
+        13 => "scala",
+        14 => "cpp",
+        15 => "text",
+        _ => return None,
+    })
+}
+
+// Phase 3 aggressive: encode RefSite enums as u8 ids on disk. 38M ref_sites
+// × ~26B saved (lang+edge+access string headers) ≈ ~1GB shard size cut.
+// 255 reserved for "string follows inline" (unknown enum value).
+const EDGE_KIND_OTHER: u8 = 255;
+const ACCESS_KIND_OTHER: u8 = 255;
+
+#[inline]
+fn compute_edge_kind_id(s: &str) -> u8 {
+    match s {
+        "usage" => 0,
+        "call" => 1,
+        "construct" => 2,
+        _ => EDGE_KIND_OTHER,
+    }
+}
+
+#[inline]
+fn edge_kind_str_from_id(id: u8) -> Option<&'static str> {
+    Some(match id {
+        0 => "usage",
+        1 => "call",
+        2 => "construct",
+        _ => return None,
+    })
+}
+
+#[inline]
+fn compute_access_kind_id(s: &str) -> u8 {
+    match s {
+        "bare" => 0,
+        "member" => 1,
+        _ => ACCESS_KIND_OTHER,
+    }
+}
+
+#[inline]
+fn access_kind_str_from_id(id: u8) -> Option<&'static str> {
+    Some(match id {
+        0 => "bare",
+        1 => "member",
+        _ => return None,
+    })
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GraphSymbol {
     pub id: String,
@@ -443,6 +510,11 @@ pub struct GraphSymbol {
     pub kind_flags: u8,
     #[serde(skip, default)]
     pub language_id: u16,
+    /// Phase 3 aggressive: stable_symbol_id u64 hash extracted from
+    /// `id`. Used as the HashMap key in phase E `counts` so we skip a
+    /// per-insert string hash + clone. Falls back to 0 for non-standard ids.
+    #[serde(skip, default)]
+    pub id_u64: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1123,6 +1195,7 @@ pub fn index_graph_from_tsv(
         &counts,
         None,
         false,
+        None,
         None,
     )
 }
@@ -1814,11 +1887,6 @@ where
     });
     let mut counts = resolution.counts;
     compute_native_counts(&symbols, &mut counts, &hierarchy_facts);
-    // Stream references to their sidecars BEFORE write_store. Build a
-    // file_table identical to the one write_store will derive (ref_sites +
-    // symbols share rel_paths with references, so same order = same file_ids).
-    // After streaming we pass an empty references slice + references_streamed=true
-    // so write_store doesn't try to write the reference sidecars again.
     let stream_started = std::time::Instant::now();
     let mut stream_file_table = FileTable::default();
     for site in &ref_sites {
@@ -1830,6 +1898,20 @@ where
     for sym in &symbols {
         stream_file_table.intern(&sym.rel_path);
     }
+    for fact in &import_facts {
+        stream_file_table.intern(&fact.rel_path);
+    }
+    for fact in &type_facts {
+        stream_file_table.intern(&fact.rel_path);
+    }
+    for fact in &function_return_facts {
+        stream_file_table.intern(&fact.rel_path);
+    }
+    let layout_root_pre = config.index_root(workspace_root);
+    fs::create_dir_all(&layout_root_pre)?;
+    let file_table_path_pre = graph_file_table_path(workspace_root, config);
+    write_file_table_binary(&file_table_path_pre, &stream_file_table)?;
+    clear_graph_shard_families(&layout_root_pre)?;
     // Force-spill the phase E/F in-memory tail so the streaming sidecar
     // writer only ever loads one partial at a time. Without this the tail can
     // hold millions of records (multiple GB).
@@ -1841,10 +1923,6 @@ where
     let use_light_stream = reference_partials_for_stream.is_empty()
         && !resolution.light_references.is_empty();
     let (_streamed_bytes, streamed_reference_count) = if use_light_stream {
-        // Fast path: no spilled partials, in-memory `light_references` holds
-        // the complete result. Stream directly from LightRef + ref_sites
-        // without materializing GraphReference (saves ~14.4M × 9 String
-        // allocations during write).
         drop(resolution.references);
         let r = stream_lights_to_sidecars(
             workspace_root,
@@ -1857,9 +1935,6 @@ where
         resolution.light_references = Vec::new();
         r
     } else {
-        // Legacy path: partials exist (memory pressure caused spills) or the
-        // light Vec is out of sync. Force-spill tail and consume partials in
-        // GraphReference format.
         if !resolution.references.is_empty() {
             let force_spill_dir = std::env::var("ZOEK_RESOLVE_SPILL_DIR")
                 .map(std::path::PathBuf::from)
@@ -1892,7 +1967,6 @@ where
     if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
         eprintln!("[resolve] stream_references={stream_ms}ms refs_emitted={streamed_reference_count}");
     }
-    // (resolution.references was already dropped inside the stream branch above)
     let empty_refs: Vec<GraphReference> = Vec::new();
     let summary = write_store(
         workspace_root,
@@ -1909,6 +1983,7 @@ where
         None,
         true,
         Some(streamed_reference_count),
+        Some(&stream_file_table),
     )?;
     let indexing_ms = indexing_started.elapsed().as_millis();
     let total_ms = started.elapsed().as_millis();
@@ -2175,6 +2250,7 @@ pub fn update_graph_native(
         Some(&exclude_paths),
         false,
         None,
+        None,
     );
     if probe { eprintln!("[flow] write_store={}ms", _t.elapsed().as_millis()); }
     result
@@ -2326,20 +2402,29 @@ pub fn query_graph_document_symbols_with_options(
     let start = start_line.unwrap_or(0);
     let end = end_line.unwrap_or(u32::MAX);
     let uri_shard_path = graph_symbol_uri_shard_path(workspace_root, config, uri);
-    let read_path = if uri_shard_path.exists() {
-        uri_shard_path.as_path()
-    } else {
-        symbol_path.as_path()
-    };
     let file_table_path = graph_file_table_path(workspace_root, config);
     let file_table = if file_table_path.exists() {
         read_file_table_binary(&file_table_path).unwrap_or_default()
     } else {
         FileTable::default()
     };
-    let mut symbols = read_symbols_matching(read_path, &file_table, |s| {
-        s.uri == uri && s.start_line <= end && s.end_line >= start
-    })?;
+    // Phase 3 aggressive: sym_uri shards are no longer written by default
+    // (they duplicate sym_id data). Prefer that shard when present, then
+    // legacy single-file symbol index, finally scan all sym_id shards.
+    let mut symbols = if uri_shard_path.exists() {
+        read_symbols_matching(uri_shard_path.as_path(), &file_table, |s| {
+            s.uri == uri && s.start_line <= end && s.end_line >= start
+        })?
+    } else if symbol_path.exists() {
+        read_symbols_matching(symbol_path.as_path(), &file_table, |s| {
+            s.uri == uri && s.start_line <= end && s.end_line >= start
+        })?
+    } else {
+        read_all_symbols_from_id_shards(workspace_root, config, &file_table)?
+            .into_iter()
+            .filter(|s| s.uri == uri && s.start_line <= end && s.end_line >= start)
+            .collect()
+    };
     apply_count_options_for_symbols(workspace_root, config, &mut symbols, options)?;
     symbols.sort_by(|left, right| {
         left.start_line
@@ -3083,6 +3168,7 @@ fn materialize_symbols(symbol_defs: Vec<SymbolDef>, line_count: u32) -> Vec<Grap
             .cloned();
         let kind_flags = compute_kind_flags(&draft.kind);
         let language_id = compute_language_id(&draft.language);
+        let id_u64 = parse_stable_symbol_id_to_u64(&id).unwrap_or(0);
         symbols.push(GraphSymbol {
             id,
             name: draft.name,
@@ -3112,6 +3198,7 @@ fn materialize_symbols(symbol_defs: Vec<SymbolDef>, line_count: u32) -> Vec<Grap
             implementation_may_count: None,
             kind_flags,
             language_id,
+            id_u64,
         });
     }
     symbols
@@ -5157,7 +5244,14 @@ fn resolve_ref_sites_a_to_e<'a>(
         // Pre-size: empirically ~36% of sites in a chunk push a reference here.
         // Cap at spill_threshold to avoid wasted reservation when chunk is huge.
         let chunk_estimate = ((end - start) / 3).min(spill_threshold).max(64);
-        let mut counts: hashbrown::HashMap<String, GraphCount> = hashbrown::HashMap::new();
+        // Phase 3 aggressive: per-worker counts keyed by u64 (GraphSymbol.id_u64)
+        // instead of String. Eliminates per-call string hash + alloc. Merge
+        // step at end converts back to "sym:HEX16" strings via id_to_string.
+        let mut counts: hashbrown::HashMap<u64, GraphCount> = hashbrown::HashMap::new();
+        // Track u64 → String for end-of-chunk conversion to global counts.
+        // Each unique target contributes one entry; ~5M total across all
+        // workers vs 14M (site,target) pairs without the cache.
+        let mut id_to_string: AHashMap<u64, String> = AHashMap::default();
         // Phase 3 (sizing): pre-allocate the three edge-key dedup sets to a
         // multiple of expected unique edges per chunk. Avoids ~20 growths each
         // (each growth rehashes everything). 2x chunk_estimate covers typical
@@ -5296,9 +5390,10 @@ fn resolve_ref_sites_a_to_e<'a>(
             let site_partial = site_partial_hash(&site.source_ref_id, &site.edge_kind);
             if is_member {
                 for target in fallback_candidates.iter() {
-                    let edge_key = edge_key_from_partial(site_partial, &target.id);
+                    let edge_key = edge_key_from_partial_u64(site_partial, target.id_u64);
                     add_resolution_count(
                         &mut counts,
+                        &mut id_to_string,
                         &mut counted_likely,
                         &mut counted_exact,
                         site,
@@ -5310,9 +5405,10 @@ fn resolve_ref_sites_a_to_e<'a>(
                     );
                 }
                 for candidate in exact_buf.drain(..) {
-                    let edge_key = edge_key_from_partial(site_partial, &candidate.target.id);
+                    let edge_key = edge_key_from_partial_u64(site_partial, candidate.target.id_u64);
                     add_resolution_count(
                         &mut counts,
+                        &mut id_to_string,
                         &mut counted_likely,
                         &mut counted_exact,
                         site,
@@ -5334,9 +5430,10 @@ fn resolve_ref_sites_a_to_e<'a>(
                     );
                 }
                 if let Some(target) = unique_member_candidate {
-                    let edge_key = edge_key_from_partial(site_partial, &target.id);
+                    let edge_key = edge_key_from_partial_u64(site_partial, target.id_u64);
                     add_resolution_count(
                         &mut counts,
+                        &mut id_to_string,
                         &mut counted_likely,
                         &mut counted_exact,
                         site,
@@ -5388,9 +5485,10 @@ fn resolve_ref_sites_a_to_e<'a>(
                 };
                 let fallback_already_counts_may =
                     is_bare && target.name == site.name.as_str();
-                let edge_key = edge_key_from_partial(site_partial, &target.id);
+                let edge_key = edge_key_from_partial_u64(site_partial, target.id_u64);
                 add_resolution_count(
                     &mut counts,
+                    &mut id_to_string,
                     &mut counted_likely,
                     &mut counted_exact,
                     site,
@@ -5414,9 +5512,10 @@ fn resolve_ref_sites_a_to_e<'a>(
                 }
             }
             for target in star_imported_candidates.iter() {
-                let edge_key = edge_key_from_partial(site_partial, &target.id);
+                let edge_key = edge_key_from_partial_u64(site_partial, target.id_u64);
                 add_resolution_count(
                     &mut counts,
+                    &mut id_to_string,
                     &mut counted_likely,
                     &mut counted_exact,
                     site,
@@ -5449,9 +5548,10 @@ fn resolve_ref_sites_a_to_e<'a>(
                     BOUND_MAY
                 };
                 if is_same_file_unique || is_workspace_unique {
-                    let edge_key = edge_key_from_partial(site_partial, &target.id);
+                    let edge_key = edge_key_from_partial_u64(site_partial, target.id_u64);
                     add_resolution_count(
                         &mut counts,
+                        &mut id_to_string,
                         &mut counted_likely,
                         &mut counted_exact,
                         site,
@@ -5505,7 +5605,18 @@ fn resolve_ref_sites_a_to_e<'a>(
         // unchanged. The conversion is a parallel per-worker pass (~325K
         // moves per worker) and small compared to the inner-loop probe
         // savings we get from `entry_ref`.
-        let std_counts: HashMap<String, GraphCount> = counts.into_iter().collect();
+        // Phase 3 aggressive: convert u64-keyed counts back to String keys
+        // for the downstream merge. id_to_string holds the original sym:HEX16
+        // for each id_u64; fallback synthesizes via the standard format.
+        let std_counts: HashMap<String, GraphCount> = counts
+            .into_iter()
+            .map(|(k, v)| {
+                let s = id_to_string
+                    .remove(&k)
+                    .unwrap_or_else(|| format!("sym:{:016x}", k));
+                (s, v)
+            })
+            .collect();
         Ok((std_counts, counted_likely, counted_exact, references, dedup, spill_paths, light_refs))
     };
 
@@ -6014,6 +6125,15 @@ fn compute_receiver_resolution<'a>(
         }
     }
 
+    // Phase 3 aggressive: dedup type_targets by symbol identity. Same symbol
+    // can be reached via types_by_name + import_targets + type_facts in the
+    // same receiver — without dedup we do the same members lookup multiple
+    // times per ref site. For a cache entry with avg ~30% redundancy this
+    // saves ~10% of phase E hot-loop HashMap probes.
+    if type_targets.len() > 1 {
+        type_targets.sort_unstable_by_key(|t| t.sym as *const GraphSymbol as usize);
+        type_targets.dedup_by_key(|t| t.sym as *const GraphSymbol as usize);
+    }
     ReceiverResolution {
         has_any: true,
         self_container,
@@ -6632,7 +6752,8 @@ fn phase_c_process_chunk<'a>(
 }
 
 fn add_resolution_count(
-    counts: &mut hashbrown::HashMap<String, GraphCount>,
+    counts: &mut hashbrown::HashMap<u64, GraphCount>,
+    id_to_string: &mut AHashMap<u64, String>,
     counted_likely: &mut AHashSet<u64>,
     counted_exact: &mut AHashSet<u64>,
     site: &RefSite,
@@ -6646,11 +6767,14 @@ fn add_resolution_count(
     // `matches!(site.edge_kind.as_str(), "call" | "construct")` up to 3
     // times per call (with ~5 calls per site → 15 string matches/site).
     let is_callish = matches!(site.edge_kind.as_str(), "call" | "construct");
-    // `entry_ref` (hashbrown-only) probes by `&str` and allocates a String
-    // key only when the entry is genuinely new — a single lookup on hit,
-    // vs the prior contains_key+get_mut two-lookup pattern. ~14M calls in
-    // phase E means ~14M fewer HashMap probes on the hot path.
-    let count = counts.entry_ref(target.id.as_str()).or_default();
+    // Phase 3 aggressive: u64 key (target.id_u64) vs the prior String. Skips
+    // a per-call string hash + clone on insert. id_to_string maps the u64
+    // back to its "sym:HEX16" string for the global merge.
+    let key = target.id_u64;
+    if !id_to_string.contains_key(&key) {
+        id_to_string.insert(key, target.id.clone());
+    }
+    let count = counts.entry(key).or_default();
     if likely && counted_likely.insert(edge_key) {
         count.usage_likely += 1;
         if is_callish {
@@ -6965,6 +7089,18 @@ fn edge_key_from_partial(site_partial: u64, target_id: &str) -> u64 {
     h.finish()
 }
 
+/// Phase 3 aggressive: u64 variant of `edge_key_from_partial`. Saves a string
+/// hash (~80ns) per (site, target) call when caller has the symbol's cached
+/// `id_u64`. ~14M calls in phase E → ~1.1s CPU per worker.
+#[inline]
+fn edge_key_from_partial_u64(site_partial: u64, target_id_u64: u64) -> u64 {
+    use std::hash::Hasher;
+    let mut h = ahash::AHasher::default();
+    h.write_u64(site_partial);
+    h.write_u64(target_id_u64);
+    h.finish()
+}
+
 /// Push a `LightRef` into the in-flight buffer, returning whether the record
 /// survived `dedup`. Mirrors `push_resolved_reference` but uses the compact
 /// representation. Phase E / F integration uses this once the parallel
@@ -7183,15 +7319,11 @@ fn compute_native_counts(
     counts: &mut HashMap<String, GraphCount>,
     hierarchy_facts: &[HierarchyFact],
 ) {
-    // Phase 3: pre-size to avoid HashMap grow/rehash on 4M symbols. Skip the
-    // clone when the key is already present (~50% of symbols on the
-    // captain2 corpus already have counts from phase E).
-    counts.reserve(symbols.len().saturating_sub(counts.len()));
-    for symbol in symbols {
-        if !counts.contains_key(symbol.id.as_str()) {
-            counts.insert(symbol.id.clone(), GraphCount::default());
-        }
-    }
+    // Phase 3 aggressive: previously we inserted a default zero count for
+    // every symbol so reads would return zero instead of "not found". But
+    // write_count_id_shards drops all-zero entries anyway, so this whole
+    // pass is now a no-op for symbols without any incoming references. Skip
+    // it entirely — readers already treat a missing key as zero counts.
     if symbols.len() <= MAX_EAGER_IMPLEMENTATION_SYMBOLS {
         apply_implementation_counts(symbols, hierarchy_facts, counts);
     }
@@ -7236,6 +7368,7 @@ fn apply_implementation_counts(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_store(
     workspace_root: &Path,
     built_at_unix_ms: u64,
@@ -7251,35 +7384,48 @@ fn write_store(
     incremental: Option<&HashSet<String>>,
     references_streamed: bool,
     reference_count_override: Option<usize>,
+    // Phase 3 aggressive: when Some, the caller has already (a) built the
+    // file_table including all rel_paths, (b) persisted it to disk, and
+    // (c) cleared the layout's prior shard families. write_store will skip
+    // those steps to enable parallel execution with stream_*_to_sidecars.
+    precomputed_file_table: Option<&FileTable>,
 ) -> io::Result<GraphIndexSummary> {
     let layout_root = config.index_root(workspace_root);
     fs::create_dir_all(&layout_root)?;
     let file_table_path = graph_file_table_path(workspace_root, config);
-    let mut file_table = if incremental.is_some() && file_table_path.exists() {
-        read_file_table_binary(&file_table_path).unwrap_or_default()
+    let (built_table, file_table_bytes) = if precomputed_file_table.is_some() {
+        (None, file_len(&file_table_path).unwrap_or(0))
     } else {
-        FileTable::default()
+        let mut t = if incremental.is_some() && file_table_path.exists() {
+            read_file_table_binary(&file_table_path).unwrap_or_default()
+        } else {
+            FileTable::default()
+        };
+        for site in ref_sites {
+            t.intern(&site.rel_path);
+        }
+        for r in references {
+            t.intern(&r.rel_path);
+        }
+        for sym in symbols {
+            t.intern(&sym.rel_path);
+        }
+        for fact in import_facts {
+            t.intern(&fact.rel_path);
+        }
+        for fact in type_facts {
+            t.intern(&fact.rel_path);
+        }
+        for fact in function_return_facts {
+            t.intern(&fact.rel_path);
+        }
+        let bytes = write_file_table_binary(&file_table_path, &t)?;
+        (Some(t), bytes)
     };
-    for site in ref_sites {
-        file_table.intern(&site.rel_path);
-    }
-    for r in references {
-        file_table.intern(&r.rel_path);
-    }
-    for sym in symbols {
-        file_table.intern(&sym.rel_path);
-    }
-    for fact in import_facts {
-        file_table.intern(&fact.rel_path);
-    }
-    for fact in type_facts {
-        file_table.intern(&fact.rel_path);
-    }
-    for fact in function_return_facts {
-        file_table.intern(&fact.rel_path);
-    }
-    let file_table_bytes = write_file_table_binary(&file_table_path, &file_table)?;
-    if incremental.is_none() {
+    let file_table: &FileTable = precomputed_file_table.unwrap_or_else(|| {
+        built_table.as_ref().expect("file_table built when no precomputed")
+    });
+    if precomputed_file_table.is_none() && incremental.is_none() {
         clear_graph_shard_families(&layout_root)?;
     }
     let symbol_path = graph_symbol_index_path(workspace_root, config);
@@ -7924,9 +8070,17 @@ fn write_graph_shards(
             let r = write_symbol_id_shards(workspace_root, config, symbols, file_table);
             (t.elapsed(), r)
         });
+        // Phase 3 aggressive: sym_uri shards are now derived on demand from
+        // sym_id shards. Saves ~820MB disk write per index build. The skip
+        // env var lets users re-enable for backwards-compat dev tooling.
+        let write_uri = std::env::var("ZOEK_WRITE_SYM_URI").is_ok();
         let symbol_uri_h = s.spawn(move || {
             let t = std::time::Instant::now();
-            let r = write_symbol_uri_shards(workspace_root, config, symbols, file_table);
+            let r: io::Result<u64> = if write_uri {
+                write_symbol_uri_shards(workspace_root, config, symbols, file_table)
+            } else {
+                Ok(0)
+            };
             (t.elapsed(), r)
         });
         let ref_target_h = s.spawn(move || {
@@ -8274,7 +8428,15 @@ fn write_count_id_shards(
     config: &EngineConfig,
     counts: &HashMap<String, GraphCount>,
 ) -> io::Result<u64> {
-    let rows: Vec<(&String, &GraphCount)> = counts.iter().collect();
+    // Phase 3 aggressive: drop all-zero counts. For 4.1M-symbol corpora most
+    // symbols have no incoming references and yield default-zero counts; we
+    // were writing those just to make readers return zero on hit, but readers
+    // already treat missing keys as zero. Skip writing them at all.
+    let default_count = GraphCount::default();
+    let rows: Vec<(&String, &GraphCount)> = counts
+        .iter()
+        .filter(|(_, c)| **c != default_count)
+        .collect();
     parallel_sharded_write_serialize(
         workspace_root,
         config,
@@ -9127,11 +9289,29 @@ fn parse_function_return_fact_binary(
 }
 
 fn serialize_symbol_binary(symbol: &GraphSymbol, file_id: u32, out: &mut Vec<u8>) {
-    write_u16_str(out, &symbol.id);
+    // Phase 3 aggressive: symbol.id is "sym:HEX16" — encode as u64 (8B) vs
+    // 22B string. Sentinel u64::MAX falls back to inline string.
+    if let Some(u) = parse_stable_symbol_id_to_u64(&symbol.id) {
+        out.extend_from_slice(&u.to_le_bytes());
+    } else {
+        out.extend_from_slice(&u64::MAX.to_le_bytes());
+        write_u16_str(out, &symbol.id);
+    }
     write_u16_str(out, &symbol.name);
     write_u16_str(out, &symbol.qualified_name);
-    write_u16_str(out, &symbol.kind);
-    write_u16_str(out, &symbol.language);
+    // kind: u8 id (KIND_OTHER = inline string fallback).
+    let kind_id = compute_kind_id(&symbol.kind);
+    out.push(kind_id);
+    if kind_id == KIND_OTHER {
+        write_u16_str(out, &symbol.kind);
+    }
+    // language: u8 id (255 sentinel = inline string fallback).
+    let lang_id = compute_language_id(&symbol.language);
+    let lang_byte = if lang_id <= u8::MAX as u16 { lang_id as u8 } else { 255 };
+    out.push(lang_byte);
+    if lang_byte == 255 || language_str_from_id(lang_id).is_none() {
+        write_u16_str(out, &symbol.language);
+    }
     write_u16_str(out, &symbol.uri);
     out.extend_from_slice(&file_id.to_le_bytes());
     out.extend_from_slice(&symbol.start_line.to_le_bytes());
@@ -9160,11 +9340,36 @@ fn parse_symbol_binary(
     cursor: &mut usize,
     file_table: &FileTable,
 ) -> io::Result<GraphSymbol> {
-    let id = read_u16_str(bytes, cursor)?;
+    if *cursor + 8 > bytes.len() {
+        return Err(invalid_data("symbol truncated (id u64)"));
+    }
+    let u = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
+    *cursor += 8;
+    let id = if u == u64::MAX {
+        read_u16_str(bytes, cursor)?
+    } else {
+        format!("sym:{:016x}", u)
+    };
     let name = read_u16_str(bytes, cursor)?;
     let qualified_name = read_u16_str(bytes, cursor)?;
-    let kind = read_u16_str(bytes, cursor)?;
-    let language = read_u16_str(bytes, cursor)?;
+    if *cursor >= bytes.len() {
+        return Err(invalid_data("symbol truncated (kind id)"));
+    }
+    let kind_id = bytes[*cursor];
+    *cursor += 1;
+    let kind = match kind_str_from_id(kind_id) {
+        Some(s) => s.to_string(),
+        None => read_u16_str(bytes, cursor)?,
+    };
+    if *cursor >= bytes.len() {
+        return Err(invalid_data("symbol truncated (language id)"));
+    }
+    let lang_byte = bytes[*cursor];
+    *cursor += 1;
+    let language = match language_str_from_id(lang_byte as u16) {
+        Some(s) => s.to_string(),
+        None => read_u16_str(bytes, cursor)?,
+    };
     let uri = read_u16_str(bytes, cursor)?;
     let file_id = read_u32_le(bytes, cursor)?;
     let rel_path = file_table
@@ -9192,6 +9397,7 @@ fn parse_symbol_binary(
     let implementation_may_count = read_opt_u64(bytes, cursor)?;
     let kind_flags = compute_kind_flags(&kind);
     let language_id = compute_language_id(&language);
+    let id_u64 = parse_stable_symbol_id_to_u64(&id).unwrap_or(0);
     Ok(GraphSymbol {
         id,
         name,
@@ -9221,22 +9427,58 @@ fn parse_symbol_binary(
         implementation_may_count,
         kind_flags,
         language_id,
+        id_u64,
     })
 }
 
 
 fn serialize_ref_site_binary(site: &RefSite, file_id: u32, out: &mut Vec<u8>) {
-    write_u16_str(out, &site.source_ref_id);
+    // Phase 3 aggressive: source_ref_id is always "ref:HEX16" produced by
+    // stable_ref_id. Encode as raw u64 (8B) instead of 22B string. Use
+    // 0xFFFFFFFFFFFFFFFF as sentinel for non-standard ids (legacy input).
+    if let Some(u) = parse_stable_ref_id_to_u64(&site.source_ref_id) {
+        out.extend_from_slice(&u.to_le_bytes());
+    } else {
+        out.extend_from_slice(&u64::MAX.to_le_bytes());
+        write_u16_str(out, &site.source_ref_id);
+    }
     write_u16_str(out, &site.name);
-    write_u16_str(out, &site.raw_text);
+    // Phase 3 aggressive: build_file_graph constructs raw_text == name for
+    // every ref site. Encode the common case as a single marker byte (0 =
+    // copy name; 1 = inline string follows for legacy TSV paths).
+    if site.raw_text == site.name {
+        out.push(0);
+    } else {
+        out.push(1);
+        write_u16_str(out, &site.raw_text);
+    }
     out.extend_from_slice(&file_id.to_le_bytes());
-    write_u16_str(out, &site.language);
+    // Phase 3 aggressive (RefSite slim): language/edge_kind/access_kind go
+    // through small enum tables. Most refs hit a known value (~99.99% in
+    // captain2/captain) so the 1-byte id replaces a u16-prefixed string
+    // (typically 8-12 bytes).
+    let lang_id = compute_language_id(&site.language);
+    let lang_byte = if lang_id <= u8::MAX as u16 { lang_id as u8 } else { 255 };
+    out.push(lang_byte);
+    if lang_byte == 255 || language_str_from_id(lang_id).is_none() {
+        // Fallback: id 255 marker followed by full string. Reader must
+        // re-read string when it sees the sentinel.
+        write_u16_str(out, &site.language);
+    }
     out.extend_from_slice(&site.start_line.to_le_bytes());
     out.extend_from_slice(&site.start_column.to_le_bytes());
     out.extend_from_slice(&site.end_line.to_le_bytes());
     out.extend_from_slice(&site.end_column.to_le_bytes());
-    write_u16_str(out, &site.edge_kind);
-    write_u16_str(out, &site.access_kind);
+    let edge_id = compute_edge_kind_id(&site.edge_kind);
+    out.push(edge_id);
+    if edge_id == EDGE_KIND_OTHER {
+        write_u16_str(out, &site.edge_kind);
+    }
+    let access_id = compute_access_kind_id(&site.access_kind);
+    out.push(access_id);
+    if access_id == ACCESS_KIND_OTHER {
+        write_u16_str(out, &site.access_kind);
+    }
     out.push(if site.is_definition { 1 } else { 0 });
     out.push(if site.is_import_context { 1 } else { 0 });
     if let Some(r) = site.receiver_name.as_deref() {
@@ -9245,9 +9487,17 @@ fn serialize_ref_site_binary(site: &RefSite, file_id: u32, out: &mut Vec<u8>) {
     } else {
         out.push(0);
     }
+    // Phase 3 aggressive: enclosing_symbol_id is also "sym:HEX16" format
+    // when present (built from stable_symbol_id). Encode as u64 + 1B
+    // present marker. 0 = absent, 1 = u64 follows, 2 = inline string.
     if let Some(e) = site.enclosing_symbol_id.as_deref() {
-        out.push(1);
-        write_u16_str(out, e);
+        if let Some(u) = parse_stable_symbol_id_to_u64(e) {
+            out.push(1);
+            out.extend_from_slice(&u.to_le_bytes());
+        } else {
+            out.push(2);
+            write_u16_str(out, e);
+        }
     } else {
         out.push(0);
     }
@@ -9258,21 +9508,65 @@ fn parse_ref_site_binary(
     cursor: &mut usize,
     file_table: &FileTable,
 ) -> io::Result<RefSite> {
-    let source_ref_id = read_u16_str(bytes, cursor)?;
+    if *cursor + 8 > bytes.len() {
+        return Err(invalid_data("ref_site truncated (source_ref_id u64)"));
+    }
+    let u = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
+    *cursor += 8;
+    let source_ref_id = if u == u64::MAX {
+        read_u16_str(bytes, cursor)?
+    } else {
+        format!("ref:{:016x}", u)
+    };
     let name = read_u16_str(bytes, cursor)?;
-    let raw_text = read_u16_str(bytes, cursor)?;
+    if *cursor >= bytes.len() {
+        return Err(invalid_data("ref_site truncated (raw_text marker)"));
+    }
+    let raw_text_marker = bytes[*cursor];
+    *cursor += 1;
+    let raw_text = if raw_text_marker == 0 {
+        name.clone()
+    } else {
+        read_u16_str(bytes, cursor)?
+    };
     let file_id = read_u32_le(bytes, cursor)?;
     let rel_path = file_table
         .get_path(file_id)
         .ok_or_else(|| invalid_data(format!("unknown ref-site file_id {file_id}")))?
         .to_string();
-    let language = read_u16_str(bytes, cursor)?;
+    // Phase 3 aggressive (RefSite slim): language is a u8 id; 255 = inline
+    // string follows. Same for edge_kind / access_kind below.
+    if *cursor >= bytes.len() {
+        return Err(invalid_data("ref_site truncated (language id)"));
+    }
+    let lang_byte = bytes[*cursor];
+    *cursor += 1;
+    let language = match language_str_from_id(lang_byte as u16) {
+        Some(s) => s.to_string(),
+        None => read_u16_str(bytes, cursor)?,
+    };
     let start_line = read_u32_le(bytes, cursor)?;
     let start_column = read_u32_le(bytes, cursor)?;
     let end_line = read_u32_le(bytes, cursor)?;
     let end_column = read_u32_le(bytes, cursor)?;
-    let edge_kind = read_u16_str(bytes, cursor)?;
-    let access_kind = read_u16_str(bytes, cursor)?;
+    if *cursor >= bytes.len() {
+        return Err(invalid_data("ref_site truncated (edge_kind id)"));
+    }
+    let edge_id = bytes[*cursor];
+    *cursor += 1;
+    let edge_kind = match edge_kind_str_from_id(edge_id) {
+        Some(s) => s.to_string(),
+        None => read_u16_str(bytes, cursor)?,
+    };
+    if *cursor >= bytes.len() {
+        return Err(invalid_data("ref_site truncated (access_kind id)"));
+    }
+    let access_id = bytes[*cursor];
+    *cursor += 1;
+    let access_kind = match access_kind_str_from_id(access_id) {
+        Some(s) => s.to_string(),
+        None => read_u16_str(bytes, cursor)?,
+    };
     if *cursor + 2 > bytes.len() {
         return Err(invalid_data("ref_site truncated (flags)"));
     }
@@ -9294,10 +9588,19 @@ fn parse_ref_site_binary(
     }
     let enclosing_marker = bytes[*cursor];
     *cursor += 1;
-    let enclosing_symbol_id = if enclosing_marker == 1 {
-        Some(read_u16_str(bytes, cursor)?)
-    } else {
-        None
+    let enclosing_symbol_id = match enclosing_marker {
+        0 => None,
+        1 => {
+            if *cursor + 8 > bytes.len() {
+                return Err(invalid_data("ref_site truncated (enclosing u64)"));
+            }
+            let u =
+                u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
+            *cursor += 8;
+            Some(format!("sym:{:016x}", u))
+        }
+        2 => Some(read_u16_str(bytes, cursor)?),
+        _ => return Err(invalid_data("ref_site invalid enclosing marker")),
     };
     Ok(RefSite {
         source_ref_id,
@@ -9648,8 +9951,10 @@ fn parse_symbol_fields(fields: &[&str]) -> io::Result<GraphSymbol> {
     let kind_flags = compute_kind_flags(&kind);
     let language = decode_field(fields[5])?;
     let language_id = compute_language_id(&language);
+    let id_field: String = decode_field(fields[1])?;
+    let id_u64 = parse_stable_symbol_id_to_u64(&id_field).unwrap_or(0);
     Ok(GraphSymbol {
-        id: decode_field(fields[1])?,
+        id: id_field,
         name: decode_field(fields[2])?,
         qualified_name: decode_field(fields[3])?,
         kind,
@@ -9677,6 +9982,7 @@ fn parse_symbol_fields(fields: &[&str]) -> io::Result<GraphSymbol> {
         implementation_may_count: None,
         kind_flags,
         language_id,
+        id_u64,
     })
 }
 
@@ -10880,6 +11186,67 @@ fn stable_symbol_id(
 fn stable_ref_id(rel_path: &str, line: u32, column: u32, name: &str) -> String {
     let key = format!("{rel_path}\0{line}\0{column}\0{name}");
     format!("ref:{:016x}", stable_hash(&key))
+}
+
+/// Parse a "ref:HEX16" id back to its underlying u64 hash. Returns None for
+/// any other string (legacy formats, externally-provided ids, etc.) so the
+/// serializer can fall back to inline string encoding.
+fn parse_stable_ref_id_to_u64(s: &str) -> Option<u64> {
+    s.strip_prefix("ref:")
+        .filter(|hex| hex.len() == 16)
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+}
+
+/// Same encoding as `parse_stable_ref_id_to_u64` but for `sym:HEX16`.
+fn parse_stable_symbol_id_to_u64(s: &str) -> Option<u64> {
+    s.strip_prefix("sym:")
+        .filter(|hex| hex.len() == 16)
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+}
+
+// Phase 3 aggressive: encode common GraphSymbol.kind values as u8 ids.
+// Mirrors kind_flags but provides reversible (string ↔ u8) mapping for the
+// shard codec. 255 = inline string follows for unknown kinds.
+const KIND_OTHER: u8 = 255;
+
+#[inline]
+fn compute_kind_id(s: &str) -> u8 {
+    match s {
+        "class" => 0,
+        "interface" => 1,
+        "enum" => 2,
+        "type" => 3,
+        "struct" => 4,
+        "method" => 5,
+        "function" => 6,
+        "field" => 7,
+        "property" => 8,
+        "variable" => 9,
+        "module" => 10,
+        "constant" => 11,
+        "trait" => 12,
+        _ => KIND_OTHER,
+    }
+}
+
+#[inline]
+fn kind_str_from_id(id: u8) -> Option<&'static str> {
+    Some(match id {
+        0 => "class",
+        1 => "interface",
+        2 => "enum",
+        3 => "type",
+        4 => "struct",
+        5 => "method",
+        6 => "function",
+        7 => "field",
+        8 => "property",
+        9 => "variable",
+        10 => "module",
+        11 => "constant",
+        12 => "trait",
+        _ => return None,
+    })
 }
 
 fn stable_file_id(rel_path: &str) -> String {
