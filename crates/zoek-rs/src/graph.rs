@@ -4,6 +4,7 @@ use crate::corpus::{
 };
 use crate::mmap_store::write_atomically;
 use ahash::{AHashMap, AHashSet, HashMapExt, HashSetExt};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -80,16 +81,16 @@ impl StrTable {
 /// plus the main-thread overhead — right at the process budget.
 const MAX_GRAPH_WORKERS: usize = 128;
 
-/// Memory-aware worker count. Default 64 (2× physical cores on a 32-core
-/// box) — rayon work-stealing handles oversubscription well, and benchmarks
-/// on captain2 show resolve drops ~7s going from 32 → 64. Override with
+/// Memory-aware worker count. Default 128 (= MAX_GRAPH_WORKERS) — rayon
+/// work-stealing handles oversubscription well, and the W12 pool sweep on
+/// captain2 placed 128 marginally ahead of 64 (~−1.7s wall). Override with
 /// ZOEK_GRAPH_WORKERS=N up to MAX_GRAPH_WORKERS.
 fn graph_worker_count(total: usize) -> usize {
     let workers = std::env::var("ZOEK_GRAPH_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(64);
+        .unwrap_or(MAX_GRAPH_WORKERS);
     workers.min(MAX_GRAPH_WORKERS).min(total.max(1))
 }
 
@@ -155,10 +156,10 @@ fn acquire_graph_lock(workspace_root: &Path) -> io::Result<fs::File> {
 /// with ZOEK_MEMORY_CAP_BYTES. Best-effort: silently ignored on platforms
 /// that don't honor RLIMIT_AS (macOS may ignore).
 /// Configure the global rayon thread pool. Sized to ZOEK_GRAPH_WORKERS (or
-/// the same 64 default as graph_worker_count) so par_iter / par_sort_by_key
-/// scale across more threads than the OS reports as physical cores —
-/// captain2 sees a ~7s resolve drop going from 32 → 64 because phase E is
-/// HashMap-heavy and benefits from oversubscription.
+/// the 128 default, matching MAX_GRAPH_WORKERS) so par_iter / par_sort_by_key
+/// scale across more threads than the OS reports as physical cores — phase E
+/// is HashMap-heavy and more concurrent probes hide memory stalls. Captain2
+/// pool sweep (W12) showed 64→128 trims ~1.7s; 15 (physical) is the worst.
 fn apply_rayon_pool_size() {
     static APPLIED: std::sync::Once = std::sync::Once::new();
     APPLIED.call_once(|| {
@@ -166,7 +167,7 @@ fn apply_rayon_pool_size() {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|n| *n > 0)
-            .unwrap_or(64)
+            .unwrap_or(MAX_GRAPH_WORKERS)
             .min(MAX_GRAPH_WORKERS);
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
@@ -438,7 +439,13 @@ fn language_str_from_id(id: u16) -> Option<&'static str> {
 // × ~26B saved (lang+edge+access string headers) ≈ ~1GB shard size cut.
 // 255 reserved for "string follows inline" (unknown enum value).
 const EDGE_KIND_OTHER: u8 = 255;
+#[allow(dead_code)]
+const EDGE_KIND_USAGE: u8 = 0;
+const EDGE_KIND_CALL: u8 = 1;
+const EDGE_KIND_CONSTRUCT: u8 = 2;
 const ACCESS_KIND_OTHER: u8 = 255;
+const ACCESS_KIND_BARE: u8 = 0;
+const ACCESS_KIND_MEMBER: u8 = 1;
 
 #[inline]
 fn compute_edge_kind_id(s: &str) -> u8 {
@@ -474,6 +481,70 @@ fn access_kind_str_from_id(id: u8) -> Option<&'static str> {
     Some(match id {
         0 => "bare",
         1 => "member",
+        _ => return None,
+    })
+}
+
+// D1c (W11): confidence/provenance closed-set enum tables. Mirror
+// LightConfidence / LightProvenance string canonicalization so the on-disk
+// reference shard can store a 1-byte id instead of a u16-prefixed string
+// for every reference record (~25 bytes saved per record across 14.4M
+// records in captain2 — ~360MB shard size cut + ~30% byte-traffic drop in
+// `append_lights_to_both_shards`). 255 = "string follows inline" fallback
+// for any value outside the closed set (e.g., legacy TSV inputs).
+const CONFIDENCE_OTHER: u8 = 255;
+const PROVENANCE_OTHER: u8 = 255;
+
+#[inline]
+fn compute_confidence_id(s: &str) -> u8 {
+    match s {
+        "possible" => 0,
+        "exact" => 1,
+        _ => CONFIDENCE_OTHER,
+    }
+}
+
+#[inline]
+fn confidence_str_from_id(id: u8) -> Option<&'static str> {
+    Some(match id {
+        0 => "possible",
+        1 => "exact",
+        _ => return None,
+    })
+}
+
+#[inline]
+fn compute_provenance_id(s: &str) -> u8 {
+    match s {
+        "import" => 0,
+        "import-star" => 1,
+        "import-namespace" => 2,
+        "imported-type" => 3,
+        "receiver-self" => 4,
+        "receiver-type" => 5,
+        "type-fact" => 6,
+        "lexical" => 7,
+        "unique-name" => 8,
+        "token-shape" => 9,
+        "external-tsv" => 10,
+        _ => PROVENANCE_OTHER,
+    }
+}
+
+#[inline]
+fn provenance_str_from_id(id: u8) -> Option<&'static str> {
+    Some(match id {
+        0 => "import",
+        1 => "import-star",
+        2 => "import-namespace",
+        3 => "imported-type",
+        4 => "receiver-self",
+        5 => "receiver-type",
+        6 => "type-fact",
+        7 => "lexical",
+        8 => "unique-name",
+        9 => "token-shape",
+        10 => "external-tsv",
         _ => return None,
     })
 }
@@ -632,15 +703,23 @@ struct RefSite {
     source_ref_id: String,
     name: String,
     raw_text: String,
-    uri: String,
-    rel_path: String,
-    language: String,
+    // P1 (parse alloc reduction): `rel_path`/`language`/`edge_kind`/`access_kind`
+    // are constant within a file (rel_path/language) or drawn from a tiny fixed
+    // set (edge_kind/access_kind). The AoS built one fresh `String` per site —
+    // ~38M × these fields, the dominant malloc/memmove + 128-thread allocator
+    // lock contention in the parse sample. As `Arc<str>` the per-site write is a
+    // refcount bump of a per-file/per-value Arc, not an allocation+copy. Readers
+    // deref to `&str` unchanged. (`uri` was dead — never read post-parse and the
+    // disk format omits it; `parse_ref_site_binary` already rebuilds it empty —
+    // so it is dropped from the struct entirely.)
+    rel_path: Arc<str>,
+    language: Arc<str>,
     start_line: u32,
     start_column: u32,
     end_line: u32,
     end_column: u32,
-    edge_kind: String,
-    access_kind: String,
+    edge_kind: Arc<str>,
+    access_kind: Arc<str>,
     is_definition: bool,
     is_import_context: bool,
     receiver_name: Option<String>,
@@ -660,7 +739,112 @@ struct RefSite {
     /// Same purpose as receiver_name_hash.
     #[serde(skip, default)]
     enclosing_symbol_id_hash: u64,
+    /// W12: precomputed access_kind enum id (ACCESS_KIND_BARE / MEMBER /
+    /// OTHER). Replaces `access_kind == "member"` / `== "bare"` memcmps in
+    /// phase_e_prefilter (31M sites) + phase E loop (16M sites) + phase C
+    /// hot paths.
+    #[serde(skip, default)]
+    access_kind_id: u8,
+    /// W12: precomputed edge_kind enum id (EDGE_KIND_USAGE / CALL /
+    /// CONSTRUCT / OTHER). Eliminates the `matches!(edge_kind, "call" |
+    /// "construct")` memcmps in `append_lights_to_both_shards` (14.4M
+    /// records) and the `compute_edge_kind_id` call in
+    /// `serialize_ref_site_binary`.
+    #[serde(skip, default)]
+    edge_kind_id: u8,
 }
+
+/// W17 (Option B / SoA, step B1): string interner for symbol & site names.
+///
+/// Built once after phase A from the symbol-name set, it maps each distinct
+/// name to a dense `u32` id so the SoA hot path can probe `(language_id,
+/// name_id)`-keyed maps with an integer key instead of a string. `MISS`
+/// (`u32::MAX`) is returned for any name that was never interned (e.g. a site
+/// `name` that matches no symbol) — such a name can never match a
+/// symbol-keyed map anyway, so the miss is behaviourally identical to the
+/// current string probe missing.
+///
+/// Keys are owned `Box<str>` (no borrow of `symbols`) so the interner can
+/// outlive the phase-A scratch maps and feed every later phase. `hashes[id]`
+/// carries the precomputed `stable_hash(name)`, letting the eventual SoA
+/// columns drop the per-site `name_hash`/`receiver_name_hash` re-derivation.
+struct NameInterner {
+    ids: AHashMap<Box<str>, u32>,
+    hashes: Vec<u64>,
+}
+
+impl NameInterner {
+    const MISS: u32 = u32::MAX;
+
+    fn with_capacity(cap: usize) -> Self {
+        NameInterner {
+            ids: AHashMap::with_capacity(cap),
+            hashes: Vec::with_capacity(cap),
+        }
+    }
+
+    /// Intern `name` (assigning a fresh id on first sight), returning its id.
+    #[inline]
+    fn intern(&mut self, name: &str, name_hash: u64) -> u32 {
+        if let Some(&id) = self.ids.get(name) {
+            return id;
+        }
+        let id = self.hashes.len() as u32;
+        self.ids.insert(name.into(), id);
+        self.hashes.push(name_hash);
+        id
+    }
+
+    /// Look up an existing name's id without inserting; `MISS` if absent.
+    #[inline]
+    fn get(&self, name: &str) -> u32 {
+        self.ids.get(name).copied().unwrap_or(Self::MISS)
+    }
+
+    fn len(&self) -> usize {
+        self.hashes.len()
+    }
+}
+
+/// W18 (Option B / SoA, step B2): the dense, all-integer column view of a
+/// `RefSite` that every hot resolve pass reads. The prior failed SoA attempts
+/// kept the string fields in the per-site struct, so the worker still loaded
+/// the ~292B `RefSite` cache lines and the cache-miss pattern was unchanged
+/// (net-zero). `SiteCols` is 32B with NO strings — a pass that needs only
+/// these fields (the phase-E pre-filter, and later the worker fast paths)
+/// touches 32B/site instead of ~292B, a ~9x cut in cache traffic.
+///
+/// Every field is already precomputed on `RefSite` (the W2/W9/W12 hashes +
+/// enum ids), so building this column is a pure copy fused into the existing
+/// `site_language_ids` pass — no extra 38M scan (the cost that sank the prior
+/// attempts; see B1 finding in optimization.md).
+#[derive(Clone, Copy, Debug)]
+struct SiteCols {
+    name_hash: u64,
+    rel_path_hash: u64,
+    receiver_name_hash: u64,
+    /// W18 / Option B step B4: enclosing-symbol-id hash. The member receiver
+    /// cache key is `(receiver_name_hash, enclosing_symbol_id_hash)`; having it
+    /// here lets the worker build that key without reading the `RefSite`.
+    enclosing_symbol_id_hash: u64,
+    /// B4: precomputed `site_partial_hash(source_ref_id, edge_kind)` — the
+    /// per-site invariant prefix of every `(site, target)` dedup key. Computed
+    /// once in the column build (same hash fn as before, so dedup keys are
+    /// byte-identical) instead of re-reading the two `RefSite` strings per
+    /// productive site in the hot loop.
+    site_partial: u64,
+    language_id: u16,
+    access_kind_id: u8,
+    /// B4: precomputed edge_kind enum id. `add_resolution_count`'s `is_callish`
+    /// (`edge_kind == "call" | "construct"`) becomes `id ∈ {CALL, CONSTRUCT}`,
+    /// so the worker need not read `RefSite.edge_kind`.
+    edge_kind_id: u8,
+    flags: u8,
+}
+
+const SITE_FLAG_IS_DEFINITION: u8 = 1;
+const SITE_FLAG_HAS_RECEIVER: u8 = 1 << 1;
+const SITE_FLAG_IS_IMPORT_CONTEXT: u8 = 1 << 2;
 
 #[derive(Clone, Debug)]
 struct GraphStore {
@@ -699,7 +883,10 @@ struct ResolutionResult {
     counts: HashMap<String, GraphCount>,
 }
 
-struct ResolveIntermediate<'a> {
+// B5: all fields are owned now (the two site maps hold `u32` indices, not
+// `&'a RefSite`), so the intermediate no longer borrows `ref_sites` and needs
+// no lifetime — the resolve result outlives the input slices freely.
+struct ResolveIntermediate {
     references: Vec<GraphReference>,
     /// Compact LightRef accumulator for the full-rebuild write path. Each
     /// LightRef references the owning `ref_sites` slice by index rather
@@ -722,8 +909,19 @@ struct ResolveIntermediate<'a> {
     bare_call_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize>,
     member_usage_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize>,
     member_call_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize>,
-    bare_likely_sites_by_scope_and_name: HashMap<(u64, u64, u64), Vec<&'a RefSite>>,
-    member_likely_sites_by_scope_and_name: HashMap<(u64, u64, u64), Vec<&'a RefSite>>,
+    // B5 (Option B / SoA, phase C → columns): stores the global `ref_sites`
+    // index (u32) of each token-shape-likely site rather than a `&RefSite`
+    // pointer. Phase F reads `ref_sites[idx]` for the (rare) push, so the
+    // 38M-site phase-C scan that fills these maps never dereferences the 292B
+    // struct — it reads the dense 48B `SiteCols` instead. The prior pointer
+    // form also forced phase F to recover the index via `offset_from`; the
+    // explicit u32 removes that unsafe step.
+    bare_likely_sites_by_scope_and_name: HashMap<(u64, u64, u64), Vec<u32>>,
+    member_likely_sites_by_scope_and_name: HashMap<(u64, u64, u64), Vec<u32>>,
+    // F1.a: per-target tally accumulated during phase E (keyed by GraphSymbol.id_u64).
+    // Replaces the rescan loop at apply_token_shape_likely_count_baseline that built
+    // reference_counts_by_symbol_id from light_in. Phase F reads this directly.
+    light_target_count_by_id_u64: AHashMap<u64, usize>,
 }
 
 pub fn graph_index_path(workspace_root: &Path, config: &EngineConfig) -> PathBuf {
@@ -917,7 +1115,7 @@ fn read_ref_sites_excluding_paths(
                     let mut cursor = 0;
                     while cursor < bytes.len() {
                         let site = parse_ref_site_binary(&bytes, &mut cursor, file_table_ref)?;
-                        if !exclude_ref.contains(&site.rel_path) {
+                        if !exclude_ref.contains(&*site.rel_path) {
                             local.push(site);
                         }
                     }
@@ -1227,6 +1425,7 @@ pub fn index_graph_from_tsv(
         false,
         None,
         None,
+        false,
     )
 }
 
@@ -1613,6 +1812,8 @@ where
                     .as_deref()
                     .map(stable_hash)
                     .unwrap_or(0);
+                site.access_kind_id = compute_access_kind_id(&site.access_kind);
+                site.edge_kind_id = compute_edge_kind_id(&site.edge_kind);
             }
             Ok(accum)
         }
@@ -1907,118 +2108,298 @@ where
     let fact_generation_hash = accum.fact_generation_hash;
     let symbol_def_count = accum.symbol_def_count;
     let skip_resolve = std::env::var("ZOEK_SKIP_RESOLVE").is_ok();
-    let mut resolution = if skip_resolve {
-        ResolutionResult {
-            references: Vec::new(),
-            light_references: Vec::new(),
-            reference_partials: Vec::new(),
-            counts: HashMap::new(),
-        }
-    } else {
-        resolve_ref_sites_for_rebuild(
-            &symbols,
-            &ref_sites,
-            &import_facts,
-            &type_facts,
-            &function_return_facts,
-            &hierarchy_facts,
-        )
-    };
-    let resolving_ms = resolving_started.elapsed().as_millis();
-
-    let indexing_started = std::time::Instant::now();
-    progress(GraphRebuildProgress {
-        stage: "indexing",
-        current: resolution.references.len(),
-        total: resolution.references.len(),
-        message: format!(
-            "building count sidecar symbol_defs={symbol_def_count} fact_generation={fact_generation_hash:016x} (resolve {resolving_ms}ms)"
-        ),
-    });
-    let mut counts = resolution.counts;
-    compute_native_counts(&symbols, &mut counts, &hierarchy_facts);
-    let stream_started = std::time::Instant::now();
+    // F1.b: channel-driven write pipeline. file_table + shard writers are
+    // prepared before resolve so phase E/F workers can stream LightRef batches
+    // into a writer thread that overlaps with the resolve phases. Sequential
+    // sum was ~phase_e + phase_f + stream_references; the overlap turns it
+    // into ~max(phase_e + phase_f, writer drain). Opt out with
+    // ZOEK_DISABLE_LIGHT_CHANNEL=1 to fall back to the legacy sequential
+    // stream_lights_to_sidecars path.
+    let use_channel_pipeline = !skip_resolve
+        && std::env::var("ZOEK_DISABLE_LIGHT_CHANNEL").is_err();
+    // W23: overlap the 38M-record ref_site shard write with resolve (on a
+    // dedicated rayon pool — W1 pattern, separate from the global pool so no
+    // nested-spawn starvation). The ref_site write is the dominant index-phase
+    // cost (`serialize_ref_site_binary` was the #1 write leaf); writing it while
+    // resolve runs hides it behind the resolve phase. `write_store` then skips
+    // it (`skip_ref_sites`). Promoted to the default after paired measurement
+    // (index 6544→2802ms −57%, total −2.8s, byte-identical 3,788,145,402, no
+    // deadlock). `ZOEK_OVERLAP_STATIC_OFF` reverts to writing ref_sites in the
+    // index phase. Only active on the channel pipeline (the writer lives in its
+    // scope); falls back automatically when the channel is disabled.
+    let overlap_static =
+        use_channel_pipeline && std::env::var("ZOEK_OVERLAP_STATIC_OFF").is_err();
+    // W23: bytes written by the overlapped ref_site writer (0 unless overlapped).
+    // `write_store` skips ref_sites when overlapping, so its reported `bytes`
+    // omits them; add this back so the summary total stays accurate.
+    let mut overlap_ref_site_bytes: u64 = 0;
     let mut stream_file_table = FileTable::default();
-    for site in &ref_sites {
-        stream_file_table.intern(&site.rel_path);
-    }
-    for r in &resolution.references {
-        stream_file_table.intern(&r.rel_path);
-    }
-    for sym in &symbols {
-        stream_file_table.intern(&sym.rel_path);
-    }
-    for fact in &import_facts {
-        stream_file_table.intern(&fact.rel_path);
-    }
-    for fact in &type_facts {
-        stream_file_table.intern(&fact.rel_path);
-    }
-    for fact in &function_return_facts {
-        stream_file_table.intern(&fact.rel_path);
-    }
-    let layout_root_pre = config.index_root(workspace_root);
-    fs::create_dir_all(&layout_root_pre)?;
-    let file_table_path_pre = graph_file_table_path(workspace_root, config);
-    write_file_table_binary(&file_table_path_pre, &stream_file_table)?;
-    clear_graph_shard_families(&layout_root_pre)?;
-    // Force-spill the phase E/F in-memory tail so the streaming sidecar
-    // writer only ever loads one partial at a time. Without this the tail can
-    // hold millions of records (multiple GB).
-    let mut reference_partials_for_stream = resolution.reference_partials;
-    // Phase 4-Q: workers skip materialization, so `resolution.references` is
-    // empty after `resolve_ref_sites_for_rebuild`. Use the light stream when
-    // we have light_references and no spilled partials (captain2 / no-spill
-    // case under the 16GB cap).
-    let use_light_stream = reference_partials_for_stream.is_empty()
-        && !resolution.light_references.is_empty();
-    let (_streamed_bytes, streamed_reference_count) = if use_light_stream {
-        drop(resolution.references);
-        let r = stream_lights_to_sidecars(
-            workspace_root,
-            config,
-            &[],
-            &resolution.light_references,
-            &ref_sites,
-            &stream_file_table,
-        )?;
-        resolution.light_references = Vec::new();
-        r
-    } else {
-        if !resolution.references.is_empty() {
-            let force_spill_dir = std::env::var("ZOEK_RESOLVE_SPILL_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::env::temp_dir().join("zoek-rs-resolve-spill"));
-            let _ = fs::create_dir_all(&force_spill_dir);
-            let path = force_spill_dir.join(format!(
-                "phase_f_tail_main_{}.bin",
-                reference_partials_for_stream.len()
-            ));
-            let f = fs::File::create(&path)?;
-            let mut w = std::io::BufWriter::with_capacity(1024 * 1024, f);
-            bincode::serialize_into(&mut w, &resolution.references).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("tail spill: {e}"))
-            })?;
-            w.flush()?;
-            reference_partials_for_stream.push(path);
-            resolution.references.clear();
+    let mut counts: HashMap<String, GraphCount>;
+    let streamed_reference_count: usize;
+    let resolving_ms: u128;
+    let indexing_started;
+    let stream_started = std::time::Instant::now();
+    if use_channel_pipeline {
+        // Prep: file_table + shard writers. References are reconstructed from
+        // ref_sites via LightRef.site_idx so file_table needs only ref_sites +
+        // symbols + facts (no resolution.references rel_paths).
+        for site in &ref_sites {
+            stream_file_table.intern(&site.rel_path);
         }
-        drop(resolution.light_references);
-        let empty_tail: Vec<GraphReference> = Vec::new();
-        stream_references_to_sidecars(
+        for sym in &symbols {
+            stream_file_table.intern(&sym.rel_path);
+        }
+        for fact in &import_facts {
+            stream_file_table.intern(&fact.rel_path);
+        }
+        for fact in &type_facts {
+            stream_file_table.intern(&fact.rel_path);
+        }
+        for fact in &function_return_facts {
+            stream_file_table.intern(&fact.rel_path);
+        }
+        let layout_root_pre = config.index_root(workspace_root);
+        fs::create_dir_all(&layout_root_pre)?;
+        let file_table_path_pre = graph_file_table_path(workspace_root, config);
+        write_file_table_binary(&file_table_path_pre, &stream_file_table)?;
+        clear_graph_shard_families(&layout_root_pre)?;
+        let mut target_w = open_graph_shard_writers(
             workspace_root,
             config,
-            &reference_partials_for_stream,
-            &empty_tail,
-            &stream_file_table,
-        )?
-    };
-    let stream_ms = stream_started.elapsed().as_millis();
-    if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
-        eprintln!("[resolve] stream_references={stream_ms}ms refs_emitted={streamed_reference_count}");
+            GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
+        )?;
+        let mut enclosing_w = open_graph_shard_writers(
+            workspace_root,
+            config,
+            GRAPH_REFERENCE_ENCLOSING_SHARD_PREFIX,
+        )?;
+        // Bounded queue depth tunable via ZOEK_LIGHT_CHANNEL_CAP. Default 1024
+        // batches × LIGHT_BATCH_FLUSH_SIZE records × 24B/record ≈ 96MB max
+        // in-flight queue. The writer thread is single-threaded so a small
+        // queue (e.g. 64) stalls phase F worker threads waiting for the writer
+        // to catch up — the slack lets workers finish before the writer drains
+        // (turning phase_f wall back down to ~5s instead of ~17s).
+        let channel_cap = std::env::var("ZOEK_LIGHT_CHANNEL_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1024);
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<LightRef>>(channel_cap);
+        let symbols_ref = &symbols;
+        let ref_sites_ref = &ref_sites;
+        let import_facts_ref = &import_facts;
+        let type_facts_ref = &type_facts;
+        let function_return_facts_ref = &function_return_facts;
+        let hierarchy_facts_ref = &hierarchy_facts;
+        let stream_file_table_ref = &stream_file_table;
+        let resolving_started_inner = resolving_started;
+        let (resolution_inner, streamed_total, static_bytes) =
+            std::thread::scope(|s| -> io::Result<(ResolutionResult, usize, u64)> {
+                let target_w_ref = &mut target_w;
+                let enclosing_w_ref = &mut enclosing_w;
+                let writer_handle = s.spawn(move || -> io::Result<usize> {
+                    write_lights_from_channel(
+                        rx,
+                        ref_sites_ref,
+                        stream_file_table_ref,
+                        target_w_ref,
+                        enclosing_w_ref,
+                    )
+                });
+                // W23: overlap the ref_site shard write with resolve on its own
+                // rayon pool (separate from the global pool the phase-E/F workers
+                // saturate, so no nested-spawn starvation — W14 lesson). Uses the
+                // same `stream_file_table` as the later `write_store`, so the
+                // shard bytes are identical; only the timing moves.
+                let static_writer_handle = if overlap_static {
+                    Some(s.spawn(move || -> io::Result<u64> {
+                        let threads = std::env::var("ZOEK_OVERLAP_STATIC_THREADS")
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .filter(|n| *n > 0)
+                            .unwrap_or(4)
+                            .clamp(1, 8);
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(threads)
+                            .thread_name(|i| format!("static-writer-{i}"))
+                            .build()
+                            .map_err(|e| {
+                                io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("static writer pool: {e}"),
+                                )
+                            })?;
+                        pool.install(|| {
+                            write_ref_sites_by_file_shards(
+                                workspace_root,
+                                config,
+                                ref_sites_ref,
+                                stream_file_table_ref,
+                                None,
+                            )
+                        })
+                    }))
+                } else {
+                    None
+                };
+                let mut resolution = resolve_ref_sites_for_rebuild(
+                    symbols_ref,
+                    ref_sites_ref,
+                    import_facts_ref,
+                    type_facts_ref,
+                    function_return_facts_ref,
+                    hierarchy_facts_ref,
+                    Some(&tx),
+                );
+                // F1.b: phase F's lights were buffered (phase_f wall avoids
+                // backpressure). Drop them into the channel as one big batch
+                // before closing — the writer drains while we wait on join.
+                let phase_f_lights = std::mem::take(&mut resolution.light_references);
+                if !phase_f_lights.is_empty() {
+                    let _ = tx.send(phase_f_lights);
+                }
+                drop(tx);
+                let total = writer_handle
+                    .join()
+                    .expect("F1.b writer thread panicked")?;
+                // W23: ensure the overlapped ref_site shard write finished before
+                // the index phase (write_store with skip_ref_sites) proceeds, and
+                // capture its byte count so the summary total stays accurate.
+                let static_bytes = if let Some(h) = static_writer_handle {
+                    h.join().expect("W23 static writer thread panicked")?
+                } else {
+                    0u64
+                };
+                Ok((resolution, total, static_bytes))
+            })?;
+        overlap_ref_site_bytes = static_bytes;
+        let _ = finish_graph_shard_writers(target_w)?;
+        let _ = finish_graph_shard_writers(enclosing_w)?;
+        resolving_ms = resolving_started_inner.elapsed().as_millis();
+        indexing_started = std::time::Instant::now();
+        progress(GraphRebuildProgress {
+            stage: "indexing",
+            current: streamed_total,
+            total: streamed_total,
+            message: format!(
+                "building count sidecar symbol_defs={symbol_def_count} fact_generation={fact_generation_hash:016x} (resolve {resolving_ms}ms)"
+            ),
+        });
+        counts = resolution_inner.counts;
+        compute_native_counts(&symbols, &mut counts, &hierarchy_facts);
+        streamed_reference_count = streamed_total;
+        let stream_ms = stream_started.elapsed().as_millis();
+        if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
+            eprintln!(
+                "[resolve] stream_references={stream_ms}ms refs_emitted={streamed_reference_count} (channel pipeline)"
+            );
+        }
+    } else {
+        let mut resolution = if skip_resolve {
+            ResolutionResult {
+                references: Vec::new(),
+                light_references: Vec::new(),
+                reference_partials: Vec::new(),
+                counts: HashMap::new(),
+            }
+        } else {
+            resolve_ref_sites_for_rebuild(
+                &symbols,
+                &ref_sites,
+                &import_facts,
+                &type_facts,
+                &function_return_facts,
+                &hierarchy_facts,
+                None,
+            )
+        };
+        resolving_ms = resolving_started.elapsed().as_millis();
+        indexing_started = std::time::Instant::now();
+        progress(GraphRebuildProgress {
+            stage: "indexing",
+            current: resolution.references.len(),
+            total: resolution.references.len(),
+            message: format!(
+                "building count sidecar symbol_defs={symbol_def_count} fact_generation={fact_generation_hash:016x} (resolve {resolving_ms}ms)"
+            ),
+        });
+        counts = resolution.counts;
+        compute_native_counts(&symbols, &mut counts, &hierarchy_facts);
+        for site in &ref_sites {
+            stream_file_table.intern(&site.rel_path);
+        }
+        for r in &resolution.references {
+            stream_file_table.intern(&r.rel_path);
+        }
+        for sym in &symbols {
+            stream_file_table.intern(&sym.rel_path);
+        }
+        for fact in &import_facts {
+            stream_file_table.intern(&fact.rel_path);
+        }
+        for fact in &type_facts {
+            stream_file_table.intern(&fact.rel_path);
+        }
+        for fact in &function_return_facts {
+            stream_file_table.intern(&fact.rel_path);
+        }
+        let layout_root_pre = config.index_root(workspace_root);
+        fs::create_dir_all(&layout_root_pre)?;
+        let file_table_path_pre = graph_file_table_path(workspace_root, config);
+        write_file_table_binary(&file_table_path_pre, &stream_file_table)?;
+        clear_graph_shard_families(&layout_root_pre)?;
+        let mut reference_partials_for_stream = resolution.reference_partials;
+        let use_light_stream = reference_partials_for_stream.is_empty()
+            && !resolution.light_references.is_empty();
+        let (_streamed_bytes, refs_emitted) = if use_light_stream {
+            drop(resolution.references);
+            let r = stream_lights_to_sidecars(
+                workspace_root,
+                config,
+                &[],
+                &resolution.light_references,
+                &ref_sites,
+                &stream_file_table,
+            )?;
+            resolution.light_references = Vec::new();
+            r
+        } else {
+            if !resolution.references.is_empty() {
+                let force_spill_dir = std::env::var("ZOEK_RESOLVE_SPILL_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::env::temp_dir().join("zoek-rs-resolve-spill"));
+                let _ = fs::create_dir_all(&force_spill_dir);
+                let path = force_spill_dir.join(format!(
+                    "phase_f_tail_main_{}.bin",
+                    reference_partials_for_stream.len()
+                ));
+                let f = fs::File::create(&path)?;
+                let mut w = std::io::BufWriter::with_capacity(1024 * 1024, f);
+                bincode::serialize_into(&mut w, &resolution.references).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("tail spill: {e}"))
+                })?;
+                w.flush()?;
+                reference_partials_for_stream.push(path);
+                resolution.references.clear();
+            }
+            drop(resolution.light_references);
+            let empty_tail: Vec<GraphReference> = Vec::new();
+            stream_references_to_sidecars(
+                workspace_root,
+                config,
+                &reference_partials_for_stream,
+                &empty_tail,
+                &stream_file_table,
+            )?
+        };
+        streamed_reference_count = refs_emitted;
+        let stream_ms = stream_started.elapsed().as_millis();
+        if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
+            eprintln!("[resolve] stream_references={stream_ms}ms refs_emitted={streamed_reference_count}");
+        }
     }
     let empty_refs: Vec<GraphReference> = Vec::new();
-    let summary = write_store(
+    let mut summary = write_store(
         workspace_root,
         built_at_unix_ms,
         config,
@@ -2034,7 +2415,11 @@ where
         true,
         Some(streamed_reference_count),
         Some(&stream_file_table),
+        overlap_static,
     )?;
+    // W23: write_store skipped the overlapped ref_site shards; fold their byte
+    // count back in so the reported total matches the non-overlapped path.
+    summary.bytes += overlap_ref_site_bytes;
     let indexing_ms = indexing_started.elapsed().as_millis();
     let total_ms = started.elapsed().as_millis();
     dump_parse_profile_if_enabled();
@@ -2207,7 +2592,7 @@ pub fn update_graph_native(
         .iter()
         .enumerate()
         .filter_map(|(idx, site)| {
-            if affected_paths.contains(&site.rel_path) {
+            if affected_paths.contains(&*site.rel_path) {
                 Some(idx as u32)
             } else {
                 None
@@ -2224,6 +2609,7 @@ pub fn update_graph_native(
         &type_facts,
         &function_return_facts,
         &hierarchy_facts,
+        None,
     );
     if probe { eprintln!("[flow] resolve_a_to_e={}ms", _t.elapsed().as_millis()); }
     let _t = std::time::Instant::now();
@@ -2258,10 +2644,11 @@ pub fn update_graph_native(
         &intermediate.bare_likely_sites_by_scope_and_name,
         &intermediate.member_likely_sites_by_scope_and_name,
         &mut all_references,
-        &light_in,
+        &intermediate.light_target_count_by_id_u64,
         &mut light_out_f,
         &mut intermediate.dedup,
         &mut intermediate.reference_partials,
+        None,
     );
     intermediate.light_references = light_in;
     intermediate.light_references.append(&mut light_out_f);
@@ -2301,6 +2688,7 @@ pub fn update_graph_native(
         false,
         None,
         None,
+        false,
     );
     if probe { eprintln!("[flow] write_store={}ms", _t.elapsed().as_millis()); }
     result
@@ -2792,7 +3180,7 @@ fn build_file_graph(entry: &CorpusEntry) -> FileGraph {
     let function_return_facts = extract_function_return_facts(entry, &language);
     if profile { PROFILE_NS_FUNCTION_RETURNS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
     let t = std::time::Instant::now();
-    let ref_sites = extract_ref_sites(entry, &symbols, &language, &uri);
+    let ref_sites = extract_ref_sites(entry, &symbols, &language);
     if profile { PROFILE_NS_REF_SITES.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
     FileGraph {
         file_id,
@@ -4780,7 +5168,6 @@ fn extract_ref_sites(
     entry: &CorpusEntry,
     symbols: &[GraphSymbol],
     language: &str,
-    uri: &str,
 ) -> Vec<RefSite> {
     // Borrow the symbol names instead of cloning them into the set, so each
     // membership check only hashes &str (no String allocation per token).
@@ -4790,6 +5177,15 @@ fn extract_ref_sites(
         .collect();
     let mut ref_sites = Vec::new();
     let rel_path_hash = stable_hash(&entry.rel_path);
+    // P1: allocate the per-file-constant / tiny-fixed-set strings ONCE, then
+    // hand each site a cheap `Arc<str>` clone (refcount bump) instead of a fresh
+    // String. rel_path (~40 chars) + language alone were ~38M redundant allocs.
+    let rel_path_arc: Arc<str> = Arc::from(entry.rel_path.as_str());
+    let language_arc: Arc<str> = Arc::from(language);
+    let arc_call: Arc<str> = Arc::from("call");
+    let arc_usage: Arc<str> = Arc::from("usage");
+    let arc_member: Arc<str> = Arc::from("member");
+    let arc_bare: Arc<str> = Arc::from("bare");
     let mut python_multiline_string_quote = None;
     let line_count = entry.text.lines().count().max(1) as u32;
     let line_enclosing_cache = precompute_enclosing_per_line(symbols, line_count);
@@ -4830,19 +5226,28 @@ fn extract_ref_sites(
                 .as_deref()
                 .map(stable_hash)
                 .unwrap_or(0);
+            let access_kind_id = compute_access_kind_id(access_kind);
+            let edge_kind_id = compute_edge_kind_id(edge_kind);
             ref_sites.push(RefSite {
                 source_ref_id,
                 name: name.clone(),
                 raw_text: name,
-                uri: uri.to_string(),
-                rel_path: entry.rel_path.clone(),
-                language: language.to_string(),
+                rel_path: rel_path_arc.clone(),
+                language: language_arc.clone(),
                 start_line: line_idx as u32,
                 start_column: start as u32,
                 end_line: line_idx as u32,
                 end_column: end as u32,
-                edge_kind: edge_kind.to_string(),
-                access_kind: access_kind.to_string(),
+                edge_kind: if edge_kind == "call" {
+                    arc_call.clone()
+                } else {
+                    arc_usage.clone()
+                },
+                access_kind: if access_kind == "member" {
+                    arc_member.clone()
+                } else {
+                    arc_bare.clone()
+                },
                 is_definition,
                 is_import_context,
                 receiver_name,
@@ -4851,6 +5256,8 @@ fn extract_ref_sites(
                 name_hash,
                 receiver_name_hash,
                 enclosing_symbol_id_hash,
+                access_kind_id,
+                edge_kind_id,
             });
         }
     }
@@ -4873,6 +5280,7 @@ fn resolve_ref_sites(
         type_facts,
         function_return_facts,
         hierarchy_facts,
+        None,
     );
     let _t_pf = std::time::Instant::now();
     // phase_f reads `references.iter()` to compute reference_counts_by_symbol_id;
@@ -4901,10 +5309,11 @@ fn resolve_ref_sites(
         &intermediate.bare_likely_sites_by_scope_and_name,
         &intermediate.member_likely_sites_by_scope_and_name,
         &mut intermediate.references,
-        &light_in,
+        &intermediate.light_target_count_by_id_u64,
         &mut light_out_f,
         &mut intermediate.dedup,
         &mut intermediate.reference_partials,
+        None,
     );
     intermediate.light_references = light_in;
     intermediate.light_references.append(&mut light_out_f);
@@ -4931,6 +5340,12 @@ fn resolve_ref_sites_for_rebuild(
     type_facts: &[TypeFact],
     function_return_facts: &[FunctionReturnFact],
     hierarchy_facts: &[HierarchyFact],
+    // F1.b: pass-through. `Some(&sender)` enables the channel-driven write
+    // pipeline for phase E workers (their LightRef batches stream into the
+    // writer thread). Phase F continues to accumulate into `light_out_f` so
+    // its worker wall isn't slowed by channel backpressure; the caller can
+    // bulk-send `light_references` into the same channel after this returns.
+    light_sender: Option<&crossbeam_channel::Sender<Vec<LightRef>>>,
 ) -> ResolutionResult {
     let mut intermediate = resolve_ref_sites_a_to_e(
         symbols,
@@ -4940,6 +5355,7 @@ fn resolve_ref_sites_for_rebuild(
         type_facts,
         function_return_facts,
         hierarchy_facts,
+        light_sender,
     );
     for path in std::mem::take(&mut intermediate.reference_partials) {
         let bytes_or_err = fs::read(&path);
@@ -4949,10 +5365,28 @@ fn resolve_ref_sites_for_rebuild(
             bincode::deserialize(&bytes).expect("deserialize spill");
         intermediate.references.extend(batch);
     }
-    // Same split pattern as the test path: take phase_e lights out for
-    // the read-only tally, give phase_f a fresh Vec, then concat.
+    // Phase F runs sequentially after phase E and is a single rayon parallel
+    // pass (~5s). With the original single-thread writer, streaming its 9.18M
+    // lights through the channel added backpressure (workers stalled while the
+    // writer drained), bloating phase_f wall to ~17s — so phase F buffered into
+    // `light_out_f` and rebuild_graph_native bulk-sent it as one batch.
+    //
+    // F1.b (W1): the writer is now multi-threaded (dedicated rayon pool) and
+    // drains fast enough to keep up, so phase F can stream too — its lights then
+    // overlap the writer instead of being written after resolve completes
+    // (phase F is ~64% of all records, so this is where the real overlap win
+    // lives). Opt in via ZOEK_LIGHT_CHANNEL_PHASE_F=1. phase_f wall is the
+    // load-robust signal: if backpressure returns it spikes, so the default
+    // keeps the safe buffering path.
     let light_in = std::mem::take(&mut intermediate.light_references);
     let mut light_out_f: Vec<LightRef> = Vec::new();
+    let phase_f_sender = if light_sender.is_some()
+        && std::env::var("ZOEK_LIGHT_CHANNEL_PHASE_F").is_ok()
+    {
+        light_sender
+    } else {
+        None
+    };
     let _t_pf = std::time::Instant::now();
     apply_token_shape_likely_count_baseline(
         symbols,
@@ -4965,10 +5399,11 @@ fn resolve_ref_sites_for_rebuild(
         &intermediate.bare_likely_sites_by_scope_and_name,
         &intermediate.member_likely_sites_by_scope_and_name,
         &mut intermediate.references,
-        &light_in,
+        &intermediate.light_target_count_by_id_u64,
         &mut light_out_f,
         &mut intermediate.dedup,
         &mut intermediate.reference_partials,
+        phase_f_sender,
     );
     if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
         eprintln!(
@@ -4993,7 +5428,7 @@ fn resolve_ref_sites_for_rebuild(
 /// Single-threaded — cheap for test-sized workloads (<1k refs) and only
 /// runs when the caller actually goes through `resolve_ref_sites`.
 fn materialize_resolution_for_legacy_callers(
-    mut intermediate: ResolveIntermediate<'_>,
+    mut intermediate: ResolveIntermediate,
     ref_sites: &[RefSite],
 ) -> ResolutionResult {
     let mut references = std::mem::take(&mut intermediate.references);
@@ -5011,6 +5446,55 @@ fn materialize_resolution_for_legacy_callers(
     }
 }
 
+/// Option C Stage 1: per-file bucket of phase E site indices. Each bucket
+/// groups indices sharing the same `rel_path_hash` so the phase E outer loop
+/// processes one file at a time. ref_sites arrives file-grouped per parse
+/// chunk (FileGraph ingest is atomic), so the bucket builder is a single
+/// linear scan that opens a new bucket whenever the hash changes.
+struct PhaseEFileBucket {
+    rel_path_hash: u64,
+    indices: Vec<u32>,
+}
+
+fn build_phase_e_file_buckets(
+    ref_sites: &[RefSite],
+    indices: Option<&[u32]>,
+) -> Vec<PhaseEFileBucket> {
+    let total = indices.map(|i| i.len()).unwrap_or(ref_sites.len());
+    if total == 0 {
+        return Vec::new();
+    }
+    // captain2 corpus avg ~120 sites/file → preallocate at total/100 buckets.
+    let mut buckets: Vec<PhaseEFileBucket> = Vec::with_capacity(total / 100 + 16);
+    let push_index = |buckets: &mut Vec<PhaseEFileBucket>, idx: u32, hash: u64| {
+        match buckets.last_mut() {
+            Some(b) if b.rel_path_hash == hash => b.indices.push(idx),
+            _ => buckets.push(PhaseEFileBucket {
+                rel_path_hash: hash,
+                indices: {
+                    let mut v = Vec::with_capacity(32);
+                    v.push(idx);
+                    v
+                },
+            }),
+        }
+    };
+    match indices {
+        Some(idxs) => {
+            for &idx in idxs {
+                let hash = ref_sites[idx as usize].rel_path_hash;
+                push_index(&mut buckets, idx, hash);
+            }
+        }
+        None => {
+            for (i, site) in ref_sites.iter().enumerate() {
+                push_index(&mut buckets, i as u32, site.rel_path_hash);
+            }
+        }
+    }
+    buckets
+}
+
 fn resolve_ref_sites_a_to_e<'a>(
     symbols: &'a [GraphSymbol],
     ref_sites: &'a [RefSite],
@@ -5019,27 +5503,50 @@ fn resolve_ref_sites_a_to_e<'a>(
     type_facts: &'a [TypeFact],
     function_return_facts: &'a [FunctionReturnFact],
     hierarchy_facts: &'a [HierarchyFact],
-) -> ResolveIntermediate<'a> {
+    // F1.b: when `Some`, phase E workers stream LightRef batches into this
+    // channel instead of accumulating a per-worker `Vec<LightRef>`. The
+    // returned `light_references` is left empty (channel sink drains them).
+    light_sender: Option<&'a crossbeam_channel::Sender<Vec<LightRef>>>,
+) -> ResolveIntermediate {
     let probe = std::env::var("ZOEK_RESOLVE_PROBE").is_ok();
     // Phase 1.4: GraphSymbol.kind_flags carries the cached classification
     // flags. Phase A reads them directly off the struct (no parallel side
     // vector needed). Hot resolve paths elsewhere also use the field.
 
     let t_a = std::time::Instant::now();
-    let mut symbols_by_name: AHashMap<&str, Vec<&GraphSymbol>> = AHashMap::default();
+    // B5: phase C only ever asked `symbols_by_name.contains_key(name)` ("does any
+    // symbol carry this name?"). A `name_hash` set answers that with an integer
+    // probe and lets phase C avoid reading the site `&str` — same proven-safe
+    // rekey as W9b. (This was the lone reader of the old `&str`-keyed map.)
+    let mut symbol_name_hashes: AHashSet<u64> = AHashSet::default();
     // W9b: bare_symbols_by_name keyed by name_hash (u64) instead of &str.
     // Phase E hot loop and prefilter probe this per bare site; the u64
     // lookup is ~5x cheaper than the prior string hash + memcmp.
     let mut bare_symbols_by_name: AHashMap<u64, Vec<&GraphSymbol>> = AHashMap::default();
-    let mut bare_symbols_by_language_and_name: AHashMap<(u16, &str), Vec<&GraphSymbol>> =
+    // W18 / Option B step B3a: keyed by (language_id, name_hash) — the u64
+    // name hash precomputed on each symbol/site — so the phase-E pre-filter and
+    // worker probe these with an integer key (no `&str` read from the 292B
+    // RefSite). Same proven-safe pattern as `bare_symbols_by_name` (W9b).
+    let mut bare_symbols_by_language_and_name: AHashMap<(u16, u64), Vec<&GraphSymbol>> =
         AHashMap::default();
-    let mut member_symbols_by_language_and_name: AHashMap<(u16, &str), Vec<&GraphSymbol>> =
+    let mut member_symbols_by_language_and_name: AHashMap<(u16, u64), Vec<&GraphSymbol>> =
         AHashMap::default();
     let mut symbols_by_id: AHashMap<&str, &GraphSymbol> = AHashMap::default();
     let mut types_by_name: AHashMap<&str, Vec<&GraphSymbol>> = AHashMap::default();
     let mut members_by_container_and_name: AHashMap<(&str, &str), Vec<&GraphSymbol>> =
         AHashMap::default();
     let mut symbols_by_file_and_name: AHashMap<(&str, &str), Vec<&GraphSymbol>> = AHashMap::default();
+    // W18 / Option B step B4: hash-keyed twins of the two member-resolution maps
+    // the phase-E worker probes per site. Keyed by precomputed `stable_hash`es
+    // (`(container_hash, name_hash)` and `(rel_path_hash, name_hash)`) so the
+    // column-only worker can expand receivers without reading the site `&str`s.
+    // Same proven-safe rekey pattern as `bare_symbols_by_name` (W9b) / B3a; the
+    // invariant gate validates collision-freedom on the corpus. Built alongside
+    // the string maps (compute_receiver_resolution's cold path still uses those).
+    let mut members_by_container_and_name_h: AHashMap<(u64, u64), Vec<&GraphSymbol>> =
+        AHashMap::default();
+    let mut symbols_by_file_and_name_h: AHashMap<(u64, u64), Vec<&GraphSymbol>> =
+        AHashMap::default();
     // W5: count bare-fallback definitions per (name_hash, rel_path_hash). The
     // phase E hot loop uses this O(1) lookup instead of scanning the per-name
     // candidate Vec with a rel_path filter (was 208K closure samples).
@@ -5047,16 +5554,17 @@ fn resolve_ref_sites_a_to_e<'a>(
     for symbol in symbols {
         let flags = symbol.kind_flags;
         symbols_by_id.insert(&symbol.id, symbol);
-        symbols_by_name
-            .entry(&symbol.name)
-            .or_default()
-            .push(symbol);
+        symbol_name_hashes.insert(symbol.name_hash);
         if flags & KF_TYPE != 0 {
             types_by_name.entry(&symbol.name).or_default().push(symbol);
         }
         if let Some(container_name) = symbol.container_name.as_deref() {
             members_by_container_and_name
                 .entry((container_name, symbol.name.as_str()))
+                .or_default()
+                .push(symbol);
+            members_by_container_and_name_h
+                .entry((stable_hash(container_name), symbol.name_hash))
                 .or_default()
                 .push(symbol);
         }
@@ -5066,7 +5574,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                 .or_default()
                 .push(symbol);
             bare_symbols_by_language_and_name
-                .entry((symbol.language_id, symbol.name.as_str()))
+                .entry((symbol.language_id, symbol.name_hash))
                 .or_default()
                 .push(symbol);
             *same_file_bare_count
@@ -5075,7 +5583,7 @@ fn resolve_ref_sites_a_to_e<'a>(
         }
         if flags & KF_MEMBER_FB != 0 {
             member_symbols_by_language_and_name
-                .entry((symbol.language_id, symbol.name.as_str()))
+                .entry((symbol.language_id, symbol.name_hash))
                 .or_default()
                 .push(symbol);
         }
@@ -5083,22 +5591,205 @@ fn resolve_ref_sites_a_to_e<'a>(
             .entry((&symbol.rel_path, &symbol.name))
             .or_default()
             .push(symbol);
+        symbols_by_file_and_name_h
+            .entry((symbol.rel_path_hash, symbol.name_hash))
+            .or_default()
+            .push(symbol);
     }
     if probe { eprintln!("[resolve] phase_a={}ms same_file_bare_count_entries={}", t_a.elapsed().as_millis(), same_file_bare_count.len()); }
+    // W17 / Option B step B1: de-risk the SoA build cost behind a flag before
+    // wiring any consumer. The prior failed SoA attempt paid ~5.2s building
+    // per-site columns AFTER parse; the open question is whether interning +
+    // a single 38M-site `u32` column can be built in <1s. This block is
+    // gated by `ZOEK_SOA_B1` so normal runs, tests, and the invariant gate
+    // are untouched (nothing consumes the interner yet). It measures: (a)
+    // interner build over all symbol names, (b) the par_iter populate of a
+    // `site_name_id` column over every ref_site, (c) hit rate + rough memory.
+    if std::env::var("ZOEK_SOA_B1").is_ok() {
+        use rayon::prelude::*;
+        // Build the string interner (id -> name + hash; for cold-path &str
+        // resolution) AND a `name_hash -> id` side map. Dedup is by the
+        // precomputed `name_hash` (the W9b-proven key), so the 38M-site
+        // `site_name_id` column populate below is a pure u64 probe with zero
+        // string hashing — the key finding the prior failed SoA attempt
+        // (separate per-site string re-hash) missed.
+        let t_int = std::time::Instant::now();
+        let mut interner = NameInterner::with_capacity(symbols.len());
+        let mut hash_to_id: AHashMap<u64, u32> = AHashMap::with_capacity(symbols.len());
+        for symbol in symbols {
+            let id = interner.intern(&symbol.name, symbol.name_hash);
+            hash_to_id.entry(symbol.name_hash).or_insert(id);
+        }
+        let build_ms = t_int.elapsed().as_millis();
+        let unique = interner.len();
+        // Populate via precomputed site.name_hash (no string hashing).
+        let t_pop = std::time::Instant::now();
+        let site_name_ids: Vec<u32> = ref_sites
+            .par_iter()
+            .map(|s| hash_to_id.get(&s.name_hash).copied().unwrap_or(NameInterner::MISS))
+            .collect();
+        let pop_ms = t_pop.elapsed().as_millis();
+        // Cross-check: a string-keyed populate (what B0/prior attempt did) to
+        // quantify the string-hash overhead we avoid.
+        let t_pop_str = std::time::Instant::now();
+        let str_hits = ref_sites
+            .par_iter()
+            .filter(|s| interner.get(&s.name) != NameInterner::MISS)
+            .count();
+        let pop_str_ms = t_pop_str.elapsed().as_millis();
+        let hits = site_name_ids
+            .par_iter()
+            .filter(|&&id| id != NameInterner::MISS)
+            .count();
+        let mem_mb = (interner.ids.capacity()
+            * (std::mem::size_of::<Box<str>>() + std::mem::size_of::<u32>())
+            + interner.hashes.capacity() * std::mem::size_of::<u64>()
+            + hash_to_id.capacity() * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>())
+            + site_name_ids.capacity() * std::mem::size_of::<u32>())
+            / (1024 * 1024);
+        eprintln!(
+            "[soa-b1] interner_build={build_ms}ms unique_names={unique} \
+             populate_by_hash={pop_ms}ms populate_by_str={pop_str_ms}ms \
+             sites={} interned_hit={hits} ({:.1}%) approx_mem={mem_mb}MB \
+             (str_hits={str_hits})",
+            site_name_ids.len(),
+            100.0 * hits as f64 / site_name_ids.len().max(1) as f64,
+        );
+        std::hint::black_box(&site_name_ids);
+    }
     let t_b = std::time::Instant::now();
     let import_targets = resolve_import_targets(import_facts, &symbols_by_file_and_name);
     let import_facts_by_file_local = import_facts_by_file_local(import_facts);
     let star_import_facts_by_file = star_import_facts_by_file(import_facts);
+    // B4: rel_path_hash -> flattened module_candidate hashes for star imports,
+    // so the column-only worker's bare path resolves star candidates without
+    // reading `site.rel_path` / `site.name`. Probe pairs `(module_hash,
+    // name_hash)` against `symbols_by_file_and_name_h`. Mirrors
+    // `star_import_candidates_into` exactly (output dedups by symbol identity).
+    let star_module_hashes_by_rel: AHashMap<u64, Vec<u64>> = {
+        let mut m: AHashMap<u64, Vec<u64>> = AHashMap::default();
+        for (rel, facts) in &star_import_facts_by_file {
+            let rel_hash = stable_hash(rel);
+            let entry = m.entry(rel_hash).or_default();
+            for fact in facts {
+                for module_path in &fact.module_candidates {
+                    entry.push(stable_hash(module_path));
+                }
+            }
+        }
+        m
+    };
     let type_facts_by_file_local = type_facts_by_file_local(type_facts);
     let function_return_facts_by_file_name =
         function_return_facts_by_file_name(function_return_facts);
+    // W12-Stage 3: 2-level views of (rel_path, name)-keyed maps. Phase E
+    // bucket loop / prefilter per-worker file cache look the outer key up
+    // once per file, then probe small inner maps by name only — eliminates
+    // the tuple hash per site (14-31M probes).
+    // W16: inner key is the precomputed FNV-1a name hash (u64) rather than the
+    // `&str` name. The hot per-site probes (prefilter 31M, worker 16M) look the
+    // inner map up by `site.name_hash` / `site.receiver_name_hash` (already
+    // precomputed on RefSite) so each probe is a u64 hash instead of a string
+    // hash. Same proven pattern as `bare_symbols_by_name` (W9b). The build pays
+    // one `stable_hash(name)` per (rel_path, name) entry (~few M, phase_b only).
+    // W18 / Option B step B3a: the OUTER key is now the precomputed
+    // `rel_path_hash` (u64) rather than the `&str` rel_path, so the pre-filter
+    // and worker look these up by `site.rel_path_hash` (already on RefSite /
+    // SiteCols) without reading the path string. Inner key remains the W16
+    // name hash. `stable_hash(rp)` here matches `site.rel_path_hash` because
+    // both hash the same path string with the same FNV-1a (extract_ref_sites).
+    let import_targets_by_rel: AHashMap<u64, AHashMap<u64, &[&GraphSymbol]>> = {
+        let mut by_rel: AHashMap<u64, AHashMap<u64, &[&GraphSymbol]>> = AHashMap::default();
+        for ((rp, nm), targets) in &import_targets {
+            by_rel
+                .entry(stable_hash(rp))
+                .or_default()
+                .insert(stable_hash(nm), targets.as_slice());
+        }
+        by_rel
+    };
+    let import_facts_by_rel: AHashMap<u64, AHashSet<u64>> = {
+        let mut by_rel: AHashMap<u64, AHashSet<u64>> = AHashMap::default();
+        for ((rp, nm), _) in &import_facts_by_file_local {
+            by_rel.entry(stable_hash(rp)).or_default().insert(stable_hash(nm));
+        }
+        by_rel
+    };
+    let type_facts_by_rel: AHashMap<u64, AHashSet<u64>> = {
+        let mut by_rel: AHashMap<u64, AHashSet<u64>> = AHashMap::default();
+        for ((rp, nm), _) in &type_facts_by_file_local {
+            by_rel.entry(stable_hash(rp)).or_default().insert(stable_hash(nm));
+        }
+        by_rel
+    };
     if probe { eprintln!("[resolve] phase_b={}ms", t_b.elapsed().as_millis()); }
+    // Phase 1.5A pre-cache: build site language_id once (parallel) so the
+    // pre-filter and phase E workers can do O(1) array lookups instead of
+    // repeatedly running compute_language_id (a ~15-arm string match).
+    //
+    // W18 / Option B step B2: build the dense `SiteCols` column instead of the
+    // old `site_language_ids: Vec<u16>`. This widens an existing full-ref_sites
+    // par_iter (which already paid the AoS traversal for `s.language`) to also
+    // copy the precomputed hash/enum fields the hot passes read — so the column
+    // build adds only the extra column writes, not a fresh 38M-struct scan.
+    //
+    // B5: moved ahead of phase C (was between phase D and the pre-filter) so the
+    // phase-C scan can read `SiteCols` too. The build depends only on `ref_sites`
+    // (all fields precomputed at parse), so the move is order-safe; the total
+    // work is unchanged, only its position.
+    let t_slang = std::time::Instant::now();
+    let site_cols: Vec<SiteCols> = {
+        use rayon::prelude::*;
+        ref_sites
+            .par_iter()
+            .map(|s| {
+                let mut flags = 0u8;
+                if s.is_definition {
+                    flags |= SITE_FLAG_IS_DEFINITION;
+                }
+                if s.receiver_name.is_some() {
+                    flags |= SITE_FLAG_HAS_RECEIVER;
+                }
+                if s.is_import_context {
+                    flags |= SITE_FLAG_IS_IMPORT_CONTEXT;
+                }
+                SiteCols {
+                    name_hash: s.name_hash,
+                    rel_path_hash: s.rel_path_hash,
+                    receiver_name_hash: s.receiver_name_hash,
+                    enclosing_symbol_id_hash: s.enclosing_symbol_id_hash,
+                    // B4: same fn the worker called per-site (byte-identical
+                    // dedup keys). Fused into this AoS pass we already pay.
+                    site_partial: site_partial_hash(&s.source_ref_id, &s.edge_kind),
+                    language_id: compute_language_id(s.language.as_str()),
+                    access_kind_id: s.access_kind_id,
+                    edge_kind_id: s.edge_kind_id,
+                    flags,
+                }
+            })
+            .collect()
+    };
+    if probe { eprintln!("[resolve] site_cols_build={}ms n={}", t_slang.elapsed().as_millis(), site_cols.len()); }
     let t_c = std::time::Instant::now();
     let phase_c_total = ref_sites.len();
     let phase_c_workers = graph_worker_count(phase_c_total.max(1));
-    let symbols_by_name_ref = &symbols_by_name;
+    // B5: column-only phase C reads `SiteCols`. Promoted to the default after
+    // the invariant held (14,372,638) and phase_c measured −32% (2408→1636ms,
+    // paired). `ZOEK_SOA_OFF` reverts to the struct read for A/B / debugging.
+    // Both paths probe the name-hash set and key the "may"/"likely" maps
+    // identically, so only the per-site field read differs (48B vs 292B).
+    let soa_b5 = std::env::var("ZOEK_SOA_OFF").is_err();
+    let symbol_name_hashes_ref = &symbol_name_hashes;
+    let site_cols_ref = &site_cols;
     let phase_c_outputs = if phase_c_total == 0 || phase_c_workers <= 1 {
-        vec![phase_c_process_chunk(ref_sites, symbols_by_name_ref)]
+        vec![phase_c_process_chunk(
+            ref_sites,
+            site_cols_ref,
+            0,
+            phase_c_total,
+            symbol_name_hashes_ref,
+            soa_b5,
+        )]
     } else {
         use rayon::prelude::*;
         let chunks_per_worker = 8usize;
@@ -5111,14 +5802,23 @@ fn resolve_ref_sites_a_to_e<'a>(
         ranges
             .into_par_iter()
             .map(|(start, end)| {
-                phase_c_process_chunk(&ref_sites[start..end], symbols_by_name_ref)
+                phase_c_process_chunk(
+                    ref_sites,
+                    site_cols_ref,
+                    start,
+                    end,
+                    symbol_name_hashes_ref,
+                    soa_b5,
+                )
             })
             .collect()
     };
-    let mut bare_usage_may_by_name: HashMap<&str, usize> = HashMap::new();
-    let mut bare_call_may_by_name: HashMap<&str, usize> = HashMap::new();
-    let mut member_usage_may_by_name: HashMap<&str, usize> = HashMap::new();
-    let mut member_call_may_by_name: HashMap<&str, usize> = HashMap::new();
+    // B5: "may" maps keyed by name_hash (u64), consumed in phase D via
+    // `symbol.name_hash`. Was `&str` keyed by the site name.
+    let mut bare_usage_may_by_name: HashMap<u64, usize> = HashMap::new();
+    let mut bare_call_may_by_name: HashMap<u64, usize> = HashMap::new();
+    let mut member_usage_may_by_name: HashMap<u64, usize> = HashMap::new();
+    let mut member_call_may_by_name: HashMap<u64, usize> = HashMap::new();
     let mut bare_usage_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize> =
         HashMap::new();
     let mut bare_call_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize> = HashMap::new();
@@ -5126,9 +5826,9 @@ fn resolve_ref_sites_a_to_e<'a>(
         HashMap::new();
     let mut member_call_likely_by_scope_and_name: HashMap<(u64, u64, u64), usize> =
         HashMap::new();
-    let mut bare_likely_sites_by_scope_and_name: HashMap<(u64, u64, u64), Vec<&RefSite>> =
+    let mut bare_likely_sites_by_scope_and_name: HashMap<(u64, u64, u64), Vec<u32>> =
         HashMap::new();
-    let mut member_likely_sites_by_scope_and_name: HashMap<(u64, u64, u64), Vec<&RefSite>> =
+    let mut member_likely_sites_by_scope_and_name: HashMap<(u64, u64, u64), Vec<u32>> =
         HashMap::new();
     for (
         w_bare_usage_may,
@@ -5189,36 +5889,26 @@ fn resolve_ref_sites_a_to_e<'a>(
     let mut counts: HashMap<String, GraphCount> = HashMap::with_capacity(symbols.len());
     for symbol in symbols {
         let count = counts.entry(symbol.id.clone()).or_default();
+        // B5: the "may" maps are now keyed by name_hash; look up by the
+        // symbol's precomputed name_hash (was `symbol.name.as_str()`).
         count.usage_may += bare_usage_may_by_name
-            .get(symbol.name.as_str())
+            .get(&symbol.name_hash)
             .copied()
             .unwrap_or(0);
         count.calls_in_may += bare_call_may_by_name
-            .get(symbol.name.as_str())
+            .get(&symbol.name_hash)
             .copied()
             .unwrap_or(0);
         count.usage_may += member_usage_may_by_name
-            .get(symbol.name.as_str())
+            .get(&symbol.name_hash)
             .copied()
             .unwrap_or(0);
         count.calls_in_may += member_call_may_by_name
-            .get(symbol.name.as_str())
+            .get(&symbol.name_hash)
             .copied()
             .unwrap_or(0);
     }
     if probe { eprintln!("[resolve] phase_d={}ms", t_d.elapsed().as_millis()); }
-    // Phase 1.5A pre-cache: build site language_id once (parallel) so the
-    // pre-filter and phase E workers can do O(1) array lookups instead of
-    // repeatedly running compute_language_id (a ~15-arm string match).
-    let t_slang = std::time::Instant::now();
-    let site_language_ids: Vec<u16> = {
-        use rayon::prelude::*;
-        ref_sites
-            .par_iter()
-            .map(|s| compute_language_id(s.language.as_str()))
-            .collect()
-    };
-    if probe { eprintln!("[resolve] site_lang_id_cache={}ms n={}", t_slang.elapsed().as_millis(), site_language_ids.len()); }
     // Phase E pre-filter v2: drop sites that cannot emit a ref. Matches
     // ALL the worker's productive paths including unique_member /
     // unique_bare candidate via the *_by_language_and_name maps. References
@@ -5239,53 +5929,151 @@ fn resolve_ref_sites_a_to_e<'a>(
                 .take_while(|(s, _)| *s < total)
                 .collect();
             let types_by_name_pf = &types_by_name;
-            let import_targets_pf = &import_targets;
-            let import_facts_pf = &import_facts_by_file_local;
-            let type_facts_pf = &type_facts_by_file_local;
+            // W12-Stage 3: 2-level views for per-worker file-local lookups.
+            // Prefilter ranges hit sites in parse-chunk order which is mostly
+            // file-grouped → cache hit rate ~99%. Inner contains_key on a
+            // single string replaces (rel_path, name) tuple probe.
+            let import_targets_by_rel_pf = &import_targets_by_rel;
+            let import_facts_by_rel_pf = &import_facts_by_rel;
+            let type_facts_by_rel_pf = &type_facts_by_rel;
             let bare_symbols_pf = &bare_symbols_by_name;
             let bare_lang_pf = &bare_symbols_by_language_and_name;
             let member_lang_pf = &member_symbols_by_language_and_name;
             let star_imports_pf = &star_import_facts_by_file;
-            let mut chunk_outputs: Vec<Vec<u32>> = ranges
-                .into_par_iter()
-                .map(|(start, end)| {
-                    let mut buf: Vec<u32> = Vec::with_capacity((end - start) / 4);
-                    for i in start..end {
-                        let site = &ref_sites[i];
-                        if site.is_definition {
-                            continue;
-                        }
-                        let access_kind = site.access_kind.as_str();
-                        let rel_path = site.rel_path.as_str();
-                        let name = site.name.as_str();
-                        let language_id = site_language_ids[i];
-                        let productive = if access_kind == "member" {
-                            if let Some(receiver) = site.receiver_name.as_deref() {
-                                let has_receiver_match = matches!(receiver, "self" | "cls")
-                                    || types_by_name_pf.contains_key(receiver)
-                                    || import_targets_pf.contains_key(&(rel_path, receiver))
-                                    || import_facts_pf.contains_key(&(rel_path, receiver))
-                                    || type_facts_pf.contains_key(&(rel_path, receiver));
-                                has_receiver_match
-                                    || member_lang_pf.contains_key(&(language_id, name))
+            // W18 / Option B step B3b: the pre-filter inner loop reads ONLY
+            // `site_cols[i]` (48B dense) and never touches the ~292B `RefSite`
+            // struct — the whole point of the SoA migration. Promoted to the
+            // default (W18 measured −83%, 5.8x). `ZOEK_SOA_OFF` reverts to the
+            // W16 struct-reading path for paired ON/OFF measurement.
+            let soa_b3 = std::env::var("ZOEK_SOA_OFF").is_err();
+            let mut chunk_outputs: Vec<Vec<u32>> = if soa_b3 {
+                let site_cols_pf = &site_cols;
+                // Side sets so the column path needs no `&str`: self/cls and the
+                // type-name / star-import-file probes the default path does as
+                // string lookups become precomputed-hash probes. Productivity
+                // is a superset of the default path (a hash collision can only
+                // *add* a candidate, never drop a real one), so the reference
+                // count is unchanged — validated by the invariant gate.
+                let self_hash = stable_hash("self");
+                let cls_hash = stable_hash("cls");
+                let type_recv_hashes: AHashSet<u64> =
+                    types_by_name_pf.keys().map(|&k| stable_hash(k)).collect();
+                let star_rel_hashes: AHashSet<u64> =
+                    star_imports_pf.keys().map(|&k| stable_hash(k)).collect();
+                ranges
+                    .into_par_iter()
+                    .map(|(start, end)| {
+                        let mut buf: Vec<u32> = Vec::with_capacity((end - start) / 4);
+                        let mut cached_rel_hash: u64 = u64::MAX;
+                        let mut cached_imports: Option<&AHashMap<u64, &[&GraphSymbol]>> = None;
+                        let mut cached_import_facts: Option<&AHashSet<u64>> = None;
+                        let mut cached_type_facts: Option<&AHashSet<u64>> = None;
+                        let mut cached_has_star = false;
+                        for i in start..end {
+                            // The only per-site memory read: a 32B SiteCols copy.
+                            let c = site_cols_pf[i];
+                            if c.flags & SITE_FLAG_IS_DEFINITION != 0 {
+                                continue;
+                            }
+                            let access_id = c.access_kind_id;
+                            let language_id = c.language_id;
+                            if c.rel_path_hash != cached_rel_hash {
+                                cached_rel_hash = c.rel_path_hash;
+                                cached_imports = import_targets_by_rel_pf.get(&cached_rel_hash);
+                                cached_import_facts = import_facts_by_rel_pf.get(&cached_rel_hash);
+                                cached_type_facts = type_facts_by_rel_pf.get(&cached_rel_hash);
+                                cached_has_star = star_rel_hashes.contains(&cached_rel_hash);
+                            }
+                            let productive = if access_id == ACCESS_KIND_MEMBER {
+                                if c.flags & SITE_FLAG_HAS_RECEIVER != 0 {
+                                    let rhash = c.receiver_name_hash;
+                                    let has_receiver_match = rhash == self_hash
+                                        || rhash == cls_hash
+                                        || type_recv_hashes.contains(&rhash)
+                                        || cached_imports.is_some_and(|m| m.contains_key(&rhash))
+                                        || cached_import_facts.is_some_and(|s| s.contains(&rhash))
+                                        || cached_type_facts.is_some_and(|s| s.contains(&rhash));
+                                    has_receiver_match
+                                        || member_lang_pf.contains_key(&(language_id, c.name_hash))
+                                } else {
+                                    false
+                                }
+                            } else if access_id == ACCESS_KIND_BARE {
+                                bare_symbols_pf.contains_key(&c.name_hash)
+                                    || cached_imports.is_some_and(|m| m.contains_key(&c.name_hash))
+                                    || cached_has_star
+                                    || bare_lang_pf.contains_key(&(language_id, c.name_hash))
                             } else {
                                 false
+                            };
+                            if productive {
+                                buf.push(i as u32);
                             }
-                        } else if access_kind == "bare" {
-                            bare_symbols_pf.contains_key(&site.name_hash)
-                                || import_targets_pf.contains_key(&(rel_path, name))
-                                || star_imports_pf.contains_key(rel_path)
-                                || bare_lang_pf.contains_key(&(language_id, name))
-                        } else {
-                            false
-                        };
-                        if productive {
-                            buf.push(i as u32);
                         }
-                    }
-                    buf
-                })
-                .collect();
+                        buf
+                    })
+                    .collect()
+            } else {
+                ranges
+                    .into_par_iter()
+                    .map(|(start, end)| {
+                        let mut buf: Vec<u32> = Vec::with_capacity((end - start) / 4);
+                        // W12-Stage 3: per-worker file-local 3-map cache.
+                        // ref_sites are parse-chunk grouped (atomic FileGraph
+                        // ingest) so adjacent indices share rel_path with ~99%
+                        // probability inside a worker range.
+                        let mut cached_rel_hash: u64 = u64::MAX;
+                        let mut cached_imports: Option<&AHashMap<u64, &[&GraphSymbol]>> = None;
+                        let mut cached_import_facts: Option<&AHashSet<u64>> = None;
+                        let mut cached_type_facts: Option<&AHashSet<u64>> = None;
+                        for i in start..end {
+                            let site = &ref_sites[i];
+                            if site.is_definition {
+                                continue;
+                            }
+                            // W12: precomputed `access_kind_id` saves 2 memcmps
+                            // per site (member/bare checks) × 31M sites.
+                            let access_id = site.access_kind_id;
+                            let language_id = site_cols[i].language_id;
+                            if site.rel_path_hash != cached_rel_hash {
+                                cached_rel_hash = site.rel_path_hash;
+                                cached_imports = import_targets_by_rel_pf.get(&cached_rel_hash);
+                                cached_import_facts = import_facts_by_rel_pf.get(&cached_rel_hash);
+                                cached_type_facts = type_facts_by_rel_pf.get(&cached_rel_hash);
+                            }
+                            let productive = if access_id == ACCESS_KIND_MEMBER {
+                                if let Some(receiver) = site.receiver_name.as_deref() {
+                                    // W16: file-local probes keyed by precomputed
+                                    // receiver_name_hash (u64) instead of `receiver`.
+                                    let rhash = site.receiver_name_hash;
+                                    let has_receiver_match = matches!(receiver, "self" | "cls")
+                                        || types_by_name_pf.contains_key(receiver)
+                                        || cached_imports
+                                            .is_some_and(|m| m.contains_key(&rhash))
+                                        || cached_import_facts
+                                            .is_some_and(|s| s.contains(&rhash))
+                                        || cached_type_facts.is_some_and(|s| s.contains(&rhash));
+                                    has_receiver_match
+                                        || member_lang_pf.contains_key(&(language_id, site.name_hash))
+                                } else {
+                                    false
+                                }
+                            } else if access_id == ACCESS_KIND_BARE {
+                                bare_symbols_pf.contains_key(&site.name_hash)
+                                    || cached_imports.is_some_and(|m| m.contains_key(&site.name_hash))
+                                    || star_imports_pf.contains_key(site.rel_path.as_str())
+                                    || bare_lang_pf.contains_key(&(language_id, site.name_hash))
+                            } else {
+                                false
+                            };
+                            if productive {
+                                buf.push(i as u32);
+                            }
+                        }
+                        buf
+                    })
+                    .collect()
+            };
             let total_filtered: usize = chunk_outputs.iter().map(|c| c.len()).sum();
             let mut indices: Vec<u32> = Vec::with_capacity(total_filtered);
             for c in &mut chunk_outputs {
@@ -5306,6 +6094,22 @@ fn resolve_ref_sites_a_to_e<'a>(
     let t_e = std::time::Instant::now();
 
     let total_refs = phase_e_indices_effective.map(|i| i.len()).unwrap_or(ref_sites.len());
+    // Option C Stage 1: bucket phase E site indices by file (rel_path_hash).
+    // Rayon dispatch now chunks buckets keeping each file's sites together —
+    // foundation for stages 2-4 (per-file receiver cache, per-file local
+    // sub-maps, per-file mini-context). On its own this is a pure refactor.
+    let phase_e_buckets = build_phase_e_file_buckets(ref_sites, phase_e_indices_effective);
+    if probe {
+        let avg = if phase_e_buckets.is_empty() {
+            0
+        } else {
+            total_refs / phase_e_buckets.len()
+        };
+        eprintln!(
+            "[resolve] phase_e_buckets={} avg_sites/bucket={avg}",
+            phase_e_buckets.len()
+        );
+    }
     let worker_count = graph_resolve_e_worker_count(total_refs.max(1));
     let spill_threshold = std::env::var("ZOEK_RESOLVE_SPILL_REFS")
         .ok()
@@ -5317,7 +6121,28 @@ fn resolve_ref_sites_a_to_e<'a>(
         .unwrap_or_else(|_| std::env::temp_dir().join("zoek-rs-resolve-spill"));
     let _ = fs::create_dir_all(&spill_dir);
     let spill_dir_ref = &spill_dir;
-    let process_chunk = |start: usize, end: usize, worker_id: usize| -> io::Result<(
+    // W18 / Option B step B4: the phase-E worker inner loop reads ONLY
+    // `site_cols[idx]` (48B) per site and never the ~292B `RefSite` (the SoA
+    // goal validated 5.8x on the pre-filter in B3). The struct is touched only
+    // on the rare receiver cache-miss (to run the validated string-keyed
+    // `compute_receiver_resolution` once per distinct receiver). Promoted to
+    // the default (W19 measured phase_e −16%, paired). `ZOEK_SOA_OFF` reverts
+    // to the W16 struct path for paired ON/OFF measurement.
+    let soa_b4 = std::env::var("ZOEK_SOA_OFF").is_err();
+    // B4 column pre-screen side-set: receiver-name hashes that match a type
+    // name. Mirrors the struct path's `types_by_name.contains_key(receiver)`
+    // without a `&str` read. A hash collision can only *admit* a receiver to
+    // the (rare) compute path, which then re-validates by string — so the
+    // reference count is unchanged (invariant gate).
+    let type_recv_hashes: AHashSet<u64> = if soa_b4 {
+        types_by_name.keys().map(|&k| stable_hash(k)).collect()
+    } else {
+        AHashSet::default()
+    };
+    let type_recv_hashes_ref = &type_recv_hashes;
+    let self_hash = stable_hash("self");
+    let cls_hash = stable_hash("cls");
+    let process_chunk = |buckets_slice: &[PhaseEFileBucket], worker_id: usize| -> io::Result<(
         HashMap<String, GraphCount>,
         AHashSet<u64>,
         AHashSet<u64>,
@@ -5325,12 +6150,14 @@ fn resolve_ref_sites_a_to_e<'a>(
         AHashSet<u64>,
         Vec<PathBuf>,
         Vec<LightRef>,
+        AHashMap<u64, usize>,
     )> {
         // hashbrown::HashMap exposes `entry_ref` (probe by &str without
         // pre-allocating a String key). std::HashMap does not.
         // Pre-size: empirically ~36% of sites in a chunk push a reference here.
         // Cap at spill_threshold to avoid wasted reservation when chunk is huge.
-        let chunk_estimate = ((end - start) / 3).min(spill_threshold).max(64);
+        let chunk_site_count: usize = buckets_slice.iter().map(|b| b.indices.len()).sum();
+        let chunk_estimate = (chunk_site_count / 3).min(spill_threshold).max(64);
         // Phase 3 aggressive: per-worker counts keyed by u64 (GraphSymbol.id_u64)
         // instead of String. Eliminates per-call string hash + alloc. Merge
         // step at end converts back to "sym:HEX16" strings via id_to_string.
@@ -5353,20 +6180,33 @@ fn resolve_ref_sites_a_to_e<'a>(
         // existing downstream path (phase F, write, spill) is unchanged.
         let mut light_refs: Vec<LightRef> = Vec::with_capacity(chunk_estimate);
         let mut dedup: AHashSet<u64> = AHashSet::with_capacity(dedup_cap);
+        // F1.a: slim per-target tally built incrementally as lights are pushed.
+        // Replaces the previous rescan of all 14M LightRefs at phase F entry.
+        let mut local_target_tally: AHashMap<u64, usize> = AHashMap::default();
         let mut spill_paths: Vec<PathBuf> = Vec::new();
         // Reused per-site candidate buffers; capacity is retained across iterations.
         let mut fallback_buf: Vec<&GraphSymbol> = Vec::new();
         let mut exact_buf: Vec<MemberExactCandidate<'_>> = Vec::new();
         let mut star_imported_buf: Vec<&GraphSymbol> = Vec::new();
         // Phase 3 (Receiver Memoization): cache receiver-side resolution per
-        // (rel_path, receiver, enclosing_id). Within a chunk many sites share
-        // the same triplet — typical hit rate >70% on member-heavy corpora.
-        // W9a: key is now (u64, u64, u64) hash triple — eliminates the
-        // 3-string hash + memcmp on every cache probe (line 5363 was the
-        // single biggest active hotspot at 60K samples). enclosing=0 sentinel
-        // for None; collision probability negligible for u64-cubed.
-        let mut receiver_cache: AHashMap<(u64, u64, u64), ReceiverResolution<'_>> =
+        // (receiver, enclosing_id). W9a moved the key to a u64 triple
+        // (rel_path, receiver, enclosing). W12-Stage 2 narrows it to a u64
+        // pair: the bucket loop resets the cache when rel_path changes, so
+        // rel_path is constant within one file's run — dropping it from the
+        // key shrinks the cache (per-file working set ~50-200 entries vs
+        // chunk-wide ~10K+) and tightens probe hash work.
+        let mut receiver_cache: AHashMap<(u64, u64), ReceiverResolution<'_>> =
             AHashMap::default();
+        // B4: the all-hash receiver cache used by the column-only path. Only
+        // one of the two caches is populated per run (gated by `soa_b4`).
+        let mut receiver_cache_cols: AHashMap<(u64, u64), ReceiverResolutionCols> =
+            AHashMap::default();
+        let mut current_file_hash: u64 = u64::MAX;
+        // W12-Stage 3: file-local views updated on bucket (file) transition.
+        // `None` if the current file has no entries in the corresponding map.
+        let mut current_file_imports: Option<&AHashMap<u64, &[&GraphSymbol]>> = None;
+        let mut current_file_import_facts: Option<&AHashSet<u64>> = None;
+        let mut current_file_type_facts: Option<&AHashSet<u64>> = None;
         let mut maybe_spill = |refs: &mut Vec<GraphReference>, paths: &mut Vec<PathBuf>| -> io::Result<()> {
             if refs.len() < spill_threshold {
                 return Ok(());
@@ -5386,84 +6226,194 @@ fn resolve_ref_sites_a_to_e<'a>(
             paths.push(path);
             Ok(())
         };
-        for pos in start..end {
-            // `site_idx` is the canonical index into the owning `ref_sites`
-            // slice; LightRef stores it so the writer can look up site
-            // fields without duplicating them per-record.
-            let site_idx: u32 = match phase_e_indices_effective {
-                Some(indices) => indices[pos],
-                None => pos as u32,
-            };
-            let site = &ref_sites[site_idx as usize];
-            if site.is_definition {
+        // Option C Stage 1: outer iteration is now bucket-by-bucket (one file
+        // at a time) via flat_map. Indices are pre-resolved at bucket-build
+        // time so the per-site `match phase_e_indices_effective { ... }`
+        // dispatch is gone. Stages 2+ will add per-bucket prelude work
+        // (per-file receiver cache, per-file local sub-maps).
+        for site_idx in buckets_slice
+            .iter()
+            .flat_map(|b| b.indices.iter().copied())
+        {
+            // B4: the 48B column is the only guaranteed per-site read. The
+            // 292B `RefSite` is fetched only inside the `soa_b4` cache-miss
+            // closure below (rare) or, with `soa_b4` off, once per site.
+            let c = site_cols[site_idx as usize];
+            // W12-Stage 2/3: per-file receiver cache scope + file-local views,
+            // refreshed on file (rel_path_hash) change.
+            if c.rel_path_hash != current_file_hash {
+                receiver_cache.clear();
+                receiver_cache_cols.clear();
+                current_file_hash = c.rel_path_hash;
+                // W18 / B3a: import_*_by_rel outer key is now rel_path_hash.
+                current_file_imports = import_targets_by_rel.get(&current_file_hash);
+                current_file_import_facts = import_facts_by_rel.get(&current_file_hash);
+                current_file_type_facts = type_facts_by_rel.get(&current_file_hash);
+            }
+            if c.flags & SITE_FLAG_IS_DEFINITION != 0 {
                 continue;
             }
-            // Cache access_kind comparison once per site (used 3x downstream).
-            let access_kind = site.access_kind.as_str();
-            let is_member = access_kind == "member";
-            let is_bare = access_kind == "bare";
+            // W12: precomputed access_kind_id replaces 2 memcmps per site.
+            let is_member = c.access_kind_id == ACCESS_KIND_MEMBER;
+            let is_bare = c.access_kind_id == ACCESS_KIND_BARE;
             fallback_buf.clear();
             exact_buf.clear();
-            if is_member {
-                if let Some(receiver) = site.receiver_name.as_deref() {
-                    let key = (
-                        site.rel_path_hash,
-                        site.receiver_name_hash,
-                        site.enclosing_symbol_id_hash,
-                    );
-                    let res = receiver_cache.entry(key).or_insert_with(|| {
-                        compute_receiver_resolution(
-                            site.rel_path.as_str(),
-                            receiver,
-                            site.enclosing_symbol_id.as_deref(),
-                            &symbols_by_id,
-                            &types_by_name,
-                            &import_targets,
-                            &import_facts_by_file_local,
-                            &type_facts_by_file_local,
-                            &symbols_by_file_and_name,
-                            &function_return_facts_by_file_name,
-                            hierarchy_facts,
-                        )
-                    });
-                    expand_receiver_for_name(
-                        res,
-                        site.name.as_str(),
-                        &members_by_container_and_name,
-                        &symbols_by_file_and_name,
-                        &mut fallback_buf,
-                        &mut exact_buf,
-                    );
+            // ===== HEAD (gated): fill fallback_buf / exact_buf / star_imported_buf =====
+            if soa_b4 {
+                // Column-only candidate gathering: SiteCols + hash-keyed maps.
+                if is_member {
+                    if c.flags & SITE_FLAG_HAS_RECEIVER != 0 {
+                        let key = (c.receiver_name_hash, c.enclosing_symbol_id_hash);
+                        let res = receiver_cache_cols.entry(key).or_insert_with(|| {
+                            // Pre-screen entirely on hashes (no RefSite read):
+                            // mirrors compute_receiver_resolution's has_any guard.
+                            // Only a real candidate reaches the struct load.
+                            let rhash = c.receiver_name_hash;
+                            let is_self = rhash == self_hash || rhash == cls_hash;
+                            if !is_self
+                                && !type_recv_hashes_ref.contains(&rhash)
+                                && !current_file_imports
+                                    .is_some_and(|m| m.contains_key(&rhash))
+                                && !current_file_import_facts
+                                    .is_some_and(|s| s.contains(&rhash))
+                                && !current_file_type_facts
+                                    .is_some_and(|s| s.contains(&rhash))
+                            {
+                                return ReceiverResolutionCols {
+                                    has_any: false,
+                                    self_container_hash: None,
+                                    self_type: None,
+                                    type_targets: Vec::new(),
+                                    import_modules: Vec::new(),
+                                };
+                            }
+                            // Rare: load the RefSite once for the validated
+                            // string-keyed compute, then collapse to hashes.
+                            let site = &ref_sites[site_idx as usize];
+                            let receiver = site.receiver_name.as_deref().unwrap_or("");
+                            let res = compute_receiver_resolution(
+                                site.rel_path.as_str(),
+                                receiver,
+                                site.enclosing_symbol_id.as_deref(),
+                                &symbols_by_id,
+                                &types_by_name,
+                                &import_targets,
+                                &import_facts_by_file_local,
+                                &type_facts_by_file_local,
+                                &symbols_by_file_and_name,
+                                &function_return_facts_by_file_name,
+                                hierarchy_facts,
+                            );
+                            receiver_resolution_to_cols(&res)
+                        });
+                        expand_receiver_for_name_cols(
+                            res,
+                            c.name_hash,
+                            &members_by_container_and_name_h,
+                            &symbols_by_file_and_name_h,
+                            &mut fallback_buf,
+                            &mut exact_buf,
+                        );
+                    }
+                } else if let Some(bare) = bare_symbols_by_name.get(&c.name_hash) {
+                    fallback_buf.extend(bare.iter().copied());
                 }
-            } else if let Some(bare) = bare_symbols_by_name.get(&site.name_hash) {
-                fallback_buf.extend(bare.iter().copied());
-            }
-            let fallback_candidates: &[&GraphSymbol] = &fallback_buf;
-            let (imported_candidates, star_imported_candidates): (&[&GraphSymbol], &[&GraphSymbol]) = if is_bare {
-                let imported = import_targets
-                    .get(&(site.rel_path.as_str(), site.name.as_str()))
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                star_import_candidates_into(
-                    site,
-                    &star_import_facts_by_file,
-                    &symbols_by_file_and_name,
-                    &mut star_imported_buf,
-                );
-                (imported, star_imported_buf.as_slice())
+                if is_bare {
+                    star_import_candidates_into_cols(
+                        c.rel_path_hash,
+                        c.name_hash,
+                        &star_module_hashes_by_rel,
+                        &symbols_by_file_and_name_h,
+                        &mut star_imported_buf,
+                    );
+                } else {
+                    star_imported_buf.clear();
+                }
             } else {
-                star_imported_buf.clear();
-                (&[], &[])
+                // Struct path (default): read RefSite fields + string-keyed maps.
+                let site = &ref_sites[site_idx as usize];
+                if is_member {
+                    if let Some(receiver) = site.receiver_name.as_deref() {
+                        let key = (site.receiver_name_hash, site.enclosing_symbol_id_hash);
+                        let res = receiver_cache.entry(key).or_insert_with(|| {
+                            let is_self = matches!(receiver, "self" | "cls");
+                            if !is_self {
+                                let rhash = site.receiver_name_hash;
+                                let could_resolve = types_by_name.contains_key(receiver)
+                                    || current_file_imports
+                                        .is_some_and(|m| m.contains_key(&rhash))
+                                    || current_file_import_facts
+                                        .is_some_and(|s| s.contains(&rhash))
+                                    || current_file_type_facts
+                                        .is_some_and(|s| s.contains(&rhash));
+                                if !could_resolve {
+                                    return ReceiverResolution {
+                                        has_any: false,
+                                        self_container: None,
+                                        self_type_symbol: None,
+                                        type_targets: Vec::new(),
+                                        import_facts: Vec::new(),
+                                    };
+                                }
+                            }
+                            compute_receiver_resolution(
+                                site.rel_path.as_str(),
+                                receiver,
+                                site.enclosing_symbol_id.as_deref(),
+                                &symbols_by_id,
+                                &types_by_name,
+                                &import_targets,
+                                &import_facts_by_file_local,
+                                &type_facts_by_file_local,
+                                &symbols_by_file_and_name,
+                                &function_return_facts_by_file_name,
+                                hierarchy_facts,
+                            )
+                        });
+                        expand_receiver_for_name(
+                            res,
+                            site.name.as_str(),
+                            &members_by_container_and_name,
+                            &symbols_by_file_and_name,
+                            &mut fallback_buf,
+                            &mut exact_buf,
+                        );
+                    }
+                } else if let Some(bare) = bare_symbols_by_name.get(&site.name_hash) {
+                    fallback_buf.extend(bare.iter().copied());
+                }
+                if is_bare {
+                    star_import_candidates_into(
+                        site,
+                        &star_import_facts_by_file,
+                        &symbols_by_file_and_name,
+                        &mut star_imported_buf,
+                    );
+                } else {
+                    star_imported_buf.clear();
+                }
+            }
+            // ===== TAIL (shared): reads only the 48B column `c`. =====
+            let fallback_candidates: &[&GraphSymbol] = &fallback_buf;
+            // W12-Stage 3: file-local probe keyed by name_hash (B3a outer key).
+            let imported_candidates: &[&GraphSymbol] = if is_bare {
+                current_file_imports
+                    .and_then(|m| m.get(&c.name_hash).copied())
+                    .unwrap_or(&[])
+            } else {
+                &[]
             };
+            let star_imported_candidates: &[&GraphSymbol] =
+                if is_bare { star_imported_buf.as_slice() } else { &[] };
             let unique_member_candidate = if is_member
-                && !site.is_import_context
-                && site.receiver_name.is_some()
+                && c.flags & SITE_FLAG_IS_IMPORT_CONTEXT == 0
+                && c.flags & SITE_FLAG_HAS_RECEIVER != 0
                 && fallback_candidates.is_empty()
             {
                 unique_symbol_by_language_and_name(
                     &member_symbols_by_language_and_name,
-                    site_language_ids[site_idx as usize],
-                    site.name.as_str(),
+                    c.language_id,
+                    c.name_hash,
                 )
             } else {
                 None
@@ -5475,10 +6425,9 @@ fn resolve_ref_sites_a_to_e<'a>(
             {
                 continue;
             }
-            // Phase 3: site-invariant partial hash (source_ref_id + edge_kind)
-            // computed once per site. Each candidate's edge_key only needs an
-            // additional u64 + target_id hash instead of 3 string hashes.
-            let site_partial = site_partial_hash(&site.source_ref_id, &site.edge_kind);
+            // B4: site-invariant partial hash precomputed into the column
+            // (byte-identical to the old per-site `site_partial_hash`).
+            let site_partial = c.site_partial;
             if is_member {
                 for target in fallback_candidates.iter() {
                     let edge_key = edge_key_from_partial_u64(site_partial, target.id_u64);
@@ -5487,7 +6436,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                         &mut id_to_string,
                         &mut counted_likely,
                         &mut counted_exact,
-                        site,
+                        c.edge_kind_id,
                         target,
                         BOUND_MAY,
                         true,
@@ -5502,7 +6451,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                         &mut id_to_string,
                         &mut counted_likely,
                         &mut counted_exact,
-                        site,
+                        c.edge_kind_id,
                         candidate.target,
                         BOUND_MAY | BOUND_MUST,
                         true,
@@ -5512,6 +6461,8 @@ fn resolve_ref_sites_a_to_e<'a>(
                     let _ = push_light_resolved_reference(
                         &mut light_refs,
                         &mut dedup,
+                        Some(&mut local_target_tally),
+                        light_sender,
                         site_idx,
                         candidate.target,
                         BOUND_MAY | BOUND_MUST,
@@ -5527,7 +6478,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                         &mut id_to_string,
                         &mut counted_likely,
                         &mut counted_exact,
-                        site,
+                        c.edge_kind_id,
                         target,
                         BOUND_MAY,
                         true,
@@ -5537,6 +6488,8 @@ fn resolve_ref_sites_a_to_e<'a>(
                     let _ = push_light_resolved_reference(
                         &mut light_refs,
                         &mut dedup,
+                        Some(&mut local_target_tally),
+                        light_sender,
                         site_idx,
                         target,
                         BOUND_MAY,
@@ -5553,21 +6506,21 @@ fn resolve_ref_sites_a_to_e<'a>(
             // `bare_symbols_by_name[name]`, so counting bare-fb symbols with
             // matching name + file is equivalent. Member sites already
             // `continue` above, so this branch only runs for bare.
-            let site_rel_path_hash = site.rel_path_hash;
+            let site_rel_path_hash = c.rel_path_hash;
             let same_file_count = same_file_bare_count
-                .get(&(site.name_hash, site_rel_path_hash))
+                .get(&(c.name_hash, site_rel_path_hash))
                 .copied()
                 .unwrap_or(0) as usize;
             let unique_bare_candidate = if is_bare
-                && !site.is_import_context
+                && c.flags & SITE_FLAG_IS_IMPORT_CONTEXT == 0
                 && same_file_count == 0
                 && imported_candidates.is_empty()
                 && star_imported_candidates.is_empty()
             {
                 unique_symbol_by_language_and_name(
                     &bare_symbols_by_language_and_name,
-                    site_language_ids[site_idx as usize],
-                    site.name.as_str(),
+                    c.language_id,
+                    c.name_hash,
                 )
             } else {
                 None
@@ -5582,14 +6535,14 @@ fn resolve_ref_sites_a_to_e<'a>(
                     BOUND_MAY
                 };
                 let fallback_already_counts_may =
-                    is_bare && target.name_hash == site.name_hash;
+                    is_bare && target.name_hash == c.name_hash;
                 let edge_key = edge_key_from_partial_u64(site_partial, target.id_u64);
                 add_resolution_count(
                     &mut counts,
                     &mut id_to_string,
                     &mut counted_likely,
                     &mut counted_exact,
-                    site,
+                    c.edge_kind_id,
                     target,
                     bound_mask,
                     fallback_already_counts_may,
@@ -5600,6 +6553,8 @@ fn resolve_ref_sites_a_to_e<'a>(
                     let _ = push_light_resolved_reference(
                         &mut light_refs,
                         &mut dedup,
+                        Some(&mut local_target_tally),
+                        light_sender,
                         site_idx,
                         target,
                         bound_mask,
@@ -5616,7 +6571,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                     &mut id_to_string,
                     &mut counted_likely,
                     &mut counted_exact,
-                    site,
+                    c.edge_kind_id,
                     target,
                     BOUND_MAY,
                     true,
@@ -5626,6 +6581,8 @@ fn resolve_ref_sites_a_to_e<'a>(
                 let _ = push_light_resolved_reference(
                     &mut light_refs,
                     &mut dedup,
+                    Some(&mut local_target_tally),
+                    light_sender,
                     site_idx,
                     target,
                     BOUND_MAY,
@@ -5652,7 +6609,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                         &mut id_to_string,
                         &mut counted_likely,
                         &mut counted_exact,
-                        site,
+                        c.edge_kind_id,
                         target,
                         bound_mask,
                         true,
@@ -5672,6 +6629,8 @@ fn resolve_ref_sites_a_to_e<'a>(
                     let _ = push_light_resolved_reference(
                         &mut light_refs,
                         &mut dedup,
+                        Some(&mut local_target_tally),
+                        light_sender,
                         site_idx,
                         target,
                         bound_mask,
@@ -5694,6 +6653,16 @@ fn resolve_ref_sites_a_to_e<'a>(
         // below, then dropped. Sampling showed ~6% of phase E CPU spent here.
         let mut references: Vec<GraphReference> = Vec::new();
         maybe_spill(&mut references, &mut spill_paths)?;
+        // F1.b: send the worker's residual light batch into the channel-driven
+        // writer (Phase 5-A). The worker output tuple still carries a light_refs
+        // Vec, but when streaming it is left empty here so the main-thread
+        // merge becomes a no-op append.
+        if let Some(s) = light_sender {
+            if !light_refs.is_empty() {
+                let batch = std::mem::take(&mut light_refs);
+                let _ = s.send(batch);
+            }
+        }
         // Convert hashbrown → std HashMap at the worker boundary so the
         // existing downstream merge (which expects std::HashMap) is
         // unchanged. The conversion is a parallel per-worker pass (~325K
@@ -5711,7 +6680,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                 (s, v)
             })
             .collect();
-        Ok((std_counts, counted_likely, counted_exact, references, dedup, spill_paths, light_refs))
+        Ok((std_counts, counted_likely, counted_exact, references, dedup, spill_paths, light_refs, local_target_tally))
     };
 
     let worker_outputs: io::Result<Vec<(
@@ -5722,8 +6691,9 @@ fn resolve_ref_sites_a_to_e<'a>(
         AHashSet<u64>,
         Vec<PathBuf>,
         Vec<LightRef>,
+        AHashMap<u64, usize>,
     )>> = if total_refs == 0 || worker_count <= 1 {
-        process_chunk(0, total_refs, 0).map(|t| vec![t])
+        process_chunk(&phase_e_buckets, 0).map(|t| vec![t])
     } else {
         // Rayon work-stealing: split into more chunks than threads so faster
         // cores can grab additional work as slower ones finish. Helps when
@@ -5734,6 +6704,10 @@ fn resolve_ref_sites_a_to_e<'a>(
         // exposing load imbalance (cvwait dominated leaf samples at 362K).
         // Finer chunks let work-stealing recover tail latency from
         // member-heavy chunks. Override with ZOEK_PHASE_E_CHUNKS_PER_WORKER.
+        //
+        // Option C Stage 1: chunks are now bucket-ranges. Buckets are kept
+        // intact (each chunk holds a contiguous run of files) so per-file
+        // state added in stages 2+ stays inside one rayon work unit.
         use rayon::prelude::*;
         let chunks_per_worker = std::env::var("ZOEK_PHASE_E_CHUNKS_PER_WORKER")
             .ok()
@@ -5741,19 +6715,27 @@ fn resolve_ref_sites_a_to_e<'a>(
             .filter(|n| *n > 0)
             .unwrap_or(32);
         let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
-        let chunk_size = total_refs.div_ceil(target_chunks).max(1);
-        let ranges: Vec<(usize, usize, usize)> = (0..)
-            .map(|i| {
-                let start = i * chunk_size;
-                let end = (start + chunk_size).min(total_refs);
-                (i, start, end)
-            })
-            .take_while(|(_, start, _)| *start < total_refs)
-            .collect();
+        let chunk_target_sites = total_refs.div_ceil(target_chunks).max(1);
+        let mut bucket_ranges: Vec<(usize, usize)> = Vec::with_capacity(target_chunks + 1);
+        let mut bs = 0usize;
+        let mut accumulated = 0usize;
+        for (i, b) in phase_e_buckets.iter().enumerate() {
+            accumulated += b.indices.len();
+            if accumulated >= chunk_target_sites {
+                bucket_ranges.push((bs, i + 1));
+                bs = i + 1;
+                accumulated = 0;
+            }
+        }
+        if bs < phase_e_buckets.len() {
+            bucket_ranges.push((bs, phase_e_buckets.len()));
+        }
         let pc = &process_chunk;
-        let collected: Result<Vec<_>, _> = ranges
+        let buckets_ref = &phase_e_buckets;
+        let collected: Result<Vec<_>, _> = bucket_ranges
             .into_par_iter()
-            .map(|(idx, start, end)| pc(start, end, idx))
+            .enumerate()
+            .map(|(idx, (bs, be))| pc(&buckets_ref[bs..be], idx))
             .collect();
         collected
     };
@@ -5766,7 +6748,11 @@ fn resolve_ref_sites_a_to_e<'a>(
     let mut light_references: Vec<LightRef> = Vec::with_capacity(total_phase_e_refs);
     let mut dedup: AHashSet<u64> = AHashSet::default();
     let mut reference_partials: Vec<PathBuf> = Vec::new();
-    for (w_counts, _w_likely, _w_exact, mut w_refs, w_dedup, mut w_spill_paths, mut w_light_refs) in worker_outputs {
+    // F1.a: merge per-worker tallies (sized by union of unique target ids).
+    let total_tally_entries: usize = worker_outputs.iter().map(|t| t.7.len()).sum();
+    let mut light_target_count_by_id_u64: AHashMap<u64, usize> =
+        AHashMap::with_capacity(total_tally_entries);
+    for (w_counts, _w_likely, _w_exact, mut w_refs, w_dedup, mut w_spill_paths, mut w_light_refs, w_tally) in worker_outputs {
         // Hand spill paths up to the caller; the streaming sidecar writer
         // will consume them once. The in-memory tail (w_refs) stays for
         // phase F to process and ultimately also be streamed.
@@ -5791,6 +6777,9 @@ fn resolve_ref_sites_a_to_e<'a>(
         references.append(&mut w_refs);
         light_references.append(&mut w_light_refs);
         dedup.extend(w_dedup);
+        for (k, v) in w_tally {
+            *light_target_count_by_id_u64.entry(k).or_default() += v;
+        }
     }
     // Phase 4-Q: phase E workers skip materialization. References stays
     // empty; LightRef holds the data. resolve_ref_sites materializes for
@@ -5820,6 +6809,7 @@ fn resolve_ref_sites_a_to_e<'a>(
         member_call_likely_by_scope_and_name,
         bare_likely_sites_by_scope_and_name,
         member_likely_sites_by_scope_and_name,
+        light_target_count_by_id_u64,
     }
 }
 
@@ -6143,7 +7133,174 @@ struct ReceiverResolution<'a> {
     import_facts: Vec<&'a ImportFact>,
 }
 
+/// W18 / Option B step B4: the all-hash twin of `TypeTarget`. The container
+/// strings of the type symbol (qualified_name / name) are hashed once when the
+/// `ReceiverResolution` is converted (cache-miss, rare) so the per-site
+/// `expand` probe of `members_by_container_and_name_h` is pure integer keys.
+struct TypeTargetCols {
+    qual_hash: u64,
+    name_hash: u64,
+    /// `qualified_name == name` — skip the redundant second member probe.
+    qual_eq_name: bool,
+    provenance: &'static str,
+}
+
+/// B4: the all-hash twin of `ReceiverResolution`. Holds NO borrows (every
+/// string collapsed to a `u64` hash), so it carries no lifetime and the
+/// per-file `receiver_cache_cols` is cheap to clear. Built once per distinct
+/// `(receiver, enclosing)` via `receiver_resolution_to_cols`; the hot
+/// `expand_receiver_for_name_cols` reads only these hashes + `site_cols`.
+struct ReceiverResolutionCols {
+    has_any: bool,
+    /// receiver=self|cls with container_name → `stable_hash(container)`.
+    self_container_hash: Option<u64>,
+    /// receiver=self|cls where source is itself a type kind →
+    /// `(qualified_name hash, name hash, qualified_name == name)`.
+    self_type: Option<(u64, u64, bool)>,
+    type_targets: Vec<TypeTargetCols>,
+    /// `(module_candidate hash, is_star)` pairs flattened from the import facts.
+    import_modules: Vec<(u64, bool)>,
+}
+
+/// B4: convert the validated string-keyed `ReceiverResolution` (built by the
+/// existing `compute_receiver_resolution` on the rare cache-miss path) into the
+/// all-hash `ReceiverResolutionCols` the column-only worker caches and expands.
+/// Hashing happens once per distinct receiver, not per site.
+fn receiver_resolution_to_cols(res: &ReceiverResolution) -> ReceiverResolutionCols {
+    ReceiverResolutionCols {
+        has_any: res.has_any,
+        self_container_hash: res.self_container.map(stable_hash),
+        self_type: res.self_type_symbol.map(|s| {
+            (
+                stable_hash(&s.qualified_name),
+                s.name_hash,
+                s.qualified_name == s.name,
+            )
+        }),
+        type_targets: res
+            .type_targets
+            .iter()
+            .map(|tt| TypeTargetCols {
+                qual_hash: stable_hash(&tt.sym.qualified_name),
+                name_hash: tt.sym.name_hash,
+                qual_eq_name: tt.sym.qualified_name == tt.sym.name,
+                provenance: tt.provenance,
+            })
+            .collect(),
+        import_modules: res
+            .import_facts
+            .iter()
+            .flat_map(|f| {
+                let is_star = f.imported_name == "*";
+                f.module_candidates
+                    .iter()
+                    .map(move |m| (stable_hash(m), is_star))
+            })
+            .collect(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
+/// B4: all-hash twin of `expand_receiver_for_name`. Probes the hash-keyed
+/// `members_by_container_and_name_h` / `symbols_by_file_and_name_h` with
+/// `(container_hash, name_hash)` so the hot member path reads no `RefSite`
+/// `&str`. Operation order + provenance strings mirror the string version
+/// exactly, so the dedup'd output is identical (modulo hash collisions, which
+/// the invariant gate rules out).
+fn expand_receiver_for_name_cols<'a>(
+    res: &ReceiverResolutionCols,
+    name_hash: u64,
+    members_by_container_and_name_h: &HashMap<(u64, u64), Vec<&'a GraphSymbol>>,
+    symbols_by_file_and_name_h: &HashMap<(u64, u64), Vec<&'a GraphSymbol>>,
+    fallback: &mut Vec<&'a GraphSymbol>,
+    exact: &mut Vec<MemberExactCandidate<'a>>,
+) {
+    fallback.clear();
+    exact.clear();
+    if !res.has_any {
+        return;
+    }
+    if let Some(ch) = res.self_container_hash {
+        // extend_and_collect_members_for_container (receiver-self): both buffers.
+        if let Some(symbols) = members_by_container_and_name_h.get(&(ch, name_hash)) {
+            for sym in symbols {
+                fallback.push(*sym);
+                exact.push(MemberExactCandidate { target: *sym, provenance: "receiver-self" });
+            }
+        }
+    } else if let Some((qual_hash, name_h, qual_eq_name)) = res.self_type {
+        // extend_members_for_type (self type): fallback only.
+        if let Some(symbols) = members_by_container_and_name_h.get(&(qual_hash, name_hash)) {
+            fallback.extend(symbols.iter().copied());
+        }
+        if !qual_eq_name {
+            if let Some(symbols) = members_by_container_and_name_h.get(&(name_h, name_hash)) {
+                fallback.extend(symbols.iter().copied());
+            }
+        }
+    }
+    for tt in &res.type_targets {
+        // extend_and_collect_members_for_type: both buffers, qual then (name if !=).
+        if let Some(symbols) = members_by_container_and_name_h.get(&(tt.qual_hash, name_hash)) {
+            for sym in symbols {
+                fallback.push(*sym);
+                exact.push(MemberExactCandidate { target: *sym, provenance: tt.provenance });
+            }
+        }
+        if !tt.qual_eq_name {
+            if let Some(symbols) = members_by_container_and_name_h.get(&(tt.name_hash, name_hash)) {
+                for sym in symbols {
+                    fallback.push(*sym);
+                    exact.push(MemberExactCandidate { target: *sym, provenance: tt.provenance });
+                }
+            }
+        }
+    }
+    for (module_hash, is_star) in &res.import_modules {
+        if let Some(symbols) = symbols_by_file_and_name_h.get(&(*module_hash, name_hash)) {
+            fallback.extend(symbols.iter().copied());
+            if *is_star {
+                for symbol in symbols {
+                    exact.push(MemberExactCandidate { target: *symbol, provenance: "import-namespace" });
+                }
+            }
+        }
+    }
+    if fallback.len() > 1 {
+        fallback.sort_unstable_by_key(sym_ptr);
+        fallback.dedup_by_key(|s| sym_ptr(s));
+    }
+    sort_dedup_member_exact_candidates(exact);
+    if exact.len() != 1 {
+        exact.clear();
+    }
+}
+
+/// B4: all-hash twin of `star_import_candidates_into`. Uses the prebuilt
+/// `star_module_hashes_by_rel` (rel_path_hash → module hashes) + the hash-keyed
+/// `symbols_by_file_and_name_h` so the bare path reads no `RefSite` `&str`.
+fn star_import_candidates_into_cols<'a>(
+    rel_path_hash: u64,
+    name_hash: u64,
+    star_module_hashes_by_rel: &HashMap<u64, Vec<u64>>,
+    symbols_by_file_and_name_h: &HashMap<(u64, u64), Vec<&'a GraphSymbol>>,
+    out: &mut Vec<&'a GraphSymbol>,
+) {
+    out.clear();
+    let Some(module_hashes) = star_module_hashes_by_rel.get(&rel_path_hash) else {
+        return;
+    };
+    for &module_hash in module_hashes {
+        if let Some(symbols) = symbols_by_file_and_name_h.get(&(module_hash, name_hash)) {
+            out.extend(symbols.iter().copied());
+        }
+    }
+    if out.len() > 1 {
+        out.sort_unstable_by_key(sym_ptr);
+        out.dedup_by_key(|s| sym_ptr(s));
+    }
+}
+
 fn compute_receiver_resolution<'a>(
     rel_path: &'a str,
     receiver: &'a str,
@@ -6774,83 +7931,126 @@ fn sort_dedup_member_exact_candidates(candidates: &mut Vec<MemberExactCandidate<
     candidates.dedup_by_key(|c| c.target as *const GraphSymbol as usize);
 }
 
-type PhaseCAccums<'a> = (
-    AHashMap<&'a str, usize>,
-    AHashMap<&'a str, usize>,
-    AHashMap<&'a str, usize>,
-    AHashMap<&'a str, usize>,
+// B5: the four "may" maps are keyed by `name_hash` (u64) instead of the site
+// `&str` name — same proven-safe rekey as W9b/B3a, so phase C reads no string
+// off the 292B `RefSite`. The two site maps store global `ref_sites` indices
+// (u32) instead of `&RefSite`. No field borrows `ref_sites` any more, so the
+// accumulator tuple no longer needs a lifetime.
+type PhaseCAccums = (
+    AHashMap<u64, usize>,
+    AHashMap<u64, usize>,
+    AHashMap<u64, usize>,
+    AHashMap<u64, usize>,
     AHashMap<(u64, u64, u64), usize>,
     AHashMap<(u64, u64, u64), usize>,
     AHashMap<(u64, u64, u64), usize>,
     AHashMap<(u64, u64, u64), usize>,
-    AHashMap<(u64, u64, u64), Vec<&'a RefSite>>,
-    AHashMap<(u64, u64, u64), Vec<&'a RefSite>>,
+    AHashMap<(u64, u64, u64), Vec<u32>>,
+    AHashMap<(u64, u64, u64), Vec<u32>>,
 );
 
-fn phase_c_process_chunk<'a>(
-    chunk: &'a [RefSite],
-    symbols_by_name: &HashMap<&str, Vec<&'a GraphSymbol>>,
-) -> PhaseCAccums<'a> {
-    let mut bare_usage_may: AHashMap<&str, usize> = AHashMap::default();
-    let mut bare_call_may: AHashMap<&str, usize> = AHashMap::default();
-    let mut member_usage_may: AHashMap<&str, usize> = AHashMap::default();
-    let mut member_call_may: AHashMap<&str, usize> = AHashMap::default();
+// B5 (Option B / SoA, phase C → columns): the 38M-site phase-C scan is a full
+// sequential pass over `ref_sites` — the same shape as the phase-E pre-filter
+// that the SoA conversion sped up ~5.8x by reading the 48B `SiteCols` instead
+// of the 292B `RefSite`. This makes phase C read `SiteCols[i]` for every hot
+// per-site field (name_hash / edge_kind_id / access_kind_id / is_definition /
+// rel_path_hash), touching `RefSite` only at file boundaries to hash the scope
+// (first path component) and language strings. `soa_b5` gates the per-site read
+// source for paired A/B measurement; both paths build identical maps.
+fn phase_c_process_chunk(
+    ref_sites: &[RefSite],
+    site_cols: &[SiteCols],
+    start: usize,
+    end: usize,
+    symbol_name_hashes: &AHashSet<u64>,
+    soa_b5: bool,
+) -> PhaseCAccums {
+    let mut bare_usage_may: AHashMap<u64, usize> = AHashMap::default();
+    let mut bare_call_may: AHashMap<u64, usize> = AHashMap::default();
+    let mut member_usage_may: AHashMap<u64, usize> = AHashMap::default();
+    let mut member_call_may: AHashMap<u64, usize> = AHashMap::default();
     let mut bare_usage_likely: AHashMap<(u64, u64, u64), usize> = AHashMap::default();
     let mut bare_call_likely: AHashMap<(u64, u64, u64), usize> = AHashMap::default();
     let mut member_usage_likely: AHashMap<(u64, u64, u64), usize> = AHashMap::default();
     let mut member_call_likely: AHashMap<(u64, u64, u64), usize> = AHashMap::default();
-    let mut bare_likely_sites: AHashMap<(u64, u64, u64), Vec<&RefSite>> = AHashMap::default();
-    let mut member_likely_sites: AHashMap<(u64, u64, u64), Vec<&RefSite>> = AHashMap::default();
-    // W10: micro-cache rel_path → scope_hash and language → lang_hash. ref_sites
-    // arrive grouped by file, so the same (rel_path, language) pair runs for
-    // consecutive sites; the cache hit rate is ~99%. Avoids stable_hash of
-    // source_scope_key and language per site, which was the dominant cost when
-    // building (&str, &str, &str) tuple keys.
-    let mut cached_rel_path: &str = "";
+    let mut bare_likely_sites: AHashMap<(u64, u64, u64), Vec<u32>> = AHashMap::default();
+    let mut member_likely_sites: AHashMap<(u64, u64, u64), Vec<u32>> = AHashMap::default();
+    // W10 micro-cache, B5: boundary detection is now a `rel_path_hash` (u64)
+    // compare from the dense column rather than a per-site string compare. A
+    // file's `language` is constant (one language per file), so the scope and
+    // language hashes are refreshed together on the rel_path boundary — reading
+    // both strings from `ref_sites[i]` only there (file-grouped ⇒ ~once per
+    // file). Keeping the language tied to the rel_path boundary (vs a separate
+    // `language_id` compare) avoids a correctness hazard: distinct unknown
+    // languages share `language_id` 0 but must keep distinct `lang_hash`es to
+    // match the symbol side, and distinct strings here always re-hash.
+    let mut have_file = false;
+    let mut cached_rel_path_hash: u64 = 0;
     let mut cached_scope_hash: u64 = 0;
-    let mut cached_language: &str = "";
     let mut cached_lang_hash: u64 = 0;
-    for site in chunk {
-        if site.access_kind.as_str() == "bare" && symbols_by_name.contains_key(site.name.as_str()) {
-            *bare_usage_may.entry(site.name.as_str()).or_default() += 1;
-            if matches!(site.edge_kind.as_str(), "call" | "construct") {
-                *bare_call_may.entry(site.name.as_str()).or_default() += 1;
+    for i in start..end {
+        // Gated dense read. With `soa_b5` the per-site fields come from the 48B
+        // `SiteCols`; otherwise from the 292B `RefSite`. The values are
+        // identical (SiteCols is a field-for-field copy), so the maps below are
+        // built the same either way — only the cache traffic differs.
+        let (name_hash, edge_kind_id, access_kind_id, is_definition, rel_path_hash) = if soa_b5 {
+            let c = site_cols[i];
+            (
+                c.name_hash,
+                c.edge_kind_id,
+                c.access_kind_id,
+                c.flags & SITE_FLAG_IS_DEFINITION != 0,
+                c.rel_path_hash,
+            )
+        } else {
+            let s = &ref_sites[i];
+            (
+                s.name_hash,
+                s.edge_kind_id,
+                s.access_kind_id,
+                s.is_definition,
+                s.rel_path_hash,
+            )
+        };
+        // W12: precomputed access_kind_id / edge_kind_id replace memcmps.
+        let is_call_or_construct =
+            edge_kind_id == EDGE_KIND_CALL || edge_kind_id == EDGE_KIND_CONSTRUCT;
+        let in_symbols = symbol_name_hashes.contains(&name_hash);
+        if access_kind_id == ACCESS_KIND_BARE && in_symbols {
+            *bare_usage_may.entry(name_hash).or_default() += 1;
+            if is_call_or_construct {
+                *bare_call_may.entry(name_hash).or_default() += 1;
             }
-        } else if site.access_kind.as_str() == "member"
-            && symbols_by_name.contains_key(site.name.as_str())
-        {
-            *member_usage_may.entry(site.name.as_str()).or_default() += 1;
-            if matches!(site.edge_kind.as_str(), "call" | "construct") {
-                *member_call_may.entry(site.name.as_str()).or_default() += 1;
+        } else if access_kind_id == ACCESS_KIND_MEMBER && in_symbols {
+            *member_usage_may.entry(name_hash).or_default() += 1;
+            if is_call_or_construct {
+                *member_call_may.entry(name_hash).or_default() += 1;
             }
         }
-        if site.is_definition {
+        if is_definition {
             continue;
         }
-        let path = site.rel_path.as_str();
-        if path != cached_rel_path {
-            cached_rel_path = path;
-            cached_scope_hash = stable_hash(source_scope_key(path));
+        if !have_file || rel_path_hash != cached_rel_path_hash {
+            have_file = true;
+            cached_rel_path_hash = rel_path_hash;
+            let s = &ref_sites[i];
+            cached_scope_hash = stable_hash(source_scope_key(s.rel_path.as_str()));
+            cached_lang_hash = stable_hash(s.language.as_str());
         }
-        let lang = site.language.as_str();
-        if lang != cached_language {
-            cached_language = lang;
-            cached_lang_hash = stable_hash(lang);
-        }
-        let scope_name = (cached_lang_hash, cached_scope_hash, site.name_hash);
-        if site.access_kind.as_str() == "bare" {
+        let scope_name = (cached_lang_hash, cached_scope_hash, name_hash);
+        if access_kind_id == ACCESS_KIND_BARE {
             *bare_usage_likely.entry(scope_name).or_default() += 1;
-            bare_likely_sites.entry(scope_name).or_default().push(site);
-            if matches!(site.edge_kind.as_str(), "call" | "construct") {
+            bare_likely_sites.entry(scope_name).or_default().push(i as u32);
+            if is_call_or_construct {
                 *bare_call_likely.entry(scope_name).or_default() += 1;
             }
-        } else if site.access_kind.as_str() == "member" {
+        } else if access_kind_id == ACCESS_KIND_MEMBER {
             *member_usage_likely.entry(scope_name).or_default() += 1;
             member_likely_sites
                 .entry(scope_name)
                 .or_default()
-                .push(site);
-            if matches!(site.edge_kind.as_str(), "call" | "construct") {
+                .push(i as u32);
+            if is_call_or_construct {
                 *member_call_likely.entry(scope_name).or_default() += 1;
             }
         }
@@ -6874,17 +8074,18 @@ fn add_resolution_count(
     id_to_string: &mut AHashMap<u64, String>,
     counted_likely: &mut AHashSet<u64>,
     counted_exact: &mut AHashSet<u64>,
-    site: &RefSite,
+    // B4: was `site: &RefSite` (read only for `edge_kind`). Taking the
+    // precomputed enum id lets the column-only worker call this without
+    // touching the 292B struct; `EDGE_KIND_{CALL,CONSTRUCT}` ⟺ the old
+    // `edge_kind == "call" | "construct"` match.
+    edge_kind_id: u8,
     target: &GraphSymbol,
     bound_mask: u8,
     may_already_counted: bool,
     likely: bool,
     edge_key: u64,
 ) {
-    // Phase 3: cache the edge_kind classification once. Old code re-ran
-    // `matches!(site.edge_kind.as_str(), "call" | "construct")` up to 3
-    // times per call (with ~5 calls per site → 15 string matches/site).
-    let is_callish = matches!(site.edge_kind.as_str(), "call" | "construct");
+    let is_callish = edge_kind_id == EDGE_KIND_CALL || edge_kind_id == EDGE_KIND_CONSTRUCT;
     // Phase 3 aggressive: u64 key (target.id_u64) vs the prior String. Skips
     // a per-call string hash + clone on insert. id_to_string maps the u64
     // back to its "sym:HEX16" string for the global merge.
@@ -6921,25 +8122,23 @@ fn apply_token_shape_likely_count_baseline(
     bare_call_by_scope_and_name: &HashMap<(u64, u64, u64), usize>,
     member_usage_by_scope_and_name: &HashMap<(u64, u64, u64), usize>,
     member_call_by_scope_and_name: &HashMap<(u64, u64, u64), usize>,
-    bare_sites_by_scope_and_name: &HashMap<(u64, u64, u64), Vec<&RefSite>>,
-    member_sites_by_scope_and_name: &HashMap<(u64, u64, u64), Vec<&RefSite>>,
+    // B5: phase C now stores global ref_sites indices (u32) rather than
+    // `&RefSite` pointers. Phase F reads `ref_sites[idx]` for the rare push.
+    bare_sites_by_scope_and_name: &HashMap<(u64, u64, u64), Vec<u32>>,
+    member_sites_by_scope_and_name: &HashMap<(u64, u64, u64), Vec<u32>>,
     references: &mut Vec<GraphReference>,
-    // light_in_for_tally: read-only source for the per-target tally (phase E's LightRef output).
-    // light_out: phase F's new LightRef records (separate Vec — lets rebuild_graph_native
-    // write light_in_for_tally to shards concurrently while phase F appends to light_out).
-    light_in_for_tally: &[LightRef],
+    // F1.a: per-target tally built by phase E workers as lights are pushed.
+    // Replaces the previous rescan over `light_in` (14M entries → ~3M unique
+    // targets, single-thread loop). Keyed by GraphSymbol.id_u64.
+    light_target_count_by_id_u64: &AHashMap<u64, usize>,
     light_out: &mut Vec<LightRef>,
     dedup: &mut AHashSet<u64>,
     reference_partials_out: &mut Vec<PathBuf>,
+    // F1.b: when `Some`, phase F also streams LightRef batches into the
+    // channel-driven writer. `light_out` is left empty as drained by the
+    // batch flush inside `push_light_resolved_reference`.
+    light_sender: Option<&crossbeam_channel::Sender<Vec<LightRef>>>,
 ) {
-    let mut reference_counts_by_symbol_id: AHashMap<&str, usize> = AHashMap::default();
-    for light in light_in_for_tally.iter() {
-        if let Some(target_symbol_id) = light.target_symbol_id.as_deref() {
-            *reference_counts_by_symbol_id
-                .entry(target_symbol_id)
-                .or_default() += 1;
-        }
-    }
     let mut bare_symbol_count_by_scope_and_name: AHashMap<(u64, u64, u64), usize> =
         AHashMap::default();
     let mut member_symbol_count_by_scope_and_name: AHashMap<(u64, u64, u64), usize> =
@@ -6974,7 +8173,7 @@ fn apply_token_shape_likely_count_baseline(
     let worker_count = graph_worker_count(symbols_total.max(1));
     let bare_symbol_count_ref = &bare_symbol_count_by_scope_and_name;
     let member_symbol_count_ref = &member_symbol_count_by_scope_and_name;
-    let reference_counts_ref = &reference_counts_by_symbol_id;
+    let reference_counts_ref = light_target_count_by_id_u64;
     let counts_snapshot = &*counts;
     let spill_threshold = std::env::var("ZOEK_RESOLVE_SPILL_REFS")
         .ok()
@@ -7001,7 +8200,6 @@ fn apply_token_shape_likely_count_baseline(
         let mut local_light_refs: Vec<LightRef> = Vec::new();
         let mut local_dedup: AHashSet<u64> = AHashSet::default();
         let mut spill_paths: Vec<PathBuf> = Vec::new();
-        let ref_sites_base = ref_sites.as_ptr();
         // Spill helper: materializes a light batch to GraphReference before
         // writing the existing bincode spill format (keeps downstream spill
         // load unchanged).
@@ -7075,27 +8273,27 @@ fn apply_token_shape_likely_count_baseline(
             count.usage_likely = count.usage_must.max(usage_baseline);
             count.calls_in_likely = count.calls_in_must.max(call_baseline);
             let mut reference_count = reference_counts_ref
-                .get(symbol.id.as_str())
+                .get(&symbol.id_u64)
                 .copied()
                 .unwrap_or(0);
             if reference_count < count.usage_likely {
                 if let Some(sites) = baseline_sites {
                     let fanout = sites.len().saturating_mul(symbol_count_for_key);
                     if fanout <= MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY {
-                        for site in sites {
+                        for &site_idx in sites {
                             if reference_count >= count.usage_likely {
                                 break;
                             }
+                            // B5: phase C stored the global ref_sites index, so
+                            // read the site by index for the rare push — no
+                            // `offset_from` pointer recovery.
+                            let site = &ref_sites[site_idx as usize];
                             let edge_key = edge_key_hash(&site.source_ref_id, &symbol.id, &site.edge_kind);
-                            // SAFETY: `sites` is built from refs into the
-                            // owning `ref_sites` slice; offset_from yields a
-                            // valid u32 index into the same allocation.
-                            let site_idx = unsafe {
-                                ((*site as *const RefSite).offset_from(ref_sites_base)) as u32
-                            };
                             if push_light_resolved_reference(
                                 &mut local_light_refs,
                                 &mut local_dedup,
+                                None,
+                                light_sender,
                                 site_idx,
                                 symbol,
                                 BOUND_MAY,
@@ -7117,6 +8315,15 @@ fn apply_token_shape_likely_count_baseline(
             maybe_spill(&mut local_light_refs, &mut spill_paths)?;
         }
         maybe_spill(&mut local_light_refs, &mut spill_paths)?;
+        // F1.b: drain the F worker's residual light batch into the channel-driven
+        // writer when streaming. local_light_refs is left empty so the
+        // main-thread `light_out.append(local_light_refs)` becomes a no-op.
+        if let Some(s) = light_sender {
+            if !local_light_refs.is_empty() {
+                let batch = std::mem::take(&mut local_light_refs);
+                let _ = s.send(batch);
+            }
+        }
         // Phase 4-Q: skip worker materialization (same reasoning as phase E
         // worker above). `local_light_refs` carries the data; `local_refs`
         // is empty.
@@ -7248,10 +8455,18 @@ fn edge_key_from_partial_u64(site_partial: u64, target_id_u64: u64) -> u64 {
 /// survived `dedup`. Mirrors `push_resolved_reference` but uses the compact
 /// representation. Phase E / F integration uses this once the parallel
 /// LightRef Vec is wired alongside the existing `Vec<GraphReference>`.
+///
+/// F1.b: when `flush_sender` is `Some`, the `refs` buffer is treated as a
+/// rolling batch — once it reaches `LIGHT_BATCH_FLUSH_SIZE` records the buffer
+/// is moved into the channel and replaced with a freshly allocated one. This
+/// lets phase E worker threads stream LightRefs into the channel-driven
+/// writer (Phase 5-A) instead of accumulating a multi-GB Vec per worker.
 #[allow(dead_code)] // Wired in stages with the LightRef refactor.
 fn push_light_resolved_reference(
     refs: &mut Vec<LightRef>,
     dedup: &mut AHashSet<u64>,
+    target_tally: Option<&mut AHashMap<u64, usize>>,
+    flush_sender: Option<&crossbeam_channel::Sender<Vec<LightRef>>>,
     site_idx: u32,
     target: &GraphSymbol,
     bound_mask: u8,
@@ -7269,8 +8484,24 @@ fn push_light_resolved_reference(
         confidence,
         provenance,
     });
+    if let Some(tally) = target_tally {
+        *tally.entry(target.id_u64).or_default() += 1;
+    }
+    if let Some(s) = flush_sender {
+        if refs.len() >= LIGHT_BATCH_FLUSH_SIZE {
+            let batch = std::mem::replace(refs, Vec::with_capacity(LIGHT_BATCH_FLUSH_SIZE));
+            let _ = s.send(batch);
+        }
+    }
     true
 }
+
+/// F1.b: number of `LightRef` records a phase E/F worker accumulates before
+/// flushing the batch to the channel-driven writer. ~4K × 24B = ~96KB per
+/// batch — small enough to keep the channel queue (bounded 64 batches) well
+/// under 10MB total, large enough to keep send/recv overhead negligible
+/// (3.5K send calls instead of 14M per-record sends).
+const LIGHT_BATCH_FLUSH_SIZE: usize = 4096;
 
 /// Convert a confidence string literal to `LightConfidence`. Used at the
 /// push call sites while the legacy `&str` API coexists with `LightRef`.
@@ -7360,11 +8591,14 @@ fn materialize_light_ref(light: &LightRef, ref_sites: &[RefSite]) -> GraphRefere
     GraphReference {
         source_ref_id: site.source_ref_id.as_str().into(),
         target_symbol_id: light.target_symbol_id.clone(),
-        edge_kind: site.edge_kind.as_str().into(),
+        edge_kind: (&*site.edge_kind).into(),
         name: site.name.as_str().into(),
         raw_text: site.raw_text.as_str().into(),
-        uri: site.uri.as_str().into(),
-        rel_path: site.rel_path.as_str().into(),
+        // P1: RefSite no longer carries `uri` (dead). GraphReference.uri is
+        // lazily filled from rel_path at write time (see file_uri fixup), so an
+        // empty value here is the existing contract.
+        uri: Box::from(""),
+        rel_path: (&*site.rel_path).into(),
         start_line: site.start_line,
         start_column: site.start_column,
         end_line: site.end_line,
@@ -7392,11 +8626,11 @@ fn push_resolved_reference(
     references.push(GraphReference {
         source_ref_id: site.source_ref_id.as_str().into(),
         target_symbol_id: Some(target.id.as_str().into()),
-        edge_kind: site.edge_kind.as_str().into(),
+        edge_kind: (&*site.edge_kind).into(),
         name: site.name.as_str().into(),
         raw_text: site.raw_text.as_str().into(),
-        uri: site.uri.as_str().into(),
-        rel_path: site.rel_path.as_str().into(),
+        uri: Box::from(""),
+        rel_path: (&*site.rel_path).into(),
         start_line: site.start_line,
         start_column: site.start_column,
         end_line: site.end_line,
@@ -7532,6 +8766,9 @@ fn write_store(
     // (c) cleared the layout's prior shard families. write_store will skip
     // those steps to enable parallel execution with stream_*_to_sidecars.
     precomputed_file_table: Option<&FileTable>,
+    // W23: ref_site shards already written (overlapped with resolve). Forwarded
+    // to write_graph_shards to skip the 38M-record ref_site write here.
+    skip_ref_sites: bool,
 ) -> io::Result<GraphIndexSummary> {
     let layout_root = config.index_root(workspace_root);
     fs::create_dir_all(&layout_root)?;
@@ -7592,6 +8829,7 @@ fn write_store(
         &file_table,
         incremental,
         references_streamed,
+        skip_ref_sites,
     )?;
 
     let indexed_at_unix_secs = unix_secs_now();
@@ -7920,19 +9158,23 @@ fn append_lights_to_both_shards(
     target_shards: &mut [GraphShardWriter],
     enclosing_shards: &mut [GraphShardWriter],
     file_table: &FileTable,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     use rayon::prelude::*;
     let n_target = target_shards.len();
     let n_encl = enclosing_shards.len();
     if lights.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     // Stage 1 — parallel per-chunk serialize into per-shard byte buffers.
     // Each chunk worker emits two Vec<Vec<u8>> (one per side, length =
     // shard count). Single serialize per ref; bytes dispatched to whichever
     // sides apply. With 32 chunks × 128 shards × ~10KB per shard slot the
     // intermediate buffers stay well under 100MB total.
-    let worker_count = graph_worker_count(lights.len()).max(1);
+    // Chunk count tracks the *current* rayon pool (global ≈ 128, or the
+    // dedicated writer pool when called from write_lights_from_channel) so a
+    // small writer pool does not balloon per_chunk into thousands of empty
+    // per-shard Vecs.
+    let worker_count = rayon::current_num_threads().max(1);
     let chunks_per_worker = 8usize;
     let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
     let chunk_size = lights.len().div_ceil(target_chunks).max(1);
@@ -7944,7 +9186,7 @@ fn append_lights_to_both_shards(
         })
         .take_while(|(start, _)| *start < lights.len())
         .collect();
-    let per_chunk: Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)> = ranges
+    let per_chunk: Vec<(usize, Vec<Vec<u8>>, Vec<Vec<u8>>)> = ranges
         .into_par_iter()
         .map(|(start, end)| {
             let mut tgt_bufs: Vec<Vec<u8>> = (0..n_target).map(|_| Vec::new()).collect();
@@ -7952,10 +9194,13 @@ fn append_lights_to_both_shards(
             let mut scratch: Vec<u8> = Vec::with_capacity(200);
             let mut cached_path: &str = "";
             let mut cached_id: u32 = u32::MAX;
+            let mut emitted: usize = 0;
             for light in &lights[start..end] {
                 let site = &ref_sites[light.site_idx as usize];
                 let target_id = light.target_symbol_id.as_deref();
-                let enclosing_id = if matches!(&*site.edge_kind, "call" | "construct") {
+                let enclosing_id = if site.edge_kind_id == EDGE_KIND_CALL
+                    || site.edge_kind_id == EDGE_KIND_CONSTRUCT
+                {
                     site.enclosing_symbol_id.as_deref()
                 } else {
                     None
@@ -7982,8 +9227,9 @@ fn append_lights_to_both_shards(
                     let s = shard_index_for_key(e);
                     enc_bufs[s].extend_from_slice(&scratch);
                 }
+                emitted += 1;
             }
-            (tgt_bufs, enc_bufs)
+            (emitted, tgt_bufs, enc_bufs)
         })
         .collect();
     // Stage 2 — per-shard parallel merge into the actual writer slices.
@@ -7995,8 +9241,8 @@ fn append_lights_to_both_shards(
         .enumerate()
         .try_for_each(|(shard, w)| -> io::Result<()> {
             for c in per_chunk_ref {
-                if !c.0[shard].is_empty() {
-                    w.writer.write_all(&c.0[shard])?;
+                if !c.1[shard].is_empty() {
+                    w.writer.write_all(&c.1[shard])?;
                 }
             }
             Ok(())
@@ -8006,13 +9252,14 @@ fn append_lights_to_both_shards(
         .enumerate()
         .try_for_each(|(shard, w)| -> io::Result<()> {
             for c in per_chunk_ref {
-                if !c.1[shard].is_empty() {
-                    w.writer.write_all(&c.1[shard])?;
+                if !c.2[shard].is_empty() {
+                    w.writer.write_all(&c.2[shard])?;
                 }
             }
             Ok(())
         })?;
-    Ok(())
+    let emitted: usize = per_chunk_ref.iter().map(|c| c.0).sum();
+    Ok(emitted)
 }
 
 /// Foundation for the channel-driven write pipeline (Option 1 / Phase 5-A).
@@ -8024,52 +9271,92 @@ fn append_lights_to_both_shards(
 /// Borrows the shard writer slices mutably (caller owns them in its scope).
 /// Returns total records emitted on each side; both halves of the channel
 /// must be drained before `finish_graph_shard_writers` runs on the writers.
-#[allow(dead_code)] // Wired in by Phase 5-B (rebuild_graph_native pipeline).
 fn write_lights_from_channel(
-    rx: crossbeam_channel::Receiver<LightRef>,
+    rx: crossbeam_channel::Receiver<Vec<LightRef>>,
     ref_sites: &[RefSite],
     file_table: &FileTable,
     target_shards: &mut [GraphShardWriter],
     enclosing_shards: &mut [GraphShardWriter],
 ) -> io::Result<usize> {
-    let mut total: usize = 0;
-    let mut scratch: Vec<u8> = Vec::with_capacity(200);
-    let mut cached_path: &str = "";
-    let mut cached_id: u32 = u32::MAX;
-    while let Ok(light) = rx.recv() {
-        let site = &ref_sites[light.site_idx as usize];
-        let path = site.rel_path.as_str();
-        let id = if path == cached_path {
-            cached_id
-        } else {
-            let new_id = file_table.get_id(path).unwrap_or(u32::MAX);
-            cached_path = path;
-            cached_id = new_id;
-            new_id
-        };
-        // Serialize once for whichever sides this ref appears on.
-        let target_id = light.target_symbol_id.as_deref();
-        let enclosing_id = if matches!(&*site.edge_kind, "call" | "construct") {
-            site.enclosing_symbol_id.as_deref()
-        } else {
-            None
-        };
-        if target_id.is_none() && enclosing_id.is_none() {
-            continue;
+    // F1.b (W1+W2) — decoupled recv/flush writer.
+    //
+    // History: the single-thread per-record writer was deadlock-immune but
+    // capped at ~750K rec/s, too slow to overlap resolve. W1 flushed via a
+    // dedicated rayon pool (par_iter on threads independent of the saturated,
+    // partly-blocked global pool, so no nested-spawn starvation) — but recv and
+    // flush ran on the *same* thread: while a flush ran, recv stopped, the
+    // channel filled, and phase F workers (~1.5M rec/s) stalled on `send`,
+    // ballooning phase_f wall 6s -> 14s.
+    //
+    // W2 splits the roles. This thread only drains the channel into a buffer
+    // and hands full buffers to a flush thread over a small bounded queue. The
+    // flush thread owns the shard writers + the dedicated rayon pool and runs
+    // append_lights_to_both_shards. recv never blocks on a flush, so the
+    // channel stays drained and phase E *and* phase F can stream without
+    // backpressure while the flush thread writes in parallel.
+    let writer_threads = std::env::var("ZOEK_LIGHT_WRITER_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+                .clamp(2, 8)
+        });
+    let flush_threshold: usize = std::env::var("ZOEK_LIGHT_WRITER_FLUSH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(512 * 1024);
+    // Small queue: a couple of full buffers in flight is enough to keep the
+    // flush thread busy without letting unbounded buffers pile up in memory.
+    let (flush_tx, flush_rx) = crossbeam_channel::bounded::<Vec<LightRef>>(3);
+    std::thread::scope(|s| -> io::Result<usize> {
+        let flush_handle = s.spawn(move || -> io::Result<usize> {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(writer_threads)
+                .thread_name(|i| format!("light-writer-{i}"))
+                .build()
+                .map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("writer pool: {e}"))
+                })?;
+            let mut total: usize = 0;
+            while let Ok(buf) = flush_rx.recv() {
+                let buf: Vec<LightRef> = buf;
+                total += pool.install(|| {
+                    append_lights_to_both_shards(
+                        &buf,
+                        ref_sites,
+                        target_shards,
+                        enclosing_shards,
+                        file_table,
+                    )
+                })?;
+            }
+            Ok(total)
+        });
+        // recv loop: only drain the channel, never block on a flush.
+        let mut buffer: Vec<LightRef> =
+            Vec::with_capacity(flush_threshold + LIGHT_BATCH_FLUSH_SIZE);
+        while let Ok(batch) = rx.recv() {
+            buffer.extend(batch);
+            if buffer.len() >= flush_threshold {
+                let full = std::mem::replace(
+                    &mut buffer,
+                    Vec::with_capacity(flush_threshold + LIGHT_BATCH_FLUSH_SIZE),
+                );
+                if flush_tx.send(full).is_err() {
+                    break;
+                }
+            }
         }
-        scratch.clear();
-        serialize_reference_binary_from_light(&light, site, id, &mut scratch);
-        if let Some(t) = target_id {
-            let shard = shard_index_for_key(t);
-            target_shards[shard].writer.write_all(&scratch)?;
+        if !buffer.is_empty() {
+            let _ = flush_tx.send(buffer);
         }
-        if let Some(e) = enclosing_id {
-            let shard = shard_index_for_key(e);
-            enclosing_shards[shard].writer.write_all(&scratch)?;
-        }
-        total += 1;
-    }
-    Ok(total)
+        drop(flush_tx);
+        flush_handle.join().expect("F1.b flush thread panicked")
+    })
 }
 
 /// `LightRef`-aware streaming sidecar writer. Reads spilled partials (each
@@ -8204,6 +9491,11 @@ fn write_graph_shards(
     file_table: &FileTable,
     incremental: Option<&HashSet<String>>,
     references_streamed: bool,
+    // W23: when true, the ref_site shards were already written (overlapped with
+    // resolve on a dedicated pool — default; opt out via `ZOEK_OVERLAP_STATIC_OFF`), so skip
+    // re-writing them here. The 38M-record ref_site write is the dominant index
+    // cost; overlapping it hides it behind the resolve phase.
+    skip_ref_sites: bool,
 ) -> io::Result<u64> {
     let probe = std::env::var("ZOEK_WRITE_PROBE").is_ok();
     let t0 = std::time::Instant::now();
@@ -8246,7 +9538,11 @@ fn write_graph_shards(
         });
         let ref_sites_h = s.spawn(move || {
             let t = std::time::Instant::now();
-            let r = write_ref_sites_by_file_shards(workspace_root, config, ref_sites, file_table, incremental);
+            let r: io::Result<u64> = if skip_ref_sites {
+                Ok(0)
+            } else {
+                write_ref_sites_by_file_shards(workspace_root, config, ref_sites, file_table, incremental)
+            };
             (t.elapsed(), r)
         });
         let facts_h = s.spawn(move || {
@@ -9068,30 +10364,108 @@ fn serialize_function_return_fact_row(fact: &FunctionReturnFact) -> String {
 }
 
 fn serialize_reference_binary(reference: &GraphReference, file_id: u32, out: &mut Vec<u8>) {
-    write_u16_str(out, &reference.source_ref_id);
-    if let Some(t) = reference.target_symbol_id.as_deref() {
-        out.push(1);
-        write_u16_str(out, t);
+    serialize_reference_record(
+        &reference.source_ref_id,
+        reference.target_symbol_id.as_deref(),
+        &reference.edge_kind,
+        &reference.name,
+        &reference.raw_text,
+        file_id,
+        reference.start_line,
+        reference.start_column,
+        reference.end_line,
+        reference.end_column,
+        reference.enclosing_symbol_id.as_deref(),
+        reference.bound_mask,
+        &reference.confidence,
+        &reference.provenance,
+        out,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn serialize_reference_record(
+    source_ref_id: &str,
+    target_symbol_id: Option<&str>,
+    edge_kind: &str,
+    name: &str,
+    raw_text: &str,
+    file_id: u32,
+    start_line: u32,
+    start_column: u32,
+    end_line: u32,
+    end_column: u32,
+    enclosing_symbol_id: Option<&str>,
+    bound_mask: u8,
+    confidence: &str,
+    provenance: &str,
+    out: &mut Vec<u8>,
+) {
+    // source_ref_id: u64 if "ref:HEX16"; u64::MAX sentinel = inline str.
+    if let Some(u) = parse_stable_ref_id_to_u64(source_ref_id) {
+        out.extend_from_slice(&u.to_le_bytes());
     } else {
-        out.push(0);
+        out.extend_from_slice(&u64::MAX.to_le_bytes());
+        write_u16_str(out, source_ref_id);
     }
-    write_u16_str(out, &reference.edge_kind);
-    write_u16_str(out, &reference.name);
-    write_u16_str(out, &reference.raw_text);
+    // target_symbol_id: 0=none, 1=u64 follows, 2=inline str follows.
+    match target_symbol_id {
+        None => out.push(0),
+        Some(t) => {
+            if let Some(u) = parse_stable_symbol_id_to_u64(t) {
+                out.push(1);
+                out.extend_from_slice(&u.to_le_bytes());
+            } else {
+                out.push(2);
+                write_u16_str(out, t);
+            }
+        }
+    }
+    // edge_kind: u8 enum id; 255=inline str follows.
+    let edge_id = compute_edge_kind_id(edge_kind);
+    out.push(edge_id);
+    if edge_id == EDGE_KIND_OTHER {
+        write_u16_str(out, edge_kind);
+    }
+    write_u16_str(out, name);
+    // raw_text: most refs have raw_text == name; marker byte avoids a
+    // duplicate string for the common case.
+    if raw_text == name {
+        out.push(0);
+    } else {
+        out.push(1);
+        write_u16_str(out, raw_text);
+    }
     out.extend_from_slice(&file_id.to_le_bytes());
-    out.extend_from_slice(&reference.start_line.to_le_bytes());
-    out.extend_from_slice(&reference.start_column.to_le_bytes());
-    out.extend_from_slice(&reference.end_line.to_le_bytes());
-    out.extend_from_slice(&reference.end_column.to_le_bytes());
-    if let Some(e) = reference.enclosing_symbol_id.as_deref() {
-        out.push(1);
-        write_u16_str(out, e);
-    } else {
-        out.push(0);
+    out.extend_from_slice(&start_line.to_le_bytes());
+    out.extend_from_slice(&start_column.to_le_bytes());
+    out.extend_from_slice(&end_line.to_le_bytes());
+    out.extend_from_slice(&end_column.to_le_bytes());
+    // enclosing_symbol_id: 0=none, 1=u64 follows, 2=inline str follows.
+    match enclosing_symbol_id {
+        None => out.push(0),
+        Some(e) => {
+            if let Some(u) = parse_stable_symbol_id_to_u64(e) {
+                out.push(1);
+                out.extend_from_slice(&u.to_le_bytes());
+            } else {
+                out.push(2);
+                write_u16_str(out, e);
+            }
+        }
     }
-    out.push(reference.bound_mask);
-    write_u16_str(out, &reference.confidence);
-    write_u16_str(out, &reference.provenance);
+    out.push(bound_mask);
+    let conf_id = compute_confidence_id(confidence);
+    out.push(conf_id);
+    if conf_id == CONFIDENCE_OTHER {
+        write_u16_str(out, confidence);
+    }
+    let prov_id = compute_provenance_id(provenance);
+    out.push(prov_id);
+    if prov_id == PROVENANCE_OTHER {
+        write_u16_str(out, provenance);
+    }
 }
 
 /// Direct-from-LightRef binary serialization. Writes site-derived fields
@@ -9107,30 +10481,23 @@ fn serialize_reference_binary_from_light(
     file_id: u32,
     out: &mut Vec<u8>,
 ) {
-    write_u16_str(out, &site.source_ref_id);
-    if let Some(t) = light.target_symbol_id.as_deref() {
-        out.push(1);
-        write_u16_str(out, t);
-    } else {
-        out.push(0);
-    }
-    write_u16_str(out, &site.edge_kind);
-    write_u16_str(out, &site.name);
-    write_u16_str(out, &site.raw_text);
-    out.extend_from_slice(&file_id.to_le_bytes());
-    out.extend_from_slice(&site.start_line.to_le_bytes());
-    out.extend_from_slice(&site.start_column.to_le_bytes());
-    out.extend_from_slice(&site.end_line.to_le_bytes());
-    out.extend_from_slice(&site.end_column.to_le_bytes());
-    if let Some(e) = site.enclosing_symbol_id.as_deref() {
-        out.push(1);
-        write_u16_str(out, e);
-    } else {
-        out.push(0);
-    }
-    out.push(light.bound_mask);
-    write_u16_str(out, light.confidence.as_str());
-    write_u16_str(out, light.provenance.as_str());
+    serialize_reference_record(
+        &site.source_ref_id,
+        light.target_symbol_id.as_deref(),
+        &site.edge_kind,
+        &site.name,
+        &site.raw_text,
+        file_id,
+        site.start_line,
+        site.start_column,
+        site.end_line,
+        site.end_column,
+        site.enclosing_symbol_id.as_deref(),
+        light.bound_mask,
+        light.confidence.as_str(),
+        light.provenance.as_str(),
+        out,
+    );
 }
 
 fn write_u16_str(out: &mut Vec<u8>, s: &str) {
@@ -9616,12 +10983,14 @@ fn serialize_ref_site_binary(site: &RefSite, file_id: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&site.start_column.to_le_bytes());
     out.extend_from_slice(&site.end_line.to_le_bytes());
     out.extend_from_slice(&site.end_column.to_le_bytes());
-    let edge_id = compute_edge_kind_id(&site.edge_kind);
+    // W12: precomputed edge_kind_id / access_kind_id on RefSite — write side
+    // skips the string match on every record.
+    let edge_id = site.edge_kind_id;
     out.push(edge_id);
     if edge_id == EDGE_KIND_OTHER {
         write_u16_str(out, &site.edge_kind);
     }
-    let access_id = compute_access_kind_id(&site.access_kind);
+    let access_id = site.access_kind_id;
     out.push(access_id);
     if access_id == ACCESS_KIND_OTHER {
         write_u16_str(out, &site.access_kind);
@@ -9753,19 +11122,22 @@ fn parse_ref_site_binary(
     let name_hash = stable_hash(&name);
     let receiver_name_hash = receiver_name.as_deref().map(stable_hash).unwrap_or(0);
     let enclosing_symbol_id_hash = enclosing_symbol_id.as_deref().map(stable_hash).unwrap_or(0);
+    let access_kind_id = compute_access_kind_id(&access_kind);
+    let edge_kind_id = compute_edge_kind_id(&edge_kind);
     Ok(RefSite {
         source_ref_id,
         name,
         raw_text,
-        uri: String::new(),
-        rel_path,
-        language,
+        // P1: struct fields are now `Arc<str>` (From<String> allocates once here,
+        // on the cold read path — fine; the hot parse path shares per-file Arcs).
+        rel_path: rel_path.into(),
+        language: language.into(),
         start_line,
         start_column,
         end_line,
         end_column,
-        edge_kind,
-        access_kind,
+        edge_kind: edge_kind.into(),
+        access_kind: access_kind.into(),
         is_definition,
         is_import_context,
         receiver_name,
@@ -9774,6 +11146,8 @@ fn parse_ref_site_binary(
         name_hash,
         receiver_name_hash,
         enclosing_symbol_id_hash,
+        access_kind_id,
+        edge_kind_id,
     })
 }
 
@@ -9782,20 +11156,62 @@ fn parse_reference_binary(
     cursor: &mut usize,
     file_table: &FileTable,
 ) -> io::Result<GraphReference> {
-    let source_ref_id = read_u16_str(bytes, cursor)?;
-    if *cursor >= bytes.len() {
-        return Err(invalid_data("binary record truncated (target marker)"));
+    // source_ref_id: u64 (u64::MAX sentinel = inline str follows).
+    if *cursor + 8 > bytes.len() {
+        return Err(invalid_data("reference truncated (source_ref_id u64)"));
     }
-    let target_present = bytes[*cursor];
-    *cursor += 1;
-    let target_symbol_id = if target_present == 1 {
-        Some(read_u16_str(bytes, cursor)?)
+    let u = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
+    *cursor += 8;
+    let source_ref_id = if u == u64::MAX {
+        read_u16_str(bytes, cursor)?
     } else {
-        None
+        format!("ref:{:016x}", u)
     };
-    let edge_kind = read_u16_str(bytes, cursor)?;
+    // target_symbol_id: 0=none, 1=u64, 2=inline.
+    if *cursor >= bytes.len() {
+        return Err(invalid_data("reference truncated (target marker)"));
+    }
+    let target_kind = bytes[*cursor];
+    *cursor += 1;
+    let target_symbol_id = match target_kind {
+        0 => None,
+        1 => {
+            if *cursor + 8 > bytes.len() {
+                return Err(invalid_data("reference truncated (target u64)"));
+            }
+            let u = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
+            *cursor += 8;
+            Some(format!("sym:{:016x}", u))
+        }
+        2 => Some(read_u16_str(bytes, cursor)?),
+        other => {
+            return Err(invalid_data(format!(
+                "reference invalid target_kind {other}"
+            )))
+        }
+    };
+    // edge_kind: u8 id (255=inline).
+    if *cursor >= bytes.len() {
+        return Err(invalid_data("reference truncated (edge_id)"));
+    }
+    let edge_id = bytes[*cursor];
+    *cursor += 1;
+    let edge_kind = match edge_kind_str_from_id(edge_id) {
+        Some(s) => s.to_string(),
+        None => read_u16_str(bytes, cursor)?,
+    };
     let name = read_u16_str(bytes, cursor)?;
-    let raw_text = read_u16_str(bytes, cursor)?;
+    // raw_text marker: 0=same as name, 1=inline.
+    if *cursor >= bytes.len() {
+        return Err(invalid_data("reference truncated (raw_text marker)"));
+    }
+    let raw_text_marker = bytes[*cursor];
+    *cursor += 1;
+    let raw_text = if raw_text_marker == 0 {
+        name.clone()
+    } else {
+        read_u16_str(bytes, cursor)?
+    };
     let file_id = read_u32_le(bytes, cursor)?;
     let rel_path = file_table
         .get_path(file_id)
@@ -9805,23 +11221,54 @@ fn parse_reference_binary(
     let start_column = read_u32_le(bytes, cursor)?;
     let end_line = read_u32_le(bytes, cursor)?;
     let end_column = read_u32_le(bytes, cursor)?;
+    // enclosing_symbol_id: 0=none, 1=u64, 2=inline.
     if *cursor >= bytes.len() {
-        return Err(invalid_data("binary record truncated (enclosing marker)"));
+        return Err(invalid_data("reference truncated (enclosing marker)"));
     }
-    let enclosing_present = bytes[*cursor];
+    let enclosing_kind = bytes[*cursor];
     *cursor += 1;
-    let enclosing_symbol_id = if enclosing_present == 1 {
-        Some(read_u16_str(bytes, cursor)?)
-    } else {
-        None
+    let enclosing_symbol_id = match enclosing_kind {
+        0 => None,
+        1 => {
+            if *cursor + 8 > bytes.len() {
+                return Err(invalid_data("reference truncated (enclosing u64)"));
+            }
+            let u = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
+            *cursor += 8;
+            Some(format!("sym:{:016x}", u))
+        }
+        2 => Some(read_u16_str(bytes, cursor)?),
+        other => {
+            return Err(invalid_data(format!(
+                "reference invalid enclosing_kind {other}"
+            )))
+        }
     };
     if *cursor >= bytes.len() {
-        return Err(invalid_data("binary record truncated (bound_mask)"));
+        return Err(invalid_data("reference truncated (bound_mask)"));
     }
     let bound_mask = bytes[*cursor];
     *cursor += 1;
-    let confidence = read_u16_str(bytes, cursor)?;
-    let provenance = read_u16_str(bytes, cursor)?;
+    // confidence: u8 id (255=inline).
+    if *cursor >= bytes.len() {
+        return Err(invalid_data("reference truncated (confidence_id)"));
+    }
+    let conf_id = bytes[*cursor];
+    *cursor += 1;
+    let confidence = match confidence_str_from_id(conf_id) {
+        Some(s) => s.to_string(),
+        None => read_u16_str(bytes, cursor)?,
+    };
+    // provenance: u8 id (255=inline).
+    if *cursor >= bytes.len() {
+        return Err(invalid_data("reference truncated (provenance_id)"));
+    }
+    let prov_id = bytes[*cursor];
+    *cursor += 1;
+    let provenance = match provenance_str_from_id(prov_id) {
+        Some(s) => s.to_string(),
+        None => read_u16_str(bytes, cursor)?,
+    };
     Ok(GraphReference {
         source_ref_id: source_ref_id.into(),
         target_symbol_id: target_symbol_id.map(Into::into),
@@ -10945,7 +12392,26 @@ fn leading_qualified_identifier(value: &str) -> Option<String> {
     }
 }
 
-fn sanitize_code_line(line: &str, language: &str) -> String {
+fn sanitize_code_line<'a>(line: &'a str, language: &str) -> Cow<'a, str> {
+    // P2 (parse alloc reduction): the sanitizer rebuilds the line char-by-char
+    // only to blank out string/comment spans. A line with no quote/comment
+    // trigger sanitizes to itself, so borrow it instead of allocating a copy —
+    // the common case in code (`def f(x):`, `import os`, `a = b + c`). This is
+    // the #2 parse leaf (`sanitize_code_line`, called per line by type_facts &
+    // the non-python ref-site path). Output is byte-identical to the owned path.
+    let is_python = language == "python";
+    // Triggers must be a SUPERSET of what the owned scan below acts on, or the
+    // borrow path would diverge. The owned scan blanks quote spans (`"` `'` `` ` ``),
+    // breaks on a python `#` comment, AND breaks on `//` for ANY language (the
+    // `//` check is not language-gated). So `/` is a trigger for every language
+    // — missing that made python `a // b` borrow the whole line while the owned
+    // path truncated at `//` (caught by a 119KB index-size diff at equal counts).
+    let needs_work = line.as_bytes().iter().any(|&b| {
+        b == b'"' || b == b'\'' || b == b'`' || b == b'/' || (is_python && b == b'#')
+    });
+    if !needs_work {
+        return Cow::Borrowed(line);
+    }
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     let mut quote: Option<char> = None;
@@ -10977,14 +12443,14 @@ fn sanitize_code_line(line: &str, language: &str) -> String {
         }
         out.push(ch);
     }
-    out
+    Cow::Owned(out)
 }
 
-fn sanitize_ref_site_code_line(
-    line: &str,
+fn sanitize_ref_site_code_line<'a>(
+    line: &'a str,
     language: &str,
     python_multiline_string_quote: &mut Option<char>,
-) -> String {
+) -> Cow<'a, str> {
     if language == "python" {
         sanitize_python_ref_site_code_line(line, python_multiline_string_quote)
     } else {
@@ -10992,10 +12458,21 @@ fn sanitize_ref_site_code_line(
     }
 }
 
-fn sanitize_python_ref_site_code_line(
-    line: &str,
+fn sanitize_python_ref_site_code_line<'a>(
+    line: &'a str,
     multiline_string_quote: &mut Option<char>,
-) -> String {
+) -> Cow<'a, str> {
+    // P2: when not inside a triple-quoted string and the line has no quote or
+    // `#`, no literal can start and no comment can begin → it sanitizes to
+    // itself; borrow it (state stays None). Otherwise build the owned copy.
+    if multiline_string_quote.is_none()
+        && !line
+            .as_bytes()
+            .iter()
+            .any(|&b| b == b'"' || b == b'\'' || b == b'#')
+    {
+        return Cow::Borrowed(line);
+    }
     let mut out = String::with_capacity(line.len());
     let mut idx = 0usize;
     while idx < line.len() {
@@ -11040,7 +12517,7 @@ fn sanitize_python_ref_site_code_line(
         out.push(ch);
         idx += ch.len_utf8();
     }
-    out
+    Cow::Owned(out)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -11521,11 +12998,11 @@ pub(crate) fn is_member_fallback_sym(s: &GraphSymbol) -> bool {
 }
 
 fn unique_symbol_by_language_and_name<'a>(
-    symbols_by_name: &HashMap<(u16, &'a str), Vec<&'a GraphSymbol>>,
+    symbols_by_name: &HashMap<(u16, u64), Vec<&'a GraphSymbol>>,
     language_id: u16,
-    name: &str,
+    name_hash: u64,
 ) -> Option<&'a GraphSymbol> {
-    let symbols = symbols_by_name.get(&(language_id, name))?;
+    let symbols = symbols_by_name.get(&(language_id, name_hash))?;
     if symbols.len() == 1 {
         symbols.first().copied()
     } else {
