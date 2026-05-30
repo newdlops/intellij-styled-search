@@ -731,7 +731,18 @@ struct RefSite {
     is_definition: bool,
     is_import_context: bool,
     receiver_name: Option<String>,
-    enclosing_symbol_id: Option<String>,
+    /// B6 stage-3: the u64 of the enclosing scope's "sym:HEX16" symbol id
+    /// (`parse_stable_symbol_id_to_u64`; 0 = no enclosing scope). The prior
+    /// `Option<String>` was redundant — the enclosing is always a standard
+    /// symbol id at parse, so we keep the u64 and rebuild the string only on the
+    /// cold materialize/serialize paths (`enclosing_id_to_string`). It also
+    /// replaces the old `enclosing_symbol_id_hash` as the receiver-cache key
+    /// component — a bijective relabel (both are deterministic fns of the same
+    /// string, so distinct enclosings still map to distinct keys). Unlike the
+    /// other precomputed hashes this is NOT `#[serde(skip)]`: once the string is
+    /// gone it cannot be rederived after a spill round-trip, so it is serialized
+    /// directly and the load FIXUP no longer recomputes it.
+    enclosing_id: u64,
     /// W2: precomputed FNV-1a hash of rel_path. See GraphSymbol::rel_path_hash.
     #[serde(skip, default)]
     rel_path_hash: u64,
@@ -743,10 +754,6 @@ struct RefSite {
     /// u64-triple hash + compare instead of 3 string hashes + memcmps.
     #[serde(skip, default)]
     receiver_name_hash: u64,
-    /// W9a: precomputed FNV-1a hash of enclosing_symbol_id (0 if None).
-    /// Same purpose as receiver_name_hash.
-    #[serde(skip, default)]
-    enclosing_symbol_id_hash: u64,
     /// W12: precomputed access_kind enum id (ACCESS_KIND_BARE / MEMBER /
     /// OTHER). Replaces `access_kind == "member"` / `== "bare"` memcmps in
     /// phase_e_prefilter (31M sites) + phase E loop (16M sites) + phase C
@@ -776,9 +783,20 @@ struct RefSite {
 /// outlive the phase-A scratch maps and feed every later phase. `hashes[id]`
 /// carries the precomputed `stable_hash(name)`, letting the eventual SoA
 /// columns drop the per-site `name_hash`/`receiver_name_hash` re-derivation.
+///
+/// B6 stage-4: a reverse `names: Vec<Box<str>>` (id -> &str) is added so the
+/// cold reconstruction paths (the 14M write `serialize_reference_binary_from_light`,
+/// `materialize_light_ref`/`push_resolved_reference`, and the per-file
+/// receiver cache-miss) can rebuild the `name`/`receiver_name` strings from a
+/// per-site `u32` id once the `Vec<RefSite>` is dropped (stage-5). The reverse
+/// entry is a second `Box<str>` (the forward `ids` map keeps its own key for a
+/// collision-free string lookup); the duplication is ~27MB over ~0.6–0.9M
+/// unique names — negligible next to the ~7.6GB `Vec<RefSite>` this enables
+/// dropping.
 struct NameInterner {
     ids: AHashMap<Box<str>, u32>,
     hashes: Vec<u64>,
+    names: Vec<Box<str>>,
 }
 
 impl NameInterner {
@@ -788,6 +806,7 @@ impl NameInterner {
         NameInterner {
             ids: AHashMap::with_capacity(cap),
             hashes: Vec::with_capacity(cap),
+            names: Vec::with_capacity(cap),
         }
     }
 
@@ -798,7 +817,9 @@ impl NameInterner {
             return id;
         }
         let id = self.hashes.len() as u32;
-        self.ids.insert(name.into(), id);
+        let boxed: Box<str> = name.into();
+        self.names.push(boxed.clone());
+        self.ids.insert(boxed, id);
         self.hashes.push(name_hash);
         id
     }
@@ -807,6 +828,13 @@ impl NameInterner {
     #[inline]
     fn get(&self, name: &str) -> u32 {
         self.ids.get(name).copied().unwrap_or(Self::MISS)
+    }
+
+    /// Reverse lookup: the interned string for `id` (B6 stage-4 cold
+    /// reconstruction). `None` for `MISS` / any out-of-range id.
+    #[inline]
+    fn name(&self, id: u32) -> Option<&str> {
+        self.names.get(id as usize).map(|s| &**s)
     }
 
     fn len(&self) -> usize {
@@ -831,10 +859,11 @@ struct SiteCols {
     name_hash: u64,
     rel_path_hash: u64,
     receiver_name_hash: u64,
-    /// W18 / Option B step B4: enclosing-symbol-id hash. The member receiver
-    /// cache key is `(receiver_name_hash, enclosing_symbol_id_hash)`; having it
-    /// here lets the worker build that key without reading the `RefSite`.
-    enclosing_symbol_id_hash: u64,
+    /// W18 / Option B step B4 (+ B6 stage-3): the enclosing scope id as a u64
+    /// (was the FNV hash of the id string; now `RefSite.enclosing_id`). The
+    /// member receiver cache key is `(receiver_name_hash, enclosing_id)`; having
+    /// it here lets the worker build that key without reading the `RefSite`.
+    enclosing_id: u64,
     /// B4: precomputed `site_partial_hash(source_ref_id, edge_kind)` — the
     /// per-site invariant prefix of every `(site, target)` dedup key. Computed
     /// once in the column build (same hash fn as before, so dedup keys are
@@ -853,6 +882,28 @@ struct SiteCols {
 const SITE_FLAG_IS_DEFINITION: u8 = 1;
 const SITE_FLAG_HAS_RECEIVER: u8 = 1 << 1;
 const SITE_FLAG_IS_IMPORT_CONTEXT: u8 = 1 << 2;
+
+/// B6 stage-5a: the per-site columns the 14M-record reference write path reads,
+/// so `append_lights_to_both_shards` / `serialize_reference_binary_from_light`
+/// no longer dereference the ~200B `RefSite` (nor call `file_table.get_id`) —
+/// the toehold for dropping `Vec<RefSite>` before resolve (stage-5d). `name` is
+/// rebuilt from `name_id` via the interner (stage-4), `rel_path` is replaced by
+/// the precomputed `file_id` (no per-record `FileTable` probe), and `edge_kind`
+/// is rebuilt from `edge_kind_id` (always standard for fresh ref_sites:
+/// `extract_ref_sites` only emits `call`/`usage`). Built before the writer
+/// scope (the writer thread drains it concurrently with resolve), ~48B/site.
+#[derive(Clone, Copy, Debug)]
+struct RefWriteCol {
+    source_ref_id: u64,
+    enclosing_id: u64,
+    name_id: u32,
+    file_id: u32,
+    start_line: u32,
+    start_column: u32,
+    end_line: u32,
+    end_column: u32,
+    edge_kind_id: u8,
+}
 
 #[derive(Clone, Debug)]
 struct GraphStore {
@@ -1815,11 +1866,9 @@ where
                     .as_deref()
                     .map(stable_hash)
                     .unwrap_or(0);
-                site.enclosing_symbol_id_hash = site
-                    .enclosing_symbol_id
-                    .as_deref()
-                    .map(stable_hash)
-                    .unwrap_or(0);
+                // B6 stage-3: enclosing_id is now a serialized (non-skip) field,
+                // so it survives the spill round-trip and needs no recompute here
+                // (the source string was dropped).
                 site.access_kind_id = compute_access_kind_id(&site.access_kind);
                 site.edge_kind_id = compute_edge_kind_id(&site.edge_kind);
             }
@@ -2116,6 +2165,48 @@ where
     let fact_generation_hash = accum.fact_generation_hash;
     let symbol_def_count = accum.symbol_def_count;
     let skip_resolve = std::env::var("ZOEK_SKIP_RESOLVE").is_ok();
+    // B6 stage-4: intern symbol names with a reverse table, plus a per-site
+    // `name_id` column, so the 14M-record write path (both the channel writer
+    // and the `ZOEK_DISABLE_LIGHT_CHANNEL` fallback `stream_lights_to_sidecars`)
+    // reconstructs each reference's `name` from a `u32` id instead of reading
+    // `RefSite.name`. Every emitted reference's name is the target symbol's name
+    // (bare and member resolution both match the site name against a
+    // symbol-keyed map), so the symbol-name interner covers them; a non-symbol
+    // site name (interner MISS) never resolves to a target, so it never reaches
+    // a write path. Built before resolve (the channel writer thread drains it
+    // concurrently with the resolve phases). Toehold for stage-5 (dropping
+    // `Vec<RefSite>` before resolve).
+    let mut name_interner = NameInterner::with_capacity(symbols.len() + 1024);
+    for symbol in &symbols {
+        name_interner.intern(&symbol.name, symbol.name_hash);
+    }
+    // Receivers are interned too (they may be locals/`self`/`cls` — not in the
+    // symbol set), so the column worker's per-file receiver cache-miss can
+    // rebuild `receiver_name` from a `u32` id once `Vec<RefSite>` is dropped
+    // (stage-5). String-keyed intern is collision-free, so reconstruction is
+    // byte-exact.
+    for site in &ref_sites {
+        if let Some(receiver) = &site.receiver_name {
+            name_interner.intern(receiver, site.receiver_name_hash);
+        }
+    }
+    let (site_name_ids, site_receiver_name_ids): (Vec<u32>, Vec<u32>) = {
+        use rayon::prelude::*;
+        rayon::join(
+            || ref_sites.par_iter().map(|s| name_interner.get(&s.name)).collect(),
+            || {
+                ref_sites
+                    .par_iter()
+                    .map(|s| {
+                        s.receiver_name
+                            .as_deref()
+                            .map(|r| name_interner.get(r))
+                            .unwrap_or(NameInterner::MISS)
+                    })
+                    .collect()
+            },
+        )
+    };
     // F1.b: channel-driven write pipeline. file_table + shard writers are
     // prepared before resolve so phase E/F workers can stream LightRef batches
     // into a writer thread that overlaps with the resolve phases. Sequential
@@ -2193,8 +2284,14 @@ where
             .filter(|n| *n > 0)
             .unwrap_or(1024);
         let (tx, rx) = crossbeam_channel::bounded::<Vec<LightRef>>(channel_cap);
+        // B6 stage-5a: reference write columns (file_table now complete). The
+        // writer thread reads only this — no `RefSite`, no per-record file_table.
+        let write_cols = build_ref_write_cols(&ref_sites, &stream_file_table, &site_name_ids);
         let symbols_ref = &symbols;
         let ref_sites_ref = &ref_sites;
+        let name_interner_ref = &name_interner;
+        let write_cols_ref = &write_cols;
+        let site_receiver_name_ids_ref = &site_receiver_name_ids;
         let import_facts_ref = &import_facts;
         let type_facts_ref = &type_facts;
         let function_return_facts_ref = &function_return_facts;
@@ -2208,8 +2305,8 @@ where
                 let writer_handle = s.spawn(move || -> io::Result<usize> {
                     write_lights_from_channel(
                         rx,
-                        ref_sites_ref,
-                        stream_file_table_ref,
+                        write_cols_ref,
+                        name_interner_ref,
                         target_w_ref,
                         enclosing_w_ref,
                     )
@@ -2257,6 +2354,7 @@ where
                     type_facts_ref,
                     function_return_facts_ref,
                     hierarchy_facts_ref,
+                    Some((name_interner_ref, site_receiver_name_ids_ref)),
                     Some(&tx),
                 );
                 // F1.b: phase F's lights were buffered (phase_f wall avoids
@@ -2318,6 +2416,7 @@ where
                 &type_facts,
                 &function_return_facts,
                 &hierarchy_facts,
+                Some((&name_interner, &site_receiver_name_ids)),
                 None,
             )
         };
@@ -2361,13 +2460,16 @@ where
             && !resolution.light_references.is_empty();
         let (_streamed_bytes, refs_emitted) = if use_light_stream {
             drop(resolution.references);
+            // B6 stage-5a: reference write columns (file_table complete).
+            let write_cols =
+                build_ref_write_cols(&ref_sites, &stream_file_table, &site_name_ids);
             let r = stream_lights_to_sidecars(
                 workspace_root,
                 config,
                 &[],
                 &resolution.light_references,
-                &ref_sites,
-                &stream_file_table,
+                &write_cols,
+                &name_interner,
             )?;
             resolution.light_references = Vec::new();
             r
@@ -2617,6 +2719,7 @@ pub fn update_graph_native(
         &type_facts,
         &function_return_facts,
         &hierarchy_facts,
+        None, // B6 stage-4: incremental path keeps reading RefSite.receiver_name
         None,
     );
     if probe { eprintln!("[flow] resolve_a_to_e={}ms", _t.elapsed().as_millis()); }
@@ -5201,10 +5304,14 @@ fn extract_ref_sites(
         let sanitized =
             sanitize_ref_site_code_line(line, language, &mut python_multiline_string_quote);
         let is_import_context = is_import_context_line(sanitized.trim_start(), language);
-        let line_enclosing = line_enclosing_cache
+        // B6 stage-3: enclosing is line-constant; parse the "sym:HEX16" id to
+        // its u64 once per line (0 = none) instead of cloning the String per
+        // line and re-hashing it per site.
+        let line_enclosing_id: u64 = line_enclosing_cache
             .get(line_idx)
-            .cloned()
-            .flatten();
+            .and_then(|o| o.as_deref())
+            .and_then(parse_stable_symbol_id_to_u64)
+            .unwrap_or(0);
         for (name, start, end) in identifier_tokens(&sanitized) {
             if is_keyword(&name, language) {
                 continue;
@@ -5228,10 +5335,6 @@ fn extract_ref_sites(
                 stable_ref_id_u64(&entry.rel_path, line_idx as u32, start as u32, &name);
             let name_hash = stable_hash(&name);
             let receiver_name_hash = receiver_name
-                .as_deref()
-                .map(stable_hash)
-                .unwrap_or(0);
-            let enclosing_symbol_id_hash = line_enclosing
                 .as_deref()
                 .map(stable_hash)
                 .unwrap_or(0);
@@ -5260,11 +5363,10 @@ fn extract_ref_sites(
                 is_definition,
                 is_import_context,
                 receiver_name,
-                enclosing_symbol_id: line_enclosing.clone(),
+                enclosing_id: line_enclosing_id,
                 rel_path_hash,
                 name_hash,
                 receiver_name_hash,
-                enclosing_symbol_id_hash,
                 access_kind_id,
                 edge_kind_id,
             });
@@ -5289,6 +5391,7 @@ fn resolve_ref_sites(
         type_facts,
         function_return_facts,
         hierarchy_facts,
+        None, // B6 stage-4: legacy path keeps reading RefSite.receiver_name
         None,
     );
     let _t_pf = std::time::Instant::now();
@@ -5349,6 +5452,9 @@ fn resolve_ref_sites_for_rebuild(
     type_facts: &[TypeFact],
     function_return_facts: &[FunctionReturnFact],
     hierarchy_facts: &[HierarchyFact],
+    // B6 stage-4: pass-through `Some((interner, receiver_name_ids))` so the
+    // column worker rebuilds `receiver_name` from a `u32` id (stage-5 toehold).
+    receiver_recon: Option<(&NameInterner, &[u32])>,
     // F1.b: pass-through. `Some(&sender)` enables the channel-driven write
     // pipeline for phase E workers (their LightRef batches stream into the
     // writer thread). Phase F continues to accumulate into `light_out_f` so
@@ -5364,6 +5470,7 @@ fn resolve_ref_sites_for_rebuild(
         type_facts,
         function_return_facts,
         hierarchy_facts,
+        receiver_recon,
         light_sender,
     );
     for path in std::mem::take(&mut intermediate.reference_partials) {
@@ -5512,6 +5619,11 @@ fn resolve_ref_sites_a_to_e<'a>(
     type_facts: &'a [TypeFact],
     function_return_facts: &'a [FunctionReturnFact],
     hierarchy_facts: &'a [HierarchyFact],
+    // B6 stage-4: `Some((interner, receiver_name_ids))` lets the column
+    // worker's per-file receiver cache-miss rebuild `receiver_name` from a
+    // `u32` id (stage-5 toehold). `None` on incremental/legacy/test paths,
+    // which keep reading `RefSite.receiver_name`.
+    receiver_recon: Option<(&'a NameInterner, &'a [u32])>,
     // F1.b: when `Some`, phase E workers stream LightRef batches into this
     // channel instead of accumulating a per-worker `Vec<LightRef>`. The
     // returned `light_references` is left empty (channel sink drains them).
@@ -5766,7 +5878,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                     name_hash: s.name_hash,
                     rel_path_hash: s.rel_path_hash,
                     receiver_name_hash: s.receiver_name_hash,
-                    enclosing_symbol_id_hash: s.enclosing_symbol_id_hash,
+                    enclosing_id: s.enclosing_id,
                     // B4: same fn the worker called per-site (byte-identical
                     // dedup keys). Fused into this AoS pass we already pay.
                     site_partial: site_partial_hash_u64(s.source_ref_id, &s.edge_kind),
@@ -6272,7 +6384,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                 // Column-only candidate gathering: SiteCols + hash-keyed maps.
                 if is_member {
                     if c.flags & SITE_FLAG_HAS_RECEIVER != 0 {
-                        let key = (c.receiver_name_hash, c.enclosing_symbol_id_hash);
+                        let key = (c.receiver_name_hash, c.enclosing_id);
                         let res = receiver_cache_cols.entry(key).or_insert_with(|| {
                             // Pre-screen entirely on hashes (no RefSite read):
                             // mirrors compute_receiver_resolution's has_any guard.
@@ -6299,11 +6411,24 @@ fn resolve_ref_sites_a_to_e<'a>(
                             // Rare: load the RefSite once for the validated
                             // string-keyed compute, then collapse to hashes.
                             let site = &ref_sites[site_idx as usize];
-                            let receiver = site.receiver_name.as_deref().unwrap_or("");
+                            // B6 stage-4: rebuild `receiver` from the per-site id
+                            // column when present (stage-5 toehold); the
+                            // string-keyed intern is collision-free so this is
+                            // byte-identical to `site.receiver_name`. `rel_path`
+                            // below is still read from `site` (stage-5/file_id).
+                            let receiver = match receiver_recon {
+                                Some((interner, recv_ids)) => {
+                                    interner.name(recv_ids[site_idx as usize]).unwrap_or("")
+                                }
+                                None => site.receiver_name.as_deref().unwrap_or(""),
+                            };
+                            // B6 stage-3: rebuild the enclosing id string (cold,
+                            // once per file cache-miss) from the column u64.
+                            let enclosing_str = enclosing_id_to_string(c.enclosing_id);
                             let res = compute_receiver_resolution(
                                 site.rel_path.as_str(),
                                 receiver,
-                                site.enclosing_symbol_id.as_deref(),
+                                enclosing_str.as_deref(),
                                 &symbols_by_id,
                                 &types_by_name,
                                 &import_targets,
@@ -6343,7 +6468,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                 let site = &ref_sites[site_idx as usize];
                 if is_member {
                     if let Some(receiver) = site.receiver_name.as_deref() {
-                        let key = (site.receiver_name_hash, site.enclosing_symbol_id_hash);
+                        let key = (site.receiver_name_hash, site.enclosing_id);
                         let res = receiver_cache.entry(key).or_insert_with(|| {
                             let is_self = matches!(receiver, "self" | "cls");
                             if !is_self {
@@ -6365,10 +6490,13 @@ fn resolve_ref_sites_a_to_e<'a>(
                                     };
                                 }
                             }
+                            // B6 stage-3: rebuild the enclosing id string (cold,
+                            // once per file cache-miss) from the stored u64.
+                            let enclosing_str = enclosing_id_to_string(site.enclosing_id);
                             compute_receiver_resolution(
                                 site.rel_path.as_str(),
                                 receiver,
-                                site.enclosing_symbol_id.as_deref(),
+                                enclosing_str.as_deref(),
                                 &symbols_by_id,
                                 &types_by_name,
                                 &import_targets,
@@ -6936,11 +7064,13 @@ fn combined_member_candidates<'a>(
         exact.clear();
         return;
     };
+    // B6 stage-3: rebuild the enclosing id string from the stored u64 (cold).
+    let enclosing_str = enclosing_id_to_string(site.enclosing_id);
     combined_member_candidates_by_key(
         site.rel_path.as_str(),
         receiver,
         site.name.as_str(),
-        site.enclosing_symbol_id.as_deref(),
+        enclosing_str.as_deref(),
         symbols_by_id,
         types_by_name,
         members_by_container_and_name,
@@ -6963,7 +7093,7 @@ fn combined_member_candidates_by_key<'a>(
     rel_path: &'a str,
     receiver: &'a str,
     name: &'a str,
-    site_enclosing_id: Option<&'a str>,
+    site_enclosing_id: Option<&str>,
     symbols_by_id: &HashMap<&'a str, &'a GraphSymbol>,
     types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
     members_by_container_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
@@ -7313,7 +7443,7 @@ fn star_import_candidates_into_cols<'a>(
 fn compute_receiver_resolution<'a>(
     rel_path: &'a str,
     receiver: &'a str,
-    site_enclosing_id: Option<&'a str>,
+    site_enclosing_id: Option<&str>,
     symbols_by_id: &HashMap<&'a str, &'a GraphSymbol>,
     types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
     import_targets: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
@@ -7492,7 +7622,7 @@ fn type_fact_applies_by_enclosing(fact: &TypeFact, site_enclosing_id: Option<&st
 fn resolve_type_fact_targets_by_key<'a>(
     fact: &TypeFact,
     site_rel_path: &'a str,
-    site_enclosing_id: Option<&'a str>,
+    site_enclosing_id: Option<&str>,
     symbols_by_id: &HashMap<&'a str, &'a GraphSymbol>,
     types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
     symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
@@ -7573,7 +7703,7 @@ fn resolve_type_fact_targets_by_key<'a>(
 fn resolve_type_name_targets_by_key<'a>(
     type_expr: &str,
     context_rel_path: &'a str,
-    site_enclosing_id: Option<&'a str>,
+    site_enclosing_id: Option<&str>,
     symbols_by_id: &HashMap<&'a str, &'a GraphSymbol>,
     types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
     symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
@@ -7619,14 +7749,9 @@ fn resolve_type_name_targets_by_key<'a>(
 }
 
 fn type_fact_applies_to_site(fact: &TypeFact, site: &RefSite) -> bool {
-    match (
-        fact.enclosing_symbol_id.as_deref(),
-        site.enclosing_symbol_id.as_deref(),
-    ) {
-        (Some(fact_scope), Some(site_scope)) => fact_scope == site_scope,
-        (None, _) => true,
-        _ => false,
-    }
+    // B6 stage-3: enclosing is stored as a u64; rebuild the string (cold) and
+    // reuse the by-key comparison.
+    type_fact_applies_by_enclosing(fact, enclosing_id_to_string(site.enclosing_id).as_deref())
 }
 
 fn resolve_type_fact_targets<'a>(
@@ -7722,8 +7847,9 @@ fn resolve_type_name_targets<'a>(
 ) -> Vec<&'a GraphSymbol> {
     let type_name = type_tail(type_expr);
     if type_name == "Self" {
-        if let Some(container_name) = site
-            .enclosing_symbol_id
+        // B6 stage-3: rebuild the enclosing id string from the stored u64 (cold).
+        let site_enclosing = enclosing_id_to_string(site.enclosing_id);
+        if let Some(container_name) = site_enclosing
             .as_deref()
             .and_then(|id| symbols_by_id.get(id))
             .and_then(|symbol| symbol.container_name.as_deref())
@@ -8626,7 +8752,7 @@ fn materialize_light_ref(light: &LightRef, ref_sites: &[RefSite]) -> GraphRefere
         start_column: site.start_column,
         end_line: site.end_line,
         end_column: site.end_column,
-        enclosing_symbol_id: site.enclosing_symbol_id.as_deref().map(|s| s.into()),
+        enclosing_symbol_id: enclosing_id_to_string(site.enclosing_id).map(|s| s.into()), // B6 stage-3: u64→string (cold)
         bound_mask: light.bound_mask,
         confidence: light.confidence.as_str().into(),
         provenance: light.provenance.as_str().into(),
@@ -8658,7 +8784,7 @@ fn push_resolved_reference(
         start_column: site.start_column,
         end_line: site.end_line,
         end_column: site.end_column,
-        enclosing_symbol_id: site.enclosing_symbol_id.as_deref().map(|s| s.into()),
+        enclosing_symbol_id: enclosing_id_to_string(site.enclosing_id).map(|s| s.into()), // B6 stage-3: u64→string (cold)
         bound_mask,
         confidence: confidence.into(),
         provenance: provenance.into(),
@@ -9168,19 +9294,49 @@ fn append_references_to_both_shards(
     })
 }
 
+/// B6 stage-5a: build the per-site `RefWriteCol` column the reference write
+/// path reads, so it dereferences no `RefSite`. `name_id` comes from the
+/// stage-4 column (interner-backed); `file_id` is resolved once here (was a
+/// per-record `FileTable` probe in `append_lights_to_both_shards`). Pure
+/// `par_iter` copy of precomputed fields — no extra scan beyond this one.
+fn build_ref_write_cols(
+    ref_sites: &[RefSite],
+    file_table: &FileTable,
+    site_name_ids: &[u32],
+) -> Vec<RefWriteCol> {
+    use rayon::prelude::*;
+    ref_sites
+        .par_iter()
+        .zip(site_name_ids.par_iter())
+        .map(|(s, &name_id)| RefWriteCol {
+            source_ref_id: s.source_ref_id,
+            enclosing_id: s.enclosing_id,
+            name_id,
+            file_id: file_table.get_id(&s.rel_path).unwrap_or(u32::MAX),
+            start_line: s.start_line,
+            start_column: s.start_column,
+            end_line: s.end_line,
+            end_column: s.end_column,
+            edge_kind_id: s.edge_kind_id,
+        })
+        .collect()
+}
+
 /// `LightRef`-aware variant of `append_references_to_both_shards`. Each
-/// record's site-derived fields come from the owning `ref_sites` slice via
-/// `light.site_idx`, and bytes are serialized via
+/// record's site-derived fields come from the `RefWriteCol` column (stage-5a)
+/// via `light.site_idx`, and bytes are serialized via
 /// `serialize_reference_binary_from_light` without materializing a
-/// `GraphReference`. Same 2-thread split (target + enclosing) and same
-/// adjacent rel_path → file_id cache as the GraphReference variant.
+/// `GraphReference`. Same 2-thread split (target + enclosing).
 #[allow(dead_code)] // Wired in by Phase 4-L stream_lights_to_sidecars.
 fn append_lights_to_both_shards(
     lights: &[LightRef],
-    ref_sites: &[RefSite],
+    // B6 stage-5a: per-site write columns (was `ref_sites` + `site_name_ids` +
+    // `file_table`). `name` comes from the interner via `col.name_id`; the
+    // `file_id` is precomputed (no per-record `FileTable` probe).
+    write_cols: &[RefWriteCol],
+    name_interner: &NameInterner,
     target_shards: &mut [GraphShardWriter],
     enclosing_shards: &mut [GraphShardWriter],
-    file_table: &FileTable,
 ) -> io::Result<usize> {
     use rayon::prelude::*;
     let n_target = target_shards.len();
@@ -9215,38 +9371,38 @@ fn append_lights_to_both_shards(
             let mut tgt_bufs: Vec<Vec<u8>> = (0..n_target).map(|_| Vec::new()).collect();
             let mut enc_bufs: Vec<Vec<u8>> = (0..n_encl).map(|_| Vec::new()).collect();
             let mut scratch: Vec<u8> = Vec::with_capacity(200);
-            let mut cached_path: &str = "";
-            let mut cached_id: u32 = u32::MAX;
             let mut emitted: usize = 0;
             for light in &lights[start..end] {
-                let site = &ref_sites[light.site_idx as usize];
+                let col = &write_cols[light.site_idx as usize];
                 let target_id = light.target_symbol_id.as_deref();
-                let enclosing_id = if site.edge_kind_id == EDGE_KIND_CALL
-                    || site.edge_kind_id == EDGE_KIND_CONSTRUCT
+                // B6 stage-3: enclosing is stored as a u64; the enclosing shard
+                // is keyed by the id *string* (shard_index_for_key, read-side
+                // compatible), so rebuild it (cold) only for call/construct edges
+                // that actually carry an enclosing scope.
+                let enclosing_str = if col.edge_kind_id == EDGE_KIND_CALL
+                    || col.edge_kind_id == EDGE_KIND_CONSTRUCT
                 {
-                    site.enclosing_symbol_id.as_deref()
+                    enclosing_id_to_string(col.enclosing_id)
                 } else {
                     None
                 };
-                if target_id.is_none() && enclosing_id.is_none() {
+                if target_id.is_none() && enclosing_str.is_none() {
                     continue;
                 }
-                let path = site.rel_path.as_str();
-                let id = if path == cached_path {
-                    cached_id
-                } else {
-                    let new_id = file_table.get_id(path).unwrap_or(u32::MAX);
-                    cached_path = path;
-                    cached_id = new_id;
-                    new_id
-                };
+                // B6 stage-4: rebuild `name` from the per-site id column instead
+                // of `site.name`. No fallback here — if any emitted reference's
+                // name failed to intern (MISS) the empty string diverges the
+                // shard bytes, so the `bytes` gate proves the "emitted name is
+                // always a symbol name" invariant. stage-5a: `file_id` is now a
+                // precomputed column (no per-record `FileTable` probe).
+                let name = name_interner.name(col.name_id).unwrap_or("");
                 scratch.clear();
-                serialize_reference_binary_from_light(light, site, id, &mut scratch);
+                serialize_reference_binary_from_light(light, col, name, &mut scratch);
                 if let Some(t) = target_id {
                     let s = shard_index_for_key(t);
                     tgt_bufs[s].extend_from_slice(&scratch);
                 }
-                if let Some(e) = enclosing_id {
+                if let Some(e) = enclosing_str.as_deref() {
                     let s = shard_index_for_key(e);
                     enc_bufs[s].extend_from_slice(&scratch);
                 }
@@ -9296,8 +9452,11 @@ fn append_lights_to_both_shards(
 /// must be drained before `finish_graph_shard_writers` runs on the writers.
 fn write_lights_from_channel(
     rx: crossbeam_channel::Receiver<Vec<LightRef>>,
-    ref_sites: &[RefSite],
-    file_table: &FileTable,
+    // B6 stage-5a: per-site write columns (was `ref_sites` + `site_name_ids` +
+    // `file_table`). The reference write path reads no `RefSite` and does no
+    // per-record `FileTable` probe — the toehold for dropping `Vec<RefSite>`.
+    write_cols: &[RefWriteCol],
+    name_interner: &NameInterner,
     target_shards: &mut [GraphShardWriter],
     enclosing_shards: &mut [GraphShardWriter],
 ) -> io::Result<usize> {
@@ -9350,10 +9509,10 @@ fn write_lights_from_channel(
                 total += pool.install(|| {
                     append_lights_to_both_shards(
                         &buf,
-                        ref_sites,
+                        write_cols,
+                        name_interner,
                         target_shards,
                         enclosing_shards,
-                        file_table,
                     )
                 })?;
             }
@@ -9393,8 +9552,10 @@ fn stream_lights_to_sidecars(
     config: &EngineConfig,
     partials: &[PathBuf],
     tail: &[LightRef],
-    ref_sites: &[RefSite],
-    file_table: &FileTable,
+    // B6 stage-5a: per-site write columns (was `ref_sites` + `site_name_ids` +
+    // `file_table`); `name` rebuilt from the interner via `col.name_id`.
+    write_cols: &[RefWriteCol],
+    name_interner: &NameInterner,
 ) -> io::Result<(u64, usize)> {
     let mut target_w = open_graph_shard_writers(
         workspace_root,
@@ -9415,11 +9576,23 @@ fn stream_lights_to_sidecars(
         })?;
         drop(bytes);
         total_records += batch.len();
-        append_lights_to_both_shards(&batch, ref_sites, &mut target_w, &mut enclosing_w, file_table)?;
+        append_lights_to_both_shards(
+            &batch,
+            write_cols,
+            name_interner,
+            &mut target_w,
+            &mut enclosing_w,
+        )?;
     }
     if !tail.is_empty() {
         total_records += tail.len();
-        append_lights_to_both_shards(tail, ref_sites, &mut target_w, &mut enclosing_w, file_table)?;
+        append_lights_to_both_shards(
+            tail,
+            write_cols,
+            name_interner,
+            &mut target_w,
+            &mut enclosing_w,
+        )?;
     }
     let target_bytes = finish_graph_shard_writers(target_w)?;
     let enclosing_bytes = finish_graph_shard_writers(enclosing_w)?;
@@ -10393,6 +10566,15 @@ fn serialize_reference_binary(reference: &GraphReference, file_id: u32, out: &mu
         Some(u) => (u, None),
         None => (u64::MAX, Some(reference.source_ref_id.as_ref())),
     };
+    // B6 stage-3: parse the enclosing id once too (0 = none; a non-standard id
+    // falls back to an inline string, which fresh data never produces).
+    let (eu, ei) = match reference.enclosing_symbol_id.as_deref() {
+        None => (0u64, None),
+        Some(e) => match parse_stable_symbol_id_to_u64(e) {
+            Some(u) => (u, None),
+            None => (0u64, Some(e)),
+        },
+    };
     serialize_reference_record(
         sru,
         sri,
@@ -10405,7 +10587,8 @@ fn serialize_reference_binary(reference: &GraphReference, file_id: u32, out: &mu
         reference.start_column,
         reference.end_line,
         reference.end_column,
-        reference.enclosing_symbol_id.as_deref(),
+        eu,
+        ei,
         reference.bound_mask,
         &reference.confidence,
         &reference.provenance,
@@ -10431,7 +10614,11 @@ fn serialize_reference_record(
     start_column: u32,
     end_line: u32,
     end_column: u32,
-    enclosing_symbol_id: Option<&str>,
+    // B6 stage-3: pre-parsed enclosing id (0 = none); `enclosing_inline` is Some
+    // only for the legacy non-standard case (avoids reconstructing "sym:HEX16"
+    // per record on the 14M-record write path) — mirrors the source_ref_id args.
+    enclosing_id_u64: u64,
+    enclosing_inline: Option<&str>,
     bound_mask: u8,
     confidence: &str,
     provenance: &str,
@@ -10475,16 +10662,20 @@ fn serialize_reference_record(
     out.extend_from_slice(&start_column.to_le_bytes());
     out.extend_from_slice(&end_line.to_le_bytes());
     out.extend_from_slice(&end_column.to_le_bytes());
-    // enclosing_symbol_id: 0=none, 1=u64 follows, 2=inline str follows.
-    match enclosing_symbol_id {
-        None => out.push(0),
+    // enclosing_symbol_id: 0=none, 1=u64 follows, 2=inline str follows. B6
+    // stage-3: pre-parsed by the caller (inline only for legacy non-standard
+    // ids, which fresh writes never emit — so this stays byte-identical).
+    match enclosing_inline {
         Some(e) => {
-            if let Some(u) = parse_stable_symbol_id_to_u64(e) {
-                out.push(1);
-                out.extend_from_slice(&u.to_le_bytes());
+            out.push(2);
+            write_u16_str(out, e);
+        }
+        None => {
+            if enclosing_id_u64 == 0 {
+                out.push(0);
             } else {
-                out.push(2);
-                write_u16_str(out, e);
+                out.push(1);
+                out.extend_from_slice(&enclosing_id_u64.to_le_bytes());
             }
         }
     }
@@ -10510,23 +10701,30 @@ fn serialize_reference_record(
 #[allow(dead_code)] // Used once the write pipeline migrates to LightRef.
 fn serialize_reference_binary_from_light(
     light: &LightRef,
-    site: &RefSite,
-    file_id: u32,
+    // B6 stage-5a: the per-site write columns (was `&RefSite`). `name` is the
+    // caller's interner reconstruction (stage-4); everything else reads the
+    // column. `edge_kind` is rebuilt from `edge_kind_id` (always standard for
+    // references — `extract_ref_sites` emits only `call`/`usage`); the
+    // `serialize_reference_record` re-derives the same id, so byte-identical.
+    col: &RefWriteCol,
+    name: &str,
     out: &mut Vec<u8>,
 ) {
+    let edge_kind = edge_kind_str_from_id(col.edge_kind_id).unwrap_or("usage");
     serialize_reference_record(
-        site.source_ref_id, // B6 stage-2: already a u64; always standard at parse
+        col.source_ref_id, // B6 stage-2: already a u64; always standard at parse
         None,
         light.target_symbol_id.as_deref(),
-        &site.edge_kind,
-        &site.name,
-        &site.name, // B6: raw_text == name (field dropped)
-        file_id,
-        site.start_line,
-        site.start_column,
-        site.end_line,
-        site.end_column,
-        site.enclosing_symbol_id.as_deref(),
+        edge_kind,
+        name,
+        name, // B6: raw_text == name (field dropped)
+        col.file_id,
+        col.start_line,
+        col.start_column,
+        col.end_line,
+        col.end_column,
+        col.enclosing_id, // B6 stage-3: already a u64 (always standard at parse)
+        None,
         light.bound_mask,
         light.confidence.as_str(),
         light.provenance.as_str(),
@@ -11029,17 +11227,15 @@ fn serialize_ref_site_binary(site: &RefSite, file_id: u32, out: &mut Vec<u8>) {
     } else {
         out.push(0);
     }
-    // Phase 3 aggressive: enclosing_symbol_id is also "sym:HEX16" format
-    // when present (built from stable_symbol_id). Encode as u64 + 1B
-    // present marker. 0 = absent, 1 = u64 follows, 2 = inline string.
-    if let Some(e) = site.enclosing_symbol_id.as_deref() {
-        if let Some(u) = parse_stable_symbol_id_to_u64(e) {
-            out.push(1);
-            out.extend_from_slice(&u.to_le_bytes());
-        } else {
-            out.push(2);
-            write_u16_str(out, e);
-        }
+    // Phase 3 aggressive: enclosing_symbol_id is also "sym:HEX16" format when
+    // present (built from stable_symbol_id). Encode as u64 + 1B present marker:
+    // 0 = absent, 1 = u64 follows, 2 = inline string. B6 stage-3: the field is
+    // already the u64 (0 = absent), so emit marker 1 + u64 directly — the inline
+    // marker-2 was never reached for real "sym:HEX16" ids, so this stays
+    // byte-identical to the prior parse_stable_symbol_id_to_u64 path.
+    if site.enclosing_id != 0 {
+        out.push(1);
+        out.extend_from_slice(&site.enclosing_id.to_le_bytes());
     } else {
         out.push(0);
     }
@@ -11134,24 +11330,29 @@ fn parse_ref_site_binary(
     }
     let enclosing_marker = bytes[*cursor];
     *cursor += 1;
-    let enclosing_symbol_id = match enclosing_marker {
-        0 => None,
+    // B6 stage-3: decode straight to the u64 (0 = absent); no "sym:HEX16"
+    // string is rebuilt on the read path (the hot loop keys on the u64).
+    let enclosing_id: u64 = match enclosing_marker {
+        0 => 0,
         1 => {
             if *cursor + 8 > bytes.len() {
                 return Err(invalid_data("ref_site truncated (enclosing u64)"));
             }
-            let u =
-                u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
+            let u = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
             *cursor += 8;
-            Some(format!("sym:{:016x}", u))
+            u
         }
-        2 => Some(read_u16_str(bytes, cursor)?),
+        2 => {
+            // Legacy non-standard id (fresh writes never emit marker 2); parse
+            // back to the u64, defaulting to 0 (= none) when unparseable.
+            let s = read_u16_str(bytes, cursor)?;
+            parse_stable_symbol_id_to_u64(&s).unwrap_or(0)
+        }
         _ => return Err(invalid_data("ref_site invalid enclosing marker")),
     };
     let rel_path_hash = stable_hash(&rel_path);
     let name_hash = stable_hash(&name);
     let receiver_name_hash = receiver_name.as_deref().map(stable_hash).unwrap_or(0);
-    let enclosing_symbol_id_hash = enclosing_symbol_id.as_deref().map(stable_hash).unwrap_or(0);
     let access_kind_id = compute_access_kind_id(&access_kind);
     let edge_kind_id = compute_edge_kind_id(&edge_kind);
     Ok(RefSite {
@@ -11170,11 +11371,10 @@ fn parse_ref_site_binary(
         is_definition,
         is_import_context,
         receiver_name,
-        enclosing_symbol_id,
+        enclosing_id,
         rel_path_hash,
         name_hash,
         receiver_name_hash,
-        enclosing_symbol_id_hash,
         access_kind_id,
         edge_kind_id,
     })
@@ -12869,6 +13069,17 @@ fn parse_stable_symbol_id_to_u64(s: &str) -> Option<u64> {
     s.strip_prefix("sym:")
         .filter(|hex| hex.len() == 16)
         .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+}
+
+/// B6 stage-3: reconstruct the `"sym:HEX16"` enclosing-scope id string from the
+/// stored `u64` (0 = no enclosing scope). Byte-identical to the original
+/// `GraphSymbol.id` because symbol ids are always `format!("sym:{:016x}", …)`
+/// (see `stable_symbol_id`), so `parse_stable_symbol_id_to_u64` is its exact
+/// inverse. Cold path only — the hot resolve loop keys on the `u64` directly;
+/// this rebuilds the string for the few string-keyed lookups on a per-file
+/// receiver-cache miss and for the materialize / shard-serialize cold paths.
+fn enclosing_id_to_string(enclosing_id: u64) -> Option<String> {
+    (enclosing_id != 0).then(|| format!("sym:{enclosing_id:016x}"))
 }
 
 // Phase 3 aggressive: encode common GraphSymbol.kind values as u8 ids.
