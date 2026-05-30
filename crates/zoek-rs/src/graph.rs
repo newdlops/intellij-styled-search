@@ -2256,7 +2256,17 @@ where
     // columnized — the channel pipeline (5a/5b/5c readers), SoA on (column
     // resolve paths, else the struct paths read ref_sites), and OV1 on (else the
     // index-phase `write_store` writes ref_sites from the AoS). Otherwise keep it.
-    let drop_ref_sites = overlap_static && std::env::var("ZOEK_SOA_OFF").is_err();
+    let soa_on = std::env::var("ZOEK_SOA_OFF").is_err();
+    let drop_ref_sites = overlap_static
+        && soa_on
+        // Measurement gate (W26 paired): keep `ref_sites` resident (same columns
+        // built + same column path) so a drop-ON/OFF pair isolates the freed
+        // 7.6GB's effect on peak RSS. Does not change output.
+        && std::env::var("ZOEK_B6_KEEP_REFSITES").is_err();
+    // B6 stage-5d: the channel rebuild always resolves via the columns when SoA
+    // is on (decoupled from `drop_ref_sites` so the KEEP_REFSITES pair still uses
+    // the column path). `ZOEK_SOA_OFF` keeps the struct paths (and `ref_sites`).
+    let force_columns_channel = soa_on;
     // W23: bytes written by the overlapped ref_site writer (0 unless overlapped).
     // `write_store` skips ref_sites when overlapping, so its reported `bytes`
     // omits them; add this back so the summary total stays accurate.
@@ -2423,7 +2433,7 @@ where
                     // struct paths (which would index the dropped ref_sites) are
                     // never taken.
                     Some(site_cols_ref),
-                    drop_ref_sites,
+                    force_columns_channel,
                     Some(&tx),
                 );
                 // F1.b: phase F's lights were buffered (phase_f wall avoids
