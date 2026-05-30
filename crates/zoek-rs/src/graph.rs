@@ -700,7 +700,11 @@ struct MemberExactCandidate<'a> {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct RefSite {
-    source_ref_id: String,
+    // B6 stage-2: the u64 of "ref:HEX16" (= stable_hash(key)); the string was
+    // redundant (always standard at parse) — store the u64, reconstruct the
+    // string only on the cold materialize path. The on-disk encoding already
+    // used this u64, so shard bytes are unchanged.
+    source_ref_id: u64,
     name: String,
     // B6 (RefSite slim, peak RSS was 17GB > 16GB cap): `raw_text` was always
     // == `name` (set so in `extract_ref_sites`; the disk format already encodes
@@ -5219,8 +5223,9 @@ fn extract_ref_sites(
             } else {
                 "bare"
             };
+            // B6 stage-2: build the u64 directly (no "ref:HEX16" string alloc).
             let source_ref_id =
-                stable_ref_id(&entry.rel_path, line_idx as u32, start as u32, &name);
+                stable_ref_id_u64(&entry.rel_path, line_idx as u32, start as u32, &name);
             let name_hash = stable_hash(&name);
             let receiver_name_hash = receiver_name
                 .as_deref()
@@ -5764,7 +5769,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                     enclosing_symbol_id_hash: s.enclosing_symbol_id_hash,
                     // B4: same fn the worker called per-site (byte-identical
                     // dedup keys). Fused into this AoS pass we already pay.
-                    site_partial: site_partial_hash(&s.source_ref_id, &s.edge_kind),
+                    site_partial: site_partial_hash_u64(s.source_ref_id, &s.edge_kind),
                     language_id: compute_language_id(s.language.as_str()),
                     access_kind_id: s.access_kind_id,
                     edge_kind_id: s.edge_kind_id,
@@ -8292,7 +8297,13 @@ fn apply_token_shape_likely_count_baseline(
                             // read the site by index for the rare push — no
                             // `offset_from` pointer recovery.
                             let site = &ref_sites[site_idx as usize];
-                            let edge_key = edge_key_hash(&site.source_ref_id, &symbol.id, &site.edge_kind);
+                            // B6 stage-2: source_ref_id is now u64; build the
+                            // edge_key from the same u64-keyed site_partial as
+                            // site_cols/phase_e (relabeled but bijective).
+                            let edge_key = edge_key_from_partial(
+                                site_partial_hash_u64(site.source_ref_id, &site.edge_kind),
+                                &symbol.id,
+                            );
                             if push_light_resolved_reference(
                                 &mut local_light_refs,
                                 &mut local_dedup,
@@ -8414,22 +8425,30 @@ fn resolve_import_targets<'a>(
     out
 }
 
-fn edge_key_hash(source_ref_id: &str, target_id: &str, edge_kind: &str) -> u64 {
-    edge_key_from_partial(
-        site_partial_hash(source_ref_id, edge_kind),
-        target_id,
-    )
+// B6 stage-2: `edge_key_hash` and the string-keyed `site_partial_hash` were
+// retired — source_ref_id is now a u64, so the only callers use the u64-keyed
+// `site_partial_hash_u64` + `edge_key_from_partial` instead.
+
+/// B6 stage-2: the underlying u64 of `stable_ref_id` (= `stable_hash(key)`),
+/// without ever building the `"ref:HEX16"` string. `RefSite.source_ref_id` is
+/// stored as this u64 (saving ~24B inline + ~24B heap per site, and a 38M
+/// per-site string allocation at parse). `parse_stable_ref_id_to_u64` of the
+/// old string equals this value, so the on-disk encoding is byte-identical.
+#[inline]
+fn stable_ref_id_u64(rel_path: &str, line: u32, column: u32, name: &str) -> u64 {
+    stable_hash(&format!("{rel_path}\0{line}\0{column}\0{name}"))
 }
 
-/// Phase 3 optimization: per-site partial hash (source_ref_id + edge_kind).
-/// Same source ref produces multiple resolutions with different targets;
-/// hashing the site-invariant components once saves N-1 string hashes for
-/// the candidate fan-out.
+/// B6 stage-2: `site_partial_hash` over the u64 source-ref-id. The value differs
+/// from the string-keyed `site_partial_hash` (it mixes the u64, not the
+/// "ref:HEX16" bytes), but source_ref_id ↔ u64 is a bijection so the per-site
+/// `site_partial` stays unique — the dedup behaviour (and thus the reference
+/// invariant) is unchanged; only the key values are relabeled.
 #[inline]
-fn site_partial_hash(source_ref_id: &str, edge_kind: &str) -> u64 {
+fn site_partial_hash_u64(source_ref_id: u64, edge_kind: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = ahash::AHasher::default();
-    source_ref_id.hash(&mut h);
+    h.write_u64(source_ref_id);
     edge_kind.hash(&mut h);
     h.finish()
 }
@@ -8593,7 +8612,7 @@ fn load_light_refs_from_file(path: &Path) -> io::Result<Vec<LightRef>> {
 fn materialize_light_ref(light: &LightRef, ref_sites: &[RefSite]) -> GraphReference {
     let site = &ref_sites[light.site_idx as usize];
     GraphReference {
-        source_ref_id: site.source_ref_id.as_str().into(),
+        source_ref_id: format!("ref:{:016x}", site.source_ref_id).into(), // B6 stage-2: u64→string (cold)
         target_symbol_id: light.target_symbol_id.clone(),
         edge_kind: (&*site.edge_kind).into(),
         name: site.name.as_str().into(),
@@ -8628,7 +8647,7 @@ fn push_resolved_reference(
         return false;
     }
     references.push(GraphReference {
-        source_ref_id: site.source_ref_id.as_str().into(),
+        source_ref_id: format!("ref:{:016x}", site.source_ref_id).into(), // B6 stage-2: u64→string (cold)
         target_symbol_id: Some(target.id.as_str().into()),
         edge_kind: (&*site.edge_kind).into(),
         name: site.name.as_str().into(),
@@ -10368,8 +10387,15 @@ fn serialize_function_return_fact_row(fact: &FunctionReturnFact) -> String {
 }
 
 fn serialize_reference_binary(reference: &GraphReference, file_id: u32, out: &mut Vec<u8>) {
+    // B6 stage-2: parse the string id once (GraphReference keeps it as a string);
+    // non-standard ids fall back to the u64::MAX sentinel + inline string.
+    let (sru, sri) = match parse_stable_ref_id_to_u64(&reference.source_ref_id) {
+        Some(u) => (u, None),
+        None => (u64::MAX, Some(reference.source_ref_id.as_ref())),
+    };
     serialize_reference_record(
-        &reference.source_ref_id,
+        sru,
+        sri,
         reference.target_symbol_id.as_deref(),
         &reference.edge_kind,
         &reference.name,
@@ -10390,7 +10416,12 @@ fn serialize_reference_binary(reference: &GraphReference, file_id: u32, out: &mu
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn serialize_reference_record(
-    source_ref_id: &str,
+    // B6 stage-2: caller passes the pre-parsed u64 (RefSite/LightRef already
+    // store it; the GraphReference path parses once). `source_ref_id_inline` is
+    // Some only for the legacy non-standard case (u64::MAX sentinel) — avoids
+    // reconstructing the "ref:HEX16" string per record on the 14M-record path.
+    source_ref_id_u64: u64,
+    source_ref_id_inline: Option<&str>,
     target_symbol_id: Option<&str>,
     edge_kind: &str,
     name: &str,
@@ -10406,12 +10437,10 @@ fn serialize_reference_record(
     provenance: &str,
     out: &mut Vec<u8>,
 ) {
-    // source_ref_id: u64 if "ref:HEX16"; u64::MAX sentinel = inline str.
-    if let Some(u) = parse_stable_ref_id_to_u64(source_ref_id) {
-        out.extend_from_slice(&u.to_le_bytes());
-    } else {
-        out.extend_from_slice(&u64::MAX.to_le_bytes());
-        write_u16_str(out, source_ref_id);
+    // source_ref_id: u64 if standard; u64::MAX sentinel = inline str follows.
+    out.extend_from_slice(&source_ref_id_u64.to_le_bytes());
+    if source_ref_id_u64 == u64::MAX {
+        write_u16_str(out, source_ref_id_inline.unwrap_or(""));
     }
     // target_symbol_id: 0=none, 1=u64 follows, 2=inline str follows.
     match target_symbol_id {
@@ -10486,7 +10515,8 @@ fn serialize_reference_binary_from_light(
     out: &mut Vec<u8>,
 ) {
     serialize_reference_record(
-        &site.source_ref_id,
+        site.source_ref_id, // B6 stage-2: already a u64; always standard at parse
+        None,
         light.target_symbol_id.as_deref(),
         &site.edge_kind,
         &site.name,
@@ -10954,12 +10984,9 @@ fn serialize_ref_site_binary(site: &RefSite, file_id: u32, out: &mut Vec<u8>) {
     // Phase 3 aggressive: source_ref_id is always "ref:HEX16" produced by
     // stable_ref_id. Encode as raw u64 (8B) instead of 22B string. Use
     // 0xFFFFFFFFFFFFFFFF as sentinel for non-standard ids (legacy input).
-    if let Some(u) = parse_stable_ref_id_to_u64(&site.source_ref_id) {
-        out.extend_from_slice(&u.to_le_bytes());
-    } else {
-        out.extend_from_slice(&u64::MAX.to_le_bytes());
-        write_u16_str(out, &site.source_ref_id);
-    }
+    // B6 stage-2: source_ref_id is already the u64 (always standard at parse).
+    // Byte-identical to the prior parse_stable_ref_id_to_u64 path.
+    out.extend_from_slice(&site.source_ref_id.to_le_bytes());
     write_u16_str(out, &site.name);
     // B6: raw_text is always == name (the field was dropped), so always emit the
     // marker-0 "copy name" case. Byte-identical to the prior output; the reader
@@ -11028,10 +11055,14 @@ fn parse_ref_site_binary(
     }
     let u = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
     *cursor += 8;
-    let source_ref_id = if u == u64::MAX {
-        read_u16_str(bytes, cursor)?
+    // B6 stage-2: RefSite.source_ref_id is a u64. Common path = the u64 read
+    // above. The legacy sentinel (u64::MAX + inline string) is parsed back to a
+    // u64 (or kept as MAX); fresh writes never emit it.
+    let source_ref_id: u64 = if u == u64::MAX {
+        let s = read_u16_str(bytes, cursor)?;
+        parse_stable_ref_id_to_u64(&s).unwrap_or(u64::MAX)
     } else {
-        format!("ref:{:016x}", u)
+        u
     };
     let name = read_u16_str(bytes, cursor)?;
     if *cursor >= bytes.len() {
