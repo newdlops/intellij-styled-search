@@ -15,7 +15,9 @@
 ## ▶ START HERE — 다음 세션 진입점 (W24 종료 시점)
 
 **현재 상태**:
-- **★ W24: B6 착수 — peak RSS 측정(캡 초과 발견) + raw_text 드롭(stage 1).** `/usr/bin/time -l`: **OV1 ON peak 17~18GB(16GB 하드캡 초과!)**, OV1 OFF ~16GB → **OV1(wall −2.8s)이 +2GB peak로 캡 초과**(write 버퍼가 resolve와 공존). B6 stage1=`raw_text` 필드 드롭(불변 `==name`, byte-identical, data −1.8GB + name-clone 제거). **근본=full B6**(RefSite drop −6GB→peak ~11-12GB). **⚠️ OV1 default-ON 재고 필요**(캡 vs wall, 사용자 결정). → 상세 **`### 이번 세션 (W24)`**. 미커밋(graph.rs raw_text 드롭 + optimization.md).
+- **★ W24: B6 착수 — peak RSS 측정(캡 초과 발견) + raw_text 드롭(stage 1).** `/usr/bin/time -l`: **OV1 ON peak 17~18GB(16GB 하드캡 초과!)**, OV1 OFF ~16GB → **OV1(wall −2.8s)이 +2GB peak로 캡 초과**(write 버퍼가 resolve와 공존). B6 stage1=`raw_text` 필드 드롭(불변 `==name`, byte-identical, data −1.8GB + name-clone 제거). **근본=full B6**(RefSite drop −6GB→peak ~11-12GB). **OV1 default-ON 결정=유지**(사용자, wall 우선; +2GB 캡 초과는 full B6까지 감수, 16GB 머신 배포 전 B6 필수). → 상세 **`### 이번 세션 (W24)`**. 커밋 `5a944b9`.
+
+**다음 세션 = full B6 (RefSite AoS retire)**: SiteCols에 복원 컬럼(name_id/source_ref_id_u64/enclosing_id_u64/receiver_name_id/positions) + NameInterner reverse(id→&str) 추가 → resolve-time reader(compute_receiver_resolution/phase_f/materialize) + **OV1의 ref_site disk write(serialize_ref_site_binary)**를 columns서 serialize → resolve 진입 전 `Vec<RefSite>` drop. **−6GB → peak ~11-12GB(OV1 포함 캡 내).** 멀티세션, 단계별 게이트(75/75+invariant 14,372,638+bytes 3,788,145,402). 주의: OV1이 ref_site write를 resolve 중 하므로 serialize도 columns화해야 RefSite drop 가능(W22 scoping보다 큼).
 - **W23: write 재프로파일(타겟 정정) + OV1 구현 — ref_site write를 resolve와 overlap.** index 병목은 reference가 아니라 **ref_site(38M) static write**(references는 이미 채널 overlap). ref_site write를 **resolve scope에 dedicated pool**(W1 패턴)로 spawn, `write_store`가 `skip_ref_sites`로 skip. **paired: index 6544→2802ms(−57%), total −2.8s, byte-identical, deadlock 없음 → default ON 승격**(opt-out `ZOEK_OVERLAP_STATIC_OFF`, channel pipeline서만 활성). default 재검증 14,372,638/3,788,145,402 ✓. **OV2(symbols/facts도 overlap) 시도→❌revert**: index 690ms(−85%)이나 resolve +2.1s contention으로 net −2.3s<OV1 −2.8s → OV1(ref_sites-only)이 sweet spot. 단 OV1 concurrency라 실사용 부하/incremental 추가 관찰 권장. → 상세 **`### 이번 세션 (W23)`**.
 - **W22: phase_e 재프로파일 → 옵션 C 기각 + B6 범위 정정 (코드 변경 0, de-risking 조사).** phase_e 20.6s의 **~65%가 rayon oversubscription parking**(cvwait/semaphore가 `rayon Sleep`/`join_context`, **채널 backpressure 아님**), 실 compute 분산, 대형 맵 probe가 dominant 아님 → **옵션 C는 ❌C2 재현 위험이라 기각**. 사용자 재선택 **B6**. **B6 범위 좁힘**: 디스크 write(1957)가 resolve 전이라 **RefSite를 resolve 직전 drop**하면 −6GB, **디스크/incremental 경로 불변** → 변환은 resolve-time reader 3종(compute_receiver_resolution/phase_f/materialize)만. **⚠️ B6 prize=메모리 −6GB, phase_e wall 이득은 불확실**(hot path 이미 columns). → 상세 **`### 이번 세션 (W22)`**.
 - **W21: parse 공략 — ⚠️ 옵션 A 전제 정정 + P1/P2.** **parse는 tree-sitter가 아니다 — 이미 hand-written regex/string 파서**(`build_file_graph`→`extract_*`, Cargo에 tree-sitter 의존성 없음). 그래서 "tree-sitter를 custom tokenizer로 교체"라는 옵션 A는 **무의미**; 진짜 공략 = 기존 추출 함수의 할당/스캔 최적화. **내장 `ZOEK_PARSE_PROFILE=1`이 parse를 8개 sub-phase로 분해**: ref_sites **46%** > symbol_defs **20%** > type_facts **18%** > import_facts 8% > materialize 7%. **P1**(extract_ref_sites 할당 감축)+**P2**(sanitize Cow). → 상세 아래 **`### 이번 세션 (W21)`**.
@@ -615,8 +617,8 @@ profiling-driven (macOS `sample` PID DURATION) 진단으로 새 hot path 식별 
 
 **W24 진단/결론**:
 - 리빌드 peak가 16GB 캡 경계~초과. **OV1이 캡 초과 주범**(+2GB). **근본 = full B6**(RefSite AoS drop→columns ~90B→−6GB→peak ~11-12GB, 캡 여유+OV1 수용). B6가 OV1을 감당 가능하게 만드는 synergy.
-- **OV1 default-ON 재고(사용자)**: wall −2.8s vs +2GB peak(캡 초과). (a)유지+B6까지 감수 / (b)default-OFF로 캡 우선 / (c)write 버퍼 eager-flush로 peak↓.
-- raw_text 드롭 유지(정확·유익). full B6(columns+interner+RefSite drop)는 다음 세션들.
+- **★ OV1 default-ON 결정 = 유지 (사용자, wall 우선)**: −2.8s wall 위해 +2GB peak(16GB 캡 일시 초과)를 **full B6 완료까지 감수**. captain2 머신은 RAM 넉넉. **단 16GB RAM 유저 머신 배포 전엔 full B6로 peak를 캡 아래로 내려야 함**(또는 그 환경선 `ZOEK_OVERLAP_STATIC_OFF=1`). 즉 OV1+16GB 양립의 전제 = full B6.
+- raw_text 드롭 유지(정확·유익). **다음 세션: full B6**(columns+interner+RefSite drop, −6GB) — OV1을 캡 내로 수용하는 근본 작업.
 
 ---
 
