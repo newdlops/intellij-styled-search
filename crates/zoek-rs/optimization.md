@@ -12,9 +12,10 @@
 
 ---
 
-## ▶ START HERE — 다음 세션 진입점 (W26 종료 시점)
+## ▶ START HERE — 다음 세션 진입점 (W27 종료 시점)
 
 **현재 상태**:
+- **★ W27: B6 종료(메모리 목표 미달) → wall 10s 공략으로 전환 (사용자 선택: 점진, ~20-25s 목표).** 재프로파일(현 ~34s): discover 2.6 / **parse 8.83** / **resolve 22.84**(prep 3.36 + phase_a~d 4.5 + **phase_e 8.67** + phase_f 1.23 + **writer-drain-tail ~5**) / index ~0. **솔직한 평가: 10s는 점진 누적 불가(잘해야 ~20-25s), 아키텍처(W13 Parse-Resolve fusion 등) 필요.** ✅ **wall-W1: interner 빌드 병렬화** — 38M site + 16M receiver 이름의 sequential intern(~2.4s, stage-5가 추가한 회귀)을 **par_fold로 distinct(~1M) 수집 후 intern**. interner id는 내부값(consumer는 `name(get())` round-trip, hot map은 name_hash) → **byte-identical**. **resolve-prep 3.36→1.73s(−1.63s)**, 75/75 + bytes 3,788,145,402. **남은 점진 레버는 더 어려움**(phase_e parking·writer-drain backpressure는 W22/W14서 탐구; phase_a/b 맵빌드 병렬화는 Vec-ordering byte-identity 위험). → 상세 **`### 이번 세션 (W27)`**.
 - **★ W26: B6 stage-4 — `name`/`receiver_name` → NameInterner u32 id (reverse table) + 양쪽 reader 복원 (byte-identical).** stage-5(`Vec<RefSite>` drop) 토대. **NameInterner에 reverse `names: Vec<Box<str>>`(id→&str) 추가**(forward `ids`는 collision-free string-key 유지 → 복원 byte-exact). `rebuild_graph_native` 분기 전에 **symbol name + 전 receiver intern → `site_name_ids`/`site_receiver_name_ids` 컬럼**(par populate, channel writer가 resolve와 동시 소비하므로 scope 전 빌드). **write path(14M)**: `serialize_reference_binary_from_light`가 `interner.name(site_name_ids[idx])`로 `name` 복원(**fallback 없음** → MISS면 bytes 발산). **가설 입증**: emitted reference의 name은 항상 타겟 symbol name(bare/member 모두 symbol-keyed 매치 필요)이라 symbol interner로 14M 전부 hit(MISS 0, bytes 게이트 확인). **worker cold**: `resolve_ref_sites_a_to_e`에 `receiver_recon: Option<(&NameInterner,&[u32])>` 추가, column cache-miss서 receiver 복원(string-key라 byte-exact); `rel_path`는 아직 site(stage-5 file_id). materialize/push는 channel write path 아님 → 미변경. **게이트 통과: 75/75 + invariant 14,372,638 + bytes 3,788,145,402 + schemaVersion 20(완전 byte-identical, name·receiver 복원 둘 다).** ⚠️ **메모리는 전이적 +~330MB**(interner+2 id 컬럼이 Vec<RefSite> 위에 얹힘) — **win은 stage-5(Vec drop −7.6GB)**. → 상세 **`### 이번 세션 (W26)`**.
 - **★★ W26 같은 세션 stage-5 (5a~5d) 완료 = `Vec<RefSite>` drop, byte-identical — 단 메모리 win 없음(중요 발견).** (사용자 선택 A 전 필드 컬럼화→OV1 유지; 결과 보고 후 **유지(keep)** 결정.) 5a reference writer→RefWriteCol, 5b OV1 disk writer→`serialize_ref_site_binary_from_cols`(probe로 unknown-language=0 확인→fallback 문자열 불요; interner를 전 site name으로 확장), 5c worker/buckets→site_cols+file_id, 5d `build_site_cols` 후 resolve 전 `ref_sites=Vec::new()`(drop_ref_sites=overlap_static&&soa_on, force_columns로 struct 경로 차단). **게이트: 75/75 + invariant 14,372,638 + bytes 3,788,145,402(channel+fallback 둘 다) + schemaVersion 20.** ⚠️ **메모리 win 거의 없음 (paired로 확정).** drop ON/OFF paired(`ZOEK_B6_KEEP_REFSITES` 토글, peak RSS는 프로세스값이라 신뢰): **ON ~15.07GB vs OFF ~15.54GB → drop이 peak를 ~0.5GB만 줄임(7.6 아님)**. **peak는 build-window**(parse가 ref_sites+symbols+facts ~9.1GB 후 컬럼 ~4GB 적층, ON/OFF 동일)이고 drop은 그 이후. **→ B6(resolve-time ref_sites drop)로 −6GB 불가능 확정.** 진짜 레버=parse base 또는 resolution 맵 축소. wall은 미측정(idle 필요). 상세 **full B6 stage-5 항목** + **`### 이번 세션 (W26)`**.
 - **다음 작업 후보**: (1) **resolution 맵 메모리 축소**(peak 실주범 — symbols_by_file_and_name 등 ~10GB; 메모리 우선이면 여기). (2) stage-5 유지했으니 **matched-idle paired로 wall(5a의 file_table probe 제거 등) + peak 정밀 재측정**(단일측정 ±1GB 노이즈). (3) 30s wall 목표면 parse 스캔/index 잔여(W21 후보). **B6은 메모리 목표 미달로 종료 — 추가 ref_sites 컬럼화 무의미.**
@@ -620,6 +621,31 @@ profiling-driven (macOS `sample` PID DURATION) 진단으로 새 hot path 식별 
 **환경 변수 추가**: `ZOEK_SOA_B4=1` — column-only worker ON (default OFF=struct HEAD). `ZOEK_SOA_B3`(prefilter)와 독립.
 
 **B3+B4 승격 권장 (다음 세션 첫 후보)**: B3(prefilter −1.8s) + B4(worker −3.2s) 둘 다 strict-improvement·invariant 검증 완료. gate 제거(default ON) → cold rebuild에서 phase_e+prefilter 합 **−5s** 실현. 단 struct 경로 삭제는 B6(RefSite retire)와 묶는 게 깔끔 → 판단은 사용자. 현재는 둘 다 gated(안전). **→ W20에서 승격 완료(struct 경로는 `ZOEK_SOA_OFF` opt-out으로 보존, 삭제는 B6).**
+
+---
+
+### 이번 세션 (W27) — B6 종료 → wall 10s 공략 전환 + wall-W1 (interner 빌드 병렬화)
+
+**먼저 한 일**: B6 stage-5 paired peak 측정(W26)으로 ref_sites drop이 peak를 ~0.5GB만 줄임을 확정 → **B6은 메모리 목표(−6GB) 미달로 종료**. 사용자 결정: 문서 1순위 목표인 **wall(≤10s) 공략, 점진(안전) 스코프 ~20-25s**.
+
+**재프로파일 (현 ~34s, 단일 run·load 영향이라 비율만 신뢰)**:
+- discover 2.59s / **parse 8.83s** / **resolve 22.84s** / index ~0(OV1로 흡수).
+- resolve 분해: prep 3.36s(interner+컬럼+file_table 빌드) + phase_a 2.16 + b 0.89 + c 0.78 + d 0.63 + prefilter 0.05 + **phase_e 8.67** + phase_f 1.23 + **writer-drain-tail ~5s**(채널 writer가 phase_f 후 9.18M lights drain).
+- **솔직한 평가**: 10s는 점진 누적 불가(easy win은 W20-23서 소진). 잘해야 ~20-25s. **10s는 아키텍처(W13 카드: Parse-Resolve fusion −15~20s / mmap / persistent+delta) 필요** — 사용자가 점진 선택.
+- ⚠️ **부수 발견**: stage-5의 interner site-name 확장이 resolve-prep에 ~1.5s 더함(메모리 0.5GB 위해) — wall 목표인 지금은 회귀 → W1로 회복.
+
+**✅ wall-W1: interner 빌드 병렬화**:
+- 문제: symbols 후 **38M site name + 16M receiver를 sequential intern**(~2.4s). stage-5가 site-name 부분을 추가.
+- 해결: `ref_sites.par_iter().fold(.. AHashMap<&str,u64> ..).reduce(..)`로 **distinct (name,hash) 병렬 수집**(unique ~1M) 후 그것만 intern. symbols는 먼저 순서대로 intern(id 안정).
+- **byte-identical 근거**: interner id는 **내부값뿐** — 모든 consumer가 `name(get(s))`로 round-trip, hot resolve 맵은 name_hash로 키잉(id 아님). distinct 순회 순서(비결정)가 site/receiver id를 바꿔도 출력 불변. (대조: file_table id는 disk file_id로 **외부 노출**이라 같은 트릭 불가 — 순서 보존 필요.)
+- **측정**: resolve-prep **3.36s→1.73s (−1.63s)**(resolve_ms−stream_references). 75/75 + invariant 14,372,638 + **bytes 3,788,145,402** + schemaVersion 20. (이 run은 load↑로 phase_e 8.67→9.99 출렁여 resolve total은 가려짐; prep delta는 신뢰. 정확 net wall은 captain idle 필요.)
+
+**다음 점진 레버 (전부 W1보다 어렵/위험)**:
+- **writer-drain-tail ~5s**: 채널 writer가 phase_f의 9.18M lights를 bulk-send 후 drain(W14가 phase_f streaming→backpressure로 revert). writer 스레드↑/배칭 여지 있으나 W1/W2 이미 탐구.
+- **phase_e 8.67s**: W22 ~65% rayon parking(memory-stall), 공략 어려움(옵션 C ❌C2 위험으로 기각됨).
+- **parse 8.83s**: W21 P1/P2 후 잔여=스캔(sanitize/tokens)·file I/O(135K)·malloc 경합.
+- **phase_a/b 맵빌드 병렬화**: sharded build+merge로 −1~1.5s 가능하나 **Vec<&symbol> ordering이 출력에 영향 시 byte 위험** — 신중 검증 필요.
+- **측정 주의**: wall은 captain(VSCode) 종료해 idle여야 신뢰(문서 반복 경고). 구현+byte-identical 게이트는 captain 켜둔 채 가능하나, net wall 확정은 idle paired 필요.
 
 ---
 

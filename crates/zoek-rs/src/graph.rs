@@ -2208,10 +2208,35 @@ where
     for symbol in &symbols {
         name_interner.intern(&symbol.name, symbol.name_hash);
     }
-    for site in &ref_sites {
-        name_interner.intern(&site.name, site.name_hash);
-        if let Some(receiver) = &site.receiver_name {
-            name_interner.intern(receiver, site.receiver_name_hash);
+    // wall-W1: the sequential intern of all 38M site names + 16M receivers was
+    // ~2.4s of resolve-prep. Collect the DISTINCT (name, hash) pairs in parallel
+    // (the unique set is ~1M, not 54M), then intern those. The interner ids are
+    // internal only — every consumer round-trips through `name(get(s))`, and the
+    // hot resolve maps key on `name_hash`, not the id — so the (nondeterministic)
+    // distinct-iteration order that assigns site/receiver ids leaves the output
+    // byte-identical (symbols are interned first, in order, keeping their ids).
+    {
+        use rayon::prelude::*;
+        let distinct: AHashMap<&str, u64> = ref_sites
+            .par_iter()
+            .fold(AHashMap::default, |mut acc: AHashMap<&str, u64>, s| {
+                acc.entry(s.name.as_str()).or_insert(s.name_hash);
+                if let Some(r) = &s.receiver_name {
+                    acc.entry(r.as_str()).or_insert(s.receiver_name_hash);
+                }
+                acc
+            })
+            .reduce(AHashMap::default, |mut a, mut b| {
+                // Same name -> same hash, so extend (overwrite) is harmless;
+                // extend the smaller into the larger to minimize rehashing.
+                if a.len() < b.len() {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                a.extend(b);
+                a
+            });
+        for (name, hash) in distinct {
+            name_interner.intern(name, hash);
         }
     }
     let (site_name_ids, site_receiver_name_ids): (Vec<u32>, Vec<u32>) = {
