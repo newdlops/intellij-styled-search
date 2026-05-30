@@ -903,6 +903,31 @@ struct RefWriteCol {
     end_line: u32,
     end_column: u32,
     edge_kind_id: u8,
+    // B6 stage-5b: the extra columns the OV1 ref_site DISK writer needs (the
+    // reference writer ignores them). With these, `serialize_ref_site_binary`
+    // reconstructs the full 38M-site disk record from this column +
+    // `site_receiver_name_ids` + the interner — no `RefSite`. `language_id`
+    // mirrors `SiteCols`/`compute_language_id`; `flags` mirrors `SiteCols`
+    // (is_definition / has_receiver / is_import_context).
+    language_id: u16,
+    access_kind_id: u8,
+    flags: u8,
+}
+
+/// B6 stage-4/5c: the columns the resolve worker's cold per-file cache-miss
+/// needs to rebuild a site's strings without dereferencing `RefSite`, so the
+/// `Vec<RefSite>` can be dropped before resolve (stage-5d). `Some` on the
+/// full-rebuild paths (the interner/columns are built there); `None` for
+/// incremental/legacy/test, which keep reading `RefSite`.
+/// - `receiver_name` ← `interner.name(receiver_name_ids[idx])` (stage-4).
+/// - `rel_path` ← `file_table.get_path(file_ids[idx])` when `file` is `Some`
+///   (stage-5c, channel path); `None` keeps reading `site.rel_path` (the
+///   fallback path still has `ref_sites`, so it need not reconstruct).
+#[derive(Clone, Copy)]
+struct SiteReconCols<'a> {
+    interner: &'a NameInterner,
+    receiver_name_ids: &'a [u32],
+    file: Option<(&'a FileTable, &'a [u32])>,
 }
 
 #[derive(Clone, Debug)]
@@ -2157,7 +2182,7 @@ where
         message: format!("materializing serving graph (parsing {parsing_ms}ms)"),
     });
     let symbols = std::mem::take(&mut accum.symbols);
-    let ref_sites = std::mem::take(&mut accum.ref_sites);
+    let mut ref_sites = std::mem::take(&mut accum.ref_sites);
     let import_facts = std::mem::take(&mut accum.import_facts);
     let type_facts = std::mem::take(&mut accum.type_facts);
     let function_return_facts = std::mem::take(&mut accum.function_return_facts);
@@ -2165,27 +2190,26 @@ where
     let fact_generation_hash = accum.fact_generation_hash;
     let symbol_def_count = accum.symbol_def_count;
     let skip_resolve = std::env::var("ZOEK_SKIP_RESOLVE").is_ok();
-    // B6 stage-4: intern symbol names with a reverse table, plus a per-site
-    // `name_id` column, so the 14M-record write path (both the channel writer
-    // and the `ZOEK_DISABLE_LIGHT_CHANNEL` fallback `stream_lights_to_sidecars`)
-    // reconstructs each reference's `name` from a `u32` id instead of reading
-    // `RefSite.name`. Every emitted reference's name is the target symbol's name
-    // (bare and member resolution both match the site name against a
-    // symbol-keyed map), so the symbol-name interner covers them; a non-symbol
-    // site name (interner MISS) never resolves to a target, so it never reaches
-    // a write path. Built before resolve (the channel writer thread drains it
-    // concurrently with the resolve phases). Toehold for stage-5 (dropping
-    // `Vec<RefSite>` before resolve).
+    // B6 stage-4/5b: a NameInterner over symbol names + every site name + every
+    // receiver name (with a reverse table), so the per-site `name_id` /
+    // `receiver_name_id` columns reconstruct the strings byte-exactly once
+    // `Vec<RefSite>` is dropped (stage-5d). Symbols are interned first (their
+    // ids are what the resolve maps key on); site/receiver names that aren't
+    // symbols get fresh ids used only on the cold reconstruction paths.
+    // Interning is string-keyed (collision-free) and idempotent, so the later
+    // site/receiver passes never change a symbol name's id — the stage-4
+    // reference-writer output (emitted name == a symbol name) stays
+    // byte-identical. ALL site names must be interned because the OV1 disk
+    // writer (`serialize_ref_site_binary`) serializes every one of the 38M
+    // sites' names, not just the ~14M emitted ones (a symbol-only interner
+    // would MISS the ~6.7% non-symbol site names). Built before resolve (the
+    // channel writer + OV1 disk writer drain it concurrently with resolve).
     let mut name_interner = NameInterner::with_capacity(symbols.len() + 1024);
     for symbol in &symbols {
         name_interner.intern(&symbol.name, symbol.name_hash);
     }
-    // Receivers are interned too (they may be locals/`self`/`cls` — not in the
-    // symbol set), so the column worker's per-file receiver cache-miss can
-    // rebuild `receiver_name` from a `u32` id once `Vec<RefSite>` is dropped
-    // (stage-5). String-keyed intern is collision-free, so reconstruction is
-    // byte-exact.
     for site in &ref_sites {
+        name_interner.intern(&site.name, site.name_hash);
         if let Some(receiver) = &site.receiver_name {
             name_interner.intern(receiver, site.receiver_name_hash);
         }
@@ -2228,6 +2252,11 @@ where
     // scope); falls back automatically when the channel is disabled.
     let overlap_static =
         use_channel_pipeline && std::env::var("ZOEK_OVERLAP_STATIC_OFF").is_err();
+    // B6 stage-5d: drop `Vec<RefSite>` before resolve only when every reader is
+    // columnized — the channel pipeline (5a/5b/5c readers), SoA on (column
+    // resolve paths, else the struct paths read ref_sites), and OV1 on (else the
+    // index-phase `write_store` writes ref_sites from the AoS). Otherwise keep it.
+    let drop_ref_sites = overlap_static && std::env::var("ZOEK_SOA_OFF").is_err();
     // W23: bytes written by the overlapped ref_site writer (0 unless overlapped).
     // `write_store` skips ref_sites when overlapping, so its reported `bytes`
     // omits them; add this back so the summary total stays accurate.
@@ -2284,14 +2313,39 @@ where
             .filter(|n| *n > 0)
             .unwrap_or(1024);
         let (tx, rx) = crossbeam_channel::bounded::<Vec<LightRef>>(channel_cap);
-        // B6 stage-5a: reference write columns (file_table now complete). The
-        // writer thread reads only this — no `RefSite`, no per-record file_table.
-        let write_cols = build_ref_write_cols(&ref_sites, &stream_file_table, &site_name_ids);
+        // B6 stage-5a/5c: file_id column + reference write columns (file_table
+        // now complete). The writer thread reads only RefWriteCol; the resolve
+        // worker rebuilds rel_path from site_file_ids + file_table (no RefSite).
+        let site_file_ids = build_site_file_ids(&ref_sites, &stream_file_table);
+        let write_cols = build_ref_write_cols(&ref_sites, &site_file_ids, &site_name_ids);
+        // B6 stage-5d: build the hot-path SiteCols column here (was inside
+        // resolve) so `Vec<RefSite>` can be freed before the resolve phases —
+        // every channel-path reader (reference writer 5a, worker/prefilter 5c,
+        // OV1 disk writer 5b) now reads columns, not RefSite.
+        let site_cols = build_site_cols(&ref_sites);
+        if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
+            use rayon::prelude::*;
+            let unknown = ref_sites
+                .par_iter()
+                .filter(|s| compute_language_id(&s.language) == LANG_UNKNOWN)
+                .count();
+            eprintln!("[b6-5b] unknown_language_sites={unknown} / {}", ref_sites.len());
+        }
+        // B6 stage-5d: free the ~7.6GB `Vec<RefSite>` before resolve. Guarded on
+        // `drop_ref_sites` (= channel + SoA-on + OV1-on): the columns above cover
+        // every channel-path reader, and `write_store` skips ref_sites under OV1.
+        // When off (ZOEK_SOA_OFF / ZOEK_OVERLAP_STATIC_OFF) ref_sites stays so the
+        // struct paths / index-phase ref_site write still work.
+        if drop_ref_sites {
+            ref_sites = Vec::new();
+        }
         let symbols_ref = &symbols;
         let ref_sites_ref = &ref_sites;
         let name_interner_ref = &name_interner;
         let write_cols_ref = &write_cols;
+        let site_cols_ref = &site_cols;
         let site_receiver_name_ids_ref = &site_receiver_name_ids;
+        let site_file_ids_ref = &site_file_ids;
         let import_facts_ref = &import_facts;
         let type_facts_ref = &type_facts;
         let function_return_facts_ref = &function_return_facts;
@@ -2335,12 +2389,16 @@ where
                                 )
                             })?;
                         pool.install(|| {
-                            write_ref_sites_by_file_shards(
+                            // B6 stage-5b: OV1 disk writer reads the columns, not
+                            // ref_sites — so ref_sites can be dropped before
+                            // resolve (stage-5d).
+                            write_ref_sites_by_file_shards_cols(
                                 workspace_root,
                                 config,
-                                ref_sites_ref,
+                                write_cols_ref,
+                                site_receiver_name_ids_ref,
+                                name_interner_ref,
                                 stream_file_table_ref,
-                                None,
                             )
                         })
                     }))
@@ -2354,7 +2412,18 @@ where
                     type_facts_ref,
                     function_return_facts_ref,
                     hierarchy_facts_ref,
-                    Some((name_interner_ref, site_receiver_name_ids_ref)),
+                    // B6 stage-5c: full column reconstruction (receiver + rel_path
+                    // via file_id) so the worker reads no RefSite — toward 5d drop.
+                    Some(SiteReconCols {
+                        interner: name_interner_ref,
+                        receiver_name_ids: site_receiver_name_ids_ref,
+                        file: Some((stream_file_table_ref, site_file_ids_ref)),
+                    }),
+                    // B6 stage-5d: SiteCols pre-built above; force columns so the
+                    // struct paths (which would index the dropped ref_sites) are
+                    // never taken.
+                    Some(site_cols_ref),
+                    drop_ref_sites,
                     Some(&tx),
                 );
                 // F1.b: phase F's lights were buffered (phase_f wall avoids
@@ -2416,7 +2485,16 @@ where
                 &type_facts,
                 &function_return_facts,
                 &hierarchy_facts,
-                Some((&name_interner, &site_receiver_name_ids)),
+                // B6 stage-5c: fallback keeps `ref_sites` (not dropped), so the
+                // worker reads `site.rel_path` directly — `file: None`. Receiver
+                // still reconstructs from the interner (built before the branch).
+                Some(SiteReconCols {
+                    interner: &name_interner,
+                    receiver_name_ids: &site_receiver_name_ids,
+                    file: None,
+                }),
+                None,  // B6 stage-5d: fallback keeps ref_sites → build SiteCols internally
+                false, // force_columns: respect ZOEK_SOA_OFF (ref_sites present)
                 None,
             )
         };
@@ -2460,9 +2538,10 @@ where
             && !resolution.light_references.is_empty();
         let (_streamed_bytes, refs_emitted) = if use_light_stream {
             drop(resolution.references);
-            // B6 stage-5a: reference write columns (file_table complete).
+            // B6 stage-5a/5c: file_id + reference write columns (file_table complete).
+            let site_file_ids = build_site_file_ids(&ref_sites, &stream_file_table);
             let write_cols =
-                build_ref_write_cols(&ref_sites, &stream_file_table, &site_name_ids);
+                build_ref_write_cols(&ref_sites, &site_file_ids, &site_name_ids);
             let r = stream_lights_to_sidecars(
                 workspace_root,
                 config,
@@ -2720,6 +2799,8 @@ pub fn update_graph_native(
         &function_return_facts,
         &hierarchy_facts,
         None, // B6 stage-4: incremental path keeps reading RefSite.receiver_name
+        None, // prebuilt_site_cols: build internally
+        false, // force_columns: respect ZOEK_SOA_OFF
         None,
     );
     if probe { eprintln!("[flow] resolve_a_to_e={}ms", _t.elapsed().as_millis()); }
@@ -2760,6 +2841,7 @@ pub fn update_graph_native(
         &mut intermediate.dedup,
         &mut intermediate.reference_partials,
         None,
+        None, // B6 stage-5d: incremental path keeps ref_sites (no prebuilt SiteCols)
     );
     intermediate.light_references = light_in;
     intermediate.light_references.append(&mut light_out_f);
@@ -5392,6 +5474,8 @@ fn resolve_ref_sites(
         function_return_facts,
         hierarchy_facts,
         None, // B6 stage-4: legacy path keeps reading RefSite.receiver_name
+        None, // prebuilt_site_cols: build internally
+        false, // force_columns: respect ZOEK_SOA_OFF
         None,
     );
     let _t_pf = std::time::Instant::now();
@@ -5426,6 +5510,7 @@ fn resolve_ref_sites(
         &mut intermediate.dedup,
         &mut intermediate.reference_partials,
         None,
+        None, // B6 stage-5d: legacy path keeps ref_sites (no prebuilt SiteCols)
     );
     intermediate.light_references = light_in;
     intermediate.light_references.append(&mut light_out_f);
@@ -5452,9 +5537,12 @@ fn resolve_ref_sites_for_rebuild(
     type_facts: &[TypeFact],
     function_return_facts: &[FunctionReturnFact],
     hierarchy_facts: &[HierarchyFact],
-    // B6 stage-4: pass-through `Some((interner, receiver_name_ids))` so the
-    // column worker rebuilds `receiver_name` from a `u32` id (stage-5 toehold).
-    receiver_recon: Option<(&NameInterner, &[u32])>,
+    // B6 stage-4/5c: pass-through column reconstruction (receiver + rel_path).
+    recon: Option<SiteReconCols>,
+    // B6 stage-5d: pass-through pre-built SiteCols + force-columns (channel
+    // rebuild that dropped `ref_sites`).
+    prebuilt_site_cols: Option<&[SiteCols]>,
+    force_columns: bool,
     // F1.b: pass-through. `Some(&sender)` enables the channel-driven write
     // pipeline for phase E workers (their LightRef batches stream into the
     // writer thread). Phase F continues to accumulate into `light_out_f` so
@@ -5470,7 +5558,9 @@ fn resolve_ref_sites_for_rebuild(
         type_facts,
         function_return_facts,
         hierarchy_facts,
-        receiver_recon,
+        recon,
+        prebuilt_site_cols,
+        force_columns,
         light_sender,
     );
     for path in std::mem::take(&mut intermediate.reference_partials) {
@@ -5520,6 +5610,7 @@ fn resolve_ref_sites_for_rebuild(
         &mut intermediate.dedup,
         &mut intermediate.reference_partials,
         phase_f_sender,
+        prebuilt_site_cols, // B6 stage-5d: site_partial from SiteCols when ref_sites dropped
     );
     if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
         eprintln!(
@@ -5573,10 +5664,13 @@ struct PhaseEFileBucket {
 }
 
 fn build_phase_e_file_buckets(
-    ref_sites: &[RefSite],
+    // B6 stage-5c: reads only `rel_path_hash` (in `SiteCols`), so it no longer
+    // dereferences `RefSite` — one of the two remaining column-path reads to
+    // clear before `Vec<RefSite>` can be dropped.
+    site_cols: &[SiteCols],
     indices: Option<&[u32]>,
 ) -> Vec<PhaseEFileBucket> {
-    let total = indices.map(|i| i.len()).unwrap_or(ref_sites.len());
+    let total = indices.map(|i| i.len()).unwrap_or(site_cols.len());
     if total == 0 {
         return Vec::new();
     }
@@ -5598,13 +5692,13 @@ fn build_phase_e_file_buckets(
     match indices {
         Some(idxs) => {
             for &idx in idxs {
-                let hash = ref_sites[idx as usize].rel_path_hash;
+                let hash = site_cols[idx as usize].rel_path_hash;
                 push_index(&mut buckets, idx, hash);
             }
         }
         None => {
-            for (i, site) in ref_sites.iter().enumerate() {
-                push_index(&mut buckets, i as u32, site.rel_path_hash);
+            for (i, c) in site_cols.iter().enumerate() {
+                push_index(&mut buckets, i as u32, c.rel_path_hash);
             }
         }
     }
@@ -5619,11 +5713,19 @@ fn resolve_ref_sites_a_to_e<'a>(
     type_facts: &'a [TypeFact],
     function_return_facts: &'a [FunctionReturnFact],
     hierarchy_facts: &'a [HierarchyFact],
-    // B6 stage-4: `Some((interner, receiver_name_ids))` lets the column
-    // worker's per-file receiver cache-miss rebuild `receiver_name` from a
-    // `u32` id (stage-5 toehold). `None` on incremental/legacy/test paths,
-    // which keep reading `RefSite.receiver_name`.
-    receiver_recon: Option<(&'a NameInterner, &'a [u32])>,
+    // B6 stage-4/5c: when `Some`, the column worker's per-file cache-miss
+    // rebuilds `receiver_name` (and, when `recon.file` is `Some`, `rel_path`)
+    // from `u32` id columns instead of `RefSite` — the toehold for dropping
+    // `Vec<RefSite>` (stage-5d). `None` on incremental/legacy/test paths.
+    recon: Option<SiteReconCols<'a>>,
+    // B6 stage-5d: when `Some`, `SiteCols` was built before resolve (so
+    // `Vec<RefSite>` could be dropped) and is used as-is; `None` builds it from
+    // `ref_sites` (incremental/legacy/test/fallback). `force_columns` forces the
+    // SoA column paths on (ignoring `ZOEK_SOA_OFF`) so the struct paths — which
+    // would index a dropped/empty `ref_sites` — are never taken on the channel
+    // rebuild that dropped `ref_sites`.
+    prebuilt_site_cols: Option<&'a [SiteCols]>,
+    force_columns: bool,
     // F1.b: when `Some`, phase E workers stream LightRef batches into this
     // channel instead of accumulating a per-worker `Vec<LightRef>`. The
     // returned `light_references` is left empty (channel sink drains them).
@@ -5859,49 +5961,31 @@ fn resolve_ref_sites_a_to_e<'a>(
     // (all fields precomputed at parse), so the move is order-safe; the total
     // work is unchanged, only its position.
     let t_slang = std::time::Instant::now();
-    let site_cols: Vec<SiteCols> = {
-        use rayon::prelude::*;
-        ref_sites
-            .par_iter()
-            .map(|s| {
-                let mut flags = 0u8;
-                if s.is_definition {
-                    flags |= SITE_FLAG_IS_DEFINITION;
-                }
-                if s.receiver_name.is_some() {
-                    flags |= SITE_FLAG_HAS_RECEIVER;
-                }
-                if s.is_import_context {
-                    flags |= SITE_FLAG_IS_IMPORT_CONTEXT;
-                }
-                SiteCols {
-                    name_hash: s.name_hash,
-                    rel_path_hash: s.rel_path_hash,
-                    receiver_name_hash: s.receiver_name_hash,
-                    enclosing_id: s.enclosing_id,
-                    // B4: same fn the worker called per-site (byte-identical
-                    // dedup keys). Fused into this AoS pass we already pay.
-                    site_partial: site_partial_hash_u64(s.source_ref_id, &s.edge_kind),
-                    language_id: compute_language_id(s.language.as_str()),
-                    access_kind_id: s.access_kind_id,
-                    edge_kind_id: s.edge_kind_id,
-                    flags,
-                }
-            })
-            .collect()
+    // B6 stage-5d: use the pre-built `SiteCols` when the caller built it before
+    // resolve (channel rebuild that dropped `ref_sites`); otherwise build it
+    // here from `ref_sites` (behaviour-identical to the prior inline build).
+    let site_cols_owned: Vec<SiteCols>;
+    let site_cols: &[SiteCols] = match prebuilt_site_cols {
+        Some(c) => c,
+        None => {
+            site_cols_owned = build_site_cols(ref_sites);
+            &site_cols_owned
+        }
     };
     if probe { eprintln!("[resolve] site_cols_build={}ms n={}", t_slang.elapsed().as_millis(), site_cols.len()); }
     let t_c = std::time::Instant::now();
-    let phase_c_total = ref_sites.len();
+    // B6 stage-5d: site count from `site_cols` (full length) — `ref_sites` may be
+    // dropped/empty on the channel rebuild.
+    let phase_c_total = site_cols.len();
     let phase_c_workers = graph_worker_count(phase_c_total.max(1));
     // B5: column-only phase C reads `SiteCols`. Promoted to the default after
     // the invariant held (14,372,638) and phase_c measured −32% (2408→1636ms,
     // paired). `ZOEK_SOA_OFF` reverts to the struct read for A/B / debugging.
     // Both paths probe the name-hash set and key the "may"/"likely" maps
     // identically, so only the per-site field read differs (48B vs 292B).
-    let soa_b5 = std::env::var("ZOEK_SOA_OFF").is_err();
+    let soa_b5 = force_columns || std::env::var("ZOEK_SOA_OFF").is_err();
     let symbol_name_hashes_ref = &symbol_name_hashes;
-    let site_cols_ref = &site_cols;
+    let site_cols_ref = site_cols;
     let phase_c_outputs = if phase_c_total == 0 || phase_c_workers <= 1 {
         vec![phase_c_process_chunk(
             ref_sites,
@@ -5910,6 +5994,7 @@ fn resolve_ref_sites_a_to_e<'a>(
             phase_c_total,
             symbol_name_hashes_ref,
             soa_b5,
+            recon.and_then(|r| r.file),
         )]
     } else {
         use rayon::prelude::*;
@@ -5930,6 +6015,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                     end,
                     symbol_name_hashes_ref,
                     soa_b5,
+                    recon.and_then(|r| r.file),
                 )
             })
             .collect()
@@ -6041,7 +6127,7 @@ fn resolve_ref_sites_a_to_e<'a>(
         None => {
             use rayon::prelude::*;
             let chunks_per_worker = 8usize;
-            let total = ref_sites.len();
+            let total = site_cols.len(); // B6 stage-5d: ref_sites may be dropped
             let workers = graph_resolve_e_worker_count(total.max(1));
             let target_chunks = workers.saturating_mul(chunks_per_worker).max(workers);
             let chunk_size = total.div_ceil(target_chunks).max(1);
@@ -6066,9 +6152,9 @@ fn resolve_ref_sites_a_to_e<'a>(
             // struct — the whole point of the SoA migration. Promoted to the
             // default (W18 measured −83%, 5.8x). `ZOEK_SOA_OFF` reverts to the
             // W16 struct-reading path for paired ON/OFF measurement.
-            let soa_b3 = std::env::var("ZOEK_SOA_OFF").is_err();
+            let soa_b3 = force_columns || std::env::var("ZOEK_SOA_OFF").is_err();
             let mut chunk_outputs: Vec<Vec<u32>> = if soa_b3 {
-                let site_cols_pf = &site_cols;
+                let site_cols_pf = site_cols;
                 // Side sets so the column path needs no `&str`: self/cls and the
                 // type-name / star-import-file probes the default path does as
                 // string lookups become precomputed-hash probes. Productivity
@@ -6205,7 +6291,7 @@ fn resolve_ref_sites_a_to_e<'a>(
         }
     };
     if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
-        let total_pre = ref_sites.len();
+        let total_pre = site_cols.len(); // B6 stage-5d: ref_sites may be dropped
         let total_post = phase_e_indices_effective.map(|i| i.len()).unwrap_or(total_pre);
         eprintln!(
             "[resolve] phase_e_prefilter={}ms before={total_pre} after={total_post}",
@@ -6214,12 +6300,12 @@ fn resolve_ref_sites_a_to_e<'a>(
     }
     let t_e = std::time::Instant::now();
 
-    let total_refs = phase_e_indices_effective.map(|i| i.len()).unwrap_or(ref_sites.len());
+    let total_refs = phase_e_indices_effective.map(|i| i.len()).unwrap_or(site_cols.len());
     // Option C Stage 1: bucket phase E site indices by file (rel_path_hash).
     // Rayon dispatch now chunks buckets keeping each file's sites together —
     // foundation for stages 2-4 (per-file receiver cache, per-file local
     // sub-maps, per-file mini-context). On its own this is a pure refactor.
-    let phase_e_buckets = build_phase_e_file_buckets(ref_sites, phase_e_indices_effective);
+    let phase_e_buckets = build_phase_e_file_buckets(site_cols, phase_e_indices_effective);
     if probe {
         let avg = if phase_e_buckets.is_empty() {
             0
@@ -6249,7 +6335,7 @@ fn resolve_ref_sites_a_to_e<'a>(
     // `compute_receiver_resolution` once per distinct receiver). Promoted to
     // the default (W19 measured phase_e −16%, paired). `ZOEK_SOA_OFF` reverts
     // to the W16 struct path for paired ON/OFF measurement.
-    let soa_b4 = std::env::var("ZOEK_SOA_OFF").is_err();
+    let soa_b4 = force_columns || std::env::var("ZOEK_SOA_OFF").is_err();
     // B4 column pre-screen side-set: receiver-name hashes that match a type
     // name. Mirrors the struct path's `types_by_name.contains_key(receiver)`
     // without a `&str` read. A hash collision can only *admit* a receiver to
@@ -6408,25 +6494,42 @@ fn resolve_ref_sites_a_to_e<'a>(
                                     import_modules: Vec::new(),
                                 };
                             }
-                            // Rare: load the RefSite once for the validated
-                            // string-keyed compute, then collapse to hashes.
-                            let site = &ref_sites[site_idx as usize];
-                            // B6 stage-4: rebuild `receiver` from the per-site id
-                            // column when present (stage-5 toehold); the
-                            // string-keyed intern is collision-free so this is
-                            // byte-identical to `site.receiver_name`. `rel_path`
-                            // below is still read from `site` (stage-5/file_id).
-                            let receiver = match receiver_recon {
-                                Some((interner, recv_ids)) => {
-                                    interner.name(recv_ids[site_idx as usize]).unwrap_or("")
+                            // B6 stage-4/5c: rebuild `receiver` + `rel_path` from
+                            // the per-site id columns when present (toward
+                            // dropping Vec<RefSite>). String-keyed intern + the
+                            // file_id round-trip are byte-identical to the
+                            // RefSite reads. When `recon`/`recon.file` is None
+                            // (incremental/legacy/fallback) the site is read.
+                            let (receiver, rel_path): (&str, &str) = match recon {
+                                Some(r) => {
+                                    let receiver = r
+                                        .interner
+                                        .name(r.receiver_name_ids[site_idx as usize])
+                                        .unwrap_or("");
+                                    match r.file {
+                                        Some((ft, file_ids)) => (
+                                            receiver,
+                                            ft.get_path(file_ids[site_idx as usize]).unwrap_or(""),
+                                        ),
+                                        None => {
+                                            let site = &ref_sites[site_idx as usize];
+                                            (receiver, site.rel_path.as_str())
+                                        }
+                                    }
                                 }
-                                None => site.receiver_name.as_deref().unwrap_or(""),
+                                None => {
+                                    let site = &ref_sites[site_idx as usize];
+                                    (
+                                        site.receiver_name.as_deref().unwrap_or(""),
+                                        site.rel_path.as_str(),
+                                    )
+                                }
                             };
                             // B6 stage-3: rebuild the enclosing id string (cold,
                             // once per file cache-miss) from the column u64.
                             let enclosing_str = enclosing_id_to_string(c.enclosing_id);
                             let res = compute_receiver_resolution(
-                                site.rel_path.as_str(),
+                                rel_path,
                                 receiver,
                                 enclosing_str.as_deref(),
                                 &symbols_by_id,
@@ -8099,6 +8202,12 @@ fn phase_c_process_chunk(
     end: usize,
     symbol_name_hashes: &AHashSet<u64>,
     soa_b5: bool,
+    // B6 stage-5d: when `Some`, the per-file boundary rebuilds `rel_path`
+    // (`FileTable::get_path(file_id)`) + `language` (`language_str_from_id`)
+    // from columns instead of `ref_sites[i]` (dropped on the channel rebuild).
+    // `None` reads the site. Reconstruction is byte-exact: file_id round-trips
+    // the path and site languages are canonical (probe: 0 unknown languages).
+    file_recon: Option<(&FileTable, &[u32])>,
 ) -> PhaseCAccums {
     let mut bare_usage_may: AHashMap<u64, usize> = AHashMap::default();
     let mut bare_call_may: AHashMap<u64, usize> = AHashMap::default();
@@ -8168,9 +8277,19 @@ fn phase_c_process_chunk(
         if !have_file || rel_path_hash != cached_rel_path_hash {
             have_file = true;
             cached_rel_path_hash = rel_path_hash;
-            let s = &ref_sites[i];
-            cached_scope_hash = stable_hash(source_scope_key(s.rel_path.as_str()));
-            cached_lang_hash = stable_hash(s.language.as_str());
+            match file_recon {
+                Some((ft, file_ids)) => {
+                    let rel_path = ft.get_path(file_ids[i]).unwrap_or("");
+                    cached_scope_hash = stable_hash(source_scope_key(rel_path));
+                    let lang = language_str_from_id(site_cols[i].language_id).unwrap_or("");
+                    cached_lang_hash = stable_hash(lang);
+                }
+                None => {
+                    let s = &ref_sites[i];
+                    cached_scope_hash = stable_hash(source_scope_key(s.rel_path.as_str()));
+                    cached_lang_hash = stable_hash(s.language.as_str());
+                }
+            }
         }
         let scope_name = (cached_lang_hash, cached_scope_hash, name_hash);
         if access_kind_id == ACCESS_KIND_BARE {
@@ -8273,6 +8392,10 @@ fn apply_token_shape_likely_count_baseline(
     // channel-driven writer. `light_out` is left empty as drained by the
     // batch flush inside `push_light_resolved_reference`.
     light_sender: Option<&crossbeam_channel::Sender<Vec<LightRef>>>,
+    // B6 stage-5d: when `Some`, the rare token-shape push reads the precomputed
+    // `site_partial` from `SiteCols` instead of `ref_sites[idx]` (which is
+    // dropped on the channel rebuild). `None` recomputes it from `ref_sites`.
+    prebuilt_site_cols: Option<&[SiteCols]>,
 ) {
     let mut bare_symbol_count_by_scope_and_name: AHashMap<(u64, u64, u64), usize> =
         AHashMap::default();
@@ -8419,17 +8542,20 @@ fn apply_token_shape_likely_count_baseline(
                             if reference_count >= count.usage_likely {
                                 break;
                             }
-                            // B5: phase C stored the global ref_sites index, so
-                            // read the site by index for the rare push — no
-                            // `offset_from` pointer recovery.
-                            let site = &ref_sites[site_idx as usize];
-                            // B6 stage-2: source_ref_id is now u64; build the
-                            // edge_key from the same u64-keyed site_partial as
-                            // site_cols/phase_e (relabeled but bijective).
-                            let edge_key = edge_key_from_partial(
-                                site_partial_hash_u64(site.source_ref_id, &site.edge_kind),
-                                &symbol.id,
-                            );
+                            // B5: phase C stored the global ref_sites index.
+                            // B6 stage-5d: the `site_partial` is precomputed in
+                            // `SiteCols`; read it from the column when present
+                            // (channel rebuild dropped `ref_sites`), else
+                            // recompute from `ref_sites[idx]` (same bijective
+                            // u64-keyed value as site_cols/phase_e).
+                            let site_partial = match prebuilt_site_cols {
+                                Some(sc) => sc[site_idx as usize].site_partial,
+                                None => {
+                                    let site = &ref_sites[site_idx as usize];
+                                    site_partial_hash_u64(site.source_ref_id, &site.edge_kind)
+                                }
+                            };
+                            let edge_key = edge_key_from_partial(site_partial, &symbol.id);
                             if push_light_resolved_reference(
                                 &mut local_light_refs,
                                 &mut local_dedup,
@@ -9301,23 +9427,88 @@ fn append_references_to_both_shards(
 /// `par_iter` copy of precomputed fields — no extra scan beyond this one.
 fn build_ref_write_cols(
     ref_sites: &[RefSite],
-    file_table: &FileTable,
+    // B6 stage-5c: the file_id column (built once from the file_table), shared
+    // with the resolve worker's rel_path reconstruction so file_id is resolved
+    // exactly once per site.
+    site_file_ids: &[u32],
     site_name_ids: &[u32],
 ) -> Vec<RefWriteCol> {
     use rayon::prelude::*;
     ref_sites
         .par_iter()
+        .zip(site_file_ids.par_iter())
         .zip(site_name_ids.par_iter())
-        .map(|(s, &name_id)| RefWriteCol {
-            source_ref_id: s.source_ref_id,
-            enclosing_id: s.enclosing_id,
-            name_id,
-            file_id: file_table.get_id(&s.rel_path).unwrap_or(u32::MAX),
-            start_line: s.start_line,
-            start_column: s.start_column,
-            end_line: s.end_line,
-            end_column: s.end_column,
-            edge_kind_id: s.edge_kind_id,
+        .map(|((s, &file_id), &name_id)| {
+            let mut flags = 0u8;
+            if s.is_definition {
+                flags |= SITE_FLAG_IS_DEFINITION;
+            }
+            if s.receiver_name.is_some() {
+                flags |= SITE_FLAG_HAS_RECEIVER;
+            }
+            if s.is_import_context {
+                flags |= SITE_FLAG_IS_IMPORT_CONTEXT;
+            }
+            RefWriteCol {
+                source_ref_id: s.source_ref_id,
+                enclosing_id: s.enclosing_id,
+                name_id,
+                file_id,
+                start_line: s.start_line,
+                start_column: s.start_column,
+                end_line: s.end_line,
+                end_column: s.end_column,
+                edge_kind_id: s.edge_kind_id,
+                language_id: compute_language_id(&s.language),
+                access_kind_id: s.access_kind_id,
+                flags,
+            }
+        })
+        .collect()
+}
+
+/// B6 stage-5c: the per-site `file_id` column (`stream_file_table.get_id`),
+/// feeding both `build_ref_write_cols` and the resolve worker's `rel_path`
+/// reconstruction (`FileTable::get_path`). Built once per rebuild path.
+fn build_site_file_ids(ref_sites: &[RefSite], file_table: &FileTable) -> Vec<u32> {
+    use rayon::prelude::*;
+    ref_sites
+        .par_iter()
+        .map(|s| file_table.get_id(&s.rel_path).unwrap_or(u32::MAX))
+        .collect()
+}
+
+/// B6 stage-5d: the dense `SiteCols` column the hot resolve path reads. Was
+/// built inside `resolve_ref_sites_a_to_e`; extracted so the channel rebuild
+/// can build it BEFORE resolve and pass it in, letting `Vec<RefSite>` be
+/// dropped before the resolve phases (the column is all that resolve then
+/// needs). Behaviour-identical to the prior inline build.
+fn build_site_cols(ref_sites: &[RefSite]) -> Vec<SiteCols> {
+    use rayon::prelude::*;
+    ref_sites
+        .par_iter()
+        .map(|s| {
+            let mut flags = 0u8;
+            if s.is_definition {
+                flags |= SITE_FLAG_IS_DEFINITION;
+            }
+            if s.receiver_name.is_some() {
+                flags |= SITE_FLAG_HAS_RECEIVER;
+            }
+            if s.is_import_context {
+                flags |= SITE_FLAG_IS_IMPORT_CONTEXT;
+            }
+            SiteCols {
+                name_hash: s.name_hash,
+                rel_path_hash: s.rel_path_hash,
+                receiver_name_hash: s.receiver_name_hash,
+                enclosing_id: s.enclosing_id,
+                site_partial: site_partial_hash_u64(s.source_ref_id, &s.edge_kind),
+                language_id: compute_language_id(s.language.as_str()),
+                access_kind_id: s.access_kind_id,
+                edge_kind_id: s.edge_kind_id,
+                flags,
+            }
         })
         .collect()
 }
@@ -10220,6 +10411,80 @@ fn write_ref_sites_by_file_shards(
         })
         .collect();
     let mut writers = open_graph_shard_writers(workspace_root, config, GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX)?;
+    let worker_buffers_ref = &worker_buffers;
+    writers
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(shard_idx, w)| -> io::Result<()> {
+            for w_bufs in worker_buffers_ref {
+                w.writer.write_all(&w_bufs[shard_idx])?;
+            }
+            w.writer.flush()?;
+            Ok(())
+        })?;
+    finish_graph_shard_writers(writers)
+}
+
+/// B6 stage-5b: column twin of `write_ref_sites_by_file_shards`' full-rebuild
+/// parallel path. Serializes the 38M-site disk shard from `RefWriteCol` +
+/// receiver `name_id` column + interner instead of `&[RefSite]`, so the OV1
+/// overlapped writer reads no `RefSite` — the last reader to clear before
+/// `Vec<RefSite>` can be dropped before resolve (stage-5d). Sharding is by the
+/// `rel_path` rebuilt from `file_id` (`FileTable::get_path`), matching the
+/// `shard_index_for_key(&site.rel_path)` of the AoS path; same chunk order, so
+/// the per-shard bytes are identical.
+fn write_ref_sites_by_file_shards_cols(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    write_cols: &[RefWriteCol],
+    site_receiver_name_ids: &[u32],
+    interner: &NameInterner,
+    file_table: &FileTable,
+) -> io::Result<u64> {
+    use rayon::prelude::*;
+    let total = write_cols.len();
+    let worker_count = graph_worker_count(total.max(1));
+    if total == 0 {
+        let shards =
+            open_graph_shard_writers(workspace_root, config, GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX)?;
+        return finish_graph_shard_writers(shards);
+    }
+    let chunks_per_worker = 8usize;
+    let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
+    let chunk_size = total.div_ceil(target_chunks).max(1);
+    let ranges: Vec<(usize, usize)> = (0..)
+        .map(|i| {
+            let start = i * chunk_size;
+            let end = (start + chunk_size).min(total);
+            (start, end)
+        })
+        .take_while(|(start, _)| *start < total)
+        .collect();
+    let worker_buffers: Vec<Vec<Vec<u8>>> = ranges
+        .into_par_iter()
+        .map(|(start, end)| {
+            let mut bufs: Vec<Vec<u8>> = (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+            for i in start..end {
+                let col = &write_cols[i];
+                // Shard by the rel_path (rebuilt from file_id), matching the AoS
+                // path's `shard_index_for_key(&site.rel_path)`. Every ref_site's
+                // path is interned, so get_path is always Some.
+                let shard = match file_table.get_path(col.file_id) {
+                    Some(p) => shard_index_for_key(p),
+                    None => shard_index_for_key(""),
+                };
+                serialize_ref_site_binary_from_cols(
+                    col,
+                    site_receiver_name_ids[i],
+                    interner,
+                    &mut bufs[shard],
+                );
+            }
+            bufs
+        })
+        .collect();
+    let mut writers =
+        open_graph_shard_writers(workspace_root, config, GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX)?;
     let worker_buffers_ref = &worker_buffers;
     writers
         .par_iter_mut()
@@ -11236,6 +11501,63 @@ fn serialize_ref_site_binary(site: &RefSite, file_id: u32, out: &mut Vec<u8>) {
     if site.enclosing_id != 0 {
         out.push(1);
         out.extend_from_slice(&site.enclosing_id.to_le_bytes());
+    } else {
+        out.push(0);
+    }
+}
+
+/// B6 stage-5b: column twin of `serialize_ref_site_binary` — produces the
+/// byte-identical 38M-site disk record from `RefWriteCol` + the receiver
+/// `name_id` + the interner, so the OV1 disk writer reads no `RefSite` (toward
+/// dropping `Vec<RefSite>` before resolve). `name`/`receiver_name` come from
+/// the interner (every site name is interned in stage-5b), `file_id` and the
+/// positions/source_ref_id/enclosing_id come straight from the column, and
+/// `language`/`edge_kind`/`access_kind` are written as their enum-id bytes.
+/// The inline-string fallbacks (unknown language, OTHER edge/access) are
+/// unreachable for fresh ref_sites — the stage-5b probe confirmed 0
+/// unknown-language sites, and `extract_ref_sites` only emits call/usage +
+/// member/bare — so they are intentionally not reconstructed; a future
+/// violation would diverge the `bytes` gate rather than corrupt silently.
+fn serialize_ref_site_binary_from_cols(
+    col: &RefWriteCol,
+    receiver_name_id: u32,
+    interner: &NameInterner,
+    out: &mut Vec<u8>,
+) {
+    out.extend_from_slice(&col.source_ref_id.to_le_bytes());
+    write_u16_str(out, interner.name(col.name_id).unwrap_or(""));
+    out.push(0); // raw_text == name marker (B6: field dropped)
+    out.extend_from_slice(&col.file_id.to_le_bytes());
+    let lang_byte = if col.language_id <= u8::MAX as u16 {
+        col.language_id as u8
+    } else {
+        255
+    };
+    out.push(lang_byte);
+    if lang_byte == 255 || language_str_from_id(col.language_id).is_none() {
+        // Unreachable for this corpus (probe: 0 unknown-language sites); emit an
+        // empty string to keep the record well-formed. A real unknown language
+        // would diverge `bytes` and trip the gate (it cannot be reconstructed
+        // from the id alone).
+        write_u16_str(out, "");
+    }
+    out.extend_from_slice(&col.start_line.to_le_bytes());
+    out.extend_from_slice(&col.start_column.to_le_bytes());
+    out.extend_from_slice(&col.end_line.to_le_bytes());
+    out.extend_from_slice(&col.end_column.to_le_bytes());
+    out.push(col.edge_kind_id); // standard (call/usage) for fresh ref_sites
+    out.push(col.access_kind_id); // standard (member/bare) for fresh ref_sites
+    out.push(if col.flags & SITE_FLAG_IS_DEFINITION != 0 { 1 } else { 0 });
+    out.push(if col.flags & SITE_FLAG_IS_IMPORT_CONTEXT != 0 { 1 } else { 0 });
+    if col.flags & SITE_FLAG_HAS_RECEIVER != 0 {
+        out.push(1);
+        write_u16_str(out, interner.name(receiver_name_id).unwrap_or(""));
+    } else {
+        out.push(0);
+    }
+    if col.enclosing_id != 0 {
+        out.push(1);
+        out.extend_from_slice(&col.enclosing_id.to_le_bytes());
     } else {
         out.push(0);
     }
