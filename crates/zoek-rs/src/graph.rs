@@ -702,7 +702,11 @@ struct MemberExactCandidate<'a> {
 struct RefSite {
     source_ref_id: String,
     name: String,
-    raw_text: String,
+    // B6 (RefSite slim, peak RSS was 17GB > 16GB cap): `raw_text` was always
+    // == `name` (set so in `extract_ref_sites`; the disk format already encodes
+    // the common case as a marker byte and never stores a differing string), so
+    // the field is dropped and reconstructed as `name` on the cold read/write
+    // paths — saving ~24B inline + a per-site `name` clone (~−1.5–2GB).
     // P1 (parse alloc reduction): `rel_path`/`language`/`edge_kind`/`access_kind`
     // are constant within a file (rel_path/language) or drawn from a tiny fixed
     // set (edge_kind/access_kind). The AoS built one fresh `String` per site —
@@ -5230,8 +5234,8 @@ fn extract_ref_sites(
             let edge_kind_id = compute_edge_kind_id(edge_kind);
             ref_sites.push(RefSite {
                 source_ref_id,
-                name: name.clone(),
-                raw_text: name,
+                // B6: `raw_text` dropped (== name); move `name` in, no clone.
+                name,
                 rel_path: rel_path_arc.clone(),
                 language: language_arc.clone(),
                 start_line: line_idx as u32,
@@ -8593,7 +8597,7 @@ fn materialize_light_ref(light: &LightRef, ref_sites: &[RefSite]) -> GraphRefere
         target_symbol_id: light.target_symbol_id.clone(),
         edge_kind: (&*site.edge_kind).into(),
         name: site.name.as_str().into(),
-        raw_text: site.raw_text.as_str().into(),
+        raw_text: site.name.as_str().into(), // B6: raw_text == name (field dropped)
         // P1: RefSite no longer carries `uri` (dead). GraphReference.uri is
         // lazily filled from rel_path at write time (see file_uri fixup), so an
         // empty value here is the existing contract.
@@ -8628,7 +8632,7 @@ fn push_resolved_reference(
         target_symbol_id: Some(target.id.as_str().into()),
         edge_kind: (&*site.edge_kind).into(),
         name: site.name.as_str().into(),
-        raw_text: site.raw_text.as_str().into(),
+        raw_text: site.name.as_str().into(), // B6: raw_text == name (field dropped)
         uri: Box::from(""),
         rel_path: (&*site.rel_path).into(),
         start_line: site.start_line,
@@ -10486,7 +10490,7 @@ fn serialize_reference_binary_from_light(
         light.target_symbol_id.as_deref(),
         &site.edge_kind,
         &site.name,
-        &site.raw_text,
+        &site.name, // B6: raw_text == name (field dropped)
         file_id,
         site.start_line,
         site.start_column,
@@ -10957,15 +10961,10 @@ fn serialize_ref_site_binary(site: &RefSite, file_id: u32, out: &mut Vec<u8>) {
         write_u16_str(out, &site.source_ref_id);
     }
     write_u16_str(out, &site.name);
-    // Phase 3 aggressive: build_file_graph constructs raw_text == name for
-    // every ref site. Encode the common case as a single marker byte (0 =
-    // copy name; 1 = inline string follows for legacy TSV paths).
-    if site.raw_text == site.name {
-        out.push(0);
-    } else {
-        out.push(1);
-        write_u16_str(out, &site.raw_text);
-    }
+    // B6: raw_text is always == name (the field was dropped), so always emit the
+    // marker-0 "copy name" case. Byte-identical to the prior output; the reader
+    // (parse_ref_site_binary) still accepts a marker-1 legacy string.
+    out.push(0);
     out.extend_from_slice(&file_id.to_le_bytes());
     // Phase 3 aggressive (RefSite slim): language/edge_kind/access_kind go
     // through small enum tables. Most refs hit a known value (~99.99% in
@@ -11040,11 +11039,11 @@ fn parse_ref_site_binary(
     }
     let raw_text_marker = bytes[*cursor];
     *cursor += 1;
-    let raw_text = if raw_text_marker == 0 {
-        name.clone()
-    } else {
-        read_u16_str(bytes, cursor)?
-    };
+    // B6: raw_text dropped (== name). Still advance the cursor past a legacy
+    // marker-1 inline string if one is present (fresh writes only emit 0).
+    if raw_text_marker != 0 {
+        let _ = read_u16_str(bytes, cursor)?;
+    }
     let file_id = read_u32_le(bytes, cursor)?;
     let rel_path = file_table
         .get_path(file_id)
@@ -11127,7 +11126,6 @@ fn parse_ref_site_binary(
     Ok(RefSite {
         source_ref_id,
         name,
-        raw_text,
         // P1: struct fields are now `Arc<str>` (From<String> allocates once here,
         // on the cold read path — fine; the hot parse path shares per-file Arcs).
         rel_path: rel_path.into(),

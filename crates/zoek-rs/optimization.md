@@ -12,10 +12,11 @@
 
 ---
 
-## ▶ START HERE — 다음 세션 진입점 (W23 종료 시점)
+## ▶ START HERE — 다음 세션 진입점 (W24 종료 시점)
 
 **현재 상태**:
-- **★ W23: write 재프로파일(타겟 정정) + OV1 구현 — ref_site write를 resolve와 overlap.** index 병목은 reference가 아니라 **ref_site(38M) static write**(references는 이미 채널 overlap). ref_site write를 **resolve scope에 dedicated pool**(W1 패턴)로 spawn, `write_store`가 `skip_ref_sites`로 skip. **paired: index 6544→2802ms(−57%), total −2.8s, byte-identical, deadlock 없음 → default ON 승격**(opt-out `ZOEK_OVERLAP_STATIC_OFF`, channel pipeline서만 활성). default 재검증 14,372,638/3,788,145,402 ✓. **OV2(symbols/facts도 overlap) 시도→❌revert**: index 690ms(−85%)이나 resolve +2.1s contention으로 net −2.3s<OV1 −2.8s → OV1(ref_sites-only)이 sweet spot. 단 OV1 concurrency라 실사용 부하/incremental 추가 관찰 권장. → 상세 **`### 이번 세션 (W23)`**.
+- **★ W24: B6 착수 — peak RSS 측정(캡 초과 발견) + raw_text 드롭(stage 1).** `/usr/bin/time -l`: **OV1 ON peak 17~18GB(16GB 하드캡 초과!)**, OV1 OFF ~16GB → **OV1(wall −2.8s)이 +2GB peak로 캡 초과**(write 버퍼가 resolve와 공존). B6 stage1=`raw_text` 필드 드롭(불변 `==name`, byte-identical, data −1.8GB + name-clone 제거). **근본=full B6**(RefSite drop −6GB→peak ~11-12GB). **⚠️ OV1 default-ON 재고 필요**(캡 vs wall, 사용자 결정). → 상세 **`### 이번 세션 (W24)`**. 미커밋(graph.rs raw_text 드롭 + optimization.md).
+- **W23: write 재프로파일(타겟 정정) + OV1 구현 — ref_site write를 resolve와 overlap.** index 병목은 reference가 아니라 **ref_site(38M) static write**(references는 이미 채널 overlap). ref_site write를 **resolve scope에 dedicated pool**(W1 패턴)로 spawn, `write_store`가 `skip_ref_sites`로 skip. **paired: index 6544→2802ms(−57%), total −2.8s, byte-identical, deadlock 없음 → default ON 승격**(opt-out `ZOEK_OVERLAP_STATIC_OFF`, channel pipeline서만 활성). default 재검증 14,372,638/3,788,145,402 ✓. **OV2(symbols/facts도 overlap) 시도→❌revert**: index 690ms(−85%)이나 resolve +2.1s contention으로 net −2.3s<OV1 −2.8s → OV1(ref_sites-only)이 sweet spot. 단 OV1 concurrency라 실사용 부하/incremental 추가 관찰 권장. → 상세 **`### 이번 세션 (W23)`**.
 - **W22: phase_e 재프로파일 → 옵션 C 기각 + B6 범위 정정 (코드 변경 0, de-risking 조사).** phase_e 20.6s의 **~65%가 rayon oversubscription parking**(cvwait/semaphore가 `rayon Sleep`/`join_context`, **채널 backpressure 아님**), 실 compute 분산, 대형 맵 probe가 dominant 아님 → **옵션 C는 ❌C2 재현 위험이라 기각**. 사용자 재선택 **B6**. **B6 범위 좁힘**: 디스크 write(1957)가 resolve 전이라 **RefSite를 resolve 직전 drop**하면 −6GB, **디스크/incremental 경로 불변** → 변환은 resolve-time reader 3종(compute_receiver_resolution/phase_f/materialize)만. **⚠️ B6 prize=메모리 −6GB, phase_e wall 이득은 불확실**(hot path 이미 columns). → 상세 **`### 이번 세션 (W22)`**.
 - **W21: parse 공략 — ⚠️ 옵션 A 전제 정정 + P1/P2.** **parse는 tree-sitter가 아니다 — 이미 hand-written regex/string 파서**(`build_file_graph`→`extract_*`, Cargo에 tree-sitter 의존성 없음). 그래서 "tree-sitter를 custom tokenizer로 교체"라는 옵션 A는 **무의미**; 진짜 공략 = 기존 추출 함수의 할당/스캔 최적화. **내장 `ZOEK_PARSE_PROFILE=1`이 parse를 8개 sub-phase로 분해**: ref_sites **46%** > symbol_defs **20%** > type_facts **18%** > import_facts 8% > materialize 7%. **P1**(extract_ref_sites 할당 감축)+**P2**(sanitize Cow). → 상세 아래 **`### 이번 세션 (W21)`**.
 - **W20: B5 완료 + B3/B4/B5 default 승격** (column SoA가 default, opt-out `ZOEK_SOA_OFF`). prefilter −95% / phase_c −47% 확고, phase_e(B4) 부하서 −16%.
@@ -595,6 +596,27 @@ profiling-driven (macOS `sample` PID DURATION) 진단으로 새 hot path 식별 
 **환경 변수 추가**: `ZOEK_SOA_B4=1` — column-only worker ON (default OFF=struct HEAD). `ZOEK_SOA_B3`(prefilter)와 독립.
 
 **B3+B4 승격 권장 (다음 세션 첫 후보)**: B3(prefilter −1.8s) + B4(worker −3.2s) 둘 다 strict-improvement·invariant 검증 완료. gate 제거(default ON) → cold rebuild에서 phase_e+prefilter 합 **−5s** 실현. 단 struct 경로 삭제는 B6(RefSite retire)와 묶는 게 깔끔 → 판단은 사용자. 현재는 둘 다 gated(안전). **→ W20에서 승격 완료(struct 경로는 `ZOEK_SOA_OFF` opt-out으로 보존, 삭제는 B6).**
+
+---
+
+### 이번 세션 (W24) — B6 착수: peak RSS 측정(★캡 초과 발견) + raw_text 드롭(stage 1)
+
+**먼저 한 일 / ★ peak RSS 측정 (doc B0 "측정 토대")**: `/usr/bin/time -l` max RSS, captain2:
+- **OV1 ON(default): peak 17.0~18.0GB — 문서 하드캡 16GB 초과!**
+- **OV1 OFF(`ZOEK_OVERLAP_STATIC_OFF=1`): peak ~15.95GB (캡 경계)**
+- → **OV1(wall −2.8s)이 peak를 ~+2GB 올린다**(overlapped ref_site write 버퍼 ~2GB가 resolve working-set과 공존). **wall↔memory 실제 충돌**: OV1 default-ON이 16GB 예산 초과. 16GB RAM 머신선 OOM/swap 위험(이 머신은 RAM 충분해 완료되나 doc "하드 제약 ≤16GB" 위반).
+- peak는 **run-to-run ±~1GB noise**(OV1 버퍼 타이밍) — 단일 measure 신뢰 금물.
+
+**구현 (B6 stage 1 — `raw_text` 필드 드롭)**:
+- RefSite ~280B inline struct × 38M ≈ **10GB+가 메모리 hog**. full retire(→columns)는 멀티세션이라, 안전·완료가능한 첫 stage로 redundant `raw_text` 제거.
+- `raw_text`는 parse서 항상 `==name`, 디스크는 marker-0으로 인코딩하고 fresh write가 marker-1을 절대 안 냄 → 불변. 드롭 후 cold path(serialize marker 항상 0, `serialize_reference_binary_from_light`/`materialize_light_ref`/`push_resolved_reference`는 `name`, `parse_ref_site_binary`는 marker cursor advance 유지·discard)에서 `name`으로 복원.
+- 부수익: `name: name.clone()` → `name: name`(move) — **38M name clone 제거**(parse alloc↓).
+- **검증**: 75/75, referenceCount **14,372,638**, **bytes 3,788,145,402(byte-identical)**, schemaVersion 20. data −~1.8GB(코드상 명백)이나 peak RSS noise+OV1 +2GB에 가려 peak로는 확인 어려움.
+
+**W24 진단/결론**:
+- 리빌드 peak가 16GB 캡 경계~초과. **OV1이 캡 초과 주범**(+2GB). **근본 = full B6**(RefSite AoS drop→columns ~90B→−6GB→peak ~11-12GB, 캡 여유+OV1 수용). B6가 OV1을 감당 가능하게 만드는 synergy.
+- **OV1 default-ON 재고(사용자)**: wall −2.8s vs +2GB peak(캡 초과). (a)유지+B6까지 감수 / (b)default-OFF로 캡 우선 / (c)write 버퍼 eager-flush로 peak↓.
+- raw_text 드롭 유지(정확·유익). full B6(columns+interner+RefSite drop)는 다음 세션들.
 
 ---
 
