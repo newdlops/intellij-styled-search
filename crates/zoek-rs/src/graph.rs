@@ -2387,8 +2387,14 @@ where
         let hierarchy_facts_ref = &hierarchy_facts;
         let stream_file_table_ref = &stream_file_table;
         let resolving_started_inner = resolving_started;
-        let (resolution_inner, streamed_total, static_bytes) =
-            std::thread::scope(|s| -> io::Result<(ResolutionResult, usize, u64)> {
+        // wall-W2: write phase F's ~9.18M buffered lights on the global rayon
+        // pool *after* resolve returns (all cores free), instead of bulk-sending
+        // them back through the 8-thread writer pool as a no-overlap tail. Opt
+        // out with ZOEK_WALL_W2_OFF to restore the F1.b bulk-send path (paired
+        // A/B measurement + safety revert).
+        let wall_w2 = std::env::var("ZOEK_WALL_W2_OFF").is_err();
+        let (resolution_inner, phase_e_streamed, static_bytes, phase_f_lights) =
+            std::thread::scope(|s| -> io::Result<(ResolutionResult, usize, u64, Vec<LightRef>)> {
                 let target_w_ref = &mut target_w;
                 let enclosing_w_ref = &mut enclosing_w;
                 let writer_handle = s.spawn(move || -> io::Result<usize> {
@@ -2461,17 +2467,44 @@ where
                     force_columns_channel,
                     Some(&tx),
                 );
-                // F1.b: phase F's lights were buffered (phase_f wall avoids
-                // backpressure). Drop them into the channel as one big batch
-                // before closing — the writer drains while we wait on join.
-                let phase_f_lights = std::mem::take(&mut resolution.light_references);
-                if !phase_f_lights.is_empty() {
-                    let _ = tx.send(phase_f_lights);
+                // F1.b + wall-W2: phase E streamed into the writer (overlapped
+                // with the 8-thread writer pool). Phase F's lights were buffered
+                // (no channel backpressure). Rather than bulk-send those ~9.18M
+                // records back through the *same* small writer pool — a ~5s tail
+                // with no overlap left to hide it (resolve has returned) — take
+                // them out, close the channel so the writer finishes only the
+                // phase-E stream, then write phase F on the GLOBAL rayon pool
+                // (all cores, idle once resolve returns) *after* this scope.
+                // `append_lights_to_both_shards` is chunk-count-invariant in its
+                // output bytes (per shard it concatenates per-chunk buffers in
+                // record order regardless of chunk/thread count), so the larger
+                // pool yields byte-identical shards, just faster.
+                let mut phase_f_lights = std::mem::take(&mut resolution.light_references);
+                if !wall_w2 {
+                    // Opt-out (ZOEK_WALL_W2_OFF): legacy F1.b path — bulk-send
+                    // phase F back through the 8-thread writer pool, drained as a
+                    // post-resolve tail. Emptying `phase_f_lights` makes the
+                    // post-scope global-pool write below a no-op, and the writer
+                    // join then returns the full phase-E + phase-F count.
+                    if !phase_f_lights.is_empty() {
+                        let _ = tx.send(std::mem::take(&mut phase_f_lights));
+                    }
                 }
+                let _t_join = std::time::Instant::now();
                 drop(tx);
-                let total = writer_handle
+                let phase_e_streamed = writer_handle
                     .join()
                     .expect("F1.b writer thread panicked")?;
+                if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
+                    // Isolates the post-resolve writer tail: ON drains only the
+                    // phase-E backlog still in the channel; OFF also drains the
+                    // bulk-sent phase F. (ON additionally writes phase F on the
+                    // global pool after this scope — see phase_f_tail probe.)
+                    eprintln!(
+                        "[resolve] writer_join_wait={}ms wall_w2={wall_w2}",
+                        _t_join.elapsed().as_millis()
+                    );
+                }
                 // W23: ensure the overlapped ref_site shard write finished before
                 // the index phase (write_store with skip_ref_sites) proceeds, and
                 // capture its byte count so the summary total stays accurate.
@@ -2480,9 +2513,38 @@ where
                 } else {
                     0u64
                 };
-                Ok((resolution, total, static_bytes))
+                Ok((resolution, phase_e_streamed, static_bytes, phase_f_lights))
             })?;
         overlap_ref_site_bytes = static_bytes;
+        // wall-W2: phase-F tail on the global pool. The writer + static-writer
+        // pools have been dropped (their threads joined inside the scope above),
+        // so every core is now free; this drains the ~9.18M phase-F records on
+        // the full rayon pool instead of the 8-thread writer pool. Byte-identical
+        // to the old bulk-send-through-channel path — same records appended after
+        // the phase-E stream, same per-shard record order (append_lights is
+        // chunk-count-invariant). Counted into resolving_ms (before the timer
+        // below) since it is part of the reference write that resolve overlaps.
+        let phase_f_streamed = if !phase_f_lights.is_empty() {
+            let t_tail = std::time::Instant::now();
+            let n = append_lights_to_both_shards(
+                &phase_f_lights,
+                write_cols_ref,
+                name_interner_ref,
+                &mut target_w,
+                &mut enclosing_w,
+            )?;
+            if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
+                eprintln!(
+                    "[resolve] phase_f_tail={}ms records={n} threads={} (global pool)",
+                    t_tail.elapsed().as_millis(),
+                    rayon::current_num_threads()
+                );
+            }
+            n
+        } else {
+            0
+        };
+        let streamed_total = phase_e_streamed + phase_f_streamed;
         let _ = finish_graph_shard_writers(target_w)?;
         let _ = finish_graph_shard_writers(enclosing_w)?;
         resolving_ms = resolving_started_inner.elapsed().as_millis();
