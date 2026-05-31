@@ -12,9 +12,14 @@
 
 ---
 
-## ▶ START HERE — 다음 세션 진입점 (W27 종료 시점)
+## ▶ START HERE — 다음 세션 진입점 (W28 종료 시점)
 
 **현재 상태**:
+- **★ W28: wall-W2(phase-F tail를 글로벌 풀로, ~440ms, byte-identical, 커밋 94643e2) + ⚠️ graph-update self-deadlock 버그 수정(커밋 945f804, main 체리픽 후보) + W27 "writer-tail ~5s"는 prep 오귀속 정정 + prep 분해(~4.1s, load-robust).**
+  - **(1) wall-W2**: phase_f의 9.18M lights를 resolve 종료 후 **글로벌 rayon 풀(전 코어)**로 write(기존 8-스레드 채널 writer 풀 bulk-send tail 대체; phase_e 스트리밍은 불변). `append_lights_to_both_shards`가 **chunk-count-invariant**(per-shard를 record 순서로 concat, 스레드 수 무관)라 **byte-identical**. isolated 프로브 paired(`ZOEK_WALL_W2_OFF` 토글 + `writer_join_wait`/`phase_f_tail`): phase_f drain **~918ms(8스레드)→~480ms(128)**, post-resolve tail ~953→~537ms = **~440ms 절감**. total wall은 load 노이즈로 비교 불가 → isolated 프로브로 분리. 6+ run bytes 3,788,145,402 + refs 14,372,638 + 75/75. opt-out `ZOEK_WALL_W2_OFF`.
+  - **(2) ★ 라이브 버그(self-deadlock) — 사용자 실기기 리포트**: `update_graph_native`가 graph-rebuild.lock(**flock LOCK_EX**)을 쥔 채 sidecar 불완전 시 `rebuild_graph_native` 호출 → rebuild가 같은 flock을 **새 fd로 재획득** → flock은 **open-file-description 단위**라 프로세스가 **자기 자신을 영원히 대기**(self-deadlock). orphan graph-update가 lock 영구 점유 → 후속 zoek-rs 전부 `"another zoek-rs is holding … — waiting"` 블록. 실기기서 **~21 orphan 프로세스**(parent=launchd, 0% CPU, holder PID는 lock을 fd 2개로 open = 증거) 확인·kill 정리. 수정: fallback 전 **`drop(_graph_lock)`**(rebuild가 깨끗이 재획득; sidecar 이미 불완전이라 gap 무해). **⚠️ 사용자 액션: ijss-rust-* 바이너리 재빌드/재배포해야 실기기 반영.**
+  - **(3) 정정 + prep 분해**: W27 "writer-drain-tail ~5s"는 **오귀속** — `writer_join_wait`가 OFF서도 **<1s**(phase_e backlog만; writer가 phase_e 완전 따라잡음). resolve ~5s 잔여 = **prep**(post-parse·pre-resolve, **load-robust ~4.1s**, 2 run 일치): **interner+idcols 38%(~1.6s) / file_table intern+write+open 37%(~1.5s) / columns 25%(~1.0s)**. 단일 지배 없음. 병렬 쉬운 곳은 W1이 먹음, columns는 이미 병렬, **file_table 38M intern은 disk file_id 순서 보존 필요라 byte-risky**. → **prep도 쉬운 큰 win 없음.**
+  - **솔직한 평가**: 남은 큰 덩어리(parse ~8.8 / phase_e ~8.7 / prep ~4.1)가 전부 어려움(scan-bound / rayon parking / sequential·byte-risky) → **점진으로 ~30s 근처가 한계, 10s엔 아키텍처(W13 Parse-Resolve fusion −15~20s 등) 필요** 재확인. 프로브 `prep@interner+idcols/filetable_done/columns_done` 추가(ZOEK_RESOLVE_PROBE). → 상세 **`### 이번 세션 (W28)`**.
 - **★ W27: B6 종료(메모리 목표 미달) → wall 10s 공략으로 전환 (사용자 선택: 점진, ~20-25s 목표).** 재프로파일(현 ~34s): discover 2.6 / **parse 8.83** / **resolve 22.84**(prep 3.36 + phase_a~d 4.5 + **phase_e 8.67** + phase_f 1.23 + **writer-drain-tail ~5**) / index ~0. **솔직한 평가: 10s는 점진 누적 불가(잘해야 ~20-25s), 아키텍처(W13 Parse-Resolve fusion 등) 필요.** ✅ **wall-W1: interner 빌드 병렬화** — 38M site + 16M receiver 이름의 sequential intern(~2.4s, stage-5가 추가한 회귀)을 **par_fold로 distinct(~1M) 수집 후 intern**. interner id는 내부값(consumer는 `name(get())` round-trip, hot map은 name_hash) → **byte-identical**. **resolve-prep 3.36→1.73s(−1.63s)**, 75/75 + bytes 3,788,145,402. **남은 점진 레버는 더 어려움**(phase_e parking·writer-drain backpressure는 W22/W14서 탐구; phase_a/b 맵빌드 병렬화는 Vec-ordering byte-identity 위험). → 상세 **`### 이번 세션 (W27)`**.
 - **★ W26: B6 stage-4 — `name`/`receiver_name` → NameInterner u32 id (reverse table) + 양쪽 reader 복원 (byte-identical).** stage-5(`Vec<RefSite>` drop) 토대. **NameInterner에 reverse `names: Vec<Box<str>>`(id→&str) 추가**(forward `ids`는 collision-free string-key 유지 → 복원 byte-exact). `rebuild_graph_native` 분기 전에 **symbol name + 전 receiver intern → `site_name_ids`/`site_receiver_name_ids` 컬럼**(par populate, channel writer가 resolve와 동시 소비하므로 scope 전 빌드). **write path(14M)**: `serialize_reference_binary_from_light`가 `interner.name(site_name_ids[idx])`로 `name` 복원(**fallback 없음** → MISS면 bytes 발산). **가설 입증**: emitted reference의 name은 항상 타겟 symbol name(bare/member 모두 symbol-keyed 매치 필요)이라 symbol interner로 14M 전부 hit(MISS 0, bytes 게이트 확인). **worker cold**: `resolve_ref_sites_a_to_e`에 `receiver_recon: Option<(&NameInterner,&[u32])>` 추가, column cache-miss서 receiver 복원(string-key라 byte-exact); `rel_path`는 아직 site(stage-5 file_id). materialize/push는 channel write path 아님 → 미변경. **게이트 통과: 75/75 + invariant 14,372,638 + bytes 3,788,145,402 + schemaVersion 20(완전 byte-identical, name·receiver 복원 둘 다).** ⚠️ **메모리는 전이적 +~330MB**(interner+2 id 컬럼이 Vec<RefSite> 위에 얹힘) — **win은 stage-5(Vec drop −7.6GB)**. → 상세 **`### 이번 세션 (W26)`**.
 - **★★ W26 같은 세션 stage-5 (5a~5d) 완료 = `Vec<RefSite>` drop, byte-identical — 단 메모리 win 없음(중요 발견).** (사용자 선택 A 전 필드 컬럼화→OV1 유지; 결과 보고 후 **유지(keep)** 결정.) 5a reference writer→RefWriteCol, 5b OV1 disk writer→`serialize_ref_site_binary_from_cols`(probe로 unknown-language=0 확인→fallback 문자열 불요; interner를 전 site name으로 확장), 5c worker/buckets→site_cols+file_id, 5d `build_site_cols` 후 resolve 전 `ref_sites=Vec::new()`(drop_ref_sites=overlap_static&&soa_on, force_columns로 struct 경로 차단). **게이트: 75/75 + invariant 14,372,638 + bytes 3,788,145,402(channel+fallback 둘 다) + schemaVersion 20.** ⚠️ **메모리 win 거의 없음 (paired로 확정).** drop ON/OFF paired(`ZOEK_B6_KEEP_REFSITES` 토글, peak RSS는 프로세스값이라 신뢰): **ON ~15.07GB vs OFF ~15.54GB → drop이 peak를 ~0.5GB만 줄임(7.6 아님)**. **peak는 build-window**(parse가 ref_sites+symbols+facts ~9.1GB 후 컬럼 ~4GB 적층, ON/OFF 동일)이고 drop은 그 이후. **→ B6(resolve-time ref_sites drop)로 −6GB 불가능 확정.** 진짜 레버=parse base 또는 resolution 맵 축소. wall은 미측정(idle 필요). 상세 **full B6 stage-5 항목** + **`### 이번 세션 (W26)`**.
@@ -621,6 +626,44 @@ profiling-driven (macOS `sample` PID DURATION) 진단으로 새 hot path 식별 
 **환경 변수 추가**: `ZOEK_SOA_B4=1` — column-only worker ON (default OFF=struct HEAD). `ZOEK_SOA_B3`(prefilter)와 독립.
 
 **B3+B4 승격 권장 (다음 세션 첫 후보)**: B3(prefilter −1.8s) + B4(worker −3.2s) 둘 다 strict-improvement·invariant 검증 완료. gate 제거(default ON) → cold rebuild에서 phase_e+prefilter 합 **−5s** 실현. 단 struct 경로 삭제는 B6(RefSite retire)와 묶는 게 깔끔 → 판단은 사용자. 현재는 둘 다 gated(안전). **→ W20에서 승격 완료(struct 경로는 `ZOEK_SOA_OFF` opt-out으로 보존, 삭제는 B6).**
+
+---
+
+### 이번 세션 (W28) — wall-W2(phase-F tail 글로벌 풀) + graph-update self-deadlock 수정 + prep 분해
+
+**먼저 한 일**: optimization.md(W27까지) 읽고 build green + 75/75 재확인. W27 진입점 = wall 점진 공략. 재프로파일 baseline(captain2, warm, load 낮음): discover 2.1 / parse 8.4 / **resolve 20.3** / index 2.1 / **total 32.9s**. resolve 분해: phase_a~d 4.45 + **phase_e 8.58** + phase_f 1.06 + **잔여 ~6.2s**. W27이 잔여를 "writer-drain-tail ~5s"로 봤기에 그걸 첫 타깃으로.
+
+**✅ wall-W2: phase-F tail을 글로벌 풀로 (커밋 94643e2, ~440ms, byte-identical)**:
+- **구조**: 채널 파이프라인서 phase_e lights는 8-스레드 writer 풀로 스트리밍(overlap). phase_f의 **9.18M lights는 resolve 종료 후 bulk-send**되어 **같은 8-스레드 풀**이 drain — resolve가 이미 끝나 overlap 없는 순수 tail인데 128코어 중 120이 유휴.
+- **변경**: `rebuild_graph_native`의 thread::scope가 phase_f lights를 밖으로 반환(`drop(tx)`로 채널 닫아 writer는 phase_e만 마무리) → scope 종료 후(writer·static 풀 drop, 전 코어 유휴) **`append_lights_to_both_shards`를 글로벌 rayon 풀로 직접 호출**.
+- **byte-identical 근거**: `append_lights_to_both_shards`는 per-chunk 버퍼를 **shard별로 record 순서대로 concat**(`per_chunk`는 range 순서, shard write는 chunk0→1→…) → **chunk/스레드 수와 무관하게 출력 byte 동일**. phase_e(먼저)·phase_f(나중) 순서도 baseline과 동일. **실증: 6+ run bytes 3,788,145,402.**
+- **측정(핵심 = isolated 프로브)**: total wall은 load(2.8~23) 노이즈로 비교 불가. 그래서 **`writer_join_wait`(resolve 종료→writer join)·`phase_f_tail`(글로벌 풀 phase_f write)** 프로브로 분리, `ZOEK_WALL_W2_OFF` 토글 paired:
+  - **OFF**(8-스레드 writer로 phase_f drain): writer_join_wait **996/911ms** (= phase_e backlog ~35ms + phase_f drain ~918ms)
+  - **ON**(글로벌 풀): writer_join_wait **34/36ms**(phase_e backlog만) + phase_f_tail **482/521ms**(128스레드 phase_f) = tail **~537ms**
+  - → **phase_f drain 8스레드 ~918ms → 128스레드 ~480ms, post-resolve tail ~953→~537ms = ~440ms 절감.** opt-out `ZOEK_WALL_W2_OFF`.
+- **솔직한 평가**: 기대(~4s)보다 작은 ~440ms. W27 "tail ~5s"가 틀렸기 때문 — 아래.
+
+**⚠️ ★ 라이브 버그 — graph-update self-deadlock (커밋 945f804, 세션 중 사용자 실기기 리포트)**:
+- **증상**: 실기기서 `[graph-lock] another zoek-rs is holding /…/captain/.zoek-rs/graph-rebuild.lock — waiting`. 사용자 가설: "search index 끝났는데 계속 실행중이라 lock 잡는 듯".
+- **진단**: `ps`로 **~21 orphan 프로세스**(2 graph-rebuild + ~19 graph-update on /captain, **parent=launchd**=익스텐션 종료 후 고아, **전부 0% CPU·CPU-time ~0**=rebuild 한 적 없이 lock 대기). lock은 `acquire_graph_lock`의 **flock(LOCK_EX)** — 프로세스 종료 시 자동 해제라 stale 불가인데 holder 부재 = 모순. **lsof로 PID 38691이 lock을 fd 3u+4u 두 개로 open** 발견 → 한 프로세스가 flock 2회 획득.
+- **근본 원인**: `update_graph_native`(graph.rs:2724)가 **2733에서 lock 획득** 후 sidecar 불완전 시 **2761에서 `rebuild_graph_native` 호출** → rebuild가 **1766에서 같은 flock을 새 fd로 재획득**. flock은 **open-file-description 단위**(프로세스 단위 아님)라 둘째 fd의 LOCK_EX가 첫째(자기 자신)를 영원히 대기 = **self-deadlock**. 그 프로세스가 lock 영구 점유 → 후속 전부 블록.
+- **수정**: fallback 직전 **`drop(_graph_lock)`** — nested rebuild가 깨끗이 재획득. gap은 무해(sidecar 이미 불완전→rebuild 필요, rebuild는 idempotent + lock으로 재직렬화). 실기기 orphan 21개 kill 정리. **⚠️ ijss-rust-* 바이너리 재빌드/재배포 필요.** main 체리픽 후보(최적화와 무관한 correctness).
+
+**✅ prep 분해 (W27 "~5s 잔여"의 정체)**:
+- W2의 `writer_join_wait`가 OFF서도 **<1s** → phase_f drain은 애초에 ~1s, **"~5s tail"은 오귀속**. 잔여는 **prep**(post-parse·pre-resolve: interner+컬럼+file_table 빌드).
+- 프로브 추가(`prep@interner+idcols`/`filetable_done`/`columns_done`, cumulative). **2 run 일치(load 7.66·23.59 무관 = load-robust, prep가 sequential/allocation 위주라 128-worker 부하와 분리)**:
+  - **interner + site/receiver id 컬럼**: ~1.6s (symbol intern 4.1M seq + W1 distinct + 38M×2 id 컬럼 par collect)
+  - **file_table**: ~1.5s (5 intern 루프[첫 38M] + write_file_table + clear + open 256 shards)
+  - **columns**: ~1.0s (build_site_file_ids + ref_write_cols + site_cols, 각 38M par)
+  - **prep total ~4.1s.** 단일 지배 없음.
+- **레버 평가**: 병렬 쉬운 곳은 W1이 먹음(distinct collect). columns는 이미 par. **file_table 38M intern은 disk file_id 순서 보존 필요라 병렬화 byte-risky**(W27 경고). interner의 symbol intern(4.1M seq)만 W1식 병렬화 여지(~0.3-0.5s) — 작음. → **prep도 쉬운 큰 win 없음.**
+
+**다음 세션 후보 (전부 어려움 — 10s엔 아키텍처 필요)**:
+- **parse ~8.8s**: W21 P1/P2 후 잔여=스캔(sanitize/tokens)·file I/O(135K)·malloc 경합.
+- **phase_e ~8.7s**: W22 ~65% rayon parking(memory-stall), 옵션 C ❌C2 위험 기각.
+- **prep ~4.1s**: file_table 순서보존 병렬화(byte-risky) 또는 symbol intern 병렬화(작음).
+- **아키텍처**: W13 카드(Parse-Resolve fusion −15~20s / mmap / persistent+delta) — 점진의 한계(~30s) 돌파엔 이게 본질.
+- **측정 주의**: 이 세션 내내 연속 rebuild로 load 5~23 누적 → total wall 전부 무의미. **isolated 프로브(writer_join_wait/phase_f_tail/prep@) + bytes 게이트만 신뢰.** captain idle paired는 미실시.
 
 ---
 

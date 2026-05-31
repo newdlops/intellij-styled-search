@@ -2204,6 +2204,11 @@ where
     // sites' names, not just the ~14M emitted ones (a symbol-only interner
     // would MISS the ~6.7% non-symbol site names). Built before resolve (the
     // channel writer + OV1 disk writer drain it concurrently with resolve).
+    // wall-W3 probe: prep (post-parse, pre-resolve) sub-phase timing. The W27
+    // "writer-tail ~5s" was actually this prep window. Cumulative from t_prep so
+    // successive deltas give each segment's cost. Gated on ZOEK_RESOLVE_PROBE.
+    let t_prep = std::time::Instant::now();
+    let prep_probe = std::env::var("ZOEK_RESOLVE_PROBE").is_ok();
     let mut name_interner = NameInterner::with_capacity(symbols.len() + 1024);
     for symbol in &symbols {
         name_interner.intern(&symbol.name, symbol.name_hash);
@@ -2263,6 +2268,9 @@ where
     // into ~max(phase_e + phase_f, writer drain). Opt out with
     // ZOEK_DISABLE_LIGHT_CHANNEL=1 to fall back to the legacy sequential
     // stream_lights_to_sidecars path.
+    if prep_probe {
+        eprintln!("[resolve] prep@interner+idcols={}ms", t_prep.elapsed().as_millis());
+    }
     let use_channel_pipeline = !skip_resolve
         && std::env::var("ZOEK_DISABLE_LIGHT_CHANNEL").is_err();
     // W23: overlap the 38M-record ref_site shard write with resolve (on a
@@ -2351,6 +2359,9 @@ where
         // B6 stage-5a/5c: file_id column + reference write columns (file_table
         // now complete). The writer thread reads only RefWriteCol; the resolve
         // worker rebuilds rel_path from site_file_ids + file_table (no RefSite).
+        if prep_probe {
+            eprintln!("[resolve] prep@filetable_done={}ms", t_prep.elapsed().as_millis());
+        }
         let site_file_ids = build_site_file_ids(&ref_sites, &stream_file_table);
         let write_cols = build_ref_write_cols(&ref_sites, &site_file_ids, &site_name_ids);
         // B6 stage-5d: build the hot-path SiteCols column here (was inside
@@ -2358,6 +2369,9 @@ where
         // every channel-path reader (reference writer 5a, worker/prefilter 5c,
         // OV1 disk writer 5b) now reads columns, not RefSite.
         let site_cols = build_site_cols(&ref_sites);
+        if prep_probe {
+            eprintln!("[resolve] prep@columns_done(end)={}ms", t_prep.elapsed().as_millis());
+        }
         if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
             use rayon::prelude::*;
             let unknown = ref_sites
