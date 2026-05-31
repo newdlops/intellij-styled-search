@@ -225,6 +225,12 @@ const GRAPH_HIERARCHY_PARENT_SHARD_PREFIX: &str = "callgraph-hierarchy-by-parent
 const GRAPH_METHOD_CONTAINER_SHARD_PREFIX: &str = "callgraph-methods-by-container";
 const GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX: &str = "callgraph-ref-sites-by-file";
 const GRAPH_FACTS_BY_FILE_SHARD_PREFIX: &str = "callgraph-facts-by-file";
+// A2 (incremental token-shape): persisted candidate-site tally so an incremental
+// update reconstructs the GLOBAL token-shape baseline (a top-level-dir-scoped
+// syntactic aggregate) without re-reading all ref_sites — making incremental
+// token-shape byte-identical to a full rebuild. Sharded by the (lang,scope,name)
+// key hash so a delta loads only the affected keys' shards.
+const GRAPH_TOKEN_SHAPE_SHARD_PREFIX: &str = "callgraph-token-shape-by-key";
 const GRAPH_FILE_TABLE_NAME: &str = "callgraph-file-table.bin";
 const GRAPH_SHARD_COUNT: usize = 128;
 
@@ -233,6 +239,18 @@ const BOUND_MUST: u8 = 0b0010;
 const _BOUND_OBSERVED: u8 = 0b0100;
 const MAX_EAGER_IMPLEMENTATION_SYMBOLS: usize = 50_000;
 const MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY: usize = 512;
+/// A2 Stage B: the persisted token-shape tally stores up to this many candidate
+/// sites per key — one MORE than the fanout limit. The full-rebuild phase F gate
+/// rejects any key whose TRUE likely-site count `N` satisfies `N * symbol_count
+/// > MAX_…FANOUT…` (and `symbol_count >= 1`, so any `N > 512` is rejected
+/// outright). The incremental consumer only has the persisted `candidates.len()`
+/// to gate on; capping the store at 512 would make a key with `N > 512` look
+/// like exactly 512 (`fanout = 512` for a sole symbol → wrongly emits). Storing
+/// one extra (513) lets the consumer's identical `candidates.len() * symbol_count
+/// <= 512` gate reject every over-limit key (513 > 512) while still emitting for
+/// keys whose true `N == 512`. Keys with `N > 513` never emit either way, so the
+/// further excess is irrelevant.
+const TOKEN_SHAPE_TALLY_STORE_CAP_PER_KEY: usize = MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY + 1; // A2 Stage B store cap (= fanout limit + 1)
 const RETURN_TYPE_FACT_PREFIX: &str = "__ijss_return_of__:";
 const DJANGO_MODEL_MANAGER_FACT_PREFIX: &str = "__ijss_django_model_manager_of__:";
 
@@ -914,6 +932,372 @@ struct RefWriteCol {
     flags: u8,
 }
 
+/// A2 (incremental token-shape): a self-contained candidate site (no interner /
+/// ref_sites / positional index) so the persisted tally is portable across
+/// builds. The emitted token-shape `GraphReference.name` comes from the target
+/// symbol (== the key's name) and `rel_path` from `file_id` via the file_table,
+/// so only these numeric fields are stored (~34B). Built from `RefWriteCol`.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct TokenShapeCandidate {
+    source_ref_id: u64,
+    enclosing_id: u64,
+    file_id: u32,
+    start_line: u32,
+    start_column: u32,
+    end_line: u32,
+    end_column: u32,
+    edge_kind_id: u8,
+    access_kind_id: u8,
+}
+
+/// A2: deterministically shard a token-shape `(lang_hash, scope_hash, name_hash)`
+/// key so an incremental delta loads only the shards holding the affected keys.
+fn token_shape_shard_for_key(key: (u64, u64, u64)) -> usize {
+    let mixed = key.0 ^ key.1.rotate_left(21) ^ key.2.rotate_left(42);
+    (mixed % GRAPH_SHARD_COUNT as u64) as usize
+}
+
+/// A2: persist the token-shape candidate-site tally. `bare`/`member` map each
+/// `(lang,scope,name)` key to its likely sites' ref_sites indices; `cols` supplies
+/// each site's content. Per key the candidates are persisted in the SAME order
+/// the full-rebuild phase F consumes `*_likely_sites` in: the build/push order,
+/// which is ascending global `ref_sites` index (phase C pushes each site's index
+/// as it scans, and the per-worker maps merge in worker order over contiguous
+/// rel_path-sorted ranges). The `idxs` Vec is already in that order, so it is
+/// NOT re-sorted — phase F's per-symbol `break` at `usage_likely` truncates the
+/// candidate list, so the incremental consumer must iterate this identical order
+/// or it selects a different (same-sized) subset. (A `source_ref_id` sort — a
+/// hash order — caused ~555K extra/missing token-shape churn; even a
+/// `(file_id,line,col)` sort diverges because `build_file_graph` does not emit a
+/// file's sites in strict position order.) Capped at the fanout limit + 1 (keys
+/// above the limit never emit, so the excess is never read). Sharded by key.
+/// Returns total bytes written (for sizing; not added to the manifest summary).
+fn write_token_shape_tally_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    bare: &HashMap<(u64, u64, u64), Vec<u32>>,
+    member: &HashMap<(u64, u64, u64), Vec<u32>>,
+    cols: &[RefWriteCol],
+) -> io::Result<u64> {
+    let mut shards: Vec<HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>> =
+        (0..GRAPH_SHARD_COUNT).map(|_| HashMap::default()).collect();
+    let mut ingest = |map: &HashMap<(u64, u64, u64), Vec<u32>>| {
+        for (key, idxs) in map {
+            // Preserve the build/push order (== phase F consumption order); only
+            // cap. Store one MORE than the fanout limit so the incremental
+            // consumer's `candidates.len()`-based gate can tell an over-limit key
+            // (513) from one at exactly the limit (512).
+            let mut idxs: Vec<u32> = idxs.clone();
+            idxs.truncate(TOKEN_SHAPE_TALLY_STORE_CAP_PER_KEY);
+            let candidates: Vec<TokenShapeCandidate> = idxs
+                .iter()
+                .map(|&i| {
+                    let c = &cols[i as usize];
+                    TokenShapeCandidate {
+                        source_ref_id: c.source_ref_id,
+                        enclosing_id: c.enclosing_id,
+                        file_id: c.file_id,
+                        start_line: c.start_line,
+                        start_column: c.start_column,
+                        end_line: c.end_line,
+                        end_column: c.end_column,
+                        edge_kind_id: c.edge_kind_id,
+                        access_kind_id: c.access_kind_id,
+                    }
+                })
+                .collect();
+            let shard = token_shape_shard_for_key(*key);
+            shards[shard].entry(*key).or_default().extend(candidates);
+        }
+    };
+    ingest(bare);
+    ingest(member);
+    let mut total: u64 = 0;
+    for (shard_idx, map) in shards.into_iter().enumerate() {
+        // Serialize as a Vec of (key, candidates) entries — portable regardless of
+        // the map's hasher (does not rely on HashMap's Serialize impl).
+        let entries: Vec<((u64, u64, u64), Vec<TokenShapeCandidate>)> =
+            map.into_iter().collect();
+        let path =
+            graph_shard_path(workspace_root, config, GRAPH_TOKEN_SHAPE_SHARD_PREFIX, shard_idx);
+        let bytes = bincode::serialize(&entries).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("token-shape ser: {e}"))
+        })?;
+        write_atomically(&path, &bytes)?;
+        total += bytes.len() as u64;
+    }
+    Ok(total)
+}
+
+/// A2 fix (4d): persist the delta-maintained token-shape tally back to its
+/// sidecar from the in-memory `bare`/`member` candidate maps (the incremental
+/// path holds `TokenShapeCandidate`s, not the idx maps + `write_cols` the
+/// full-rebuild writer takes). Without this, chained incremental updates reload
+/// STALE candidates for previously-edited files and token-shape drifts from a
+/// full rebuild. Per key the bare then member candidates are concatenated into
+/// one shard entry (the load side re-splits by `access_kind_id`), reproducing
+/// the full-rebuild on-disk layout. Writes all shards (v1 loads all keys); a
+/// later v2 can restrict to the touched shards.
+fn write_token_shape_tally_candidates(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    bare: &HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
+    member: &HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
+) -> io::Result<u64> {
+    let mut shards: Vec<HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>> =
+        (0..GRAPH_SHARD_COUNT).map(|_| HashMap::default()).collect();
+    for (key, cands) in bare {
+        shards[token_shape_shard_for_key(*key)]
+            .entry(*key)
+            .or_default()
+            .extend(cands.iter().copied());
+    }
+    for (key, cands) in member {
+        shards[token_shape_shard_for_key(*key)]
+            .entry(*key)
+            .or_default()
+            .extend(cands.iter().copied());
+    }
+    let mut total: u64 = 0;
+    for (shard_idx, map) in shards.into_iter().enumerate() {
+        let entries: Vec<((u64, u64, u64), Vec<TokenShapeCandidate>)> =
+            map.into_iter().collect();
+        let path =
+            graph_shard_path(workspace_root, config, GRAPH_TOKEN_SHAPE_SHARD_PREFIX, shard_idx);
+        let bytes = bincode::serialize(&entries).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("token-shape ser: {e}"))
+        })?;
+        write_atomically(&path, &bytes)?;
+        total += bytes.len() as u64;
+    }
+    Ok(total)
+}
+
+/// A2 Stage B: load the persisted token-shape candidate tally and split each
+/// key's candidates into a `bare` and a `member` map keyed by the same
+/// `(lang_hash, scope_hash, name_hash)` triple as the build side. The split is
+/// by `access_kind_id` (`ACCESS_KIND_MEMBER` → member, `ACCESS_KIND_BARE` →
+/// bare) so the incremental emitter can reproduce
+/// `apply_token_shape_likely_count_baseline`'s per-access gate exactly. When
+/// `only_shards` is `Some`, only those shard files are read; `None` reads all
+/// `GRAPH_SHARD_COUNT` (v1 loads ALL). A key may end up in both maps if it had
+/// both bare and member candidate sites (the build side keeps them in separate
+/// `*_likely_sites` maps), so each map's `Vec` holds only its access kind's
+/// candidates — kept in BUILD order (NOT sorted by `source_ref_id`; phase F
+/// consumes `*_likely_sites` in that order and its per-symbol `break` truncates
+/// there, so the persisted order must match) and capped on disk.
+#[allow(clippy::type_complexity)]
+fn load_token_shape_tally(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    only_shards: Option<&HashSet<usize>>,
+) -> io::Result<(
+    HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
+    HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
+)> {
+    let mut bare: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>> = HashMap::default();
+    let mut member: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>> = HashMap::default();
+    for shard in 0..GRAPH_SHARD_COUNT {
+        if let Some(os) = only_shards {
+            if !os.contains(&shard) {
+                continue;
+            }
+        }
+        let path =
+            graph_shard_path(workspace_root, config, GRAPH_TOKEN_SHAPE_SHARD_PREFIX, shard);
+        if !path.exists() {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let entries: Vec<((u64, u64, u64), Vec<TokenShapeCandidate>)> =
+            bincode::deserialize(&bytes).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("token-shape de: {e}"))
+            })?;
+        for (key, candidates) in entries {
+            for c in candidates {
+                if c.access_kind_id == ACCESS_KIND_MEMBER {
+                    member.entry(key).or_default().push(c);
+                } else if c.access_kind_id == ACCESS_KIND_BARE {
+                    bare.entry(key).or_default().push(c);
+                }
+            }
+        }
+    }
+    Ok((bare, member))
+}
+
+/// A2 Stage B: rebuild the GLOBAL token-shape references from the persisted
+/// candidate tally. Mirrors `apply_token_shape_likely_count_baseline`'s gate
+/// EXACTLY (per-symbol bare/member `symbol_count`; per key `usage_baseline`,
+/// `call_baseline`, `baseline_sites`, `symbol_count_for_key`; `usage_likely =
+/// usage_must.max(usage_baseline)`; emit only when `reference_count <
+/// usage_likely` and `fanout <= MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY`),
+/// but sourced from the self-contained tally instead of `ref_sites`:
+/// `usage_baseline = candidates.len()`, and each emitted `GraphReference` is
+/// built from the `TokenShapeCandidate` exactly as `materialize_light_ref`
+/// builds a token-shape light. `reference_counts` is the per-target EXACT count
+/// (== full rebuild's `light_target_count_by_id_u64`) that gates how many
+/// token-shape refs pad each symbol up to `usage_likely`. The candidate order
+/// is the persisted build order (= phase F's `*_likely_sites` consumption
+/// order), so the `break` truncation selects the identical subset. Phase F does
+/// NOT dedup token-shape against phase E's exact edge_keys (its dedup is a fresh
+/// per-worker set), so neither do we — emission is count-gated only.
+fn emit_token_shape_refs_from_tally(
+    symbols: &[GraphSymbol],
+    bare_tally: &HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
+    member_tally: &HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
+    reference_counts: &AHashMap<u64, usize>,
+    counts: &HashMap<String, GraphCount>,
+    file_table: &FileTable,
+    // A2 Stage B v2: emit token-shape ONLY for the `recompute_set` (target symbol
+    // ids whose emission inputs changed); every other target's token-shape is
+    // carried by the caller, avoiding the v1 cost of recomputing all ~9M refs.
+    // The set is built HERE, fused into the mandatory `symbol_count` first pass
+    // (which must run over ALL symbols anyway), so no extra full-symbol scan is
+    // needed: a symbol is recomputed iff its key is in `recompute_keys` (touched
+    // candidate keys ∪ changed-file symbol keys — the per-KEY inputs) or its id is
+    // in `affected_targets` (the per-TARGET exact-count change, both directions).
+    // The computed `recompute_set` is returned so the caller can drop the carried
+    // token-shape of those same targets.
+    recompute_keys: &AHashSet<(u64, u64, u64)>,
+    affected_targets: &AHashSet<u64>,
+) -> (Vec<GraphReference>, AHashSet<u64>) {
+    // Per-symbol bare/member symbol_count over the same key as the build side —
+    // identical to apply_token_shape_likely_count_baseline's first pass — fused
+    // with the recompute_set build (both need each symbol's key).
+    let mut bare_symbol_count: AHashMap<(u64, u64, u64), usize> = AHashMap::default();
+    let mut member_symbol_count: AHashMap<(u64, u64, u64), usize> = AHashMap::default();
+    let mut recompute_set: AHashSet<u64> = affected_targets.clone();
+    let mut cached_rel_path: &str = "";
+    let mut cached_scope_hash: u64 = 0;
+    let mut cached_language: &str = "";
+    let mut cached_lang_hash: u64 = 0;
+    for symbol in symbols {
+        let path = symbol.rel_path.as_str();
+        if path != cached_rel_path {
+            cached_rel_path = path;
+            cached_scope_hash = stable_hash(source_scope_key(path));
+        }
+        let lang = symbol.language.as_str();
+        if lang != cached_language {
+            cached_language = lang;
+            cached_lang_hash = stable_hash(lang);
+        }
+        let key = (cached_lang_hash, cached_scope_hash, symbol.name_hash);
+        if uses_member_token_shape_for_likely_count(symbol) {
+            *member_symbol_count.entry(key).or_default() += 1;
+        } else {
+            *bare_symbol_count.entry(key).or_default() += 1;
+        }
+        if recompute_keys.contains(&key) {
+            recompute_set.insert(symbol.id_u64);
+        }
+    }
+    let mut out: Vec<GraphReference> = Vec::new();
+    let mut dedup: AHashSet<u64> = AHashSet::default();
+    let mut cached_rel_path: &str = "";
+    let mut cached_scope_hash: u64 = 0;
+    let mut cached_language: &str = "";
+    let mut cached_lang_hash: u64 = 0;
+    for symbol in symbols {
+        // v2: emit only the recompute_set; all other targets' token-shape is
+        // carried from the prior index by the caller.
+        if !recompute_set.contains(&symbol.id_u64) {
+            continue;
+        }
+        let path = symbol.rel_path.as_str();
+        if path != cached_rel_path {
+            cached_rel_path = path;
+            cached_scope_hash = stable_hash(source_scope_key(path));
+        }
+        let lang = symbol.language.as_str();
+        if lang != cached_language {
+            cached_language = lang;
+            cached_lang_hash = stable_hash(lang);
+        }
+        let key = (cached_lang_hash, cached_scope_hash, symbol.name_hash);
+        let (candidates, symbol_count_for_key) =
+            if uses_member_token_shape_for_likely_count(symbol) {
+                (
+                    member_tally.get(&key),
+                    member_symbol_count.get(&key).copied().unwrap_or(0),
+                )
+            } else {
+                (
+                    bare_tally.get(&key),
+                    bare_symbol_count.get(&key).copied().unwrap_or(0),
+                )
+            };
+        // usage_baseline == number of likely sites for the key (build side does
+        // one +1 per candidate site). `call_baseline` (build side's
+        // `*_call_likely`) only feeds `count.calls_in_likely`, which does not
+        // gate emission, so it is intentionally not recomputed here — emission is
+        // gated solely by `reference_count < usage_likely` + the fanout limit,
+        // exactly as in `apply_token_shape_likely_count_baseline`.
+        let usage_baseline = candidates.map(|c| c.len()).unwrap_or(0);
+        let usage_must = counts.get(&symbol.id).map(|c| c.usage_must).unwrap_or(0);
+        let usage_likely = usage_must.max(usage_baseline);
+        let mut reference_count = reference_counts.get(&symbol.id_u64).copied().unwrap_or(0);
+        if reference_count < usage_likely {
+            if let Some(candidates) = candidates {
+                // Identical fanout gate: `candidates.len()` is the persisted
+                // likely-site count (stored up to 513 so an over-limit key
+                // still trips `> 512` here, matching the uncapped build side).
+                let fanout = candidates.len().saturating_mul(symbol_count_for_key);
+                if fanout <= MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY {
+                    for c in candidates {
+                        if reference_count >= usage_likely {
+                            break;
+                        }
+                        let edge_kind = edge_kind_str_from_id(c.edge_kind_id).unwrap_or("usage");
+                        let site_partial = site_partial_hash_u64(c.source_ref_id, edge_kind);
+                        let edge_key = edge_key_from_partial(site_partial, &symbol.id);
+                        // NOTE: phase F does NOT dedup token-shape against the
+                        // phase-E (exact) edge_keys — its `local_dedup` is a fresh
+                        // per-worker set, never seeded with phase E's pushes. It
+                        // gates solely on the COUNT (`reference_count`), emitting
+                        // the first `usage_likely - reference_count` candidates in
+                        // order even if a candidate site was also resolved
+                        // exactly. So we must NOT skip exact edge_keys here
+                        // (doing so dropped candidates and shifted the `break`
+                        // selection → ~551K churn). `dedup` only guards against a
+                        // duplicate token-shape push, which cannot occur (each
+                        // candidate has a distinct source_ref_id ⇒ distinct
+                        // edge_key for a given target), but is kept for parity.
+                        if !dedup.insert(edge_key) {
+                            continue;
+                        }
+                        let rel_path = file_table.get_path(c.file_id).unwrap_or("");
+                        out.push(GraphReference {
+                            source_ref_id: format!("ref:{:016x}", c.source_ref_id).into(),
+                            target_symbol_id: Some(symbol.id.as_str().into()),
+                            edge_kind: edge_kind.into(),
+                            name: symbol.name.as_str().into(),
+                            raw_text: symbol.name.as_str().into(),
+                            uri: Box::from(""),
+                            rel_path: rel_path.into(),
+                            start_line: c.start_line,
+                            start_column: c.start_column,
+                            end_line: c.end_line,
+                            end_column: c.end_column,
+                            enclosing_symbol_id: enclosing_id_to_string(c.enclosing_id)
+                                .map(|s| s.into()),
+                            bound_mask: BOUND_MAY,
+                            confidence: "possible".into(),
+                            provenance: "token-shape".into(),
+                        });
+                        reference_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    (out, recompute_set)
+}
+
 /// B6 stage-4/5c: the columns the resolve worker's cold per-file cache-miss
 /// needs to rebuild a site's strings without dereferencing `RefSite`, so the
 /// `Vec<RefSite>` can be dropped before resolve (stage-5d). `Some` on the
@@ -1476,6 +1860,77 @@ fn read_symbols_excluding_paths(
         out.extend(chunk);
     }
     Ok(out)
+}
+
+/// A2 Stage B v2: like `read_symbols_excluding_paths` but ALSO returns the
+/// token-shape keys of the EXCLUDED (changed-file) symbols. v2's recompute_set
+/// must recompute every symbol whose key's `symbol_count` changed; a def REMOVED
+/// from a changed file lowers that key's count for its same-key siblings, and
+/// the freshly parsed `symbols` no longer contain that removed def, so its prior
+/// key is collected HERE at no extra I/O — the same all-shard parallel read
+/// already deserializes every symbol; we partition (∉changed → carried, ∈changed
+/// → its key) instead of just filtering. The ADDED/modified defs' keys come from
+/// the parse loop; their union is the full per-key symbol_count change set.
+#[allow(clippy::type_complexity)]
+fn read_symbols_excluding_paths_with_changed_keys(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    exclude_paths: &HashSet<String>,
+    file_table: &FileTable,
+) -> io::Result<(Vec<GraphSymbol>, AHashSet<(u64, u64, u64)>)> {
+    let worker_count = graph_worker_count(GRAPH_SHARD_COUNT);
+    let shards_per_worker = GRAPH_SHARD_COUNT.div_ceil(worker_count);
+    let exclude_ref = exclude_paths;
+    let file_table_ref = file_table;
+    type Part = (Vec<GraphSymbol>, AHashSet<(u64, u64, u64)>);
+    let chunks: Vec<Part> = std::thread::scope(|s| -> io::Result<Vec<Part>> {
+        let mut handles = Vec::with_capacity(worker_count);
+        for w in 0..worker_count {
+            let start = w * shards_per_worker;
+            let end = ((w + 1) * shards_per_worker).min(GRAPH_SHARD_COUNT);
+            if start >= end {
+                continue;
+            }
+            handles.push(s.spawn(move || -> io::Result<Part> {
+                let mut carried: Vec<GraphSymbol> = Vec::new();
+                let mut changed_keys: AHashSet<(u64, u64, u64)> = AHashSet::default();
+                for shard in start..end {
+                    let path =
+                        graph_shard_path(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
+                    if !path.exists() {
+                        continue;
+                    }
+                    let bytes = fs::read(&path)?;
+                    let mut cursor = 0;
+                    while cursor < bytes.len() {
+                        let sym = parse_symbol_binary(&bytes, &mut cursor, file_table_ref)?;
+                        if exclude_ref.contains(&sym.rel_path) {
+                            changed_keys.insert((
+                                stable_hash(sym.language.as_str()),
+                                stable_hash(source_scope_key(&sym.rel_path)),
+                                sym.name_hash,
+                            ));
+                        } else {
+                            carried.push(sym);
+                        }
+                    }
+                }
+                Ok((carried, changed_keys))
+            }));
+        }
+        let mut combined = Vec::new();
+        for h in handles {
+            combined.push(h.join().expect("symbols read worker panicked")?);
+        }
+        Ok(combined)
+    })?;
+    let mut symbols = Vec::new();
+    let mut changed_keys: AHashSet<(u64, u64, u64)> = AHashSet::default();
+    for (chunk, keys) in chunks {
+        symbols.extend(chunk);
+        changed_keys.extend(keys);
+    }
+    Ok((symbols, changed_keys))
 }
 
 fn read_all_counts_from_id_shards(
@@ -2514,7 +2969,7 @@ where
                 } else {
                     None
                 };
-                let mut resolution = resolve_ref_sites_for_rebuild(
+                let (mut resolution, token_shape_tally) = resolve_ref_sites_for_rebuild(
                     symbols_ref,
                     ref_sites_ref,
                     import_facts_ref,
@@ -2535,6 +2990,30 @@ where
                     force_columns_channel,
                     Some(&tx),
                 );
+                // A2: persist the token-shape candidate-site tally (the likely-site
+                // idx maps + `write_cols` content) so an incremental update can
+                // rebuild the GLOBAL token-shape baseline from it + a per-changed-
+                // file delta, instead of re-deriving it from all ref_sites. Opt out
+                // with ZOEK_DISABLE_TOKEN_SHAPE_TALLY.
+                if std::env::var("ZOEK_DISABLE_TOKEN_SHAPE_TALLY").is_err() {
+                    let _t_ts = std::time::Instant::now();
+                    let ts_bytes = write_token_shape_tally_shards(
+                        workspace_root,
+                        config,
+                        &token_shape_tally.0,
+                        &token_shape_tally.1,
+                        write_cols_ref,
+                    )?;
+                    if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
+                        eprintln!(
+                            "[a2] token_shape_tally_write={}ms bytes={} bare_keys={} member_keys={}",
+                            _t_ts.elapsed().as_millis(),
+                            ts_bytes,
+                            token_shape_tally.0.len(),
+                            token_shape_tally.1.len()
+                        );
+                    }
+                }
                 // F1.b + wall-W2: phase E streamed into the writer (overlapped
                 // with the 8-thread writer pool). Phase F's lights were buffered
                 // (no channel backpressure). Rather than bulk-send those ~9.18M
@@ -2662,6 +3141,11 @@ where
                 false, // force_columns: respect ZOEK_SOA_OFF (ref_sites present)
                 None,
             )
+            // A2: the fallback (rare; ZOEK_DISABLE_LIGHT_CHANNEL / skip_resolve)
+            // keeps ref_sites and builds no `write_cols`, so it does not persist
+            // the token-shape tally — drop it. An incremental after a fallback
+            // rebuild finds no tally sidecar and recomputes it from loaded sites.
+            .0
         };
         resolving_ms = resolving_started.elapsed().as_millis();
         indexing_started = std::time::Instant::now();
@@ -2854,8 +3338,17 @@ pub fn update_graph_native(
     };
     let probe = std::env::var("ZOEK_FLOW_PROBE").is_ok();
     let _t = std::time::Instant::now();
-    let mut symbols = read_symbols_excluding_paths(workspace_root, config, &exclude_paths, &prior_file_table_for_symbols)?;
-    if probe { eprintln!("[flow] read_symbols={}ms", _t.elapsed().as_millis()); }
+    // v2: partition the prior symbols — carried (∉changed) into `symbols`, and the
+    // changed-file (about-to-be-replaced) symbols' token-shape keys into
+    // `changed_symbol_keys` (the parse loop adds the NEW defs' keys), so a def
+    // REMOVED by an edit still marks its key for recompute. Same all-shard read.
+    let (mut symbols, mut changed_symbol_keys) = read_symbols_excluding_paths_with_changed_keys(
+        workspace_root,
+        config,
+        &exclude_paths,
+        &prior_file_table_for_symbols,
+    )?;
+    if probe { eprintln!("[flow] read_symbols={}ms changed_symbol_keys_prior={}", _t.elapsed().as_millis(), changed_symbol_keys.len()); }
     drop(prior_file_table_for_symbols);
     let file_table_path = graph_file_table_path(workspace_root, config);
     let prior_file_table = if file_table_path.exists() {
@@ -2931,6 +3424,13 @@ pub fn update_graph_native(
             encoding,
         };
         let graph = build_file_graph(&entry);
+        for s in &graph.symbols {
+            changed_symbol_keys.insert((
+                stable_hash(s.language.as_str()),
+                stable_hash(source_scope_key(&s.rel_path)),
+                s.name_hash,
+            ));
+        }
         symbols.extend(graph.symbols);
         changed_ref_sites.extend(graph.ref_sites);
         import_facts.extend(graph.import_facts);
@@ -3007,92 +3507,296 @@ pub fn update_graph_native(
         None,
     );
     if probe { eprintln!("[flow] resolve_a_to_e={}ms", _t.elapsed().as_millis()); }
+    // A2 Stage B: the EXACT (non-token-shape) graph is assembled exactly as
+    // before (carried exact refs + re-resolved affected exact lights) — that
+    // half is byte-identical to a full rebuild. All token-shape refs are
+    // recomputed from the persisted candidate tally (load + per-changed-file
+    // delta + global re-emit gated identically to phase F), so we DROP every
+    // carried token-shape ref and SKIP `apply_token_shape_likely_count_baseline`.
+    // A2 Stage B v2: read ALL prior references once (no exclude) and partition.
+    // v1 excluded affected_paths at read time, DROPPED every carried token-shape
+    // ref, and recomputed ALL token-shape from the tally (~5.3s emit over millions
+    // of symbols). v2 CARRIES the prior token-shape of targets whose emission
+    // cannot have changed and re-emits only the small `recompute_set`. Reading
+    // everything also yields the prior AFFECTED exact targets: a changed/affected
+    // file that STOPPED referencing a target lowers its exact count, which a full
+    // rebuild then pads with MORE token-shape, so that target must be recomputed.
     let _t = std::time::Instant::now();
-    let unchanged_refs =
-        read_references_excluding_paths(&prior_file_table, workspace_root, config, &affected_paths)?;
-    if probe { eprintln!("[flow] read_unchanged_refs={}ms n={}", _t.elapsed().as_millis(), unchanged_refs.len()); }
-    // The incremental phase E only resolved the affected sites, so
-    // `light_target_count_by_id_u64` (the per-target resolved-ref tally phase F
-    // gates its token-shape padding on) counts only references originating in
-    // affected files. Seed it with the carried-forward unchanged references so
-    // phase F sees each symbol's GLOBAL resolved count; otherwise every symbol
-    // looks under-referenced and phase F over-pads the whole corpus (~+11M refs).
-    // The tally counts phase-E (resolved) references only, never phase F's own
-    // token-shape output, so exclude carried token-shape refs from the seed.
-    for r in &unchanged_refs {
+    let no_exclude: HashSet<String> = HashSet::default();
+    let prior_all =
+        read_references_excluding_paths(&prior_file_table, workspace_root, config, &no_exclude)?;
+    let mut carried_exact: Vec<GraphReference> = Vec::new();
+    // Carried token-shape is filtered by `recompute_set` once known (below); for
+    // now keep every token-shape ref NOT from a CHANGED file. Importers are
+    // affected for the EXACT graph (re-resolved) but their token-shape is
+    // syntactic and unchanged, so it must be carried (not dropped like v1 did).
+    let mut carried_token_shape: Vec<GraphReference> = Vec::new();
+    let mut affected_targets: AHashSet<u64> = AHashSet::default();
+    for r in prior_all {
         if r.provenance.as_ref() == "token-shape" {
+            if !exclude_paths.contains(&*r.rel_path) {
+                carried_token_shape.push(r);
+            }
+            // CHANGED-file token-shape is dropped (re-emitted via touched keys).
+        } else if affected_paths.contains(&*r.rel_path) {
+            if let Some(id_u64) = r
+                .target_symbol_id
+                .as_deref()
+                .and_then(parse_stable_symbol_id_to_u64)
+            {
+                affected_targets.insert(id_u64);
+            }
+            // Affected exact dropped here (re-resolved below).
+        } else {
+            carried_exact.push(r);
+        }
+    }
+    if probe { eprintln!("[flow] read_prior_all={}ms carried_exact={} carried_ts={} old_affected={}", _t.elapsed().as_millis(), carried_exact.len(), carried_token_shape.len(), affected_targets.len()); }
+    let _t = std::time::Instant::now();
+    let mut all_references = carried_exact;
+    all_references.append(&mut intermediate.references);
+    // Drain phase_e spilled batches (exact resolved refs for affected sites).
+    for path in std::mem::take(&mut intermediate.reference_partials) {
+        let bytes_or_err = fs::read(&path);
+        let _ = fs::remove_file(&path);
+        let bytes = bytes_or_err.expect("read spill");
+        let batch: Vec<GraphReference> =
+            bincode::deserialize(&bytes).expect("deserialize spill");
+        all_references.extend(batch.into_iter().filter(|r| r.provenance.as_ref() != "token-shape"));
+    }
+    // Materialize ONLY the affected EXACT lights (phase E output; phase F is
+    // skipped so `light_references` holds only phase-E lights, but filter on
+    // provenance to be explicit). Restores the re-resolved affected refs that
+    // resolve_ref_sites_a_to_e left as lights.
+    for light in &intermediate.light_references {
+        if light.provenance == LightProvenance::TokenShape {
             continue;
         }
-        if let Some(t) = r.target_symbol_id.as_deref() {
-            if let Some(id_u64) = parse_stable_symbol_id_to_u64(t) {
-                *intermediate
-                    .light_target_count_by_id_u64
-                    .entry(id_u64)
-                    .or_default() += 1;
-            }
-        }
-    }
-    let _t = std::time::Instant::now();
-    let mut all_references = unchanged_refs;
-    all_references.append(&mut intermediate.references);
-    // Drain phase_e spilled batches into all_references BEFORE phase_f so its
-    // reference_count tally is accurate (else token-shape over-pads).
-    for path in std::mem::take(&mut intermediate.reference_partials) {
-        let bytes_or_err = fs::read(&path);
-        let _ = fs::remove_file(&path);
-        let bytes = bytes_or_err.expect("read spill");
-        let batch: Vec<GraphReference> =
-            bincode::deserialize(&bytes).expect("deserialize spill");
-        all_references.extend(batch);
-    }
-    // For the incremental update path, just split the existing light_refs
-    // (phase E content) and let phase F append to the same vec at the end.
-    let light_in = std::mem::take(&mut intermediate.light_references);
-    let mut light_out_f: Vec<LightRef> = Vec::new();
-    apply_token_shape_likely_count_baseline(
-        &symbols,
-        &ref_sites,
-        &mut intermediate.counts,
-        &intermediate.bare_usage_likely_by_scope_and_name,
-        &intermediate.bare_call_likely_by_scope_and_name,
-        &intermediate.member_usage_likely_by_scope_and_name,
-        &intermediate.member_call_likely_by_scope_and_name,
-        &intermediate.bare_likely_sites_by_scope_and_name,
-        &intermediate.member_likely_sites_by_scope_and_name,
-        &mut all_references,
-        &intermediate.light_target_count_by_id_u64,
-        &mut light_out_f,
-        &mut intermediate.dedup,
-        &mut intermediate.reference_partials,
-        None,
-        None, // B6 stage-5d: incremental path keeps ref_sites (no prebuilt SiteCols)
-    );
-    intermediate.light_references = light_in;
-    intermediate.light_references.append(&mut light_out_f);
-    if probe { eprintln!("[flow] phase_f={}ms", _t.elapsed().as_millis()); }
-    // Drain phase_f spilled batches.
-    for path in std::mem::take(&mut intermediate.reference_partials) {
-        let bytes_or_err = fs::read(&path);
-        let _ = fs::remove_file(&path);
-        let bytes = bytes_or_err.expect("read spill");
-        let batch: Vec<GraphReference> =
-            bincode::deserialize(&bytes).expect("deserialize spill");
-        all_references.extend(batch);
-    }
-    // Phase 4-Q: phase E/F workers emit only LightRefs (intermediate.references
-    // stays empty — `local_refs: Vec::new()` in both worker closures); the
-    // legacy `resolve_ref_sites` wrapper materializes them at its boundary
-    // (materialize_resolution_for_legacy_callers). This path calls
-    // resolve_ref_sites_a_to_e directly, so it must materialize the re-resolved
-    // references itself. Phase F emits token-shape refs corpus-wide, but only
-    // those whose enclosing file is affected belong here — the rest are already
-    // carried in `unchanged_refs` (which excluded `affected_paths`). Filtering to
-    // affected enclosing restores the dropped affected refs (the materialize step
-    // was missing → -17,218) without double-counting the unaffected emission.
-    for light in &intermediate.light_references {
         let site = &ref_sites[light.site_idx as usize];
         if affected_paths.contains(&*site.rel_path) {
             all_references.push(materialize_light_ref(light, &ref_sites));
+        }
+    }
+    if probe { eprintln!("[flow] assemble_exact={}ms n={}", _t.elapsed().as_millis(), all_references.len()); }
+    // A2 Stage B: per-target EXACT reference count. This is the global exact
+    // count phase F gates token-shape padding on (== full rebuild's
+    // `light_target_count_by_id_u64`): each symbol is padded with token-shape
+    // refs only up to `usage_likely - reference_count`. (Phase F does NOT skip a
+    // candidate that was also resolved exactly — see emit_token_shape_refs — so
+    // no exact-edge_key set is needed.)
+    let _t = std::time::Instant::now();
+    let mut reference_counts: AHashMap<u64, usize> = AHashMap::default();
+    for r in &all_references {
+        if let Some(id_u64) = r
+            .target_symbol_id
+            .as_deref()
+            .and_then(parse_stable_symbol_id_to_u64)
+        {
+            *reference_counts.entry(id_u64).or_default() += 1;
+            // v2: NEW affected exact targets (re-resolved). carried_exact are all
+            // rel_path ∉ affected, so an affected rel_path here marks a re-resolved
+            // ref — union its target so a count change in EITHER direction (the OLD
+            // side was captured from prior_all above) forces recompute.
+            if affected_paths.contains(&*r.rel_path) {
+                affected_targets.insert(id_u64);
+            }
+        }
+    }
+    if probe { eprintln!("[flow] exact_counts={}ms targets={}", _t.elapsed().as_millis(), reference_counts.len()); }
+    // A2 Stage B: load the persisted token-shape tally (all shards for v1) and
+    // delta only the CHANGED files (token-shape is purely syntactic, so
+    // importers — which the exact graph re-resolves — contribute nothing here).
+    // Remove every candidate whose file is changed, then re-add candidates from
+    // the freshly parsed changed sites (same key/sort/cap as Stage A's write).
+    let _t = std::time::Instant::now();
+    let (mut bare_tally, mut member_tally) = load_token_shape_tally(workspace_root, config, None)?;
+    if probe { eprintln!("[flow] load_tally={}ms bare_keys={} member_keys={}", _t.elapsed().as_millis(), bare_tally.len(), member_tally.len()); }
+    // A2 fix (#4a NEW files): the persisted tally + emit are keyed by `file_id`,
+    // but `prior_file_table` has no id for a brand-NEW source file — so re-adding
+    // its candidates via `prior_file_table.get_id` silently skipped them, and a
+    // full rebuild (which DOES rank the new file) diverged. Build the file_table
+    // the same way `write_store` will (read prior, then intern `ref_sites` in
+    // order): new files get the appended ids `write_store` persists, so the
+    // tally we delta + write back stays consistent with the on-disk file_table
+    // the next update loads. For a modified-only update this interns nothing new
+    // (every path already present) ⇒ identical to `prior_file_table`.
+    let augmented_file_table = {
+        let mut t = prior_file_table.clone();
+        for site in &ref_sites {
+            t.intern(&site.rel_path);
+        }
+        t
+    };
+    let _t = std::time::Instant::now();
+    let changed_file_ids: HashSet<u32> = exclude_paths
+        .iter()
+        .filter_map(|p| prior_file_table.get_id(p))
+        .collect();
+    // Keys touched by the delta (candidate removed and/or added) — only these
+    // need a re-sort+cap afterwards, so unchanged keys keep their persisted
+    // (already sorted+capped) order and the whole-tally scan stays cheap.
+    let mut bare_touched: AHashSet<(u64, u64, u64)> = AHashSet::default();
+    let mut member_touched: AHashSet<(u64, u64, u64)> = AHashSet::default();
+    if !changed_file_ids.is_empty() {
+        for (map, touched) in [
+            (&mut bare_tally, &mut bare_touched),
+            (&mut member_tally, &mut member_touched),
+        ] {
+            for (key, cands) in map.iter_mut() {
+                let before = cands.len();
+                cands.retain(|c| !changed_file_ids.contains(&c.file_id));
+                if cands.len() != before {
+                    touched.insert(*key);
+                }
+            }
+        }
+    }
+    // Add candidates from the re-parsed changed/new files' sites. Mirrors
+    // phase_c: non-definition bare/member sites only; key = (lang_hash,
+    // scope_hash, name_hash) with scope = top-level dir. file_id comes from the
+    // augmented file_table, which assigns brand-new files the same appended ids
+    // `write_store` will persist (#4a) — so their candidates are added (not
+    // skipped) with an id the next update can resolve.
+    let mut bare_added: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>> = HashMap::default();
+    let mut member_added: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>> = HashMap::default();
+    for site in &ref_sites {
+        if site.is_definition {
+            continue;
+        }
+        if !exclude_paths.contains(&*site.rel_path) {
+            continue;
+        }
+        let access = site.access_kind_id;
+        if access != ACCESS_KIND_BARE && access != ACCESS_KIND_MEMBER {
+            continue;
+        }
+        let Some(file_id) = augmented_file_table.get_id(&site.rel_path) else {
+            continue;
+        };
+        let key = (
+            stable_hash(site.language.as_str()),
+            stable_hash(source_scope_key(&site.rel_path)),
+            site.name_hash,
+        );
+        let cand = TokenShapeCandidate {
+            source_ref_id: site.source_ref_id,
+            enclosing_id: site.enclosing_id,
+            file_id,
+            start_line: site.start_line,
+            start_column: site.start_column,
+            end_line: site.end_line,
+            end_column: site.end_column,
+            edge_kind_id: site.edge_kind_id,
+            access_kind_id: access,
+        };
+        if access == ACCESS_KIND_MEMBER {
+            member_added.entry(key).or_default().push(cand);
+        } else {
+            bare_added.entry(key).or_default().push(cand);
+        }
+    }
+    // Merge the re-added candidates back, recording each touched key.
+    for (map, touched, added) in [
+        (&mut bare_tally, &mut bare_touched, bare_added),
+        (&mut member_tally, &mut member_touched, member_added),
+    ] {
+        for (key, mut cands) in added {
+            touched.insert(key);
+            map.entry(key).or_default().append(&mut cands);
+        }
+    }
+    // Re-order+cap only the touched keys so their candidate order/membership
+    // matches a full rebuild's persisted form: global build order is ascending
+    // `ref_sites` index, i.e. files in rel_path order (discovery sorts by
+    // `rel_path.cmp`, ~graph.rs:2031) with each file's sites contiguous in
+    // `build_file_graph` emission order. A STABLE sort by `rel_path` reproduces
+    // that — the surviving unchanged candidates are already in build order (so
+    // stable-sort leaves their relative order), and the re-added changed/new
+    // block (appended at the end, in `ref_sites` iteration = `build_file_graph`
+    // order) is moved to its rel_path slot. We sort by rel_path, NOT `file_id`,
+    // because incremental `file_id`s are append-ordered (a new file gets the
+    // next id, not its rel_path rank — #4a), so a `file_id` sort would misplace
+    // new files vs the full rebuild; it is also robust to non-canonical `file_id`
+    // under parse spill (#1). Then cap at the fanout limit + 1. A key emptied by
+    // the delta is dropped so it cannot pad a stale baseline.
+    for (map, touched) in [
+        (&mut bare_tally, &bare_touched),
+        (&mut member_tally, &member_touched),
+    ] {
+        for key in touched.iter() {
+            if let Some(cands) = map.get_mut(key) {
+                if cands.is_empty() {
+                    map.remove(key);
+                    continue;
+                }
+                cands.sort_by(|a, b| {
+                    augmented_file_table
+                        .get_path(a.file_id)
+                        .unwrap_or("")
+                        .cmp(augmented_file_table.get_path(b.file_id).unwrap_or(""))
+                });
+                cands.truncate(TOKEN_SHAPE_TALLY_STORE_CAP_PER_KEY);
+            }
+        }
+    }
+    if probe { eprintln!("[flow] delta_tally={}ms bare_touched={} member_touched={}", _t.elapsed().as_millis(), bare_touched.len(), member_touched.len()); }
+    // A2 Stage B v2: emit token-shape ONLY for the recompute_set, carry the rest.
+    // recompute_keys = the per-KEY changed inputs: touched candidate keys ∪
+    // changed-file symbol keys. The symbol keys cover BOTH directions of a
+    // symbol_count change: ADDED/modified defs (collected at parse time) and
+    // REMOVED defs (the prior changed-file symbols' keys, collected by the
+    // partitioning symbol read) — so a def deletion that lowers a sibling key's
+    // count is recomputed too. `emit_token_shape_refs_from_tally` fuses the
+    // recompute_set build into its mandatory symbol_count pass — seeding with
+    // affected_targets (the per-TARGET exact-count change, both directions) and
+    // adding every symbol whose key is in recompute_keys — and returns it, so the
+    // caller can drop the carried token-shape of those targets. No extra
+    // full-symbol scan runs here (all inputs were gathered upstream).
+    let mut recompute_keys: AHashSet<(u64, u64, u64)> = changed_symbol_keys;
+    for k in bare_touched.iter().chain(member_touched.iter()) {
+        recompute_keys.insert(*k);
+    }
+    let _t = std::time::Instant::now();
+    let (mut token_shape_refs, recompute_set) = emit_token_shape_refs_from_tally(
+        &symbols,
+        &bare_tally,
+        &member_tally,
+        &reference_counts,
+        &intermediate.counts,
+        &augmented_file_table,
+        &recompute_keys,
+        &affected_targets,
+    );
+    if probe { eprintln!("[flow] emit_token_shape={}ms n={} recompute_keys={} recompute_targets={}", _t.elapsed().as_millis(), token_shape_refs.len(), recompute_keys.len(), recompute_set.len()); }
+    // Carry the prior token-shape refs of every target NOT being recomputed.
+    let _t = std::time::Instant::now();
+    carried_token_shape.retain(|r| {
+        match r
+            .target_symbol_id
+            .as_deref()
+            .and_then(parse_stable_symbol_id_to_u64)
+        {
+            Some(id) => !recompute_set.contains(&id),
+            None => true,
+        }
+    });
+    if probe { eprintln!("[flow] carry_filter={}ms carried_ts_kept={}", _t.elapsed().as_millis(), carried_token_shape.len()); }
+    all_references.append(&mut token_shape_refs);
+    all_references.append(&mut carried_token_shape);
+    // A2 fix (4d): persist the delta-maintained tally back to its sidecar so the
+    // NEXT incremental update loads current (not stale) candidates — otherwise
+    // chained updates accumulate token-shape drift vs a full rebuild. Same
+    // opt-out as the full-rebuild write.
+    if std::env::var("ZOEK_DISABLE_TOKEN_SHAPE_TALLY").is_err() {
+        let _t_tw = std::time::Instant::now();
+        let ts_wb =
+            write_token_shape_tally_candidates(workspace_root, config, &bare_tally, &member_tally)?;
+        if probe {
+            eprintln!(
+                "[flow] token_shape_tally_writeback={}ms bytes={}",
+                _t_tw.elapsed().as_millis(),
+                ts_wb
+            );
         }
     }
     let _t = std::time::Instant::now();
@@ -5789,7 +6493,12 @@ fn resolve_ref_sites_for_rebuild(
     // its worker wall isn't slowed by channel backpressure; the caller can
     // bulk-send `light_references` into the same channel after this returns.
     light_sender: Option<&crossbeam_channel::Sender<Vec<LightRef>>>,
-) -> ResolutionResult {
+) -> (
+    ResolutionResult,
+    // A2: token-shape likely-site idx maps (bare, member), moved out after phase
+    // F so the caller — which holds `write_cols` — can persist the candidates.
+    (HashMap<(u64, u64, u64), Vec<u32>>, HashMap<(u64, u64, u64), Vec<u32>>),
+) {
     let mut intermediate = resolve_ref_sites_a_to_e(
         symbols,
         ref_sites,
@@ -5862,12 +6571,22 @@ fn resolve_ref_sites_for_rebuild(
     }
     intermediate.light_references = light_in;
     intermediate.light_references.append(&mut light_out_f);
-    ResolutionResult {
-        references: intermediate.references, // empty in Phase 4-Q
-        light_references: intermediate.light_references,
-        reference_partials: intermediate.reference_partials,
-        counts: intermediate.counts,
-    }
+    // A2: hand the token-shape likely-site idx maps to the caller for persistence
+    // (phase F only borrowed them, so they're intact). The caller fills each
+    // candidate's content from `write_cols` and writes the sidecar.
+    let token_shape_tally = (
+        std::mem::take(&mut intermediate.bare_likely_sites_by_scope_and_name),
+        std::mem::take(&mut intermediate.member_likely_sites_by_scope_and_name),
+    );
+    (
+        ResolutionResult {
+            references: intermediate.references, // empty in Phase 4-Q
+            light_references: intermediate.light_references,
+            reference_partials: intermediate.reference_partials,
+            counts: intermediate.counts,
+        },
+        token_shape_tally,
+    )
 }
 
 /// Boundary materialize for legacy callers (tests, incremental update).
@@ -13866,6 +14585,141 @@ fn percent_encode_path(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::corpus::TextEncoding;
+
+    // A2 Stage B verification gate (ignored — needs the external captain2 corpus
+    // and runs two ~30s full passes). Mirrors the shell diff harness: full
+    // rebuild → snapshot the canonical reference set → incremental graph-update
+    // on one changed file → snapshot again → diff, split by provenance. The
+    // EXACT (non-token-shape) set MUST stay identical; token-shape extra/missing
+    // MUST both reach 0. Run with:
+    //   cargo test --release --lib -p zoek-rs -- --ignored --nocapture a2_stage_b_token_shape_matches_full_rebuild
+    #[test]
+    #[ignore]
+    fn a2_stage_b_token_shape_matches_full_rebuild() {
+        use std::collections::BTreeSet;
+        let root = PathBuf::from("/Users/lky/project/captain2/captain");
+        if !root.exists() {
+            eprintln!("[a2-test] corpus {root:?} missing — skipping");
+            return;
+        }
+        let config = EngineConfig::default();
+        let changed = std::fs::read_to_string("/tmp/a2_changed_file.txt")
+            .ok()
+            .map(|s| PathBuf::from(s.trim()))
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| {
+                // Fallback: first non-hidden .py file under the corpus.
+                walk_first_py(&root).expect("a changed .py file")
+            });
+        eprintln!("[a2-test] changed file = {changed:?}");
+
+        let snapshot = |label: &str| -> BTreeSet<String> {
+            let ft_path = graph_file_table_path(&root, &config);
+            let ft = read_file_table_binary(&ft_path).unwrap_or_default();
+            let empty: HashSet<String> = HashSet::default();
+            let refs = read_references_excluding_paths(&ft, &root, &config, &empty)
+                .expect("read refs");
+            eprintln!("[a2-test] {label}: {} refs", refs.len());
+            refs.into_iter()
+                .map(|r| {
+                    format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        &*r.rel_path,
+                        r.start_line,
+                        r.start_column,
+                        r.target_symbol_id.as_deref().unwrap_or(""),
+                        &*r.provenance,
+                        &*r.confidence,
+                    )
+                })
+                .collect()
+        };
+
+        let mut noop = |_p: GraphRebuildProgress| {};
+        rebuild_graph_native(&root, 0, &config, 0, &mut noop).expect("rebuild");
+        let full = snapshot("full");
+
+        update_graph_native(&root, std::slice::from_ref(&changed), &[], 0, &config, 0)
+            .expect("update");
+        let incr = snapshot("incr");
+
+        let extra: Vec<&String> = incr.difference(&full).collect();
+        let missing: Vec<&String> = full.difference(&incr).collect();
+        let extra_non_ts = extra.iter().filter(|l| !l.contains("token-shape")).count();
+        let missing_non_ts = missing.iter().filter(|l| !l.contains("token-shape")).count();
+        eprintln!(
+            "[a2-test] extra={} (non-ts {}), missing={} (non-ts {})",
+            extra.len(),
+            extra_non_ts,
+            missing.len(),
+            missing_non_ts
+        );
+        // On divergence, print a few samples so the failure shows what differs.
+        for l in extra.iter().take(10) {
+            eprintln!("[a2-test]   +extra: {l}");
+        }
+        for l in missing.iter().take(10) {
+            eprintln!("[a2-test]   -missing: {l}");
+        }
+        assert_eq!(extra_non_ts, 0, "non-token-shape extra must be 0");
+        assert_eq!(missing_non_ts, 0, "non-token-shape missing must be 0");
+        assert_eq!(extra.len(), 0, "token-shape extra must be 0");
+        assert_eq!(missing.len(), 0, "token-shape missing must be 0");
+    }
+
+    // A2 Stage B timing probe (ignored). Rebuilds once, then runs the
+    // incremental graph-update with ZOEK_FLOW_PROBE so the per-phase `[flow]`
+    // timings (incl. the new load_tally / delta_tally / emit_token_shape lines)
+    // print. Run with:
+    //   cargo test --release --lib -p zoek-rs -- --ignored --nocapture a2_stage_b_flow_timings
+    #[test]
+    #[ignore]
+    fn a2_stage_b_flow_timings() {
+        let root = PathBuf::from("/Users/lky/project/captain2/captain");
+        if !root.exists() {
+            eprintln!("[a2-timing] corpus missing — skipping");
+            return;
+        }
+        let config = EngineConfig::default();
+        let changed = std::fs::read_to_string("/tmp/a2_changed_file.txt")
+            .ok()
+            .map(|s| PathBuf::from(s.trim()))
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| walk_first_py(&root).expect("a changed .py file"));
+        let mut noop = |_p: GraphRebuildProgress| {};
+        rebuild_graph_native(&root, 0, &config, 0, &mut noop).expect("rebuild");
+        std::env::set_var("ZOEK_FLOW_PROBE", "1");
+        let t = std::time::Instant::now();
+        let summary =
+            update_graph_native(&root, std::slice::from_ref(&changed), &[], 0, &config, 0)
+                .expect("update");
+        std::env::remove_var("ZOEK_FLOW_PROBE");
+        eprintln!(
+            "[a2-timing] graph-update total={}ms referenceCount={}",
+            t.elapsed().as_millis(),
+            summary.reference_count
+        );
+    }
+
+    fn walk_first_py(root: &Path) -> Option<PathBuf> {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).ok()?;
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') {
+                    continue;
+                }
+                if p.is_dir() {
+                    stack.push(p);
+                } else if name.ends_with(".py") {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
 
     fn test_entry(rel_path: &str, text: &str) -> CorpusEntry {
         CorpusEntry {
