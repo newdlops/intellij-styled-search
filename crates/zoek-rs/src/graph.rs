@@ -2696,6 +2696,16 @@ pub fn update_graph_native(
              built in skip-resolve mode."
         );
         let mut noop = |_progress: GraphRebuildProgress| {};
+        // Release the update lock before the full-rebuild fallback. flock locks are
+        // keyed by open file description, not by process, so `rebuild_graph_native`
+        // re-acquiring the same lock on a fresh fd while `_graph_lock` is still held
+        // makes this process block forever waiting on *itself* (self-deadlock). That
+        // leaks an orphaned graph-update process holding graph-rebuild.lock, and every
+        // later zoek-rs invocation then blocks on "another zoek-rs is holding … —
+        // waiting". Dropping here lets the nested rebuild re-acquire cleanly; the brief
+        // unlocked gap is benign (sidecars were already incomplete → a rebuild is
+        // needed regardless, and rebuild is idempotent + re-serialized by the lock).
+        drop(_graph_lock);
         return rebuild_graph_native(workspace_root, built_at, config, worker_count, &mut noop);
     }
     let exclude_paths: HashSet<String> = changed_paths
