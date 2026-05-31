@@ -1165,6 +1165,13 @@ fn read_ref_sites_excluding_paths(
     config: &EngineConfig,
     exclude_paths: &HashSet<String>,
     file_table: &FileTable,
+    // Stage-1 slim: when `Some`, read only these shards (ref_sites are sharded by
+    // rel_path, so an incremental update only needs the shards holding the
+    // affected files — a changed file's importers and itself). `None` reads all
+    // 128 shards (full carry-forward). The shard set is a superset of the
+    // affected files (co-located files share a shard) so the affected shards can
+    // still be rewritten wholesale; the resolve pass filters to affected_indices.
+    only_shards: Option<&HashSet<usize>>,
 ) -> io::Result<Vec<RefSite>> {
     let worker_count = graph_worker_count(GRAPH_SHARD_COUNT);
     let shards_per_worker = GRAPH_SHARD_COUNT.div_ceil(worker_count);
@@ -1183,6 +1190,11 @@ fn read_ref_sites_excluding_paths(
                 let mut read_us: u128 = 0;
                 let mut parse_us: u128 = 0;
                 for shard in start..end {
+                    if let Some(os) = only_shards {
+                        if !os.contains(&shard) {
+                            continue;
+                        }
+                    }
                     let path = graph_shard_path(
                         workspace_root,
                         config,
@@ -1377,6 +1389,48 @@ fn read_references_excluding_paths(
         out.extend(chunk);
     }
     Ok(out)
+}
+
+/// Debug tool: read every reference-target shard from disk and write a sorted
+/// TSV (rel_path, start_line, start_col, target, provenance, confidence) so a
+/// full-rebuild dump and an incremental-update dump can be diffed to locate
+/// where the incremental path diverges from the canonical set. Path-independent
+/// (reads the final on-disk shards), so it compares the two write paths fairly.
+pub fn dump_references_tsv(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    out_path: &Path,
+) -> io::Result<usize> {
+    let file_table_path = graph_file_table_path(workspace_root, config);
+    let file_table = if file_table_path.exists() {
+        read_file_table_binary(&file_table_path).unwrap_or_default()
+    } else {
+        FileTable::default()
+    };
+    let empty: HashSet<String> = HashSet::default();
+    let refs = read_references_excluding_paths(&file_table, workspace_root, config, &empty)?;
+    let mut lines: Vec<String> = refs
+        .iter()
+        .map(|r| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                &*r.rel_path,
+                r.start_line,
+                r.start_column,
+                r.target_symbol_id.as_deref().unwrap_or(""),
+                &*r.provenance,
+                &*r.confidence,
+            )
+        })
+        .collect();
+    lines.sort_unstable();
+    let mut out = String::with_capacity(lines.len().saturating_mul(48));
+    for l in &lines {
+        out.push_str(l);
+        out.push('\n');
+    }
+    std::fs::write(out_path, out)?;
+    Ok(lines.len())
 }
 
 fn read_symbols_excluding_paths(
@@ -2809,10 +2863,10 @@ pub fn update_graph_native(
     } else {
         FileTable::default()
     };
-    let _t = std::time::Instant::now();
-    let mut ref_sites =
-        read_ref_sites_excluding_paths(workspace_root, config, &exclude_paths, &prior_file_table)?;
-    if probe { eprintln!("[flow] read_ref_sites={}ms n={}", _t.elapsed().as_millis(), ref_sites.len()); }
+    // Stage-1 slim: defer the ref_sites read until after `affected_paths` is
+    // known, so only the shards holding affected files are read (not all 128).
+    // Changed files' freshly parsed sites are collected here and merged in then.
+    let mut changed_ref_sites: Vec<RefSite> = Vec::new();
     let _t = std::time::Instant::now();
     let (mut import_facts, mut type_facts, mut function_return_facts) =
         read_facts_excluding_paths(workspace_root, config, &exclude_paths, &prior_file_table)?;
@@ -2878,7 +2932,7 @@ pub fn update_graph_native(
         };
         let graph = build_file_graph(&entry);
         symbols.extend(graph.symbols);
-        ref_sites.extend(graph.ref_sites);
+        changed_ref_sites.extend(graph.ref_sites);
         import_facts.extend(graph.import_facts);
         type_facts.extend(graph.type_facts);
         function_return_facts.extend(graph.function_return_facts);
@@ -2898,6 +2952,34 @@ pub fn update_graph_native(
             affected_paths.insert(fact.rel_path.clone());
         }
     }
+    // Stage-1 slim: affected_paths is known now, so read only the ref_site shards
+    // that hold those files (sharded by rel_path) instead of all 128, then merge
+    // the freshly parsed changed sites. The affected files' sites live in these
+    // shards (so affected_indices below is complete); co-located unaffected files
+    // in the same shards come along so each shard can still be rewritten whole.
+    let affected_ref_shards: HashSet<usize> = affected_paths
+        .iter()
+        .map(|p| shard_index_for_key(p))
+        .collect();
+    let _t_rs = std::time::Instant::now();
+    let mut ref_sites = read_ref_sites_excluding_paths(
+        workspace_root,
+        config,
+        &exclude_paths,
+        &prior_file_table,
+        Some(&affected_ref_shards),
+    )?;
+    ref_sites.extend(std::mem::take(&mut changed_ref_sites));
+    if probe {
+        eprintln!(
+            "[flow] read_ref_sites(slim)={}ms n={} shards={}/{}",
+            _t_rs.elapsed().as_millis(),
+            ref_sites.len(),
+            affected_ref_shards.len(),
+            GRAPH_SHARD_COUNT
+        );
+    }
+    let _t = std::time::Instant::now();
     let affected_indices: Vec<u32> = ref_sites
         .iter()
         .enumerate()
@@ -2929,6 +3011,27 @@ pub fn update_graph_native(
     let unchanged_refs =
         read_references_excluding_paths(&prior_file_table, workspace_root, config, &affected_paths)?;
     if probe { eprintln!("[flow] read_unchanged_refs={}ms n={}", _t.elapsed().as_millis(), unchanged_refs.len()); }
+    // The incremental phase E only resolved the affected sites, so
+    // `light_target_count_by_id_u64` (the per-target resolved-ref tally phase F
+    // gates its token-shape padding on) counts only references originating in
+    // affected files. Seed it with the carried-forward unchanged references so
+    // phase F sees each symbol's GLOBAL resolved count; otherwise every symbol
+    // looks under-referenced and phase F over-pads the whole corpus (~+11M refs).
+    // The tally counts phase-E (resolved) references only, never phase F's own
+    // token-shape output, so exclude carried token-shape refs from the seed.
+    for r in &unchanged_refs {
+        if r.provenance.as_ref() == "token-shape" {
+            continue;
+        }
+        if let Some(t) = r.target_symbol_id.as_deref() {
+            if let Some(id_u64) = parse_stable_symbol_id_to_u64(t) {
+                *intermediate
+                    .light_target_count_by_id_u64
+                    .entry(id_u64)
+                    .or_default() += 1;
+            }
+        }
+    }
     let _t = std::time::Instant::now();
     let mut all_references = unchanged_refs;
     all_references.append(&mut intermediate.references);
@@ -2975,6 +3078,22 @@ pub fn update_graph_native(
         let batch: Vec<GraphReference> =
             bincode::deserialize(&bytes).expect("deserialize spill");
         all_references.extend(batch);
+    }
+    // Phase 4-Q: phase E/F workers emit only LightRefs (intermediate.references
+    // stays empty — `local_refs: Vec::new()` in both worker closures); the
+    // legacy `resolve_ref_sites` wrapper materializes them at its boundary
+    // (materialize_resolution_for_legacy_callers). This path calls
+    // resolve_ref_sites_a_to_e directly, so it must materialize the re-resolved
+    // references itself. Phase F emits token-shape refs corpus-wide, but only
+    // those whose enclosing file is affected belong here — the rest are already
+    // carried in `unchanged_refs` (which excluded `affected_paths`). Filtering to
+    // affected enclosing restores the dropped affected refs (the materialize step
+    // was missing → -17,218) without double-counting the unaffected emission.
+    for light in &intermediate.light_references {
+        let site = &ref_sites[light.site_idx as usize];
+        if affected_paths.contains(&*site.rel_path) {
+            all_references.push(materialize_light_ref(light, &ref_sites));
+        }
     }
     let _t = std::time::Instant::now();
     let mut counts = std::mem::take(&mut intermediate.counts);

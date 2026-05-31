@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use zoek_rs::config::EngineConfig;
 use zoek_rs::graph::{
-    index_graph_from_tsv, query_graph, query_graph_callees,
+    dump_references_tsv, index_graph_from_tsv, query_graph, query_graph_callees,
     query_graph_document_symbols_with_options, query_graph_implementations,
     query_graph_symbols_with_options, rebuild_graph_native, update_graph_native, GraphSymbol,
     GraphSymbolQueryOptions,
@@ -56,6 +56,7 @@ fn run(args: Vec<String>) -> Result<EngineResponse, String> {
         "graph-rebuild" => run_graph_rebuild(&args[1..]),
         "graph-index" => run_graph_index(&args[1..]),
         "graph-update" => run_graph_update(&args[1..]),
+        "graph-dump-refs" => run_graph_dump_refs(&args[1..]),
         "graph-query" => run_graph_query(&args[1..]),
         "graph-callees" => run_graph_callees(&args[1..]),
         "graph-symbol-query" => run_graph_symbol_query(&args[1..]),
@@ -854,6 +855,19 @@ fn run_graph_update(args: &[String]) -> Result<EngineResponse, String> {
         bytes: summary.bytes,
         warnings: vec!["updated by rust-native graph-update".to_string()],
     }))
+}
+
+fn run_graph_dump_refs(args: &[String]) -> Result<EngineResponse, String> {
+    let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
+    let out = PathBuf::from(
+        args.get(1)
+            .cloned()
+            .ok_or_else(|| "graph-dump-refs requires an output path".to_string())?,
+    );
+    let config = EngineConfig::for_workspace(&workspace_root);
+    let n = dump_references_tsv(&workspace_root, &config, &out).map_err(|err| err.to_string())?;
+    eprintln!("graph-dump-refs: wrote {n} references to {}", out.display());
+    std::process::exit(0);
 }
 
 fn run_graph_query(args: &[String]) -> Result<EngineResponse, String> {
