@@ -23,8 +23,7 @@
 - **★ W27: B6 종료(메모리 목표 미달) → wall 10s 공략으로 전환 (사용자 선택: 점진, ~20-25s 목표).** 재프로파일(현 ~34s): discover 2.6 / **parse 8.83** / **resolve 22.84**(prep 3.36 + phase_a~d 4.5 + **phase_e 8.67** + phase_f 1.23 + **writer-drain-tail ~5**) / index ~0. **솔직한 평가: 10s는 점진 누적 불가(잘해야 ~20-25s), 아키텍처(W13 Parse-Resolve fusion 등) 필요.** ✅ **wall-W1: interner 빌드 병렬화** — 38M site + 16M receiver 이름의 sequential intern(~2.4s, stage-5가 추가한 회귀)을 **par_fold로 distinct(~1M) 수집 후 intern**. interner id는 내부값(consumer는 `name(get())` round-trip, hot map은 name_hash) → **byte-identical**. **resolve-prep 3.36→1.73s(−1.63s)**, 75/75 + bytes 3,788,145,402. **남은 점진 레버는 더 어려움**(phase_e parking·writer-drain backpressure는 W22/W14서 탐구; phase_a/b 맵빌드 병렬화는 Vec-ordering byte-identity 위험). → 상세 **`### 이번 세션 (W27)`**.
 - **★ W26: B6 stage-4 — `name`/`receiver_name` → NameInterner u32 id (reverse table) + 양쪽 reader 복원 (byte-identical).** stage-5(`Vec<RefSite>` drop) 토대. **NameInterner에 reverse `names: Vec<Box<str>>`(id→&str) 추가**(forward `ids`는 collision-free string-key 유지 → 복원 byte-exact). `rebuild_graph_native` 분기 전에 **symbol name + 전 receiver intern → `site_name_ids`/`site_receiver_name_ids` 컬럼**(par populate, channel writer가 resolve와 동시 소비하므로 scope 전 빌드). **write path(14M)**: `serialize_reference_binary_from_light`가 `interner.name(site_name_ids[idx])`로 `name` 복원(**fallback 없음** → MISS면 bytes 발산). **가설 입증**: emitted reference의 name은 항상 타겟 symbol name(bare/member 모두 symbol-keyed 매치 필요)이라 symbol interner로 14M 전부 hit(MISS 0, bytes 게이트 확인). **worker cold**: `resolve_ref_sites_a_to_e`에 `receiver_recon: Option<(&NameInterner,&[u32])>` 추가, column cache-miss서 receiver 복원(string-key라 byte-exact); `rel_path`는 아직 site(stage-5 file_id). materialize/push는 channel write path 아님 → 미변경. **게이트 통과: 75/75 + invariant 14,372,638 + bytes 3,788,145,402 + schemaVersion 20(완전 byte-identical, name·receiver 복원 둘 다).** ⚠️ **메모리는 전이적 +~330MB**(interner+2 id 컬럼이 Vec<RefSite> 위에 얹힘) — **win은 stage-5(Vec drop −7.6GB)**. → 상세 **`### 이번 세션 (W26)`**.
 - **★★ W26 같은 세션 stage-5 (5a~5d) 완료 = `Vec<RefSite>` drop, byte-identical — 단 메모리 win 없음(중요 발견).** (사용자 선택 A 전 필드 컬럼화→OV1 유지; 결과 보고 후 **유지(keep)** 결정.) 5a reference writer→RefWriteCol, 5b OV1 disk writer→`serialize_ref_site_binary_from_cols`(probe로 unknown-language=0 확인→fallback 문자열 불요; interner를 전 site name으로 확장), 5c worker/buckets→site_cols+file_id, 5d `build_site_cols` 후 resolve 전 `ref_sites=Vec::new()`(drop_ref_sites=overlap_static&&soa_on, force_columns로 struct 경로 차단). **게이트: 75/75 + invariant 14,372,638 + bytes 3,788,145,402(channel+fallback 둘 다) + schemaVersion 20.** ⚠️ **메모리 win 거의 없음 (paired로 확정).** drop ON/OFF paired(`ZOEK_B6_KEEP_REFSITES` 토글, peak RSS는 프로세스값이라 신뢰): **ON ~15.07GB vs OFF ~15.54GB → drop이 peak를 ~0.5GB만 줄임(7.6 아님)**. **peak는 build-window**(parse가 ref_sites+symbols+facts ~9.1GB 후 컬럼 ~4GB 적층, ON/OFF 동일)이고 drop은 그 이후. **→ B6(resolve-time ref_sites drop)로 −6GB 불가능 확정.** 진짜 레버=parse base 또는 resolution 맵 축소. wall은 미측정(idle 필요). 상세 **full B6 stage-5 항목** + **`### 이번 세션 (W26)`**.
-- **다음 작업 후보**: (1) **resolution 맵 메모리 축소**(peak 실주범 — symbols_by_file_and_name 등 ~10GB; 메모리 우선이면 여기). (2) stage-5 유지했으니 **matched-idle paired로 wall(5a의 file_table probe 제거 등) + peak 정밀 재측정**(단일측정 ±1GB 노이즈). (3) 30s wall 목표면 parse 스캔/index 잔여(W21 후보). **B6은 메모리 목표 미달로 종료 — 추가 ref_sites 컬럼화 무의미.**
-- **다음 = stage-5 나머지(5b/5c/5d)로 −6GB 실현**: (5c) 남은 2 읽기→site_cols/file_id. (5b) OV1 `serialize_ref_site_binary`→컬럼(language OTHER 발생 여부 먼저 조사; edge/access는 fresh가 전부 standard). (5d) **SiteCols+전 컬럼·file_table을 resolve 전으로 이동** + `drop(ref_sites)` + struct opt-out 경로 제거 결정. 각 게이트 + 최종 peak RSS matched-idle.
+- *(W24~26 B6 forward-notes는 모두 해소: stage-5 완료(W26) + B6 메모리 목표 종료(−0.5GB만). 잔존 메모리 레버 "resolution 맵 축소"는 위 **다음 작업 후보 M1**으로 통합.)*
 - **★ W25: B6 stage-3 — `RefSite.enclosing_symbol_id` Option<String> → `enclosing_id: u64` (byte-identical).** String enclosing 드롭 + redundant `enclosing_symbol_id_hash`(skip) 제거, `enclosing_id: u64`(=`parse_stable_symbol_id_to_u64`, 0=None, **non-skip 직렬화**라 FIXUP 재계산 불요)로 통합. **계획된 (B)cascade(helper들 Option<u64>화) 대신 더 안전한 (C) 채택**: symbol id가 항상 `format!("sym:{:016x}")`라 신규 `enclosing_id_to_string`로 **byte-exact 복원** 가능 → `compute_receiver_resolution`/type-fact helper의 `Option<&str>` **시그니처 불변**(enclosing lifetime만 `&'a`→`&` 완화 — 출력에 retain 안 됨, 컴파일러 검증), cold(per-file cache-miss + materialize + enclosing-shard 키)서만 string 복원. receiver_cache 키 `(recv_hash, enclosing_symbol_id_hash)`→`(recv_hash, enclosing_id)` **bijective relabel**(둘 다 enclosing 문자열의 deterministic injective 함수). `serialize_reference_record`는 stage-2 prereq 패턴대로 pre-parsed u64 받음(14M write path format! 0). dead 함수(combined_member_candidates·type_fact_applies_to_site·resolve_type_*)는 삭제 대신 최소 갱신(복원). **게이트 통과: 75/75 + invariant 14,372,638 + bytes 3,788,145,402 + schemaVersion 20.** 메모리: −24B inline/site + per-site enclosing String heap 제거. → 상세 **`### 이번 세션 (W25)`**. **다음: stage-4(name/receiver→interner) + stage-5(Vec<RefSite> drop).**
 - **★ W24: B6 stage 1+2 — peak RSS 17.98→15.72GB(OV1 ON서 16GB 캡 아래 복귀!).** peak 측정으로 **OV1(wall −2.8s)이 +2GB로 캡 초과** 발견 → **stage1(`raw_text` 드롭) + stage2(`source_ref_id` String→u64; dedup relabel은 bijective라 invariant 보존)**로 −2.26GB 내려 **OV1 유지하면서 캡 내 복귀.** 둘 다 byte-identical(invariant **14,372,638** + bytes **3,788,145,402** 게이트 통과, 75/75). prereq(`serialize_reference_record` u64화) 완료. full-B6 stage-3~5(enclosing→u64, name/receiver→interner, Vec<RefSite> drop) 남음. → 상세 **`### 이번 세션 (W24)`** + full-B6 plan. 커밋 `5a944b9` + (이번 stage-2).
 
@@ -51,26 +50,39 @@
 - **W21: parse 공략 — ⚠️ 옵션 A 전제 정정 + P1/P2.** **parse는 tree-sitter가 아니다 — 이미 hand-written regex/string 파서**(`build_file_graph`→`extract_*`, Cargo에 tree-sitter 의존성 없음). 그래서 "tree-sitter를 custom tokenizer로 교체"라는 옵션 A는 **무의미**; 진짜 공략 = 기존 추출 함수의 할당/스캔 최적화. **내장 `ZOEK_PARSE_PROFILE=1`이 parse를 8개 sub-phase로 분해**: ref_sites **46%** > symbol_defs **20%** > type_facts **18%** > import_facts 8% > materialize 7%. **P1**(extract_ref_sites 할당 감축)+**P2**(sanitize Cow). → 상세 아래 **`### 이번 세션 (W21)`**.
 - **W20: B5 완료 + B3/B4/B5 default 승격** (column SoA가 default, opt-out `ZOEK_SOA_OFF`). prefilter −95% / phase_c −47% 확고, phase_e(B4) 부하서 −16%.
 - **W19 B4 / W18 B2+B3 / W17 B1 / W16 channel ON** — 상세 각 섹션.
-- 코드: W1~W21 모두 **uncommitted**. build green, **75/75 tests**, **invariant 14,372,638** + **bytes=3788145402**(P1+P2 모두), schemaVersion=20.
+- 코드 상태(W28 종료): 이번 세션 산출 = lockfix `945f804` + wall-W2 `94643e2` + wall-W3 프로브·W28 문서 `27d9da5` (직전 W27 wall-W1 `cc97244`, B6 stages도 각 세션서 커밋). build green, **75/75 tests + invariant 14,372,638 + bytes 3788145402 + schemaVersion 20**. branch `index-optimization2` (lockfix `945f804`는 main 체리픽 후보). 워킹트리엔 무관한 `log.txt`/`.vscode` 변경만.
 
 **W21 parse 측정 (matched-load paired + profile)**:
 - **P1 (extract_ref_sites 할당)**: `uri` 제거(dead 필드 — 38M×~70자 할당, 미사용) + `rel_path`/`language`/`edge_kind`/`access_kind` → **`Arc<str>`**(per-file/정적 Arc, per-site refcount clone). matched-load paired: **ref_sites CPU −11.3%, parse wall −1.1s**(공유분만) + uri 제거(~−1s 추정) ≈ **parse −2s + 메모리 절감**(in-memory ref_sites 대폭↓).
 - **P2 (sanitize Cow)**: `sanitize_code_line`/`sanitize_python_ref_site_code_line` → `Cow<str>`, quote/comment trigger 없는 clean 라인은 **borrow**(할당 0). sample #2 leaf(`sanitize_code_line` 34K) 공략.
 - ⚠️ **버그 교훈**: P2 초기판이 invariant(14,372,638)는 통과했으나 **`bytes`가 119KB 달랐다**(P1=3788145402 vs 초기 P2=3788264475). 원인: owned sanitize가 `//`를 **언어 무관**하게 주석 처리하는데 python fast-path가 `/` trigger 누락 → python `a // b`(정수나눗셈) divergence. **invariant(ref count)만으로 부족 — `bytes`도 게이트에 추가**. 수정 후 bytes 복귀 확인.
 
-**다음 작업 후보 (택1, 30s 목표까지 큰 레버 필요)**:
-1. **parse 추가 공략**: 남은 hot = ref_sites/symbol_defs/type_facts의 **스캔**(sanitize/identifier_tokens/member_receiver/`StrSearcher`·`str::find` sample ~92K) + **file I/O**(open/read/close 135K 파일 ~86K) + **malloc 경합**(128스레드 `__ulock_wait` 39K). type_facts(18%)가 sparse한데 모든 라인 sanitize — fast pre-check로 skip 여지. 단 스캔/추출 변경은 정확도 위험(부분 정정한 옵션 A의 본질).
-2. **index/write 공략 (옵션 D)**: stream_references + write_graph_shards(~20s). D1a(scratch 제거)/D1b(per-worker shard writer). 예상 −3~6s.
-3. **B6 (RefSite cold-path retire)**: RefSite AoS 제거 → 메모리 −6GB+ + FIXUP 제거. wall 직접 win 작으나 토대.
-4. **phase_e B4 추가 win**: 대형 맵 probe(`members_by_container_and_name_h` bucket-miss).
+**▶▶ 다음 작업 후보 (W28 기준 — easy win 소진, 전부 어려움. 우선순위 제안 순)**:
+
+*운영 (코드 외 / correctness — 즉시):*
+- **O1. ijss-rust-* 바이너리 재빌드·재배포** — lock self-deadlock 수정(커밋 `945f804`)을 실기기 반영. extension이 쓰는 graph-rebuild/update 바이너리는 별도 산출물이라 재빌드 전엔 버그 잔존.
+- **O2. lock 수정 main 체리픽 검토** — `945f804`는 최적화 브랜치와 무관한 correctness fix.
+
+*아키텍처 (10s 목표엔 필수 — W13 카드. 점진 누적으론 ~30s가 한계):*
+- **A1. Parse-Resolve fusion (−15~20s 추정, 본 레버)** — parse(~8.8s)를 resolve와 파이프라인해 overlap. F1.a(W13: phase F tally rescan 제거)·F1.b(W14: channel write pipeline)서 토대 일부. parse가 resolve 뒤로 숨으면 ~8s 흡수.
+- **A2. mmap 직접 출력 / persistent index + delta rebuild** — 재빌드 작업량 자체 축소.
+
+*어려운 점진 레버 (~30s 부근서 소폭, 정확도/byte 위험):*
+- **B1. parse ~8.8s** — 잔여=스캔(sanitize/identifier_tokens/member_receiver, `StrSearcher`/`str::find`) + file I/O(135K open/read) + malloc 경합(128스레드 `__ulock_wait`). type_facts는 sparse한데 전 라인 sanitize → fast pre-check skip 여지. ⚠️ 추출 변경은 정확도 위험(W21 교훈: invariant 통과해도 `bytes` 발산).
+- **B2. phase_e ~8.7s** — ~65% rayon parking(memory-stall, W22). 옵션 C는 ❌C2 위험으로 기각. 남은 건 대형 맵 probe(`members_by_container_and_name_h` bucket-miss) 정도.
+- **B3. prep ~4.1s (W28 신규 분해)** — interner+idcols 1.6 / file_table 1.5 / columns 1.0. file_table 38M intern 순서보존 병렬화(disk file_id라 **byte-risky**) 또는 symbol intern(4.1M seq) W1식 병렬화(작음 ~0.3-0.5s). columns는 이미 par.
+- **B4. index/write 잔여** — OV1(W23, ref_site write를 resolve와 overlap) 후 작음.
+
+*메모리 (별도 목표, 현재 peak ~15GB / cap 16GB):*
+- **M1. resolution 맵 축소** — peak 실주범(`symbols_by_file_and_name` 등 ~10GB). **B6은 종료**(ref_sites drop이 peak −0.5GB만, W26 paired 확정). 진짜 레버 = parse base(~9GB) 또는 resolution 맵.
 
 **진입 절차**:
-1. 이 문서 **W21 + W20 섹션** 읽기. parse 구조: `build_file_graph`(graph.rs:3079) → `extract_symbol_defs`/`extract_import_facts`/`extract_type_facts`/`extract_ref_sites`. `ZOEK_PARSE_PROFILE=1`로 분해.
-2. `cargo build --release` + `cargo test --release --lib` (75/75).
-3. 위 후보 중 선택. (30s 목표는 멀티세션 — parse 스캔 + index가 남은 큰 덩어리.)
+1. 이 문서 **W28 + W27 섹션** + 위 후보 읽기. parse 구조: `build_file_graph` → `extract_symbol_defs`/`extract_import_facts`/`extract_type_facts`/`extract_ref_sites`. 프로파일: `ZOEK_PARSE_PROFILE=1`(parse 8 sub-phase) / `ZOEK_RESOLVE_PROBE=1`(phase_a~f + `prep@interner+idcols`/`filetable_done`/`columns_done` + `writer_join_wait` + `phase_f_tail`).
+2. `cargo build --release -p zoek-rs` + `cargo test --release --lib -p zoek-rs` (75/75).
+3. 위 후보 중 선택. (10s엔 A1 Parse-Resolve fusion 아키텍처 필수; 점진은 ~30s 한계.)
 
 **게이트 (매 step 필수)**: `cargo test --release --lib` 75/75 + captain2 `referenceCount=14,372,638` **+ `bytes`(=3788145402, parse 변경 시 필수)** + schemaVersion=20.
-**측정 주의 (W15+W20+W21 교훈)**: captain 종료해야 진짜 idle / 연속 측정 금지(128-worker가 load 누적, run 사이 load1<3 대기) / background는 절대경로 + foreground 장시간은 kill(137) 위험 → **background로** / **단일 wall 절대 신뢰 금물**(parse도 load 3→7서 13→21s 출렁; CPU-sum도 load 의존 → **matched-load paired만 신뢰**) / **parse 변경은 `bytes`까지 비교**(ref count는 divergence 못 잡음 — W21 버그).
+**측정 주의 (W15+W20+W21+W28 교훈)**: captain 종료해야 진짜 idle / 연속 측정 금지(128-worker가 load 누적, run 사이 load1<3 대기) / background는 절대경로 + foreground 장시간은 kill(137) 위험 → **background로** / **단일 wall 절대 신뢰 금물**(parse도 load 3→7서 13→21s 출렁; CPU-sum도 load 의존 → **matched-load paired만 신뢰**) / **parse 변경은 `bytes`까지 비교**(ref count는 divergence 못 잡음 — W21 버그). **W28: 연속 rebuild로 load 5~23 누적 시 total wall 전부 무의미 — opt-out env 토글(예 `ZOEK_WALL_W2_OFF`) A/B paired + isolated 프로브(`writer_join_wait`/`phase_f_tail`/`prep@*`)로 segment만 측정. prep은 sequential이라 load-robust(load 7.66·23.59서 동일).**
 
 ---
 
