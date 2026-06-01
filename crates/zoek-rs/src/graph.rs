@@ -225,6 +225,12 @@ const GRAPH_HIERARCHY_PARENT_SHARD_PREFIX: &str = "callgraph-hierarchy-by-parent
 const GRAPH_METHOD_CONTAINER_SHARD_PREFIX: &str = "callgraph-methods-by-container";
 const GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX: &str = "callgraph-ref-sites-by-file";
 const GRAPH_FACTS_BY_FILE_SHARD_PREFIX: &str = "callgraph-facts-by-file";
+// A2 v3 (memory floor): the symbol data resolution needs, sharded by NAME
+// (`shard_index_for_key(symbol.name)`) instead of by id, so an incremental
+// update can load only the candidate symbols for the names a changed file
+// references rather than the whole ~5.2M-symbol table. Same record as the by-id
+// shards (serialize_symbol_binary); only the shard key differs.
+const GRAPH_RESOLVE_INDEX_SHARD_PREFIX: &str = "callgraph-resolve-by-name";
 // A2 (incremental token-shape): persisted candidate-site tally so an incremental
 // update reconstructs the GLOBAL token-shape baseline (a top-level-dir-scoped
 // syntactic aggregate) without re-reading all ref_sites — making incremental
@@ -11331,6 +11337,11 @@ fn write_graph_shards(
             let r = write_method_container_shards(workspace_root, config, symbols, file_table);
             (t.elapsed(), r)
         });
+        let resolve_index_h = s.spawn(move || {
+            let t = std::time::Instant::now();
+            let r = write_resolve_index_shards(workspace_root, config, symbols, file_table);
+            (t.elapsed(), r)
+        });
         let mut bytes = 0;
         let (t1, r) = symbol_id_h.join().expect("symbol-id shard writer panicked"); bytes += r?;
         let (t2, r) = symbol_uri_h.join().expect("symbol-uri shard writer panicked"); bytes += r?;
@@ -11341,9 +11352,10 @@ fn write_graph_shards(
         let (t7, r) = count_id_h.join().expect("count-id shard writer panicked"); bytes += r?;
         let (t8, r) = hierarchy_h.join().expect("hierarchy-parent shard writer panicked"); bytes += r?;
         let (t9, r) = method_h.join().expect("method-container shard writer panicked"); bytes += r?;
+        let (t10, r) = resolve_index_h.join().expect("resolve-index shard writer panicked"); bytes += r?;
         if probe {
-            eprintln!("[write-probe] wall={}ms sym_id={}ms sym_uri={}ms ref_target={}ms ref_enclosing={}ms ref_sites={}ms facts={}ms counts={}ms hierarchy={}ms methods={}ms",
-                t0.elapsed().as_millis(), t1.as_millis(), t2.as_millis(), t3.as_millis(), t4.as_millis(), t5.as_millis(), t6.as_millis(), t7.as_millis(), t8.as_millis(), t9.as_millis());
+            eprintln!("[write-probe] wall={}ms sym_id={}ms sym_uri={}ms ref_target={}ms ref_enclosing={}ms ref_sites={}ms facts={}ms counts={}ms hierarchy={}ms methods={}ms resolve_index={}ms",
+                t0.elapsed().as_millis(), t1.as_millis(), t2.as_millis(), t3.as_millis(), t4.as_millis(), t5.as_millis(), t6.as_millis(), t7.as_millis(), t8.as_millis(), t9.as_millis(), t10.as_millis());
         }
         Ok(bytes)
     })
@@ -11364,6 +11376,32 @@ fn write_symbol_id_shards(
             let id = file_table.get_id(&symbol.rel_path).unwrap_or(u32::MAX);
             serialize_symbol_binary(symbol, id, buf);
             Some(shard_index_for_key(&symbol.id))
+        },
+    )
+}
+
+/// A2 v3 (memory floor): write the resolve-index sidecar — the SAME symbol
+/// record as the by-id shards, but sharded by `shard_index_for_key(symbol.name)`
+/// so resolution (S3) can load only the symbols whose name a changed file
+/// references instead of the whole table. Written on every full + incremental
+/// write_store for now; scoping this write to affected shards is a later step.
+fn write_resolve_index_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &[GraphSymbol],
+    file_table: &FileTable,
+) -> io::Result<u64> {
+    parallel_sharded_write_serialize(
+        workspace_root,
+        config,
+        GRAPH_RESOLVE_INDEX_SHARD_PREFIX,
+        symbols,
+        |symbol, buf| {
+            let id = file_table.get_id(&symbol.rel_path).unwrap_or(u32::MAX);
+            serialize_symbol_binary(symbol, id, buf);
+            // Shard by NAME, not id: stable_hash(name) % COUNT — matches the
+            // read-side lookup `name_hash % COUNT` (name_hash == stable_hash(name)).
+            Some(shard_index_for_key(&symbol.name))
         },
     )
 }
