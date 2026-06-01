@@ -1775,6 +1775,171 @@ fn read_references_excluding_paths(
     Ok(out)
 }
 
+/// A2 v3 (memory floor) probe: process peak resident set size in MB so the flow
+/// probe can show WHICH phase sets the high-water mark. `ru_maxrss` is bytes on
+/// macOS, KiB on Linux; normalize to MB. Monotonic (max-so-far).
+#[cfg(unix)]
+fn peak_rss_mb() -> u64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return 0;
+    }
+    let maxrss = usage.ru_maxrss as u64;
+    if cfg!(target_os = "macos") {
+        maxrss / (1024 * 1024)
+    } else {
+        maxrss / 1024
+    }
+}
+#[cfg(not(unix))]
+fn peak_rss_mb() -> u64 {
+    0
+}
+
+/// A2 v3 (memory floor): carried prior references, spilled to disk per shard
+/// rather than held in RAM, plus the small in-RAM aggregates the downstream
+/// emit/count logic still needs.
+struct StreamedPriorRefs {
+    carried_exact_partials: Vec<PathBuf>,
+    carried_token_shape_partials: Vec<PathBuf>,
+    /// Per-target EXACT reference count over the CARRIED refs (the caller folds
+    /// the new re-resolved exact refs in). Keyed by `parse_stable_symbol_id_to_u64`.
+    reference_counts: AHashMap<u64, usize>,
+    /// Prior AFFECTED exact targets (their exact count dropped → must recompute).
+    affected_targets: AHashSet<u64>,
+}
+
+/// Spill a batch of references to a bincode partial and return its path.
+fn spill_graph_references(path: PathBuf, refs: &[GraphReference]) -> io::Result<PathBuf> {
+    let f = fs::File::create(&path)?;
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+    bincode::serialize_into(&mut w, refs)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("carried spill: {e}")))?;
+    w.flush()?;
+    Ok(path)
+}
+
+/// A2 v3 (memory floor): stream the prior by-target reference shards and
+/// partition each ref WITHOUT materializing the whole ~20M-ref set (the
+/// incremental update's peak-RSS source — a full rebuild already streams, which
+/// is why it does not OOM the same way). Per ref:
+///   - token-shape & rel_path ∉ changed → carried token-shape (spilled)
+///   - token-shape & rel_path ∈ changed → dropped (re-emitted from the tally)
+///   - exact       & rel_path ∈ affected → dropped (re-resolved); target recorded
+///   - exact       & rel_path ∉ affected → carried exact (spilled, counted)
+/// Carried refs spill to one bincode partial per shard so peak memory stays at
+/// ~one shard per worker. The full-coverage SET is unchanged; only residency is.
+fn partition_prior_references_streaming(
+    file_table: &FileTable,
+    workspace_root: &Path,
+    config: &EngineConfig,
+    changed_paths: &HashSet<String>,
+    affected_paths: &HashSet<String>,
+    spill_dir: &Path,
+) -> io::Result<StreamedPriorRefs> {
+    fs::create_dir_all(spill_dir)?;
+    let worker_count = graph_worker_count(GRAPH_SHARD_COUNT);
+    let shards_per_worker = GRAPH_SHARD_COUNT.div_ceil(worker_count);
+    let parts: Vec<StreamedPriorRefs> =
+        std::thread::scope(|s| -> io::Result<Vec<StreamedPriorRefs>> {
+            let mut handles = Vec::with_capacity(worker_count);
+            for w in 0..worker_count {
+                let start = w * shards_per_worker;
+                let end = ((w + 1) * shards_per_worker).min(GRAPH_SHARD_COUNT);
+                if start >= end {
+                    continue;
+                }
+                handles.push(s.spawn(move || -> io::Result<StreamedPriorRefs> {
+                    let mut local = StreamedPriorRefs {
+                        carried_exact_partials: Vec::new(),
+                        carried_token_shape_partials: Vec::new(),
+                        reference_counts: AHashMap::default(),
+                        affected_targets: AHashSet::default(),
+                    };
+                    for shard in start..end {
+                        let path = graph_shard_path(
+                            workspace_root,
+                            config,
+                            GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
+                            shard,
+                        );
+                        if !path.exists() {
+                            continue;
+                        }
+                        let refs = read_binary_references_matching(&path, file_table, |_| true)?;
+                        let mut carried_exact: Vec<GraphReference> = Vec::new();
+                        let mut carried_ts: Vec<GraphReference> = Vec::new();
+                        for r in refs {
+                            if r.provenance.as_ref() == "token-shape" {
+                                if !changed_paths.contains(&*r.rel_path) {
+                                    carried_ts.push(r);
+                                }
+                            // CHANGED-file token-shape is dropped (re-emitted).
+                            } else if affected_paths.contains(&*r.rel_path) {
+                                if let Some(id) = r
+                                    .target_symbol_id
+                                    .as_deref()
+                                    .and_then(parse_stable_symbol_id_to_u64)
+                                {
+                                    local.affected_targets.insert(id);
+                                }
+                            // Affected exact dropped here (re-resolved by the caller).
+                            } else {
+                                if let Some(id) = r
+                                    .target_symbol_id
+                                    .as_deref()
+                                    .and_then(parse_stable_symbol_id_to_u64)
+                                {
+                                    *local.reference_counts.entry(id).or_default() += 1;
+                                }
+                                carried_exact.push(r);
+                            }
+                        }
+                        if !carried_exact.is_empty() {
+                            local.carried_exact_partials.push(spill_graph_references(
+                                spill_dir.join(format!("carried_exact_s{shard}.bin")),
+                                &carried_exact,
+                            )?);
+                        }
+                        if !carried_ts.is_empty() {
+                            local.carried_token_shape_partials.push(spill_graph_references(
+                                spill_dir.join(format!("carried_ts_s{shard}.bin")),
+                                &carried_ts,
+                            )?);
+                        }
+                    }
+                    Ok(local)
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.join().expect("prior reference partition worker panicked")?);
+            }
+            Ok(out)
+        })?;
+    let mut merged = StreamedPriorRefs {
+        carried_exact_partials: Vec::new(),
+        carried_token_shape_partials: Vec::new(),
+        reference_counts: AHashMap::default(),
+        affected_targets: AHashSet::default(),
+    };
+    for part in parts {
+        merged
+            .carried_exact_partials
+            .extend(part.carried_exact_partials);
+        merged
+            .carried_token_shape_partials
+            .extend(part.carried_token_shape_partials);
+        // Refs to a given target all live in ONE by-target shard (== one worker),
+        // so these per-target sums never actually split across workers.
+        for (k, v) in part.reference_counts {
+            *merged.reference_counts.entry(k).or_default() += v;
+        }
+        merged.affected_targets.extend(part.affected_targets);
+    }
+    Ok(merged)
+}
+
 /// Debug tool: read every reference-target shard from disk and write a sorted
 /// TSV (rel_path, start_line, start_col, target, provenance, confidence) so a
 /// full-rebuild dump and an incremental-update dump can be diffed to locate
@@ -3349,6 +3514,7 @@ pub fn update_graph_native(
         &prior_file_table_for_symbols,
     )?;
     if probe { eprintln!("[flow] read_symbols={}ms changed_symbol_keys_prior={}", _t.elapsed().as_millis(), changed_symbol_keys.len()); }
+    if probe { eprintln!("[flow] rss_after_read_symbols_mb={}", peak_rss_mb()); }
     drop(prior_file_table_for_symbols);
     let file_table_path = graph_file_table_path(workspace_root, config);
     let prior_file_table = if file_table_path.exists() {
@@ -3507,6 +3673,7 @@ pub fn update_graph_native(
         None,
     );
     if probe { eprintln!("[flow] resolve_a_to_e={}ms", _t.elapsed().as_millis()); }
+    if probe { eprintln!("[flow] rss_after_resolve_mb={}", peak_rss_mb()); }
     // A2 Stage B: the EXACT (non-token-shape) graph is assembled exactly as
     // before (carried exact refs + re-resolved affected exact lights) — that
     // half is byte-identical to a full rebuild. All token-shape refs are
@@ -3521,88 +3688,84 @@ pub fn update_graph_native(
     // everything also yields the prior AFFECTED exact targets: a changed/affected
     // file that STOPPED referencing a target lowers its exact count, which a full
     // rebuild then pads with MORE token-shape, so that target must be recomputed.
+    // A2 v3 (memory floor): stream + spill the prior reference set instead of
+    // materializing all ~20M refs into one Vec (the incremental update's peak-RSS
+    // source — a full rebuild already streams, which is why it does not OOM the
+    // same way). Carried exact + carried token-shape refs spill to per-shard
+    // partials; only the small aggregates the emit/count logic needs stay in RAM.
     let _t = std::time::Instant::now();
-    let no_exclude: HashSet<String> = HashSet::default();
-    let prior_all =
-        read_references_excluding_paths(&prior_file_table, workspace_root, config, &no_exclude)?;
-    let mut carried_exact: Vec<GraphReference> = Vec::new();
-    // Carried token-shape is filtered by `recompute_set` once known (below); for
-    // now keep every token-shape ref NOT from a CHANGED file. Importers are
-    // affected for the EXACT graph (re-resolved) but their token-shape is
-    // syntactic and unchanged, so it must be carried (not dropped like v1 did).
-    let mut carried_token_shape: Vec<GraphReference> = Vec::new();
-    let mut affected_targets: AHashSet<u64> = AHashSet::default();
-    for r in prior_all {
-        if r.provenance.as_ref() == "token-shape" {
-            if !exclude_paths.contains(&*r.rel_path) {
-                carried_token_shape.push(r);
-            }
-            // CHANGED-file token-shape is dropped (re-emitted via touched keys).
-        } else if affected_paths.contains(&*r.rel_path) {
-            if let Some(id_u64) = r
-                .target_symbol_id
-                .as_deref()
-                .and_then(parse_stable_symbol_id_to_u64)
-            {
-                affected_targets.insert(id_u64);
-            }
-            // Affected exact dropped here (re-resolved below).
-        } else {
-            carried_exact.push(r);
-        }
+    let incr_spill_dir =
+        std::env::temp_dir().join(format!("zoek-rs-incr-spill-{}", std::process::id()));
+    let streamed_prior = partition_prior_references_streaming(
+        &prior_file_table,
+        workspace_root,
+        config,
+        &exclude_paths,
+        &affected_paths,
+        &incr_spill_dir,
+    )?;
+    let carried_exact_partials = streamed_prior.carried_exact_partials;
+    let carried_token_shape_partials = streamed_prior.carried_token_shape_partials;
+    let mut reference_counts: AHashMap<u64, usize> = streamed_prior.reference_counts;
+    let mut affected_targets: AHashSet<u64> = streamed_prior.affected_targets;
+    if probe {
+        eprintln!(
+            "[flow] read_prior_all(stream)={}ms carried_exact_shards={} carried_ts_shards={} old_affected={}",
+            _t.elapsed().as_millis(),
+            carried_exact_partials.len(),
+            carried_token_shape_partials.len(),
+            affected_targets.len()
+        );
+        eprintln!("[flow] rss_after_read_prior_stream_mb={}", peak_rss_mb());
     }
-    if probe { eprintln!("[flow] read_prior_all={}ms carried_exact={} carried_ts={} old_affected={}", _t.elapsed().as_millis(), carried_exact.len(), carried_token_shape.len(), affected_targets.len()); }
+    // The NEW exact refs (re-resolved affected sites) are small (affected files
+    // only); keep them in RAM as the streaming write's tail. Mirrors the prior
+    // `all_references` exact-additions exactly: intermediate.references, the
+    // drained phase_e spill partials (token-shape filtered out), and the
+    // materialized affected exact lights.
     let _t = std::time::Instant::now();
-    let mut all_references = carried_exact;
-    all_references.append(&mut intermediate.references);
-    // Drain phase_e spilled batches (exact resolved refs for affected sites).
+    let mut new_exact_refs: Vec<GraphReference> = std::mem::take(&mut intermediate.references);
     for path in std::mem::take(&mut intermediate.reference_partials) {
         let bytes_or_err = fs::read(&path);
         let _ = fs::remove_file(&path);
         let bytes = bytes_or_err.expect("read spill");
         let batch: Vec<GraphReference> =
             bincode::deserialize(&bytes).expect("deserialize spill");
-        all_references.extend(batch.into_iter().filter(|r| r.provenance.as_ref() != "token-shape"));
+        new_exact_refs.extend(batch.into_iter().filter(|r| r.provenance.as_ref() != "token-shape"));
     }
-    // Materialize ONLY the affected EXACT lights (phase E output; phase F is
-    // skipped so `light_references` holds only phase-E lights, but filter on
-    // provenance to be explicit). Restores the re-resolved affected refs that
-    // resolve_ref_sites_a_to_e left as lights.
     for light in &intermediate.light_references {
         if light.provenance == LightProvenance::TokenShape {
             continue;
         }
         let site = &ref_sites[light.site_idx as usize];
         if affected_paths.contains(&*site.rel_path) {
-            all_references.push(materialize_light_ref(light, &ref_sites));
+            new_exact_refs.push(materialize_light_ref(light, &ref_sites));
         }
     }
-    if probe { eprintln!("[flow] assemble_exact={}ms n={}", _t.elapsed().as_millis(), all_references.len()); }
-    // A2 Stage B: per-target EXACT reference count. This is the global exact
-    // count phase F gates token-shape padding on (== full rebuild's
-    // `light_target_count_by_id_u64`): each symbol is padded with token-shape
-    // refs only up to `usage_likely - reference_count`. (Phase F does NOT skip a
-    // candidate that was also resolved exactly — see emit_token_shape_refs — so
-    // no exact-edge_key set is needed.)
-    let _t = std::time::Instant::now();
-    let mut reference_counts: AHashMap<u64, usize> = AHashMap::default();
-    for r in &all_references {
+    // Fold the NEW exact refs into the per-target EXACT reference_counts (the
+    // carried exact were counted during the streaming partition). Union affected
+    // targets in BOTH directions (prior captured by the partition; re-resolved
+    // captured here) so a count change either way forces token-shape recompute.
+    for r in &new_exact_refs {
         if let Some(id_u64) = r
             .target_symbol_id
             .as_deref()
             .and_then(parse_stable_symbol_id_to_u64)
         {
             *reference_counts.entry(id_u64).or_default() += 1;
-            // v2: NEW affected exact targets (re-resolved). carried_exact are all
-            // rel_path ∉ affected, so an affected rel_path here marks a re-resolved
-            // ref — union its target so a count change in EITHER direction (the OLD
-            // side was captured from prior_all above) forces recompute.
             if affected_paths.contains(&*r.rel_path) {
                 affected_targets.insert(id_u64);
             }
         }
     }
-    if probe { eprintln!("[flow] exact_counts={}ms targets={}", _t.elapsed().as_millis(), reference_counts.len()); }
+    if probe {
+        eprintln!(
+            "[flow] assemble_new_exact={}ms new_exact={} exact_targets={}",
+            _t.elapsed().as_millis(),
+            new_exact_refs.len(),
+            reference_counts.len()
+        );
+    }
     // A2 Stage B: load the persisted token-shape tally (all shards for v1) and
     // delta only the CHANGED files (token-shape is purely syntactic, so
     // importers — which the exact graph re-resolves — contribute nothing here).
@@ -3768,25 +3931,10 @@ pub fn update_graph_native(
         &affected_targets,
     );
     if probe { eprintln!("[flow] emit_token_shape={}ms n={} recompute_keys={} recompute_targets={}", _t.elapsed().as_millis(), token_shape_refs.len(), recompute_keys.len(), recompute_set.len()); }
-    // Carry the prior token-shape refs of every target NOT being recomputed.
-    let _t = std::time::Instant::now();
-    carried_token_shape.retain(|r| {
-        match r
-            .target_symbol_id
-            .as_deref()
-            .and_then(parse_stable_symbol_id_to_u64)
-        {
-            Some(id) => !recompute_set.contains(&id),
-            None => true,
-        }
-    });
-    if probe { eprintln!("[flow] carry_filter={}ms carried_ts_kept={}", _t.elapsed().as_millis(), carried_token_shape.len()); }
-    all_references.append(&mut token_shape_refs);
-    all_references.append(&mut carried_token_shape);
     // A2 fix (4d): persist the delta-maintained tally back to its sidecar so the
     // NEXT incremental update loads current (not stale) candidates — otherwise
     // chained updates accumulate token-shape drift vs a full rebuild. Same
-    // opt-out as the full-rebuild write.
+    // opt-out as the full-rebuild write. Independent of the reference sidecars.
     if std::env::var("ZOEK_DISABLE_TOKEN_SHAPE_TALLY").is_err() {
         let _t_tw = std::time::Instant::now();
         let ts_wb =
@@ -3799,18 +3947,147 @@ pub fn update_graph_native(
             );
         }
     }
-    let _t = std::time::Instant::now();
     let mut counts = std::mem::take(&mut intermediate.counts);
-    // A2: the full rebuild's phase F (apply_token_shape_likely_count_baseline)
-    // pads token-shape refs up to usage_likely, so usage_likely == #refs(target)
-    // there; the incremental path emits a byte-identical reference set via the
-    // carry/recompute_set tally but SKIPS that count pass, leaving usage_likely
-    // exact-only (ambiguous names read "0 usages" while the panel shows the
-    // carried/re-emitted token-shape rows). Recompute usage_likely/calls_in_likely
-    // from the assembled all_references — the only full-coverage source here (the
-    // candidate tally and resolve `*_likely_*` maps only hold the changed keys in
-    // an incremental update) — which reproduces the full rebuild's counts.
-    apply_incremental_likely_counts_from_references(&symbols, &mut counts, &all_references);
+    // A2 v3 (memory floor): build the canonical file_table exactly as write_store
+    // would for an incremental write (prior + ref_sites + symbols + facts; the
+    // `references` it also interns are all carried/affected paths already covered
+    // by those), persist it, then STREAM every reference batch straight to the
+    // by-target + by-enclosing sidecars and hand write_store a precomputed table
+    // with references_streamed=true (so it neither rebuilds the table, clears the
+    // shards, nor re-writes the refs). Mirrors the full-rebuild streaming write
+    // (rebuild_graph_native). Peak memory stays at ~one batch, not ~20M refs.
+    let _t = std::time::Instant::now();
+    let file_table_path = graph_file_table_path(workspace_root, config);
+    let mut stream_file_table = if file_table_path.exists() {
+        read_file_table_binary(&file_table_path).unwrap_or_default()
+    } else {
+        FileTable::default()
+    };
+    for site in &ref_sites {
+        stream_file_table.intern(&site.rel_path);
+    }
+    for sym in &symbols {
+        stream_file_table.intern(&sym.rel_path);
+    }
+    for fact in &import_facts {
+        stream_file_table.intern(&fact.rel_path);
+    }
+    for fact in &type_facts {
+        stream_file_table.intern(&fact.rel_path);
+    }
+    for fact in &function_return_facts {
+        stream_file_table.intern(&fact.rel_path);
+    }
+    write_file_table_binary(&file_table_path, &stream_file_table)?;
+    // Scoped usage_likely/calls_in_likely accumulation, fused into the streaming
+    // write (replaces the apply_incremental_likely_counts_from_references scan of
+    // `all_references`): count, per target, only refs whose source root matches
+    // the target's, over the SAME set all_references held (carried exact + new
+    // exact + emitted token-shape + carried token-shape minus recompute_set).
+    let mut scope_by_target: AHashMap<&str, &str> = AHashMap::with_capacity(symbols.len());
+    for symbol in &symbols {
+        scope_by_target.insert(symbol.id.as_str(), source_scope_key(&symbol.rel_path));
+    }
+    let mut usage_by_target: AHashMap<&str, usize> = AHashMap::default();
+    let mut calls_by_target: AHashMap<&str, usize> = AHashMap::default();
+    let mut target_w =
+        open_graph_shard_writers(workspace_root, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX)?;
+    let mut enclosing_w =
+        open_graph_shard_writers(workspace_root, config, GRAPH_REFERENCE_ENCLOSING_SHARD_PREFIX)?;
+    let mut total_emitted: usize = 0;
+    // In-RAM tails: new re-resolved exact refs + freshly emitted token-shape.
+    for batch in [&new_exact_refs, &token_shape_refs] {
+        for reference in batch.iter() {
+            accumulate_scoped_likely(
+                reference,
+                &scope_by_target,
+                &mut usage_by_target,
+                &mut calls_by_target,
+            );
+        }
+        total_emitted += batch.len();
+        append_references_to_both_shards(batch, &mut target_w, &mut enclosing_w, &stream_file_table)?;
+    }
+    // Carried exact partials (unfiltered — unchanged refs).
+    for path in &carried_exact_partials {
+        let bytes = fs::read(path)?;
+        let _ = fs::remove_file(path);
+        let batch: Vec<GraphReference> = bincode::deserialize(&bytes).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("carried exact spill: {e}"))
+        })?;
+        drop(bytes);
+        for reference in &batch {
+            accumulate_scoped_likely(
+                reference,
+                &scope_by_target,
+                &mut usage_by_target,
+                &mut calls_by_target,
+            );
+        }
+        total_emitted += batch.len();
+        append_references_to_both_shards(&batch, &mut target_w, &mut enclosing_w, &stream_file_table)?;
+    }
+    // Carried token-shape partials: drop the recompute_set targets (re-emitted in
+    // `token_shape_refs` above), mirroring the old `carried_token_shape.retain`.
+    for path in &carried_token_shape_partials {
+        let bytes = fs::read(path)?;
+        let _ = fs::remove_file(path);
+        let mut batch: Vec<GraphReference> = bincode::deserialize(&bytes).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("carried token-shape spill: {e}"))
+        })?;
+        drop(bytes);
+        batch.retain(|r| {
+            match r
+                .target_symbol_id
+                .as_deref()
+                .and_then(parse_stable_symbol_id_to_u64)
+            {
+                Some(id) => !recompute_set.contains(&id),
+                None => true,
+            }
+        });
+        for reference in &batch {
+            accumulate_scoped_likely(
+                reference,
+                &scope_by_target,
+                &mut usage_by_target,
+                &mut calls_by_target,
+            );
+        }
+        total_emitted += batch.len();
+        append_references_to_both_shards(&batch, &mut target_w, &mut enclosing_w, &stream_file_table)?;
+    }
+    let _target_bytes = finish_graph_shard_writers(target_w)?;
+    let _enclosing_bytes = finish_graph_shard_writers(enclosing_w)?;
+    let _ = fs::remove_dir_all(&incr_spill_dir);
+    if probe {
+        eprintln!(
+            "[flow] stream_write_refs={}ms emitted={}",
+            _t.elapsed().as_millis(),
+            total_emitted
+        );
+        eprintln!("[flow] rss_after_stream_write_mb={}", peak_rss_mb());
+    }
+    let _t = std::time::Instant::now();
+    // Apply the scoped likely counts. write_count_id_shards drops all-zero
+    // entries, so only materialize a new entry when the symbol is referenced.
+    for symbol in &symbols {
+        let usage_likely = usage_by_target.get(symbol.id.as_str()).copied().unwrap_or(0);
+        let calls_in_likely = calls_by_target.get(symbol.id.as_str()).copied().unwrap_or(0);
+        match counts.get_mut(&symbol.id) {
+            Some(count) => {
+                count.usage_likely = usage_likely;
+                count.calls_in_likely = calls_in_likely;
+            }
+            None => {
+                if usage_likely > 0 {
+                    let count = counts.entry(symbol.id.clone()).or_default();
+                    count.usage_likely = usage_likely;
+                    count.calls_in_likely = calls_in_likely;
+                }
+            }
+        }
+    }
     compute_native_counts(&symbols, &mut counts, &hierarchy_facts);
     let mut unique_paths: HashSet<&str> = HashSet::default();
     for symbol in &symbols {
@@ -3819,22 +4096,23 @@ pub fn update_graph_native(
     let file_count = unique_paths.len();
     if probe { eprintln!("[flow] compute_counts={}ms", _t.elapsed().as_millis()); }
     let _t = std::time::Instant::now();
+    let empty_refs: Vec<GraphReference> = Vec::new();
     let result = write_store(
         workspace_root,
         built_at,
         config,
         file_count,
         &symbols,
-        &all_references,
+        &empty_refs,
         &ref_sites,
         &import_facts,
         &type_facts,
         &function_return_facts,
         &counts,
         Some(&exclude_paths),
-        false,
-        None,
-        None,
+        true,
+        Some(total_emitted),
+        Some(&stream_file_table),
         false,
     );
     if probe { eprintln!("[flow] write_store={}ms", _t.elapsed().as_millis()); }
@@ -9643,6 +9921,36 @@ fn apply_token_shape_likely_count_baseline(
 /// is likewise taken as the call/construct reference count. Without this the
 /// incremental counts stay exact-only and ambiguous names read "0 usages" while
 /// the panel shows the carried token-shape rows.
+/// A2 v3 (memory floor): accumulate one reference into the SOURCE-ROOT-SCOPED
+/// per-target usage/calls maps that back usage_likely/calls_in_likely. Same rule
+/// as `apply_incremental_likely_counts_from_references` (count only refs whose
+/// source root matches the target's), but fused into the streaming write so the
+/// full `all_references` Vec never has to exist. Keyed by the long-lived symbol
+/// id slice (via the scope map) so there is no per-ref String allocation; a ref
+/// to a non-symbol target is skipped (it never reaches a symbol in the apply
+/// step anyway, so this is byte-identical to the old scan).
+fn accumulate_scoped_likely<'a>(
+    reference: &GraphReference,
+    scope_by_target: &AHashMap<&'a str, &'a str>,
+    usage_by_target: &mut AHashMap<&'a str, usize>,
+    calls_by_target: &mut AHashMap<&'a str, usize>,
+) {
+    if let Some(target) = reference.target_symbol_id.as_deref() {
+        if let Some((target_key, target_scope)) = scope_by_target.get_key_value(target) {
+            if source_scope_key(&reference.rel_path) != *target_scope {
+                return;
+            }
+            *usage_by_target.entry(*target_key).or_default() += 1;
+            if matches!(reference.edge_kind.as_ref(), "call" | "construct") {
+                *calls_by_target.entry(*target_key).or_default() += 1;
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // A2 v3: superseded by the fused streaming accumulation in
+// update_graph_native (accumulate_scoped_likely). Kept for the scoped-count rule
+// documentation and as a non-streaming reference implementation.
 fn apply_incremental_likely_counts_from_references(
     symbols: &[GraphSymbol],
     counts: &mut HashMap<String, GraphCount>,
