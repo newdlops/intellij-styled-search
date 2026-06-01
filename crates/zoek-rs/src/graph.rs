@@ -231,6 +231,15 @@ const GRAPH_FACTS_BY_FILE_SHARD_PREFIX: &str = "callgraph-facts-by-file";
 // references rather than the whole ~5.2M-symbol table. Same record as the by-id
 // shards (serialize_symbol_binary); only the shard key differs.
 const GRAPH_RESOLVE_INDEX_SHARD_PREFIX: &str = "callgraph-resolve-by-name";
+// A2 v3 (memory floor) — S5: a COMPACT per-symbol projection sharded by file
+// (`shard_index_for_key(rel_path)`, like `callgraph-ref-sites-by-file`), holding
+// only the fields the incremental update's token-shape emit + scoped-likely
+// counting + file/symbol counts need (id, name, name_hash, lang_hash, kind_id).
+// Loaded whole per update (~0.5GB) so those consumers stop pinning the full
+// ~5GB GraphSymbol table; written full + incrementally (affected file-shards
+// only). The full record (uri, body spans, container, extends/…) still lives in
+// the by-id/by-name shards for query + resolve.
+const GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX: &str = "callgraph-symbols-compact-by-file";
 // A2 (incremental token-shape): persisted candidate-site tally so an incremental
 // update reconstructs the GLOBAL token-shape baseline (a top-level-dir-scoped
 // syntactic aggregate) without re-reading all ref_sites — making incremental
@@ -11384,6 +11393,13 @@ fn write_graph_shards(
             let r = write_resolve_index_shards(workspace_root, config, symbols, file_table);
             (t.elapsed(), r)
         });
+        // A2 v3 — S5: compact per-symbol sidecar (file-sharded; incremental
+        // rewrites only affected shards, like ref_sites/facts).
+        let compact_h = s.spawn(move || {
+            let t = std::time::Instant::now();
+            let r = write_symbol_compact_shards(workspace_root, config, symbols, file_table, incremental);
+            (t.elapsed(), r)
+        });
         let mut bytes = 0;
         let (t1, r) = symbol_id_h.join().expect("symbol-id shard writer panicked"); bytes += r?;
         let (t2, r) = symbol_uri_h.join().expect("symbol-uri shard writer panicked"); bytes += r?;
@@ -11395,9 +11411,10 @@ fn write_graph_shards(
         let (t8, r) = hierarchy_h.join().expect("hierarchy-parent shard writer panicked"); bytes += r?;
         let (t9, r) = method_h.join().expect("method-container shard writer panicked"); bytes += r?;
         let (t10, r) = resolve_index_h.join().expect("resolve-index shard writer panicked"); bytes += r?;
+        let (t11, r) = compact_h.join().expect("symbol-compact shard writer panicked"); bytes += r?;
         if probe {
-            eprintln!("[write-probe] wall={}ms sym_id={}ms sym_uri={}ms ref_target={}ms ref_enclosing={}ms ref_sites={}ms facts={}ms counts={}ms hierarchy={}ms methods={}ms resolve_index={}ms",
-                t0.elapsed().as_millis(), t1.as_millis(), t2.as_millis(), t3.as_millis(), t4.as_millis(), t5.as_millis(), t6.as_millis(), t7.as_millis(), t8.as_millis(), t9.as_millis(), t10.as_millis());
+            eprintln!("[write-probe] wall={}ms sym_id={}ms sym_uri={}ms ref_target={}ms ref_enclosing={}ms ref_sites={}ms facts={}ms counts={}ms hierarchy={}ms methods={}ms resolve_index={}ms compact={}ms",
+                t0.elapsed().as_millis(), t1.as_millis(), t2.as_millis(), t3.as_millis(), t4.as_millis(), t5.as_millis(), t6.as_millis(), t7.as_millis(), t8.as_millis(), t9.as_millis(), t10.as_millis(), t11.as_millis());
         }
         Ok(bytes)
     })
@@ -11874,6 +11891,199 @@ fn write_ref_sites_by_file_shards(
             Ok(())
         })?;
     finish_graph_shard_writers(writers)
+}
+
+/// A2 v3 — S5: write the compact per-symbol sidecar
+/// (`GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX`). Sharded by `rel_path` exactly
+/// like `write_ref_sites_by_file_shards`: full rebuild writes all shards;
+/// incremental rewrites only the shards holding changed/deleted files. The
+/// caller passes the full current `symbols` slice (carried unchanged + freshly
+/// parsed changed), so each affected shard's complete content is present.
+fn write_symbol_compact_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &[GraphSymbol],
+    file_table: &FileTable,
+    incremental: Option<&HashSet<String>>,
+) -> io::Result<u64> {
+    if let Some(changed_paths) = incremental {
+        let mut affected_shards: HashSet<usize> = HashSet::default();
+        for path in changed_paths {
+            affected_shards.insert(shard_index_for_key(path));
+        }
+        let worker_count = graph_worker_count(symbols.len().max(1));
+        let chunk_size = symbols.len().div_ceil(worker_count.max(1));
+        let worker_outputs: Vec<HashMap<usize, Vec<u8>>> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for w in 0..worker_count {
+                let start = w * chunk_size;
+                let end = ((w + 1) * chunk_size).min(symbols.len());
+                if start >= end {
+                    continue;
+                }
+                let affected_ref = &affected_shards;
+                handles.push(s.spawn(move || {
+                    let mut local: HashMap<usize, Vec<u8>> = HashMap::default();
+                    for shard_idx in affected_ref {
+                        local.insert(*shard_idx, Vec::new());
+                    }
+                    for sym in &symbols[start..end] {
+                        let shard = shard_index_for_key(&sym.rel_path);
+                        if let Some(buffer) = local.get_mut(&shard) {
+                            let id = file_table.get_id(&sym.rel_path).unwrap_or(u32::MAX);
+                            serialize_symbol_compact_binary(sym, id, buffer);
+                        }
+                    }
+                    local
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("symbol-compact worker panicked"))
+                .collect()
+        });
+        let mut shard_buffers: HashMap<usize, Vec<u8>> = HashMap::default();
+        for shard_idx in &affected_shards {
+            shard_buffers.insert(*shard_idx, Vec::new());
+        }
+        for local in worker_outputs {
+            for (shard, mut bytes) in local {
+                if let Some(merged) = shard_buffers.get_mut(&shard) {
+                    merged.append(&mut bytes);
+                }
+            }
+        }
+        let mut total_bytes = 0;
+        for (shard_idx, buffer) in shard_buffers {
+            let path = graph_shard_path(
+                workspace_root,
+                config,
+                GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
+                shard_idx,
+            );
+            write_atomically(&path, &buffer)?;
+            total_bytes += buffer.len() as u64;
+        }
+        return Ok(total_bytes);
+    }
+    let total = symbols.len();
+    let worker_count = graph_worker_count(total.max(1));
+    if total == 0 || worker_count <= 1 {
+        let mut shards = open_graph_shard_writers(
+            workspace_root,
+            config,
+            GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
+        )?;
+        let mut scratch: Vec<u8> = Vec::with_capacity(64);
+        for sym in symbols {
+            scratch.clear();
+            let id = file_table.get_id(&sym.rel_path).unwrap_or(u32::MAX);
+            serialize_symbol_compact_binary(sym, id, &mut scratch);
+            let shard = shard_index_for_key(&sym.rel_path);
+            shards[shard].writer.write_all(&scratch)?;
+        }
+        return finish_graph_shard_writers(shards);
+    }
+    use rayon::prelude::*;
+    let chunks_per_worker = 8usize;
+    let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
+    let chunk_size = total.div_ceil(target_chunks).max(1);
+    let ranges: Vec<(usize, usize)> = (0..)
+        .map(|i| {
+            let start = i * chunk_size;
+            let end = (start + chunk_size).min(total);
+            (start, end)
+        })
+        .take_while(|(start, _)| *start < total)
+        .collect();
+    let worker_buffers: Vec<Vec<Vec<u8>>> = ranges
+        .into_par_iter()
+        .map(|(start, end)| {
+            let mut bufs: Vec<Vec<u8>> = (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+            for sym in &symbols[start..end] {
+                let id = file_table.get_id(&sym.rel_path).unwrap_or(u32::MAX);
+                let shard = shard_index_for_key(&sym.rel_path);
+                serialize_symbol_compact_binary(sym, id, &mut bufs[shard]);
+            }
+            bufs
+        })
+        .collect();
+    let mut writers = open_graph_shard_writers(
+        workspace_root,
+        config,
+        GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
+    )?;
+    let worker_buffers_ref = &worker_buffers;
+    writers
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(shard_idx, w)| -> io::Result<()> {
+            for w_bufs in worker_buffers_ref {
+                w.writer.write_all(&w_bufs[shard_idx])?;
+            }
+            w.writer.flush()?;
+            Ok(())
+        })?;
+    finish_graph_shard_writers(writers)
+}
+
+/// A2 v3 — S5: read the whole compact symbol sidecar into RAM (parallel over
+/// shards). The resident result replaces the full `GraphSymbol` table as the
+/// input to token-shape emit + scoped-likely + file/symbol counts.
+#[allow(dead_code)] // wired into emit + scoped-likely in S4.
+fn load_symbol_compact(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    file_table: &FileTable,
+) -> io::Result<Vec<CompactSym>> {
+    let worker_count = graph_worker_count(GRAPH_SHARD_COUNT);
+    let shards_per_worker = GRAPH_SHARD_COUNT.div_ceil(worker_count);
+    let file_table_ref = file_table;
+    let chunks: Vec<Vec<CompactSym>> =
+        std::thread::scope(|s| -> io::Result<Vec<Vec<CompactSym>>> {
+            let mut handles = Vec::with_capacity(worker_count);
+            for w in 0..worker_count {
+                let start = w * shards_per_worker;
+                let end = ((w + 1) * shards_per_worker).min(GRAPH_SHARD_COUNT);
+                if start >= end {
+                    continue;
+                }
+                handles.push(s.spawn(move || -> io::Result<Vec<CompactSym>> {
+                    let mut out: Vec<CompactSym> = Vec::new();
+                    for shard in start..end {
+                        let path = graph_shard_path(
+                            workspace_root,
+                            config,
+                            GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
+                            shard,
+                        );
+                        if !path.exists() {
+                            continue;
+                        }
+                        let bytes = fs::read(&path)?;
+                        let mut cursor = 0;
+                        while cursor < bytes.len() {
+                            out.push(parse_symbol_compact_binary(
+                                &bytes,
+                                &mut cursor,
+                                file_table_ref,
+                            )?);
+                        }
+                    }
+                    Ok(out)
+                }));
+            }
+            let mut combined = Vec::new();
+            for h in handles {
+                combined.push(h.join().expect("symbol-compact read worker panicked")?);
+            }
+            Ok(combined)
+        })?;
+    let mut symbols = Vec::new();
+    for chunk in chunks {
+        symbols.extend(chunk);
+    }
+    Ok(symbols)
 }
 
 /// B6 stage-5b: column twin of `write_ref_sites_by_file_shards`' full-rebuild
@@ -12482,6 +12692,24 @@ fn read_u32_le(bytes: &[u8], cursor: &mut usize) -> io::Result<u32> {
     Ok(v)
 }
 
+fn read_u64_le(bytes: &[u8], cursor: &mut usize) -> io::Result<u64> {
+    if *cursor + 8 > bytes.len() {
+        return Err(invalid_data("binary record truncated (u64)"));
+    }
+    let v = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap());
+    *cursor += 8;
+    Ok(v)
+}
+
+fn read_u8_at(bytes: &[u8], cursor: &mut usize) -> io::Result<u8> {
+    if *cursor >= bytes.len() {
+        return Err(invalid_data("binary record truncated (u8)"));
+    }
+    let v = bytes[*cursor];
+    *cursor += 1;
+    Ok(v)
+}
+
 fn write_opt_str(out: &mut Vec<u8>, value: Option<&str>) {
     if let Some(v) = value {
         out.push(1);
@@ -12743,6 +12971,91 @@ fn parse_function_return_fact_binary(
         rel_path,
         function_name,
         type_name,
+    })
+}
+
+/// A2 v3 — S5: compact per-symbol projection (see
+/// `GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX`). Holds exactly what the
+/// incremental update's token-shape emit + scoped-likely + file/symbol counts
+/// read off the full `GraphSymbol` table, so those consumers can run off this
+/// (~0.5GB) instead of pinning the full (~5GB) table. `rel_path` is recovered
+/// from `file_id` via the `FileTable` on load (so the scope key for emit /
+/// scoped-likely is derived, not stored). `is_member` mirrors
+/// `uses_member_token_shape_for_likely_count` (method/field/property → kind ids
+/// 5/7/8, which are never `KIND_OTHER`).
+#[derive(Clone, Debug)]
+struct CompactSym {
+    rel_path: Box<str>,
+    file_id: u32,
+    id: Box<str>,
+    id_u64: u64,
+    name: Box<str>,
+    name_hash: u64,
+    lang_hash: u64,
+    kind_id: u8,
+}
+
+#[allow(dead_code)] // is_member/scope_key wired into emit + scoped-likely in S4.
+impl CompactSym {
+    #[inline]
+    fn is_member(&self) -> bool {
+        matches!(self.kind_id, 5 | 7 | 8)
+    }
+    #[inline]
+    fn scope_key(&self) -> &str {
+        source_scope_key(&self.rel_path)
+    }
+}
+
+/// Same id encoding as `serialize_symbol_binary` (u64, or `u64::MAX` sentinel +
+/// inline string for a non-`sym:HEX16` id), then `name_hash`, `lang_hash`,
+/// `name`, `kind_id`, `file_id`. `rel_path` is reconstructed from `file_id` on
+/// read, so the record is self-contained given the `FileTable`.
+fn serialize_symbol_compact_binary(symbol: &GraphSymbol, file_id: u32, out: &mut Vec<u8>) {
+    if let Some(u) = parse_stable_symbol_id_to_u64(&symbol.id) {
+        out.extend_from_slice(&u.to_le_bytes());
+    } else {
+        out.extend_from_slice(&u64::MAX.to_le_bytes());
+        write_u16_str(out, &symbol.id);
+    }
+    out.extend_from_slice(&symbol.name_hash.to_le_bytes());
+    out.extend_from_slice(&stable_hash(symbol.language.as_str()).to_le_bytes());
+    write_u16_str(out, &symbol.name);
+    out.push(compute_kind_id(&symbol.kind));
+    out.extend_from_slice(&file_id.to_le_bytes());
+}
+
+fn parse_symbol_compact_binary(
+    bytes: &[u8],
+    cursor: &mut usize,
+    file_table: &FileTable,
+) -> io::Result<CompactSym> {
+    let u = read_u64_le(bytes, cursor)?;
+    let (id, id_u64) = if u == u64::MAX {
+        let s = read_u16_str(bytes, cursor)?;
+        let v = parse_stable_symbol_id_to_u64(&s).unwrap_or(0);
+        (s.into_boxed_str(), v)
+    } else {
+        (format!("sym:{:016x}", u).into_boxed_str(), u)
+    };
+    let name_hash = read_u64_le(bytes, cursor)?;
+    let lang_hash = read_u64_le(bytes, cursor)?;
+    let name = read_u16_str(bytes, cursor)?.into_boxed_str();
+    let kind_id = read_u8_at(bytes, cursor)?;
+    let file_id = read_u32_le(bytes, cursor)?;
+    let rel_path = file_table
+        .get_path(file_id)
+        .ok_or_else(|| invalid_data(format!("unknown compact-symbol file_id {file_id}")))?
+        .into();
+    Ok(CompactSym {
+        rel_path,
+        file_id,
+        id,
+        id_u64,
+        name,
+        name_hash,
+        lang_hash,
+        kind_id,
     })
 }
 
@@ -15458,6 +15771,118 @@ mod tests {
             assert_eq!(g.name, "bar", "no non-matching name must leak in");
         }
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    // A2 v3 (memory floor) — S1: the compact symbol sidecar must round-trip every
+    // field the S4/S5 consumers read off the full GraphSymbol table, and its
+    // incremental (affected-shard) rewrite must match a full rewrite of the same
+    // final symbol set.
+    #[test]
+    fn s1_symbol_compact_sidecar_roundtrips_and_incremental_matches_full() {
+        let entries = vec![
+            test_entry(
+                "pkg/a.py",
+                "class Foo:\n    def bar(self):\n        return 1\n\n    value = 2\n",
+            ),
+            test_entry(
+                "svc/b.py",
+                "def bar():\n    return 2\n\nclass Baz:\n    def qux(self):\n        return 3\n",
+            ),
+        ];
+        let (symbols, _res) = resolve_test_entries(&entries);
+        assert!(symbols.len() >= 4, "fixture should produce several symbols");
+
+        let ws = std::env::temp_dir().join(format!("zoek-s1-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        let config = EngineConfig::default();
+        fs::create_dir_all(config.index_root(&ws)).unwrap();
+        let mut file_table = FileTable::default();
+        for s in &symbols {
+            file_table.intern(&s.rel_path);
+        }
+
+        // Full write + load: every compact field must equal the source projection.
+        write_symbol_compact_shards(&ws, &config, &symbols, &file_table, None).expect("write full");
+        let loaded = load_symbol_compact(&ws, &config, &file_table).expect("load");
+        assert_eq!(loaded.len(), symbols.len(), "compact count must match");
+        let by_id: HashMap<&str, &CompactSym> =
+            loaded.iter().map(|c| (c.id.as_ref(), c)).collect();
+        for s in &symbols {
+            let c = by_id.get(s.id.as_str()).expect("every symbol present in compact");
+            assert_eq!(&*c.name, s.name.as_str(), "name");
+            assert_eq!(c.name_hash, s.name_hash, "name_hash");
+            assert_eq!(c.lang_hash, stable_hash(s.language.as_str()), "lang_hash");
+            assert_eq!(&*c.rel_path, s.rel_path.as_str(), "rel_path");
+            assert_eq!(
+                c.id_u64,
+                parse_stable_symbol_id_to_u64(&s.id).unwrap_or(0),
+                "id_u64"
+            );
+            assert_eq!(
+                c.is_member(),
+                uses_member_token_shape_for_likely_count(s),
+                "is_member must match the emit classifier for {}",
+                s.id
+            );
+            assert_eq!(
+                stable_hash(c.scope_key()),
+                stable_hash(source_scope_key(&s.rel_path)),
+                "scope key"
+            );
+        }
+
+        // Incremental rewrite of one changed file must equal a full rewrite of the
+        // new symbol set. Replace svc/b.py's symbols with a re-parsed version.
+        let changed_entry = test_entry(
+            "svc/b.py",
+            "def bar():\n    return 2\n\nclass Baz:\n    def qux(self):\n        return 30\n\n    def added(self):\n        return 4\n",
+        );
+        let changed_graph = build_file_graph(&changed_entry);
+        let mut new_set: Vec<GraphSymbol> = symbols
+            .iter()
+            .filter(|s| s.rel_path != "svc/b.py")
+            .cloned()
+            .collect();
+        new_set.extend(changed_graph.symbols.iter().cloned());
+        let mut new_ft = FileTable::default();
+        for s in &new_set {
+            new_ft.intern(&s.rel_path);
+        }
+
+        // (a) incremental write on top of the existing full index.
+        let mut changed: HashSet<String> = HashSet::default();
+        changed.insert("svc/b.py".to_string());
+        write_symbol_compact_shards(&ws, &config, &new_set, &new_ft, Some(&changed))
+            .expect("write incremental");
+        let mut incr = load_symbol_compact(&ws, &config, &new_ft).expect("load incr");
+
+        // (b) full write of the same set into a fresh index.
+        let ws2 = std::env::temp_dir().join(format!("zoek-s1-test2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws2);
+        fs::create_dir_all(config.index_root(&ws2)).unwrap();
+        write_symbol_compact_shards(&ws2, &config, &new_set, &new_ft, None).expect("write full2");
+        let mut full = load_symbol_compact(&ws2, &config, &new_ft).expect("load full2");
+
+        let key = |c: &CompactSym| (c.id.to_string(), c.id_u64, c.name.to_string());
+        incr.sort_by_key(key);
+        full.sort_by_key(key);
+        assert_eq!(incr.len(), full.len(), "incremental vs full count");
+        for (i, f) in incr.iter().zip(full.iter()) {
+            assert_eq!(i.id, f.id);
+            assert_eq!(i.rel_path, f.rel_path);
+            assert_eq!(i.name, f.name);
+            assert_eq!(i.name_hash, f.name_hash);
+            assert_eq!(i.lang_hash, f.lang_hash);
+            assert_eq!(i.kind_id, f.kind_id);
+        }
+        // The new method must be present; the deleted-then-readded set must not
+        // carry a stale "qux returns 3"-era duplicate (count parity is enough here).
+        assert!(
+            incr.iter().any(|c| &*c.name == "added"),
+            "new method must appear after incremental rewrite"
+        );
+        let _ = fs::remove_dir_all(&ws);
+        let _ = fs::remove_dir_all(&ws2);
     }
 
     #[test]
