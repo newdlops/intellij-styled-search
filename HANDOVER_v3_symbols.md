@@ -1,7 +1,24 @@
 # HANDOVER — A2 v3 memory floor (incremental graph-update symbol re-architecture)
 
-**Worktree:** `/Users/lky/project/ist-v3floors` · **branch:** `v3-ref-shard-scoping` (atop `8ba0108`)
+**Worktree:** `/Users/lky/project/ist-v3floors` · **branch:** `v3-ref-shard-scoping`
+**S1–S6 DONE + gated** (`9b4d33b` S1, `6b571be` S2–S4, `e5ee7bf` S5, `53c1752` S6, atop `8ba0108`).
 Isolated from the main repo's auto-commit watcher — commit freely here.
+
+## STATUS (2026-06-02): full-symbol carry DROPPED — byte-identical, ~3GB RSS saved
+The incremental update no longer materializes the ~5M-symbol (~5GB) table. The
+`read_symbols` 5GB phase is gone; a ~1.4GB compact-sidecar load replaces it.
+**Measured on captain2 (now 4.97M symbols, 16.3M ref_sites), standalone binary:**
+old S1-era binary peak **18.1 GiB** → S6 peak **15.0 GiB** (−3.1 GiB). a2 refs
+extra=0/missing=0; s4_s5 record-set parity across all six write families.
+
+**The peak is NOT yet ∝ affected files** — as the S3 checkpoint predicted, S4–S6
+only remove the symbols floor. The remaining ~15GB is dominated by floors this
+work did NOT touch: `ref_sites` (~4.7GB, 16.3M-site Vec — the deferred streaming
+step), the 1.2M-symbol resolve-candidate set + its in-RAM resolve indices, and the
+resident compact (~1.4GB, mostly duplicated `rel_path` strings — intern to shrink).
+Next wins (separate, larger): **(a) ref_sites columnar/streaming into resolve**
+(the single biggest remaining floor), **(b) compact `rel_path` interning** (file-id
+index instead of a per-record `Box<str>`), **(c)** shrink the resolve candidate set.
 
 ## Problem (why this work exists)
 Incremental graph-update (`update_graph_native`) on the captain corpus (137K files, 5.2M symbols,
@@ -51,61 +68,81 @@ name-index, loading only candidate symbols.
   `GRAPH_HIERARCHY_PARENT_SHARD_PREFIX` 224 (`callgraph-hierarchy-by-parent`) — written by full rebuild,
   recomputed (not loaded) incrementally.
 
-## NEXT: S4 → S5 — the actual memory win (S3 done, each a2-gated)
-**⚠️ S3 alone did NOT lower peak RSS (confirmed).** The full `symbols` Vec stays resident for hierarchy/
-emit/counts/likely/symbol-write. RSS only drops once S4/S5 move ALL of those off the full table AND the
-`read_symbols_excluding_paths_with_changed_keys` carry is dropped. Don't measure success until S5, and
-measure with the STANDALONE binary (the a2 test's RSS is contaminated by its same-process full rebuild).
+## DONE: S1–S6 (each a2-gated; the carry is gone)
+Two new file-sharded sidecars + an incremental rewrite for every symbol-keyed
+write family replaced the full-table carry. Key code (all in `graph.rs`):
+- **S1 `callgraph-symbols-compact-by-file`** — `CompactSym` {rel_path,file_id,id,
+  id_u64,name,name_hash,lang_hash,kind_id}; `write_symbol_compact_shards` +
+  `load_symbol_compact`; generic `write_file_sharded_symbols`.
+- **S2 `callgraph-hierarchy-facts-by-file`** — faithful {file_id,relation,child_qn,
+  parent} (keeps the relation the lossy `…-by-parent` query sidecar drops);
+  `write_hierarchy_facts_shards` + `load_hierarchy_facts_from_sidecar`.
+- **S3** — `update_graph_native` reconstructs `Vec<HierarchyFact>` for resolve from
+  the S2 sidecar (prior − changed + fresh) — no full scan.
+- **S4** — `emit_token_shape_refs_from_tally` takes `&[CompactSym]`;
+  `accumulate_scoped_likely`/`scope_by_target`/usage/calls re-keyed to id_u64;
+  usage_likely application extracted to `apply_scoped_likely_to_counts` (no scan).
+  Gated by unit test `s4_scoped_likely_matches_reference_impl` (counts are NOT
+  full↔incr identical — incremental skips global usage_may by design).
+- **S5** — `rewrite_shards_incremental` (read-shard-drop-add) + incremental
+  variants for symbol-id/resolve-index (DROP by file via `rel_path∈exclude`) and
+  hierarchy-by-parent/methods-by-container (DROP by `symbol.id∈prior_ids`). Plumbed
+  via `IncrementalSymbolWrite {changed_symbols, exclude_paths, prior_ids}`.
+- **S6** — `read_symbols_excluding_paths_with_changed_keys` DELETED. The compact
+  load supplies prior changed-keys + prior_ids; `changed_full_symbols` is the ADD
+  set; resolve candidates = fresh changed + per-file importer read
+  (`read_symbols_for_paths`); compact + hierarchy-facts writes also go incremental;
+  `write_store` gained `symbol_count_override`; `sidecars_ready` now requires the
+  two new families (older index → full rebuild writes them). `lazy_resolve_enabled`
+  + the full-symbol resolve fallback removed (lazy resolve is the only path).
 
-### S3 — DONE (`45fde00`). Lessons for S4/S5:
-- Resolve does NOT read `extends_names`/`implements_names` (only `hierarchy_facts_from_symbols` does);
-  in resolve, `hierarchy_facts` is used ONLY by `is_django_model_type`. So hierarchy structure is fully
-  carried by the precomputed `hierarchy_facts` Vec regardless of which symbols resolve sees.
-- `compute_native_counts` is a **no-op at captain scale** (`symbols.len() > MAX_EAGER_IMPLEMENTATION_SYMBOLS`
-  → `apply_implementation_counts` skipped). So S4 need not re-home it for memory; it's free.
-- `intermediate.counts` only needs to be right for emit (`counts[id].usage_must`, set by phase E on exact
-  targets ⊆ candidates) — `usage_likely` is overwritten at the tail from the full reference set (line ~4080),
-  and write_count drops all-zero entries. So shrinking resolve's symbol input is count-safe.
-
-### S4/S5 — remove the remaining full-symbol scans (each a2-gated)
-- Hierarchy: load from `callgraph-hierarchy-by-parent` sidecar instead of `hierarchy_facts_from_symbols`.
-- emit_token_shape + scoped-likely: drive from queried/affected symbols (emit pass-1 builds recompute_set
-  by scanning all symbols' (lang,scope,name_hash,id) — replace with a compact persisted (id,key,scope)
-  pass or query). scoped-likely needs id→scope per ref target (query symbol-id shards or a compact map).
-- `write_symbol_id_shards` + `write_resolve_index_shards`: make them streaming per-shard rewrites
-  (read shard, drop changed-file symbols, add new, write) like the ref write — bounded memory.
-- Finally DROP `read_symbols_excluding_paths_with_changed_keys` (the full carry). Now the 5GB Vec is gone.
+Lessons retained: resolve reads `hierarchy_facts` only via `is_django_model_type`
+(order-independent closure). `compute_native_counts` is a no-op at captain scale
+(passed `&[]` at S6). `usage_likely` is overwritten at the tail; counts are
+incremental-approximate (only refs are the byte-identity gate).
 
 ## Verify / measure
 ```
 cd /Users/lky/project/ist-v3floors
-cargo build --release -p zoek-rs
-cargo test -p zoek-rs --lib graph::tests                                    # unit (incl. S2 test)
+cargo build --release -p zoek-rs       # MUST rebuild the BIN before any RSS run — the
+                                        # a2/s4_s5 gates use a separate `cargo test` binary,
+                                        # so target/release/zoek-rs can be stale (this bit me:
+                                        # a stale-binary RSS run showed the OLD carry path).
+cargo test -p zoek-rs --lib graph::tests            # unit (s1/s2/s4 round-trip + equivalence)
 cargo test -p zoek-rs --lib graph::tests::a2_stage_b_token_shape_matches_full_rebuild -- --ignored --nocapture
-#   ^ ~6min, needs /Users/lky/project/captain2/captain; expect "extra=0 (non-ts 0), missing=0 (non-ts 0)"
-# RSS + per-phase on the real corpus (captain):
-BIN=/Users/lky/project/ist-v3floors/target/release/zoek-rs; WS=/Users/lky/project/captain
+#   ^ ~70s, needs /Users/lky/project/captain2/captain; expect "extra=0 (non-ts 0), missing=0 (non-ts 0)"
+cargo test -p zoek-rs --lib graph::tests::s4_s5_sidecars_match_full_rebuild -- --ignored --nocapture
+#   ^ asserts record-set parity full↔incr across ALL SIX symbol-keyed write families.
+# RSS + per-phase, STANDALONE binary on captain2 (rebuild first so the new sidecars exist):
+BIN=/Users/lky/project/ist-v3floors/target/release/zoek-rs; WS=/Users/lky/project/captain2/captain
+"$BIN" graph-rebuild "$WS" --max-file-size 0 --workers 8 --exclude '**/.zoek-rs/**' --exclude '**/.codeidx/**' --exclude '**/.vscode/**' --exclude '**/.lh/**' >/dev/null 2>&1
 BUILT_AT=$(grep -oE '"builtAtUnixMs":[0-9]+' "$WS/.zoek-rs/callgraph-manifest.json" | grep -oE '[0-9]+')
 ZOEK_FLOW_PROBE=1 /usr/bin/time -l "$BIN" graph-update "$WS" --built-at "$BUILT_AT" \
   --max-file-size 0 --workers 8 --exclude '**/.zoek-rs/**' --exclude '**/.codeidx/**' \
-  --exclude '**/.vscode/**' --exclude '**/.lh/**' "$WS/zuzu/__init__.py" 2>&1 \
-  | grep -E "rss_after_|maximum resident|real"
+  --exclude '**/.vscode/**' --exclude '**/.lh/**' "$WS/services/document_converter/v2/converter.py" 2>&1 \
+  | grep -E "rss_after_|maximum resident|real|load_compact|resolve_candidates"
 ```
-Baseline to beat: read_symbols 5.2GB, resolve +3.1GB, peak ~14GB. **Target after S5: peak ∝ affected files, not 5.2M symbols.**
+**Measured S6 (captain2, 4.97M symbols, 16.3M ref_sites):** no `read_symbols` phase;
+`load_compact`=1.4GB; `rss_after_resolve_candidates`=11.7GB; peak **15.0 GiB**
+(vs S1-era binary **18.1 GiB** same corpus). The carry (`read_symbols` 5GB) is gone.
 
-**⚠️ Second floor found during the S3 gate — `ref_sites` is ~4GB on its own.** The slim ref-site read
-materializes a `Vec<RefSite>` of every site in the affected SHARDS (not just affected files): the
-converter.py edit hit 47/128 shards ⇒ **n=14,002,545 sites** (~292B each ≈ 4GB). S4/S5 only remove the
-~5GB symbols floor, so expect peak ~14GB→~9GB, NOT "∝ affected files". Reaching the original target needs
-a SEPARATE ref_sites-streaming step (resolve consuming sites streamed/columnar). **2026-06-02: user chose
-to CHECKPOINT at S3** (`45fde00`); S4/S5 + ref_sites streaming deferred to a later session.
+**⚠️ Remaining floor — `ref_sites` ~4.7GB (the deferred step).** The slim ref-site read
+still materializes a `Vec<RefSite>` of every site in the affected SHARDS (converter.py
+hit 47/128 ⇒ **n=16,309,778 sites** ≈ 4.7GB). S4–S6 only removed the symbols floor; the
+"∝ affected files" target needs a SEPARATE ref_sites columnar/streaming step (resolve
+consuming sites streamed). Also resident at peak: 1.2M-symbol resolve candidates + their
+in-RAM indices, and compact ~1.4GB (mostly duplicated `rel_path` — intern to ~halve).
 
 ## Gotchas
-- captain `.zoek-rs` now has `callgraph-resolve-by-name-*` shards (additive, valid, built_at unchanged
-  via `--built-at`); the running extension (old 0.1.707 binary) ignores them. No cleanup needed.
+- **Rebuild the BIN (`cargo build --release`) before RSS runs** — gates use a separate test binary.
+- captain2 `.zoek-rs` now also has `callgraph-symbols-compact-by-file-*` + `callgraph-hierarchy-facts-by-file-*`
+  (additive). The running extension (old binary) ignores them. `sidecars_ready` now REQUIRES them, so an
+  index built by an old binary triggers a full rebuild (which writes them) on the next graph-update.
 - a2 test reads `/tmp/a2_changed_file.txt` (a changed .py path) or falls back to first .py under captain2.
 - Don't re-try allocators (mimalloc worse, jemalloc net-negative — both measured).
 - Auto-commit watcher only touches the MAIN repo, never this worktree.
+- Perf note: S6 trades IO/CPU for RAM — symbol-id/resolve-index incremental writes re-read all 128 shards
+  (drop-add); compact is read for emit AND re-read during its write. Optimize later if the probe shows it hot.
 - Memory note: `project_v3_ref_shard_scoping` (loaded each session) has the condensed version.
 ```
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
