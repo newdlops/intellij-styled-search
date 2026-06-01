@@ -7,18 +7,32 @@ Isolated from the main repo's auto-commit watcher — commit freely here.
 ## STATUS (2026-06-02): full-symbol carry DROPPED — byte-identical, ~3GB RSS saved
 The incremental update no longer materializes the ~5M-symbol (~5GB) table. The
 `read_symbols` 5GB phase is gone; a ~1.4GB compact-sidecar load replaces it.
-**Measured on captain2 (now 4.97M symbols, 16.3M ref_sites), standalone binary:**
-old S1-era binary peak **18.1 GiB** → S6 peak **15.0 GiB** (−3.1 GiB). a2 refs
-extra=0/missing=0; s4_s5 record-set parity across all six write families.
+a2 refs extra=0/missing=0; s4_s5 record-set parity across all six write families.
 
-**The peak is NOT yet ∝ affected files** — as the S3 checkpoint predicted, S4–S6
-only remove the symbols floor. The remaining ~15GB is dominated by floors this
-work did NOT touch: `ref_sites` (~4.7GB, 16.3M-site Vec — the deferred streaming
-step), the 1.2M-symbol resolve-candidate set + its in-RAM resolve indices, and the
-resident compact (~1.4GB, mostly duplicated `rel_path` strings — intern to shrink).
-Next wins (separate, larger): **(a) ref_sites columnar/streaming into resolve**
-(the single biggest remaining floor), **(b) compact `rel_path` interning** (file-id
-index instead of a per-record `Box<str>`), **(c)** shrink the resolve candidate set.
+**Measured (standalone S6 binary, captain2 = 135,662 files / 4.97M symbols /
+16.3M ref_sites / 18.9M refs):**
+
+| run | wall | peak RSS |
+|---|---|---|
+| full rebuild (`graph-rebuild`) | 67.0s | **14.0 GiB** (15,059,156,992 B) |
+| incremental (`graph-update`, 1 file) | 27.1s | **15.25 GiB** (16,376,545,280 B) |
+| incremental, S1-era binary (same corpus, pre-carry-drop) | ~25s | **18.1 GiB** |
+
+So S6 cut the incremental peak **18.1 → 15.25 GiB** (the carry). **BUT the headline
+finding stands out: the incremental peak (15.25 GiB) is still slightly ABOVE the
+FULL rebuild (14.0 GiB)** — editing one file costs as much memory as rebuilding all
+135K. **The stampede risk is NOT resolved by S4–S6** — per-edit RSS is still ~flat,
+not ∝ edit size. As the S3 checkpoint predicted, S4–S6 only remove the symbols
+floor; the remaining ~15GB is dominated by floors this work did NOT touch:
+`ref_sites` (~4.7GB, 16.3M-site Vec — the deferred streaming step), the 1.2M-symbol
+resolve-candidate set + its in-RAM resolve indices, and the resident compact
+(~1.4GB, mostly duplicated `rel_path` strings). Why incremental > full: the full
+rebuild STREAMS refs (never all-resident) while the incremental holds the affected
+shards' `ref_sites` (4.7GB) + candidates + compact AND streams the prior-ref set.
+Next wins (separate, larger, the real fix for the stampede): **(a) ref_sites
+columnar/streaming into resolve** (the single biggest remaining floor — and what
+makes per-edit ∝ edit size), **(b) compact `rel_path` interning** (file-id index,
+~halves the 1.4GB), **(c)** shrink the resolve candidate set.
 
 ## Problem (why this work exists)
 Incremental graph-update (`update_graph_native`) on the captain corpus (137K files, 5.2M symbols,
@@ -122,9 +136,11 @@ ZOEK_FLOW_PROBE=1 /usr/bin/time -l "$BIN" graph-update "$WS" --built-at "$BUILT_
   --exclude '**/.vscode/**' --exclude '**/.lh/**' "$WS/services/document_converter/v2/converter.py" 2>&1 \
   | grep -E "rss_after_|maximum resident|real|load_compact|resolve_candidates"
 ```
-**Measured S6 (captain2, 4.97M symbols, 16.3M ref_sites):** no `read_symbols` phase;
-`load_compact`=1.4GB; `rss_after_resolve_candidates`=11.7GB; peak **15.0 GiB**
-(vs S1-era binary **18.1 GiB** same corpus). The carry (`read_symbols` 5GB) is gone.
+**Measured S6 (captain2, 4.97M symbols, 16.3M ref_sites):** full rebuild 67.0s /
+**14.0 GiB**; incremental (1 file) 27.1s / **15.25 GiB** (no `read_symbols` phase;
+`load_compact`=1.4GB; `rss_after_resolve_candidates`=11.6GB; `stream_write`=13.55GB).
+Incremental peak is STILL slightly above the full rebuild — per-edit RSS is not yet
+∝ edit size (see STATUS). Carry (`read_symbols` 5GB) gone; S1-era was 18.1 GiB.
 
 **⚠️ Remaining floor — `ref_sites` ~4.7GB (the deferred step).** The slim ref-site read
 still materializes a `Vec<RefSite>` of every site in the affected SHARDS (converter.py
