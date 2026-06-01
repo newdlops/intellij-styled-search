@@ -23,6 +23,17 @@ name-index, loading only candidate symbols.
 - `c05ee3f` **S2**: `load_resolve_candidates(name_hashes)` — reads only the name-shards the requested
   hashes map to (`shard = name_hash % 128`), one at a time → transient ~1 shard, resident = candidates.
   Unit test `s2_load_resolve_candidates_matches_full_name_filter` green.
+- `45fde00` **S3** (lazy resolve, **byte-identical**): `build_resolve_candidate_symbols` builds the slim
+  subset resolve runs over (affected files' OWN symbols from the still-resident full Vec — covers
+  `symbols_by_id` self/cls + same-file resolution — ∪ cross-file targets via `load_resolve_candidates`,
+  minus stale changed-file copies). Seed = each affected site's `name_hash` + `receiver_name_hash`
+  (the sketch omitted the receiver — it feeds `types_by_name[receiver]`/import/type-fact lookups) + the
+  affected files' import/type/return-fact names. **No parent-type BFS**: resolve never reads
+  `extends_names`/`implements_names` off a symbol (only `hierarchy_facts_from_symbols` does, over the full
+  table); `hierarchy_facts` is used in resolve ONLY for Django filtering; inherited members resolve via
+  the by-(lang,name) fallback keyed on the already-seeded site name. Gate extra=0 missing=0 (14,372,638
+  refs, converter.py edit). candidate n=1.1M vs 4.1M full carried. Opt-out `ZOEK_V3_LAZY_RESOLVE_OFF`;
+  falls back to full symbols if resolve-index shards absent. **Peak RSS unchanged** (as predicted).
 
 ## Key locations (current lines; grep to refresh after edits)
 - `update_graph_native` 3447 — incremental driver. Full symbols loaded via
@@ -40,24 +51,21 @@ name-index, loading only candidate symbols.
   `GRAPH_HIERARCHY_PARENT_SHARD_PREFIX` 224 (`callgraph-hierarchy-by-parent`) — written by full rebuild,
   recomputed (not loaded) incrementally.
 
-## NEXT: S3 (linchpin) → S4/S5 — plan as ONE coupled push
-**⚠️ S3 alone will NOT lower peak RSS.** The full `symbols` Vec stays resident for hierarchy/emit/
-counts/likely/symbol-write. RSS only drops once S4/S5 move ALL of those off the full table AND the
-`read_symbols_excluding_paths_with_changed_keys` carry is dropped. Don't measure success until S5.
+## NEXT: S4 → S5 — the actual memory win (S3 done, each a2-gated)
+**⚠️ S3 alone did NOT lower peak RSS (confirmed).** The full `symbols` Vec stays resident for hierarchy/
+emit/counts/likely/symbol-write. RSS only drops once S4/S5 move ALL of those off the full table AND the
+`read_symbols_excluding_paths_with_changed_keys` carry is dropped. Don't measure success until S5, and
+measure with the STANDALONE binary (the a2 test's RSS is contaminated by its same-process full rebuild).
 
-### S3 — lazy resolve over candidates (gate: a2 byte-identical)
-1. Build the referenced-name set from the (already-slim) affected ref_sites: each affected site's
-   `name_hash`; plus names from affected files' `import_facts` (imported_name + local_name),
-   `type_facts` (type names), `function_return_facts`. Hash each with `stable_hash`.
-2. **Transitive BFS closure** (the hard part): `load_resolve_candidates(names)` → for every loaded
-   TYPE symbol add `extends_names`/`implements_names` (+ container_name) name-hashes → load again →
-   repeat to fixpoint (cap rounds, e.g. 6, log if hit). Needed so inherited-member resolution
-   (T.method where method is defined in a parent of T) matches the full rebuild.
-3. resolve subset = closure candidates ∪ the changed files' freshly-parsed symbols. Pass THAT to
-   `resolve_ref_sites_a_to_e` instead of the full `symbols`. (Resolve's index code is unchanged — it
-   just gets fewer symbols; correctness hinges on the closure being COMPLETE.)
-4. Gate hard: `a2_stage_b_token_shape_matches_full_rebuild` (extra=0 missing=0). Expect to iterate on
-   closure completeness — history (#4a/#1/.venv) shows resolution divergences are subtle.
+### S3 — DONE (`45fde00`). Lessons for S4/S5:
+- Resolve does NOT read `extends_names`/`implements_names` (only `hierarchy_facts_from_symbols` does);
+  in resolve, `hierarchy_facts` is used ONLY by `is_django_model_type`. So hierarchy structure is fully
+  carried by the precomputed `hierarchy_facts` Vec regardless of which symbols resolve sees.
+- `compute_native_counts` is a **no-op at captain scale** (`symbols.len() > MAX_EAGER_IMPLEMENTATION_SYMBOLS`
+  → `apply_implementation_counts` skipped). So S4 need not re-home it for memory; it's free.
+- `intermediate.counts` only needs to be right for emit (`counts[id].usage_must`, set by phase E on exact
+  targets ⊆ candidates) — `usage_likely` is overwritten at the tail from the full reference set (line ~4080),
+  and write_count drops all-zero entries. So shrinking resolve's symbol input is count-safe.
 
 ### S4/S5 — remove the remaining full-symbol scans (each a2-gated)
 - Hierarchy: load from `callgraph-hierarchy-by-parent` sidecar instead of `hierarchy_facts_from_symbols`.
