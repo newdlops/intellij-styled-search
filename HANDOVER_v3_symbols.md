@@ -93,6 +93,13 @@ ZOEK_FLOW_PROBE=1 /usr/bin/time -l "$BIN" graph-update "$WS" --built-at "$BUILT_
 ```
 Baseline to beat: read_symbols 5.2GB, resolve +3.1GB, peak ~14GB. **Target after S5: peak ∝ affected files, not 5.2M symbols.**
 
+**⚠️ Second floor found during the S3 gate — `ref_sites` is ~4GB on its own.** The slim ref-site read
+materializes a `Vec<RefSite>` of every site in the affected SHARDS (not just affected files): the
+converter.py edit hit 47/128 shards ⇒ **n=14,002,545 sites** (~292B each ≈ 4GB). S4/S5 only remove the
+~5GB symbols floor, so expect peak ~14GB→~9GB, NOT "∝ affected files". Reaching the original target needs
+a SEPARATE ref_sites-streaming step (resolve consuming sites streamed/columnar). **2026-06-02: user chose
+to CHECKPOINT at S3** (`45fde00`); S4/S5 + ref_sites streaming deferred to a later session.
+
 ## Gotchas
 - captain `.zoek-rs` now has `callgraph-resolve-by-name-*` shards (additive, valid, built_at unchanged
   via `--built-at`); the running extension (old 0.1.707 binary) ignores them. No cleanup needed.
