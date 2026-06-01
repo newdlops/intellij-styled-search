@@ -2041,76 +2041,12 @@ fn read_symbols_excluding_paths(
     Ok(out)
 }
 
-/// A2 Stage B v2: like `read_symbols_excluding_paths` but ALSO returns the
-/// token-shape keys of the EXCLUDED (changed-file) symbols. v2's recompute_set
-/// must recompute every symbol whose key's `symbol_count` changed; a def REMOVED
-/// from a changed file lowers that key's count for its same-key siblings, and
-/// the freshly parsed `symbols` no longer contain that removed def, so its prior
-/// key is collected HERE at no extra I/O — the same all-shard parallel read
-/// already deserializes every symbol; we partition (∉changed → carried, ∈changed
-/// → its key) instead of just filtering. The ADDED/modified defs' keys come from
-/// the parse loop; their union is the full per-key symbol_count change set.
-#[allow(clippy::type_complexity)]
-fn read_symbols_excluding_paths_with_changed_keys(
-    workspace_root: &Path,
-    config: &EngineConfig,
-    exclude_paths: &HashSet<String>,
-    file_table: &FileTable,
-) -> io::Result<(Vec<GraphSymbol>, AHashSet<(u64, u64, u64)>)> {
-    let worker_count = graph_worker_count(GRAPH_SHARD_COUNT);
-    let shards_per_worker = GRAPH_SHARD_COUNT.div_ceil(worker_count);
-    let exclude_ref = exclude_paths;
-    let file_table_ref = file_table;
-    type Part = (Vec<GraphSymbol>, AHashSet<(u64, u64, u64)>);
-    let chunks: Vec<Part> = std::thread::scope(|s| -> io::Result<Vec<Part>> {
-        let mut handles = Vec::with_capacity(worker_count);
-        for w in 0..worker_count {
-            let start = w * shards_per_worker;
-            let end = ((w + 1) * shards_per_worker).min(GRAPH_SHARD_COUNT);
-            if start >= end {
-                continue;
-            }
-            handles.push(s.spawn(move || -> io::Result<Part> {
-                let mut carried: Vec<GraphSymbol> = Vec::new();
-                let mut changed_keys: AHashSet<(u64, u64, u64)> = AHashSet::default();
-                for shard in start..end {
-                    let path =
-                        graph_shard_path(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
-                    if !path.exists() {
-                        continue;
-                    }
-                    let bytes = fs::read(&path)?;
-                    let mut cursor = 0;
-                    while cursor < bytes.len() {
-                        let sym = parse_symbol_binary(&bytes, &mut cursor, file_table_ref)?;
-                        if exclude_ref.contains(&sym.rel_path) {
-                            changed_keys.insert((
-                                stable_hash(sym.language.as_str()),
-                                stable_hash(source_scope_key(&sym.rel_path)),
-                                sym.name_hash,
-                            ));
-                        } else {
-                            carried.push(sym);
-                        }
-                    }
-                }
-                Ok((carried, changed_keys))
-            }));
-        }
-        let mut combined = Vec::new();
-        for h in handles {
-            combined.push(h.join().expect("symbols read worker panicked")?);
-        }
-        Ok(combined)
-    })?;
-    let mut symbols = Vec::new();
-    let mut changed_keys: AHashSet<(u64, u64, u64)> = AHashSet::default();
-    for (chunk, keys) in chunks {
-        symbols.extend(chunk);
-        changed_keys.extend(keys);
-    }
-    Ok((symbols, changed_keys))
-}
+// A2 v3 — S6: `read_symbols_excluding_paths_with_changed_keys` (the full-symbol
+// carry read) was removed. The incremental update no longer materializes the
+// ~5.2M-symbol table: the prior changed-file token-shape keys now come from the
+// compact sidecar (`load_symbol_compact` + filter on exclude), and carried
+// symbols are never resident — resolve, emit, and the writes work off the
+// compact set + per-file on-demand reads.
 
 fn read_all_counts_from_id_shards(
     workspace_root: &Path,
@@ -2198,6 +2134,7 @@ pub fn index_graph_from_tsv(
         None,
         None,
         false,
+        None,
         None,
     )
 }
@@ -3435,6 +3372,7 @@ where
         Some(&stream_file_table),
         overlap_static,
         None,
+        None,
     )?;
     // W23: write_store skipped the overlapped ref_site shards; fold their byte
     // count back in so the reported total matches the non-overlapped path.
@@ -3482,6 +3420,20 @@ pub fn update_graph_native(
             workspace_root,
             config,
             GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
+        )
+        // A2 v3 — S6: the incremental path now loads the compact + hierarchy-facts
+        // sidecars instead of the full symbol table. An index built before these
+        // existed (older binary) must full-rebuild — which writes them — rather
+        // than hit an empty compact load.
+        && graph_shard_family_available(
+            workspace_root,
+            config,
+            GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
+        )
+        && graph_shard_family_available(
+            workspace_root,
+            config,
+            GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX,
         );
     if !sidecars_ready {
         eprintln!(
@@ -3511,33 +3463,45 @@ pub fn update_graph_native(
             Some(normalize_graph_rel_path(stripped))
         })
         .collect();
-    let file_table_path_pre = graph_file_table_path(workspace_root, config);
-    let prior_file_table_for_symbols = if file_table_path_pre.exists() {
-        read_file_table_binary(&file_table_path_pre).unwrap_or_default()
-    } else {
-        FileTable::default()
-    };
     let probe = std::env::var("ZOEK_FLOW_PROBE").is_ok();
-    let _t = std::time::Instant::now();
-    // v2: partition the prior symbols — carried (∉changed) into `symbols`, and the
-    // changed-file (about-to-be-replaced) symbols' token-shape keys into
-    // `changed_symbol_keys` (the parse loop adds the NEW defs' keys), so a def
-    // REMOVED by an edit still marks its key for recompute. Same all-shard read.
-    let (mut symbols, mut changed_symbol_keys) = read_symbols_excluding_paths_with_changed_keys(
-        workspace_root,
-        config,
-        &exclude_paths,
-        &prior_file_table_for_symbols,
-    )?;
-    if probe { eprintln!("[flow] read_symbols={}ms changed_symbol_keys_prior={}", _t.elapsed().as_millis(), changed_symbol_keys.len()); }
-    if probe { eprintln!("[flow] rss_after_read_symbols_mb={}", peak_rss_mb()); }
-    drop(prior_file_table_for_symbols);
     let file_table_path = graph_file_table_path(workspace_root, config);
     let prior_file_table = if file_table_path.exists() {
         read_file_table_binary(&file_table_path).unwrap_or_default()
     } else {
         FileTable::default()
     };
+    // A2 v3 — S6 (memory floor): load the COMPACT per-symbol sidecar (~0.5GB)
+    // instead of the full ~5GB GraphSymbol table. It supplies the inputs the
+    // incremental update needs off "all symbols": the prior changed-file
+    // token-shape keys (so a def REMOVED by an edit still marks its key for
+    // recompute), the prior changed-file symbol ids (the id-only DROP for the
+    // hierarchy/method write families), and — combined with the freshly parsed
+    // changed symbols below — the current compact set for token-shape emit +
+    // scoped-likely + file/symbol counts. The full symbol records resolution and
+    // the symbol-keyed writes need are loaded per-file on demand, never carried.
+    let _t = std::time::Instant::now();
+    let prior_compact = load_symbol_compact(workspace_root, config, &prior_file_table)?;
+    let mut changed_symbol_keys: AHashSet<(u64, u64, u64)> = AHashSet::default();
+    let mut prior_changed_ids: HashSet<String> = HashSet::default();
+    for c in &prior_compact {
+        if exclude_paths.contains(&*c.rel_path) {
+            changed_symbol_keys.insert((c.lang_hash, stable_hash(c.scope_key()), c.name_hash));
+            prior_changed_ids.insert(c.id.to_string());
+        }
+    }
+    if probe {
+        eprintln!(
+            "[flow] load_compact={}ms n={} changed_keys_prior={} prior_ids={}",
+            _t.elapsed().as_millis(),
+            prior_compact.len(),
+            changed_symbol_keys.len(),
+            prior_changed_ids.len()
+        );
+        eprintln!("[flow] rss_after_load_compact_mb={}", peak_rss_mb());
+    }
+    // Freshly parsed changed-file symbols — the ADD set for the symbol-keyed
+    // writes + resolve candidates (collected by the parse loop below).
+    let mut changed_full_symbols: Vec<GraphSymbol> = Vec::new();
     // Stage-1 slim: defer the ref_sites read until after `affected_paths` is
     // known, so only the shards holding affected files are read (not all 128).
     // Changed files' freshly parsed sites are collected here and merged in then.
@@ -3613,37 +3577,27 @@ pub fn update_graph_native(
                 s.name_hash,
             ));
         }
-        symbols.extend(graph.symbols);
+        changed_full_symbols.extend(graph.symbols);
         changed_ref_sites.extend(graph.ref_sites);
         import_facts.extend(graph.import_facts);
         type_facts.extend(graph.type_facts);
         function_return_facts.extend(graph.function_return_facts);
     }
     let _t = std::time::Instant::now();
-    // A2 v3 — S3 (memory floor): reconstruct the current `Vec<HierarchyFact>` from
-    // the faithful per-file sidecar (prior facts minus changed/deleted files +
-    // freshly parsed changed files' facts) instead of scanning the full carried
-    // `symbols` table. `is_django_model_type` (resolve's only hierarchy consumer)
-    // computes an order-independent closure, so shard/file order is fine. Falls
-    // back to the full-symbol computation when the sidecar is absent (older
-    // indexes), which is still correct while the carry is resident (dropped in S6).
-    let hierarchy_facts = if graph_shard_family_available(
-        workspace_root,
-        config,
-        GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX,
-    ) {
+    // A2 v3 — S3/S6 (memory floor): reconstruct the current `Vec<HierarchyFact>`
+    // from the faithful per-file sidecar (prior facts minus changed/deleted files
+    // + freshly parsed changed files' facts) instead of scanning the full symbol
+    // table. `is_django_model_type` (resolve's only hierarchy consumer) computes an
+    // order-independent closure, so shard/file order is fine. The sidecar is
+    // guaranteed present by the `sidecars_ready` gate (else a full rebuild ran).
+    let hierarchy_facts = {
         let changed_file_ids: HashSet<u32> = exclude_paths
             .iter()
             .filter_map(|p| prior_file_table.get_id(p))
             .collect();
         let mut facts =
             load_hierarchy_facts_from_sidecar(workspace_root, config, Some(&changed_file_ids))?;
-        let changed_syms: Vec<GraphSymbol> = symbols
-            .iter()
-            .filter(|s| exclude_paths.contains(&s.rel_path))
-            .cloned()
-            .collect();
-        facts.extend(hierarchy_facts_from_symbols(&changed_syms));
+        facts.extend(hierarchy_facts_from_symbols(&changed_full_symbols));
         if probe {
             eprintln!(
                 "[flow] hierarchy_facts(sidecar)={}ms n={} (changed_files={})",
@@ -3653,12 +3607,11 @@ pub fn update_graph_native(
             );
         }
         facts
-    } else {
-        hierarchy_facts_from_symbols(&symbols)
     };
-    let new_symbol_names: HashSet<String> = symbols
+    // A2 v3 — S6: the changed files' symbol names come from the freshly parsed
+    // changed symbols (was `symbols.filter(∈exclude)` off the carried table).
+    let new_symbol_names: HashSet<String> = changed_full_symbols
         .iter()
-        .filter(|s| exclude_paths.contains(&s.rel_path))
         .map(|s| s.name.clone())
         .collect();
     let mut affected_paths: HashSet<String> = exclude_paths.clone();
@@ -3709,48 +3662,38 @@ pub fn update_graph_native(
         })
         .collect();
     if probe { eprintln!("[flow] affected_calc={}ms affected_paths={} affected_indices={}", _t.elapsed().as_millis(), affected_paths.len(), affected_indices.len()); }
-    // A2 v3 — S3 (lazy resolve): resolve over a slim candidate subset (affected
-    // files' own symbols + cross-file targets loaded by name from the
-    // resolve-index shards) instead of the full carried table, so the ~3GB
-    // resolve index is built over thousands of symbols, not millions. Requires
-    // the by-name shards (older indexes lack them → fall back to full symbols);
-    // opt out with ZOEK_V3_LAZY_RESOLVE_OFF for A/B measurement. The full
-    // `symbols` Vec stays resident for hierarchy/emit/counts/likely/symbol-write
-    // (those move off it in S4/S5), so peak RSS does not drop until then.
-    let use_lazy_resolve = lazy_resolve_enabled()
-        && graph_shard_family_available(workspace_root, config, GRAPH_RESOLVE_INDEX_SHARD_PREFIX);
+    // A2 v3 — S3/S6 (lazy resolve): resolve over a slim candidate subset —
+    // affected files' OWN symbols (changed files' freshly parsed + importers
+    // loaded per-file from the symbol-id shards) ∪ cross-file targets loaded by
+    // name from the resolve-index shards — never the full table. The symbol-id,
+    // resolve-index, and compact sidecars are all guaranteed present by the
+    // `sidecars_ready` gate (else a full rebuild ran), so there is no full-symbol
+    // fallback anymore (the carried table is gone).
     let _t = std::time::Instant::now();
-    let resolve_candidates: Option<Vec<GraphSymbol>> = if use_lazy_resolve {
-        Some(build_resolve_candidate_symbols(
-            workspace_root,
-            config,
-            &prior_file_table,
-            &symbols,
-            &ref_sites,
-            &affected_indices,
-            &affected_paths,
-            &import_facts,
-            &type_facts,
-            &function_return_facts,
-        )?)
-    } else {
-        None
-    };
+    let resolve_candidates = build_resolve_candidate_symbols(
+        workspace_root,
+        config,
+        &prior_file_table,
+        &changed_full_symbols,
+        &exclude_paths,
+        &ref_sites,
+        &affected_indices,
+        &affected_paths,
+        &import_facts,
+        &type_facts,
+        &function_return_facts,
+    )?;
     if probe {
-        if let Some(c) = &resolve_candidates {
-            eprintln!(
-                "[flow] resolve_candidates(slim)={}ms n={} (full carried {})",
-                _t.elapsed().as_millis(),
-                c.len(),
-                symbols.len()
-            );
-            eprintln!("[flow] rss_after_resolve_candidates_mb={}", peak_rss_mb());
-        }
+        eprintln!(
+            "[flow] resolve_candidates(slim)={}ms n={}",
+            _t.elapsed().as_millis(),
+            resolve_candidates.len()
+        );
+        eprintln!("[flow] rss_after_resolve_candidates_mb={}", peak_rss_mb());
     }
-    let resolve_symbols: &[GraphSymbol] = resolve_candidates.as_deref().unwrap_or(symbols.as_slice());
     let _t = std::time::Instant::now();
     let mut intermediate = resolve_ref_sites_a_to_e(
-        resolve_symbols,
+        &resolve_candidates,
         &ref_sites,
         Some(&affected_indices),
         &import_facts,
@@ -4012,16 +3955,17 @@ pub fn update_graph_native(
     for k in bare_touched.iter().chain(member_touched.iter()) {
         recompute_keys.insert(*k);
     }
-    // A2 v3 — S4 (memory floor): project the resident symbols to CompactSym so
-    // token-shape emit + scoped-likely run off the compact form (id_u64, name,
-    // name_hash, lang_hash, rel_path→scope, is_member) instead of the full
-    // GraphSymbol fields. At S6 this Vec is sourced from the compact sidecar
-    // (prior minus changed/deleted + fresh-changed projection) and the full
-    // `symbols` table is dropped. file_id is unused by these consumers (MAX).
-    let compact_syms: Vec<CompactSym> = symbols
-        .iter()
-        .map(|s| compact_sym_from_graph(s, u32::MAX))
-        .collect();
+    // A2 v3 — S6 (memory floor): the CURRENT compact set drives token-shape emit
+    // + scoped-likely + file/symbol counts (id_u64, name, name_hash, lang_hash,
+    // rel_path→scope, is_member). Built from the loaded prior compact (minus the
+    // changed/deleted files) plus the freshly parsed changed files (projected) —
+    // equal to projecting the old full carried table, but ~0.5GB not ~5GB.
+    // file_id is unused by these consumers (the compact WRITE re-derives it).
+    let mut compact_syms: Vec<CompactSym> = prior_compact;
+    compact_syms.retain(|c| !exclude_paths.contains(&*c.rel_path));
+    for s in &changed_full_symbols {
+        compact_syms.push(compact_sym_from_graph(s, u32::MAX));
+    }
     let _t = std::time::Instant::now();
     let (mut token_shape_refs, recompute_set) = emit_token_shape_refs_from_tally(
         &compact_syms,
@@ -4069,8 +4013,11 @@ pub fn update_graph_native(
     for site in &ref_sites {
         stream_file_table.intern(&site.rel_path);
     }
-    for sym in &symbols {
-        stream_file_table.intern(&sym.rel_path);
+    // A2 v3 — S6: intern current symbol paths from the compact set (was the
+    // carried `symbols`). Every symbol's file already has a definition ref_site,
+    // so this is idempotent, but kept for parity with the full-rebuild table.
+    for c in &compact_syms {
+        stream_file_table.intern(&c.rel_path);
     }
     for fact in &import_facts {
         stream_file_table.intern(&fact.rel_path);
@@ -4180,60 +4127,39 @@ pub fn update_graph_native(
     // A2 v3 — S4: drive this from the (id_u64-keyed) scoped maps instead of a
     // full-symbol scan (see apply_scoped_likely_to_counts).
     apply_scoped_likely_to_counts(&mut counts, &usage_by_target, &calls_by_target);
-    compute_native_counts(&symbols, &mut counts, &hierarchy_facts);
+    // A2 v3 — S6: `compute_native_counts` is a no-op at corpus scale
+    // (symbols.len() > MAX_EAGER_IMPLEMENTATION_SYMBOLS skips it), which the
+    // incremental path always hits — so it never recomputed impl counts here.
+    // The full symbol table is gone; pass an empty slice (same no-op result).
+    compute_native_counts(&[], &mut counts, &hierarchy_facts);
+    // file_count = distinct current symbol files, from the compact set (was the
+    // carried `symbols`); matches the full rebuild's unique-symbol-rel_path count.
     let mut unique_paths: HashSet<&str> = HashSet::default();
-    for symbol in &symbols {
-        unique_paths.insert(symbol.rel_path.as_str());
+    for c in &compact_syms {
+        unique_paths.insert(&c.rel_path);
     }
     let file_count = unique_paths.len();
-    if probe { eprintln!("[flow] compute_counts={}ms", _t.elapsed().as_millis()); }
-    // A2 v3 — S5: write the four symbol-keyed families incrementally
-    // (read-shard-drop-add) instead of fully rewriting them from the carried
-    // table. Requires the compact sidecar (for the id-only DROP of
-    // hierarchy/method via prior ids); older indexes without it fall back to the
-    // full rewrite from `symbols` (still correct while the carry is resident).
-    let _t = std::time::Instant::now();
-    let use_incr_sym = graph_shard_family_available(
-        workspace_root,
-        config,
-        GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
-    );
-    let changed_symbols: Vec<GraphSymbol> = if use_incr_sym {
-        symbols
-            .iter()
-            .filter(|s| exclude_paths.contains(&s.rel_path))
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let prior_symbol_ids: HashSet<String> = if use_incr_sym {
-        load_prior_symbol_ids_for_paths(workspace_root, config, &prior_file_table, &exclude_paths)?
-    } else {
-        HashSet::default()
-    };
-    let incr_sym = use_incr_sym.then(|| IncrementalSymbolWrite {
-        changed_symbols: &changed_symbols,
+    let symbol_count = compact_syms.len();
+    if probe { eprintln!("[flow] compute_counts={}ms file_count={} symbol_count={}", _t.elapsed().as_millis(), file_count, symbol_count); }
+    // A2 v3 — S6: all six symbol-consuming write families are now written
+    // incrementally (read-shard-drop-add) off the freshly parsed changed symbols +
+    // the existing shards, so the full carried table is no longer needed. The
+    // ADD set is `changed_full_symbols`; the id-only DROP set (`prior_changed_ids`)
+    // came from the prior compact load. Guaranteed available by `sidecars_ready`.
+    let incr_sym = IncrementalSymbolWrite {
+        changed_symbols: &changed_full_symbols,
         exclude_paths: &exclude_paths,
-        prior_ids: &prior_symbol_ids,
-    });
-    if probe {
-        eprintln!(
-            "[flow] incr_sym_prep={}ms changed_syms={} prior_ids={} (incremental_writes={})",
-            _t.elapsed().as_millis(),
-            changed_symbols.len(),
-            prior_symbol_ids.len(),
-            use_incr_sym
-        );
-    }
+        prior_ids: &prior_changed_ids,
+    };
     let _t = std::time::Instant::now();
+    let empty_symbols: Vec<GraphSymbol> = Vec::new();
     let empty_refs: Vec<GraphReference> = Vec::new();
     let result = write_store(
         workspace_root,
         built_at,
         config,
         file_count,
-        &symbols,
+        &empty_symbols,
         &empty_refs,
         &ref_sites,
         &import_facts,
@@ -4245,7 +4171,8 @@ pub fn update_graph_native(
         Some(total_emitted),
         Some(&stream_file_table),
         false,
-        incr_sym.as_ref(),
+        Some(&incr_sym),
+        Some(symbol_count),
     );
     if probe { eprintln!("[flow] write_store={}ms", _t.elapsed().as_millis()); }
     result
@@ -10584,6 +10511,10 @@ fn write_store(
     // families are written incrementally (read-shard-drop-add) rather than fully
     // rewritten from `symbols`.
     incr_sym: Option<&IncrementalSymbolWrite>,
+    // A2 v3 — S6: the manifest/summary symbol count. The incremental path no
+    // longer passes the full `symbols` slice (it's empty), so it overrides the
+    // count with the compact-set size. None → use `symbols.len()` (full rebuild).
+    symbol_count_override: Option<usize>,
 ) -> io::Result<GraphIndexSummary> {
     let layout_root = config.index_root(workspace_root);
     fs::create_dir_all(&layout_root)?;
@@ -10651,6 +10582,7 @@ fn write_store(
     let indexed_at_unix_secs = unix_secs_now();
     let bytes = shard_bytes + file_table_bytes;
     let reference_count_emitted = reference_count_override.unwrap_or(references.len());
+    let symbol_count_emitted = symbol_count_override.unwrap_or(symbols.len());
     let manifest = format!(
         "{{\"engine\":\"zoek-rs\",\"type\":\"semantic-serving-graph\",\"version\":{},\"workspaceRoot\":{},\"indexedAtUnixSecs\":{},\"builtAtUnixMs\":{},\"fileCount\":{},\"symbolCount\":{},\"referenceCount\":{},\"bytes\":{}}}",
         GRAPH_VERSION,
@@ -10658,7 +10590,7 @@ fn write_store(
         indexed_at_unix_secs,
         built_at_unix_ms,
         file_count,
-        symbols.len(),
+        symbol_count_emitted,
         reference_count_emitted,
         bytes
     );
@@ -10672,7 +10604,7 @@ fn write_store(
         indexed_at_unix_secs,
         built_at_unix_ms,
         file_count,
-        symbol_count: symbols.len(),
+        symbol_count: symbol_count_emitted,
         reference_count: reference_count_emitted,
         bytes,
     })
@@ -11532,18 +11464,28 @@ fn write_graph_shards(
             };
             (t.elapsed(), r)
         });
-        // A2 v3 — S5: compact per-symbol sidecar (file-sharded; incremental
-        // rewrites only affected shards, like ref_sites/facts).
+        // A2 v3 — S5/S6: compact per-symbol sidecar. Incremental (read-drop-add)
+        // when incr_sym is set so it needs no full `symbols` slice; full rewrite
+        // otherwise.
         let compact_h = s.spawn(move || {
             let t = std::time::Instant::now();
-            let r = write_symbol_compact_shards(workspace_root, config, symbols, file_table, incremental);
+            let r = match incr_sym {
+                Some(incr) => {
+                    write_symbol_compact_shards_incremental(workspace_root, config, incr, file_table)
+                }
+                None => write_symbol_compact_shards(workspace_root, config, symbols, file_table, incremental),
+            };
             (t.elapsed(), r)
         });
-        // A2 v3 — S4: faithful hierarchy-facts sidecar (file-sharded; same
-        // incremental shape).
+        // A2 v3 — S4/S6: faithful hierarchy-facts sidecar (same incremental shape).
         let hierarchy_facts_h = s.spawn(move || {
             let t = std::time::Instant::now();
-            let r = write_hierarchy_facts_shards(workspace_root, config, symbols, file_table, incremental);
+            let r = match incr_sym {
+                Some(incr) => {
+                    write_hierarchy_facts_shards_incremental(workspace_root, config, incr, file_table)
+                }
+                None => write_hierarchy_facts_shards(workspace_root, config, symbols, file_table, incremental),
+            };
             (t.elapsed(), r)
         });
         let mut bytes = 0;
@@ -11820,34 +11762,64 @@ fn write_method_container_shards_incremental(
 /// A2 v3 — S5: prior `symbol.id`s of the given (changed/deleted) paths, read from
 /// the compact sidecar's per-file shards (so only those files' shards are
 /// touched, not the whole table). Feeds the id-only DROP for hierarchy/method.
-fn load_prior_symbol_ids_for_paths(
+/// A2 v3 — S6: incremental write of the file-sharded compact sidecar. DROP =
+/// records whose file changed/was deleted (`rel_path ∈ exclude_paths`); ADD = the
+/// changed symbols' compact projection. Reuses the all-shard read-drop-add (the
+/// compact sidecar is file-sharded, so unaffected shards are rewritten verbatim).
+fn write_symbol_compact_shards_incremental(
     workspace_root: &Path,
     config: &EngineConfig,
+    incr: &IncrementalSymbolWrite,
     file_table: &FileTable,
-    paths: &HashSet<String>,
-) -> io::Result<HashSet<String>> {
-    let shards: HashSet<usize> = paths.iter().map(|p| shard_index_for_key(p)).collect();
-    let mut ids: HashSet<String> = HashSet::default();
-    for shard in shards {
-        let path = graph_shard_path(
-            workspace_root,
-            config,
-            GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
-            shard,
-        );
-        if !path.exists() {
-            continue;
-        }
-        let bytes = fs::read(&path)?;
-        let mut cursor = 0;
-        while cursor < bytes.len() {
-            let cs = parse_symbol_compact_binary(&bytes, &mut cursor, file_table)?;
-            if paths.contains(&*cs.rel_path) {
-                ids.insert(cs.id.to_string());
-            }
-        }
+) -> io::Result<u64> {
+    let mut fresh: Vec<Vec<u8>> = (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+    for symbol in incr.changed_symbols {
+        let fid = file_table.get_id(&symbol.rel_path).unwrap_or(u32::MAX);
+        serialize_symbol_compact_binary(symbol, fid, &mut fresh[shard_index_for_key(&symbol.rel_path)]);
     }
-    Ok(ids)
+    rewrite_shards_incremental(
+        workspace_root,
+        config,
+        GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
+        &fresh,
+        |bytes, cursor| {
+            let cs = parse_symbol_compact_binary(bytes, cursor, file_table)?;
+            Ok(!incr.exclude_paths.contains(&*cs.rel_path))
+        },
+    )
+}
+
+/// A2 v3 — S6: incremental write of the file-sharded hierarchy-facts sidecar.
+/// DROP = records whose owning file (recovered from the stored `file_id`)
+/// changed/was deleted; ADD = the changed files' fresh parent edges.
+fn write_hierarchy_facts_shards_incremental(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    incr: &IncrementalSymbolWrite,
+    file_table: &FileTable,
+) -> io::Result<u64> {
+    let mut fresh: Vec<Vec<u8>> = (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+    for symbol in incr.changed_symbols {
+        let fid = file_table.get_id(&symbol.rel_path).unwrap_or(u32::MAX);
+        serialize_symbol_hierarchy_facts(symbol, fid, &mut fresh[shard_index_for_key(&symbol.rel_path)]);
+    }
+    rewrite_shards_incremental(
+        workspace_root,
+        config,
+        GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX,
+        &fresh,
+        |bytes, cursor| {
+            let file_id = read_u32_le(bytes, cursor)?;
+            let _relation = read_u8_at(bytes, cursor)?;
+            let _child_qn = read_u16_str(bytes, cursor)?;
+            let _parent = read_u16_str(bytes, cursor)?;
+            let keep = match file_table.get_path(file_id) {
+                Some(rel_path) => !incr.exclude_paths.contains(rel_path),
+                None => true,
+            };
+            Ok(keep)
+        },
+    )
 }
 
 fn write_symbol_uri_shards(
@@ -14245,11 +14217,9 @@ fn load_resolve_candidates(
     Ok(out)
 }
 
-/// A2 v3 — S3: opt-out for lazy resolve so the candidate path can be A/B
-/// compared against the pre-S3 full-symbol resolve.
-fn lazy_resolve_enabled() -> bool {
-    std::env::var("ZOEK_V3_LAZY_RESOLVE_OFF").is_err()
-}
+// A2 v3 — S6: `lazy_resolve_enabled` (the ZOEK_V3_LAZY_RESOLVE_OFF A/B opt-out)
+// was removed — there is no full-symbol fallback anymore (the carry is gone), so
+// lazy resolve over the candidate subset is the only incremental path.
 
 /// A2 v3 — S3: seed the resolve-candidate name set from a `TypeFact` /
 /// `FunctionReturnFact` `type_name`. The resolver probes `types_by_name` /
@@ -14296,7 +14266,13 @@ fn build_resolve_candidate_symbols(
     workspace_root: &Path,
     config: &EngineConfig,
     prior_file_table: &FileTable,
-    symbols: &[GraphSymbol],
+    // A2 v3 — S6: freshly parsed changed-file symbols (replaces the carried table
+    // for the changed files' own symbols).
+    changed_symbols: &[GraphSymbol],
+    // changed ∪ deleted — so the affected-but-UNCHANGED importer files
+    // (affected ∖ exclude) are read from disk while the changed ones use the fresh
+    // parse above.
+    exclude_paths: &HashSet<String>,
     ref_sites: &[RefSite],
     affected_indices: &[u32],
     affected_paths: &HashSet<String>,
@@ -14344,14 +14320,57 @@ fn build_resolve_candidate_symbols(
             .into_iter()
             .filter(|s| !affected_paths.contains(&s.rel_path))
             .collect();
-    // Affected files' own symbols (fresh for changed, carried for importers).
+    // Affected files' own symbols. Changed files: freshly parsed (`changed_symbols`,
+    // all ∈ exclude ⊆ affected). Importers (affected ∖ exclude, unchanged on disk):
+    // loaded per-file from the symbol-id shards — usually none (a leaf edit has no
+    // importers), so this read is skipped on the common path.
     candidates.extend(
-        symbols
+        changed_symbols
             .iter()
             .filter(|s| affected_paths.contains(&s.rel_path))
             .cloned(),
     );
+    let importer_paths: HashSet<String> = affected_paths
+        .iter()
+        .filter(|p| !exclude_paths.contains(*p))
+        .cloned()
+        .collect();
+    if !importer_paths.is_empty() {
+        candidates.extend(read_symbols_for_paths(
+            workspace_root,
+            config,
+            prior_file_table,
+            &importer_paths,
+        )?);
+    }
     Ok(candidates)
+}
+
+/// A2 v3 — S6: read the symbols of the given files from the by-id symbol shards
+/// (filtered by `rel_path`). Symbols scatter across all shards by id, so every
+/// shard is scanned, but only the requested files' symbols are retained — peak
+/// resident is just those (never the whole table). Used for the affected-but-
+/// unchanged importer files in `build_resolve_candidate_symbols`.
+fn read_symbols_for_paths(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    file_table: &FileTable,
+    paths: &HashSet<String>,
+) -> io::Result<Vec<GraphSymbol>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<GraphSymbol> = Vec::new();
+    for shard in 0..GRAPH_SHARD_COUNT {
+        let path = graph_shard_path(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
+        if !path.exists() {
+            continue;
+        }
+        out.extend(read_symbols_matching(&path, file_table, |s| {
+            paths.contains(&s.rel_path)
+        })?);
+    }
+    Ok(out)
 }
 
 fn read_symbols_for_symbol_ids_indexed(
@@ -16194,13 +16213,13 @@ mod tests {
         let mut noop = |_p: GraphRebuildProgress| {};
         rebuild_graph_native(&root, 0, &config, 0, &mut noop).expect("rebuild");
         let full_counts = read_all_counts_from_id_shards(&root, &config).expect("full counts");
-        let (full_sym, full_res, full_hier, full_meth) =
+        let (full_sym, full_res, full_hier, full_meth, full_compact, full_hfacts) =
             snapshot_symbol_write_shards(&root, &config);
 
         update_graph_native(&root, std::slice::from_ref(&changed), &[], 0, &config, 0)
             .expect("update");
         let incr_counts = read_all_counts_from_id_shards(&root, &config).expect("incr counts");
-        let (incr_sym, incr_res, incr_hier, incr_meth) =
+        let (incr_sym, incr_res, incr_hier, incr_meth, incr_compact, incr_hfacts) =
             snapshot_symbol_write_shards(&root, &config);
 
         // Counts are INFORMATIONAL only: the incremental path does not recompute
@@ -16229,28 +16248,40 @@ mod tests {
             "[s4s5] count diffs (informational): total={diff_total} usage_likely={diff_likely} calls_in_likely={diff_calls_likely}"
         );
 
-        // S5 GATE: the symbol-keyed write shards (symbol-id, resolve-index,
-        // hierarchy-by-parent, methods-by-container) must hold the SAME record
-        // set after an incremental update as after a full rebuild.
+        // S5/S6 GATE: all six symbol-consuming write families must hold the SAME
+        // record set after an incremental update as after a full rebuild. (compact
+        // + hierarchy-facts gate the S6 file-sharded incremental writes, which a
+        // single update's reads otherwise wouldn't exercise.)
         eprintln!(
-            "[s4s5] shard records incr/full: sym {}/{} res {}/{} hier {}/{} meth {}/{}",
+            "[s4s5] shard records incr/full: sym {}/{} res {}/{} hier {}/{} meth {}/{} compact {}/{} hfacts {}/{}",
             incr_sym.len(), full_sym.len(), incr_res.len(), full_res.len(),
-            incr_hier.len(), full_hier.len(), incr_meth.len(), full_meth.len()
+            incr_hier.len(), full_hier.len(), incr_meth.len(), full_meth.len(),
+            incr_compact.len(), full_compact.len(), incr_hfacts.len(), full_hfacts.len()
         );
         assert_eq!(incr_sym, full_sym, "symbol-id shard records must match full rebuild");
         assert_eq!(incr_res, full_res, "resolve-index shard records must match full rebuild");
         assert_eq!(incr_hier, full_hier, "hierarchy-by-parent records must match full rebuild");
         assert_eq!(incr_meth, full_meth, "methods-by-container records must match full rebuild");
+        assert_eq!(incr_compact, full_compact, "compact records must match full rebuild");
+        assert_eq!(incr_hfacts, full_hfacts, "hierarchy-facts records must match full rebuild");
     }
 
     // Snapshot the four symbol-keyed write-shard families as sorted record sets
     // (order-independent — readers collect all records, so within-shard byte
     // order is irrelevant). kind: 0=full symbol record, 1=hierarchy edge,
     // 2=method edge.
+    #[allow(clippy::type_complexity)]
     fn snapshot_symbol_write_shards(
         root: &Path,
         config: &EngineConfig,
-    ) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    ) -> (
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+    ) {
         let ft = read_file_table_binary(&graph_file_table_path(root, config)).unwrap_or_default();
         let read_family = |prefix: &str, kind: u8| -> Vec<String> {
             let mut recs: Vec<String> = Vec::new();
@@ -16263,6 +16294,7 @@ mod tests {
                 let mut c = 0;
                 while c < bytes.len() {
                     let rec = match kind {
+                        // symbol-id / resolve-index: full symbol record.
                         0 => {
                             let s = parse_symbol_binary(&bytes, &mut c, &ft).expect("parse symbol");
                             format!(
@@ -16270,6 +16302,7 @@ mod tests {
                                 s.id, s.rel_path, s.name, s.qualified_name, s.kind
                             )
                         }
+                        // hierarchy-by-parent: (lookup_key, parent, child_id, child_qn).
                         1 => {
                             let lk = read_u16_str(&bytes, &mut c).unwrap();
                             let pn = read_u16_str(&bytes, &mut c).unwrap();
@@ -16277,10 +16310,29 @@ mod tests {
                             let qn = read_u16_str(&bytes, &mut c).unwrap();
                             format!("{lk}\t{pn}\t{id}\t{qn}")
                         }
-                        _ => {
+                        // methods-by-container: (lookup_key, method_id).
+                        2 => {
                             let lk = read_u16_str(&bytes, &mut c).unwrap();
                             let id = read_u16_str(&bytes, &mut c).unwrap();
                             format!("{lk}\t{id}")
+                        }
+                        // compact: full compact record (file_id-independent fields).
+                        3 => {
+                            let cs =
+                                parse_symbol_compact_binary(&bytes, &mut c, &ft).expect("compact");
+                            format!(
+                                "{}\t{}\t{}\t{}\t{}\t{}",
+                                cs.id, cs.rel_path, cs.name, cs.name_hash, cs.lang_hash, cs.kind_id
+                            )
+                        }
+                        // hierarchy-facts: (rel_path, relation, child_qn, parent).
+                        _ => {
+                            let file_id = read_u32_le(&bytes, &mut c).unwrap();
+                            let rel = read_u8_at(&bytes, &mut c).unwrap();
+                            let qn = read_u16_str(&bytes, &mut c).unwrap();
+                            let pn = read_u16_str(&bytes, &mut c).unwrap();
+                            let rp = ft.get_path(file_id).unwrap_or("");
+                            format!("{rp}\t{rel}\t{qn}\t{pn}")
                         }
                     };
                     recs.push(rec);
@@ -16294,6 +16346,8 @@ mod tests {
             read_family(GRAPH_RESOLVE_INDEX_SHARD_PREFIX, 0),
             read_family(GRAPH_HIERARCHY_PARENT_SHARD_PREFIX, 1),
             read_family(GRAPH_METHOD_CONTAINER_SHARD_PREFIX, 2),
+            read_family(GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX, 3),
+            read_family(GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX, 4),
         )
     }
 
