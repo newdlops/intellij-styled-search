@@ -3801,6 +3801,16 @@ pub fn update_graph_native(
     }
     let _t = std::time::Instant::now();
     let mut counts = std::mem::take(&mut intermediate.counts);
+    // A2: the full rebuild's phase F (apply_token_shape_likely_count_baseline)
+    // pads token-shape refs up to usage_likely, so usage_likely == #refs(target)
+    // there; the incremental path emits a byte-identical reference set via the
+    // carry/recompute_set tally but SKIPS that count pass, leaving usage_likely
+    // exact-only (ambiguous names read "0 usages" while the panel shows the
+    // carried/re-emitted token-shape rows). Recompute usage_likely/calls_in_likely
+    // from the assembled all_references — the only full-coverage source here (the
+    // candidate tally and resolve `*_likely_*` maps only hold the changed keys in
+    // an incremental update) — which reproduces the full rebuild's counts.
+    apply_incremental_likely_counts_from_references(&symbols, &mut counts, &all_references);
     compute_native_counts(&symbols, &mut counts, &hierarchy_facts);
     let mut unique_paths: HashSet<&str> = HashSet::default();
     for symbol in &symbols {
@@ -9487,8 +9497,27 @@ fn apply_token_shape_likely_count_baseline(
                 .get(&symbol.id)
                 .copied()
                 .unwrap_or_default();
-            count.usage_likely = count.usage_must.max(usage_baseline);
-            count.calls_in_likely = count.calls_in_must.max(call_baseline);
+            // Honest count: the token-shape "likely" baseline only contributes
+            // QUERYABLE references when the per-key fanout is within the limit —
+            // the emission gate below (`fanout <= MAX_…FANOUT…`) emits ZERO
+            // token-shape refs once it is exceeded. The baseline must follow the
+            // same gate here, otherwise `usage_likely` promises usages the index
+            // never stores: the inline usage hint shows 1000+ while Find Usages /
+            // the inlay click return nothing (graph-query finds no rows). This
+            // changes counts ONLY for over-limit keys; the emitted reference set
+            // (the full-vs-incremental byte-identical invariant) is untouched,
+            // since the inner `fanout` gate already blocks emission there.
+            let token_shape_emittable = match baseline_sites {
+                Some(sites) => {
+                    sites.len().saturating_mul(symbol_count_for_key)
+                        <= MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY
+                }
+                None => false,
+            };
+            let effective_usage_baseline = if token_shape_emittable { usage_baseline } else { 0 };
+            let effective_call_baseline = if token_shape_emittable { call_baseline } else { 0 };
+            count.usage_likely = count.usage_must.max(effective_usage_baseline);
+            count.calls_in_likely = count.calls_in_must.max(effective_call_baseline);
             let mut reference_count = reference_counts_ref
                 .get(&symbol.id_u64)
                 .copied()
@@ -9595,6 +9624,81 @@ fn apply_token_shape_likely_count_baseline(
         references.append(&mut local_refs);
         light_out.append(&mut local_light_refs);
         dedup.extend(local_dedup);
+    }
+}
+
+/// A2 (incremental counts): set `usage_likely` / `calls_in_likely` from the
+/// final assembled reference set. The full rebuild's phase F pads token-shape
+/// refs up to `usage_likely` (`apply_token_shape_likely_count_baseline`), so the
+/// number of emitted references targeting a symbol EQUALS its `usage_likely`
+/// there (verified: a full rebuild's stored `usage_likely` matches its
+/// graph-query reference count for every symbol). The incremental path assembles
+/// a byte-identical reference set (carried prior refs + re-emitted
+/// recompute_set), so counting that set per target reproduces the full rebuild's
+/// `usage_likely` exactly — and is full-coverage, unlike the affected-only
+/// candidate tally / `resolve_ref_sites_a_to_e` `*_likely_*` maps (an
+/// incremental update only loads/builds the changed keys). `usage_must` /
+/// `usage_may` / `calls_in_must` etc. are left as `resolve_ref_sites_a_to_e`
+/// computed them (full-coverage exact counts over all ref_sites). `calls_in_likely`
+/// is likewise taken as the call/construct reference count. Without this the
+/// incremental counts stay exact-only and ambiguous names read "0 usages" while
+/// the panel shows the carried token-shape rows.
+fn apply_incremental_likely_counts_from_references(
+    symbols: &[GraphSymbol],
+    counts: &mut HashMap<String, GraphCount>,
+    references: &[GraphReference],
+) {
+    // full's usage_likely is SOURCE-ROOT SCOPED: it counts refs in the target's
+    // own top-level source root and leaves cross-root name look-alikes (e.g. a
+    // same-named symbol pulled in from .venv via the workspace-unique-name
+    // fallback) in usage_may. Mirror that by counting only refs whose source root
+    // matches the target's — counting all emitted refs inflated ambiguous symbols
+    // with dependency name-collision noise (ref_count read 9 ".venv" usages it
+    // does not have), while same-root refs (incl. same-root unique-name) ARE part
+    // of the scoped count.
+    let mut scope_by_target: AHashMap<&str, &str> = AHashMap::with_capacity(symbols.len());
+    for symbol in symbols {
+        scope_by_target.insert(symbol.id.as_str(), source_scope_key(&symbol.rel_path));
+    }
+    let mut usage_by_target: AHashMap<&str, usize> = AHashMap::default();
+    let mut calls_by_target: AHashMap<&str, usize> = AHashMap::default();
+    for reference in references {
+        if let Some(target) = reference.target_symbol_id.as_deref() {
+            let target_scope = scope_by_target.get(target).copied().unwrap_or("");
+            if source_scope_key(&reference.rel_path) != target_scope {
+                continue;
+            }
+            *usage_by_target.entry(target).or_default() += 1;
+            if matches!(reference.edge_kind.as_ref(), "call" | "construct") {
+                *calls_by_target.entry(target).or_default() += 1;
+            }
+        }
+    }
+    for symbol in symbols {
+        let usage_likely = usage_by_target
+            .get(symbol.id.as_str())
+            .copied()
+            .unwrap_or(0);
+        let calls_in_likely = calls_by_target
+            .get(symbol.id.as_str())
+            .copied()
+            .unwrap_or(0);
+        // write_count_id_shards drops all-zero entries, so only materialize a new
+        // entry when the symbol is actually referenced; symbols that already have
+        // an exact count are updated in place.
+        match counts.get_mut(&symbol.id) {
+            Some(count) => {
+                count.usage_likely = usage_likely;
+                count.calls_in_likely = calls_in_likely;
+            }
+            None => {
+                if usage_likely > 0 {
+                    let count = counts.entry(symbol.id.clone()).or_default();
+                    count.usage_likely = usage_likely;
+                    count.calls_in_likely = calls_in_likely;
+                }
+            }
+        }
     }
 }
 

@@ -68,7 +68,12 @@ const AUTO_BASE_REFRESH_MIN_INTERVAL_MS = 60_000;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
 const ZOEKT_PROGRESS_PREFIX = '__ZOEK_PROGRESS__';
 const ZOEKT_SEARCH_EVENT_PREFIX = '__ZOEK_SEARCH__';
-const ZOEKT_SCHEMA_VERSION = 19;
+// MUST match `SCHEMA_VERSION` in crates/zoek-rs/src/config.rs — the rust binary
+// stamps it into .zoek-rs/manifest.json and hasReadyIndex() rejects any other
+// value as "incomplete" (→ codesearch fallback). The rust schema was bumped to
+// 20 in af9eafb (2026-05-30) without updating this constant, which left every
+// freshly-built index looking incomplete and forced the fallback path.
+const ZOEKT_SCHEMA_VERSION = 20;
 const ZOEKT_UPDATE_IGNORED_DIR_NAMES = new Set([
   '.zoek-rs',
   '.zoekt-rs',

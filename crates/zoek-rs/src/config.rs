@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 
 pub const ENGINE_NAME: &str = "zoek-rs";
 pub const PROTOCOL_VERSION: u32 = 1;
+// Stamped into .zoek-rs/manifest.json. When you bump this you MUST also update
+// `ZOEKT_SCHEMA_VERSION` in src/zoekRuntime.ts (and src/test/suite/captainIndexGate.test.ts):
+// the TS readiness check rejects any manifest whose schemaVersion != that
+// constant as "incomplete" and silently drops search to the codesearch
+// fallback. (Skew here on 2026-05-30 left search in permanent fallback.)
 pub const SCHEMA_VERSION: u32 = 20;
 
 #[derive(Clone, Debug)]

@@ -11,7 +11,8 @@ import { decodeTextBytes, hasBinaryFileExtension, looksBinaryContent } from '../
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 const CAPTAIN_WORKSPACE_SUFFIX = path.join('captain2', 'captain');
-const ZOEKT_SCHEMA_VERSION = 19;
+// Keep in sync with crates/zoek-rs/src/config.rs SCHEMA_VERSION (and zoekRuntime.ts).
+const ZOEKT_SCHEMA_VERSION = 20;
 const SEARCH_INDEX_BUDGET_MS = 8_000;
 const SEARCH_INDEX_SEED_TIMEOUT_MS = 120_000;
 const GRAPH_INDEX_BUDGET_MS = 8_000;

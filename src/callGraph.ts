@@ -663,6 +663,18 @@ const CALL_GRAPH_SOURCE_GLOB = '**/*.{py,java,kt,kts,ts,tsx,js,jsx,mjs,cjs}';
 const CALL_GRAPH_CACHE_VERSION = 14;
 const CALL_GRAPH_EXTERNAL_INCREMENTAL_DEBOUNCE_MS = 1_500;
 const CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS = 75;
+// Each incremental graph-update loads the full prior reference set into the
+// rust process; running several at once (an edit storm during a long update) is
+// the OOM risk. The drain loop serializes them — at most one update process at
+// a time — and coalesces files that change mid-update into a single follow-up
+// pass. These bound that loop:
+//   - a coalesced batch this large is cheaper + memory-bounded as ONE full
+//     rebuild than as a giant incremental (mass edit / branch switch);
+const CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD = 200;
+//   - and continuous editing can't hold one update in flight forever: after
+//     this many back-to-back passes the loop releases and the next debounce
+//     flush resumes the remainder.
+const CALL_GRAPH_INCREMENTAL_MAX_DRAIN_ITERATIONS = 50;
 const CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK = 50_000;
 const CALL_GRAPH_SYMBOL_RELATION_BUCKETS = 256;
 const CALL_GRAPH_DOCUMENT_SUMMARY_BUCKETS = 256;
@@ -1697,8 +1709,17 @@ export class CallGraphService implements vscode.Disposable {
     if (!this.incrementalReason || reason === 'saved' || this.incrementalReason.startsWith('external-')) {
       this.incrementalReason = reason;
     }
-    const normalizedDelayMs = Math.max(0, delayMs);
-    const flushAt = Date.now() + normalizedDelayMs;
+    this.armIncrementalFlush(Math.max(0, delayMs));
+  }
+
+  // Arms (or keeps) the single debounce timer that, on fire, kicks the
+  // single-flight drain. Keeps the EARLIEST already-scheduled flush so a burst
+  // of edits collapses to one flush. The timer does NOT snapshot/clear
+  // pendingChangedUris — the drain owns that, so changes arriving mid-update are
+  // coalesced into the next pass instead of spawning a concurrent update.
+  private armIncrementalFlush(delayMs: number): void {
+    if (this.disposed) { return; }
+    const flushAt = Date.now() + delayMs;
     if (this.incrementalTimer && this.incrementalFlushAt > 0 && this.incrementalFlushAt <= flushAt) {
       return;
     }
@@ -1709,13 +1730,9 @@ export class CallGraphService implements vscode.Disposable {
     this.incrementalTimer = setTimeout(() => {
       this.incrementalTimer = undefined;
       this.incrementalFlushAt = 0;
-      const uriStrings = Array.from(this.pendingChangedUris);
-      this.pendingChangedUris.clear();
-      const flushReason = this.incrementalReason || reason;
-      this.incrementalReason = '';
-      void this.refreshChangedFiles(uriStrings.map((value) => vscode.Uri.parse(value)), flushReason)
+      void this.kickIncrementalRefresh()
         .catch((err) => this.log.appendLine(`call graph incremental update failed: ${err instanceof Error ? err.message : err}`));
-    }, normalizedDelayMs);
+    }, delayMs);
   }
 
   private scheduleIncrementalRefreshIfSupported(uri: vscode.Uri, reason: string, delayMs?: number): void {
@@ -1730,33 +1747,83 @@ export class CallGraphService implements vscode.Disposable {
 
   async refreshChangedFiles(uris: vscode.Uri[], reason: string): Promise<void> {
     if (uris.length === 0 || this.disposed) { return; }
-    if (this.rebuildPromise) {
-      await this.rebuildPromise;
+    for (const uri of uris) { this.pendingChangedUris.add(uri.toString()); }
+    if (reason && (!this.incrementalReason || reason === 'saved' || this.incrementalReason.startsWith('external-'))) {
+      this.incrementalReason = reason;
     }
-    if (this.restorePromise) {
-      await this.restorePromise;
-    }
-    if (this.hasRustNativePrimaryGraph()) {
-      if (this.incrementalPromise) {
-        await this.incrementalPromise;
+    await this.kickIncrementalRefresh();
+  }
+
+  // Single-flight gate: at most ONE incremental drain runs at a time. Changes
+  // that arrive while it runs accumulate in pendingChangedUris and are picked up
+  // by the same drain loop — coalesced into one more pass instead of spawning
+  // concurrent graph-update processes. Each incremental loads the full prior
+  // reference set, so the old "await the in-flight promise, then start mine"
+  // path let N piled-up callers all resume and run at once → an edit storm could
+  // exhaust memory. Serializing + coalescing bounds it to a single process.
+  private kickIncrementalRefresh(): Promise<void> {
+    if (this.incrementalPromise) { return this.incrementalPromise; }
+    this.incrementalPromise = this.drainIncrementalRefresh().finally(() => {
+      this.incrementalPromise = undefined;
+    });
+    return this.incrementalPromise;
+  }
+
+  private async drainIncrementalRefresh(): Promise<void> {
+    if (this.rebuildPromise) { await this.rebuildPromise; }
+    if (this.restorePromise) { await this.restorePromise; }
+    let iterations = 0;
+    while (!this.disposed && this.pendingChangedUris.size > 0) {
+      if (++iterations > CALL_GRAPH_INCREMENTAL_MAX_DRAIN_ITERATIONS) {
+        // Continuous editing: release the loop (and any open update process) and
+        // let the next debounce flush resume, so a never-ending edit stream
+        // can't pin one update in flight (and block queries awaiting it) forever.
+        this.log.appendLine(
+          `call graph incremental drain: reached ${CALL_GRAPH_INCREMENTAL_MAX_DRAIN_ITERATIONS} passes; ` +
+          `deferring ${this.pendingChangedUris.size} pending file(s) to the next flush`,
+        );
+        this.armIncrementalFlush(CALL_GRAPH_EXTERNAL_INCREMENTAL_DEBOUNCE_MS);
+        return;
       }
-      this.incrementalPromise = this.refreshRustNativeChangedFiles(uris, reason).finally(() => {
-        this.incrementalPromise = undefined;
-      });
-      await this.incrementalPromise;
+      const uriStrings = Array.from(this.pendingChangedUris);
+      this.pendingChangedUris.clear();
+      const reason = this.incrementalReason || 'changed';
+      this.incrementalReason = '';
+      // A very large coalesced batch (branch switch, mass edit, generated code)
+      // is cheaper AND memory-bounded as ONE full rebuild than as a giant
+      // incremental that assembles a huge delta against the full prior graph.
+      if (uriStrings.length >= CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD) {
+        this.log.appendLine(
+          `call graph incremental: ${uriStrings.length} files changed ` +
+          `(>= ${CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD}); running one full rebuild instead`,
+        );
+        try {
+          await this.rebuild();
+        } catch (err) {
+          this.log.appendLine(`call graph batch full rebuild failed: ${err instanceof Error ? err.message : err}`);
+        }
+        continue;
+      }
+      const uris = uriStrings.map((value) => vscode.Uri.parse(value));
+      try {
+        await this.processChangedFiles(uris, reason);
+      } catch (err) {
+        this.log.appendLine(`call graph incremental update failed: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  }
+
+  private async processChangedFiles(uris: vscode.Uri[], reason: string): Promise<void> {
+    if (uris.length === 0 || this.disposed) { return; }
+    if (this.hasRustNativePrimaryGraph()) {
+      await this.refreshRustNativeChangedFiles(uris, reason);
       return;
     }
     if (!this.snapshot) {
       await this.refreshChangedFilesWithoutSnapshot(uris, reason);
       return;
     }
-    if (this.incrementalPromise) {
-      await this.incrementalPromise;
-    }
-    this.incrementalPromise = this.doRefreshChangedFiles(uris, reason).finally(() => {
-      this.incrementalPromise = undefined;
-    });
-    await this.incrementalPromise;
+    await this.doRefreshChangedFiles(uris, reason);
   }
 
   private async refreshRustNativeChangedFiles(uris: vscode.Uri[], reason: string): Promise<void> {
