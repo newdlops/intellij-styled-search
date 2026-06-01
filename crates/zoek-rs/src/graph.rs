@@ -240,6 +240,14 @@ const GRAPH_RESOLVE_INDEX_SHARD_PREFIX: &str = "callgraph-resolve-by-name";
 // only). The full record (uri, body spans, container, extends/…) still lives in
 // the by-id/by-name shards for query + resolve.
 const GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX: &str = "callgraph-symbols-compact-by-file";
+// A2 v3 (memory floor) — S4: faithful per-file hierarchy-fact sidecar (one
+// record per extends/implements edge: file_id, relation, child_qualified_name,
+// parent_name) so the incremental update reconstructs the exact
+// `Vec<HierarchyFact>` resolve needs (`is_django_model_type`) WITHOUT scanning
+// the full symbol table. Distinct from the lossy query sidecar
+// `callgraph-hierarchy-by-parent` (which drops the relation, is type-kind-only,
+// and is lookup-key-multiplied). Sharded by file like ref_sites.
+const GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX: &str = "callgraph-hierarchy-facts-by-file";
 // A2 (incremental token-shape): persisted candidate-site tally so an incremental
 // update reconstructs the GLOBAL token-shape baseline (a top-level-dir-scoped
 // syntactic aggregate) without re-reading all ref_sites — making incremental
@@ -1161,7 +1169,7 @@ fn load_token_shape_tally(
 /// NOT dedup token-shape against phase E's exact edge_keys (its dedup is a fresh
 /// per-worker set), so neither do we — emission is count-gated only.
 fn emit_token_shape_refs_from_tally(
-    symbols: &[GraphSymbol],
+    symbols: &[CompactSym],
     bare_tally: &HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
     member_tally: &HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
     reference_counts: &AHashMap<u64, usize>,
@@ -1186,23 +1194,20 @@ fn emit_token_shape_refs_from_tally(
     let mut bare_symbol_count: AHashMap<(u64, u64, u64), usize> = AHashMap::default();
     let mut member_symbol_count: AHashMap<(u64, u64, u64), usize> = AHashMap::default();
     let mut recompute_set: AHashSet<u64> = affected_targets.clone();
+    // A2 v3 — S4: `symbols` is now the CompactSym projection — `lang_hash` is
+    // precomputed (no language-string cache) and `is_member()` mirrors
+    // `uses_member_token_shape_for_likely_count`. Only the per-rel_path scope
+    // hash is still cached (CompactSym holds rel_path, not the scope hash).
     let mut cached_rel_path: &str = "";
     let mut cached_scope_hash: u64 = 0;
-    let mut cached_language: &str = "";
-    let mut cached_lang_hash: u64 = 0;
     for symbol in symbols {
-        let path = symbol.rel_path.as_str();
+        let path: &str = &symbol.rel_path;
         if path != cached_rel_path {
             cached_rel_path = path;
             cached_scope_hash = stable_hash(source_scope_key(path));
         }
-        let lang = symbol.language.as_str();
-        if lang != cached_language {
-            cached_language = lang;
-            cached_lang_hash = stable_hash(lang);
-        }
-        let key = (cached_lang_hash, cached_scope_hash, symbol.name_hash);
-        if uses_member_token_shape_for_likely_count(symbol) {
+        let key = (symbol.lang_hash, cached_scope_hash, symbol.name_hash);
+        if symbol.is_member() {
             *member_symbol_count.entry(key).or_default() += 1;
         } else {
             *bare_symbol_count.entry(key).or_default() += 1;
@@ -1215,27 +1220,20 @@ fn emit_token_shape_refs_from_tally(
     let mut dedup: AHashSet<u64> = AHashSet::default();
     let mut cached_rel_path: &str = "";
     let mut cached_scope_hash: u64 = 0;
-    let mut cached_language: &str = "";
-    let mut cached_lang_hash: u64 = 0;
     for symbol in symbols {
         // v2: emit only the recompute_set; all other targets' token-shape is
         // carried from the prior index by the caller.
         if !recompute_set.contains(&symbol.id_u64) {
             continue;
         }
-        let path = symbol.rel_path.as_str();
+        let path: &str = &symbol.rel_path;
         if path != cached_rel_path {
             cached_rel_path = path;
             cached_scope_hash = stable_hash(source_scope_key(path));
         }
-        let lang = symbol.language.as_str();
-        if lang != cached_language {
-            cached_language = lang;
-            cached_lang_hash = stable_hash(lang);
-        }
-        let key = (cached_lang_hash, cached_scope_hash, symbol.name_hash);
+        let key = (symbol.lang_hash, cached_scope_hash, symbol.name_hash);
         let (candidates, symbol_count_for_key) =
-            if uses_member_token_shape_for_likely_count(symbol) {
+            if symbol.is_member() {
                 (
                     member_tally.get(&key),
                     member_symbol_count.get(&key).copied().unwrap_or(0),
@@ -1253,7 +1251,7 @@ fn emit_token_shape_refs_from_tally(
         // gated solely by `reference_count < usage_likely` + the fanout limit,
         // exactly as in `apply_token_shape_likely_count_baseline`.
         let usage_baseline = candidates.map(|c| c.len()).unwrap_or(0);
-        let usage_must = counts.get(&symbol.id).map(|c| c.usage_must).unwrap_or(0);
+        let usage_must = counts.get(&*symbol.id).map(|c| c.usage_must).unwrap_or(0);
         let usage_likely = usage_must.max(usage_baseline);
         let mut reference_count = reference_counts.get(&symbol.id_u64).copied().unwrap_or(0);
         if reference_count < usage_likely {
@@ -1270,6 +1268,7 @@ fn emit_token_shape_refs_from_tally(
                         let edge_kind = edge_kind_str_from_id(c.edge_kind_id).unwrap_or("usage");
                         let site_partial = site_partial_hash_u64(c.source_ref_id, edge_kind);
                         let edge_key = edge_key_from_partial(site_partial, &symbol.id);
+                        // (`&symbol.id` is `&Box<str>`; deref-coerces to `&str`.)
                         // NOTE: phase F does NOT dedup token-shape against the
                         // phase-E (exact) edge_keys — its `local_dedup` is a fresh
                         // per-worker set, never seeded with phase E's pushes. It
@@ -1288,10 +1287,10 @@ fn emit_token_shape_refs_from_tally(
                         let rel_path = file_table.get_path(c.file_id).unwrap_or("");
                         out.push(GraphReference {
                             source_ref_id: format!("ref:{:016x}", c.source_ref_id).into(),
-                            target_symbol_id: Some(symbol.id.as_str().into()),
+                            target_symbol_id: Some((&*symbol.id).into()),
                             edge_kind: edge_kind.into(),
-                            name: symbol.name.as_str().into(),
-                            raw_text: symbol.name.as_str().into(),
+                            name: (&*symbol.name).into(),
+                            raw_text: (&*symbol.name).into(),
                             uri: Box::from(""),
                             rel_path: rel_path.into(),
                             start_line: c.start_line,
@@ -3619,7 +3618,42 @@ pub fn update_graph_native(
         function_return_facts.extend(graph.function_return_facts);
     }
     let _t = std::time::Instant::now();
-    let hierarchy_facts = hierarchy_facts_from_symbols(&symbols);
+    // A2 v3 — S3 (memory floor): reconstruct the current `Vec<HierarchyFact>` from
+    // the faithful per-file sidecar (prior facts minus changed/deleted files +
+    // freshly parsed changed files' facts) instead of scanning the full carried
+    // `symbols` table. `is_django_model_type` (resolve's only hierarchy consumer)
+    // computes an order-independent closure, so shard/file order is fine. Falls
+    // back to the full-symbol computation when the sidecar is absent (older
+    // indexes), which is still correct while the carry is resident (dropped in S6).
+    let hierarchy_facts = if graph_shard_family_available(
+        workspace_root,
+        config,
+        GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX,
+    ) {
+        let changed_file_ids: HashSet<u32> = exclude_paths
+            .iter()
+            .filter_map(|p| prior_file_table.get_id(p))
+            .collect();
+        let mut facts =
+            load_hierarchy_facts_from_sidecar(workspace_root, config, Some(&changed_file_ids))?;
+        let changed_syms: Vec<GraphSymbol> = symbols
+            .iter()
+            .filter(|s| exclude_paths.contains(&s.rel_path))
+            .cloned()
+            .collect();
+        facts.extend(hierarchy_facts_from_symbols(&changed_syms));
+        if probe {
+            eprintln!(
+                "[flow] hierarchy_facts(sidecar)={}ms n={} (changed_files={})",
+                _t.elapsed().as_millis(),
+                facts.len(),
+                changed_file_ids.len()
+            );
+        }
+        facts
+    } else {
+        hierarchy_facts_from_symbols(&symbols)
+    };
     let new_symbol_names: HashSet<String> = symbols
         .iter()
         .filter(|s| exclude_paths.contains(&s.rel_path))
@@ -3976,9 +4010,19 @@ pub fn update_graph_native(
     for k in bare_touched.iter().chain(member_touched.iter()) {
         recompute_keys.insert(*k);
     }
+    // A2 v3 — S4 (memory floor): project the resident symbols to CompactSym so
+    // token-shape emit + scoped-likely run off the compact form (id_u64, name,
+    // name_hash, lang_hash, rel_path→scope, is_member) instead of the full
+    // GraphSymbol fields. At S6 this Vec is sourced from the compact sidecar
+    // (prior minus changed/deleted + fresh-changed projection) and the full
+    // `symbols` table is dropped. file_id is unused by these consumers (MAX).
+    let compact_syms: Vec<CompactSym> = symbols
+        .iter()
+        .map(|s| compact_sym_from_graph(s, u32::MAX))
+        .collect();
     let _t = std::time::Instant::now();
     let (mut token_shape_refs, recompute_set) = emit_token_shape_refs_from_tally(
-        &symbols,
+        &compact_syms,
         &bare_tally,
         &member_tally,
         &reference_counts,
@@ -4041,12 +4085,15 @@ pub fn update_graph_native(
     // `all_references`): count, per target, only refs whose source root matches
     // the target's, over the SAME set all_references held (carried exact + new
     // exact + emitted token-shape + carried token-shape minus recompute_set).
-    let mut scope_by_target: AHashMap<&str, &str> = AHashMap::with_capacity(symbols.len());
-    for symbol in &symbols {
-        scope_by_target.insert(symbol.id.as_str(), source_scope_key(&symbol.rel_path));
+    // A2 v3 — S4: id_u64 → source-scope key, built from the compact projection
+    // (was the full `symbols` table). The scope &str borrows from `compact_syms`,
+    // which outlives this write. usage/calls are keyed by id_u64.
+    let mut scope_by_target: AHashMap<u64, &str> = AHashMap::with_capacity(compact_syms.len());
+    for c in &compact_syms {
+        scope_by_target.insert(c.id_u64, c.scope_key());
     }
-    let mut usage_by_target: AHashMap<&str, usize> = AHashMap::default();
-    let mut calls_by_target: AHashMap<&str, usize> = AHashMap::default();
+    let mut usage_by_target: AHashMap<u64, usize> = AHashMap::default();
+    let mut calls_by_target: AHashMap<u64, usize> = AHashMap::default();
     let mut target_w =
         open_graph_shard_writers(workspace_root, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX)?;
     let mut enclosing_w =
@@ -4128,23 +4175,9 @@ pub fn update_graph_native(
     let _t = std::time::Instant::now();
     // Apply the scoped likely counts. write_count_id_shards drops all-zero
     // entries, so only materialize a new entry when the symbol is referenced.
-    for symbol in &symbols {
-        let usage_likely = usage_by_target.get(symbol.id.as_str()).copied().unwrap_or(0);
-        let calls_in_likely = calls_by_target.get(symbol.id.as_str()).copied().unwrap_or(0);
-        match counts.get_mut(&symbol.id) {
-            Some(count) => {
-                count.usage_likely = usage_likely;
-                count.calls_in_likely = calls_in_likely;
-            }
-            None => {
-                if usage_likely > 0 {
-                    let count = counts.entry(symbol.id.clone()).or_default();
-                    count.usage_likely = usage_likely;
-                    count.calls_in_likely = calls_in_likely;
-                }
-            }
-        }
-    }
+    // A2 v3 — S4: drive this from the (id_u64-keyed) scoped maps instead of a
+    // full-symbol scan (see apply_scoped_likely_to_counts).
+    apply_scoped_likely_to_counts(&mut counts, &usage_by_target, &calls_by_target);
     compute_native_counts(&symbols, &mut counts, &hierarchy_facts);
     let mut unique_paths: HashSet<&str> = HashSet::default();
     for symbol in &symbols {
@@ -9986,20 +10019,53 @@ fn apply_token_shape_likely_count_baseline(
 /// id slice (via the scope map) so there is no per-ref String allocation; a ref
 /// to a non-symbol target is skipped (it never reaches a symbol in the apply
 /// step anyway, so this is byte-identical to the old scan).
-fn accumulate_scoped_likely<'a>(
+/// A2 v3 — S4: apply the (id_u64-keyed) scoped likely counts onto `counts`
+/// without a full-symbol scan. Equivalent to the prior per-symbol loop / the
+/// reference `apply_incremental_likely_counts_from_references`: every existing
+/// entry is (re)set from the maps (0 if unreferenced), and every referenced
+/// target not already present is added (`usage_by_target` values are always >0).
+/// All symbol ids are `sym:HEX16`, so `id_u64` ↔ id string is exact.
+fn apply_scoped_likely_to_counts(
+    counts: &mut HashMap<String, GraphCount>,
+    usage_by_target: &AHashMap<u64, usize>,
+    calls_by_target: &AHashMap<u64, usize>,
+) {
+    for (id, count) in counts.iter_mut() {
+        let u = parse_stable_symbol_id_to_u64(id).unwrap_or(0);
+        count.usage_likely = usage_by_target.get(&u).copied().unwrap_or(0);
+        count.calls_in_likely = calls_by_target.get(&u).copied().unwrap_or(0);
+    }
+    for (&u, &usage_likely) in usage_by_target {
+        let id = format!("sym:{:016x}", u);
+        if !counts.contains_key(&id) {
+            let calls_in_likely = calls_by_target.get(&u).copied().unwrap_or(0);
+            let count = counts.entry(id).or_default();
+            count.usage_likely = usage_likely;
+            count.calls_in_likely = calls_in_likely;
+        }
+    }
+}
+
+// A2 v3 — S4: keyed by `id_u64` (parsed from the target id) rather than the id
+// string, so it runs off the CompactSym-built `scope_by_target` without
+// allocating/interning id strings. `sym:HEX16` ↔ u64 is a bijection, so the set
+// of counted targets is identical to the prior string-keyed version.
+fn accumulate_scoped_likely(
     reference: &GraphReference,
-    scope_by_target: &AHashMap<&'a str, &'a str>,
-    usage_by_target: &mut AHashMap<&'a str, usize>,
-    calls_by_target: &mut AHashMap<&'a str, usize>,
+    scope_by_target: &AHashMap<u64, &str>,
+    usage_by_target: &mut AHashMap<u64, usize>,
+    calls_by_target: &mut AHashMap<u64, usize>,
 ) {
     if let Some(target) = reference.target_symbol_id.as_deref() {
-        if let Some((target_key, target_scope)) = scope_by_target.get_key_value(target) {
-            if source_scope_key(&reference.rel_path) != *target_scope {
-                return;
-            }
-            *usage_by_target.entry(*target_key).or_default() += 1;
-            if matches!(reference.edge_kind.as_ref(), "call" | "construct") {
-                *calls_by_target.entry(*target_key).or_default() += 1;
+        if let Some(target_u64) = parse_stable_symbol_id_to_u64(target) {
+            if let Some(target_scope) = scope_by_target.get(&target_u64) {
+                if source_scope_key(&reference.rel_path) != *target_scope {
+                    return;
+                }
+                *usage_by_target.entry(target_u64).or_default() += 1;
+                if matches!(reference.edge_kind.as_ref(), "call" | "construct") {
+                    *calls_by_target.entry(target_u64).or_default() += 1;
+                }
             }
         }
     }
@@ -11400,6 +11466,13 @@ fn write_graph_shards(
             let r = write_symbol_compact_shards(workspace_root, config, symbols, file_table, incremental);
             (t.elapsed(), r)
         });
+        // A2 v3 — S4: faithful hierarchy-facts sidecar (file-sharded; same
+        // incremental shape).
+        let hierarchy_facts_h = s.spawn(move || {
+            let t = std::time::Instant::now();
+            let r = write_hierarchy_facts_shards(workspace_root, config, symbols, file_table, incremental);
+            (t.elapsed(), r)
+        });
         let mut bytes = 0;
         let (t1, r) = symbol_id_h.join().expect("symbol-id shard writer panicked"); bytes += r?;
         let (t2, r) = symbol_uri_h.join().expect("symbol-uri shard writer panicked"); bytes += r?;
@@ -11412,9 +11485,10 @@ fn write_graph_shards(
         let (t9, r) = method_h.join().expect("method-container shard writer panicked"); bytes += r?;
         let (t10, r) = resolve_index_h.join().expect("resolve-index shard writer panicked"); bytes += r?;
         let (t11, r) = compact_h.join().expect("symbol-compact shard writer panicked"); bytes += r?;
+        let (t12, r) = hierarchy_facts_h.join().expect("hierarchy-facts shard writer panicked"); bytes += r?;
         if probe {
-            eprintln!("[write-probe] wall={}ms sym_id={}ms sym_uri={}ms ref_target={}ms ref_enclosing={}ms ref_sites={}ms facts={}ms counts={}ms hierarchy={}ms methods={}ms resolve_index={}ms compact={}ms",
-                t0.elapsed().as_millis(), t1.as_millis(), t2.as_millis(), t3.as_millis(), t4.as_millis(), t5.as_millis(), t6.as_millis(), t7.as_millis(), t8.as_millis(), t9.as_millis(), t10.as_millis(), t11.as_millis());
+            eprintln!("[write-probe] wall={}ms sym_id={}ms sym_uri={}ms ref_target={}ms ref_enclosing={}ms ref_sites={}ms facts={}ms counts={}ms hierarchy={}ms methods={}ms resolve_index={}ms compact={}ms hierarchy_facts={}ms",
+                t0.elapsed().as_millis(), t1.as_millis(), t2.as_millis(), t3.as_millis(), t4.as_millis(), t5.as_millis(), t6.as_millis(), t7.as_millis(), t8.as_millis(), t9.as_millis(), t10.as_millis(), t11.as_millis(), t12.as_millis());
         }
         Ok(bytes)
     })
@@ -11893,19 +11967,26 @@ fn write_ref_sites_by_file_shards(
     finish_graph_shard_writers(writers)
 }
 
-/// A2 v3 — S5: write the compact per-symbol sidecar
-/// (`GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX`). Sharded by `rel_path` exactly
-/// like `write_ref_sites_by_file_shards`: full rebuild writes all shards;
-/// incremental rewrites only the shards holding changed/deleted files. The
-/// caller passes the full current `symbols` slice (carried unchanged + freshly
-/// parsed changed), so each affected shard's complete content is present.
-fn write_symbol_compact_shards(
+/// A2 v3 — S5: generic file-sharded per-symbol sidecar writer, sharded by
+/// `rel_path` exactly like `write_ref_sites_by_file_shards`. Full rebuild writes
+/// all shards; incremental rewrites only the shards holding changed/deleted
+/// files (the caller passes the full current `symbols` slice — carried unchanged
+/// + freshly parsed changed — so each affected shard's complete content is
+/// present). `serialize_into` appends 0..N records per symbol to the shard
+/// buffer (compact = 1; hierarchy-facts = one per parent name).
+fn write_file_sharded_symbols<F>(
     workspace_root: &Path,
     config: &EngineConfig,
+    prefix: &str,
     symbols: &[GraphSymbol],
     file_table: &FileTable,
     incremental: Option<&HashSet<String>>,
-) -> io::Result<u64> {
+    serialize_into: F,
+) -> io::Result<u64>
+where
+    F: Fn(&GraphSymbol, u32, &mut Vec<u8>) + Sync,
+{
+    let serialize_ref = &serialize_into;
     if let Some(changed_paths) = incremental {
         let mut affected_shards: HashSet<usize> = HashSet::default();
         for path in changed_paths {
@@ -11931,7 +12012,7 @@ fn write_symbol_compact_shards(
                         let shard = shard_index_for_key(&sym.rel_path);
                         if let Some(buffer) = local.get_mut(&shard) {
                             let id = file_table.get_id(&sym.rel_path).unwrap_or(u32::MAX);
-                            serialize_symbol_compact_binary(sym, id, buffer);
+                            serialize_ref(sym, id, buffer);
                         }
                     }
                     local
@@ -11939,7 +12020,7 @@ fn write_symbol_compact_shards(
             }
             handles
                 .into_iter()
-                .map(|h| h.join().expect("symbol-compact worker panicked"))
+                .map(|h| h.join().expect("file-sharded symbol worker panicked"))
                 .collect()
         });
         let mut shard_buffers: HashMap<usize, Vec<u8>> = HashMap::default();
@@ -11955,12 +12036,7 @@ fn write_symbol_compact_shards(
         }
         let mut total_bytes = 0;
         for (shard_idx, buffer) in shard_buffers {
-            let path = graph_shard_path(
-                workspace_root,
-                config,
-                GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
-                shard_idx,
-            );
+            let path = graph_shard_path(workspace_root, config, prefix, shard_idx);
             write_atomically(&path, &buffer)?;
             total_bytes += buffer.len() as u64;
         }
@@ -11969,16 +12045,12 @@ fn write_symbol_compact_shards(
     let total = symbols.len();
     let worker_count = graph_worker_count(total.max(1));
     if total == 0 || worker_count <= 1 {
-        let mut shards = open_graph_shard_writers(
-            workspace_root,
-            config,
-            GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
-        )?;
+        let mut shards = open_graph_shard_writers(workspace_root, config, prefix)?;
         let mut scratch: Vec<u8> = Vec::with_capacity(64);
         for sym in symbols {
             scratch.clear();
             let id = file_table.get_id(&sym.rel_path).unwrap_or(u32::MAX);
-            serialize_symbol_compact_binary(sym, id, &mut scratch);
+            serialize_ref(sym, id, &mut scratch);
             let shard = shard_index_for_key(&sym.rel_path);
             shards[shard].writer.write_all(&scratch)?;
         }
@@ -12003,16 +12075,12 @@ fn write_symbol_compact_shards(
             for sym in &symbols[start..end] {
                 let id = file_table.get_id(&sym.rel_path).unwrap_or(u32::MAX);
                 let shard = shard_index_for_key(&sym.rel_path);
-                serialize_symbol_compact_binary(sym, id, &mut bufs[shard]);
+                serialize_ref(sym, id, &mut bufs[shard]);
             }
             bufs
         })
         .collect();
-    let mut writers = open_graph_shard_writers(
-        workspace_root,
-        config,
-        GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
-    )?;
+    let mut writers = open_graph_shard_writers(workspace_root, config, prefix)?;
     let worker_buffers_ref = &worker_buffers;
     writers
         .par_iter_mut()
@@ -12025,6 +12093,51 @@ fn write_symbol_compact_shards(
             Ok(())
         })?;
     finish_graph_shard_writers(writers)
+}
+
+/// A2 v3 — S5: compact per-symbol sidecar (`GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX`).
+fn write_symbol_compact_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &[GraphSymbol],
+    file_table: &FileTable,
+    incremental: Option<&HashSet<String>>,
+) -> io::Result<u64> {
+    write_file_sharded_symbols(
+        workspace_root,
+        config,
+        GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
+        symbols,
+        file_table,
+        incremental,
+        serialize_symbol_compact_binary,
+    )
+}
+
+/// A2 v3 — S4: faithful hierarchy-facts sidecar
+/// (`GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX`). One record per
+/// extends/implements edge — the exact `HierarchyFact` set
+/// `hierarchy_facts_from_symbols` produces, plus the owning `file_id` so an
+/// incremental update can drop a changed/deleted file's facts. Unlike the lossy
+/// query sidecar `callgraph-hierarchy-by-parent`, this keeps the relation and is
+/// NOT filtered to type kinds, so resolve's `Vec<HierarchyFact>` reconstructs
+/// byte-faithfully.
+fn write_hierarchy_facts_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &[GraphSymbol],
+    file_table: &FileTable,
+    incremental: Option<&HashSet<String>>,
+) -> io::Result<u64> {
+    write_file_sharded_symbols(
+        workspace_root,
+        config,
+        GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX,
+        symbols,
+        file_table,
+        incremental,
+        serialize_symbol_hierarchy_facts,
+    )
 }
 
 /// A2 v3 — S5: read the whole compact symbol sidecar into RAM (parallel over
@@ -13057,6 +13170,94 @@ fn parse_symbol_compact_binary(
         lang_hash,
         kind_id,
     })
+}
+
+/// A2 v3 — S4: project a full `GraphSymbol` to its `CompactSym`. `file_id` is
+/// supplied by the caller (`u32::MAX` when only the emit/scoped-likely fields
+/// are needed, since those never read it). Used to feed emit + scoped-likely
+/// from the resident table at S4; at S6 the compact set comes from the sidecar.
+fn compact_sym_from_graph(symbol: &GraphSymbol, file_id: u32) -> CompactSym {
+    CompactSym {
+        rel_path: symbol.rel_path.as_str().into(),
+        file_id,
+        id: symbol.id.as_str().into(),
+        id_u64: symbol.id_u64,
+        name: symbol.name.as_str().into(),
+        name_hash: symbol.name_hash,
+        lang_hash: stable_hash(symbol.language.as_str()),
+        kind_id: compute_kind_id(&symbol.kind),
+    }
+}
+
+const HIERARCHY_RELATION_EXTENDS: u8 = 0;
+const HIERARCHY_RELATION_IMPLEMENTS: u8 = 1;
+
+/// A2 v3 — S4: append this symbol's hierarchy-fact records (one per parent name)
+/// to the shard buffer — the same (child_qualified_name, parent_name, relation)
+/// edges, in the same extends-then-implements order, that
+/// `hierarchy_facts_from_symbols` emits — plus the owning `file_id` for the
+/// incremental drop. A symbol with no extends/implements appends nothing.
+fn serialize_symbol_hierarchy_facts(symbol: &GraphSymbol, file_id: u32, out: &mut Vec<u8>) {
+    for parent_name in &symbol.extends_names {
+        out.extend_from_slice(&file_id.to_le_bytes());
+        out.push(HIERARCHY_RELATION_EXTENDS);
+        write_u16_str(out, &symbol.qualified_name);
+        write_u16_str(out, parent_name);
+    }
+    for parent_name in &symbol.implements_names {
+        out.extend_from_slice(&file_id.to_le_bytes());
+        out.push(HIERARCHY_RELATION_IMPLEMENTS);
+        write_u16_str(out, &symbol.qualified_name);
+        write_u16_str(out, parent_name);
+    }
+}
+
+/// A2 v3 — S4: reconstruct the `Vec<HierarchyFact>` resolve needs from the
+/// faithful hierarchy-facts sidecar, optionally dropping facts whose owning
+/// `file_id` is in `exclude_file_ids` (a changed/deleted file in an incremental
+/// update). Reads every shard; no `FileTable` needed (child/parent/relation are
+/// stored inline). Order is shard/file order, not symbol order — fine, since the
+/// only consumer (`is_django_model_type`) computes an order-independent closure.
+#[allow(dead_code)] // wired into the incremental resolve path in S3.
+fn load_hierarchy_facts_from_sidecar(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    exclude_file_ids: Option<&HashSet<u32>>,
+) -> io::Result<Vec<HierarchyFact>> {
+    let mut facts: Vec<HierarchyFact> = Vec::new();
+    for shard in 0..GRAPH_SHARD_COUNT {
+        let path = graph_shard_path(
+            workspace_root,
+            config,
+            GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX,
+            shard,
+        );
+        if !path.exists() {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            let file_id = read_u32_le(&bytes, &mut cursor)?;
+            let relation_byte = read_u8_at(&bytes, &mut cursor)?;
+            let child_qualified_name = read_u16_str(&bytes, &mut cursor)?;
+            let parent_name = read_u16_str(&bytes, &mut cursor)?;
+            if exclude_file_ids.is_some_and(|s| s.contains(&file_id)) {
+                continue;
+            }
+            let relation = if relation_byte == HIERARCHY_RELATION_IMPLEMENTS {
+                "implements".to_string()
+            } else {
+                "extends".to_string()
+            };
+            facts.push(HierarchyFact {
+                child_qualified_name,
+                parent_name,
+                relation,
+            });
+        }
+    }
+    Ok(facts)
 }
 
 fn serialize_symbol_binary(symbol: &GraphSymbol, file_id: u32, out: &mut Vec<u8>) {
@@ -15657,6 +15858,134 @@ mod tests {
         );
     }
 
+    // A2 v3 (memory floor) — S4/S5 gate: the a2 reference gate does NOT cover
+    // per-symbol COUNTS (usage_likely/calls_in_likely, set by the scoped-likely
+    // accumulation S4 re-homed onto the compact sidecar) nor the symbol-keyed
+    // WRITE shards (re-homed in S5). This rebuilds, snapshots, runs one
+    // incremental edit, snapshots again, and asserts they match. Run with:
+    //   cargo test -p zoek-rs --release --lib graph::tests::s4_s5_sidecars_match_full_rebuild -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn s4_s5_sidecars_match_full_rebuild() {
+        let root = PathBuf::from("/Users/lky/project/captain2/captain");
+        if !root.exists() {
+            eprintln!("[s4s5] corpus {root:?} missing — skipping");
+            return;
+        }
+        let config = EngineConfig::default();
+        let changed = std::fs::read_to_string("/tmp/a2_changed_file.txt")
+            .ok()
+            .map(|s| PathBuf::from(s.trim()))
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| walk_first_py(&root).expect("a changed .py file"));
+        eprintln!("[s4s5] changed file = {changed:?}");
+
+        let mut noop = |_p: GraphRebuildProgress| {};
+        rebuild_graph_native(&root, 0, &config, 0, &mut noop).expect("rebuild");
+        let full_counts = read_all_counts_from_id_shards(&root, &config).expect("full counts");
+        let (full_sym, full_res, full_hier, full_meth) =
+            snapshot_symbol_write_shards(&root, &config);
+
+        update_graph_native(&root, std::slice::from_ref(&changed), &[], 0, &config, 0)
+            .expect("update");
+        let incr_counts = read_all_counts_from_id_shards(&root, &config).expect("incr counts");
+        let (incr_sym, incr_res, incr_hier, incr_meth) =
+            snapshot_symbol_write_shards(&root, &config);
+
+        // Counts are INFORMATIONAL only: the incremental path does not recompute
+        // the GLOBAL usage_may/calls_in_may aggregates (they stay 0 and
+        // write_count drops them), so full↔incr counts diverge BY DESIGN. S4's
+        // scoped-likely (usage_likely/calls_in_likely) refactor equivalence is
+        // gated by the unit test `s4_scoped_likely_matches_reference_impl`.
+        let mut ids: std::collections::BTreeSet<&String> = full_counts.keys().collect();
+        ids.extend(incr_counts.keys());
+        let (mut diff_total, mut diff_likely, mut diff_calls_likely) = (0u64, 0u64, 0u64);
+        for id in ids {
+            let f = full_counts.get(id).copied().unwrap_or_default();
+            let i = incr_counts.get(id).copied().unwrap_or_default();
+            if f == i {
+                continue;
+            }
+            diff_total += 1;
+            if f.usage_likely != i.usage_likely {
+                diff_likely += 1;
+            }
+            if f.calls_in_likely != i.calls_in_likely {
+                diff_calls_likely += 1;
+            }
+        }
+        eprintln!(
+            "[s4s5] count diffs (informational): total={diff_total} usage_likely={diff_likely} calls_in_likely={diff_calls_likely}"
+        );
+
+        // S5 GATE: the symbol-keyed write shards (symbol-id, resolve-index,
+        // hierarchy-by-parent, methods-by-container) must hold the SAME record
+        // set after an incremental update as after a full rebuild.
+        eprintln!(
+            "[s4s5] shard records incr/full: sym {}/{} res {}/{} hier {}/{} meth {}/{}",
+            incr_sym.len(), full_sym.len(), incr_res.len(), full_res.len(),
+            incr_hier.len(), full_hier.len(), incr_meth.len(), full_meth.len()
+        );
+        assert_eq!(incr_sym, full_sym, "symbol-id shard records must match full rebuild");
+        assert_eq!(incr_res, full_res, "resolve-index shard records must match full rebuild");
+        assert_eq!(incr_hier, full_hier, "hierarchy-by-parent records must match full rebuild");
+        assert_eq!(incr_meth, full_meth, "methods-by-container records must match full rebuild");
+    }
+
+    // Snapshot the four symbol-keyed write-shard families as sorted record sets
+    // (order-independent — readers collect all records, so within-shard byte
+    // order is irrelevant). kind: 0=full symbol record, 1=hierarchy edge,
+    // 2=method edge.
+    fn snapshot_symbol_write_shards(
+        root: &Path,
+        config: &EngineConfig,
+    ) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        let ft = read_file_table_binary(&graph_file_table_path(root, config)).unwrap_or_default();
+        let read_family = |prefix: &str, kind: u8| -> Vec<String> {
+            let mut recs: Vec<String> = Vec::new();
+            for shard in 0..GRAPH_SHARD_COUNT {
+                let path = graph_shard_path(root, config, prefix, shard);
+                if !path.exists() {
+                    continue;
+                }
+                let bytes = std::fs::read(&path).expect("read shard");
+                let mut c = 0;
+                while c < bytes.len() {
+                    let rec = match kind {
+                        0 => {
+                            let s = parse_symbol_binary(&bytes, &mut c, &ft).expect("parse symbol");
+                            format!(
+                                "{}\t{}\t{}\t{}\t{}",
+                                s.id, s.rel_path, s.name, s.qualified_name, s.kind
+                            )
+                        }
+                        1 => {
+                            let lk = read_u16_str(&bytes, &mut c).unwrap();
+                            let pn = read_u16_str(&bytes, &mut c).unwrap();
+                            let id = read_u16_str(&bytes, &mut c).unwrap();
+                            let qn = read_u16_str(&bytes, &mut c).unwrap();
+                            format!("{lk}\t{pn}\t{id}\t{qn}")
+                        }
+                        _ => {
+                            let lk = read_u16_str(&bytes, &mut c).unwrap();
+                            let id = read_u16_str(&bytes, &mut c).unwrap();
+                            format!("{lk}\t{id}")
+                        }
+                    };
+                    recs.push(rec);
+                }
+            }
+            recs.sort();
+            recs
+        };
+        (
+            read_family(GRAPH_SYMBOL_ID_SHARD_PREFIX, 0),
+            read_family(GRAPH_RESOLVE_INDEX_SHARD_PREFIX, 0),
+            read_family(GRAPH_HIERARCHY_PARENT_SHARD_PREFIX, 1),
+            read_family(GRAPH_METHOD_CONTAINER_SHARD_PREFIX, 2),
+        )
+    }
+
     fn walk_first_py(root: &Path) -> Option<PathBuf> {
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -15883,6 +16212,155 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&ws);
         let _ = fs::remove_dir_all(&ws2);
+    }
+
+    // A2 v3 (memory floor) — S2: the faithful hierarchy-facts sidecar must
+    // reconstruct exactly what `hierarchy_facts_from_symbols` produces, and its
+    // per-file drop (incremental) must match recomputing over the kept files.
+    #[test]
+    fn s2_hierarchy_facts_sidecar_reconstructs_and_drops_per_file() {
+        let entries = vec![
+            test_entry("pkg/a.py", "class Base:\n    pass\n\nclass Sub(Base):\n    pass\n"),
+            test_entry(
+                "pkg/b.py",
+                "class Other:\n    pass\n\nclass Child(Other):\n    pass\n",
+            ),
+        ];
+        let (symbols, _res) = resolve_test_entries(&entries);
+        let expected = hierarchy_facts_from_symbols(&symbols);
+        assert!(
+            expected.len() >= 2,
+            "fixture should yield >=2 hierarchy facts, got {}",
+            expected.len()
+        );
+
+        let ws = std::env::temp_dir().join(format!("zoek-s2hf-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        let config = EngineConfig::default();
+        fs::create_dir_all(config.index_root(&ws)).unwrap();
+        let mut file_table = FileTable::default();
+        for s in &symbols {
+            file_table.intern(&s.rel_path);
+        }
+        write_hierarchy_facts_shards(&ws, &config, &symbols, &file_table, None).expect("write");
+
+        let mut got: Vec<(String, String, String)> =
+            load_hierarchy_facts_from_sidecar(&ws, &config, None)
+                .expect("load")
+                .into_iter()
+                .map(|f| (f.child_qualified_name, f.parent_name, f.relation))
+                .collect();
+        let mut exp: Vec<(String, String, String)> = expected
+            .iter()
+            .map(|f| {
+                (
+                    f.child_qualified_name.clone(),
+                    f.parent_name.clone(),
+                    f.relation.clone(),
+                )
+            })
+            .collect();
+        got.sort();
+        exp.sort();
+        assert_eq!(got, exp, "reconstructed == hierarchy_facts_from_symbols");
+
+        // Per-file drop (incremental): excluding pkg/b.py's file_id must equal a
+        // recompute over only the kept files.
+        let drop_id = file_table.get_id("pkg/b.py").unwrap();
+        let mut excl: HashSet<u32> = HashSet::default();
+        excl.insert(drop_id);
+        let mut kept: Vec<(String, String, String)> =
+            load_hierarchy_facts_from_sidecar(&ws, &config, Some(&excl))
+                .expect("load filtered")
+                .into_iter()
+                .map(|f| (f.child_qualified_name, f.parent_name, f.relation))
+                .collect();
+        let kept_syms: Vec<GraphSymbol> = symbols
+            .iter()
+            .filter(|s| s.rel_path != "pkg/b.py")
+            .cloned()
+            .collect();
+        let mut exp_kept: Vec<(String, String, String)> =
+            hierarchy_facts_from_symbols(&kept_syms)
+                .iter()
+                .map(|f| {
+                    (
+                        f.child_qualified_name.clone(),
+                        f.parent_name.clone(),
+                        f.relation.clone(),
+                    )
+                })
+                .collect();
+        kept.sort();
+        exp_kept.sort();
+        assert_eq!(kept, exp_kept, "per-file drop == recompute over kept files");
+        assert!(
+            kept.iter().all(|(_, parent, _)| parent != "Other"),
+            "dropped file's facts must be gone"
+        );
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    // A2 v3 (memory floor) — S4: the CompactSym + id_u64-keyed scoped-likely path
+    // must produce the SAME usage_likely/calls_in_likely as the prior string-keyed
+    // reference impl `apply_incremental_likely_counts_from_references`, on the same
+    // symbols + references. (Full↔incremental count parity is NOT a goal — the
+    // incremental does not recompute global usage_may; only this refactor
+    // equivalence is gated here.)
+    #[test]
+    fn s4_scoped_likely_matches_reference_impl() {
+        let entries = vec![
+            test_entry(
+                "pkg/a.py",
+                "def helper():\n    return 1\n\nclass Worker:\n    def run(self):\n        return helper()\n",
+            ),
+            test_entry(
+                "pkg/b.py",
+                "from pkg.a import helper, Worker\n\ndef use():\n    helper()\n    w = Worker()\n    w.run()\n",
+            ),
+            test_entry("other/c.py", "def helper():\n    return 2\n"),
+        ];
+        let (symbols, result) = resolve_test_entries(&entries);
+        let references = &result.references;
+        assert!(!references.is_empty(), "fixture should resolve some references");
+        let baseline = result.counts.clone();
+
+        // OLD reference impl (string-keyed, full-symbol scan).
+        let mut counts_old = baseline.clone();
+        apply_incremental_likely_counts_from_references(&symbols, &mut counts_old, references);
+
+        // NEW path: CompactSym scope_by_target (id_u64) + accumulate + apply.
+        let mut counts_new = baseline.clone();
+        let compact: Vec<CompactSym> = symbols
+            .iter()
+            .map(|s| compact_sym_from_graph(s, u32::MAX))
+            .collect();
+        let mut scope_by_target: AHashMap<u64, &str> = AHashMap::default();
+        for c in &compact {
+            scope_by_target.insert(c.id_u64, c.scope_key());
+        }
+        let mut usage_by_target: AHashMap<u64, usize> = AHashMap::default();
+        let mut calls_by_target: AHashMap<u64, usize> = AHashMap::default();
+        for r in references {
+            accumulate_scoped_likely(r, &scope_by_target, &mut usage_by_target, &mut calls_by_target);
+        }
+        apply_scoped_likely_to_counts(&mut counts_new, &usage_by_target, &calls_by_target);
+
+        let mut ids: std::collections::BTreeSet<&String> = counts_old.keys().collect();
+        ids.extend(counts_new.keys());
+        for id in ids {
+            let o = counts_old.get(id).copied().unwrap_or_default();
+            let n = counts_new.get(id).copied().unwrap_or_default();
+            assert_eq!(o.usage_likely, n.usage_likely, "usage_likely mismatch for {id}");
+            assert_eq!(
+                o.calls_in_likely, n.calls_in_likely,
+                "calls_in_likely mismatch for {id}"
+            );
+        }
+        assert!(
+            counts_new.values().any(|c| c.usage_likely > 0),
+            "fixture should yield a scoped likely count"
+        );
     }
 
     #[test]
