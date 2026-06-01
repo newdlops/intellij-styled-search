@@ -13336,6 +13336,48 @@ where
     Ok(symbols)
 }
 
+/// A2 v3 (memory floor) — S2: load only the resolve-index candidate symbols
+/// whose `name_hash` is in `name_hashes`, by reading just the
+/// `callgraph-resolve-by-name` shards those hashes map to (shard == name_hash %
+/// GRAPH_SHARD_COUNT, identical to the writer's `shard_index_for_key(name)`
+/// since name_hash == stable_hash(name)). Each shard is read and filtered one at
+/// a time, so peak transient stays at ~one shard and the resident result is just
+/// the candidates — never the whole ~5.2M-symbol table.
+///
+/// The caller (S3) must request a COMPLETE name set — the names the affected
+/// sites reference PLUS, transitively, the parent-type names reached via
+/// extends/implements — so resolution over the returned subset is byte-identical
+/// to resolution over the full table.
+#[allow(dead_code)] // wired into the incremental resolve path in S3.
+fn load_resolve_candidates(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    file_table: &FileTable,
+    name_hashes: &AHashSet<u64>,
+) -> io::Result<Vec<GraphSymbol>> {
+    if name_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut shards: Vec<usize> = name_hashes
+        .iter()
+        .map(|h| (*h as usize) % GRAPH_SHARD_COUNT)
+        .collect();
+    shards.sort_unstable();
+    shards.dedup();
+    let mut out = Vec::new();
+    for shard in shards {
+        let path =
+            graph_shard_path(workspace_root, config, GRAPH_RESOLVE_INDEX_SHARD_PREFIX, shard);
+        if !path.exists() {
+            continue;
+        }
+        out.extend(read_symbols_matching(&path, file_table, |s| {
+            name_hashes.contains(&s.name_hash)
+        })?);
+    }
+    Ok(out)
+}
+
 fn read_symbols_for_symbol_ids_indexed(
     workspace_root: &Path,
     config: &EngineConfig,
@@ -15208,6 +15250,63 @@ mod tests {
             .find(|symbol| symbol.qualified_name == qualified_name)
             .map(|symbol| symbol.id.as_str())
             .unwrap_or_else(|| panic!("missing symbol {qualified_name}"))
+    }
+
+    // A2 v3 (memory floor) — S2: load_resolve_candidates(name_hashes) must return
+    // exactly the resolve-index symbols whose name hashes to a requested value,
+    // reading only the relevant name-sharded shards. This isolates S2 from the
+    // end-to-end S3 byte-identical gate.
+    #[test]
+    fn s2_load_resolve_candidates_matches_full_name_filter() {
+        let entries = vec![
+            test_entry(
+                "pkg/a.py",
+                "class Foo:\n    def bar(self):\n        return 1\n",
+            ),
+            test_entry(
+                "pkg/b.py",
+                "def bar():\n    return 2\n\nclass Baz:\n    def qux(self):\n        return 3\n",
+            ),
+        ];
+        let (symbols, _res) = resolve_test_entries(&entries);
+
+        let ws = std::env::temp_dir().join(format!("zoek-s2-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        let config = EngineConfig::default();
+        fs::create_dir_all(config.index_root(&ws)).unwrap();
+        let mut file_table = FileTable::default();
+        for s in &symbols {
+            file_table.intern(&s.rel_path);
+        }
+        write_resolve_index_shards(&ws, &config, &symbols, &file_table).expect("write sidecar");
+
+        // "bar" appears in BOTH files (a method + a function) and shares no shard
+        // contract with the other names — a good multi-file, single-name probe.
+        let target = stable_hash("bar");
+        let mut want: AHashSet<u64> = AHashSet::default();
+        want.insert(target);
+        let mut got = load_resolve_candidates(&ws, &config, &file_table, &want).expect("load");
+
+        let mut expected: Vec<&GraphSymbol> = symbols
+            .iter()
+            .filter(|s| stable_hash(&s.name) == target)
+            .collect();
+        assert!(
+            expected.len() >= 2,
+            "fixture should define >=2 symbols named bar, got {}",
+            expected.len()
+        );
+        got.sort_by(|a, b| a.id.cmp(&b.id));
+        expected.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(got.len(), expected.len(), "candidate count mismatch");
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert_eq!(g.id, e.id);
+            assert_eq!(g.name, e.name);
+            assert_eq!(g.qualified_name, e.qualified_name);
+            assert_eq!(g.rel_path, e.rel_path);
+            assert_eq!(g.name, "bar", "no non-matching name must leak in");
+        }
+        let _ = fs::remove_dir_all(&ws);
     }
 
     #[test]
