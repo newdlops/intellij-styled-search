@@ -2198,6 +2198,7 @@ pub fn index_graph_from_tsv(
         None,
         None,
         false,
+        None,
     )
 }
 
@@ -3433,6 +3434,7 @@ where
         Some(streamed_reference_count),
         Some(&stream_file_table),
         overlap_static,
+        None,
     )?;
     // W23: write_store skipped the overlapped ref_site shards; fold their byte
     // count back in so the reported total matches the non-overlapped path.
@@ -4185,6 +4187,45 @@ pub fn update_graph_native(
     }
     let file_count = unique_paths.len();
     if probe { eprintln!("[flow] compute_counts={}ms", _t.elapsed().as_millis()); }
+    // A2 v3 — S5: write the four symbol-keyed families incrementally
+    // (read-shard-drop-add) instead of fully rewriting them from the carried
+    // table. Requires the compact sidecar (for the id-only DROP of
+    // hierarchy/method via prior ids); older indexes without it fall back to the
+    // full rewrite from `symbols` (still correct while the carry is resident).
+    let _t = std::time::Instant::now();
+    let use_incr_sym = graph_shard_family_available(
+        workspace_root,
+        config,
+        GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
+    );
+    let changed_symbols: Vec<GraphSymbol> = if use_incr_sym {
+        symbols
+            .iter()
+            .filter(|s| exclude_paths.contains(&s.rel_path))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let prior_symbol_ids: HashSet<String> = if use_incr_sym {
+        load_prior_symbol_ids_for_paths(workspace_root, config, &prior_file_table, &exclude_paths)?
+    } else {
+        HashSet::default()
+    };
+    let incr_sym = use_incr_sym.then(|| IncrementalSymbolWrite {
+        changed_symbols: &changed_symbols,
+        exclude_paths: &exclude_paths,
+        prior_ids: &prior_symbol_ids,
+    });
+    if probe {
+        eprintln!(
+            "[flow] incr_sym_prep={}ms changed_syms={} prior_ids={} (incremental_writes={})",
+            _t.elapsed().as_millis(),
+            changed_symbols.len(),
+            prior_symbol_ids.len(),
+            use_incr_sym
+        );
+    }
     let _t = std::time::Instant::now();
     let empty_refs: Vec<GraphReference> = Vec::new();
     let result = write_store(
@@ -4204,6 +4245,7 @@ pub fn update_graph_native(
         Some(total_emitted),
         Some(&stream_file_table),
         false,
+        incr_sym.as_ref(),
     );
     if probe { eprintln!("[flow] write_store={}ms", _t.elapsed().as_millis()); }
     result
@@ -10538,6 +10580,10 @@ fn write_store(
     // W23: ref_site shards already written (overlapped with resolve). Forwarded
     // to write_graph_shards to skip the 38M-record ref_site write here.
     skip_ref_sites: bool,
+    // A2 v3 — S5: forwarded to write_graph_shards; when Some, the symbol-keyed
+    // families are written incrementally (read-shard-drop-add) rather than fully
+    // rewritten from `symbols`.
+    incr_sym: Option<&IncrementalSymbolWrite>,
 ) -> io::Result<GraphIndexSummary> {
     let layout_root = config.index_root(workspace_root);
     fs::create_dir_all(&layout_root)?;
@@ -10599,6 +10645,7 @@ fn write_store(
         incremental,
         references_streamed,
         skip_ref_sites,
+        incr_sym,
     )?;
 
     let indexed_at_unix_secs = unix_secs_now();
@@ -11377,13 +11424,24 @@ fn write_graph_shards(
     // re-writing them here. The 38M-record ref_site write is the dominant index
     // cost; overlapping it hides it behind the resolve phase.
     skip_ref_sites: bool,
+    // A2 v3 — S5: when Some, the four symbol-keyed families (symbol-id,
+    // resolve-index, hierarchy-by-parent, methods-by-container) are written
+    // incrementally (read-shard-drop-add over the existing shards + fresh changed
+    // symbols) instead of a full rewrite from `symbols`. Lets the incremental
+    // update avoid materializing the full table (S6).
+    incr_sym: Option<&IncrementalSymbolWrite>,
 ) -> io::Result<u64> {
     let probe = std::env::var("ZOEK_WRITE_PROBE").is_ok();
     let t0 = std::time::Instant::now();
     std::thread::scope(|s| -> io::Result<u64> {
         let symbol_id_h = s.spawn(move || {
             let t = std::time::Instant::now();
-            let r = write_symbol_id_shards(workspace_root, config, symbols, file_table);
+            let r = match incr_sym {
+                Some(incr) => {
+                    write_symbol_id_shards_incremental(workspace_root, config, incr, file_table)
+                }
+                None => write_symbol_id_shards(workspace_root, config, symbols, file_table),
+            };
             (t.elapsed(), r)
         });
         // Phase 3 aggressive: sym_uri shards are now derived on demand from
@@ -11444,19 +11502,34 @@ fn write_graph_shards(
             let r = write_count_id_shards(workspace_root, config, counts);
             (t.elapsed(), r)
         });
-        let hierarchy_h = s.spawn(|| {
+        let hierarchy_h = s.spawn(move || {
             let t = std::time::Instant::now();
-            let r = write_hierarchy_parent_shards(workspace_root, config, symbols);
+            let r = match incr_sym {
+                Some(incr) => {
+                    write_hierarchy_parent_shards_incremental(workspace_root, config, incr)
+                }
+                None => write_hierarchy_parent_shards(workspace_root, config, symbols),
+            };
             (t.elapsed(), r)
         });
         let method_h = s.spawn(move || {
             let t = std::time::Instant::now();
-            let r = write_method_container_shards(workspace_root, config, symbols, file_table);
+            let r = match incr_sym {
+                Some(incr) => {
+                    write_method_container_shards_incremental(workspace_root, config, incr)
+                }
+                None => write_method_container_shards(workspace_root, config, symbols, file_table),
+            };
             (t.elapsed(), r)
         });
         let resolve_index_h = s.spawn(move || {
             let t = std::time::Instant::now();
-            let r = write_resolve_index_shards(workspace_root, config, symbols, file_table);
+            let r = match incr_sym {
+                Some(incr) => {
+                    write_resolve_index_shards_incremental(workspace_root, config, incr, file_table)
+                }
+                None => write_resolve_index_shards(workspace_root, config, symbols, file_table),
+            };
             (t.elapsed(), r)
         });
         // A2 v3 — S5: compact per-symbol sidecar (file-sharded; incremental
@@ -11537,6 +11610,244 @@ fn write_resolve_index_shards(
             Some(shard_index_for_key(&symbol.name))
         },
     )
+}
+
+/// A2 v3 — S5: inputs the incremental symbol-keyed shard rewrites need so they
+/// run off the freshly parsed changed-file symbols + the existing shards
+/// (read-shard-drop-add) instead of the full ~5.2M-symbol table — which lets S6
+/// drop the carried `symbols` Vec entirely.
+struct IncrementalSymbolWrite<'a> {
+    /// Freshly parsed symbols of the changed files (the ADD set for all four
+    /// symbol-keyed families).
+    changed_symbols: &'a [GraphSymbol],
+    /// changed ∪ deleted rel_paths — identifies stale records to DROP from the
+    /// file-bearing families (symbol-id, resolve-index): a record is dropped iff
+    /// its recovered `rel_path` is in this set.
+    exclude_paths: &'a HashSet<String>,
+    /// Prior `symbol.id`s of the changed/deleted files — identifies stale records
+    /// to DROP from the id-only families (hierarchy-by-parent, methods-by-container,
+    /// whose records carry no file id). Sourced from the compact sidecar.
+    prior_ids: &'a HashSet<String>,
+}
+
+/// A2 v3 — S5: rewrite all 128 shards of a symbol-keyed family by reading each,
+/// keeping the records `keep_record` accepts (raw-copied byte-for-byte), then
+/// appending the family's freshly-serialized changed-file records for that shard
+/// (`fresh_by_shard`). Bounded memory: one shard's bytes + the small fresh
+/// buffers, never the full table. The resulting record SET equals a full rewrite
+/// of the current symbols; within-shard order differs, which no reader depends on
+/// (readers collect every record). `keep_record` parses exactly one record,
+/// advancing the cursor, and returns whether to retain it.
+fn rewrite_shards_incremental<K>(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    prefix: &str,
+    fresh_by_shard: &[Vec<u8>],
+    keep_record: K,
+) -> io::Result<u64>
+where
+    K: Fn(&[u8], &mut usize) -> io::Result<bool> + Sync,
+{
+    use rayon::prelude::*;
+    let keep_ref = &keep_record;
+    let per_shard: Vec<io::Result<u64>> = (0..GRAPH_SHARD_COUNT)
+        .into_par_iter()
+        .map(|shard| -> io::Result<u64> {
+            let path = graph_shard_path(workspace_root, config, prefix, shard);
+            let existing = if path.exists() {
+                fs::read(&path)?
+            } else {
+                Vec::new()
+            };
+            let mut out: Vec<u8> =
+                Vec::with_capacity(existing.len() + fresh_by_shard[shard].len());
+            let mut cursor = 0;
+            while cursor < existing.len() {
+                let start = cursor;
+                if keep_ref(&existing, &mut cursor)? {
+                    out.extend_from_slice(&existing[start..cursor]);
+                }
+            }
+            out.extend_from_slice(&fresh_by_shard[shard]);
+            write_atomically(&path, &out)?;
+            Ok(out.len() as u64)
+        })
+        .collect();
+    let mut bytes = 0;
+    for r in per_shard {
+        bytes += r?;
+    }
+    Ok(bytes)
+}
+
+/// A2 v3 — S5: incremental write of a full-symbol family (symbol-id /
+/// resolve-index). DROP = records whose file changed/was deleted
+/// (`rel_path ∈ exclude_paths`); ADD = the changed symbols, sharded by
+/// `shard_key` (`symbol.id` for by-id, `symbol.name` for by-name).
+fn write_full_symbol_shards_incremental<S>(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    prefix: &str,
+    changed_symbols: &[GraphSymbol],
+    exclude_paths: &HashSet<String>,
+    file_table: &FileTable,
+    shard_key: S,
+) -> io::Result<u64>
+where
+    S: Fn(&GraphSymbol) -> &str,
+{
+    let mut fresh: Vec<Vec<u8>> = (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+    for symbol in changed_symbols {
+        let fid = file_table.get_id(&symbol.rel_path).unwrap_or(u32::MAX);
+        let shard = shard_index_for_key(shard_key(symbol));
+        serialize_symbol_binary(symbol, fid, &mut fresh[shard]);
+    }
+    rewrite_shards_incremental(workspace_root, config, prefix, &fresh, |bytes, cursor| {
+        let sym = parse_symbol_binary(bytes, cursor, file_table)?;
+        Ok(!exclude_paths.contains(&sym.rel_path))
+    })
+}
+
+fn write_symbol_id_shards_incremental(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    incr: &IncrementalSymbolWrite,
+    file_table: &FileTable,
+) -> io::Result<u64> {
+    write_full_symbol_shards_incremental(
+        workspace_root,
+        config,
+        GRAPH_SYMBOL_ID_SHARD_PREFIX,
+        incr.changed_symbols,
+        incr.exclude_paths,
+        file_table,
+        |s| &s.id,
+    )
+}
+
+fn write_resolve_index_shards_incremental(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    incr: &IncrementalSymbolWrite,
+    file_table: &FileTable,
+) -> io::Result<u64> {
+    write_full_symbol_shards_incremental(
+        workspace_root,
+        config,
+        GRAPH_RESOLVE_INDEX_SHARD_PREFIX,
+        incr.changed_symbols,
+        incr.exclude_paths,
+        file_table,
+        |s| &s.name,
+    )
+}
+
+/// A2 v3 — S5: incremental write of the hierarchy-by-parent query sidecar. DROP =
+/// records whose child `symbol.id` is a prior id of a changed/deleted file
+/// (`prior_ids`); ADD = the changed files' fresh type-kind symbols' parent edges
+/// (same record + sharding as `write_hierarchy_parent_shards`).
+fn write_hierarchy_parent_shards_incremental(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    incr: &IncrementalSymbolWrite,
+) -> io::Result<u64> {
+    let mut fresh: Vec<Vec<u8>> = (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+    for symbol in incr.changed_symbols {
+        if !is_type_kind_sym(symbol) {
+            continue;
+        }
+        for parent_name in symbol.extends_names.iter().chain(&symbol.implements_names) {
+            for lookup_key in graph_name_lookup_keys(parent_name) {
+                let buf = &mut fresh[shard_index_for_key(&lookup_key)];
+                write_u16_str(buf, &lookup_key);
+                write_u16_str(buf, parent_name);
+                write_u16_str(buf, &symbol.id);
+                write_u16_str(buf, &symbol.qualified_name);
+            }
+        }
+    }
+    rewrite_shards_incremental(
+        workspace_root,
+        config,
+        GRAPH_HIERARCHY_PARENT_SHARD_PREFIX,
+        &fresh,
+        |bytes, cursor| {
+            let _lookup_key = read_u16_str(bytes, cursor)?;
+            let _parent_name = read_u16_str(bytes, cursor)?;
+            let child_id = read_u16_str(bytes, cursor)?;
+            let _child_qn = read_u16_str(bytes, cursor)?;
+            Ok(!incr.prior_ids.contains(&child_id))
+        },
+    )
+}
+
+/// A2 v3 — S5: incremental write of the methods-by-container query sidecar. DROP =
+/// records whose method `symbol.id` is a prior id of a changed/deleted file; ADD
+/// = the changed files' fresh methods (same record + sharding as
+/// `write_method_container_shards`).
+fn write_method_container_shards_incremental(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    incr: &IncrementalSymbolWrite,
+) -> io::Result<u64> {
+    let mut fresh: Vec<Vec<u8>> = (0..GRAPH_SHARD_COUNT).map(|_| Vec::new()).collect();
+    for symbol in incr.changed_symbols {
+        if symbol.kind != "method" {
+            continue;
+        }
+        let Some(container_name) = symbol.container_name.as_deref() else {
+            continue;
+        };
+        for lookup_key in graph_name_lookup_keys(container_name) {
+            let buf = &mut fresh[shard_index_for_key(&lookup_key)];
+            write_u16_str(buf, &lookup_key);
+            write_u16_str(buf, &symbol.id);
+        }
+    }
+    rewrite_shards_incremental(
+        workspace_root,
+        config,
+        GRAPH_METHOD_CONTAINER_SHARD_PREFIX,
+        &fresh,
+        |bytes, cursor| {
+            let _lookup_key = read_u16_str(bytes, cursor)?;
+            let method_id = read_u16_str(bytes, cursor)?;
+            Ok(!incr.prior_ids.contains(&method_id))
+        },
+    )
+}
+
+/// A2 v3 — S5: prior `symbol.id`s of the given (changed/deleted) paths, read from
+/// the compact sidecar's per-file shards (so only those files' shards are
+/// touched, not the whole table). Feeds the id-only DROP for hierarchy/method.
+fn load_prior_symbol_ids_for_paths(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    file_table: &FileTable,
+    paths: &HashSet<String>,
+) -> io::Result<HashSet<String>> {
+    let shards: HashSet<usize> = paths.iter().map(|p| shard_index_for_key(p)).collect();
+    let mut ids: HashSet<String> = HashSet::default();
+    for shard in shards {
+        let path = graph_shard_path(
+            workspace_root,
+            config,
+            GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
+            shard,
+        );
+        if !path.exists() {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            let cs = parse_symbol_compact_binary(&bytes, &mut cursor, file_table)?;
+            if paths.contains(&*cs.rel_path) {
+                ids.insert(cs.id.to_string());
+            }
+        }
+    }
+    Ok(ids)
 }
 
 fn write_symbol_uri_shards(
