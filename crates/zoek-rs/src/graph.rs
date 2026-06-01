@@ -3664,9 +3664,48 @@ pub fn update_graph_native(
         })
         .collect();
     if probe { eprintln!("[flow] affected_calc={}ms affected_paths={} affected_indices={}", _t.elapsed().as_millis(), affected_paths.len(), affected_indices.len()); }
+    // A2 v3 — S3 (lazy resolve): resolve over a slim candidate subset (affected
+    // files' own symbols + cross-file targets loaded by name from the
+    // resolve-index shards) instead of the full carried table, so the ~3GB
+    // resolve index is built over thousands of symbols, not millions. Requires
+    // the by-name shards (older indexes lack them → fall back to full symbols);
+    // opt out with ZOEK_V3_LAZY_RESOLVE_OFF for A/B measurement. The full
+    // `symbols` Vec stays resident for hierarchy/emit/counts/likely/symbol-write
+    // (those move off it in S4/S5), so peak RSS does not drop until then.
+    let use_lazy_resolve = lazy_resolve_enabled()
+        && graph_shard_family_available(workspace_root, config, GRAPH_RESOLVE_INDEX_SHARD_PREFIX);
+    let _t = std::time::Instant::now();
+    let resolve_candidates: Option<Vec<GraphSymbol>> = if use_lazy_resolve {
+        Some(build_resolve_candidate_symbols(
+            workspace_root,
+            config,
+            &prior_file_table,
+            &symbols,
+            &ref_sites,
+            &affected_indices,
+            &affected_paths,
+            &import_facts,
+            &type_facts,
+            &function_return_facts,
+        )?)
+    } else {
+        None
+    };
+    if probe {
+        if let Some(c) = &resolve_candidates {
+            eprintln!(
+                "[flow] resolve_candidates(slim)={}ms n={} (full carried {})",
+                _t.elapsed().as_millis(),
+                c.len(),
+                symbols.len()
+            );
+            eprintln!("[flow] rss_after_resolve_candidates_mb={}", peak_rss_mb());
+        }
+    }
+    let resolve_symbols: &[GraphSymbol] = resolve_candidates.as_deref().unwrap_or(symbols.as_slice());
     let _t = std::time::Instant::now();
     let mut intermediate = resolve_ref_sites_a_to_e(
-        &symbols,
+        resolve_symbols,
         &ref_sites,
         Some(&affected_indices),
         &import_facts,
@@ -3679,6 +3718,9 @@ pub fn update_graph_native(
         None,
     );
     if probe { eprintln!("[flow] resolve_a_to_e={}ms", _t.elapsed().as_millis()); }
+    // The candidate table (if any) is only borrowed by resolve; drop it now so
+    // it is not resident through the streaming write tail.
+    drop(resolve_candidates);
     if probe { eprintln!("[flow] rss_after_resolve_mb={}", peak_rss_mb()); }
     // A2 Stage B: the EXACT (non-token-shape) graph is assembled exactly as
     // before (carried exact refs + re-resolved affected exact lights) — that
@@ -13376,6 +13418,115 @@ fn load_resolve_candidates(
         })?);
     }
     Ok(out)
+}
+
+/// A2 v3 — S3: opt-out for lazy resolve so the candidate path can be A/B
+/// compared against the pre-S3 full-symbol resolve.
+fn lazy_resolve_enabled() -> bool {
+    std::env::var("ZOEK_V3_LAZY_RESOLVE_OFF").is_err()
+}
+
+/// A2 v3 — S3: seed the resolve-candidate name set from a `TypeFact` /
+/// `FunctionReturnFact` `type_name`. The resolver probes `types_by_name` /
+/// `symbols_by_file_and_name` with `type_tail(type_name)` (and, for the
+/// synthetic Django/return-of facts, the stripped inner name), so those are the
+/// names whose symbols must be loadable.
+fn seed_type_name_hashes(type_name: &str, set: &mut AHashSet<u64>) {
+    if let Some(model) = type_name.strip_prefix(DJANGO_MODEL_MANAGER_FACT_PREFIX) {
+        set.insert(stable_hash(type_tail(model)));
+    } else if let Some(callee) = type_name.strip_prefix(RETURN_TYPE_FACT_PREFIX) {
+        set.insert(stable_hash(callee));
+        set.insert(stable_hash(type_tail(callee)));
+    } else {
+        set.insert(stable_hash(type_tail(type_name)));
+    }
+}
+
+/// A2 v3 — S3 (lazy resolve): build the slim symbol subset
+/// `resolve_ref_sites_a_to_e` needs to resolve ONLY the affected sites
+/// byte-identically to a full rebuild, instead of the full ~5.2M-symbol carried
+/// table (the resolve index built over that table is the incremental update's
+/// ~3GB RSS spike).
+///
+/// Correctness model — every probe the resolver makes over `symbols`, for an
+/// AFFECTED site, must see the same symbols it would over the full table:
+///  - Affected files' OWN symbols are included verbatim (fresh for changed
+///    files, carried for importer files). This covers `symbols_by_id` (the
+///    self/cls + `Self` enclosing-symbol lookups, whose id is always a symbol in
+///    the site's own — hence affected — file) and same-file name resolution.
+///  - Cross-file targets are loaded BY NAME from the resolve-index shards
+///    (`load_resolve_candidates`): for any name an affected site can probe, the
+///    shards yield exactly the symbols the full table holds for that name. The
+///    probed names are bounded by each affected site's `name_hash` +
+///    `receiver_name_hash` (the receiver feeds `types_by_name`/import/type-fact
+///    lookups) plus every name in the affected files' import/type/return facts.
+///    Hierarchy is consulted via the precomputed `hierarchy_facts` (built from
+///    the full table, unchanged here) and only for Django-model filtering — the
+///    resolver never reads `extends_names`/`implements_names` off a symbol — so
+///    no parent-type transitive closure is required.
+///  - Stale changed-file symbols the shards still carry are dropped
+///    (`!affected_paths.contains`); the fresh re-parsed copies come from the
+///    affected-files set.
+fn build_resolve_candidate_symbols(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    prior_file_table: &FileTable,
+    symbols: &[GraphSymbol],
+    ref_sites: &[RefSite],
+    affected_indices: &[u32],
+    affected_paths: &HashSet<String>,
+    import_facts: &[ImportFact],
+    type_facts: &[TypeFact],
+    function_return_facts: &[FunctionReturnFact],
+) -> io::Result<Vec<GraphSymbol>> {
+    let mut name_hashes: AHashSet<u64> = AHashSet::default();
+    for &idx in affected_indices {
+        let site = &ref_sites[idx as usize];
+        name_hashes.insert(site.name_hash);
+        // Bare sites store receiver_name_hash == 0; only a real receiver feeds
+        // types_by_name / import_targets / type_facts lookups.
+        if site.receiver_name_hash != 0 {
+            name_hashes.insert(site.receiver_name_hash);
+        }
+    }
+    for fact in import_facts {
+        if !affected_paths.contains(&fact.rel_path) {
+            continue;
+        }
+        name_hashes.insert(stable_hash(&fact.imported_name));
+        name_hashes.insert(stable_hash(&fact.local_name));
+    }
+    for fact in type_facts {
+        if !affected_paths.contains(&fact.rel_path) {
+            continue;
+        }
+        name_hashes.insert(stable_hash(&fact.local_name));
+        seed_type_name_hashes(&fact.type_name, &mut name_hashes);
+    }
+    for fact in function_return_facts {
+        if !affected_paths.contains(&fact.rel_path) {
+            continue;
+        }
+        name_hashes.insert(stable_hash(&fact.function_name));
+        seed_type_name_hashes(&fact.type_name, &mut name_hashes);
+    }
+
+    // Cross-file targets from the prior resolve-index shards, minus any stale
+    // changed/affected-file copies (those arrive fresh from the affected-files
+    // set below).
+    let mut candidates: Vec<GraphSymbol> =
+        load_resolve_candidates(workspace_root, config, prior_file_table, &name_hashes)?
+            .into_iter()
+            .filter(|s| !affected_paths.contains(&s.rel_path))
+            .collect();
+    // Affected files' own symbols (fresh for changed, carried for importers).
+    candidates.extend(
+        symbols
+            .iter()
+            .filter(|s| affected_paths.contains(&s.rel_path))
+            .cloned(),
+    );
+    Ok(candidates)
 }
 
 fn read_symbols_for_symbol_ids_indexed(
