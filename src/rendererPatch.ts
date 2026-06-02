@@ -248,6 +248,10 @@ export function getRendererPatchScript(
   function disposeSearchUi(reason) {
     if (__ijFindDisposed) { return 'already-disposed'; }
     __ijFindDisposed = true;
+    // Backstop: never leave the sibling-extension pointer flag stuck true
+    // (which would suppress ir over the main editor). pointerleave normally
+    // clears it, but clear here too in case the panel is torn down mid-hover.
+    try { window.__ijFindPointerInside = false; } catch (eFlagDispose) {}
     var out = [];
     try {
       var registry = window.__ijFindInstances || null;
@@ -2575,6 +2579,21 @@ export function getRendererPatchScript(
   markSearchUiRoot(panel);
   try { panel.setAttribute('data-ij-find-src', __ijFindInstanceId); } catch (ePanelSrcAttr) {}
   wireSearchPanelFocus(panel);
+
+  // O(1) cross-extension perf signal for the sibling intellisense-recursion
+  // extension. ir's global window pointer handlers (irRememberPointerEvent, its
+  // hover-engine listener, etc.) otherwise run a closest('.ij-find-overlay')
+  // ancestor walk on EVERY pointermove/mouseover — cheap individually but it
+  // dominated CPU when our preview grows and emits a burst of mouseover events
+  // (resize/enlarge). We publish a boolean it reads in O(1) to skip its
+  // hover/scan work over our surface. pointerenter/leave fire once on the panel
+  // boundary (not per descendant), so this stays effectively free.
+  try {
+    on(panel, 'pointerenter', function () { try { window.__ijFindPointerInside = true; } catch (eFlagPe) {} });
+    on(panel, 'mouseenter', function () { try { window.__ijFindPointerInside = true; } catch (eFlagMe) {} });
+    on(panel, 'pointerleave', function () { try { window.__ijFindPointerInside = false; } catch (eFlagPl) {} });
+    on(panel, 'mouseleave', function () { try { window.__ijFindPointerInside = false; } catch (eFlagMl) {} });
+  } catch (eIjPointerFlagWire) {}
 
   // $hoverTooltip element (DIY hover) removed in #32 — Monaco's native
   // hover infra handles all hover UX through our preview editor now.
@@ -5413,7 +5432,7 @@ export function getRendererPatchScript(
         try { m = getMonacoFactorySingleton(); } catch (eMonaco) {}
         if (monacoStatus === 'ready' && m && m.ctor) {
           try {
-            renderPreviewMonacoReal(msg);
+            renderPreviewMonacoReal(msg, 'message-coldwarm');
             return;
           } catch (eRender) {
             send({ type: 'log', msg: 'preview auto-recovery render threw: ' + (eRender && eRender.message) });
@@ -5488,7 +5507,7 @@ export function getRendererPatchScript(
       ' modelSvc=' + (!!(m && m.modelSvc)) +
       ' status=' + monacoStatus });
     if (monacoStatus === 'ready' && m && m.ctor) {
-      try { renderPreviewMonacoReal(msg); return; }
+      try { renderPreviewMonacoReal(msg, 'message'); return; }
       catch (e) { send({ type: 'log', msg: 'renderPreviewMonacoReal threw: ' + (e && e.message) }); }
     }
     send({ type: 'log', msg: 'renderPreview: DOM fallback' });
@@ -5674,12 +5693,73 @@ export function getRendererPatchScript(
   // Expose for future test instrumentation (no production use).
   try { window.__ijFindGatherEmbedEditorIntellisenseSnapshot = gatherEmbedEditorIntellisenseSnapshot; } catch (eExposeIs) {}
 
-  function renderPreviewMonacoReal(msg) {
+  // Cheap fingerprint of every input that affects what renderPreviewMonacoReal
+  // paints: uri, focus line, language, base line, full-file flag, content size,
+  // match ranges (decorations), and callgraph inlays. Two messages with the
+  // same signature render pixel-identically, so the second is a no-op we can
+  // skip. Uses content shape (not the whole text) to stay O(ranges+inlays).
+  function previewRenderSignatureFor(msg, fullText) {
+    if (!msg) { return ''; }
+    var parts = [
+      String(msg.uri || ''),
+      typeof msg.focusLine === 'number' ? msg.focusLine : -1,
+      String(msg.languageId || ''),
+      typeof msg.baseLine === 'number' ? msg.baseLine : '',
+      msg.fullFile === false ? '0' : '1',
+      fullText ? fullText.length : 0,
+      (msg.lines && msg.lines.length) || 0,
+    ];
+    var rangeSig = 'r';
+    try {
+      if (Array.isArray(msg.ranges)) {
+        rangeSig += msg.ranges.length;
+        for (var i = 0; i < msg.ranges.length; i++) {
+          var r = msg.ranges[i] || {};
+          rangeSig += ':' + (r.start || 0) + ',' + (r.end || 0) + ',' + (r.endLine || 0);
+        }
+      }
+    } catch (eRangeSig) {}
+    parts.push(rangeSig);
+    var inlaySig = 'h';
+    try {
+      if (Array.isArray(msg.callGraphInlays)) {
+        inlaySig += msg.callGraphInlays.length;
+        for (var j = 0; j < msg.callGraphInlays.length; j++) {
+          var hint = msg.callGraphInlays[j] || {};
+          inlaySig += ':' + (hint.line || 0) + ',' + (hint.text || '');
+        }
+      }
+    } catch (eInlaySig) {}
+    parts.push(inlaySig);
+    return parts.join('|');
+  }
+
+  function renderPreviewMonacoReal(msg, trigger) {
     var renderT0 = perfNow();
     if (state.stolenEditor) { restoreStolenEditor(); }
     var fullText = (msg.lines || []).map(function (l) { return l.text; }).join('\\n');
     var lang = msg.languageId || 'plaintext';
+    var renderSig = previewRenderSignatureFor(msg, fullText);
     var canReuse = !!(state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody);
+    // Phase-1 no-op render skip: an identical preview (same signature — uri,
+    // focusLine, content shape, language, match ranges, callgraph inlays) is
+    // already fully rendered into a healthy, reusable editor. It already shows
+    // exactly this, so re-running setModel + layout + decorations + inlays is
+    // pure waste that wakes the diagnostics/inlay observers and feeds the
+    // longtask cascade. A heal recreate passes canReuse=false (the editor was
+    // nulled) and any genuine change alters the signature, so both still
+    // render. Skipping a post-hydrate re-render is also correct — it avoids
+    // reverting the resource (file) model back to an in-memory one. Compared by
+    // signature, not object ref: every CDP message deserializes to a fresh
+    // object even when byte-identical, so ref equality would never match.
+    if (canReuse && state.lastFullyRenderedSig && renderSig === state.lastFullyRenderedSig) {
+      trace('preview/render/skip', {
+        reason: 'identical-render',
+        trigger: String(trigger || ''),
+        uri: msg && msg.uri ? String(msg.uri) : '',
+      });
+      return;
+    }
     // Whenever the user lands on a different URI, the hydrate trip has to
     // run again on the new model. Reset previewHydrated so our fast-path
     // absolute callgraph layer renders inlays for the first 250ms before
@@ -5698,6 +5778,7 @@ export function getRendererPatchScript(
     } catch (ePreDom) {}
     trace('preview/render/start', {
       uri: msg && msg.uri ? String(msg.uri) : '',
+      trigger: String(trigger || ''),
       canReuse: canReuse,
       lines: msg && msg.lines ? msg.lines.length : 0,
       lang: lang,
@@ -5751,6 +5832,7 @@ export function getRendererPatchScript(
         state.lastRenderedPreviewUri = msg.uri;
         state.lastRenderedPreviewFocusLine = msgFocusLine;
         scheduleSettledPreviewHydrate();
+        state.lastFullyRenderedSig = renderSig;
         var postReuseMonacoHovers = 0;
         var postReuseIjRoots = 0;
         try {
@@ -5775,20 +5857,28 @@ export function getRendererPatchScript(
         return;
       }
     }
-    // CREATE path: about to replace the host with a fresh editor. If we
-    // had a previous Monaco preview editor, its hover/overflow widgets are
-    // anchored to a SHARED overflow host on document.body, NOT to
-    // $previewBody — so clearing $previewBody removes the editor's DOM but
-    // leaks the hover widget and view zones because we never call
-    // editor.dispose(). Trace this gap so we can measure how many leaks
-    // accumulate per session and prove the hypothesis before plugging it.
+    // CREATE path: about to replace the host with a fresh editor. A prior
+    // preview editor's hover/overflow widgets and view zones are anchored to a
+    // SHARED overflow host on document.body, NOT to $previewBody — so clearing
+    // $previewBody alone removes the editor DOM but leaks the widgets/zones AND
+    // the editor instance (keeping live listeners and inflating every later
+    // '.monaco-editor' DOM scan, e.g. the inlay-tag observer). Dispose it
+    // properly first via the existing teardown — it also tears down the
+    // change/keydown listeners, the heal observer, and diagnostics, and removes
+    // the old host; the code below re-creates a fresh host + editor + observers.
     var hadPriorEditor = !!state.previewMonacoEditor;
+    var priorEditorDisposed = false;
+    if (hadPriorEditor) {
+      try {
+        disposePreviewMonacoEditor();
+        priorEditorDisposed = true;
+      } catch (eDisposePrior) {
+        try { send({ type: 'log', msg: 'dispose prior preview editor threw: ' + (eDisposePrior && eDisposePrior.message) }); } catch (eDispLog) {}
+      }
+    }
     trace('preview/render/create-prep', {
       hadPriorEditor: hadPriorEditor,
-      // Intentionally NOT disposing the prior editor here yet — see [[project-preview-hover-arch]].
-      // We're instrumenting first so the leak shows up in the trace, then the
-      // E2E pins it, then we fix.
-      priorEditorDisposed: false,
+      priorEditorDisposed: priorEditorDisposed,
     });
     clearChildren($previewBody);
     $previewBody.classList.add('ij-find-editor-mounted');
@@ -5843,6 +5933,7 @@ export function getRendererPatchScript(
     state.lastRenderedPreviewUri = msg.uri;
     state.lastRenderedPreviewFocusLine = msgFocusLine;
     scheduleSettledPreviewHydrate();
+    state.lastFullyRenderedSig = renderSig;
     var postCreateMonacoHovers = 0;
     var postCreateIjRoots = 0;
     try {
@@ -5853,7 +5944,7 @@ export function getRendererPatchScript(
       path: 'create',
       uri: msg && msg.uri ? String(msg.uri) : '',
       hadPriorEditor: hadPriorEditor,
-      priorEditorDisposed: false,
+      priorEditorDisposed: priorEditorDisposed,
       totalMs: Math.round(perfNow() - renderT0),
       createMs: createMs,
       setContentMs: setNewMs,
@@ -5985,7 +6076,7 @@ export function getRendererPatchScript(
         state.previewMonacoEditor = null;
         Promise.resolve().then(function () {
           try {
-            renderPreviewMonacoReal(lastMsg);
+            renderPreviewMonacoReal(lastMsg, 'heal');
           } catch (eHealRender) {
             try { send({ type: 'log', msg: 'preview monaco self-heal render threw: ' + (eHealRender && eHealRender.message) }); } catch (eHealLog) {}
           } finally {
@@ -6062,6 +6153,17 @@ export function getRendererPatchScript(
 
   function wirePreviewMonacoDiagnostics(editor) {
     teardownPreviewMonacoDiagnostics();
+    // Lever A: the focus/blur/cursor/layout/dispose listeners + the $previewBody
+    // subtree MutationObserver wired below fire trace() + snapshotPreviewMonacoState()
+    // on every cursor move / resize / preview DOM mutation. The snapshot calls
+    // getBoundingClientRect (forces a synchronous layout) + querySelectorAll, and
+    // trace() posts an IPC message — ~130 such events pile onto each search/preview
+    // storm and amplify reflow. They are pure diagnostics, so when renderer
+    // diagnostics are off (now the default) we wire nothing. teardown above already
+    // removed any prior listeners, so toggling the setting off mid-session also goes
+    // quiet on the next render. trace()/startPanelDiagnostics/startPerfWatch are
+    // separately gated on the same flag.
+    if (!isRendererDiagnosticsEnabled()) { return; }
     if (!editor) { return; }
     var disposers = [];
     var safeOn = function (eventName) {

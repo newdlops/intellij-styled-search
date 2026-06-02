@@ -303,8 +303,8 @@
         },
         "intellijStyledSearch.rendererPerfDiagnostics": {
           "type": "boolean",
-          "default": true,
-          "description": "Enable renderer performance tracing for Search UI diagnosis. When enabled, panel open records frame gaps, event delay, event timing, long tasks, long animation frames, DOM counts, memory and phase markers in batched renderer logs."
+          "default": false,
+          "description": "Enable renderer performance tracing for Search UI diagnosis. Off by default: when on, every cursor move / resize / preview mutation records a DOM snapshot (which forces a synchronous layout) plus frame gaps, long tasks, DOM/memory counts and phase markers via IPC to the log — that instrumentation itself adds overhead during search/preview. Turn it on only to capture a diagnostics session."
         },
         "intellijStyledSearch.rendererSafetyDiagnostics": {
           "type": "boolean",
