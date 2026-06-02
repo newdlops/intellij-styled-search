@@ -660,7 +660,12 @@ const DEFAULT_CALL_GRAPH_MAX_CALLSITES = 0;
 const DEFAULT_CALL_GRAPH_MAX_REFERENCE_CANDIDATES = 0;
 const DEFAULT_CALL_GRAPH_MEMORY_BUDGET_MB = 8_192;
 const CALL_GRAPH_SOURCE_GLOB = '**/*.{py,java,kt,kts,ts,tsx,js,jsx,mjs,cjs}';
-const CALL_GRAPH_CACHE_VERSION = 14;
+// v15: paired with rust GRAPH_VERSION 6->7 (position-independent symbol ids in
+// crates/zoek-rs/src/graph.rs `stable_symbol_id`). The id scheme is on-disk-
+// incompatible with v6 — a v6 index served to the v7 binary would mix old/new
+// target ids — so this bump discards the v6 cache and forces a one-time reindex.
+// MUST move together with the GRAPH_VERSION bump + the rebuilt binary.
+const CALL_GRAPH_CACHE_VERSION = 15;
 const CALL_GRAPH_EXTERNAL_INCREMENTAL_DEBOUNCE_MS = 1_500;
 const CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS = 75;
 // Each incremental graph-update loads the full prior reference set into the
@@ -675,6 +680,12 @@ const CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD = 200;
 //     this many back-to-back passes the loop releases and the next debounce
 //     flush resumes the remainder.
 const CALL_GRAPH_INCREMENTAL_MAX_DRAIN_ITERATIONS = 50;
+// LSM overlay: a save writes a small delta overlay (graph-overlay-update, ~<1s)
+// instead of rewriting the base. After editing goes idle for this long, fold the
+// overlay into the base (graph-compact, the heavy ~O(total) job) off the critical
+// path — this keeps the overlay small (queries merge base+overlay) and refreshes
+// the base-only artifacts (token-shape, usage counts) the overlay leaves stale.
+const CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS = 12_000;
 const CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK = 50_000;
 const CALL_GRAPH_SYMBOL_RELATION_BUCKETS = 256;
 const CALL_GRAPH_DOCUMENT_SUMMARY_BUCKETS = 256;
@@ -697,6 +708,8 @@ type RustGraphProcessKind =
   | 'build'
   | 'graph-rebuild'
   | 'graph-update'
+  | 'graph-overlay-update'
+  | 'graph-compact'
   | 'graph-index'
   | 'graph-query'
   | 'graph-callees'
@@ -737,6 +750,10 @@ export class CallGraphService implements vscode.Disposable {
   private incrementalFlushAt = 0;
   private incrementalReason = '';
   private incrementalPromise: Promise<void> | undefined;
+  // LSM overlay compaction (folds the delta overlay into the base on idle).
+  private overlayDirty = false;
+  private compactionTimer: ReturnType<typeof setTimeout> | undefined;
+  private compactionPromise: Promise<void> | undefined;
   private cacheWritePromise: Promise<void> = Promise.resolve();
   private rustGraphBuildPromise: Promise<string | undefined> | undefined;
   private cacheConfigSignature: string | undefined;
@@ -809,6 +826,10 @@ export class CallGraphService implements vscode.Disposable {
     if (this.incrementalTimer) {
       clearTimeout(this.incrementalTimer);
       this.incrementalTimer = undefined;
+    }
+    if (this.compactionTimer) {
+      clearTimeout(this.compactionTimer);
+      this.compactionTimer = undefined;
     }
     this.incrementalFlushAt = 0;
     this.incrementalReason = '';
@@ -1719,6 +1740,12 @@ export class CallGraphService implements vscode.Disposable {
   // coalesced into the next pass instead of spawning a concurrent update.
   private armIncrementalFlush(delayMs: number): void {
     if (this.disposed) { return; }
+    // A fresh edit is incoming → defer overlay compaction (it re-arms after the
+    // next drain goes idle). Compaction must never overlap an update.
+    if (this.compactionTimer) {
+      clearTimeout(this.compactionTimer);
+      this.compactionTimer = undefined;
+    }
     const flushAt = Date.now() + delayMs;
     if (this.incrementalTimer && this.incrementalFlushAt > 0 && this.incrementalFlushAt <= flushAt) {
       return;
@@ -1772,6 +1799,8 @@ export class CallGraphService implements vscode.Disposable {
   private async drainIncrementalRefresh(): Promise<void> {
     if (this.rebuildPromise) { await this.rebuildPromise; }
     if (this.restorePromise) { await this.restorePromise; }
+    // Never overlay-update while a compaction is folding the overlay into the base.
+    if (this.compactionPromise) { await this.compactionPromise; }
     let iterations = 0;
     while (!this.disposed && this.pendingChangedUris.size > 0) {
       if (++iterations > CALL_GRAPH_INCREMENTAL_MAX_DRAIN_ITERATIONS) {
@@ -1811,6 +1840,44 @@ export class CallGraphService implements vscode.Disposable {
         this.log.appendLine(`call graph incremental update failed: ${err instanceof Error ? err.message : err}`);
       }
     }
+    // Editing drained to idle: if overlay-updates accumulated a delta, schedule
+    // a compaction to fold it into the base (off the critical path).
+    if (!this.disposed && this.overlayDirty && this.pendingChangedUris.size === 0) {
+      this.armCompactionTimer();
+    }
+  }
+
+  // Arm (or keep) the idle timer that folds the overlay into the base. A fresh
+  // edit clears it (armIncrementalFlush) so compaction only fires once editing
+  // has been quiet for CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS.
+  private armCompactionTimer(): void {
+    if (this.disposed || this.compactionTimer) { return; }
+    this.compactionTimer = setTimeout(() => {
+      this.compactionTimer = undefined;
+      void this.kickCompaction()
+        .catch((err) => this.log.appendLine(`call graph overlay compaction failed: ${err instanceof Error ? err.message : err}`));
+    }, CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS);
+  }
+
+  // Single-flight compaction. Defers if an update/rebuild/restore is in flight or
+  // edits are pending (re-arms so it retries once idle), so compaction never
+  // overlaps an overlay-update.
+  private kickCompaction(): Promise<void> {
+    if (this.disposed || !this.overlayDirty) { return Promise.resolve(); }
+    if (this.compactionPromise) { return this.compactionPromise; }
+    if (
+      this.incrementalPromise ||
+      this.rebuildPromise ||
+      this.restorePromise ||
+      this.pendingChangedUris.size > 0
+    ) {
+      this.armCompactionTimer();
+      return Promise.resolve();
+    }
+    this.compactionPromise = this.compactRustNativeGraphOverlay().finally(() => {
+      this.compactionPromise = undefined;
+    });
+    return this.compactionPromise;
   }
 
   private async processChangedFiles(uris: vscode.Uri[], reason: string): Promise<void> {
@@ -1851,6 +1918,9 @@ export class CallGraphService implements vscode.Disposable {
       );
       return;
     }
+    // A delta overlay was written (or a bootstrap full-update ran). Mark it so the
+    // drain schedules an idle compaction to fold it into the base.
+    this.overlayDirty = true;
     // Cross-file relation counts can change for documents that were not
     // themselves edited. Drop lazy document summaries so inlay requests for
     // already-open definition files read fresh counts from the native index.
@@ -1876,6 +1946,50 @@ export class CallGraphService implements vscode.Disposable {
       `call graph rust-native incremental updated: reason=${reason} files=${uniqueUris.length} ` +
       `elapsed=${Date.now() - started}ms`,
     );
+  }
+
+  // Fold the accumulated delta overlay into the base index (the heavy ~O(total)
+  // job), off the edit critical path. builtAt is preserved across compaction
+  // (base+overlay merged == compacted base), so the cached manifest stays valid;
+  // we only refresh derived caches so reads pick up the folded base and the
+  // now-exact token-shape / usage counts the overlay left at base values.
+  private async compactRustNativeGraphOverlay(): Promise<void> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const manifest = this.cacheManifest;
+    if (this.disposed || !folder || !manifest?.builtAtUnixMs) { return; }
+    if (!this.hasRustNativePrimaryGraph()) { this.overlayDirty = false; return; }
+    const binary = await this.resolveRustGraphBinary(true);
+    if (!binary) { return; }
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const args = [
+      binary,
+      'graph-compact',
+      folder.uri.fsPath,
+      '--built-at',
+      String(manifest.builtAtUnixMs),
+      '--max-file-size',
+      String(getConfiguredCallGraphMaxFileSize(cfg)),
+      '--workers',
+      String(getConfiguredCallGraphConcurrency(cfg)),
+    ];
+    const started = Date.now();
+    this.log.appendLine('call graph overlay compaction start');
+    let response: RustGraphIndexResponse;
+    try {
+      response = await this.invokeRustGraphJson(args) as RustGraphIndexResponse;
+    } catch (err) {
+      this.log.appendLine(`call graph overlay compaction failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    if (response.type !== 'graph-index' || response.ok !== true) {
+      this.log.appendLine('call graph overlay compaction skipped: unexpected zoek-rs graph-compact response');
+      return;
+    }
+    this.overlayDirty = false;
+    this.clearDocumentSummaryCache();
+    this.rustSymbolQueryCache.clear();
+    this.onDidChangeSnapshotEmitter.fire();
+    this.log.appendLine(`call graph overlay compaction done: elapsed=${Date.now() - started}ms`);
   }
 
   private async updateRustNativeGraphIndex(
@@ -1906,7 +2020,12 @@ export class CallGraphService implements vscode.Disposable {
     if (changedPaths.length === 0 && deletedPaths.length === 0) { return true; }
     const args = [
       binary,
-      'graph-update',
+      // LSM overlay fast path: writes a small delta overlay (O(edit)) instead of
+      // rewriting the base. Preserves builtAtUnixMs (so the guard below still
+      // matches); queries merge base+overlay; graph-compact folds it on idle.
+      // Falls back internally to a full update_graph_native when the v3 sidecars
+      // are absent (older index → bootstrap rebuild).
+      'graph-overlay-update',
       workspaceRoot,
       '--built-at',
       String(manifest.builtAtUnixMs),
@@ -3527,6 +3646,8 @@ export class CallGraphService implements vscode.Disposable {
     switch (rest[0]) {
       case 'graph-rebuild': return 'graph-rebuild';
       case 'graph-update': return 'graph-update';
+      case 'graph-overlay-update': return 'graph-overlay-update';
+      case 'graph-compact': return 'graph-compact';
       case 'graph-index': return 'graph-index';
       case 'graph-query': return 'graph-query';
       case 'graph-callees': return 'graph-callees';
@@ -3543,6 +3664,8 @@ export class CallGraphService implements vscode.Disposable {
       case 'build': return undefined;
       case 'graph-rebuild': return 'ijss-rust-graph-rebuild';
       case 'graph-update': return 'ijss-rust-graph-update';
+      case 'graph-overlay-update': return 'ijss-rust-graph-overlay-update';
+      case 'graph-compact': return 'ijss-rust-graph-compact';
       case 'graph-index': return 'ijss-rust-graph-index';
       case 'graph-query': return 'ijss-rust-graph-query';
       case 'graph-callees': return 'ijss-rust-graph-callees';
