@@ -211,7 +211,13 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const GRAPH_VERSION: u32 = 6;
+// v7: position-INDEPENDENT symbol ids (see `stable_symbol_id`) — a symbol's id no
+// longer encodes its line/column, so a body edit keeps every symbol id stable and
+// the overlay update can skip re-resolving importers whose target ids did not
+// change. The id scheme is on-disk-incompatible with v6 (every symbol/target id
+// differs), so the bump forces a one-time reindex (paired with the TS
+// CALL_GRAPH_CACHE_VERSION bump).
+const GRAPH_VERSION: u32 = 7;
 const GRAPH_FILE_NAME: &str = "callgraph-relations.tsv";
 const GRAPH_SYMBOL_FILE_NAME: &str = "callgraph-symbols.tsv";
 const GRAPH_COUNT_FILE_NAME: &str = "callgraph-counts.tsv";
@@ -3751,6 +3757,7 @@ pub fn update_graph_native(
         &import_facts,
         &type_facts,
         &function_return_facts,
+        None, // full-incremental / compaction path reads importer symbols per-file
     )?;
     if probe {
         eprintln!(
@@ -4247,6 +4254,72 @@ pub fn update_graph_native(
     result
 }
 
+/// Parse one file into its `FileGraph` for the overlay edit path, applying the
+/// same source-file guards as a full rebuild (skip non-source / extension-state /
+/// excluded / oversized / binary files). Returns `None` when the path is skipped.
+/// Used for both the changed files and the re-parsed affected importers — an
+/// importer's on-disk content is unchanged by an edit elsewhere, so a fresh parse
+/// is byte-identical to its stored symbols/sites (position-independent ids) yet far
+/// cheaper than scanning the 128 by-id symbol shards + whole ref-site shards.
+fn parse_overlay_file(
+    workspace_root: &Path,
+    path: &Path,
+    config: &EngineConfig,
+) -> io::Result<Option<FileGraph>> {
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    };
+    let Ok(metadata) = fs::metadata(&abs_path) else {
+        return Ok(None);
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let rel_path =
+        normalize_graph_rel_path(abs_path.strip_prefix(workspace_root).unwrap_or(&abs_path));
+    if !is_graph_source_path(&rel_path) {
+        return Ok(None);
+    }
+    if rel_path
+        .split('/')
+        .any(|segment| config.is_extension_state_dir_name(segment))
+    {
+        return Ok(None);
+    }
+    if config.is_excluded_normalized_relative_path(&rel_path) {
+        return Ok(None);
+    }
+    if metadata.len() > config.max_file_size_bytes || config.is_binary_extension(&abs_path) {
+        return Ok(None);
+    }
+    let bytes = match read_file_bytes_with_limit_if_not_binary(
+        &abs_path,
+        config.max_file_size_bytes,
+        Some(metadata.len()),
+    )? {
+        ReadTextBytesOutcome::Text(bytes) => bytes,
+        _ => return Ok(None),
+    };
+    let (text, encoding) = decode_bytes(&bytes);
+    let modified_unix_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let entry = CorpusEntry {
+        rel_path,
+        abs_path,
+        text,
+        size_bytes: metadata.len(),
+        modified_unix_secs,
+        encoding,
+    };
+    Ok(Some(build_file_graph(&entry)))
+}
+
 /// FAST incremental edit path (LSM overlay). Parses + lazy-resolves ONLY the
 /// changed + affected files (O(edit)), then writes a small delta overlay
 /// (`graph_overlay`) instead of rewriting the canonical base index — which
@@ -4347,61 +4420,13 @@ pub fn overlay_update_graph_native(
         read_facts_excluding_paths(workspace_root, config, &exclude_paths, &prior_file_table)?;
     if probe { eprintln!("[overlay] read_facts={}ms", t.elapsed().as_millis()); }
     for path in changed_paths {
-        let abs_path = if path.is_absolute() {
-            path.clone()
-        } else {
-            workspace_root.join(path)
-        };
-        let Ok(metadata) = fs::metadata(&abs_path) else { continue };
-        if !metadata.is_file() {
-            continue;
+        if let Some(graph) = parse_overlay_file(workspace_root, path, config)? {
+            changed_full_symbols.extend(graph.symbols);
+            changed_ref_sites.extend(graph.ref_sites);
+            import_facts.extend(graph.import_facts);
+            type_facts.extend(graph.type_facts);
+            function_return_facts.extend(graph.function_return_facts);
         }
-        let rel_path =
-            normalize_graph_rel_path(abs_path.strip_prefix(workspace_root).unwrap_or(&abs_path));
-        if !is_graph_source_path(&rel_path) {
-            continue;
-        }
-        if rel_path
-            .split('/')
-            .any(|segment| config.is_extension_state_dir_name(segment))
-        {
-            continue;
-        }
-        if config.is_excluded_normalized_relative_path(&rel_path) {
-            continue;
-        }
-        if metadata.len() > config.max_file_size_bytes || config.is_binary_extension(&abs_path) {
-            continue;
-        }
-        let bytes = match read_file_bytes_with_limit_if_not_binary(
-            &abs_path,
-            config.max_file_size_bytes,
-            Some(metadata.len()),
-        )? {
-            ReadTextBytesOutcome::Text(bytes) => bytes,
-            _ => continue,
-        };
-        let (text, encoding) = decode_bytes(&bytes);
-        let modified_unix_secs = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .map(|value| value.as_secs())
-            .unwrap_or(0);
-        let entry = CorpusEntry {
-            rel_path: rel_path.clone(),
-            abs_path,
-            text,
-            size_bytes: metadata.len(),
-            modified_unix_secs,
-            encoding,
-        };
-        let graph = build_file_graph(&entry);
-        changed_full_symbols.extend(graph.symbols);
-        changed_ref_sites.extend(graph.ref_sites);
-        import_facts.extend(graph.import_facts);
-        type_facts.extend(graph.type_facts);
-        function_return_facts.extend(graph.function_return_facts);
     }
 
     // ---- hierarchy facts from the per-file sidecar (+ changed files') ----
@@ -4417,23 +4442,52 @@ pub fn overlay_update_graph_native(
     };
 
     // ---- affected (importer) files via import propagation ----
-    // A file is "affected" (must be re-resolved) if it imports a name that a
-    // changed file defines AND that import actually targets a changed file.
+    // A file is "affected" (must be re-resolved) only if it imports a name whose
+    // SYMBOL ID actually changed in this edit. With position-independent ids (see
+    // `stable_symbol_id`) a body edit leaves every id untouched, so importers see
+    // identical target ids and need NO re-resolution — the affected set collapses
+    // to just the edited files (O(edit)). The changed names are found by diffing
+    // the changed/deleted files' PRIOR ids (compact sidecar, only those files'
+    // shards) against the freshly parsed ids, per name: a name is "changed" iff its
+    // id-set differs (a symbol added / removed / renamed / kind-changed).
+    //
+    // Each changed name then gets the module-qualified tightening:
     // `module_candidates` are the resolver's own rel_path candidates for the
-    // import's module (e.g. "pkg/a.py", "pkg/a/__init__.py"), so an import whose
-    // candidates are non-empty but include NO changed file definitely imports
-    // that name from elsewhere — skip it. This drops the name-only over-match
-    // that made common-named definitions (a migration's `name`/`to`/`field`/
-    // `Migration` kwargs-parsed-as-symbols) pull in hundreds of false importers.
-    // Imports with NO candidates (can't tell — unique-name / fallback resolution)
-    // keep the conservative name-only match so a real importer is never missed.
-    // Overlay-path only: an excluded file does not reference a changed symbol, so
-    // its refs are unchanged either way — the full compaction path is untouched.
-    let new_symbol_names: HashSet<String> =
-        changed_full_symbols.iter().map(|s| s.name.clone()).collect();
+    // import's module (e.g. "pkg/a.py", "pkg/a/__init__.py"); an import whose
+    // candidates are non-empty but include NO changed file definitely imports that
+    // name from elsewhere, so skip it. Imports with NO candidates (unique-name /
+    // fallback resolution) keep the conservative match so a real importer is never
+    // missed. Overlay-path only — the full compaction path is untouched.
+    let prior_compact =
+        read_compact_syms_for_paths(workspace_root, config, &prior_file_table, &exclude_paths)?;
+    let mut old_ids_by_name: HashMap<String, HashSet<u64>> = HashMap::new();
+    for cs in &prior_compact {
+        old_ids_by_name
+            .entry(cs.name.to_string())
+            .or_default()
+            .insert(cs.id_u64);
+    }
+    let mut new_ids_by_name: HashMap<String, HashSet<u64>> = HashMap::new();
+    for sym in &changed_full_symbols {
+        new_ids_by_name
+            .entry(sym.name.clone())
+            .or_default()
+            .insert(sym.id_u64);
+    }
+    let mut changed_names: HashSet<String> = HashSet::new();
+    for (name, old_ids) in &old_ids_by_name {
+        if new_ids_by_name.get(name) != Some(old_ids) {
+            changed_names.insert(name.clone());
+        }
+    }
+    for (name, new_ids) in &new_ids_by_name {
+        if old_ids_by_name.get(name) != Some(new_ids) {
+            changed_names.insert(name.clone());
+        }
+    }
     let mut affected_paths: HashSet<String> = exclude_paths.clone();
     for fact in &import_facts {
-        if !new_symbol_names.contains(&fact.imported_name)
+        if !changed_names.contains(&fact.imported_name)
             || exclude_paths.contains(&fact.rel_path)
         {
             continue;
@@ -4448,15 +4502,31 @@ pub fn overlay_update_graph_native(
         }
         affected_paths.insert(fact.rel_path.clone());
     }
-    let affected_ref_shards: HashSet<usize> =
-        affected_paths.iter().map(|p| shard_index_for_key(p)).collect();
-    let mut ref_sites = read_ref_sites_excluding_paths(
-        workspace_root,
-        config,
-        &exclude_paths,
-        &prior_file_table,
-        Some(&affected_ref_shards),
-    )?;
+    if probe {
+        eprintln!(
+            "[overlay] changed_names={} (prior_names={} fresh_names={})",
+            changed_names.len(),
+            old_ids_by_name.len(),
+            new_ids_by_name.len()
+        );
+    }
+    // Re-parse the affected importer files (affected ∖ changed) for BOTH their
+    // symbols (resolve candidates) and ref sites. An importer's on-disk content is
+    // unchanged by an edit elsewhere, so a fresh parse is byte-identical to the
+    // stored data (position-independent ids) yet avoids the two whole-shard reads
+    // that have no per-file seek: the 128 by-id symbol shards
+    // (`read_symbols_for_paths`) and the ref-site shards
+    // (`read_ref_sites_excluding_paths`). For a body edit there are no importers, so
+    // this is empty and only the changed files' own sites remain (truly O(edit)).
+    // It also matches the full-rebuild baseline exactly (both fresh-parse).
+    let mut importer_symbols: Vec<GraphSymbol> = Vec::new();
+    let mut ref_sites: Vec<RefSite> = Vec::new();
+    for rel in affected_paths.iter().filter(|p| !exclude_paths.contains(*p)) {
+        if let Some(graph) = parse_overlay_file(workspace_root, Path::new(rel.as_str()), config)? {
+            importer_symbols.extend(graph.symbols);
+            ref_sites.extend(graph.ref_sites);
+        }
+    }
     ref_sites.extend(std::mem::take(&mut changed_ref_sites));
     let affected_indices: Vec<u32> = ref_sites
         .iter()
@@ -4514,6 +4584,7 @@ pub fn overlay_update_graph_native(
         &aff_import_facts,
         &aff_type_facts,
         &aff_return_facts,
+        Some(&importer_symbols), // re-parsed affected importers (no 128-shard scan)
     )?;
     let mut intermediate = resolve_ref_sites_a_to_e(
         &resolve_candidates,
@@ -5760,15 +5831,26 @@ fn extract_brace_symbol_defs(
 
 fn materialize_symbols(symbol_defs: Vec<SymbolDef>, line_count: u32) -> Vec<GraphSymbol> {
     let mut by_qualified_name: HashMap<String, String> = HashMap::new();
+    // Source-order occurrence index per (kind, qualified_name), so the rare
+    // duplicate name (overload stub + impl, property get/set) gets a distinct yet
+    // position-independent id. Drafts arrive in source order (single-pass parse).
+    let mut occurrence_by_key: HashMap<(String, String), u32> = HashMap::new();
     let mut symbols = Vec::with_capacity(symbol_defs.len());
     for draft in symbol_defs {
+        let occurrence = {
+            let slot = occurrence_by_key
+                .entry((draft.kind.clone(), draft.qualified_name.clone()))
+                .or_insert(0);
+            let value = *slot;
+            *slot += 1;
+            value
+        };
         let id = stable_symbol_id(
             &draft.language,
             &draft.rel_path,
             &draft.kind,
             &draft.qualified_name,
-            draft.start_line,
-            draft.start_column,
+            occurrence,
         );
         by_qualified_name.insert(draft.qualified_name.clone(), id.clone());
         let container_id = draft
@@ -13331,6 +13413,44 @@ fn load_symbol_compact(
     Ok(symbols)
 }
 
+/// Prior `CompactSym`s for the given (changed/deleted) files, read ONLY from the
+/// compact sidecar shards those files hash into — not the whole table (that is
+/// `load_symbol_compact`). The compact sidecar is file-sharded by `rel_path`, so a
+/// 1–2 file edit touches 1–2 shards. Feeds `overlay_update_graph_native`'s id-diff
+/// affected set (which imported names changed their symbol id?).
+fn read_compact_syms_for_paths(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    file_table: &FileTable,
+    paths: &HashSet<String>,
+) -> io::Result<Vec<CompactSym>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let shards: HashSet<usize> = paths.iter().map(|p| shard_index_for_key(p)).collect();
+    let mut out = Vec::new();
+    for shard in shards {
+        let path = graph_shard_path(
+            workspace_root,
+            config,
+            GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
+            shard,
+        );
+        if !path.exists() {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            let cs = parse_symbol_compact_binary(&bytes, &mut cursor, file_table)?;
+            if paths.contains(&*cs.rel_path) {
+                out.push(cs);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// B6 stage-5b: column twin of `write_ref_sites_by_file_shards`' full-rebuild
 /// parallel path. Serializes the 38M-site disk shard from `RefWriteCol` +
 /// receiver `name_id` column + interner instead of `&[RefSite]`, so the OV1
@@ -15163,6 +15283,11 @@ fn build_resolve_candidate_symbols(
     import_facts: &[ImportFact],
     type_facts: &[TypeFact],
     function_return_facts: &[FunctionReturnFact],
+    // Overlay path: the affected importers, already re-parsed from disk (their
+    // content is unchanged, so the fresh symbols are byte-identical to the by-id
+    // shards). When `Some`, used in place of the 128-shard `read_symbols_for_paths`
+    // scan. `None` → the full-incremental / compaction path reads them per-file.
+    prereaded_importer_symbols: Option<&[GraphSymbol]>,
 ) -> io::Result<Vec<GraphSymbol>> {
     let mut name_hashes: AHashSet<u64> = AHashSet::default();
     for &idx in affected_indices {
@@ -15214,18 +15339,30 @@ fn build_resolve_candidate_symbols(
             .filter(|s| affected_paths.contains(&s.rel_path))
             .cloned(),
     );
-    let importer_paths: HashSet<String> = affected_paths
-        .iter()
-        .filter(|p| !exclude_paths.contains(*p))
-        .cloned()
-        .collect();
-    if !importer_paths.is_empty() {
-        candidates.extend(read_symbols_for_paths(
-            workspace_root,
-            config,
-            prior_file_table,
-            &importer_paths,
-        )?);
+    match prereaded_importer_symbols {
+        // Overlay path: reuse the already re-parsed importer symbols (byte-identical
+        // to the shards) instead of the 128 by-id shard scan.
+        Some(syms) => candidates.extend(
+            syms.iter()
+                .filter(|s| affected_paths.contains(&s.rel_path))
+                .cloned(),
+        ),
+        // Full-incremental / compaction path: read the importers' symbols per-file.
+        None => {
+            let importer_paths: HashSet<String> = affected_paths
+                .iter()
+                .filter(|p| !exclude_paths.contains(*p))
+                .cloned()
+                .collect();
+            if !importer_paths.is_empty() {
+                candidates.extend(read_symbols_for_paths(
+                    workspace_root,
+                    config,
+                    prior_file_table,
+                    &importer_paths,
+                )?);
+            }
+        }
     }
     Ok(candidates)
 }
@@ -16728,15 +16865,28 @@ fn qualify_symbol_name(container_name: Option<&String>, name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+/// Position-INDEPENDENT symbol id. The id is a hash of the symbol's *identity*
+/// (language, file, kind, qualified name) plus an `occurrence` disambiguator —
+/// the 0-based index among same-`(kind, qualified_name)` symbols in the file, in
+/// source order. Crucially it does NOT encode line/column, so a body edit (which
+/// shifts positions but not identity or source order) leaves every symbol's id
+/// unchanged. That stability is what lets `overlay_update_graph_native` diff the
+/// changed file's prior vs fresh ids and skip re-resolving importers whose target
+/// ids did not move — turning a hub body edit from O(importers) into O(edit).
+///
+/// `occurrence` is 0 for the overwhelmingly common unique-name case; it only grows
+/// for genuinely duplicated `(kind, qualified_name)` within one file (an
+/// `@overload` stub plus its impl, a property getter/setter pair, a conditional
+/// `def`). Source order makes it stable under body edits; adding/removing an
+/// earlier duplicate shifts later ones, but that is a structural edit anyway.
 fn stable_symbol_id(
     language: &str,
     rel_path: &str,
     kind: &str,
     qualified_name: &str,
-    line: u32,
-    column: u32,
+    occurrence: u32,
 ) -> String {
-    let key = format!("{language}\0{rel_path}\0{kind}\0{qualified_name}\0{line}\0{column}");
+    let key = format!("{language}\0{rel_path}\0{kind}\0{qualified_name}\0{occurrence}");
     format!("sym:{:016x}", stable_hash(&key))
 }
 
