@@ -8,7 +8,8 @@ use std::time::Instant;
 
 use zoek_rs::config::EngineConfig;
 use zoek_rs::graph::{
-    dump_references_tsv, index_graph_from_tsv, query_graph, query_graph_callees,
+    compact_graph_overlay, dump_references_tsv, dump_references_with_overlay_tsv,
+    index_graph_from_tsv, overlay_update_graph_native, query_graph, query_graph_callees,
     query_graph_document_symbols_with_options, query_graph_implementations,
     query_graph_symbols_with_options, rebuild_graph_native, update_graph_native, GraphSymbol,
     GraphSymbolQueryOptions,
@@ -56,7 +57,10 @@ fn run(args: Vec<String>) -> Result<EngineResponse, String> {
         "graph-rebuild" => run_graph_rebuild(&args[1..]),
         "graph-index" => run_graph_index(&args[1..]),
         "graph-update" => run_graph_update(&args[1..]),
+        "graph-overlay-update" => run_graph_overlay_update(&args[1..]),
+        "graph-compact" => run_graph_compact(&args[1..]),
         "graph-dump-refs" => run_graph_dump_refs(&args[1..]),
+        "graph-overlay-dump" => run_graph_overlay_dump(&args[1..]),
         "graph-query" => run_graph_query(&args[1..]),
         "graph-callees" => run_graph_callees(&args[1..]),
         "graph-symbol-query" => run_graph_symbol_query(&args[1..]),
@@ -867,6 +871,169 @@ fn run_graph_dump_refs(args: &[String]) -> Result<EngineResponse, String> {
     let config = EngineConfig::for_workspace(&workspace_root);
     let n = dump_references_tsv(&workspace_root, &config, &out).map_err(|err| err.to_string())?;
     eprintln!("graph-dump-refs: wrote {n} references to {}", out.display());
+    std::process::exit(0);
+}
+
+/// FAST incremental edit (LSM overlay). Same argument shape as `graph-update`
+/// (`<ws> [--built-at MS] [--max-file-size N] [--workers N] [--delete PATH]…
+/// PATH…`) but writes a small delta overlay instead of rewriting the base.
+fn run_graph_overlay_update(args: &[String]) -> Result<EngineResponse, String> {
+    let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
+    let mut config = EngineConfig::for_workspace(&workspace_root);
+    let mut built_at_unix_ms = 0u64;
+    let mut max_file_size: Option<u64> = None;
+    let mut workers = 0usize;
+    let mut changed_paths = Vec::new();
+    let mut deleted_paths = Vec::new();
+    let mut idx = 1;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--built-at" => {
+                built_at_unix_ms = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--built-at requires a value".to_string())?
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid --built-at: {err}"))?;
+                idx += 2;
+            }
+            "--max-file-size" => {
+                max_file_size = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "--max-file-size requires a value".to_string())?
+                        .parse::<u64>()
+                        .map_err(|err| format!("invalid --max-file-size: {err}"))?,
+                );
+                idx += 2;
+            }
+            "--workers" => {
+                workers = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--workers requires a value".to_string())?
+                    .parse::<usize>()
+                    .map_err(|err| format!("invalid --workers: {err}"))?;
+                idx += 2;
+            }
+            "--exclude" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--exclude requires a value".to_string())?;
+                config.add_exclude_pattern(value.clone());
+                idx += 2;
+            }
+            "--delete" => {
+                deleted_paths.push(PathBuf::from(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "--delete requires a path".to_string())?,
+                ));
+                idx += 2;
+            }
+            other => {
+                changed_paths.push(PathBuf::from(other));
+                idx += 1;
+            }
+        }
+    }
+    if let Some(limit) = max_file_size {
+        config.max_file_size_bytes = if limit == 0 { u64::MAX } else { limit };
+    }
+    let summary = overlay_update_graph_native(
+        &workspace_root,
+        &changed_paths,
+        &deleted_paths,
+        built_at_unix_ms,
+        &config,
+        workers,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(EngineResponse::GraphIndex(GraphIndexResponse {
+        ok: true,
+        engine: EngineInfo::current(),
+        workspace_root: summary.workspace_root,
+        index_path: summary.index_path,
+        indexed_at_unix_secs: summary.indexed_at_unix_secs,
+        built_at_unix_ms: summary.built_at_unix_ms,
+        file_count: summary.file_count,
+        symbol_count: summary.symbol_count,
+        reference_count: summary.reference_count,
+        bytes: summary.bytes,
+        warnings: vec!["updated by rust-native graph-overlay-update".to_string()],
+    }))
+}
+
+/// COMPACTION: fold the delta overlay into the base, then clear the overlay.
+/// `<ws> [--built-at MS] [--workers N]`. Run on idle (off the edit critical
+/// path). Picks a NEW builtAt (the base advances); the extension refreshes its
+/// cached builtAt from the response.
+fn run_graph_compact(args: &[String]) -> Result<EngineResponse, String> {
+    let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
+    let mut config = EngineConfig::for_workspace(&workspace_root);
+    let mut built_at_unix_ms = 0u64;
+    let mut max_file_size: Option<u64> = None;
+    let mut workers = 0usize;
+    let mut idx = 1;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--built-at" => {
+                built_at_unix_ms = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--built-at requires a value".to_string())?
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid --built-at: {err}"))?;
+                idx += 2;
+            }
+            "--max-file-size" => {
+                max_file_size = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "--max-file-size requires a value".to_string())?
+                        .parse::<u64>()
+                        .map_err(|err| format!("invalid --max-file-size: {err}"))?,
+                );
+                idx += 2;
+            }
+            "--workers" => {
+                workers = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--workers requires a value".to_string())?
+                    .parse::<usize>()
+                    .map_err(|err| format!("invalid --workers: {err}"))?;
+                idx += 2;
+            }
+            other => return Err(format!("unknown graph-compact flag: {other}")),
+        }
+    }
+    if let Some(limit) = max_file_size {
+        config.max_file_size_bytes = if limit == 0 { u64::MAX } else { limit };
+    }
+    let summary = compact_graph_overlay(&workspace_root, built_at_unix_ms, &config, workers)
+        .map_err(|err| err.to_string())?;
+    Ok(EngineResponse::GraphIndex(GraphIndexResponse {
+        ok: true,
+        engine: EngineInfo::current(),
+        workspace_root: summary.workspace_root,
+        index_path: summary.index_path,
+        indexed_at_unix_secs: summary.indexed_at_unix_secs,
+        built_at_unix_ms: summary.built_at_unix_ms,
+        file_count: summary.file_count,
+        symbol_count: summary.symbol_count,
+        reference_count: summary.reference_count,
+        bytes: summary.bytes,
+        warnings: vec!["compacted rust-native graph overlay".to_string()],
+    }))
+}
+
+/// Dump the overlay-MERGED reference set (base + overlay) to a TSV, comparable
+/// to `graph-dump-refs` (which dumps base only). Verification helper.
+fn run_graph_overlay_dump(args: &[String]) -> Result<EngineResponse, String> {
+    let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
+    let out = PathBuf::from(
+        args.get(1)
+            .cloned()
+            .ok_or_else(|| "graph-overlay-dump requires an output path".to_string())?,
+    );
+    let config = EngineConfig::for_workspace(&workspace_root);
+    let n = dump_references_with_overlay_tsv(&workspace_root, &config, &out)
+        .map_err(|err| err.to_string())?;
+    eprintln!("graph-overlay-dump: wrote {n} merged references to {}", out.display());
     std::process::exit(0);
 }
 

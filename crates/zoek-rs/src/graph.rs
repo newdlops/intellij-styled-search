@@ -256,6 +256,8 @@ const GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX: &str = "callgraph-hierarchy-fa
 const GRAPH_TOKEN_SHAPE_SHARD_PREFIX: &str = "callgraph-token-shape-by-key";
 const GRAPH_FILE_TABLE_NAME: &str = "callgraph-file-table.bin";
 const GRAPH_SHARD_COUNT: usize = 128;
+// Per-source-file EXACT-scoped outgoing-target tally (overlay count deltas).
+const GRAPH_OUTGOING_TALLY_BY_FILE_SHARD_PREFIX: &str = "callgraph-outgoing-tally-by-file";
 
 const BOUND_MAY: u8 = 0b0001;
 const BOUND_MUST: u8 = 0b0010;
@@ -1996,6 +1998,67 @@ pub fn dump_references_tsv(
     Ok(lines.len())
 }
 
+/// Dump the OVERLAY-MERGED reference set (base + overlay, replacement-by-file),
+/// line-comparable to `dump_references_tsv`. This mirrors the query-time merge
+/// exactly so the verification harness can diff merged-vs-full-rebuild:
+///   * a base EXACT ref is dropped if its source file is superseded by the
+///     overlay (the overlay re-supplies it);
+///   * base TOKEN-SHAPE refs are kept even for superseded files (v1 leaves
+///     token-shape in the base, refreshed at compaction — see `graph_overlay`);
+///   * the overlay's own exact refs are added.
+/// The EXACT-provenance lines must match a full rebuild; token-shape lines may
+/// differ until the next compaction (the existing gate tolerates token-shape).
+pub fn dump_references_with_overlay_tsv(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    out_path: &Path,
+) -> io::Result<usize> {
+    let file_table_path = graph_file_table_path(workspace_root, config);
+    let file_table = if file_table_path.exists() {
+        read_file_table_binary(&file_table_path).unwrap_or_default()
+    } else {
+        FileTable::default()
+    };
+    let base_built_at =
+        read_built_at_unix_ms(&graph_manifest_path(workspace_root, config)).unwrap_or(0);
+    let overlay =
+        crate::graph_overlay::GraphOverlay::load_valid(workspace_root, config, base_built_at);
+    let ref_superseded = overlay.ref_superseded();
+
+    let empty: HashSet<String> = HashSet::default();
+    let base_refs = read_references_excluding_paths(&file_table, workspace_root, config, &empty)?;
+    let fmt = |r: &GraphReference| {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            &*r.rel_path,
+            r.start_line,
+            r.start_column,
+            r.target_symbol_id.as_deref().unwrap_or(""),
+            &*r.provenance,
+            &*r.confidence,
+        )
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for r in &base_refs {
+        let is_token_shape = r.provenance.as_ref() == "token-shape";
+        if !is_token_shape && ref_superseded.contains(&*r.rel_path) {
+            continue;
+        }
+        lines.push(fmt(r));
+    }
+    for r in overlay.live_refs() {
+        lines.push(fmt(r));
+    }
+    lines.sort_unstable();
+    let mut out = String::with_capacity(lines.len().saturating_mul(48));
+    for l in &lines {
+        out.push_str(l);
+        out.push('\n');
+    }
+    std::fs::write(out_path, out)?;
+    Ok(lines.len())
+}
+
 fn read_symbols_excluding_paths(
     workspace_root: &Path,
     config: &EngineConfig,
@@ -3389,6 +3452,12 @@ where
             summary.file_count, summary.symbol_count, summary.reference_count
         ),
     });
+    // Post-build pass: the per-source-file scoped outgoing tally that the overlay
+    // edit path needs for exact count deltas. Best-effort — a failure here must
+    // not fail the rebuild (the overlay degrades to base-only counts).
+    if let Err(err) = build_and_write_outgoing_tally(workspace_root, config) {
+        eprintln!("[graph-rebuild] outgoing-tally build skipped: {err}");
+    }
     Ok(summary)
 }
 
@@ -4178,6 +4247,560 @@ pub fn update_graph_native(
     result
 }
 
+/// FAST incremental edit path (LSM overlay). Parses + lazy-resolves ONLY the
+/// changed + affected files (O(edit)), then writes a small delta overlay
+/// (`graph_overlay`) instead of rewriting the canonical base index — which
+/// `update_graph_native` does and costs O(total index size) (~54s on captain).
+///
+/// The base shards and the base `callgraph-manifest.json` (incl. its
+/// `builtAtUnixMs`) are left UNTOUCHED, so the extension's `--built-at` guard
+/// keeps matching. Queries merge base + overlay (replacement-by-file, see
+/// `graph_overlay`); `graph-compact` folds the overlay into the base on idle.
+///
+/// What it deliberately does NOT do (the O(total) phases `update_graph_native`
+/// pays): no `partition_prior_references_streaming` (the 9s carry read), no
+/// full resolve, no token-shape tally load/emit, no `write_store` shard rewrite.
+/// Token-shape ("possible") refs and usage counts stay at their base values and
+/// are refreshed at compaction; the overlay carries the exact resolved graph
+/// (the correctness-critical part) for the edited/affected files.
+///
+/// Falls back to `update_graph_native` (the full path, which also builds the v3
+/// sidecars the lazy resolve needs) when those sidecars are absent or there is
+/// no base manifest yet (bootstrap).
+pub fn overlay_update_graph_native(
+    workspace_root: &Path,
+    changed_paths: &[PathBuf],
+    deleted_paths: &[PathBuf],
+    built_at_unix_ms: u64,
+    config: &EngineConfig,
+    worker_count: usize,
+) -> io::Result<GraphIndexSummary> {
+    use crate::graph_overlay::{GraphOverlay, GraphOverlayEntry, GraphOverlayEntryKind};
+    apply_memory_cap();
+    let _graph_lock = acquire_graph_lock(workspace_root)?;
+    let probe = std::env::var("ZOEK_FLOW_PROBE").is_ok();
+    let t_total = std::time::Instant::now();
+
+    let manifest_path = graph_manifest_path(workspace_root, config);
+    let base_built_at = read_built_at_unix_ms(&manifest_path).unwrap_or(0);
+
+    // Without the v3 sidecars the lazy resolve cannot run, and without a base
+    // manifest there is nothing to overlay — fall back to the full path (which
+    // builds the sidecars). Same gate as update_graph_native.
+    let sidecars_ready = graph_shard_family_available(
+        workspace_root,
+        config,
+        GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX,
+    ) && graph_shard_family_available(workspace_root, config, GRAPH_FACTS_BY_FILE_SHARD_PREFIX)
+        && graph_shard_family_available(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX)
+        && graph_shard_family_available(workspace_root, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX)
+        && graph_shard_family_available(
+            workspace_root,
+            config,
+            GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX,
+        )
+        && graph_shard_family_available(
+            workspace_root,
+            config,
+            GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX,
+        );
+    if !sidecars_ready || base_built_at == 0 {
+        if probe {
+            eprintln!(
+                "[overlay] fallback to full update_graph_native (sidecars_ready={} base_built_at={})",
+                sidecars_ready, base_built_at
+            );
+        }
+        drop(_graph_lock);
+        return update_graph_native(
+            workspace_root,
+            changed_paths,
+            deleted_paths,
+            built_at_unix_ms,
+            config,
+            worker_count,
+        );
+    }
+
+    let normalize = |path: &PathBuf| -> String {
+        normalize_graph_rel_path(path.strip_prefix(workspace_root).unwrap_or(path))
+    };
+    let exclude_paths: HashSet<String> = changed_paths
+        .iter()
+        .chain(deleted_paths.iter())
+        .map(normalize)
+        .collect();
+    let deleted_rel: HashSet<String> = deleted_paths.iter().map(normalize).collect();
+
+    let file_table_path = graph_file_table_path(workspace_root, config);
+    let prior_file_table = if file_table_path.exists() {
+        read_file_table_binary(&file_table_path).unwrap_or_default()
+    } else {
+        FileTable::default()
+    };
+
+    // ---- parse the changed files (O(edit)) ----
+    let mut changed_full_symbols: Vec<GraphSymbol> = Vec::new();
+    let mut changed_ref_sites: Vec<RefSite> = Vec::new();
+    let t = std::time::Instant::now();
+    let (mut import_facts, mut type_facts, mut function_return_facts) =
+        read_facts_excluding_paths(workspace_root, config, &exclude_paths, &prior_file_table)?;
+    if probe { eprintln!("[overlay] read_facts={}ms", t.elapsed().as_millis()); }
+    for path in changed_paths {
+        let abs_path = if path.is_absolute() {
+            path.clone()
+        } else {
+            workspace_root.join(path)
+        };
+        let Ok(metadata) = fs::metadata(&abs_path) else { continue };
+        if !metadata.is_file() {
+            continue;
+        }
+        let rel_path =
+            normalize_graph_rel_path(abs_path.strip_prefix(workspace_root).unwrap_or(&abs_path));
+        if !is_graph_source_path(&rel_path) {
+            continue;
+        }
+        if rel_path
+            .split('/')
+            .any(|segment| config.is_extension_state_dir_name(segment))
+        {
+            continue;
+        }
+        if config.is_excluded_normalized_relative_path(&rel_path) {
+            continue;
+        }
+        if metadata.len() > config.max_file_size_bytes || config.is_binary_extension(&abs_path) {
+            continue;
+        }
+        let bytes = match read_file_bytes_with_limit_if_not_binary(
+            &abs_path,
+            config.max_file_size_bytes,
+            Some(metadata.len()),
+        )? {
+            ReadTextBytesOutcome::Text(bytes) => bytes,
+            _ => continue,
+        };
+        let (text, encoding) = decode_bytes(&bytes);
+        let modified_unix_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_secs())
+            .unwrap_or(0);
+        let entry = CorpusEntry {
+            rel_path: rel_path.clone(),
+            abs_path,
+            text,
+            size_bytes: metadata.len(),
+            modified_unix_secs,
+            encoding,
+        };
+        let graph = build_file_graph(&entry);
+        changed_full_symbols.extend(graph.symbols);
+        changed_ref_sites.extend(graph.ref_sites);
+        import_facts.extend(graph.import_facts);
+        type_facts.extend(graph.type_facts);
+        function_return_facts.extend(graph.function_return_facts);
+    }
+
+    // ---- hierarchy facts from the per-file sidecar (+ changed files') ----
+    let hierarchy_facts = {
+        let changed_file_ids: HashSet<u32> = exclude_paths
+            .iter()
+            .filter_map(|p| prior_file_table.get_id(p))
+            .collect();
+        let mut facts =
+            load_hierarchy_facts_from_sidecar(workspace_root, config, Some(&changed_file_ids))?;
+        facts.extend(hierarchy_facts_from_symbols(&changed_full_symbols));
+        facts
+    };
+
+    // ---- affected (importer) files via import propagation ----
+    // A file is "affected" (must be re-resolved) if it imports a name that a
+    // changed file defines AND that import actually targets a changed file.
+    // `module_candidates` are the resolver's own rel_path candidates for the
+    // import's module (e.g. "pkg/a.py", "pkg/a/__init__.py"), so an import whose
+    // candidates are non-empty but include NO changed file definitely imports
+    // that name from elsewhere — skip it. This drops the name-only over-match
+    // that made common-named definitions (a migration's `name`/`to`/`field`/
+    // `Migration` kwargs-parsed-as-symbols) pull in hundreds of false importers.
+    // Imports with NO candidates (can't tell — unique-name / fallback resolution)
+    // keep the conservative name-only match so a real importer is never missed.
+    // Overlay-path only: an excluded file does not reference a changed symbol, so
+    // its refs are unchanged either way — the full compaction path is untouched.
+    let new_symbol_names: HashSet<String> =
+        changed_full_symbols.iter().map(|s| s.name.clone()).collect();
+    let mut affected_paths: HashSet<String> = exclude_paths.clone();
+    for fact in &import_facts {
+        if !new_symbol_names.contains(&fact.imported_name)
+            || exclude_paths.contains(&fact.rel_path)
+        {
+            continue;
+        }
+        if !fact.module_candidates.is_empty()
+            && !fact
+                .module_candidates
+                .iter()
+                .any(|m| exclude_paths.contains(m))
+        {
+            continue; // import definitely resolves to a non-changed module
+        }
+        affected_paths.insert(fact.rel_path.clone());
+    }
+    let affected_ref_shards: HashSet<usize> =
+        affected_paths.iter().map(|p| shard_index_for_key(p)).collect();
+    let mut ref_sites = read_ref_sites_excluding_paths(
+        workspace_root,
+        config,
+        &exclude_paths,
+        &prior_file_table,
+        Some(&affected_ref_shards),
+    )?;
+    ref_sites.extend(std::mem::take(&mut changed_ref_sites));
+    let affected_indices: Vec<u32> = ref_sites
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, site)| {
+            if affected_paths.contains(&*site.rel_path) {
+                Some(idx as u32)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if probe {
+        eprintln!(
+            "[overlay] affected_paths={} affected_indices={} ref_sites={}",
+            affected_paths.len(),
+            affected_indices.len(),
+            ref_sites.len()
+        );
+    }
+
+    // ---- lazy-resolve ONLY the affected sites (reuse v3) ----
+    // The resolver builds its fact-based maps (import_targets / types_by_name /
+    // return-of) over EVERY fact handed in. An affected site only ever consults
+    // its OWN file's facts, so filter to the affected files first — `read_facts`
+    // loaded all 137K files' facts for the `affected_paths` computation above,
+    // and feeding that whole set to the resolver is a fixed O(total-facts)
+    // map-build that dominates the floor of a low-fanout edit. (This is an
+    // overlay-path-only narrowing; the full `update_graph_native` is unchanged.)
+    let aff_import_facts: Vec<ImportFact> = import_facts
+        .iter()
+        .filter(|f| affected_paths.contains(&f.rel_path))
+        .cloned()
+        .collect();
+    let aff_type_facts: Vec<TypeFact> = type_facts
+        .iter()
+        .filter(|f| affected_paths.contains(&f.rel_path))
+        .cloned()
+        .collect();
+    let aff_return_facts: Vec<FunctionReturnFact> = function_return_facts
+        .iter()
+        .filter(|f| affected_paths.contains(&f.rel_path))
+        .cloned()
+        .collect();
+    let t = std::time::Instant::now();
+    let resolve_candidates = build_resolve_candidate_symbols(
+        workspace_root,
+        config,
+        &prior_file_table,
+        &changed_full_symbols,
+        &exclude_paths,
+        &ref_sites,
+        &affected_indices,
+        &affected_paths,
+        &aff_import_facts,
+        &aff_type_facts,
+        &aff_return_facts,
+    )?;
+    let mut intermediate = resolve_ref_sites_a_to_e(
+        &resolve_candidates,
+        &ref_sites,
+        Some(&affected_indices),
+        &aff_import_facts,
+        &aff_type_facts,
+        &aff_return_facts,
+        &hierarchy_facts,
+        None,
+        None,
+        false,
+        None,
+    );
+    // target id_u64 → its source root, for scoping the overlay's count
+    // contributions (usage_likely counts only same-root refs). Built from the
+    // resolve candidates (cross-file targets) + the changed files' fresh symbols
+    // — covers every target the new refs can point to. Built before the
+    // candidates are dropped.
+    let mut scope_by_target: AHashMap<u64, Box<str>> = AHashMap::default();
+    for s in resolve_candidates.iter().chain(changed_full_symbols.iter()) {
+        if let Some(u) = parse_stable_symbol_id_to_u64(&s.id) {
+            scope_by_target
+                .entry(u)
+                .or_insert_with(|| source_scope_key(&s.rel_path).into());
+        }
+    }
+    drop(resolve_candidates);
+    if probe { eprintln!("[overlay] resolve={}ms", t.elapsed().as_millis()); }
+
+    // ---- assemble the NEW exact refs (drop token-shape; mirrors update_graph_native) ----
+    let mut new_exact_refs: Vec<GraphReference> = std::mem::take(&mut intermediate.references);
+    for path in std::mem::take(&mut intermediate.reference_partials) {
+        let bytes = fs::read(&path)?;
+        let _ = fs::remove_file(&path);
+        let batch: Vec<GraphReference> = bincode::deserialize(&bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("overlay spill: {e}")))?;
+        new_exact_refs.extend(
+            batch
+                .into_iter()
+                .filter(|r| r.provenance.as_ref() != "token-shape"),
+        );
+    }
+    for light in &intermediate.light_references {
+        if light.provenance == LightProvenance::TokenShape {
+            continue;
+        }
+        let site = &ref_sites[light.site_idx as usize];
+        if affected_paths.contains(&*site.rel_path) {
+            new_exact_refs.push(materialize_light_ref(light, &ref_sites));
+        }
+    }
+
+    // ---- group by source file → per-file overlay entries ----
+    let mut refs_by_file: HashMap<String, Vec<GraphReference>> = HashMap::default();
+    for r in new_exact_refs {
+        refs_by_file.entry(r.rel_path.to_string()).or_default().push(r);
+    }
+    let mut syms_by_file: HashMap<String, Vec<GraphSymbol>> = HashMap::default();
+    for s in changed_full_symbols {
+        syms_by_file.entry(s.rel_path.clone()).or_default().push(s);
+    }
+
+    // EXACT-scoped per-target contribution of one file's refs (for count deltas).
+    let scoped_contrib = |refs: &[GraphReference]| -> std::collections::BTreeMap<u64, (u32, u32)> {
+        let mut m: std::collections::BTreeMap<u64, (u32, u32)> = std::collections::BTreeMap::new();
+        for r in refs {
+            let Some(t) = r
+                .target_symbol_id
+                .as_deref()
+                .and_then(parse_stable_symbol_id_to_u64)
+            else {
+                continue;
+            };
+            let Some(root) = scope_by_target.get(&t) else {
+                continue;
+            };
+            if source_scope_key(&r.rel_path) != &**root {
+                continue;
+            }
+            let e = m.entry(t).or_insert((0, 0));
+            e.0 += 1;
+            if matches!(r.edge_kind.as_ref(), "call" | "construct") {
+                e.1 += 1;
+            }
+        }
+        m
+    };
+
+    let mut overlay = GraphOverlay::load_valid(workspace_root, config, base_built_at);
+    // Changed (non-deleted) files: supersede base refs + symbols.
+    for rel in exclude_paths.iter().filter(|r| !deleted_rel.contains(*r)) {
+        let refs = refs_by_file.remove(rel).unwrap_or_default();
+        let contrib = scoped_contrib(&refs);
+        overlay.upsert(
+            rel,
+            GraphOverlayEntry {
+                kind: GraphOverlayEntryKind::Changed,
+                refs,
+                symbols: syms_by_file.remove(rel).unwrap_or_default(),
+                contrib,
+            },
+        );
+    }
+    // Deleted files: tombstone (supersede base refs + symbols, supply neither).
+    for rel in &deleted_rel {
+        overlay.upsert_tombstone(rel, GraphOverlayEntryKind::Deleted);
+    }
+    // Affected (importer) files: supersede base refs only (symbols unchanged).
+    for rel in affected_paths.iter().filter(|r| !exclude_paths.contains(*r)) {
+        let refs = refs_by_file.remove(rel).unwrap_or_default();
+        let contrib = scoped_contrib(&refs);
+        overlay.upsert(
+            rel,
+            GraphOverlayEntry {
+                kind: GraphOverlayEntryKind::AffectedRefs,
+                refs,
+                symbols: Vec::new(),
+                contrib,
+            },
+        );
+    }
+
+    // Recompute per-target count deltas = current overlay contribution − base
+    // tally over the overlay's files (recomputed from ALL entries each edit so
+    // chained edits stay correct). Empty when the tally sidecar is absent
+    // (graceful degrade → base counts until the next compaction builds it).
+    let overlay_files: HashSet<String> = overlay.entries.keys().cloned().collect();
+    let base_contrib = load_outgoing_tally_for_files(workspace_root, config, &overlay_files)?;
+    let current = overlay.total_contrib();
+    let mut count_deltas: std::collections::BTreeMap<u64, (i64, i64)> =
+        std::collections::BTreeMap::new();
+    for (&t, &n) in &current {
+        let o = base_contrib.get(&t).copied().unwrap_or((0, 0));
+        let d = (n.0 - o.0, n.1 - o.1);
+        if d != (0, 0) {
+            count_deltas.insert(t, d);
+        }
+    }
+    for (&t, &o) in &base_contrib {
+        if !current.contains_key(&t) && o != (0, 0) {
+            count_deltas.insert(t, (-o.0, -o.1));
+        }
+    }
+    overlay.count_deltas = count_deltas;
+    overlay.updated_unix_secs = unix_secs_now();
+    overlay.save(workspace_root, config)?;
+    if probe {
+        eprintln!(
+            "[overlay] wrote overlay entries={} refs={} total={}ms",
+            overlay.entry_count(),
+            overlay.ref_count(),
+            t_total.elapsed().as_millis()
+        );
+    }
+
+    // Synthetic summary: builtAt is preserved (base, unchanged) so the TS guard
+    // matches; counts echo the base manifest (the overlay does not recompute base
+    // totals — compaction does).
+    let manifest_text = fs::read_to_string(&manifest_path).unwrap_or_default();
+    Ok(GraphIndexSummary {
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        index_path: config
+            .index_root(workspace_root)
+            .join(GRAPH_FILE_NAME)
+            .to_string_lossy()
+            .into_owned(),
+        indexed_at_unix_secs: unix_secs_now(),
+        built_at_unix_ms: base_built_at,
+        file_count: json_u64_field(&manifest_text, "fileCount").unwrap_or(0) as usize,
+        symbol_count: json_u64_field(&manifest_text, "symbolCount").unwrap_or(0) as usize,
+        reference_count: json_u64_field(&manifest_text, "referenceCount").unwrap_or(0) as usize,
+        bytes: json_u64_field(&manifest_text, "bytes").unwrap_or(0),
+    })
+}
+
+/// Synthesize a `GraphIndexSummary` from the on-disk base manifest (used when
+/// there is nothing to do).
+fn base_graph_summary(workspace_root: &Path, config: &EngineConfig) -> GraphIndexSummary {
+    let manifest_path = graph_manifest_path(workspace_root, config);
+    let manifest_text = fs::read_to_string(&manifest_path).unwrap_or_default();
+    GraphIndexSummary {
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        index_path: config
+            .index_root(workspace_root)
+            .join(GRAPH_FILE_NAME)
+            .to_string_lossy()
+            .into_owned(),
+        indexed_at_unix_secs: unix_secs_now(),
+        built_at_unix_ms: read_built_at_unix_ms(&manifest_path).unwrap_or(0),
+        file_count: json_u64_field(&manifest_text, "fileCount").unwrap_or(0) as usize,
+        symbol_count: json_u64_field(&manifest_text, "symbolCount").unwrap_or(0) as usize,
+        reference_count: json_u64_field(&manifest_text, "referenceCount").unwrap_or(0) as usize,
+        bytes: json_u64_field(&manifest_text, "bytes").unwrap_or(0),
+    }
+}
+
+/// COMPACTION: fold the delta overlay back into the canonical base index, then
+/// clear the overlay. This is the heavy (~O(total)) job — run it OFF the edit's
+/// critical path (the extension schedules it on idle), never inline in
+/// `overlay_update_graph_native`.
+///
+/// Mechanism: feed the overlay's changed + deleted files to `update_graph_native`
+/// (which re-resolves them TOGETHER against the current base, producing an index
+/// byte-identical to a full rebuild of the edited state — this also fixes the
+/// cross-edit resolution staleness the overlay tolerates between compactions),
+/// then clear the overlay.
+///
+/// Crash-safety: `update_graph_native` rewrites base shards + restamps the
+/// manifest atomically FIRST; the overlay is cleared LAST. A crash in between
+/// leaves base(with edits) + overlay(same edits); the replacement-by-file query
+/// merge makes that idempotent (the edits are not double-counted), and the next
+/// compaction retries. A concurrent overlay-update landing during the fold is
+/// detected via `updated_unix_secs` and the overlay is left in place (its folded
+/// entries re-supersede idempotently; the next compaction folds again).
+pub fn compact_graph_overlay(
+    workspace_root: &Path,
+    built_at_unix_ms: u64,
+    config: &EngineConfig,
+    worker_count: usize,
+) -> io::Result<GraphIndexSummary> {
+    use crate::graph_overlay::GraphOverlay;
+    let probe = std::env::var("ZOEK_FLOW_PROBE").is_ok();
+    let overlay = GraphOverlay::load_any(workspace_root, config);
+    if overlay.is_empty() {
+        return Ok(base_graph_summary(workspace_root, config));
+    }
+    let updated_before = overlay.updated_unix_secs;
+    let changed: Vec<PathBuf> = overlay
+        .changed_paths()
+        .iter()
+        .map(|r| workspace_root.join(r))
+        .collect();
+    let deleted: Vec<PathBuf> = overlay
+        .deleted_paths()
+        .iter()
+        .map(|r| workspace_root.join(r))
+        .collect();
+    if probe {
+        eprintln!(
+            "[compact] folding overlay: changed={} deleted={} overlay_refs={}",
+            changed.len(),
+            deleted.len(),
+            overlay.ref_count()
+        );
+    }
+    // Preserve the base builtAt across compaction: folding the overlay does not
+    // change query results (base+overlay merged == compacted base), so the
+    // extension's `--built-at` guard need not move and no TS manifest refresh is
+    // required. (Falls back to the caller's value only if the base has none.)
+    let base_built_at = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config))
+        .unwrap_or(built_at_unix_ms);
+    let effective_built_at = if base_built_at != 0 {
+        base_built_at
+    } else {
+        built_at_unix_ms
+    };
+    // NOTE: do NOT hold the graph lock here — `update_graph_native` acquires it
+    // itself, and flock is keyed by open fd (re-acquiring on a fresh fd while
+    // holding it self-deadlocks; see the fallback in update_graph_native).
+    let summary = update_graph_native(
+        workspace_root,
+        &changed,
+        &deleted,
+        effective_built_at,
+        config,
+        worker_count,
+    )?;
+    // Rebuild the outgoing tally over the freshly folded base so the next overlay
+    // edit's count deltas are computed against current data.
+    if let Err(err) = build_and_write_outgoing_tally(workspace_root, config) {
+        eprintln!("[graph-compact] outgoing-tally rebuild skipped: {err}");
+    }
+    // Base now incorporates the overlay. Clear it — unless a concurrent
+    // overlay-update landed during the fold (its new entries are NOT in the new
+    // base), in which case keep the overlay (idempotent re-supersession; next
+    // compaction folds it).
+    let after = GraphOverlay::load_any(workspace_root, config);
+    if after.updated_unix_secs == updated_before {
+        GraphOverlay::clear(workspace_root, config)?;
+        if probe { eprintln!("[compact] cleared overlay; builtAt={}", summary.built_at_unix_ms); }
+    } else if probe {
+        eprintln!("[compact] overlay changed during fold; left in place for next compaction");
+    }
+    Ok(summary)
+}
+
 pub fn query_graph_symbols(
     workspace_root: &Path,
     query: &str,
@@ -4203,9 +4826,10 @@ pub fn query_graph_symbols_with_options(
     if query.starts_with("sym:") {
         return query_graph_symbol_id_with_options(workspace_root, query, limit, config, options);
     }
-    let Some(store) = read_symbol_store(workspace_root, config)? else {
+    let Some(mut store) = read_symbol_store(workspace_root, config)? else {
         return Ok(None);
     };
+    merge_overlay_count_deltas(workspace_root, config, store.built_at_unix_ms, &mut store.counts);
     let query_lower = query.to_ascii_lowercase();
     let mut symbols: Vec<GraphSymbol> = store
         .symbols
@@ -4522,6 +5146,59 @@ pub fn query_graph_implementations(
     }))
 }
 
+/// Merge the delta overlay into a query's base references (replacement-by-file,
+/// mirrors `dump_references_with_overlay_tsv` and the `graph_overlay` contract):
+/// drop base EXACT refs whose source file the overlay supersedes (the overlay
+/// re-supplies them), keep base token-shape refs (v1 leaves token-shape in the
+/// base until compaction), then add the overlay's own matching refs. No-op when
+/// the overlay is empty or was built against a different base (`load_valid`).
+/// Apply the overlay's per-target count deltas onto a freshly-read base `counts`
+/// map (keyed by `sym:HEX16`). Bumps `usage_likely`/`calls_in_likely` so the
+/// inline "N usages" hint reflects an un-compacted edit. Exact for the
+/// exact-usage component; token-shape padding converges at the next compaction.
+/// No-op when the overlay is empty / built against a different base.
+fn merge_overlay_count_deltas(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    built_at_unix_ms: u64,
+    counts: &mut HashMap<String, GraphCount>,
+) {
+    let overlay =
+        crate::graph_overlay::GraphOverlay::load_valid(workspace_root, config, built_at_unix_ms);
+    if overlay.count_deltas.is_empty() {
+        return;
+    }
+    for (&t, &(usage_delta, calls_delta)) in &overlay.count_deltas {
+        let id = format!("sym:{:016x}", t);
+        let count = counts.entry(id).or_default();
+        count.usage_likely = (count.usage_likely as i64 + usage_delta).max(0) as usize;
+        count.calls_in_likely = (count.calls_in_likely as i64 + calls_delta).max(0) as usize;
+    }
+}
+
+fn merge_overlay_query_refs(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    built_at_unix_ms: u64,
+    base_refs: &mut Vec<GraphReference>,
+    keep_overlay_ref: impl Fn(&GraphReference) -> bool,
+) {
+    let overlay =
+        crate::graph_overlay::GraphOverlay::load_valid(workspace_root, config, built_at_unix_ms);
+    if overlay.is_empty() {
+        return;
+    }
+    let ref_superseded = overlay.ref_superseded();
+    base_refs.retain(|r| {
+        r.provenance.as_ref() == "token-shape" || !ref_superseded.contains(&*r.rel_path)
+    });
+    for r in overlay.live_refs() {
+        if keep_overlay_ref(r) {
+            base_refs.push(r.clone());
+        }
+    }
+}
+
 pub fn query_graph(
     workspace_root: &Path,
     symbol_id: &str,
@@ -4553,6 +5230,11 @@ pub fn query_graph(
     } else {
         Vec::new()
     };
+    merge_overlay_query_refs(workspace_root, config, built_at_unix_ms, &mut references, |r| {
+        r.target_symbol_id
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(symbol_id))
+    });
     references.sort_by(|left, right| {
         left.rel_path
             .cmp(&right.rel_path)
@@ -4606,6 +5288,12 @@ pub fn query_graph_callees(
     } else {
         Vec::new()
     };
+    merge_overlay_query_refs(workspace_root, config, built_at_unix_ms, &mut references, |r| {
+        r.enclosing_symbol_id
+            .as_deref()
+            .is_some_and(|e| e.eq_ignore_ascii_case(symbol_id))
+            && matches!(r.edge_kind.as_ref(), "call" | "construct")
+    });
     references.sort_by(|left, right| {
         left.rel_path
             .cmp(&right.rel_path)
@@ -10110,6 +10798,167 @@ fn source_scope_key(rel_path: &str) -> &str {
     rel_path.split('/').next().unwrap_or(rel_path)
 }
 
+/// Build the per-source-file EXACT-scoped outgoing-target tally and write it
+/// sharded by source rel_path. For each source file F it records, per target T,
+/// how many of F's EXACT (non-token-shape) references to T are scoped to T
+/// (source root == target root) — i.e. F's contribution to `usage_likely(T)`'s
+/// exact component, split into usage + call counts.
+///
+/// The overlay edit path reads only the affected files' rows (O(edit)) to get
+/// each superseded file's PRIOR contribution, so it can compute an exact count
+/// delta (new re-resolved contribution − this prior contribution) without
+/// re-reading the whole base reference set. Token-shape padding is NOT tallied
+/// here (the overlay carries no token-shape), so `usage_likely` deltas are exact
+/// for the exact-usage component and converge fully at the next compaction.
+///
+/// Run as a post-build pass after the reference shards are written (full rebuild
+/// + compaction) — an extra O(total) streaming read, acceptable for those
+/// occasional ops. Gated by ZOEK_DISABLE_OUTGOING_TALLY; absence degrades the
+/// overlay to base-only counts.
+fn build_and_write_outgoing_tally(workspace_root: &Path, config: &EngineConfig) -> io::Result<()> {
+    if std::env::var("ZOEK_DISABLE_OUTGOING_TALLY").is_ok() {
+        return Ok(());
+    }
+    let file_table_path = graph_file_table_path(workspace_root, config);
+    if !file_table_path.exists() {
+        return Ok(());
+    }
+    let file_table = read_file_table_binary(&file_table_path).unwrap_or_default();
+    // target id_u64 → its source root (for the usage_likely scoping), from compact.
+    let compact = load_symbol_compact(workspace_root, config, &file_table)?;
+    let mut scope_by_target: AHashMap<u64, Box<str>> = AHashMap::with_capacity(compact.len());
+    for c in &compact {
+        scope_by_target
+            .entry(c.id_u64)
+            .or_insert_with(|| source_scope_key(&c.rel_path).into());
+    }
+    drop(compact);
+    // Accumulate per (source rel_path → target → (usage, calls)) by streaming the
+    // by-target reference shards one at a time (never holds the full ref set).
+    let mut tally: HashMap<String, AHashMap<u64, (u32, u32)>> = HashMap::default();
+    for shard in 0..GRAPH_SHARD_COUNT {
+        let path = graph_shard_path(
+            workspace_root,
+            config,
+            GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
+            shard,
+        );
+        if !path.exists() {
+            continue;
+        }
+        let refs = read_binary_references_matching(&path, &file_table, |r| {
+            r.provenance.as_ref() != "token-shape"
+        })?;
+        for r in &refs {
+            let Some(t) = r
+                .target_symbol_id
+                .as_deref()
+                .and_then(parse_stable_symbol_id_to_u64)
+            else {
+                continue;
+            };
+            let Some(root) = scope_by_target.get(&t) else {
+                continue;
+            };
+            if source_scope_key(&r.rel_path) != &**root {
+                continue;
+            }
+            let entry = tally
+                .entry(r.rel_path.to_string())
+                .or_default()
+                .entry(t)
+                .or_default();
+            entry.0 = entry.0.saturating_add(1);
+            if matches!(r.edge_kind.as_ref(), "call" | "construct") {
+                entry.1 = entry.1.saturating_add(1);
+            }
+        }
+    }
+    // Write sharded by source rel_path. Per record: u32 path_len, path bytes,
+    // u32 n_targets, then n × (u64 target, u32 usage, u32 calls).
+    let mut shard_bufs: Vec<Vec<u8>> = vec![Vec::new(); GRAPH_SHARD_COUNT];
+    for (rel_path, targets) in &tally {
+        let buf = &mut shard_bufs[shard_index_for_key(rel_path)];
+        let pb = rel_path.as_bytes();
+        buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
+        buf.extend_from_slice(pb);
+        buf.extend_from_slice(&(targets.len() as u32).to_le_bytes());
+        for (t, (usage, calls)) in targets {
+            buf.extend_from_slice(&t.to_le_bytes());
+            buf.extend_from_slice(&usage.to_le_bytes());
+            buf.extend_from_slice(&calls.to_le_bytes());
+        }
+    }
+    for (shard, buf) in shard_bufs.iter().enumerate() {
+        let path = graph_shard_path(
+            workspace_root,
+            config,
+            GRAPH_OUTGOING_TALLY_BY_FILE_SHARD_PREFIX,
+            shard,
+        );
+        write_atomically(&path, buf)?;
+    }
+    Ok(())
+}
+
+/// Sum the prior EXACT-scoped outgoing contribution of the given source files,
+/// per target id_u64: (usage, calls). Reads only the tally shards holding those
+/// files (O(edit)). Returns an empty map when the tally sidecar is absent.
+fn load_outgoing_tally_for_files(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    files: &HashSet<String>,
+) -> io::Result<AHashMap<u64, (i64, i64)>> {
+    let mut out: AHashMap<u64, (i64, i64)> = AHashMap::default();
+    if files.is_empty() {
+        return Ok(out);
+    }
+    let shards: HashSet<usize> = files.iter().map(|f| shard_index_for_key(f)).collect();
+    for shard in shards {
+        let path = graph_shard_path(
+            workspace_root,
+            config,
+            GRAPH_OUTGOING_TALLY_BY_FILE_SHARD_PREFIX,
+            shard,
+        );
+        if !path.exists() {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        let mut cur = 0usize;
+        while cur + 4 <= bytes.len() {
+            let plen = u32::from_le_bytes(bytes[cur..cur + 4].try_into().unwrap()) as usize;
+            cur += 4;
+            if cur + plen > bytes.len() {
+                break;
+            }
+            let rel = std::str::from_utf8(&bytes[cur..cur + plen]).unwrap_or("");
+            cur += plen;
+            if cur + 4 > bytes.len() {
+                break;
+            }
+            let n = u32::from_le_bytes(bytes[cur..cur + 4].try_into().unwrap()) as usize;
+            cur += 4;
+            let include = files.contains(rel);
+            for _ in 0..n {
+                if cur + 16 > bytes.len() {
+                    break;
+                }
+                if include {
+                    let t = u64::from_le_bytes(bytes[cur..cur + 8].try_into().unwrap());
+                    let usage = u32::from_le_bytes(bytes[cur + 8..cur + 12].try_into().unwrap());
+                    let calls = u32::from_le_bytes(bytes[cur + 12..cur + 16].try_into().unwrap());
+                    let e = out.entry(t).or_default();
+                    e.0 += usage as i64;
+                    e.1 += calls as i64;
+                }
+                cur += 16;
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn resolve_import_targets<'a>(
     import_facts: &'a [ImportFact],
     symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
@@ -14203,16 +15052,51 @@ fn load_resolve_candidates(
         .collect();
     shards.sort_unstable();
     shards.dedup();
+    // Each referenced name maps to one shard; a shard is read+parsed WHOLE
+    // (~10-30MB) to extract the matching symbols. For a low-fanout edit this is
+    // a handful of shards and dominates the overlay-update wall time, so read
+    // them in parallel (mirrors `read_symbols_excluding_paths`). Pure perf — the
+    // returned set is identical to the sequential read.
+    let worker_count = graph_worker_count(shards.len().max(1));
+    let per_worker = shards.len().div_ceil(worker_count.max(1));
+    let shards_ref = &shards;
+    let chunks: Vec<Vec<GraphSymbol>> =
+        std::thread::scope(|s| -> io::Result<Vec<Vec<GraphSymbol>>> {
+            let mut handles = Vec::with_capacity(worker_count);
+            for w in 0..worker_count {
+                let start = w * per_worker;
+                let end = ((w + 1) * per_worker).min(shards_ref.len());
+                if start >= end {
+                    continue;
+                }
+                handles.push(s.spawn(move || -> io::Result<Vec<GraphSymbol>> {
+                    let mut local = Vec::new();
+                    for &shard in &shards_ref[start..end] {
+                        let path = graph_shard_path(
+                            workspace_root,
+                            config,
+                            GRAPH_RESOLVE_INDEX_SHARD_PREFIX,
+                            shard,
+                        );
+                        if !path.exists() {
+                            continue;
+                        }
+                        local.extend(read_symbols_matching(&path, file_table, |s| {
+                            name_hashes.contains(&s.name_hash)
+                        })?);
+                    }
+                    Ok(local)
+                }));
+            }
+            let mut combined = Vec::new();
+            for h in handles {
+                combined.push(h.join().expect("resolve candidate worker panicked")?);
+            }
+            Ok(combined)
+        })?;
     let mut out = Vec::new();
-    for shard in shards {
-        let path =
-            graph_shard_path(workspace_root, config, GRAPH_RESOLVE_INDEX_SHARD_PREFIX, shard);
-        if !path.exists() {
-            continue;
-        }
-        out.extend(read_symbols_matching(&path, file_table, |s| {
-            name_hashes.contains(&s.name_hash)
-        })?);
+    for chunk in chunks {
+        out.extend(chunk);
     }
     Ok(out)
 }
@@ -14360,15 +15244,49 @@ fn read_symbols_for_paths(
     if paths.is_empty() {
         return Ok(Vec::new());
     }
-    let mut out: Vec<GraphSymbol> = Vec::new();
-    for shard in 0..GRAPH_SHARD_COUNT {
-        let path = graph_shard_path(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
-        if !path.exists() {
-            continue;
-        }
-        out.extend(read_symbols_matching(&path, file_table, |s| {
-            paths.contains(&s.rel_path)
-        })?);
+    // Symbols scatter across all 128 shards by id, so every shard is scanned —
+    // but in parallel (this is the dominant cost of an incremental edit that has
+    // importers; sequential it was ~2s even for a single importer). Mirrors
+    // `read_symbols_excluding_paths`; identical result, just parallel.
+    let worker_count = graph_worker_count(GRAPH_SHARD_COUNT);
+    let shards_per_worker = GRAPH_SHARD_COUNT.div_ceil(worker_count);
+    let chunks: Vec<Vec<GraphSymbol>> =
+        std::thread::scope(|s| -> io::Result<Vec<Vec<GraphSymbol>>> {
+            let mut handles = Vec::with_capacity(worker_count);
+            for w in 0..worker_count {
+                let start = w * shards_per_worker;
+                let end = ((w + 1) * shards_per_worker).min(GRAPH_SHARD_COUNT);
+                if start >= end {
+                    continue;
+                }
+                handles.push(s.spawn(move || -> io::Result<Vec<GraphSymbol>> {
+                    let mut local = Vec::new();
+                    for shard in start..end {
+                        let path = graph_shard_path(
+                            workspace_root,
+                            config,
+                            GRAPH_SYMBOL_ID_SHARD_PREFIX,
+                            shard,
+                        );
+                        if !path.exists() {
+                            continue;
+                        }
+                        local.extend(read_symbols_matching(&path, file_table, |sym| {
+                            paths.contains(&sym.rel_path)
+                        })?);
+                    }
+                    Ok(local)
+                }));
+            }
+            let mut combined = Vec::new();
+            for h in handles {
+                combined.push(h.join().expect("symbols-for-paths worker panicked")?);
+            }
+            Ok(combined)
+        })?;
+    let mut out = Vec::new();
+    for chunk in chunks {
+        out.extend(chunk);
     }
     Ok(out)
 }
@@ -14797,7 +15715,11 @@ fn apply_count_options_for_symbols(
         return Ok(());
     }
     let symbol_ids: HashSet<String> = symbols.iter().map(|symbol| symbol.id.clone()).collect();
-    let counts = read_counts_for_symbol_ids_indexed(workspace_root, config, &symbol_ids)?;
+    let mut counts = read_counts_for_symbol_ids_indexed(workspace_root, config, &symbol_ids)?;
+    // Overlay an un-compacted edit's per-target count deltas so the inline
+    // "N usages" hint matches the (already overlay-merged) reference list.
+    let built_at = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config)).unwrap_or(0);
+    merge_overlay_count_deltas(workspace_root, config, built_at, &mut counts);
     for symbol in symbols {
         apply_count_options(symbol, &counts, options);
     }
