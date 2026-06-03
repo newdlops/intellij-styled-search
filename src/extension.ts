@@ -1284,6 +1284,24 @@ function getConfiguredCallGraphMaxUsageResults(): number {
   return Math.floor(raw);
 }
 
+// Fix-B: when false (default), Find Usages folds low-confidence references
+// ("possible"/"unresolved" — e.g. cross-module unique-name look-alikes) out of
+// the default panel so the visible count tracks the inline "N usages" hint,
+// which only counts confirmed usages. `exactDeficit == 0` corpus-wide proves the
+// confirmed set is always a subset of the inlay count, so this can never make the
+// panel reveal MORE confirmed usages than the hint promised (undercount = 0).
+function getConfiguredCallGraphIncludeLowConfidenceUsages(): boolean {
+  const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+  return cfg.get<boolean>('callGraphIncludeLowConfidenceUsages', false) === true;
+}
+
+// A "confirmed" usage is one the resolver bound with high confidence (an exact
+// import/definition match). "possible"/"unresolved" references are heuristic
+// (e.g. unique-name) and are the entire source of the inlay-vs-panel gap.
+function isConfirmedUsage(reference: CallGraphReference): boolean {
+  return reference.confidence === 'exact' || reference.confidence === 'resolved';
+}
+
 async function showCallGraphUsageResult(
   overlay: OverlayPanel,
   callGraph: CallGraphService,
@@ -1360,14 +1378,28 @@ async function showCallGraphUsageMatches(
   showEmptyPanel = false,
 ): Promise<void> {
   let sourceLabel = initialSourceLabel;
-  let matches = await buildCallGraphUsageFileMatches(usages);
+  // Fix-B: split confirmed vs low-confidence usages. Default view shows only
+  // confirmed (so the panel count tracks the inline hint); the low-confidence
+  // envelope is folded out unless the user opts in, or unless there are no
+  // confirmed usages at all (then show the envelope rather than an empty panel).
+  const includeLowConfidence = getConfiguredCallGraphIncludeLowConfidenceUsages();
+  const confirmedUsages = usages.filter(isConfirmedUsage);
+  const lowConfidenceCount = usages.length - confirmedUsages.length;
+  const showFolded = includeLowConfidence || confirmedUsages.length === 0;
+  const displayUsages = showFolded ? usages : confirmedUsages;
+  let matches = await buildCallGraphUsageFileMatches(displayUsages);
   const graphMatchCount = countFileMatchMatches(matches);
+  // Gate the text fallback on the FULL graph count, not the (possibly folded)
+  // displayed count — otherwise folding a noisy symbol down to a few confirmed
+  // rows would wrongly trigger a workspace-wide text search and re-flood it.
+  const graphTotalCount = usages.length;
   const targetLabel = targetLabelOverride ?? targetSymbol?.qualifiedName ?? query;
   callGraphLog.appendLine(
     `find usages source: ${initialSourceLabel} query=${JSON.stringify(targetLabel)} ` +
-    `matches=${graphMatchCount}`,
+    `matches=${graphMatchCount} confirmed=${confirmedUsages.length} lowConfidence=${lowConfidenceCount} ` +
+    `folded=${!showFolded && lowConfidenceCount > 0}`,
   );
-  if (allowTextFallback && targetSymbol && shouldSearchUsageTextFallback(targetSymbol, graphMatchCount)) {
+  if (allowTextFallback && targetSymbol && shouldSearchUsageTextFallback(targetSymbol, graphTotalCount)) {
     const searched = await searchWorkspaceForUsageText(overlay, targetSymbol);
     const searchMatches = searched.result.matches;
     const total = countFileMatchMatches(searchMatches);
@@ -1391,7 +1423,8 @@ async function showCallGraphUsageMatches(
     vscode.window.showInformationMessage('No usages found for the selected call graph symbol.');
     return;
   }
-  await overlay.showStaticResults(`${title} [${sourceLabel}]: ${targetLabel}`, matches);
+  const foldedSuffix = !showFolded && lowConfidenceCount > 0 ? ` · 추정 ${lowConfidenceCount}개 접힘` : '';
+  await overlay.showStaticResults(`${title} [${sourceLabel}]: ${targetLabel}${foldedSuffix}`, matches);
 }
 
 function labelFromCallGraphSymbolId(symbolId: string): string {

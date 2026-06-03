@@ -5577,6 +5577,43 @@ fn extract_symbol_defs(
     }
 }
 
+/// Net bracket balance of a single source line — `(`/`[`/`{` count +1, the
+/// closers −1 — ignoring brackets that appear inside string literals or after a
+/// `#` comment. Used by the indent-based Python extractor to detect that a
+/// `class`/`def` (or any statement) header spans multiple physical lines, so its
+/// continuation lines (notably a closing `):` sitting at the header's OWN
+/// indent) are not mistaken for a dedent that closes the enclosing class. Triple
+/// quoted strings are not modeled (they do not occur in class/def headers).
+fn net_bracket_depth(line: &str) -> i32 {
+    let bytes = line.as_bytes();
+    let mut depth: i32 = 0;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'#' => break,
+                b'\'' | b'"' => quote = Some(c),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    depth
+}
+
 fn extract_python_symbol_defs(
     entry: &CorpusEntry,
     language: &str,
@@ -5586,11 +5623,22 @@ fn extract_python_symbol_defs(
     let mut drafts = Vec::new();
     let mut class_stack: Vec<(usize, String)> = Vec::new();
     let mut package_name = python_package_name(&entry.rel_path);
+    // Bracket balance carried across physical lines. While > 0 we are inside a
+    // multi-line header/statement (e.g. a `class Foo(\n  Base,\n):` base list);
+    // its continuation lines must not pop `class_stack` (the closing `):` sits at
+    // the class's own indent and would otherwise evict it, misclassifying every
+    // method below as a container-less top-level function) nor be parsed as defs.
+    let mut header_bracket_depth: i32 = 0;
     for (line_idx, line) in entry.text.lines().enumerate() {
         let trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+        if header_bracket_depth > 0 {
+            header_bracket_depth = (header_bracket_depth + net_bracket_depth(trimmed)).max(0);
+            continue;
+        }
+        let line_bracket_delta = net_bracket_depth(trimmed);
         let indent = line_indent(line);
         while class_stack
             .last()
@@ -5619,6 +5667,7 @@ fn extract_python_symbol_defs(
                 implements_names: Vec::new(),
             });
             class_stack.push((indent, qualified_name));
+            header_bracket_depth = line_bracket_delta.max(0);
             continue;
         }
         if let Some(name) = python_function_from_line(trimmed) {
@@ -5645,6 +5694,7 @@ fn extract_python_symbol_defs(
                 extends_names: Vec::new(),
                 implements_names: Vec::new(),
             });
+            header_bracket_depth = line_bracket_delta.max(0);
             continue;
         }
         if let Some(name) = simple_assignment_name(trimmed) {
@@ -5674,6 +5724,10 @@ fn extract_python_symbol_defs(
                 implements_names: Vec::new(),
             });
         }
+        // NOTE: continuation tracking is entered ONLY from `class`/`def` headers
+        // (above), never from arbitrary statements — a bare statement with an
+        // unbalanced bracket inside a multi-line string (e.g. SQL `"""SELECT ("""`)
+        // would otherwise wrongly swallow the defs that follow it.
         if package_name.is_none() {
             package_name = python_package_name(&entry.rel_path);
         }
@@ -15957,6 +16011,306 @@ fn read_counts(path: &Path) -> io::Result<HashMap<String, GraphCount>> {
     Ok(counts)
 }
 
+/// Audit the accuracy of the inline usage hint (`usage_likely`, the number the
+/// "N usages" inlay shows) against the number of EMITTED, queryable references
+/// per target (exactly what `graph-query --symbol-id` / the Find-Usages panel
+/// returns on click — `total_references`).
+///
+/// Definitions, per symbol that has a count row (i.e. one that can show an inlay):
+///   * `inlay      = usage_likely`           (source-root scoped count index)
+///   * `panel      = emitted_refs[target]`   (tally of all reference rows whose
+///                                            target == this symbol, across all
+///                                            128 reference-target shards)
+///   * UNDERCOUNT  ⇔ inlay <  panel  (the inlay shows fewer than a click reveals)
+///   * OVERCOUNT   ⇔ inlay >  panel  (the inlay over-promises)
+///   * EXACT       ⇔ inlay == panel
+///
+/// The user-facing acceptance bar is `undercount.symbols == 0`. Returns a JSON
+/// report string (hand-rolled, matching `protocol::*::to_json` style — the
+/// crate has no `serde_json`). NOTE: this is a static shard tally; it does NOT
+/// merge the (normally empty on a freshly built index) hot call-graph overlay
+/// that `query_graph` would, so on a workspace with pending un-compacted edits
+/// the panel side can differ by the overlay delta.
+pub fn audit_usage_counts(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    top_n: usize,
+    dump_first_party: Option<&Path>,
+) -> io::Result<String> {
+    use crate::protocol::json_string;
+    use std::fmt::Write as _;
+
+    // When dumping, capture (lowercased id, name, rel_path, kind) for every
+    // first-party symbol (not vendored) so an external rg-based ground-truth pass
+    // can compare each symbol's graph usage count to its textual occurrences.
+    let want_dump = dump_first_party.is_some();
+    let is_first_party = |rel: &str| {
+        !rel.contains(".venv/")
+            && !rel.contains("node_modules/")
+            && !rel.contains("site-packages/")
+    };
+    let mut fp_syms: Vec<(String, String, String, String)> = Vec::new();
+
+    let file_table_path = graph_file_table_path(workspace_root, config);
+    let file_table = if file_table_path.exists() {
+        read_file_table_binary(&file_table_path).unwrap_or_default()
+    } else {
+        FileTable::default()
+    };
+
+    // 1) Tally emitted references per (lowercased) target symbol id. All refs for
+    //    a given target live in that target's shard, so a cross-shard tally by
+    //    target reproduces `query_graph`'s `total_references` exactly.
+    // Map each symbol id -> interned source-root id (`source_scope_key` = top path
+    // segment), so a reference can be classified same-root vs cross-root relative
+    // to its target. Built by streaming the symbol-id shards one at a time.
+    let mut root_intern: HashMap<String, u32> = HashMap::default();
+    let mut root_name: Vec<String> = Vec::new();
+    let mut root_of: HashMap<String, u32> = HashMap::default();
+    for shard in 0..GRAPH_SHARD_COUNT {
+        let path = graph_shard_path(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
+        if !path.exists() {
+            continue;
+        }
+        for s in read_symbols(&path, &file_table)? {
+            let root = source_scope_key(&s.rel_path);
+            let rid = match root_intern.get(root) {
+                Some(rid) => *rid,
+                None => {
+                    let rid = root_name.len() as u32;
+                    root_intern.insert(root.to_string(), rid);
+                    root_name.push(root.to_string());
+                    rid
+                }
+            };
+            let id_lc = s.id.to_ascii_lowercase();
+            if want_dump && is_first_party(&s.rel_path) {
+                fp_syms.push((id_lc.clone(), s.name.clone(), s.rel_path.clone(), s.kind.clone()));
+            }
+            root_of.insert(id_lc, rid);
+        }
+    }
+
+    // Per target: [total, exact, same_root_total, same_root_exact]. `same_root` =
+    // reference whose own source-root equals the target symbol's source-root.
+    let mut stats: HashMap<String, [u64; 4]> = HashMap::default();
+    let mut total_emitted: u64 = 0;
+    let mut total_emitted_exact: u64 = 0;
+    let mut untargeted_refs: u64 = 0;
+    for shard in 0..GRAPH_SHARD_COUNT {
+        let path =
+            graph_shard_path(workspace_root, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX, shard);
+        if !path.exists() {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            let r = parse_reference_binary(&bytes, &mut cursor, &file_table)?;
+            let Some(target) = r.target_symbol_id.as_deref() else {
+                untargeted_refs += 1;
+                continue;
+            };
+            total_emitted += 1;
+            let key = target.to_ascii_lowercase();
+            let is_exact = &*r.confidence == "exact";
+            let same_root = root_of
+                .get(&key)
+                .map(|rid| source_scope_key(&r.rel_path) == root_name[*rid as usize].as_str())
+                .unwrap_or(false);
+            let e = stats.entry(key).or_insert([0; 4]);
+            e[0] += 1;
+            if is_exact {
+                total_emitted_exact += 1;
+                e[1] += 1;
+            }
+            if same_root {
+                e[2] += 1;
+                if is_exact {
+                    e[3] += 1;
+                }
+            }
+        }
+    }
+    let emitted: HashMap<String, u64> = stats.iter().map(|(k, v)| (k.clone(), v[0])).collect();
+
+    // 2) Load every count row (keyed lowercased to match emitted tally + ids).
+    let mut counts: HashMap<String, GraphCount> = HashMap::default();
+    for shard in 0..GRAPH_SHARD_COUNT {
+        let path = graph_shard_path(workspace_root, config, GRAPH_COUNT_ID_SHARD_PREFIX, shard);
+        if !path.exists() {
+            continue;
+        }
+        for (id, c) in read_counts(&path)? {
+            counts.insert(id.to_ascii_lowercase(), c);
+        }
+    }
+
+    // 3) Classify every counted symbol (these are the ones that get an inlay).
+    let mut exact: u64 = 0;
+    let mut under_symbols: u64 = 0;
+    let mut under_deficit: u64 = 0;
+    let mut under_max: u64 = 0;
+    let mut under_explained_by_may: u64 = 0;
+    // SERIOUS undercount: inlay below the count of EXACT/high-confidence refs.
+    let mut under_exact_symbols: u64 = 0;
+    let mut under_exact_deficit: u64 = 0;
+    let mut under_exact_max: u64 = 0;
+    let mut over_symbols: u64 = 0;
+    let mut over_excess: u64 = 0;
+    let mut over_max: u64 = 0;
+    // Fix-B simulation: the panel shows the top `usage_likely` references ranked
+    // [exact, then same-root possible, then cross-root possible], folding the rest.
+    // That makes panel-primary count == usage_likely == inlay (undercount=0 AND
+    // overcount=0 by construction). The only quality risk is "noise promotion":
+    // when usage_likely exceeds (same_root_total + cross_root_exact), the primary
+    // list must reach into cross-root *possible* (look-alike) refs to fill its
+    // quota. We want that count ~0.
+    let mut fixb_noise_promoted_symbols: u64 = 0;
+    let mut fixb_noise_promoted_refs: u64 = 0;
+    let mut fixb_noise_promoted_max: u64 = 0;
+    // (id, usage_likely, usage_must, usage_may, emitted, emitted_exact, delta)
+    let mut under_off: Vec<(String, usize, usize, usize, u64, u64, u64)> = Vec::new();
+    let mut over_off: Vec<(String, usize, usize, usize, u64, u64, u64)> = Vec::new();
+
+    for (id, c) in &counts {
+        let st = stats.get(id).copied().unwrap_or([0; 4]);
+        let em = st[0];
+        let em_exact = st[1];
+        let same_root_total = st[2];
+        let cross_root_exact = st[1].saturating_sub(st[3]);
+        let ul = c.usage_likely as u64;
+        // Fix-B noise-promotion check (only matters when refs are actually folded).
+        if ul < em {
+            let high_conf = same_root_total + cross_root_exact;
+            if ul > high_conf {
+                let promoted = ul - high_conf;
+                fixb_noise_promoted_symbols += 1;
+                fixb_noise_promoted_refs += promoted;
+                fixb_noise_promoted_max = fixb_noise_promoted_max.max(promoted);
+            }
+        }
+        if ul < em {
+            let d = em - ul;
+            under_symbols += 1;
+            under_deficit += d;
+            under_max = under_max.max(d);
+            if c.usage_may as u64 >= em {
+                under_explained_by_may += 1;
+            }
+            if ul < em_exact {
+                under_exact_symbols += 1;
+                under_exact_deficit += em_exact - ul;
+                under_exact_max = under_exact_max.max(em_exact - ul);
+            }
+            under_off.push((id.clone(), c.usage_likely, c.usage_must, c.usage_may, em, em_exact, d));
+        } else if ul > em {
+            let e = ul - em;
+            over_symbols += 1;
+            over_excess += e;
+            over_max = over_max.max(e);
+            over_off.push((id.clone(), c.usage_likely, c.usage_must, c.usage_may, em, em_exact, e));
+        } else {
+            exact += 1;
+        }
+    }
+
+    // Emitted targets that have NO count row: refs point at them (panel shows N)
+    // but they carry no inlay number at all.
+    let mut emitted_without_count: u64 = 0;
+    let mut emitted_without_count_refs: u64 = 0;
+    for (id, em) in &emitted {
+        if !counts.contains_key(id) {
+            emitted_without_count += 1;
+            emitted_without_count_refs += *em;
+        }
+    }
+
+    if let Some(dump_path) = dump_first_party {
+        let mut out = String::with_capacity(fp_syms.len().saturating_mul(64));
+        out.push_str("relPath\tname\tkind\tusageLikely\tusageMust\tusageMay\temitted\n");
+        for (id, name, rel, kind) in &fp_syms {
+            let c = counts.get(id).copied().unwrap_or_default();
+            let em = stats.get(id).map(|s| s[0]).unwrap_or(0);
+            let _ = write!(
+                out,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                rel, name, kind, c.usage_likely, c.usage_must, c.usage_may, em
+            );
+        }
+        fs::write(dump_path, out)?;
+    }
+
+    under_off.sort_by(|a, b| b.6.cmp(&a.6).then_with(|| b.4.cmp(&a.4)));
+    over_off.sort_by(|a, b| b.6.cmp(&a.6).then_with(|| b.4.cmp(&a.4)));
+    under_off.truncate(top_n);
+    over_off.truncate(top_n);
+
+    // Resolve names/paths for the offenders only.
+    let ids: HashSet<String> = under_off
+        .iter()
+        .chain(over_off.iter())
+        .map(|o| o.0.clone())
+        .collect();
+    let mut sym_by_id: HashMap<String, GraphSymbol> = HashMap::default();
+    for s in read_symbols_for_symbol_ids_indexed(workspace_root, config, &ids).unwrap_or_default() {
+        sym_by_id.insert(s.id.to_ascii_lowercase(), s);
+    }
+
+    let render = |off: &[(String, usize, usize, usize, u64, u64, u64)]| -> String {
+        off.iter()
+            .map(|(id, ul, must, may, em, em_exact, delta)| {
+                let (name, rel, kind) = sym_by_id
+                    .get(id)
+                    .map(|s| (s.name.clone(), s.rel_path.clone(), s.kind.clone()))
+                    .unwrap_or_default();
+                format!(
+                    "{{\"symbolId\":{},\"name\":{},\"relPath\":{},\"kind\":{},\"usageLikely\":{},\"usageMust\":{},\"usageMay\":{},\"emitted\":{},\"emittedExact\":{},\"delta\":{}}}",
+                    json_string(id),
+                    json_string(&name),
+                    json_string(&rel),
+                    json_string(&kind),
+                    ul,
+                    must,
+                    may,
+                    em,
+                    em_exact,
+                    delta
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    Ok(format!(
+        "{{\"type\":\"graph-audit-counts\",\"workspaceRoot\":{},\"symbolsWithCounts\":{},\"distinctEmittedTargets\":{},\"totalEmittedRefs\":{},\"totalEmittedExactRefs\":{},\"untargetedRefs\":{},\"exact\":{},\"undercount\":{{\"symbols\":{},\"totalDeficit\":{},\"maxDeficit\":{},\"explainedByUsageMay\":{},\"exactDeficitSymbols\":{},\"exactDeficitTotal\":{},\"exactDeficitMax\":{},\"topOffenders\":[{}]}},\"overcount\":{{\"symbols\":{},\"totalExcess\":{},\"maxExcess\":{},\"topOffenders\":[{}]}},\"fixB\":{{\"noisePromotedSymbols\":{},\"noisePromotedRefs\":{},\"noisePromotedMax\":{}}},\"emittedTargetsWithoutCountRow\":{{\"symbols\":{},\"refs\":{}}}}}",
+        json_string(&workspace_root.to_string_lossy()),
+        counts.len(),
+        emitted.len(),
+        total_emitted,
+        total_emitted_exact,
+        untargeted_refs,
+        exact,
+        under_symbols,
+        under_deficit,
+        under_max,
+        under_explained_by_may,
+        under_exact_symbols,
+        under_exact_deficit,
+        under_exact_max,
+        render(&under_off),
+        over_symbols,
+        over_excess,
+        over_max,
+        render(&over_off),
+        fixb_noise_promoted_symbols,
+        fixb_noise_promoted_refs,
+        fixb_noise_promoted_max,
+        emitted_without_count,
+        emitted_without_count_refs,
+    ))
+}
+
 fn read_counts_for_symbol_ids(
     path: &Path,
     symbol_ids: &HashSet<String>,
@@ -17774,6 +18128,85 @@ mod tests {
             .find(|symbol| symbol.qualified_name == qualified_name)
             .map(|symbol| symbol.id.as_str())
             .unwrap_or_else(|| panic!("missing symbol {qualified_name}"))
+    }
+
+    #[test]
+    fn net_bracket_depth_ignores_strings_and_comments() {
+        assert_eq!(net_bracket_depth("class Foo(Base):"), 0);
+        assert_eq!(net_bracket_depth("class Foo(  # type: ignore[x]"), 1);
+        assert_eq!(net_bracket_depth("):"), -1);
+        assert_eq!(net_bracket_depth("    TimestampedModel,"), 0);
+        assert_eq!(net_bracket_depth("x = foo(\"a ( paren in string\")"), 0);
+        assert_eq!(net_bracket_depth("def f(a, b,"), 1);
+    }
+
+    // Regression: a `class Foo(\n  Base,\n):` header whose closing `):` sits at
+    // the class's OWN indent must not evict the class from the indent stack.
+    // Otherwise every method below is misclassified as a container-less top-level
+    // `function`, so its `obj.method()` call sites never feed the member usage
+    // baseline and the inline "N usages" hint reads 0 (captain `Company.ceo_at`).
+    #[test]
+    fn multiline_class_header_keeps_methods_classified_as_methods() {
+        let text = concat!(
+            "class Company(  # type: ignore[django-manager-missing]\n",
+            "    TimestampedModel,\n",
+            "    SoftDeletableModel,\n",
+            "):\n",
+            "    class CreationPath(models.TextChoices):\n",
+            "        INCORPORATION = \"incorporation\"\n",
+            "\n",
+            "    def ceo_at(self, date):\n",
+            "        return self.director_set\n",
+            "\n",
+            "    def latest_ceo(\n",
+            "        self,\n",
+            "        date,\n",
+            "    ):\n",
+            "        return self.ceo_at(date)\n",
+        );
+        let entry = test_entry("pkg/company.py", text);
+        let defs = extract_python_symbol_defs(&entry, "python", "file:///pkg/company.py", 15);
+        let find = |name: &str| {
+            defs.iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("missing symbol {name}"))
+        };
+        // The method right after the multi-line class header.
+        let ceo_at = find("ceo_at");
+        assert_eq!(ceo_at.kind, "method", "ceo_at must be a method of Company");
+        assert_eq!(ceo_at.container_name.as_deref(), Some("Company"));
+        // A method whose OWN signature also spans multiple lines.
+        let latest = find("latest_ceo");
+        assert_eq!(latest.kind, "method");
+        assert_eq!(latest.container_name.as_deref(), Some("Company"));
+        // The nested class is still detected (header handling did not eat it).
+        assert!(defs
+            .iter()
+            .any(|d| d.name == "CreationPath" && d.kind == "class"));
+    }
+
+    // Guard the fix's blast radius: a bare statement carrying a multi-line string
+    // with an unbalanced '(' must NOT trip header-continuation mode and swallow
+    // the following def (continuation is entered only from class/def headers).
+    #[test]
+    fn multiline_string_with_unbalanced_bracket_does_not_swallow_defs() {
+        let text = concat!(
+            "QUERY = \"\"\"\n",
+            "SELECT ( FROM some_table\n",
+            "\"\"\"\n",
+            "def after_query():\n",
+            "    return 1\n",
+        );
+        let entry = test_entry("pkg/q.py", text);
+        let defs = extract_python_symbol_defs(&entry, "python", "file:///pkg/q.py", 5);
+        assert!(
+            defs.iter()
+                .any(|d| d.name == "after_query" && d.kind == "function"),
+            "def after a multi-line string must still be extracted; got {:?}",
+            defs.iter()
+                .map(|d| (d.name.clone(), d.kind.clone()))
+                .collect::<Vec<_>>()
+        );
     }
 
     // A2 v3 (memory floor) — S2: load_resolve_candidates(name_hashes) must return

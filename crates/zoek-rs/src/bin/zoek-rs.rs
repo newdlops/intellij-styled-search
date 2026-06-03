@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use zoek_rs::config::EngineConfig;
 use zoek_rs::graph::{
-    compact_graph_overlay, dump_references_tsv, dump_references_with_overlay_tsv,
+    audit_usage_counts, compact_graph_overlay, dump_references_tsv, dump_references_with_overlay_tsv,
     index_graph_from_tsv, overlay_update_graph_native, query_graph, query_graph_callees,
     query_graph_document_symbols_with_options, query_graph_implementations,
     query_graph_symbols_with_options, rebuild_graph_native, update_graph_native, GraphSymbol,
@@ -65,6 +65,7 @@ fn run(args: Vec<String>) -> Result<EngineResponse, String> {
         "graph-callees" => run_graph_callees(&args[1..]),
         "graph-symbol-query" => run_graph_symbol_query(&args[1..]),
         "graph-implementations" => run_graph_implementations(&args[1..]),
+        "graph-audit-counts" => run_graph_audit_counts(&args[1..]),
         _ => Err(usage()),
     }
 }
@@ -1109,6 +1110,42 @@ fn run_graph_query(args: &[String]) -> Result<EngineResponse, String> {
             .collect(),
         warnings: Vec::new(),
     }))
+}
+
+fn run_graph_audit_counts(args: &[String]) -> Result<EngineResponse, String> {
+    let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
+    let mut top_n = 50usize;
+    let mut dump_first_party: Option<PathBuf> = None;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--top" => {
+                top_n = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--top requires a value".to_string())?
+                    .parse::<usize>()
+                    .map_err(|_| "--top must be an integer".to_string())?;
+                idx += 2;
+            }
+            "--dump-first-party" => {
+                dump_first_party = Some(PathBuf::from(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "--dump-first-party requires a path".to_string())?,
+                ));
+                idx += 2;
+            }
+            other => return Err(format!("unknown graph-audit-counts flag: {other}")),
+        }
+    }
+    let json = audit_usage_counts(
+        &workspace_root,
+        &EngineConfig::default(),
+        top_n,
+        dump_first_party.as_deref(),
+    )
+    .map_err(|err| err.to_string())?;
+    println!("{json}");
+    std::process::exit(0);
 }
 
 fn run_graph_callees(args: &[String]) -> Result<EngineResponse, String> {

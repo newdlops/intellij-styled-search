@@ -358,6 +358,11 @@
           "default": true,
           "description": "Watch external filesystem create/change/delete events for call graph incremental updates. Enabled by default so semantic symbol/reference results follow terminal and agent file operations."
         },
+        "intellijStyledSearch.callGraphIncludeLowConfidenceUsages": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show low-confidence (heuristic 'possible'/'unresolved', e.g. cross-module unique-name look-alikes) references in Find Usages results. When false (default), only confirmed usages are shown so the panel count matches the inline 'N usages' hint; the folded count is noted in the panel title."
+        },
         "intellijStyledSearch.callGraphBackend": {
           "type": "string",
           "enum": [
