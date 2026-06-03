@@ -2446,6 +2446,52 @@ fn count_graph_source_candidates(
     Ok(total)
 }
 
+/// Drop each `foo.pyi` type stub whose `foo.py` implementation is also present.
+/// Python import resolution already prefers `.py` over `.pyi`
+/// (`python_module_path_candidates` lists `.py` first), so when both exist the
+/// stub is never the resolution target — it only contributes a DUPLICATE symbol
+/// set (a second inline "N usages" hint, and an inflated token-shape
+/// `symbol_count` that wrongly makes unique names look ambiguous and gates their
+/// usages) plus duplicate type-reference sites. A `.pyi` with NO `.py` sibling
+/// (a pure stub, e.g. for a C extension) is kept — it is the only declaration.
+/// Net effect: fewer files to parse ⇒ strictly faster indexing.
+/// True when `path` is a `foo.pyi` stub whose `foo.py` implementation exists on
+/// disk — i.e. the same file the full rebuild's `drop_redundant_python_stubs`
+/// would skip. The incremental path uses this to treat a changed redundant stub
+/// as a deletion (drop any stale prior symbols, do not re-add), keeping it
+/// consistent with the full rebuild.
+fn is_redundant_python_stub_path(path: &Path, workspace_root: &Path) -> bool {
+    let Some(s) = path.to_str() else { return false };
+    let Some(stem) = s.strip_suffix(".pyi") else {
+        return false;
+    };
+    let py = PathBuf::from(format!("{stem}.py"));
+    if py.is_absolute() {
+        py.exists()
+    } else {
+        workspace_root.join(&py).exists()
+    }
+}
+
+fn drop_redundant_python_stubs(
+    mut candidates: Vec<GraphSourceCandidate>,
+) -> (Vec<GraphSourceCandidate>, usize) {
+    let py_modules: HashSet<String> = candidates
+        .iter()
+        .filter_map(|c| c.rel_path.strip_suffix(".py").map(str::to_string))
+        .collect();
+    if py_modules.is_empty() {
+        return (candidates, 0);
+    }
+    let before = candidates.len();
+    candidates.retain(|c| match c.rel_path.strip_suffix(".pyi") {
+        Some(stem) => !py_modules.contains(stem),
+        None => true,
+    });
+    let dropped = before - candidates.len();
+    (candidates, dropped)
+}
+
 pub fn rebuild_graph_native<F>(
     workspace_root: &Path,
     built_at_unix_ms: u64,
@@ -2468,6 +2514,15 @@ where
     });
     let candidates =
         discover_graph_source_files_with_progress(workspace_root, config, progress)?;
+    let (candidates, stubs_dropped) = drop_redundant_python_stubs(candidates);
+    if stubs_dropped > 0 {
+        progress(GraphRebuildProgress {
+            stage: "discovering",
+            current: candidates.len(),
+            total: candidates.len(),
+            message: format!("dropped {stubs_dropped} redundant .pyi stubs (have .py sibling)"),
+        });
+    }
     let discover_ms = started.elapsed().as_millis();
 
     let parsing_started = std::time::Instant::now();
@@ -3637,6 +3692,20 @@ pub fn update_graph_native(
         drop(_graph_lock);
         return rebuild_graph_native(workspace_root, built_at, config, worker_count, &mut noop);
     }
+    // A changed `foo.pyi` whose `foo.py` exists is NOT indexed (the full rebuild
+    // drops it). Treat it as a deletion so any stale prior stub symbols are
+    // removed and it is not re-added — keeping incremental byte-identical to full.
+    let (changed_owned, stub_deletions): (Vec<PathBuf>, Vec<PathBuf>) = changed_paths
+        .iter()
+        .cloned()
+        .partition(|path| !is_redundant_python_stub_path(path, workspace_root));
+    let changed_paths: &[PathBuf] = &changed_owned;
+    let deleted_owned: Vec<PathBuf> = deleted_paths
+        .iter()
+        .cloned()
+        .chain(stub_deletions)
+        .collect();
+    let deleted_paths: &[PathBuf] = &deleted_owned;
     let exclude_paths: HashSet<String> = changed_paths
         .iter()
         .chain(deleted_paths.iter())
