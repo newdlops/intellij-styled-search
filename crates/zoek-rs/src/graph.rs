@@ -2496,12 +2496,23 @@ pub fn rebuild_graph_native<F>(
     workspace_root: &Path,
     built_at_unix_ms: u64,
     config: &EngineConfig,
-    _worker_count: usize,
+    worker_count: usize,
     progress: &mut F,
 ) -> io::Result<GraphIndexSummary>
 where
     F: FnMut(GraphRebuildProgress),
 {
+    // Honor the caller's requested worker count (the CLI `--workers`, fed from the
+    // extension's `callGraphConcurrency`). Previously this arg was ignored and both
+    // the rayon pool (apply_rayon_pool_size) and the per-stage chunking
+    // (graph_worker_count) read ZOEK_GRAPH_WORKERS / defaulted to MAX_GRAPH_WORKERS,
+    // so the progress display reported a different worker count than was requested.
+    // Publishing it to the env that BOTH of those read keeps requested == actual ==
+    // displayed. `0` means "auto" — leave the env untouched. MUST run before
+    // apply_rayon_pool_size (a `Once`) and before any graph_worker_count call.
+    if worker_count > 0 {
+        std::env::set_var("ZOEK_GRAPH_WORKERS", worker_count.to_string());
+    }
     apply_memory_cap();
     apply_rayon_pool_size();
     let _graph_lock = acquire_graph_lock(workspace_root)?;
@@ -2722,19 +2733,30 @@ where
             }
         }
         let t_parse_compute = std::time::Instant::now();
-        let worker_accums: io::Result<Vec<(ParseAccum, Vec<PathBuf>)>> = ranges
-            .into_par_iter()
-            .map(|(w, start, end)| -> io::Result<(ParseAccum, Vec<PathBuf>)> {
-                let mut a = ParseAccum::new();
-                let mut partial_paths: Vec<PathBuf> = Vec::new();
-                let probe = std::env::var("ZOEK_MEM_PROBE").is_ok();
-                let mut check_counter = 0usize;
-                let mut partial_idx = 0usize;
-                for cand in &candidates_ref[start..end] {
-                    if let Some(entry) = read_graph_source_candidate(cand, config)? {
-                        a.ingest(build_file_graph(&entry));
-                    }
-                    check_counter += 1;
+        // Incremental parse progress: workers bump a shared counter per file while
+        // a poller on this thread reports current/total every ~150ms (the
+        // `progress` callback is not Send, so it must stay here). Without this the
+        // parsing stage jumped straight from 0 to total (the bar sat at the
+        // stage's start % for the whole — often longest — parse).
+        let parsed_counter = std::sync::atomic::AtomicUsize::new(0);
+        let parsed_ref = &parsed_counter;
+        let worker_accums: io::Result<Vec<(ParseAccum, Vec<PathBuf>)>> =
+            std::thread::scope(|scope| {
+                let handle = scope.spawn(move || {
+                    ranges
+                        .into_par_iter()
+                        .map(|(w, start, end)| -> io::Result<(ParseAccum, Vec<PathBuf>)> {
+                            let mut a = ParseAccum::new();
+                            let mut partial_paths: Vec<PathBuf> = Vec::new();
+                            let probe = std::env::var("ZOEK_MEM_PROBE").is_ok();
+                            let mut check_counter = 0usize;
+                            let mut partial_idx = 0usize;
+                            for cand in &candidates_ref[start..end] {
+                                if let Some(entry) = read_graph_source_candidate(cand, config)? {
+                                    a.ingest(build_file_graph(&entry));
+                                }
+                                parsed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                check_counter += 1;
                     if check_counter % 100 == 0 {
                         let used = a.estimated_bytes();
                         if memory_limit > 0 && used > memory_limit {
@@ -2764,9 +2786,24 @@ where
                         }
                     }
                 }
-                Ok((a, partial_paths))
-            })
-            .collect();
+                            Ok((a, partial_paths))
+                        })
+                        .collect::<io::Result<Vec<(ParseAccum, Vec<PathBuf>)>>>()
+                });
+                while !handle.is_finished() {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    let cur = parsed_ref
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .min(total_entries);
+                    progress(GraphRebuildProgress {
+                        stage: "parsing",
+                        current: cur,
+                        total: total_entries,
+                        message: format!("extracting file graphs with {worker_count} workers"),
+                    });
+                }
+                handle.join().expect("parse worker thread panicked")
+            });
         if std::env::var("ZOEK_PARSE_PROBE").is_ok() {
             eprintln!(
                 "[parse] compute(par_iter)={}ms target_chunks={}",
