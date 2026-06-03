@@ -482,6 +482,19 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       await runDedupedCallGraphSymbolCommand('showUsagesForSymbol', symbolId, () =>
         showCallGraphUsageResult(overlay, callGraph, callGraphLog, symbolId, label));
     }),
+    // Re-render the most recent Find Usages result with the low-confidence (추정)
+    // envelope expanded — the cross-module/heuristic look-alikes that are folded
+    // out of the default view so the panel count tracks the inline "N usages" hint.
+    vscode.commands.registerCommand('intellijStyledSearch.showEstimatedUsages', async () => {
+      if (!lastUsageQuery?.query) {
+        vscode.window.showInformationMessage(
+          'Run Find Usages on a symbol first, then use this to expand its estimated (low-confidence) usages.',
+        );
+        return;
+      }
+      const { query, label, symbol } = lastUsageQuery;
+      await showCallGraphUsageResult(overlay, callGraph, callGraphLog, query, label, symbol, true);
+    }),
     vscode.commands.registerCommand('intellijStyledSearch.activateCallGraphInlayAtPosition', async (
       kind: string,
       uriString: string,
@@ -1302,6 +1315,10 @@ function isConfirmedUsage(reference: CallGraphReference): boolean {
   return reference.confidence === 'exact' || reference.confidence === 'resolved';
 }
 
+// Remembers the most recent Find Usages query so the "Show Estimated Usages"
+// command can re-render it with the low-confidence (추정) envelope expanded.
+let lastUsageQuery: { query?: string; label?: string; symbol?: CallGraphSymbol } | undefined;
+
 async function showCallGraphUsageResult(
   overlay: OverlayPanel,
   callGraph: CallGraphService,
@@ -1309,11 +1326,15 @@ async function showCallGraphUsageResult(
   explicitQuery?: string,
   explicitLabel?: string,
   explicitSymbol?: CallGraphSymbol,
+  forceIncludeLowConfidence?: boolean,
 ): Promise<void> {
   try {
     const title = 'Find Usages';
     const showedPendingPanel = !!explicitQuery;
     const limit = getConfiguredCallGraphMaxUsageResults();
+    if (explicitQuery) {
+      lastUsageQuery = { query: explicitQuery, label: explicitLabel, symbol: explicitSymbol };
+    }
     if (explicitQuery) {
       await showCallGraphPendingPanel(overlay, title, explicitLabel ?? explicitQuery);
     }
@@ -1334,6 +1355,7 @@ async function showCallGraphUsageResult(
             false,
             explicitLabel ?? explicitSymbol?.qualifiedName ?? labelFromCallGraphSymbolId(explicitSymbolId),
             showedPendingPanel,
+            forceIncludeLowConfidence,
           );
           return;
         }
@@ -1358,6 +1380,7 @@ async function showCallGraphUsageResult(
       !explicitQuery,
       explicitLabel,
       showedPendingPanel,
+      forceIncludeLowConfidence,
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1376,13 +1399,17 @@ async function showCallGraphUsageMatches(
   allowTextFallback: boolean,
   targetLabelOverride?: string,
   showEmptyPanel = false,
+  forceIncludeLowConfidence?: boolean,
 ): Promise<void> {
   let sourceLabel = initialSourceLabel;
   // Fix-B: split confirmed vs low-confidence usages. Default view shows only
   // confirmed (so the panel count tracks the inline hint); the low-confidence
   // envelope is folded out unless the user opts in, or unless there are no
   // confirmed usages at all (then show the envelope rather than an empty panel).
-  const includeLowConfidence = getConfiguredCallGraphIncludeLowConfidenceUsages();
+  // `forceIncludeLowConfidence` (the "Show Estimated Usages" command) overrides
+  // the config per-invocation so the user can expand the fold on demand.
+  const includeLowConfidence =
+    forceIncludeLowConfidence ?? getConfiguredCallGraphIncludeLowConfidenceUsages();
   const confirmedUsages = usages.filter(isConfirmedUsage);
   const lowConfidenceCount = usages.length - confirmedUsages.length;
   const showFolded = includeLowConfidence || confirmedUsages.length === 0;
@@ -1423,8 +1450,13 @@ async function showCallGraphUsageMatches(
     vscode.window.showInformationMessage('No usages found for the selected call graph symbol.');
     return;
   }
-  const foldedSuffix = !showFolded && lowConfidenceCount > 0 ? ` · 추정 ${lowConfidenceCount}개 접힘` : '';
-  await overlay.showStaticResults(`${title} [${sourceLabel}]: ${targetLabel}${foldedSuffix}`, matches);
+  const statusSuffix =
+    !showFolded && lowConfidenceCount > 0
+      ? ` · 추정 ${lowConfidenceCount}개 접힘 (펼치기: "Show Estimated Usages")`
+      : showFolded && lowConfidenceCount > 0
+        ? ` · 추정 ${lowConfidenceCount}개 포함`
+        : '';
+  await overlay.showStaticResults(`${title} [${sourceLabel}]: ${targetLabel}${statusSuffix}`, matches);
 }
 
 function labelFromCallGraphSymbolId(symbolId: string): string {
