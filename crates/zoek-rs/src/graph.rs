@@ -8726,6 +8726,18 @@ fn resolve_ref_sites_a_to_e<'a>(
     let type_recv_hashes_ref = &type_recv_hashes;
     let self_hash = stable_hash("self");
     let cls_hash = stable_hash("cls");
+    // ① Source-root (top-dir) hash per file `rel_path_hash`, so the
+    // workspace-unique-name emit can DROP a cross-root look-alike — a `.venv` /
+    // node_modules site that references a first-party symbol only by coincidental
+    // identical name — instead of emitting it as a queryable reference. Combined
+    // with ② (usage_likely := emitted count), keeping emission same-root makes the
+    // inline count == panel == the real same-root usages (undercount=0, no noise).
+    // Real cross-module usage via import is EXACT (a different emit path) and kept.
+    let scope_hash_by_rel_path_hash: AHashMap<u64, u64> = symbols
+        .iter()
+        .map(|s| (s.rel_path_hash, stable_hash(source_scope_key(&s.rel_path))))
+        .collect();
+    let scope_hash_by_rel_path_hash = &scope_hash_by_rel_path_hash;
     let process_chunk = |buckets_slice: &[PhaseEFileBucket], worker_id: usize| -> io::Result<(
         HashMap<String, GraphCount>,
         AHashSet<u64>,
@@ -8786,6 +8798,9 @@ fn resolve_ref_sites_a_to_e<'a>(
         let mut receiver_cache_cols: AHashMap<(u64, u64), ReceiverResolutionCols> =
             AHashMap::default();
         let mut current_file_hash: u64 = u64::MAX;
+        // ① source-root hash of the file currently being processed (sites in a
+        // bucket share one file, so this is computed once per file transition).
+        let mut current_site_scope_hash: u64 = 0;
         // W12-Stage 3: file-local views updated on bucket (file) transition.
         // `None` if the current file has no entries in the corresponding map.
         let mut current_file_imports: Option<&AHashMap<u64, &[&GraphSymbol]>> = None;
@@ -8829,6 +8844,10 @@ fn resolve_ref_sites_a_to_e<'a>(
                 receiver_cache.clear();
                 receiver_cache_cols.clear();
                 current_file_hash = c.rel_path_hash;
+                current_site_scope_hash = scope_hash_by_rel_path_hash
+                    .get(&c.rel_path_hash)
+                    .copied()
+                    .unwrap_or(0);
                 // W18 / B3a: import_*_by_rel outer key is now rel_path_hash.
                 current_file_imports = import_targets_by_rel.get(&current_file_hash);
                 current_file_import_facts = import_facts_by_rel.get(&current_file_hash);
@@ -9119,18 +9138,29 @@ fn resolve_ref_sites_a_to_e<'a>(
                         true,
                         edge_key,
                     );
-                    let _ = push_light_resolved_reference(
-                        &mut light_refs,
-                        &mut dedup,
-                        Some(&mut local_target_tally),
-                        light_sender,
-                        site_idx,
-                        target,
-                        BOUND_MAY,
-                        LightConfidence::Possible,
-                        LightProvenance::UniqueName,
-                        edge_key,
-                    );
+                    // ① emit the workspace-unique MEMBER ref (`recv.name` where
+                    // `name` is unique) only when the site shares the target's
+                    // source-root — same cross-root look-alike filter as the bare
+                    // case. Cross-root stays in MAY (counted above), not emitted.
+                    if scope_hash_by_rel_path_hash
+                        .get(&target.rel_path_hash)
+                        .copied()
+                        .unwrap_or(0)
+                        == current_site_scope_hash
+                    {
+                        let _ = push_light_resolved_reference(
+                            &mut light_refs,
+                            &mut dedup,
+                            Some(&mut local_target_tally),
+                            light_sender,
+                            site_idx,
+                            target,
+                            BOUND_MAY,
+                            LightConfidence::Possible,
+                            LightProvenance::UniqueName,
+                            edge_key,
+                        );
+                    }
                 }
                 continue;
             }
@@ -9250,18 +9280,32 @@ fn resolve_ref_sites_a_to_e<'a>(
                         true,
                         edge_key,
                     );
-                    let _ = push_light_resolved_reference(
-                        &mut light_refs,
-                        &mut dedup,
-                        Some(&mut local_target_tally),
-                        light_sender,
-                        site_idx,
-                        target,
-                        BOUND_MAY,
-                        confidence_from_str("possible"),
-                        provenance_from_str("unique-name"),
-                        edge_key,
-                    );
+                    // ① EMIT (and thus count toward the ② emitted-based
+                    // usage_likely) only when the referencing site shares the
+                    // target's source-root. A `.venv`/node_modules site referencing
+                    // a first-party symbol by coincidental identical name is not a
+                    // real usage — it stays in the MAY envelope (counted above) but
+                    // is not a queryable reference, so it neither inflates the inline
+                    // count nor appears in the panel.
+                    if scope_hash_by_rel_path_hash
+                        .get(&target.rel_path_hash)
+                        .copied()
+                        .unwrap_or(0)
+                        == current_site_scope_hash
+                    {
+                        let _ = push_light_resolved_reference(
+                            &mut light_refs,
+                            &mut dedup,
+                            Some(&mut local_target_tally),
+                            light_sender,
+                            site_idx,
+                            target,
+                            BOUND_MAY,
+                            confidence_from_str("possible"),
+                            provenance_from_str("unique-name"),
+                            edge_key,
+                        );
+                    }
                 } else if same_file_count == 1 {
                     // is_same_file_unique: the lone same-file bare-fb def of this
                     // name. Looked up directly via the per-(file,name) bucket
@@ -11045,6 +11089,15 @@ fn apply_token_shape_likely_count_baseline(
                     }
                 }
             }
+            // ② usage_likely := the target's TOTAL emitted-reference count, so the
+            // inline "N usages" hint equals exactly what graph-query / the panel
+            // returns (undercount=0 AND overcount=0 by construction). `reference_count`
+            // began at the phase-E emitted tally (`reference_counts_ref`, which
+            // already counts exact + unique-name + member refs) and the token-shape
+            // loop above incremented it per emit, so it now == this target's emitted
+            // total. overcount==0 means this is always >= the prior scoped baseline,
+            // so usage_likely never decreases.
+            count.usage_likely = reference_count;
             // Downstream consumers `counts.get(id).unwrap_or_default()`, so skip
             // emitting default entries — saves String clone per zero-usage symbol.
             if count != GraphCount::default() {
@@ -16266,6 +16319,20 @@ pub fn audit_usage_counts(
     let mut fixb_noise_promoted_symbols: u64 = 0;
     let mut fixb_noise_promoted_refs: u64 = 0;
     let mut fixb_noise_promoted_max: u64 = 0;
+    // Option-B simulation: if cross-root NON-exact emitted refs are NOT emitted,
+    // each target keeps `same_root_total + cross_root_exact` refs. Measures the
+    // resulting undercount (usage_likely < kept), how many refs would be dropped,
+    // and how many symbols' panels would go empty (all refs were cross-root
+    // low-confidence) — and of those, how many still show a non-zero inlay
+    // (potential real-usage loss to inspect).
+    let mut optb_dropped_refs: u64 = 0;
+    let mut optb_undercount_after: u64 = 0;
+    let mut optb_undercount_after_deficit: u64 = 0;
+    let mut optb_emptied_symbols: u64 = 0;
+    let mut optb_emptied_with_nonzero_inlay: u64 = 0;
+    // (id, usage_likely, emitted, same_root_total) for emptied-with-inlay symbols
+    // — the only real-usage-loss risk of Option B, to inspect before committing.
+    let mut optb_emptied_off: Vec<(String, usize, u64, u64)> = Vec::new();
     // (id, usage_likely, usage_must, usage_may, emitted, emitted_exact, delta)
     let mut under_off: Vec<(String, usize, usize, usize, u64, u64, u64)> = Vec::new();
     let mut over_off: Vec<(String, usize, usize, usize, u64, u64, u64)> = Vec::new();
@@ -16285,6 +16352,20 @@ pub fn audit_usage_counts(
                 fixb_noise_promoted_symbols += 1;
                 fixb_noise_promoted_refs += promoted;
                 fixb_noise_promoted_max = fixb_noise_promoted_max.max(promoted);
+            }
+        }
+        // Option-B simulation: keep only same-root + cross-root-exact refs.
+        let optb_kept = same_root_total + cross_root_exact;
+        optb_dropped_refs += em.saturating_sub(optb_kept);
+        if ul < optb_kept {
+            optb_undercount_after += 1;
+            optb_undercount_after_deficit += optb_kept - ul;
+        }
+        if em > 0 && optb_kept == 0 {
+            optb_emptied_symbols += 1;
+            if ul > 0 {
+                optb_emptied_with_nonzero_inlay += 1;
+                optb_emptied_off.push((id.clone(), c.usage_likely, em, same_root_total));
             }
         }
         if ul < em {
@@ -16342,12 +16423,15 @@ pub fn audit_usage_counts(
     over_off.sort_by(|a, b| b.6.cmp(&a.6).then_with(|| b.4.cmp(&a.4)));
     under_off.truncate(top_n);
     over_off.truncate(top_n);
+    optb_emptied_off.sort_by(|a, b| b.2.cmp(&a.2));
+    optb_emptied_off.truncate(top_n);
 
     // Resolve names/paths for the offenders only.
     let ids: HashSet<String> = under_off
         .iter()
         .chain(over_off.iter())
         .map(|o| o.0.clone())
+        .chain(optb_emptied_off.iter().map(|o| o.0.clone()))
         .collect();
     let mut sym_by_id: HashMap<String, GraphSymbol> = HashMap::default();
     for s in read_symbols_for_symbol_ids_indexed(workspace_root, config, &ids).unwrap_or_default() {
@@ -16378,9 +16462,30 @@ pub fn audit_usage_counts(
             .collect::<Vec<_>>()
             .join(",")
     };
+    let render_emptied = |off: &[(String, usize, u64, u64)]| -> String {
+        off.iter()
+            .map(|(id, ul, em, same_root)| {
+                let (name, rel, kind) = sym_by_id
+                    .get(id)
+                    .map(|s| (s.name.clone(), s.rel_path.clone(), s.kind.clone()))
+                    .unwrap_or_default();
+                format!(
+                    "{{\"symbolId\":{},\"name\":{},\"relPath\":{},\"kind\":{},\"usageLikely\":{},\"emitted\":{},\"sameRoot\":{}}}",
+                    json_string(id),
+                    json_string(&name),
+                    json_string(&rel),
+                    json_string(&kind),
+                    ul,
+                    em,
+                    same_root
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
 
     Ok(format!(
-        "{{\"type\":\"graph-audit-counts\",\"workspaceRoot\":{},\"symbolsWithCounts\":{},\"distinctEmittedTargets\":{},\"totalEmittedRefs\":{},\"totalEmittedExactRefs\":{},\"untargetedRefs\":{},\"exact\":{},\"undercount\":{{\"symbols\":{},\"totalDeficit\":{},\"maxDeficit\":{},\"explainedByUsageMay\":{},\"exactDeficitSymbols\":{},\"exactDeficitTotal\":{},\"exactDeficitMax\":{},\"topOffenders\":[{}]}},\"overcount\":{{\"symbols\":{},\"totalExcess\":{},\"maxExcess\":{},\"topOffenders\":[{}]}},\"fixB\":{{\"noisePromotedSymbols\":{},\"noisePromotedRefs\":{},\"noisePromotedMax\":{}}},\"emittedTargetsWithoutCountRow\":{{\"symbols\":{},\"refs\":{}}}}}",
+        "{{\"type\":\"graph-audit-counts\",\"workspaceRoot\":{},\"symbolsWithCounts\":{},\"distinctEmittedTargets\":{},\"totalEmittedRefs\":{},\"totalEmittedExactRefs\":{},\"untargetedRefs\":{},\"exact\":{},\"undercount\":{{\"symbols\":{},\"totalDeficit\":{},\"maxDeficit\":{},\"explainedByUsageMay\":{},\"exactDeficitSymbols\":{},\"exactDeficitTotal\":{},\"exactDeficitMax\":{},\"topOffenders\":[{}]}},\"overcount\":{{\"symbols\":{},\"totalExcess\":{},\"maxExcess\":{},\"topOffenders\":[{}]}},\"fixB\":{{\"noisePromotedSymbols\":{},\"noisePromotedRefs\":{},\"noisePromotedMax\":{}}},\"optB\":{{\"droppedRefs\":{},\"undercountAfter\":{},\"undercountAfterDeficit\":{},\"emptiedSymbols\":{},\"emptiedWithNonzeroInlay\":{},\"emptiedOffenders\":[{}]}},\"emittedTargetsWithoutCountRow\":{{\"symbols\":{},\"refs\":{}}}}}",
         json_string(&workspace_root.to_string_lossy()),
         counts.len(),
         emitted.len(),
@@ -16403,6 +16508,12 @@ pub fn audit_usage_counts(
         fixb_noise_promoted_symbols,
         fixb_noise_promoted_refs,
         fixb_noise_promoted_max,
+        optb_dropped_refs,
+        optb_undercount_after,
+        optb_undercount_after_deficit,
+        optb_emptied_symbols,
+        optb_emptied_with_nonzero_inlay,
+        render_emptied(&optb_emptied_off),
         emitted_without_count,
         emitted_without_count_refs,
     ))
