@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 128;
+export const RENDERER_PATCH_VERSION = 129;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -2678,6 +2678,13 @@ export function getRendererPatchScript(
     stolenGroupOrigStyles: null,
     previewMonacoEditor: null,
     previewMonacoHost: null,
+    // #perf: requestPreview throttle (leading + trailing). Fast arrow-nav
+    // through results used to post one requestPreview per row (no debounce),
+    // flooding the ext host with file reads whose responses were then dropped
+    // as stale — the preview only "caught up" in a burst when nav paused.
+    previewRequestTimer: null,
+    previewRequestPending: null,
+    lastPreviewRequestAt: 0,
     lastRenderedPreviewUri: '',
     lastRenderedPreviewFocusLine: -1,
     previewMonacoInlayLayer: null,
@@ -4106,6 +4113,11 @@ export function getRendererPatchScript(
       clearTimeout(state.previewRecoveryTimer);
       state.previewRecoveryTimer = null;
     }
+    if (state.previewRequestTimer) {
+      clearTimeout(state.previewRequestTimer);
+      state.previewRequestTimer = null;
+    }
+    state.previewRequestPending = null;
     if (state.stolenEditor) { restoreStolenEditor(); }
     // Preserve the embedded preview Monaco editor across clears so the
     // next preview render reuses it (avoiding the 124ms cold create cost
@@ -4136,6 +4148,7 @@ export function getRendererPatchScript(
 
   var _renderPending = false;
   var _resultsViewportPending = false;
+  var _resultsEnsureVisiblePending = false;
   var _renderTimer = null;
   var _lastRenderAt = 0;
   function scheduleRender() {
@@ -4177,6 +4190,7 @@ export function getRendererPatchScript(
     }
     _renderPending = false;
     _resultsViewportPending = false;
+    _resultsEnsureVisiblePending = false;
   }
 
   function scheduleResultsViewportRender() {
@@ -4186,6 +4200,16 @@ export function getRendererPatchScript(
       var viewportT0 = perfNow();
       _resultsViewportPending = false;
       try {
+        // #perf: scroll-into-view + viewport rebuild both run once per frame
+        // here instead of synchronously on every arrow key. Rapid nav used to
+        // call ensureActiveVisible (writes scrollTop) then renderResultsViewport
+        // (reads scrollTop) N times per frame — a forced reflow + full row
+        // rebuild per keystroke. Coalescing collapses N to 1 and the scrollTop
+        // read now lands after layout settles.
+        if (_resultsEnsureVisiblePending) {
+          _resultsEnsureVisiblePending = false;
+          ensureActiveVisible();
+        }
         renderResultsViewport();
       } finally {
         reportPerfPhase('resultsViewport:scheduled', viewportT0, {
@@ -4415,8 +4439,45 @@ export function getRendererPatchScript(
   }
 
   function applyActive(shouldScroll) {
-    if (shouldScroll) { ensureActiveVisible(); }
-    renderResultsViewport();
+    // #perf: never render the viewport synchronously. Selection state
+    // (state.activeIndex) is already updated by the caller; the actual scroll
+    // + row rebuild are coalesced into a single rAF (scheduleResultsViewportRender)
+    // so holding an arrow key down can't fire one full rebuild per keystroke.
+    if (shouldScroll) { _resultsEnsureVisiblePending = true; }
+    scheduleResultsViewportRender();
+  }
+
+  // #perf: throttle outbound requestPreview so rapid arrow-nav fetches only the
+  // row the user settles on. Leading edge fires immediately (single deliberate
+  // moves stay snappy); calls inside the window coalesce to one trailing send
+  // carrying the latest selection. activePreviewSeq is bumped at send time so it
+  // stays monotonic with what actually goes out (stale responses still dropped
+  // by previewMessageIsStale on the inbound side).
+  var PREVIEW_REQUEST_THROTTLE_MS = 90;
+  function flushPreviewRequest() {
+    state.previewRequestTimer = null;
+    var fn = state.previewRequestPending;
+    state.previewRequestPending = null;
+    if (fn) {
+      state.lastPreviewRequestAt = perfNow();
+      fn();
+    }
+  }
+  function requestPreviewThrottled(sendFn) {
+    var now = perfNow();
+    var sinceLast = now - (state.lastPreviewRequestAt || 0);
+    if (!state.previewRequestTimer && sinceLast >= PREVIEW_REQUEST_THROTTLE_MS) {
+      state.lastPreviewRequestAt = now;
+      state.previewRequestPending = null;
+      sendFn();
+      return;
+    }
+    state.previewRequestPending = sendFn;
+    if (!state.previewRequestTimer) {
+      var wait = PREVIEW_REQUEST_THROTTLE_MS - sinceLast;
+      if (wait < 0) { wait = 0; }
+      state.previewRequestTimer = setTimeout(flushPreviewRequest, wait);
+    }
   }
 
   function selectMatch(flatIdx) {
@@ -4434,14 +4495,16 @@ export function getRendererPatchScript(
         return;
       }
       state.lastPreviewKey = pkey;
-      state.activePreviewSeq++;
-      trace('preview/select', {
-        path: 'pending',
-        flatIdx: flatIdx,
-        previewSeq: state.activePreviewSeq,
-        applyActiveMs: Math.round(perfNow() - selectT0),
+      requestPreviewThrottled(function () {
+        state.activePreviewSeq++;
+        trace('preview/select', {
+          path: 'pending',
+          flatIdx: flatIdx,
+          previewSeq: state.activePreviewSeq,
+          applyActiveMs: Math.round(perfNow() - selectT0),
+        });
+        send({ type: 'requestPreview', uri: fm.pendingUri, line: 0, contextLines: 0, previewSeq: state.activePreviewSeq });
       });
-      send({ type: 'requestPreview', uri: fm.pendingUri, line: 0, contextLines: 0, previewSeq: state.activePreviewSeq });
       return;
     }
     var f = state.files[fm.fi];
@@ -4459,15 +4522,17 @@ export function getRendererPatchScript(
     var previewRanges = rangesForCurrentQuery(m);
     // Only refresh the overlay's preview pane; do NOT touch VSCode's editor
     // area at all. Arrow-key browsing leaves no trace.
-    state.activePreviewSeq++;
-    trace('preview/select', {
-      path: 'match',
-      flatIdx: flatIdx,
-      previewSeq: state.activePreviewSeq,
-      line: m.line,
-      applyActiveMs: Math.round(perfNow() - selectT0),
+    requestPreviewThrottled(function () {
+      state.activePreviewSeq++;
+      trace('preview/select', {
+        path: 'match',
+        flatIdx: flatIdx,
+        previewSeq: state.activePreviewSeq,
+        line: m.line,
+        applyActiveMs: Math.round(perfNow() - selectT0),
+      });
+      send({ type: 'requestPreview', uri: f.uri, line: m.line, ranges: previewRanges, contextLines: 0, previewSeq: state.activePreviewSeq });
     });
-    send({ type: 'requestPreview', uri: f.uri, line: m.line, ranges: previewRanges, contextLines: 0, previewSeq: state.activePreviewSeq });
   }
 
   // If we're in extension-filter mode, compute single-line ranges for the
