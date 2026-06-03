@@ -495,6 +495,16 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       const { query, label, symbol } = lastUsageQuery;
       await showCallGraphUsageResult(overlay, callGraph, callGraphLog, query, label, symbol, true);
     }),
+    // Toggle target of the in-panel "Estimated" button (sent over the renderer
+    // bridge). Flips the expanded state and re-renders the last Find Usages.
+    vscode.commands.registerCommand('intellijStyledSearch.toggleEstimatedUsages', async () => {
+      if (!lastUsageQuery?.query) { return; }
+      estimatedUsagesExpanded = !estimatedUsagesExpanded;
+      const { query, label, symbol } = lastUsageQuery;
+      await showCallGraphUsageResult(
+        overlay, callGraph, callGraphLog, query, label, symbol, estimatedUsagesExpanded,
+      );
+    }),
     vscode.commands.registerCommand('intellijStyledSearch.activateCallGraphInlayAtPosition', async (
       kind: string,
       uriString: string,
@@ -1316,8 +1326,11 @@ function isConfirmedUsage(reference: CallGraphReference): boolean {
 }
 
 // Remembers the most recent Find Usages query so the "Show Estimated Usages"
-// command can re-render it with the low-confidence (추정) envelope expanded.
+// command / in-panel toggle can re-render it with the low-confidence envelope
+// expanded. `estimatedUsagesExpanded` is the in-panel toggle's current state; it
+// resets to collapsed whenever a fresh Find Usages runs (a new symbol).
 let lastUsageQuery: { query?: string; label?: string; symbol?: CallGraphSymbol } | undefined;
+let estimatedUsagesExpanded = false;
 
 async function showCallGraphUsageResult(
   overlay: OverlayPanel,
@@ -1334,6 +1347,8 @@ async function showCallGraphUsageResult(
     const limit = getConfiguredCallGraphMaxUsageResults();
     if (explicitQuery) {
       lastUsageQuery = { query: explicitQuery, label: explicitLabel, symbol: explicitSymbol };
+      // A fresh Find Usages (not a toggle re-render) starts collapsed.
+      if (forceIncludeLowConfidence === undefined) { estimatedUsagesExpanded = false; }
     }
     if (explicitQuery) {
       await showCallGraphPendingPanel(overlay, title, explicitLabel ?? explicitQuery);
@@ -1452,11 +1467,14 @@ async function showCallGraphUsageMatches(
   }
   const statusSuffix =
     !showFolded && lowConfidenceCount > 0
-      ? ` · 추정 ${lowConfidenceCount}개 접힘 (펼치기: "Show Estimated Usages")`
+      ? ` · ${lowConfidenceCount} estimated hidden`
       : showFolded && lowConfidenceCount > 0
-        ? ` · 추정 ${lowConfidenceCount}개 포함`
+        ? ` · ${lowConfidenceCount} estimated shown`
         : '';
   await overlay.showStaticResults(`${title} [${sourceLabel}]: ${targetLabel}${statusSuffix}`, matches);
+  // Drive the in-panel "Estimated" toggle button: visible only when there is a
+  // low-confidence envelope to reveal; pressed when it is currently shown.
+  overlay.setEstimatedToggleState({ visible: lowConfidenceCount > 0, pressed: showFolded });
 }
 
 function labelFromCallGraphSymbolId(symbolId: string): string {

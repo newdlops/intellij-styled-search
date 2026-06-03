@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 127;
+export const RENDERER_PATCH_VERSION = 128;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -2534,7 +2534,10 @@ export function getRendererPatchScript(
   var $optRegex = el('button', { className: 'ij-find-opt', title: 'Regex (Alt+R)', text: '.*', attrs: { 'data-opt': 'useRegex', 'aria-pressed': 'false' } });
   var $optRegexMultiline = el('button', { className: 'ij-find-opt', title: 'Regex Multiline (Alt+M)', text: 'ML', attrs: { 'data-opt': 'regexMultiline', 'aria-pressed': 'true', 'aria-disabled': 'true' } });
   var $refresh = el('button', { className: 'ij-find-opt ij-find-refresh', title: 'Refresh Search', text: 'Run', attrs: { type: 'button', 'aria-label': 'Refresh search' } });
-  var $opts = el('div', { className: 'ij-find-opts', children: [$optCase, $optWord, $optRegex, $optRegexMultiline, $refresh] });
+  // Find Usages only: toggle the low-confidence (estimated) envelope. Hidden
+  // until the extension sends an estimatedToggle message saying there is one.
+  var $optEst = el('button', { className: 'ij-find-opt ij-find-opt-est', title: 'Show Estimated (Low-Confidence) Usages', text: 'Est', attrs: { type: 'button', 'aria-pressed': 'false', hidden: '' } });
+  var $opts = el('div', { className: 'ij-find-opts', children: [$optCase, $optWord, $optRegex, $optRegexMultiline, $optEst, $refresh] });
   var $queryGroup = el('div', { className: 'ij-find-query-group', children: [$q, $historyWrap] });
   var $searchRow = el('div', { className: 'ij-find-search-row', children: [$queryGroup, $opts] });
   var $scope = el('input', {
@@ -4792,6 +4795,13 @@ export function getRendererPatchScript(
   on($optCase, 'click', function () { toggleOpt('caseSensitive', $optCase); });
   on($optWord, 'click', function () { toggleOpt('wholeWord', $optWord); });
   on($optRegex, 'click', function () { toggleOpt('useRegex', $optRegex); });
+  on($optEst, 'click', function () {
+    // Optimistically flip; the extension re-renders and confirms via an
+    // estimatedToggle message. Re-running the query is the extension's job.
+    var pressed = $optEst.getAttribute('aria-pressed') === 'true';
+    $optEst.setAttribute('aria-pressed', String(!pressed));
+    send({ type: 'runCommand', command: 'intellijStyledSearch.toggleEstimatedUsages', args: [] });
+  });
   on($optRegexMultiline, 'click', function () { toggleOpt('regexMultiline', $optRegexMultiline); });
   on($refresh, 'click', refreshSearch);
   function applyMinimapSetting() {
@@ -9553,6 +9563,15 @@ export function getRendererPatchScript(
       });
       try {
 	    switch (msg.type) {
+	      case 'estimatedToggle':
+        // Drive the Find Usages "Est" toggle button: show it only when a
+        // low-confidence envelope exists, and reflect whether it is shown.
+        try {
+          if (msg.visible) { $optEst.removeAttribute('hidden'); }
+          else { $optEst.setAttribute('hidden', ''); }
+          $optEst.setAttribute('aria-pressed', String(!!msg.pressed));
+        } catch (eEst) {}
+        return 'ok';
 	      case 'results:start':
         panelDiagMark('results:start', { searchId: msgSearchId });
         setShellMode(false);

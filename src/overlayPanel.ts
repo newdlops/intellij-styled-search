@@ -66,6 +66,7 @@ export type PreviewCallGraphInlayProvider = (
 // HoverContent type removed in #32 along with sendHover()/$hoverTooltip.
 
 type OverlayMessage =
+  | { type: 'estimatedToggle'; visible: boolean; pressed: boolean }
   | { type: 'results:start'; searchId: number }
   | { type: 'results:candidates'; searchId: number; candidates: Array<{ uri: string; relPath: string }>; total: number }
   | { type: 'results:file'; searchId: number; match: FileMatch }
@@ -2169,6 +2170,18 @@ export class OverlayPanel {
         this.staticResultsChain = next.then(() => undefined, () => undefined);
         void next.then(pending.resolve, pending.reject);
       }, 45);
+    });
+  }
+
+  // Drive the in-panel "Estimated" toggle button from the extension: `visible`
+  // shows/hides it (only when a low-confidence envelope exists), `pressed` marks
+  // whether the envelope is currently shown. Fire-and-forget; harmless if the
+  // renderer is not up yet.
+  setEstimatedToggleState(state: { visible: boolean; pressed: boolean }): void {
+    void this.postToRenderer({
+      type: 'estimatedToggle',
+      visible: state.visible,
+      pressed: state.pressed,
     });
   }
 

@@ -47,6 +47,11 @@
         "category": "IntelliJ Search"
       },
       {
+        "command": "intellijStyledSearch.toggleEstimatedUsages",
+        "title": "Toggle Estimated (Low-Confidence) Usages",
+        "category": "IntelliJ Search"
+      },
+      {
         "command": "intellijStyledSearch.rebuildIndex",
         "title": "Force Rebuild Search + Graph Index",
         "category": "IntelliJ Search"
