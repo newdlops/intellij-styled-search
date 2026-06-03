@@ -2619,13 +2619,54 @@ where
         let spill_dir = workspace_root.join(".zoek-rs").join("graph-spill");
         let _ = fs::create_dir_all(&spill_dir);
         let spill_dir_for_workers = spill_dir.clone();
+        // Size-aware contiguous chunking. The previous fixed file-COUNT chunks
+        // serialized a whole chunk's worth of huge generated/vendored files
+        // (8MB codegen, multi-MB .venv JSON — these cluster by directory, hence
+        // land adjacent in discovery order, hence in the SAME count-chunk) on one
+        // thread while the other cores idled — the profiled parse wall was a
+        // straggler tail (workers parked in Sleep/wait_until_cold). Cutting chunk
+        // boundaries on accumulated BYTES instead isolates each large file into
+        // its own (near-)singleton chunk, so rayon's work-stealing parses the big
+        // files concurrently rather than serially behind one thread. Chunks stay
+        // CONTIGUOUS in discovery order, so the chunk-index-ordered merge below is
+        // byte-identical regardless of where the boundaries fall. Tune the target
+        // with ZOEK_PARSE_CHUNK_BYTES.
         let chunks_per_worker = 8usize;
         let target_chunks = worker_count.saturating_mul(chunks_per_worker).max(worker_count);
-        let chunk_size = total_entries.div_ceil(target_chunks).max(1);
-        let ranges: Vec<(usize, usize, usize)> = (0..)
-            .map(|i| (i, i * chunk_size, ((i + 1) * chunk_size).min(total_entries)))
-            .take_while(|(_, s, _)| *s < total_entries)
-            .collect();
+        let total_bytes: u64 = candidates_ref.iter().map(|c| c.size_bytes).sum();
+        let target_chunk_bytes = std::env::var("ZOEK_PARSE_CHUNK_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| (total_bytes / target_chunks as u64).max(1));
+        let mut ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(target_chunks + 64);
+        {
+            let mut start = 0usize;
+            let mut acc: u64 = 0;
+            let mut idx = 0usize;
+            for i in 0..total_entries {
+                let sz = candidates_ref[i].size_bytes;
+                // Flush the in-progress small-file chunk before a file that would
+                // overflow the byte target, so a large file lands in its own chunk.
+                if acc > 0 && acc.saturating_add(sz) > target_chunk_bytes {
+                    ranges.push((idx, start, i));
+                    idx += 1;
+                    start = i;
+                    acc = 0;
+                }
+                acc = acc.saturating_add(sz);
+                if acc >= target_chunk_bytes {
+                    ranges.push((idx, start, i + 1));
+                    idx += 1;
+                    start = i + 1;
+                    acc = 0;
+                }
+            }
+            if start < total_entries {
+                ranges.push((idx, start, total_entries));
+            }
+        }
+        let t_parse_compute = std::time::Instant::now();
         let worker_accums: io::Result<Vec<(ParseAccum, Vec<PathBuf>)>> = ranges
             .into_par_iter()
             .map(|(w, start, end)| -> io::Result<(ParseAccum, Vec<PathBuf>)> {
@@ -2671,6 +2712,13 @@ where
                 Ok((a, partial_paths))
             })
             .collect();
+        if std::env::var("ZOEK_PARSE_PROBE").is_ok() {
+            eprintln!(
+                "[parse] compute(par_iter)={}ms target_chunks={}",
+                t_parse_compute.elapsed().as_millis(),
+                target_chunks
+            );
+        }
         let skip_resolve_fast_path = std::env::var("ZOEK_SKIP_RESOLVE").is_ok();
         if skip_resolve_fast_path {
             // Streaming fast path: never build a full in-memory total.
@@ -2848,8 +2896,39 @@ where
                 bytes: total_bytes,
             });
         }
+        let t_parse_merge = std::time::Instant::now();
+        let chunk_accums = worker_accums?;
+        // Pre-reserve the merged Vecs from the in-memory chunk finals (the bulk;
+        // spilled partials are rare and extend on top). The old `total =
+        // ParseAccum::new()` + 1024× `extend` reallocated/copied the growing
+        // Vecs O(log n) times — for the 48M-site / 5M-symbol concat that
+        // realloc churn was the dominant merge cost. Reserving once makes every
+        // `merge` a pure append. Order is unchanged (same sequential extend in
+        // chunk order, final-then-partials per chunk), so output is byte-identical.
         let mut total = ParseAccum::new();
-        for (a, partial_paths) in worker_accums? {
+        {
+            let mut sym = 0usize;
+            let mut refs = 0usize;
+            let mut imp = 0usize;
+            let mut typ = 0usize;
+            let mut frf = 0usize;
+            let mut hier = 0usize;
+            for (a, _) in &chunk_accums {
+                sym += a.symbols.len();
+                refs += a.ref_sites.len();
+                imp += a.import_facts.len();
+                typ += a.type_facts.len();
+                frf += a.function_return_facts.len();
+                hier += a.hierarchy_facts.len();
+            }
+            total.symbols.reserve(sym);
+            total.ref_sites.reserve(refs);
+            total.import_facts.reserve(imp);
+            total.type_facts.reserve(typ);
+            total.function_return_facts.reserve(frf);
+            total.hierarchy_facts.reserve(hier);
+        }
+        for (a, partial_paths) in chunk_accums {
             total.merge(a);
             for path in partial_paths {
                 let partial = ParseAccum::load_from_file(&path)?;
@@ -2859,6 +2938,14 @@ where
         }
         // Clean up the spill dir if it still exists (best-effort).
         let _ = fs::remove_dir_all(workspace_root.join(".zoek-rs").join("graph-spill"));
+        if std::env::var("ZOEK_PARSE_PROBE").is_ok() {
+            eprintln!(
+                "[parse] merge={}ms symbols={} ref_sites={}",
+                t_parse_merge.elapsed().as_millis(),
+                total.symbols.len(),
+                total.ref_sites.len()
+            );
+        }
         total
     };
     let parsing_ms = parsing_started.elapsed().as_millis();
@@ -3009,11 +3096,31 @@ where
         // Prep: file_table + shard writers. References are reconstructed from
         // ref_sites via LightRef.site_idx so file_table needs only ref_sites +
         // symbols + facts (no resolution.references rel_paths).
+        // The intern's per-call cost is the rel_path string hash. Sites and
+        // symbols arrive file-grouped (atomic per-file FileGraph ingest → ~99%
+        // of adjacent entries share a rel_path, W12), so skip the call when
+        // rel_path is unchanged from the previous entry, comparing the
+        // precomputed `rel_path_hash` (inline u64, no String deref on the hot
+        // skip path). The first occurrence of every path is still a transition
+        // and is interned at the same point, so the id-assignment ORDER — hence
+        // the serialized file_table and the site_file_ids column — is
+        // byte-identical; repeats only ever returned the existing id. Relies on
+        // the same rel_path_hash collision-freedom the W16/W18 maps already
+        // assume (validated by the a2 invariant gate). Cuts ~48M+5M intern
+        // calls to ~one per file transition.
+        let mut last_rel_h = u64::MAX;
         for site in &ref_sites {
-            stream_file_table.intern(&site.rel_path);
+            if site.rel_path_hash != last_rel_h {
+                last_rel_h = site.rel_path_hash;
+                stream_file_table.intern(&site.rel_path);
+            }
         }
+        last_rel_h = u64::MAX;
         for sym in &symbols {
-            stream_file_table.intern(&sym.rel_path);
+            if sym.rel_path_hash != last_rel_h {
+                last_rel_h = sym.rel_path_hash;
+                stream_file_table.intern(&sym.rel_path);
+            }
         }
         for fact in &import_facts {
             stream_file_table.intern(&fact.rel_path);
@@ -6314,6 +6421,14 @@ fn extract_ts_type_facts(
         .map(|symbol| (symbol.start_line, symbol.id.clone()))
         .collect();
     let mut pending_params: Option<(String, String, i32)> = None;
+    // O(lines+symbols) per-line enclosing-scope table, replacing the previous
+    // per-line enclosing_type_fact_scope_for_line() that re-scanned EVERY file
+    // symbol on every line — O(lines×symbols), a top parse-CPU leaf in the
+    // profile (quadratic on large files). precompute_enclosing_per_line yields
+    // byte-identical values (same is_lexical_scope filter + (start_line,
+    // start_column) max, same id), validated by the a2 gate.
+    let ts_line_count = entry.text.lines().count() as u32;
+    let enclosing_by_line = precompute_enclosing_per_line(symbols, ts_line_count);
     for (line_idx, line) in entry.text.lines().enumerate() {
         let sanitized = sanitize_code_line(line, language);
         let trimmed = sanitized.trim_start();
@@ -6330,7 +6445,7 @@ fn extract_ts_type_facts(
             }
             continue;
         }
-        let scope = enclosing_type_fact_scope_for_line(symbols, line_idx as u32);
+        let scope = enclosing_by_line[line_idx].clone();
         if let Some(signature_scope) = signature_start_scopes.get(&(line_idx as u32)) {
             let depth = paren_delta(trimmed);
             if depth > 0 {
@@ -6570,13 +6685,18 @@ fn extend_python_alias_type_facts(
     let mut known: HashMap<(String, String), String> = HashMap::new();
     let mut known_elements: HashMap<(String, String), String> = HashMap::new();
     let mut pending_params: Option<(String, String, i32)> = None;
+    // Same O(lines×symbols)→O(lines+symbols) fix as extract_ts_type_facts: use
+    // the precomputed per-line enclosing table instead of re-scanning all
+    // symbols per line. Byte-identical (a2-gated).
+    let alias_line_count = entry.text.lines().count() as u32;
+    let enclosing_by_line = precompute_enclosing_per_line(symbols, alias_line_count);
     for (line_idx, line) in entry.text.lines().enumerate() {
         let sanitized = sanitize_code_line(line, language);
         let trimmed = sanitized.trim_start();
         if trimmed.is_empty() {
             continue;
         }
-        let scope = enclosing_type_fact_scope_for_line(symbols, line_idx as u32);
+        let scope = enclosing_by_line[line_idx].clone();
         if let Some((buffer, pending_scope, depth)) = pending_params.as_mut() {
             buffer.push(' ');
             buffer.push_str(trimmed);
@@ -7817,7 +7937,15 @@ fn resolve_ref_sites_a_to_e<'a>(
     // symbol carry this name?"). A `name_hash` set answers that with an integer
     // probe and lets phase C avoid reading the site `&str` — same proven-safe
     // rekey as W9b. (This was the lone reader of the old `&str`-keyed map.)
-    let mut symbol_name_hashes: AHashSet<u64> = AHashSet::default();
+    // Pre-size the four per-symbol (~5M-entry) maps to symbols.len() so the
+    // build never rehashes/regrows mid-fill (each grew from empty ~20× before,
+    // re-inserting every live entry on each growth). Capacity-only — insertion
+    // order and contents are unchanged, so the maps' Vec values and all probes
+    // stay byte-identical (same class as the already-presized same_file_bare_count
+    // below, and the parse-merge pre-reserve). Subset maps (types/members/bare)
+    // stay default-sized.
+    let n_syms = symbols.len();
+    let mut symbol_name_hashes: AHashSet<u64> = AHashSet::with_capacity(n_syms);
     // W9b: bare_symbols_by_name keyed by name_hash (u64) instead of &str.
     // Phase E hot loop and prefilter probe this per bare site; the u64
     // lookup is ~5x cheaper than the prior string hash + memcmp.
@@ -7830,11 +7958,12 @@ fn resolve_ref_sites_a_to_e<'a>(
         AHashMap::default();
     let mut member_symbols_by_language_and_name: AHashMap<(u16, u64), Vec<&GraphSymbol>> =
         AHashMap::default();
-    let mut symbols_by_id: AHashMap<&str, &GraphSymbol> = AHashMap::default();
+    let mut symbols_by_id: AHashMap<&str, &GraphSymbol> = AHashMap::with_capacity(n_syms);
     let mut types_by_name: AHashMap<&str, Vec<&GraphSymbol>> = AHashMap::default();
     let mut members_by_container_and_name: AHashMap<(&str, &str), Vec<&GraphSymbol>> =
         AHashMap::default();
-    let mut symbols_by_file_and_name: AHashMap<(&str, &str), Vec<&GraphSymbol>> = AHashMap::default();
+    let mut symbols_by_file_and_name: AHashMap<(&str, &str), Vec<&GraphSymbol>> =
+        AHashMap::with_capacity(n_syms);
     // W18 / Option B step B4: hash-keyed twins of the two member-resolution maps
     // the phase-E worker probes per site. Keyed by precomputed `stable_hash`es
     // (`(container_hash, name_hash)` and `(rel_path_hash, name_hash)`) so the
@@ -7845,56 +7974,91 @@ fn resolve_ref_sites_a_to_e<'a>(
     let mut members_by_container_and_name_h: AHashMap<(u64, u64), Vec<&GraphSymbol>> =
         AHashMap::default();
     let mut symbols_by_file_and_name_h: AHashMap<(u64, u64), Vec<&GraphSymbol>> =
-        AHashMap::default();
+        AHashMap::with_capacity(n_syms);
     // W5: count bare-fallback definitions per (name_hash, rel_path_hash). The
     // phase E hot loop uses this O(1) lookup instead of scanning the per-name
     // candidate Vec with a rel_path filter (was 208K closure samples).
     let mut same_file_bare_count: AHashMap<(u64, u64), u32> = AHashMap::with_capacity(1 << 20);
-    for symbol in symbols {
-        let flags = symbol.kind_flags;
-        symbols_by_id.insert(&symbol.id, symbol);
-        symbol_name_hashes.insert(symbol.name_hash);
-        if flags & KF_TYPE != 0 {
-            types_by_name.entry(&symbol.name).or_default().push(symbol);
-        }
-        if let Some(container_name) = symbol.container_name.as_deref() {
-            members_by_container_and_name
-                .entry((container_name, symbol.name.as_str()))
-                .or_default()
-                .push(symbol);
-            members_by_container_and_name_h
-                .entry((stable_hash(container_name), symbol.name_hash))
-                .or_default()
-                .push(symbol);
-        }
-        if flags & KF_BARE_FB != 0 {
-            bare_symbols_by_name
-                .entry(symbol.name_hash)
-                .or_default()
-                .push(symbol);
-            bare_symbols_by_language_and_name
-                .entry((symbol.language_id, symbol.name_hash))
-                .or_default()
-                .push(symbol);
-            *same_file_bare_count
-                .entry((symbol.name_hash, symbol.rel_path_hash))
-                .or_default() += 1;
-        }
-        if flags & KF_MEMBER_FB != 0 {
-            member_symbols_by_language_and_name
-                .entry((symbol.language_id, symbol.name_hash))
-                .or_default()
-                .push(symbol);
-        }
-        symbols_by_file_and_name
-            .entry((&symbol.rel_path, &symbol.name))
-            .or_default()
-            .push(symbol);
-        symbols_by_file_and_name_h
-            .entry((symbol.rel_path_hash, symbol.name_hash))
-            .or_default()
-            .push(symbol);
-    }
+    // phase_a parallel build: the 11 lookup maps partition into four groups that
+    // share no output map, so rayon::join fills them concurrently with NO merge
+    // step. Each map is still filled by a single pass over `symbols` in symbol
+    // order, so its contents and per-key Vec order are byte-identical to the
+    // prior serial loop (a2/s4_s5 gated). The four closures take DISJOINT &mut
+    // borrows of the maps; `symbols` is shared (&). rayon::join is scoped, so the
+    // stack borrows are valid for its duration (no 'static / move needed).
+    rayon::join(
+        // GA — every-symbol (rel_path, name) maps (string + hash twin).
+        || {
+            for symbol in symbols {
+                symbols_by_file_and_name
+                    .entry((&symbol.rel_path, &symbol.name))
+                    .or_default()
+                    .push(symbol);
+                symbols_by_file_and_name_h
+                    .entry((symbol.rel_path_hash, symbol.name_hash))
+                    .or_default()
+                    .push(symbol);
+            }
+        },
+        || {
+            rayon::join(
+                // GB — every-symbol id map + name-hash set.
+                || {
+                    for symbol in symbols {
+                        symbols_by_id.insert(&symbol.id, symbol);
+                        symbol_name_hashes.insert(symbol.name_hash);
+                    }
+                },
+                || {
+                    rayon::join(
+                        // GC — type + container-member maps.
+                        || {
+                            for symbol in symbols {
+                                if symbol.kind_flags & KF_TYPE != 0 {
+                                    types_by_name.entry(&symbol.name).or_default().push(symbol);
+                                }
+                                if let Some(container_name) = symbol.container_name.as_deref() {
+                                    members_by_container_and_name
+                                        .entry((container_name, symbol.name.as_str()))
+                                        .or_default()
+                                        .push(symbol);
+                                    members_by_container_and_name_h
+                                        .entry((stable_hash(container_name), symbol.name_hash))
+                                        .or_default()
+                                        .push(symbol);
+                                }
+                            }
+                        },
+                        // GD — bare-fallback + member-fallback maps + counts.
+                        || {
+                            for symbol in symbols {
+                                let flags = symbol.kind_flags;
+                                if flags & KF_BARE_FB != 0 {
+                                    bare_symbols_by_name
+                                        .entry(symbol.name_hash)
+                                        .or_default()
+                                        .push(symbol);
+                                    bare_symbols_by_language_and_name
+                                        .entry((symbol.language_id, symbol.name_hash))
+                                        .or_default()
+                                        .push(symbol);
+                                    *same_file_bare_count
+                                        .entry((symbol.name_hash, symbol.rel_path_hash))
+                                        .or_default() += 1;
+                                }
+                                if flags & KF_MEMBER_FB != 0 {
+                                    member_symbols_by_language_and_name
+                                        .entry((symbol.language_id, symbol.name_hash))
+                                        .or_default()
+                                        .push(symbol);
+                                }
+                            }
+                        },
+                    );
+                },
+            );
+        },
+    );
     if probe { eprintln!("[resolve] phase_a={}ms same_file_bare_count_entries={}", t_a.elapsed().as_millis(), same_file_bare_count.len()); }
     // W17 / Option B step B1: de-risk the SoA build cost behind a flag before
     // wiring any consumer. The prior failed SoA attempt paid ~5.2s building
@@ -7997,30 +8161,44 @@ fn resolve_ref_sites_a_to_e<'a>(
     // SiteCols) without reading the path string. Inner key remains the W16
     // name hash. `stable_hash(rp)` here matches `site.rel_path_hash` because
     // both hash the same path string with the same FNV-1a (extract_ref_sites).
-    let import_targets_by_rel: AHashMap<u64, AHashMap<u64, &[&GraphSymbol]>> = {
-        let mut by_rel: AHashMap<u64, AHashMap<u64, &[&GraphSymbol]>> = AHashMap::default();
-        for ((rp, nm), targets) in &import_targets {
+    // phase_b parallel: these three rel_path-keyed views read three different
+    // source maps and share no output, so rayon::join builds them concurrently.
+    // Each is filled by a single pass over its source (same as the serial blocks);
+    // inner values are AHashMap/AHashSet (order-independent), so output is
+    // byte-identical (a2/s4_s5 gated).
+    let (import_targets_by_rel, (import_facts_by_rel, type_facts_by_rel)): (
+        AHashMap<u64, AHashMap<u64, &[&GraphSymbol]>>,
+        (AHashMap<u64, AHashSet<u64>>, AHashMap<u64, AHashSet<u64>>),
+    ) = rayon::join(
+        || {
+            let mut by_rel: AHashMap<u64, AHashMap<u64, &[&GraphSymbol]>> = AHashMap::default();
+            for ((rp, nm), targets) in &import_targets {
+                by_rel
+                    .entry(stable_hash(rp))
+                    .or_default()
+                    .insert(stable_hash(nm), targets.as_slice());
+            }
             by_rel
-                .entry(stable_hash(rp))
-                .or_default()
-                .insert(stable_hash(nm), targets.as_slice());
-        }
-        by_rel
-    };
-    let import_facts_by_rel: AHashMap<u64, AHashSet<u64>> = {
-        let mut by_rel: AHashMap<u64, AHashSet<u64>> = AHashMap::default();
-        for ((rp, nm), _) in &import_facts_by_file_local {
-            by_rel.entry(stable_hash(rp)).or_default().insert(stable_hash(nm));
-        }
-        by_rel
-    };
-    let type_facts_by_rel: AHashMap<u64, AHashSet<u64>> = {
-        let mut by_rel: AHashMap<u64, AHashSet<u64>> = AHashMap::default();
-        for ((rp, nm), _) in &type_facts_by_file_local {
-            by_rel.entry(stable_hash(rp)).or_default().insert(stable_hash(nm));
-        }
-        by_rel
-    };
+        },
+        || {
+            rayon::join(
+                || {
+                    let mut by_rel: AHashMap<u64, AHashSet<u64>> = AHashMap::default();
+                    for ((rp, nm), _) in &import_facts_by_file_local {
+                        by_rel.entry(stable_hash(rp)).or_default().insert(stable_hash(nm));
+                    }
+                    by_rel
+                },
+                || {
+                    let mut by_rel: AHashMap<u64, AHashSet<u64>> = AHashMap::default();
+                    for ((rp, nm), _) in &type_facts_by_file_local {
+                        by_rel.entry(stable_hash(rp)).or_default().insert(stable_hash(nm));
+                    }
+                    by_rel
+                },
+            )
+        },
+    );
     if probe { eprintln!("[resolve] phase_b={}ms", t_b.elapsed().as_millis()); }
     // Phase 1.5A pre-cache: build site language_id once (parallel) so the
     // pre-filter and phase E workers can do O(1) array lookups instead of
@@ -8628,9 +8806,14 @@ fn resolve_ref_sites_a_to_e<'a>(
                             &mut exact_buf,
                         );
                     }
-                } else if let Some(bare) = bare_symbols_by_name.get(&c.name_hash) {
-                    fallback_buf.extend(bare.iter().copied());
                 }
+                // B-fanout fix: bare candidates are intentionally NOT gathered
+                // into fallback_buf here. The bare emit path below resolves the
+                // single unique / same-file target via direct map lookups, so the
+                // prior full-candidate extend + per-candidate scan (~57B iters on
+                // captain2 — common names have thousands of defs, all but one
+                // discarded) is gone. fallback_buf stays empty for non-member
+                // sites; the productivity check below uses contains_key instead.
                 if is_bare {
                     star_import_candidates_into_cols(
                         c.rel_path_hash,
@@ -8695,9 +8878,10 @@ fn resolve_ref_sites_a_to_e<'a>(
                             &mut exact_buf,
                         );
                     }
-                } else if let Some(bare) = bare_symbols_by_name.get(&site.name_hash) {
-                    fallback_buf.extend(bare.iter().copied());
                 }
+                // B-fanout fix (struct path): see the column-path note above —
+                // bare candidates are not materialized; the emit path resolves the
+                // unique/same-file target directly.
                 if is_bare {
                     star_import_candidates_into(
                         site,
@@ -8734,7 +8918,18 @@ fn resolve_ref_sites_a_to_e<'a>(
             } else {
                 None
             };
-            if fallback_candidates.is_empty()
+            // B-fanout fix: bare/other sites no longer materialize fallback_buf,
+            // so test "does this name have bare candidates" via contains_key —
+            // equivalent to the old `!fallback_candidates.is_empty()` (the
+            // else-if-bare branch had extended it for exactly the names present in
+            // bare_symbols_by_name). Member sites still use the receiver-resolved
+            // fallback_buf.
+            let has_fallback_candidates = if is_member {
+                !fallback_candidates.is_empty()
+            } else {
+                bare_symbols_by_name.contains_key(&c.name_hash)
+            };
+            if !has_fallback_candidates
                 && imported_candidates.is_empty()
                 && star_imported_candidates.is_empty()
                 && unique_member_candidate.is_none()
@@ -8907,18 +9102,18 @@ fn resolve_ref_sites_a_to_e<'a>(
                     edge_key,
                 );
             }
-            for target in fallback_candidates.iter() {
-                let is_same_file_unique = is_bare
-                    && same_file_count == 1
-                    && target.rel_path_hash == site_rel_path_hash;
-                let is_workspace_unique = is_bare
-                    && unique_bare_candidate.is_some_and(|unique| unique.id == target.id);
-                let bound_mask = if is_same_file_unique {
-                    BOUND_MAY | BOUND_MUST
-                } else {
-                    BOUND_MAY
-                };
-                if is_same_file_unique || is_workspace_unique {
+            // B-fanout fix: resolve the single emitted bare target directly
+            // instead of scanning every global candidate of this name (this loop
+            // was ~57B iters on captain2 yet emitted for at most one candidate).
+            // The two emit cases are mutually exclusive — unique_bare_candidate is
+            // computed only when same_file_count==0, the same-file case requires
+            // ==1 — and this is byte-identical to the prior loop (every skipped
+            // candidate failed the `is_same_file_unique || is_workspace_unique`
+            // guard and emitted nothing). Other-access sites (is_bare false) keep
+            // emitting nothing, as before.
+            if is_bare {
+                if let Some(target) = unique_bare_candidate {
+                    // is_workspace_unique: MAY, possible, unique-name.
                     let edge_key = edge_key_from_partial_u64(site_partial, target.id_u64);
                     add_resolution_count(
                         &mut counts,
@@ -8927,21 +9122,11 @@ fn resolve_ref_sites_a_to_e<'a>(
                         &mut counted_exact,
                         c.edge_kind_id,
                         target,
-                        bound_mask,
+                        BOUND_MAY,
                         true,
                         true,
                         edge_key,
                     );
-                    let confidence = if bound_mask & BOUND_MUST != 0 {
-                        "exact"
-                    } else {
-                        "possible"
-                    };
-                    let provenance = if is_same_file_unique {
-                        "lexical"
-                    } else {
-                        "unique-name"
-                    };
                     let _ = push_light_resolved_reference(
                         &mut light_refs,
                         &mut dedup,
@@ -8949,11 +9134,51 @@ fn resolve_ref_sites_a_to_e<'a>(
                         light_sender,
                         site_idx,
                         target,
-                        bound_mask,
-                        confidence_from_str(confidence),
-                        provenance_from_str(provenance),
+                        BOUND_MAY,
+                        confidence_from_str("possible"),
+                        provenance_from_str("unique-name"),
                         edge_key,
                     );
+                } else if same_file_count == 1 {
+                    // is_same_file_unique: the lone same-file bare-fb def of this
+                    // name. Looked up directly via the per-(file,name) bucket
+                    // (tiny) rather than filtering the whole candidate list.
+                    if let Some(syms) =
+                        symbols_by_file_and_name_h.get(&(site_rel_path_hash, c.name_hash))
+                    {
+                        for target in syms.iter() {
+                            if target.rel_path_hash == site_rel_path_hash
+                                && target.kind_flags & KF_BARE_FB != 0
+                            {
+                                let edge_key =
+                                    edge_key_from_partial_u64(site_partial, target.id_u64);
+                                add_resolution_count(
+                                    &mut counts,
+                                    &mut id_to_string,
+                                    &mut counted_likely,
+                                    &mut counted_exact,
+                                    c.edge_kind_id,
+                                    target,
+                                    BOUND_MAY | BOUND_MUST,
+                                    true,
+                                    true,
+                                    edge_key,
+                                );
+                                let _ = push_light_resolved_reference(
+                                    &mut light_refs,
+                                    &mut dedup,
+                                    Some(&mut local_target_tally),
+                                    light_sender,
+                                    site_idx,
+                                    target,
+                                    BOUND_MAY | BOUND_MUST,
+                                    confidence_from_str("exact"),
+                                    provenance_from_str("lexical"),
+                                    edge_key,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -11082,7 +11307,20 @@ fn resolve_import_targets<'a>(
 /// old string equals this value, so the on-disk encoding is byte-identical.
 #[inline]
 fn stable_ref_id_u64(rel_path: &str, line: u32, column: u32, name: &str) -> u64 {
-    stable_hash(&format!("{rel_path}\0{line}\0{column}\0{name}"))
+    // Hot: ~one call per ref_site (tens of millions per rebuild). The previous
+    // `stable_hash(&format!("{rel_path}\0{line}\0{column}\0{name}"))` allocated a
+    // fresh key String and ran the full `core::fmt` integer-formatting machinery
+    // every call — the #1 parse-phase CPU/alloc cost in the profile. Stream the
+    // identical byte sequence straight into FNV-1a instead: byte-identical digest
+    // (\0 == the literal NUL in the format string; decimal ints == Display), zero
+    // allocation, no fmt.
+    let mut h = fnv1a_bytes(FNV_OFFSET_BASIS, rel_path.as_bytes());
+    h = fnv1a_bytes(h, b"\0");
+    h = fnv1a_u32_decimal(h, line);
+    h = fnv1a_bytes(h, b"\0");
+    h = fnv1a_u32_decimal(h, column);
+    h = fnv1a_bytes(h, b"\0");
+    fnv1a_bytes(h, name.as_bytes())
 }
 
 /// B6 stage-2: `site_partial_hash` over the u64 source-ref-id. The value differs
@@ -16886,8 +17124,23 @@ fn stable_symbol_id(
     qualified_name: &str,
     occurrence: u32,
 ) -> String {
-    let key = format!("{language}\0{rel_path}\0{kind}\0{qualified_name}\0{occurrence}");
-    format!("sym:{:016x}", stable_hash(&key))
+    // Hot: ~one call per symbol. Stream the composite key into FNV-1a (no key
+    // String) and hand-encode the hex id (no fmt) — byte-identical to
+    // format!("sym:{:016x}", stable_hash(&format!("{language}\0{rel_path}\0\
+    // {kind}\0{qualified_name}\0{occurrence}"))).
+    let mut h = fnv1a_bytes(FNV_OFFSET_BASIS, language.as_bytes());
+    h = fnv1a_bytes(h, b"\0");
+    h = fnv1a_bytes(h, rel_path.as_bytes());
+    h = fnv1a_bytes(h, b"\0");
+    h = fnv1a_bytes(h, kind.as_bytes());
+    h = fnv1a_bytes(h, b"\0");
+    h = fnv1a_bytes(h, qualified_name.as_bytes());
+    h = fnv1a_bytes(h, b"\0");
+    h = fnv1a_u32_decimal(h, occurrence);
+    let mut s = String::with_capacity(20);
+    s.push_str("sym:");
+    push_hex16(&mut s, h);
+    s
 }
 
 fn stable_ref_id(rel_path: &str, line: u32, column: u32, name: &str) -> String {
@@ -16971,13 +17224,54 @@ fn stable_file_id(rel_path: &str) -> String {
     format!("file:{:016x}", stable_hash(rel_path))
 }
 
-fn stable_hash(value: &str) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in value.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+/// FNV-1a over a byte run, continuing from `hash`. Streaming-friendly so the hot
+/// id builders can hash a composite key's byte sequence WITHOUT first
+/// materializing it as a `String` via `format!`. Since FNV-1a is a pure
+/// left-to-right byte fold, feeding the pieces in order yields the exact same
+/// digest as hashing the concatenated string.
+#[inline]
+fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+/// Fold the decimal ASCII of `value` into the FNV-1a state — no leading zeros,
+/// "0" for zero — exactly the bytes `format!("{value}")` would produce, so the
+/// digest matches a key that interpolated the integer with `{}`.
+#[inline]
+fn fnv1a_u32_decimal(hash: u64, value: u32) -> u64 {
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    let mut n = value;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    fnv1a_bytes(hash, &buf[i..])
+}
+/// Append the 16-digit lowercase zero-padded hex of `value` — byte-identical to
+/// `format!("{value:016x}")` — without the `core::fmt` machinery
+/// (Formatter/pad_integral/Write) that dominated the parse CPU sample.
+#[inline]
+fn push_hex16(s: &mut String, value: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 16];
+    for i in 0..16 {
+        buf[15 - i] = HEX[((value >> (i * 4)) & 0xf) as usize];
+    }
+    // SAFETY: every byte written is an ASCII hex digit, so `buf` is valid UTF-8.
+    s.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
+}
+fn stable_hash(value: &str) -> u64 {
+    fnv1a_bytes(FNV_OFFSET_BASIS, value.as_bytes())
 }
 
 fn shard_index_for_key(value: &str) -> usize {
