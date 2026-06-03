@@ -9728,6 +9728,26 @@ fn combined_member_candidates_by_key<'a>(
                         }
                     }
                 }
+                // `receiver` may be an imported SUBMODULE (`from pkg import svc;
+                // svc.member`); resolve `member` inside pkg/svc.py. A module-member
+                // access is unambiguous, so it is exact (still gated by the
+                // single-candidate check at the end). MUST mirror the cols path in
+                // `receiver_resolution_to_cols` for full↔incremental byte-identity.
+                if let Some(submodule) =
+                    submodule_member_candidate(module_path, &fact.imported_name)
+                {
+                    if let Some(symbols) =
+                        symbols_by_file_and_name.get(&(submodule.as_str(), name))
+                    {
+                        fallback.extend(symbols.iter().copied());
+                        for symbol in symbols {
+                            exact.push(MemberExactCandidate {
+                                target: *symbol,
+                                provenance: "import-namespace",
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -9858,9 +9878,17 @@ fn receiver_resolution_to_cols(res: &ReceiverResolution) -> ReceiverResolutionCo
             .iter()
             .flat_map(|f| {
                 let is_star = f.imported_name == "*";
-                f.module_candidates
-                    .iter()
-                    .map(move |m| (stable_hash(m), is_star))
+                let imported = f.imported_name.as_str();
+                f.module_candidates.iter().flat_map(move |m| {
+                    // Mirror combined_member_candidates_by_key: the module itself
+                    // (is_star ⇒ exact) PLUS, when `m` is a package, the imported
+                    // submodule pkg/name.py (always exact — module-member access).
+                    let mut entries = vec![(stable_hash(m), is_star)];
+                    if let Some(submodule) = submodule_member_candidate(m, imported) {
+                        entries.push((stable_hash(&submodule), true));
+                    }
+                    entries
+                })
             })
             .collect(),
     }
@@ -16853,6 +16881,26 @@ fn python_module_path_candidates(module_path: &str) -> Vec<String> {
     ]
 }
 
+/// For `from pkg import name` where `pkg` is a PACKAGE, the imported `name` may
+/// itself be a SUBMODULE (`pkg/name.py`); a later `name.member` access then
+/// resolves into that submodule. Given a package module-candidate
+/// (`.../pkg/__init__.py`) and the imported name, return the submodule file path
+/// so member resolution can look `member` up inside it. Returns None for
+/// non-package candidates (`pkg.py` — a module file has no submodules) and for
+/// star imports. This is the `import service_module; service_module.fn()` /
+/// `from pkg import svc; svc.fn()` pattern that otherwise resolves to nothing
+/// (the function is bare-kind, so it never consults the member token-shape
+/// baseline that the `.fn` access feeds → usage_likely=0, no inline hint).
+fn submodule_member_candidate(module_candidate: &str, imported_name: &str) -> Option<String> {
+    if imported_name.is_empty() || imported_name == "*" {
+        return None;
+    }
+    let pkg_dir = module_candidate
+        .strip_suffix("/__init__.py")
+        .or_else(|| module_candidate.strip_suffix("/__init__.pyi"))?;
+    Some(format!("{pkg_dir}/{imported_name}.py"))
+}
+
 fn ts_module_candidates(rel_path: &str, module_specifier: &str) -> Vec<String> {
     if !module_specifier.starts_with('.') {
         return Vec::new();
@@ -18252,6 +18300,38 @@ mod tests {
         assert!(defs
             .iter()
             .any(|d| d.name == "CreationPath" && d.kind == "class"));
+    }
+
+    // `from pkg import svc; svc.fn()` — `svc` is an imported SUBMODULE
+    // (pkg/svc.py), so the member access resolves EXACTLY to `fn` in pkg/svc.py.
+    // Regression guard for the service-module pattern that previously resolved to
+    // nothing (a bare-kind function never consults the member token-shape baseline
+    // that the `.fn` access feeds → usage_likely=0, no inline hint). The fix must
+    // stay byte-identical across the string + cols resolver paths.
+    #[test]
+    fn python_imported_submodule_member_access_is_exact() {
+        let pkg_init = test_entry("pkg/__init__.py", "\n");
+        let svc = test_entry("pkg/svc.py", "def get_thing(arg):\n    return arg\n");
+        let caller = test_entry(
+            "pkg/caller.py",
+            "from pkg import svc\n\n\ndef use():\n    return svc.get_thing(1)\n",
+        );
+        let (symbols, result) = resolve_test_entries(&[pkg_init, svc, caller]);
+        let target = symbol_id(&symbols, "get_thing");
+        assert!(
+            result.references.iter().any(|r| {
+                r.target_symbol_id.as_deref() == Some(target)
+                    && &*r.rel_path == "pkg/caller.py"
+                    && &*r.raw_text == "get_thing"
+                    && &*r.confidence == "exact"
+            }),
+            "svc.get_thing() (svc = imported submodule pkg/svc.py) must resolve exact; got: {:?}",
+            result
+                .references
+                .iter()
+                .filter(|r| &*r.raw_text == "get_thing")
+                .collect::<Vec<_>>()
+        );
     }
 
     // Guard the fix's blast radius: a bare statement carrying a multi-line string
