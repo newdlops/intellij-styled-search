@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 129;
+export const RENDERER_PATCH_VERSION = 130;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -4149,6 +4149,14 @@ export function getRendererPatchScript(
   var _renderPending = false;
   var _resultsViewportPending = false;
   var _resultsEnsureVisiblePending = false;
+  // #perf: virtual-row render cache. Lets renderResultsViewport skip the full
+  // clearChildren + rebuild when only the active selection moved within the
+  // already-rendered range (the common case during arrow-key navigation).
+  var _resultsViewLastStart = -1;
+  var _resultsViewLastEnd = -1;
+  var _resultsViewLastTotalRows = -1;
+  var _resultsViewRowsRendered = false;
+  var _resultsViewForceRebuild = false;
   var _renderTimer = null;
   var _lastRenderAt = 0;
   function scheduleRender() {
@@ -4191,6 +4199,7 @@ export function getRendererPatchScript(
     _renderPending = false;
     _resultsViewportPending = false;
     _resultsEnsureVisiblePending = false;
+    _resultsViewForceRebuild = true;
   }
 
   function scheduleResultsViewportRender() {
@@ -4329,17 +4338,40 @@ export function getRendererPatchScript(
   function renderResultsViewport() {
     var viewportT0 = perfNow();
     try {
-    clearChildren($resultsInner);
     var totalRows = totalRenderableRows();
     if (totalRows === 0) {
+      clearChildren($resultsInner);
       $resultsInner.style.height = 'auto';
+      _resultsViewRowsRendered = false;
+      _resultsViewLastStart = -1; _resultsViewLastEnd = -1; _resultsViewLastTotalRows = 0;
+      _resultsViewForceRebuild = false;
       return;
     }
-    $resultsInner.style.height = (totalRows * RESULT_ROW_HEIGHT) + 'px';
     var viewportHeight = Math.max($results.clientHeight || 0, RESULT_ROW_HEIGHT * 8);
     var scrollTop = $results.scrollTop;
     var start = Math.max(0, Math.floor(scrollTop / RESULT_ROW_HEIGHT) - RESULT_OVERSCAN);
     var end = Math.min(totalRows, Math.ceil((scrollTop + viewportHeight) / RESULT_ROW_HEIGHT) + RESULT_OVERSCAN);
+    var forceRebuild = _resultsViewForceRebuild;
+    _resultsViewForceRebuild = false;
+    // #perf fast path: when the visible range + row count are unchanged and the
+    // underlying data didn't change (render() forces a rebuild via
+    // applyActive(false)), pure navigation only moved the selection. Rebuilding
+    // all ~44 rows + the forced scrollTop reflow on every arrow keystroke was
+    // the top main-thread cost during continuous nav (Trace-20260604T102734);
+    // here we just move .active between the two affected rows — the DOM is
+    // otherwise already correct. activeIndex is always a result row (< flat.length).
+    if (!forceRebuild && _resultsViewRowsRendered
+        && start === _resultsViewLastStart && end === _resultsViewLastEnd
+        && totalRows === _resultsViewLastTotalRows
+        && state.activeIndex >= start && state.activeIndex < end) {
+      var prevActive = $resultsInner.querySelector('.ij-find-row.active');
+      if (prevActive) { prevActive.classList.remove('active'); }
+      var curActive = $resultsInner.querySelector('.ij-find-row[data-flat="' + state.activeIndex + '"]');
+      if (curActive) { curActive.classList.add('active'); }
+      return;
+    }
+    $resultsInner.style.height = (totalRows * RESULT_ROW_HEIGHT) + 'px';
+    clearChildren($resultsInner);
     var frag = document.createDocumentFragment();
     for (var rowIdx = start; rowIdx < end; rowIdx++) {
       var row = rowIdx < state.flat.length ? buildResultRow(rowIdx) : buildInfoRow(rowIdx);
@@ -4347,6 +4379,10 @@ export function getRendererPatchScript(
       frag.appendChild(row);
     }
     $resultsInner.appendChild(frag);
+    _resultsViewLastStart = start;
+    _resultsViewLastEnd = end;
+    _resultsViewLastTotalRows = totalRows;
+    _resultsViewRowsRendered = true;
     maybeLoadMoreResults();
     } finally {
       reportPerfPhase('resultsViewport', viewportT0, {
@@ -4444,6 +4480,7 @@ export function getRendererPatchScript(
     // + row rebuild are coalesced into a single rAF (scheduleResultsViewportRender)
     // so holding an arrow key down can't fire one full rebuild per keystroke.
     if (shouldScroll) { _resultsEnsureVisiblePending = true; }
+    else { _resultsViewForceRebuild = true; }  // render()/data path: rebuild rows, never the nav fast path
     scheduleResultsViewportRender();
   }
 
