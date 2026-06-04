@@ -879,7 +879,7 @@ export class TrigramIndex {
       patternSrc = escapeRegexSource(query);
       if (opts.wholeWord) { patternSrc = '\\b' + patternSrc + '\\b'; }
     }
-    const regexMultiline = opts.useRegex && opts.regexMultiline !== false;
+    const regexMultiline = opts.useRegex && opts.regexMultiline === true;
     const ast = parseRegex(patternSrc, {
       caseInsensitive: !opts.caseSensitive,
       dotAll: regexMultiline,

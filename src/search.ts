@@ -48,6 +48,10 @@ export interface SearchForTestsResult {
   requestedEngine: SearchEngine;
   effectiveEngine: SearchEngine;
   fallbackReason?: string;
+  /** Set when the search failed because the pattern itself is invalid
+   *  (e.g. a regex the engine can't compile). Distinct from fallbackReason:
+   *  the search did not fall back, it stopped with a user-facing error. */
+  error?: string;
 }
 
 export interface SearchProgress {
@@ -72,7 +76,7 @@ export function searchQueryTerms(opts: Pick<SearchOptions, 'query' | 'queries'>)
 export function isRegexMultilineEnabled(
   opts: Pick<SearchOptions, 'useRegex' | 'regexMultiline'>,
 ): boolean {
-  return !!opts.useRegex && opts.regexMultiline !== false;
+  return !!opts.useRegex && opts.regexMultiline === true;
 }
 
 function buildRegex(opts: SearchOptions): RegExp | null {

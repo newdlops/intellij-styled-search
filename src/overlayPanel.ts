@@ -1327,6 +1327,17 @@ export class OverlayPanel {
           effectiveEngine,
         };
       }
+      if (readiness.invalidPattern) {
+        // Invalid/unsupported pattern: surface the error, do not fall back
+        // (the fallback engine shares the same regex semantics and would fail
+        // or mislead). Mirrors the live runSearchPage results:error path.
+        return {
+          matches: [],
+          requestedEngine,
+          effectiveEngine: requestedEngine,
+          error: readiness.reason,
+        };
+      }
       if (fallbackPolicy === 'never') {
         return {
           matches: mergeFileMatches(matches),
@@ -4180,6 +4191,12 @@ export class OverlayPanel {
         }
       } else {
         const readiness = await this.zoektRuntime.runSearch(pageOptions, cts.token, progress);
+        if (readiness.invalidPattern && !cts.token.isCancellationRequested) {
+          // User pattern can't compile: show the error instead of silently
+          // falling back to codesearch (same regex engine → same failure).
+          progress.onError(new Error(readiness.reason ?? 'invalid regular expression'));
+          return;
+        }
         if (!readiness.ready && !cts.token.isCancellationRequested) {
           session.effectiveEngine = 'codesearch';
           this.maybePromptZoektIndexRecommendation(readiness.reason);

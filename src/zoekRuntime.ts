@@ -31,6 +31,10 @@ import type {
 type SearchReadiness = {
   ready: boolean;
   reason?: string;
+  /** True when the failure is a regex the engine can't compile (bad syntax,
+   *  backreference, look-around). The caller should surface this as a user
+   *  error rather than falling back to another engine. */
+  invalidPattern?: boolean;
 };
 
 export type ZoektFreshnessStatus = {
@@ -456,7 +460,7 @@ export class ZoektRuntime implements vscode.Disposable {
         ...queryArgs,
         '--stream',
         ...(options.useRegex ? ['--regex'] : []),
-        ...(options.useRegex && options.regexMultiline === false ? ['--regex-singleline'] : []),
+        ...(options.useRegex && options.regexMultiline === true ? ['--regex-multiline'] : []),
         ...(!options.useRegex && options.wholeWord ? ['--whole-word'] : []),
         ...(!options.caseSensitive ? [] : ['--case-sensitive']),
         ...this.effectiveIncludeArgs(options),
@@ -490,7 +494,14 @@ export class ZoektRuntime implements vscode.Disposable {
         },
       });
       if (response.type !== 'search' || !response.ok) {
-        return { ready: false, reason: this.describeEngineFailure(response, 'zoek-rs search failed') };
+        const reason = this.describeEngineFailure(response, 'zoek-rs search failed');
+        // A regex the engine (Rust `regex` crate / RE2) can't compile — bad
+        // syntax, backreference, or look-around — is a user error, not an
+        // engine-readiness problem. Flag it so the caller surfaces the error
+        // instead of silently falling back to codesearch (which uses the same
+        // regex engine and would fail or, worse, return misleading results).
+        const invalidPattern = options.useRegex === true && /regex parse error/i.test(reason);
+        return { ready: false, reason, invalidPattern };
       }
       if (token.isCancellationRequested) { return { ready: true }; }
       const page = this.paginateSearchResponse(response, options, workspaceRoot);
@@ -596,7 +607,7 @@ export class ZoektRuntime implements vscode.Disposable {
         workspaceRoot,
         ...queryArgs,
         ...(options.useRegex ? ['--regex'] : []),
-        ...(options.useRegex && options.regexMultiline === false ? ['--regex-singleline'] : []),
+        ...(options.useRegex && options.regexMultiline === true ? ['--regex-multiline'] : []),
         ...(!options.useRegex && options.wholeWord ? ['--whole-word'] : []),
         ...(!options.caseSensitive ? [] : ['--case-sensitive']),
         ...this.effectiveIncludeArgs(options),

@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 130;
+export const RENDERER_PATCH_VERSION = 131;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -2532,7 +2532,7 @@ export function getRendererPatchScript(
   var $optCase = el('button', { className: 'ij-find-opt', title: 'Case Sensitive (Alt+C)', text: 'aA', attrs: { 'data-opt': 'caseSensitive', 'aria-pressed': 'false' } });
   var $optWord = el('button', { className: 'ij-find-opt', title: 'Whole Word (Alt+W)', text: 'W', attrs: { 'data-opt': 'wholeWord', 'aria-pressed': 'false' } });
   var $optRegex = el('button', { className: 'ij-find-opt', title: 'Regex (Alt+R)', text: '.*', attrs: { 'data-opt': 'useRegex', 'aria-pressed': 'false' } });
-  var $optRegexMultiline = el('button', { className: 'ij-find-opt', title: 'Regex Multiline (Alt+M)', text: 'ML', attrs: { 'data-opt': 'regexMultiline', 'aria-pressed': 'true', 'aria-disabled': 'true' } });
+  var $optRegexMultiline = el('button', { className: 'ij-find-opt', title: 'Regex Multiline / dotAll (Alt+M)', text: 'ML', attrs: { 'data-opt': 'regexMultiline', 'aria-pressed': 'false', 'aria-disabled': 'true' } });
   var $refresh = el('button', { className: 'ij-find-opt ij-find-refresh', title: 'Refresh Search', text: 'Run', attrs: { type: 'button', 'aria-label': 'Refresh search' } });
   // Find Usages only: toggle the low-confidence (estimated) envelope. Hidden
   // until the extension sends an estimatedToggle message saying there is one.
@@ -2611,7 +2611,7 @@ export function getRendererPatchScript(
   } catch (e) {}
 
   var state = {
-    options: { caseSensitive: false, wholeWord: false, useRegex: false, regexMultiline: true },
+    options: { caseSensitive: false, wholeWord: false, useRegex: false, regexMultiline: false },
     files: [],
     flat: [],
     candidates: [],             // [{uri, relPath}] — planner-narrowed files, rg hasn't confirmed yet
@@ -3370,7 +3370,7 @@ export function getRendererPatchScript(
   }
 
   function effectiveRegexMultilineValue(opts) {
-    return !!(opts && opts.useRegex && opts.regexMultiline !== false);
+    return !!(opts && opts.useRegex && opts.regexMultiline === true);
   }
 
   function previewMinimapMatchOptions(active) {
@@ -9586,7 +9586,7 @@ export function getRendererPatchScript(
           caseSensitive: !!state.options.caseSensitive,
           wholeWord: !!state.options.wholeWord,
           useRegex: !!state.options.useRegex,
-          regexMultiline: state.options.regexMultiline !== false,
+          regexMultiline: state.options.regexMultiline === true,
         },
       };
     } catch (e) { return { err: String(e && e.message) }; }

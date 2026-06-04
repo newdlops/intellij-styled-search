@@ -9,7 +9,7 @@ use crate::shard::{ShardDocument, ShardReader};
 use crate::verifier::{
     build_file_result, load_current_text, matches_path_filters, verify_literal, verify_regex,
 };
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,6 +63,21 @@ where
         .map(Regex::new)
         .transpose()
         .map_err(|err| format!("invalid path regex: {err}"))?;
+    // Validate the content regex up front so an invalid or unsupported pattern
+    // (bad syntax, backreference, look-around) surfaces a clear error even when
+    // the trigram pre-filter selects zero candidate files. Otherwise verify_regex
+    // only compiles per candidate, so a zero-candidate query silently returns
+    // "no matches" and hides the real cause from the user.
+    if matches!(plan.mode, QueryMode::Regex) {
+        for term in &plan.terms {
+            RegexBuilder::new(&term.effective_query)
+                .case_insensitive(!request.case_sensitive)
+                .multi_line(request.regex_multiline)
+                .dot_matches_new_line(request.regex_multiline)
+                .build()
+                .map_err(|err| err.to_string())?;
+        }
+    }
     let workspace_root = Path::new(&request.workspace_root);
     let layout = StoreLayout::for_workspace(workspace_root, config);
     let mut warnings = Vec::new();
