@@ -43,12 +43,12 @@
       },
       {
         "command": "intellijStyledSearch.showEstimatedUsages",
-        "title": "Show Estimated (Low-Confidence) Usages",
+        "title": "Show Candidate Usages",
         "category": "IntelliJ Search"
       },
       {
         "command": "intellijStyledSearch.toggleEstimatedUsages",
-        "title": "Toggle Estimated (Low-Confidence) Usages",
+        "title": "Toggle Candidate Usages",
         "category": "IntelliJ Search"
       },
       {

@@ -5131,9 +5131,6 @@ pub fn query_graph_symbols_with_options(
         })
         .cloned()
         .collect();
-    for symbol in &mut symbols {
-        apply_count_options(symbol, &store.counts, options);
-    }
     symbols.sort_by(|left, right| {
         score_symbol_match(left, query)
             .cmp(&score_symbol_match(right, query))
@@ -5143,6 +5140,10 @@ pub fn query_graph_symbols_with_options(
     });
     let total_symbols = symbols.len();
     symbols.truncate(limit);
+    for symbol in &mut symbols {
+        apply_count_options(symbol, &store.counts, options);
+    }
+    apply_deduped_usage_counts_for_symbols(workspace_root, config, &mut symbols, options)?;
     Ok(Some(GraphSymbolQueryResult {
         workspace_root: store.workspace_root,
         built_at_unix_ms: store.built_at_unix_ms,
@@ -5178,7 +5179,6 @@ fn query_graph_symbol_id_with_options(
     let mut symbols = read_symbols_matching(read_path, &file_table, |s| {
         s.id.eq_ignore_ascii_case(symbol_id)
     })?;
-    apply_count_options_for_symbols(workspace_root, config, &mut symbols, options)?;
     symbols.sort_by(|left, right| {
         score_symbol_match(left, symbol_id)
             .cmp(&score_symbol_match(right, symbol_id))
@@ -5188,6 +5188,7 @@ fn query_graph_symbol_id_with_options(
     });
     let total_symbols = symbols.len();
     symbols.truncate(limit);
+    apply_count_options_for_symbols(workspace_root, config, &mut symbols, options)?;
     Ok(Some(GraphSymbolQueryResult {
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         built_at_unix_ms,
@@ -5255,7 +5256,6 @@ pub fn query_graph_document_symbols_with_options(
             .filter(|s| s.uri == uri && s.start_line <= end && s.end_line >= start)
             .collect()
     };
-    apply_count_options_for_symbols(workspace_root, config, &mut symbols, options)?;
     symbols.sort_by(|left, right| {
         left.start_line
             .cmp(&right.start_line)
@@ -5264,6 +5264,7 @@ pub fn query_graph_document_symbols_with_options(
     });
     let total_symbols = symbols.len();
     symbols.truncate(limit);
+    apply_count_options_for_symbols(workspace_root, config, &mut symbols, options)?;
     Ok(Some(GraphSymbolQueryResult {
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         built_at_unix_ms,
@@ -5430,6 +5431,88 @@ pub fn query_graph_implementations(
     }))
 }
 
+fn dedupe_graph_references_by_source_occurrence(
+    references: Vec<GraphReference>,
+) -> Vec<GraphReference> {
+    let mut by_occurrence: HashMap<String, usize> = HashMap::default();
+    let mut out: Vec<GraphReference> = Vec::with_capacity(references.len());
+    for reference in references {
+        let key = graph_reference_source_occurrence_key(&reference);
+        match by_occurrence.get(&key).copied() {
+            Some(existing_idx) => {
+                if graph_reference_preference_score(&reference)
+                    > graph_reference_preference_score(&out[existing_idx])
+                {
+                    out[existing_idx] = reference;
+                }
+            }
+            None => {
+                by_occurrence.insert(key, out.len());
+                out.push(reference);
+            }
+        }
+    }
+    out
+}
+
+fn graph_reference_source_occurrence_key(reference: &GraphReference) -> String {
+    let target = reference.target_symbol_id.as_deref().unwrap_or("");
+    if !reference.source_ref_id.is_empty() {
+        return format!("{target}\0{}", reference.source_ref_id);
+    }
+    format!(
+        "{}\0{}\0{}\0{}",
+        target,
+        reference.rel_path,
+        reference.start_line,
+        reference.start_column,
+    )
+}
+
+fn graph_reference_preference_score(reference: &GraphReference) -> i32 {
+    graph_reference_confidence_rank(&reference.confidence) * 10_000
+        + graph_reference_provenance_rank(&reference.provenance) * 100
+        + graph_reference_edge_kind_rank(&reference.edge_kind)
+}
+
+fn graph_reference_confidence_rank(confidence: &str) -> i32 {
+    match confidence {
+        "exact" => 4,
+        "resolved" => 3,
+        "possible" => 2,
+        "unresolved" => 1,
+        _ => 0,
+    }
+}
+
+fn graph_reference_provenance_rank(provenance: &str) -> i32 {
+    let value = provenance.to_ascii_lowercase();
+    if value.contains("semantic") || value.contains("typed") || value.contains("rust-native") {
+        4
+    } else if value.contains("heuristic") || value.contains("provider") || value.contains("framework") {
+        3
+    } else if value.contains("token")
+        || value.contains("zoekt")
+        || value.contains("lexical")
+        || value.contains("text")
+        || value.contains("fallback")
+    {
+        1
+    } else {
+        2
+    }
+}
+
+fn graph_reference_edge_kind_rank(edge_kind: &str) -> i32 {
+    match edge_kind {
+        "definition" | "import" => 5,
+        "call" | "construct" => 4,
+        "method" | "static" | "virtual" | "direct" => 3,
+        "usage" | "reference" => 2,
+        _ => 1,
+    }
+}
+
 /// Merge the delta overlay into a query's base references (replacement-by-file,
 /// mirrors `dump_references_with_overlay_tsv` and the `graph_overlay` contract):
 /// drop base EXACT refs whose source file the overlay supersedes (the overlay
@@ -5519,6 +5602,7 @@ pub fn query_graph(
             .as_deref()
             .is_some_and(|t| t.eq_ignore_ascii_case(symbol_id))
     });
+    references = dedupe_graph_references_by_source_occurrence(references);
     references.sort_by(|left, right| {
         left.rel_path
             .cmp(&right.rel_path)
@@ -5578,6 +5662,7 @@ pub fn query_graph_callees(
             .is_some_and(|e| e.eq_ignore_ascii_case(symbol_id))
             && matches!(r.edge_kind.as_ref(), "call" | "construct")
     });
+    references = dedupe_graph_references_by_source_occurrence(references);
     references.sort_by(|left, right| {
         left.rel_path
             .cmp(&right.rel_path)
@@ -16694,10 +16779,104 @@ fn apply_count_options_for_symbols(
     // "N usages" hint matches the (already overlay-merged) reference list.
     let built_at = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config)).unwrap_or(0);
     merge_overlay_count_deltas(workspace_root, config, built_at, &mut counts);
-    for symbol in symbols {
+    for symbol in symbols.iter_mut() {
         apply_count_options(symbol, &counts, options);
     }
+    apply_deduped_usage_counts_for_symbols(workspace_root, config, symbols, options)?;
     Ok(())
+}
+
+fn apply_deduped_usage_counts_for_symbols(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &mut [GraphSymbol],
+    options: GraphSymbolQueryOptions,
+) -> io::Result<()> {
+    if !options.include_usage_counts || symbols.is_empty() {
+        return Ok(());
+    }
+    let symbol_ids: HashSet<String> = symbols
+        .iter()
+        .filter(|symbol| symbol.usage_count.unwrap_or(0) > 0)
+        .map(|symbol| symbol.id.clone())
+        .collect();
+    if symbol_ids.is_empty() {
+        return Ok(());
+    }
+    let counts = deduped_reference_counts_for_symbol_ids_indexed(workspace_root, config, &symbol_ids)?;
+    for symbol in symbols {
+        if symbol.usage_count.unwrap_or(0) == 0 {
+            continue;
+        }
+        let key = symbol.id.to_ascii_lowercase();
+        symbol.usage_count = Some(counts.get(&key).copied().unwrap_or(0));
+    }
+    Ok(())
+}
+
+fn deduped_reference_counts_for_symbol_ids_indexed(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbol_ids: &HashSet<String>,
+) -> io::Result<HashMap<String, usize>> {
+    if symbol_ids.is_empty() || !graph_index_available(workspace_root, config) {
+        return Ok(HashMap::new());
+    }
+    let ids_lower: HashSet<String> = symbol_ids.iter().map(|id| id.to_ascii_lowercase()).collect();
+    let built_at_unix_ms = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config)).unwrap_or(0);
+    let file_table_path = graph_file_table_path(workspace_root, config);
+    let file_table = if file_table_path.exists() {
+        read_file_table_binary(&file_table_path).unwrap_or_default()
+    } else {
+        FileTable::default()
+    };
+    let mut references: Vec<GraphReference> = Vec::new();
+    if graph_shard_family_available(workspace_root, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX) {
+        let mut shards: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for id in &ids_lower {
+            shards
+                .entry(shard_index_for_key(id))
+                .or_default()
+                .push(id.clone());
+        }
+        for (shard, shard_ids) in shards {
+            let path =
+                graph_shard_path(workspace_root, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX, shard);
+            if !path.exists() {
+                continue;
+            }
+            let shard_set: HashSet<String> = shard_ids.into_iter().collect();
+            references.extend(read_binary_references_matching(&path, &file_table, |r| {
+                r.target_symbol_id
+                    .as_deref()
+                    .map(|target| shard_set.contains(&target.to_ascii_lowercase()))
+                    .unwrap_or(false)
+            })?);
+        }
+    } else {
+        let relation_path = graph_index_path(workspace_root, config);
+        if relation_path.exists() {
+            references.extend(read_references_matching(&relation_path, |fields, offset| {
+                Ok(ids_lower.contains(&fields[1 + offset].to_ascii_lowercase()))
+            })?);
+        }
+    }
+    merge_overlay_query_refs(workspace_root, config, built_at_unix_ms, &mut references, |r| {
+        r.target_symbol_id
+            .as_deref()
+            .map(|target| ids_lower.contains(&target.to_ascii_lowercase()))
+            .unwrap_or(false)
+    });
+    let mut counts: HashMap<String, usize> = HashMap::default();
+    for reference in dedupe_graph_references_by_source_occurrence(references) {
+        if let Some(target) = reference.target_symbol_id.as_deref() {
+            let key = target.to_ascii_lowercase();
+            if ids_lower.contains(&key) {
+                *counts.entry(key).or_default() += 1;
+            }
+        }
+    }
+    Ok(counts)
 }
 
 fn apply_count_options(
@@ -18057,6 +18236,38 @@ fn percent_encode_path(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::corpus::TextEncoding;
+
+    fn test_graph_reference(confidence: &str, provenance: &str, edge_kind: &str) -> GraphReference {
+        GraphReference {
+            source_ref_id: "ref:0000000000000001".into(),
+            target_symbol_id: Some("sym:0000000000000002".into()),
+            edge_kind: edge_kind.into(),
+            name: "target".into(),
+            raw_text: "source.target()".into(),
+            uri: "file:///workspace/source.py".into(),
+            rel_path: "source.py".into(),
+            start_line: 10,
+            start_column: 12,
+            end_line: 10,
+            end_column: 18,
+            enclosing_symbol_id: Some("sym:0000000000000003".into()),
+            bound_mask: 0,
+            confidence: confidence.into(),
+            provenance: provenance.into(),
+        }
+    }
+
+    #[test]
+    fn dedupes_same_source_occurrence_and_keeps_stronger_reference() {
+        let references = vec![
+            test_graph_reference("possible", "token-shape", "usage"),
+            test_graph_reference("exact", "semantic", "call"),
+        ];
+        let deduped = dedupe_graph_references_by_source_occurrence(references);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(&*deduped[0].confidence, "exact");
+        assert_eq!(&*deduped[0].edge_kind, "call");
+    }
 
     // A2 Stage B verification gate (ignored — needs the external captain2 corpus
     // and runs two ~30s full passes). Mirrors the shell diff harness: full

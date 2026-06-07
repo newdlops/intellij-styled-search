@@ -40,6 +40,9 @@ export interface FileMatch {
     line: number;
     preview: string;
     ranges: MatchRange[];
+    usageConfidence?: 'resolved' | 'ambiguous' | 'textual';
+    usageConfidenceLabel?: string;
+    usageConfidenceDetail?: string;
   }>;
 }
 

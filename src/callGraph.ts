@@ -16,6 +16,7 @@ export type CallGraphSymbolModifier = 'abstract' | 'interface' | 'property';
 export type CallGraphEdgeKind = 'direct' | 'method' | 'constructor' | 'static' | 'virtual' | 'dynamic';
 export type CallGraphConfidence = 'exact' | 'resolved' | 'possible' | 'unresolved';
 export type CallGraphEdgeSource = 'semantic' | 'heuristic' | 'zoekt-fallback';
+export type CallGraphUsageConfidence = 'resolved' | 'ambiguous' | 'textual';
 
 export interface CallGraphRange {
   startLine: number;
@@ -85,6 +86,7 @@ export interface CallGraphReference {
   boundMask?: number;
   confidence?: string;
   provenance?: string;
+  evidence?: string[];
 }
 
 export interface CallGraphStats {
@@ -133,6 +135,80 @@ export interface CallGraphSymbolRelationSummary {
   implementations: CallGraphSymbol[];
   usageCount: number;
   usages: CallGraphReference[];
+}
+
+export interface CallGraphUsageConfidenceCounts {
+  total: number;
+  resolved: number;
+  ambiguous: number;
+  textual: number;
+}
+
+export interface CallGraphUsageRefinementOptions {
+  targetSymbols?: readonly CallGraphSymbol[];
+  targetLabel?: string;
+}
+
+export function callGraphUsageConfidenceBucket(
+  reference: Pick<CallGraphReference, 'confidence' | 'provenance' | 'edgeKind' | 'evidence'>,
+): CallGraphUsageConfidence {
+  const rawConfidence = String(reference.confidence ?? '').toLowerCase();
+  const provenance = String(reference.provenance ?? '').toLowerCase();
+  const evidence = (reference.evidence ?? [])
+    .join(' ')
+    .toLowerCase()
+    .replace(/\bsynthetic ambiguous usage candidate\b/g, '');
+  const combined = `${provenance} ${evidence}`;
+  if (/\b(?:zoekt|lexical|textual)\b/.test(combined) || /\btext(?:-only)?\b/.test(combined)) {
+    return 'textual';
+  }
+  if (rawConfidence === 'exact' || rawConfidence === 'resolved') {
+    return /\b(?:fallback|unknown|ambiguous|same-name)\b/.test(combined)
+      ? 'ambiguous'
+      : 'resolved';
+  }
+  if (rawConfidence === 'possible' || rawConfidence === 'unresolved') {
+    return 'ambiguous';
+  }
+  if (reference.edgeKind === 'definition' || reference.edgeKind === 'import') {
+    return 'resolved';
+  }
+  return 'ambiguous';
+}
+
+export function summarizeCallGraphUsageConfidence(
+  references: readonly Pick<CallGraphReference, 'confidence' | 'provenance' | 'edgeKind' | 'evidence'>[],
+): CallGraphUsageConfidenceCounts {
+  const counts: CallGraphUsageConfidenceCounts = {
+    total: references.length,
+    resolved: 0,
+    ambiguous: 0,
+    textual: 0,
+  };
+  for (const reference of references) {
+    counts[callGraphUsageConfidenceBucket(reference)] += 1;
+  }
+  return counts;
+}
+
+export function dedupeCallGraphUsageReferences(
+  references: readonly CallGraphReference[],
+): CallGraphReference[] {
+  const byOccurrence = new Map<string, number>();
+  const out: CallGraphReference[] = [];
+  for (const reference of references) {
+    const key = usageReferenceOccurrenceKey(reference);
+    const existingIndex = byOccurrence.get(key);
+    if (existingIndex === undefined) {
+      byOccurrence.set(key, out.length);
+      out.push(reference);
+      continue;
+    }
+    if (usageReferencePreferenceScore(reference) > usageReferencePreferenceScore(out[existingIndex])) {
+      out[existingIndex] = reference;
+    }
+  }
+  return out;
 }
 
 export interface CallGraphRebuildProgress {
@@ -426,6 +502,18 @@ type ParsedSourceFileResult = {
   skipped: boolean;
   reused?: boolean;
   warnings: string[];
+};
+
+type UsageRefinementSource = {
+  uri: vscode.Uri;
+  text: string;
+  source: 'open-document' | 'workspace-file';
+};
+
+type UsageProviderRefinementResult = {
+  references: CallGraphReference[];
+  attempted: number;
+  timedOut: boolean;
 };
 
 type CallGraphReferenceCandidate = Omit<CallGraphReference, 'symbolId'> & {
@@ -724,6 +812,15 @@ const MODULE_IMPORT_TARGET = '*module*';
 const RUST_GRAPH_QUERY_TIMEOUT_MS = 30_000;
 const RUST_GRAPH_DOCUMENT_SYMBOL_QUERY_TIMEOUT_MS = 3_000;
 const RUST_GRAPH_PROCESS_KILL_TIMEOUT_MS = 2_000;
+const USAGE_SOURCE_REFINEMENT_TIMEOUT_MS = 1_500;
+const USAGE_SOURCE_REFINEMENT_MAX_URIS = 8;
+const USAGE_SOURCE_REFINEMENT_MAX_OCCURRENCES = 200;
+const USAGE_SOURCE_REFINEMENT_MAX_TARGET_SYMBOLS = 50;
+const USAGE_SOURCE_REFINEMENT_MAX_TARGET_CONTEXT_URIS = 4;
+const USAGE_PROVIDER_REFINEMENT_MAX_OCCURRENCES = 24;
+const USAGE_PROVIDER_REFINEMENT_PER_REQUEST_TIMEOUT_MS = 500;
+const USAGE_SOURCE_REFINEMENT_MAX_FILE_BYTES = 512 * 1024;
+const USAGE_SOURCE_REFINEMENT_AUDIT_SAMPLE_LIMIT = 12;
 const INTERNAL_CALL_GRAPH_EXCLUDE_GLOBS = [
   '**/.zoek-rs/**',
   '**/.zoekt-rs/**',
@@ -982,7 +1079,11 @@ export class CallGraphService implements vscode.Disposable {
     return scored.slice(0, limit).map((entry) => entry.symbol);
   }
 
-  async resolveSymbolsResolved(query: string, limit = 20): Promise<CallGraphSymbol[]> {
+  async resolveSymbolsResolved(
+    query: string,
+    limit = 20,
+    options: { includeImplementationCounts?: boolean; includeUsageCounts?: boolean; timeoutMs?: number } = {},
+  ): Promise<CallGraphSymbol[]> {
     const cached = this.resolveSymbols(query, limit);
     if (!this.isRustNativeIndexOnly() || !query.trim()) { return cached; }
     const folder = vscode.workspace.workspaceFolders?.[0];
@@ -992,7 +1093,11 @@ export class CallGraphService implements vscode.Disposable {
       folder.uri.fsPath,
       { query: query.trim(), limit },
       manifest.builtAtUnixMs,
-      { includeImplementationCounts: false },
+      {
+        includeImplementationCounts: options.includeImplementationCounts ?? false,
+        includeUsageCounts: options.includeUsageCounts,
+        timeoutMs: options.timeoutMs,
+      },
     );
     if (!symbols) { return cached; }
     if (this.cacheManifest?.builtAtUnixMs !== manifest.builtAtUnixMs) { return cached; }
@@ -1008,32 +1113,38 @@ export class CallGraphService implements vscode.Disposable {
     const symbols = await this.resolveSymbolsResolved(symbolOrQuery, Math.min(Math.max(limit, 1), 200));
     if (symbols.length === 0) { return []; }
     const out: CallGraphReference[] = [];
-    const seen = new Set<string>();
     for (const symbol of symbols) {
       const usages = await this.findUsagesForSymbolIdFromCache(symbol.id, limit) ?? this.findUsages(symbol.id, limit);
       for (const reference of usages) {
-        const key = referenceLocationKey(reference);
-        if (seen.has(key)) { continue; }
-        seen.add(key);
         out.push(reference);
-        if (out.length >= limit) { return out; }
+        const deduped = dedupeCallGraphUsageReferences(out);
+        if (deduped.length >= limit) { return deduped.slice(0, limit); }
       }
     }
-    return out;
+    return dedupeCallGraphUsageReferences(out).slice(0, limit);
   }
 
   async findDeclarationSymbolsAtPositionResolved(uri: vscode.Uri, position: vscode.Position): Promise<CallGraphSymbol[]> {
     const cached = this.findDeclarationSymbolsAtPosition(uri, position);
-    if (cached.length > 0) { return cached; }
     if (!this.isRustNativeIndexOnly()) { return cached; }
+    const indexed = await this.findRustNativeDeclarationSymbolsAtPosition(uri, position);
+    if (indexed.length > 0) { return indexed; }
+    if (cached.length > 0) { return cached; }
     const localSymbols = await this.getDocumentSymbolsFromLocalParse(uri, 'resolve-at-declaration-fast-path');
     const localDeclarations = localSymbols
       .filter((symbol) => symbol.uri === uri.toString() && rangeContainsPosition(symbol.range, position))
       .sort((a, b) => rangeSize(a.range) - rangeSize(b.range));
     if (localDeclarations.length > 0) { return dedupeSymbols(localDeclarations); }
+    return cached;
+  }
+
+  private async findRustNativeDeclarationSymbolsAtPosition(
+    uri: vscode.Uri,
+    position: vscode.Position,
+  ): Promise<CallGraphSymbol[]> {
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
-    if (!folder || !manifest?.builtAtUnixMs) { return cached; }
+    if (!folder || !manifest?.builtAtUnixMs) { return []; }
     const symbols = await this.queryRustGraphSymbolIndex(
       folder.uri.fsPath,
       {
@@ -1045,14 +1156,15 @@ export class CallGraphService implements vscode.Disposable {
       manifest.builtAtUnixMs,
       {
         includeImplementationCounts: false,
+        includeUsageCounts: false,
         timeoutMs: RUST_GRAPH_DOCUMENT_SYMBOL_QUERY_TIMEOUT_MS,
       },
     );
-    if (!symbols || this.cacheManifest?.builtAtUnixMs !== manifest.builtAtUnixMs) { return cached; }
+    if (!symbols || this.cacheManifest?.builtAtUnixMs !== manifest.builtAtUnixMs) { return []; }
     const declarations = symbols
       .filter((symbol) => symbol.uri === uri.toString() && rangeContainsPosition(symbol.range, position))
       .sort((a, b) => rangeSize(a.range) - rangeSize(b.range));
-    return declarations.length > 0 ? dedupeSymbols(declarations) : cached;
+    return declarations.length > 0 ? dedupeSymbols(declarations) : [];
   }
 
   async findTargetsAtPositionResolved(uri: vscode.Uri, position: vscode.Position): Promise<CallGraphSymbol[]> {
@@ -1256,17 +1368,14 @@ export class CallGraphService implements vscode.Disposable {
     if (symbols.length === 0) { return []; }
     const relationIndex = this.getRelationSummaryIndex(snapshot);
     const out: CallGraphReference[] = [];
-    const seen = new Set<string>();
     for (const symbol of symbols) {
       for (const reference of relationIndex.usagesBySymbolId.get(symbol.id) ?? []) {
-        const key = referenceLocationKey(reference);
-        if (seen.has(key)) { continue; }
-        seen.add(key);
         out.push(reference);
-        if (out.length >= limit) { return out; }
+        const deduped = dedupeCallGraphUsageReferences(out);
+        if (deduped.length >= limit) { return deduped.slice(0, limit); }
       }
     }
-    return out;
+    return dedupeCallGraphUsageReferences(out).slice(0, limit);
   }
 
   async findUsagesForSymbolIdFromCache(
@@ -1285,7 +1394,7 @@ export class CallGraphService implements vscode.Disposable {
       );
       if (rustUsages) {
         if (isRustNativeGraphManifest(manifest)) {
-          const usages = rustUsages.slice(0, limit);
+          const usages = dedupeCallGraphUsageReferences(rustUsages).slice(0, limit);
           this.log.appendLine(
             `call graph cached usage query: source=rust-native graph-index symbolId=${JSON.stringify(symbolId)} ` +
             `matches=${usages.length} elapsed=${Date.now() - started}ms`,
@@ -1299,7 +1408,7 @@ export class CallGraphService implements vscode.Disposable {
           calleesBySymbolId: new Map(),
           usagesBySymbolId: new Map([[
             symbolId,
-            rustUsages.filter((reference) => !overriddenUris.has(reference.uri)).slice(0, limit),
+            dedupeCallGraphUsageReferences(rustUsages.filter((reference) => !overriddenUris.has(reference.uri))).slice(0, limit),
           ]]),
         };
         if (overrides.length > 0) {
@@ -1310,7 +1419,7 @@ export class CallGraphService implements vscode.Disposable {
             relationIndex,
           );
         }
-        const usages = (relationIndex.usagesBySymbolId.get(symbolId) ?? []).slice(0, limit);
+        const usages = dedupeCallGraphUsageReferences(relationIndex.usagesBySymbolId.get(symbolId) ?? []).slice(0, limit);
         this.log.appendLine(
           `call graph cached usage query: source=rust-graph-index symbolId=${JSON.stringify(symbolId)} ` +
           `matches=${usages.length} elapsed=${Date.now() - started}ms`,
@@ -1333,7 +1442,7 @@ export class CallGraphService implements vscode.Disposable {
         calleesBySymbolId: new Map(),
         usagesBySymbolId: new Map([[
           symbolId,
-          baseUsages.filter((reference) => !overriddenUris.has(reference.uri)).slice(0, limit),
+          dedupeCallGraphUsageReferences(baseUsages.filter((reference) => !overriddenUris.has(reference.uri))).slice(0, limit),
         ]]),
       };
       if (overrides.length > 0) {
@@ -1344,7 +1453,7 @@ export class CallGraphService implements vscode.Disposable {
           relationIndex,
         );
       }
-      const usages = (relationIndex.usagesBySymbolId.get(symbolId) ?? []).slice(0, limit);
+      const usages = dedupeCallGraphUsageReferences(relationIndex.usagesBySymbolId.get(symbolId) ?? []).slice(0, limit);
       this.log.appendLine(
         `call graph cached usage query: source=symbol-relations symbolId=${JSON.stringify(symbolId)} ` +
         `matches=${usages.length} elapsed=${Date.now() - started}ms`,
@@ -1353,7 +1462,7 @@ export class CallGraphService implements vscode.Disposable {
     }
     const snapshot = this.snapshot;
     if (snapshot && this.relationSummaryCache?.snapshot === snapshot) {
-      const usages = (this.relationSummaryCache.index.usagesBySymbolId.get(symbolId) ?? []).slice(0, limit);
+      const usages = dedupeCallGraphUsageReferences(this.relationSummaryCache.index.usagesBySymbolId.get(symbolId) ?? []).slice(0, limit);
       this.log.appendLine(
         `call graph cached usage query: source=memory-relation-index symbolId=${JSON.stringify(symbolId)} ` +
         `matches=${usages.length} elapsed=${Date.now() - started}ms`,
@@ -1361,6 +1470,535 @@ export class CallGraphService implements vscode.Disposable {
       return usages;
     }
     return undefined;
+  }
+
+  async refineUsageReferencesWithOpenDocuments(
+    references: readonly CallGraphReference[],
+    options: CallGraphUsageRefinementOptions = {},
+  ): Promise<CallGraphReference[]> {
+    return this.refineUsageReferencesWithCurrentSources(references, options);
+  }
+
+  async refineUsageReferencesWithCurrentSources(
+    references: readonly CallGraphReference[],
+    options: CallGraphUsageRefinementOptions = {},
+  ): Promise<CallGraphReference[]> {
+    const deduped = dedupeCallGraphUsageReferences(references);
+    if (deduped.length === 0) { return deduped; }
+    const started = Date.now();
+    const deadline = started + USAGE_SOURCE_REFINEMENT_TIMEOUT_MS;
+    const openDocumentsByUri = new Map(vscode.workspace.textDocuments
+      .filter((document) => document.uri.scheme === 'file')
+      .map((document) => [document.uri.toString(), document]));
+    const refinableByUri = new Map<string, CallGraphReference[]>();
+    let refinableOccurrenceCount = 0;
+    for (const reference of deduped) {
+      if (callGraphUsageConfidenceBucket(reference) === 'resolved') { continue; }
+      if (refinableByUri.size >= USAGE_SOURCE_REFINEMENT_MAX_URIS && !refinableByUri.has(reference.uri)) {
+        continue;
+      }
+      if (refinableOccurrenceCount >= USAGE_SOURCE_REFINEMENT_MAX_OCCURRENCES) {
+        continue;
+      }
+      pushMap(refinableByUri, reference.uri, reference);
+      refinableOccurrenceCount += 1;
+    }
+    if (refinableByUri.size === 0) { return deduped; }
+    this.log.appendLine(
+      `call graph usage source refinement start: refs=${deduped.length} ` +
+      `uris=${refinableByUri.size} occurrences=${refinableOccurrenceCount} budget=${USAGE_SOURCE_REFINEMENT_TIMEOUT_MS}ms`,
+    );
+    const refinementsByUri = new Map<string, CallGraphReference[]>();
+    try {
+      const seededTargetSymbols = usageRefinementTargetSymbolsFromHints(deduped, options);
+      const targetSymbolsById = await this.resolveUsageRefinementTargetSymbols(deduped, seededTargetSymbols, deadline);
+      this.log.appendLine(
+        `call graph usage source refinement context: seededTargets=${seededTargetSymbols.size} ` +
+        `targetSymbols=${targetSymbolsById.size}`,
+      );
+      let timedOut = false;
+      let openSourceCount = 0;
+      let fileSourceCount = 0;
+      for (const [uri, uriReferences] of refinableByUri) {
+        if (usageRefinementDeadlineExceeded(deadline)) {
+          timedOut = true;
+          break;
+        }
+        const source = await this.readUsageRefinementSource(uri, openDocumentsByUri.get(uri), deadline);
+        if (!source) { continue; }
+        if (source.source === 'open-document') {
+          openSourceCount += 1;
+        } else {
+          fileSourceCount += 1;
+        }
+        const refinements = await this.buildUsageSourceRefinements(source, uriReferences, targetSymbolsById, deadline);
+        if (refinements.length > 0) {
+          refinementsByUri.set(uri, refinements);
+        }
+      }
+      const providerResult = await this.buildUsageProviderRefinements(
+        deduped,
+        refinementsByUri,
+        targetSymbolsById,
+        deadline,
+      );
+      if (providerResult.timedOut) {
+        timedOut = true;
+      }
+      for (const refinement of providerResult.references) {
+        pushMap(refinementsByUri, refinement.uri, refinement);
+      }
+      if (providerResult.attempted > 0) {
+        this.log.appendLine(
+          `call graph usage provider refinement: attempted=${providerResult.attempted} ` +
+          `resolved=${providerResult.references.length} timedOut=${providerResult.timedOut}`,
+        );
+      }
+      if (refinementsByUri.size === 0) {
+        this.log.appendLine(
+          `call graph usage source refinement done: upgraded=0 timedOut=${timedOut} ` +
+          `openSources=${openSourceCount} fileSources=${fileSourceCount} elapsed=${Date.now() - started}ms`,
+        );
+        return deduped;
+      }
+      let upgradedCount = 0;
+      let refinedCount = 0;
+      const upgradeEvidenceKinds = new Map<string, number>();
+      const upgradeAuditSamples: string[] = [];
+      const refinedReferences = dedupeCallGraphUsageReferences(deduped.map((reference) => {
+        if (callGraphUsageConfidenceBucket(reference) === 'resolved') { return reference; }
+        const refinements = refinementsByUri.get(reference.uri);
+        if (!refinements) { return reference; }
+        const refined = this.selectBestUsageRefinementForReference(reference, refinements, targetSymbolsById);
+        if (!refined) { return reference; }
+        refinedCount += 1;
+        const merged: CallGraphReference = {
+          ...reference,
+          edgeKind: refined.edgeKind ?? reference.edgeKind,
+          name: refined.name || reference.name,
+          rawText: refined.rawText || reference.rawText,
+          range: refined.range,
+          enclosingSymbolId: refined.enclosingSymbolId ?? reference.enclosingSymbolId,
+          confidence: refined.confidence ?? 'resolved',
+          provenance: refined.provenance ?? 'usage-source-refinement',
+          evidence: [
+            ...(reference.evidence ?? []),
+            ...(refined.evidence ?? []),
+            'current source re-resolved this source occurrence to the requested symbol',
+          ],
+        };
+        const upgraded = normalizeRefinedUsageConfidence(merged);
+        if (callGraphUsageConfidenceBucket(upgraded) !== 'resolved') {
+          return upgraded;
+        }
+        upgradedCount += 1;
+        const evidenceKind = usageRefinementEvidenceKind(upgraded);
+        incrementCount(upgradeEvidenceKinds, evidenceKind);
+        if (upgradeAuditSamples.length < USAGE_SOURCE_REFINEMENT_AUDIT_SAMPLE_LIMIT) {
+          upgradeAuditSamples.push(usageRefinementAuditSample(reference, upgraded, evidenceKind));
+        }
+        return upgraded;
+      }));
+      this.log.appendLine(
+        `call graph usage source refinement done: refined=${refinedCount} upgraded=${upgradedCount} ` +
+        `timedOut=${timedOut} openSources=${openSourceCount} fileSources=${fileSourceCount} elapsed=${Date.now() - started}ms`,
+      );
+      if (upgradedCount > 0) {
+        this.log.appendLine(
+          `call graph usage source refinement upgrades: byEvidence=${JSON.stringify(sortedCountObject(upgradeEvidenceKinds))} ` +
+          `sample=${upgradeAuditSamples.join(' | ')}`,
+        );
+      }
+      return refinedReferences;
+    } catch (err) {
+      this.log.appendLine(
+        `call graph usage source refinement skipped: ${err instanceof Error ? err.message : String(err)} ` +
+        `elapsed=${Date.now() - started}ms`,
+      );
+      return deduped;
+    }
+  }
+
+  private async resolveUsageRefinementTargetSymbols(
+    references: readonly CallGraphReference[],
+    seededSymbols: Map<string, CallGraphSymbol>,
+    deadline?: number,
+  ): Promise<Map<string, CallGraphSymbol>> {
+    const out = new Map<string, CallGraphSymbol>(seededSymbols);
+    const snapshot = this.snapshot;
+    if (snapshot) {
+      const index = this.getIndex(snapshot);
+      for (const reference of references) {
+        const symbol = index.byId.get(reference.symbolId);
+        if (symbol) { out.set(reference.symbolId, symbol); }
+      }
+    }
+    await this.enrichUsageRefinementTargetSymbolsFromCurrentSources(out, deadline);
+    if (this.isRustNativeIndexOnly()) {
+      return out;
+    }
+    const missing = [...new Set(references.map((reference) => reference.symbolId))]
+      .filter((symbolId) => !out.has(symbolId));
+    for (const symbolId of missing) {
+      if (usageRefinementDeadlineExceeded(deadline)) { break; }
+      const symbol = (await this.resolveSymbolsResolved(symbolId, 1, {
+        includeImplementationCounts: false,
+        includeUsageCounts: false,
+        timeoutMs: remainingUsageRefinementTimeoutMs(deadline),
+      }))[0];
+      if (symbol) { out.set(symbolId, symbol); }
+    }
+    return out;
+  }
+
+  private async enrichUsageRefinementTargetSymbolsFromCurrentSources(
+    targetSymbolsById: Map<string, CallGraphSymbol>,
+    deadline?: number,
+  ): Promise<void> {
+    if (targetSymbolsById.size === 0 || usageRefinementDeadlineExceeded(deadline)) {
+      return;
+    }
+    const openDocumentsByUri = new Map(vscode.workspace.textDocuments
+      .filter((document) => document.uri.scheme === 'file')
+      .map((document) => [document.uri.toString(), document]));
+    const uris = dedupeStrings([...targetSymbolsById.values()]
+      .map((symbol) => symbol.uri)
+      .filter((uri) => !!uri))
+      .slice(0, USAGE_SOURCE_REFINEMENT_MAX_TARGET_CONTEXT_URIS);
+    let added = 0;
+    let replaced = 0;
+    let matched = 0;
+    let parsedSources = 0;
+    for (const uri of uris) {
+      if (usageRefinementDeadlineExceeded(deadline)) { break; }
+      const source = await this.readUsageRefinementSource(uri, openDocumentsByUri.get(uri), deadline);
+      if (!source) { continue; }
+      const parsed = this.parseUsageRefinementFileRecord(source);
+      for (const warning of parsed.warnings) {
+        this.log.appendLine(warning);
+      }
+      if (!parsed.record) { continue; }
+      parsedSources += 1;
+      const targets = [...targetSymbolsById.values()];
+      for (const symbol of parsed.record.parsed.symbols.map(stripMutableSymbol)) {
+        if (!isUsageRefinementContextSymbol(symbol, targets)) { continue; }
+        matched += 1;
+        const existing = targetSymbolsById.get(symbol.id);
+        if (existing) {
+          const preferred = preferUsageRefinementContextSymbol(existing, symbol);
+          if (preferred !== existing) {
+            replaced += 1;
+          }
+          targetSymbolsById.set(symbol.id, preferred);
+        } else {
+          targetSymbolsById.set(symbol.id, symbol);
+          added += 1;
+        }
+      }
+    }
+    this.log.appendLine(
+      `call graph usage source refinement target context: sourceUris=${uris.length} parsedSources=${parsedSources} ` +
+      `matchedSymbols=${matched} addedSymbols=${added} replacedSymbols=${replaced} targetSymbols=${targetSymbolsById.size}`,
+    );
+  }
+
+  private async buildUsageSourceRefinements(
+    source: UsageRefinementSource,
+    originalReferences: readonly CallGraphReference[],
+    targetSymbolsById: Map<string, CallGraphSymbol>,
+    deadline?: number,
+  ): Promise<CallGraphReference[]> {
+    if (usageRefinementDeadlineExceeded(deadline)) { return []; }
+    const parsed = this.parseUsageRefinementFileRecord(source);
+    for (const warning of parsed.warnings) {
+      this.log.appendLine(warning);
+    }
+    if (!parsed.record) { return []; }
+    const referenceCandidates = parsed.record.parsed.referenceCandidates
+      .filter((candidate) => originalReferences.some((reference) => sameUsageSourceOccurrence(candidate, reference)));
+    const calls = parsed.record.parsed.calls
+      .filter((call) => originalReferences.some((reference) => sameUsageSourceOccurrence(call, reference)));
+    if (referenceCandidates.length === 0 && calls.length === 0) { return []; }
+    const localSymbols = parsed.record.parsed.symbols.map(stripMutableSymbol);
+    const relatedSymbols = await this.resolveSymbolsForUsageRefinement(targetSymbolsById, deadline);
+    const symbols = dedupeSymbols([
+      ...localSymbols,
+      ...relatedSymbols,
+      ...targetSymbolsById.values(),
+    ]);
+    for (const symbol of symbols) {
+      if (!targetSymbolsById.has(symbol.id)) {
+        targetSymbolsById.set(symbol.id, symbol);
+      }
+    }
+    const index = buildSymbolIndex(symbols, parsed.record.parsed.bindings);
+    const provenance = source.source === 'open-document'
+      ? 'open-document-refinement'
+      : 'source-file-refinement';
+    const sourceEvidence = source.source === 'open-document'
+      ? 'opened document'
+      : 'workspace file snapshot';
+    const references = resolveReferenceCandidates(referenceCandidates, symbols, index)
+      .map((reference) => ({
+        ...reference,
+        confidence: 'resolved',
+        provenance,
+        evidence: [`${sourceEvidence} reference candidate resolved against current symbol graph`],
+      }));
+    if (usageRefinementDeadlineExceeded(deadline)) {
+      return dedupeCallGraphUsageReferences(references);
+    }
+    const resolvedCalls = await resolveCallsAsync(calls, index, {
+      resolveOptions: {
+        ...getConfiguredCallGraphResolveOptions(),
+        includePossibleEdges: false,
+        includeUnresolvedEdges: false,
+      },
+    });
+    const callReferences = resolvedCalls.edges
+      .filter((edge) => edge.calleeId && (edge.confidence === 'exact' || edge.confidence === 'resolved'))
+      .map((edge) => ({
+        ...callsiteReferenceFromEdge(edge, edge.calleeId!),
+        provenance,
+        evidence: [
+          ...edge.evidence,
+          `${sourceEvidence} callsite resolved against current symbol graph`,
+        ],
+      }));
+    return dedupeCallGraphUsageReferences([...references, ...callReferences]);
+  }
+
+  private async buildUsageProviderRefinements(
+    references: readonly CallGraphReference[],
+    refinementsByUri: Map<string, CallGraphReference[]>,
+    targetSymbolsById: Map<string, CallGraphSymbol>,
+    deadline?: number,
+  ): Promise<UsageProviderRefinementResult> {
+    const out: CallGraphReference[] = [];
+    let attempted = 0;
+    let timedOut = false;
+    for (const reference of references) {
+      if (callGraphUsageConfidenceBucket(reference) === 'resolved') { continue; }
+      if (attempted >= USAGE_PROVIDER_REFINEMENT_MAX_OCCURRENCES) { break; }
+      if (usageRefinementDeadlineExceeded(deadline)) {
+        timedOut = true;
+        break;
+      }
+      const target = targetSymbolsById.get(reference.symbolId);
+      if (!target || !isSupportedSourceUri(vscode.Uri.parse(reference.uri))) { continue; }
+      const existing = refinementsByUri.get(reference.uri);
+      if (existing?.some((candidate) =>
+        callGraphUsageConfidenceBucket(candidate) === 'resolved' &&
+        sameUsageSourceOccurrence(candidate, reference) &&
+        this.usageRefinementTargetsSameSymbol(candidate, reference, targetSymbolsById))) {
+        continue;
+      }
+      const refinement = await this.resolveUsageReferenceWithDefinitionProvider(reference, target, deadline);
+      attempted += 1;
+      if (refinement.timedOut) {
+        timedOut = true;
+        break;
+      }
+      if (refinement.reference) {
+        out.push(refinement.reference);
+      }
+    }
+    return { references: dedupeCallGraphUsageReferences(out), attempted, timedOut };
+  }
+
+  private selectBestUsageRefinementForReference(
+    reference: CallGraphReference,
+    refinements: readonly CallGraphReference[],
+    targetSymbolsById: Map<string, CallGraphSymbol>,
+  ): CallGraphReference | undefined {
+    return refinements
+      .filter((candidate) =>
+        sameUsageSourceOccurrence(candidate, reference) &&
+        this.usageRefinementTargetsSameSymbol(candidate, reference, targetSymbolsById))
+      .sort((left, right) => usageReferencePreferenceScore(right) - usageReferencePreferenceScore(left))[0];
+  }
+
+  private async resolveUsageReferenceWithDefinitionProvider(
+    reference: CallGraphReference,
+    target: CallGraphSymbol,
+    deadline?: number,
+  ): Promise<{ reference?: CallGraphReference; timedOut: boolean }> {
+    const uri = vscode.Uri.parse(reference.uri);
+    for (const position of usageReferenceProviderPositions(reference)) {
+      if (usageRefinementDeadlineExceeded(deadline)) {
+        return { timedOut: true };
+      }
+      const timeoutMs = Math.min(
+        USAGE_PROVIDER_REFINEMENT_PER_REQUEST_TIMEOUT_MS,
+        remainingUsageRefinementTimeoutMs(deadline) ?? USAGE_PROVIDER_REFINEMENT_PER_REQUEST_TIMEOUT_MS,
+      );
+      const result = await promiseWithTimeout(
+        vscode.commands.executeCommand<(vscode.Location | vscode.LocationLink)[]>(
+          'vscode.executeDefinitionProvider',
+          uri,
+          position,
+        ),
+        timeoutMs,
+      );
+      if (result.timedOut) {
+        return { timedOut: true };
+      }
+      if (!result.value?.some((location) => definitionProviderLocationMatchesTarget(location, target))) {
+        continue;
+      }
+      return {
+        timedOut: false,
+        reference: {
+          ...reference,
+          confidence: 'resolved',
+          provenance: 'definition-provider',
+          evidence: [
+            ...(reference.evidence ?? []),
+            `VS Code definition provider resolved this source occurrence to ${target.qualifiedName} at ${target.relPath}:${target.range.startLine + 1}`,
+          ],
+        },
+      };
+    }
+    return { timedOut: false };
+  }
+
+  private async readUsageRefinementSource(
+    uriString: string,
+    openDocument: vscode.TextDocument | undefined,
+    deadline?: number,
+  ): Promise<UsageRefinementSource | undefined> {
+    if (openDocument) {
+      return {
+        uri: openDocument.uri,
+        text: openDocument.getText(),
+        source: 'open-document',
+      };
+    }
+    if (usageRefinementDeadlineExceeded(deadline)) { return undefined; }
+    const uri = vscode.Uri.parse(uriString);
+    if (!isSupportedSourceUri(uri) || hasBinaryFileExtension(uri.fsPath)) {
+      return undefined;
+    }
+    try {
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      if (usageRefinementDeadlineExceeded(deadline)) { return undefined; }
+      if (bytes.byteLength > USAGE_SOURCE_REFINEMENT_MAX_FILE_BYTES || looksBinaryContent(bytes)) {
+        return undefined;
+      }
+      return {
+        uri,
+        text: decodeTextBytes(bytes),
+        source: 'workspace-file',
+      };
+    } catch (err) {
+      this.log.appendLine(
+        `call graph usage source refinement read skipped: uri=${uriString} ` +
+        `error=${err instanceof Error ? err.message : String(err)}`,
+      );
+      return undefined;
+    }
+  }
+
+  private parseUsageRefinementFileRecord(source: UsageRefinementSource): ParsedSourceFileResult {
+    if (!isSupportedSourceUri(source.uri) || hasBinaryFileExtension(source.uri.fsPath)) {
+      return { skipped: true, warnings: [] };
+    }
+    const language = LANGUAGE_BY_EXTENSION.get(path.extname(source.uri.fsPath).toLowerCase());
+    if (!language) { return { skipped: true, warnings: [] }; }
+    const text = source.text;
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const maxFileSize = getConfiguredCallGraphMaxFileSize(cfg);
+    const size = Buffer.byteLength(text, 'utf8');
+    if (size > USAGE_SOURCE_REFINEMENT_MAX_FILE_BYTES) {
+      return {
+        skipped: true,
+        warnings: [`skipped call graph usage source refinement for ${source.uri.fsPath}: file is ${size} bytes`],
+      };
+    }
+    if (maxFileSize > 0 && size > maxFileSize) {
+      return { skipped: true, warnings: [] };
+    }
+    const limits = getConfiguredCallGraphParseLimits(cfg);
+    const relPath = vscode.workspace.asRelativePath(source.uri, false).replace(/\\/g, '/');
+    const lineCheck = checkParseLineLimits(text, limits);
+    if (lineCheck) {
+      return { skipped: true, warnings: [`skipped call graph usage source parse for ${relPath}: ${lineCheck}`] };
+    }
+    return {
+      skipped: false,
+      warnings: [],
+      record: {
+        uri: source.uri.toString(),
+        relPath,
+        language,
+        mtime: Date.now(),
+        size,
+        parsed: parseFile(language, source.uri, relPath, text, limits),
+      },
+    };
+  }
+
+  private async resolveSymbolsForUsageRefinement(
+    targetSymbolsById: Map<string, CallGraphSymbol>,
+    deadline?: number,
+  ): Promise<CallGraphSymbol[]> {
+    const out: CallGraphSymbol[] = [];
+    const targetSymbols = [...targetSymbolsById.values()].slice(0, USAGE_SOURCE_REFINEMENT_MAX_TARGET_SYMBOLS);
+    const snapshot = this.snapshot;
+    if (snapshot && !this.isRustNativeIndexOnly()) {
+      const index = this.getIndex(snapshot);
+      for (const target of targetSymbols) {
+        if (target.containerId) {
+          const container = index.byId.get(target.containerId);
+          if (container) { out.push(container); }
+        }
+        for (const key of usageRefinementTargetContextQueries(target)) {
+          out.push(...index.byName.get(key) ?? []);
+          out.push(...index.byQualifiedName.get(key) ?? []);
+          if (target.language === 'python' || target.language === 'java' || target.language === 'kotlin' || target.language === 'typescript' || target.language === 'javascript') {
+            out.push(...index.byClassName.get(lastQualifiedPart(key)) ?? []);
+          }
+        }
+      }
+      return dedupeSymbols(out);
+    }
+    if (this.isRustNativeIndexOnly()) {
+      return [];
+    }
+    const queries = new Set<string>();
+    for (const target of targetSymbols) {
+      if (target.containerId) { queries.add(target.containerId); }
+      for (const key of usageRefinementTargetContextQueries(target)) {
+        queries.add(key);
+      }
+    }
+    for (const query of queries) {
+      if (usageRefinementDeadlineExceeded(deadline)) { break; }
+      if (!query || query.length < 2) { continue; }
+      const resolved = await this.resolveSymbolsResolved(query, 20, {
+        includeImplementationCounts: false,
+        includeUsageCounts: false,
+        timeoutMs: remainingUsageRefinementTimeoutMs(deadline),
+      });
+      for (const symbol of resolved) {
+        if (isUsageRefinementContextSymbol(symbol, targetSymbols)) {
+          out.push(symbol);
+        }
+      }
+    }
+    return dedupeSymbols(out);
+  }
+
+  private usageRefinementTargetsSameSymbol(
+    refined: CallGraphReference,
+    original: CallGraphReference,
+    targetSymbolsById: Map<string, CallGraphSymbol>,
+  ): boolean {
+    if (refined.symbolId === original.symbolId) { return true; }
+    const refinedSymbol = targetSymbolsById.get(refined.symbolId);
+    const originalSymbol = targetSymbolsById.get(original.symbolId);
+    if (!refinedSymbol || !originalSymbol) { return false; }
+    return symbolsSameLogicalDeclaration(refinedSymbol, originalSymbol);
   }
 
   findImplementations(symbolOrQuery: string, limit = 200): CallGraphSymbol[] {
@@ -2957,17 +3595,8 @@ export class CallGraphService implements vscode.Disposable {
     const callersBySymbolId = new Map<string, Set<string>>();
     const calleesBySymbolId = new Map<string, Set<string>>();
     const usagesBySymbolId = new Map<string, CallGraphReference[]>();
-    const usageKeysBySymbolId = new Map<string, Set<string>>();
     const pushUsage = (reference: CallGraphReference) => {
       if (!symbolIds.has(reference.symbolId)) { return; }
-      const key = referenceLocationKey(reference);
-      let keys = usageKeysBySymbolId.get(reference.symbolId);
-      if (!keys) {
-        keys = new Set<string>();
-        usageKeysBySymbolId.set(reference.symbolId, keys);
-      }
-      if (keys.has(key)) { return; }
-      keys.add(key);
       pushMap(usagesBySymbolId, reference.symbolId, reference);
     };
     await this.visitCacheArrayChunks<CallGraphEdge>(workspaceRoot, manifest.snapshot?.edges ?? [], async (edges) => {
@@ -2987,7 +3616,11 @@ export class CallGraphService implements vscode.Disposable {
         pushUsage(reference);
       }
     });
-    return { callersBySymbolId, calleesBySymbolId, usagesBySymbolId };
+    return {
+      callersBySymbolId,
+      calleesBySymbolId,
+      usagesBySymbolId: dedupeRelationSummaryUsages(usagesBySymbolId),
+    };
   }
 
   private async mergeRecordOverrideRelationsForSymbolIds(
@@ -3515,7 +4148,7 @@ export class CallGraphService implements vscode.Disposable {
       limit,
       manifest.builtAtUnixMs,
     );
-    return usages ?? [];
+    return dedupeCallGraphUsageReferences(usages ?? []).slice(0, limit);
   }
 
   private async queryRustGraphOutgoingUsageIndex(
@@ -6748,6 +7381,7 @@ function findCallsInLine(
     for (const match of line.matchAll(chainedMemberRegex)) {
       const name = match[1];
       if (CALL_KEYWORDS.has(name)) { continue; }
+      const dotStart = match.index ?? 0;
       const start = (match.index ?? 0) + match[0].indexOf(name);
       const alreadyCall = calls.some((call) =>
         call.name === name &&
@@ -6758,7 +7392,7 @@ function findCallsInLine(
       const end = (match.index ?? 0) + match[0].length;
       calls.push({
         name,
-        receiver: '<chain>',
+        receiver: readChainedMemberReceiver(line, dotStart) ?? '<chain>',
         rawText: rawLine.slice(start, Math.min(rawLine.length, end)),
         uri: uri.toString(),
         relPath,
@@ -6826,6 +7460,12 @@ function findCallsInLine(
     });
   }
   return calls;
+}
+
+function readChainedMemberReceiver(line: string, dotStart: number): string | undefined {
+  const prefix = line.slice(0, Math.max(0, dotStart)).trimEnd();
+  const match = /([A-Za-z_$][\w$]*(?:\s*\([^()]*\))?(?:\s*\.\s*[A-Za-z_$][\w$]*(?:\s*\([^()]*\))?)*)$/.exec(prefix);
+  return match ? normalizeReceiver(match[1]) : undefined;
 }
 
 function resolveReferenceCandidates(
@@ -7041,6 +7681,17 @@ function resolveCall(
         evidence: [match.inherited
           ? `receiver ${receiver} matched indexed class and inherited method from ${match.owner.qualifiedName}`
           : `receiver ${receiver} matched indexed class`],
+      }));
+    }
+    const djangoQuerySetChainTargets = findPythonDjangoQuerySetChainMethodMatches(caller, call, index);
+    if (djangoQuerySetChainTargets.length > 0) {
+      return djangoQuerySetChainTargets.map((match) => ({
+        symbol: match.symbol,
+        kind: 'method' as const,
+        confidence: 'resolved' as const,
+        evidence: [match.inherited
+          ? `receiver ${receiver} resolved from Django QuerySet chain convention through inherited method from ${match.owner.qualifiedName}; owner type is a Django ORM collection`
+          : `receiver ${receiver} resolved from Django QuerySet chain convention ${match.owner.qualifiedName}; owner type is a Django ORM collection`],
       }));
     }
     const relatedTargets = findPythonDjangoRelatedReceiverMethodMatches(call, index);
@@ -7300,6 +7951,45 @@ function findPythonDjangoRelatedReceiverMethodMatches(
     }
   }
   return dedupeMethodMatches(matches);
+}
+
+function findPythonDjangoQuerySetChainMethodMatches(
+  caller: CallGraphSymbol,
+  call: CallGraphCallSite,
+  index: SymbolIndex,
+): MethodTargetMatch[] {
+  if (caller.language !== 'python' || !call.receiver) {
+    return [];
+  }
+  const modelName = djangoModelNameFromQuerySetChainReceiver(call.receiver);
+  if (!modelName) { return []; }
+  const matches: MethodTargetMatch[] = [];
+  for (const symbol of collectMethodNameMatches(call.name, index)) {
+    if (symbol.language !== 'python' || symbol.kind !== 'method' || !symbol.containerName) { continue; }
+    if (djangoModelNameFromQuerySetTypeName(symbol.containerName) !== modelName) { continue; }
+    const owner = findTypeSymbol(symbol.containerName, index);
+    if (!owner || !isPythonDjangoOrmCollectionType(owner, index, new Set<string>())) { continue; }
+    matches.push({ symbol, owner, inherited: false });
+  }
+  return dedupeMethodMatches(matches);
+}
+
+function djangoModelNameFromQuerySetChainReceiver(receiver: string): string {
+  if (!receiver || receiver === '<chain>') { return ''; }
+  const normalized = normalizeReceiver(receiver);
+  const parts = normalized.split('.').filter(Boolean);
+  const objectsIndex = parts.indexOf('objects');
+  if (objectsIndex <= 0) { return ''; }
+  const modelPart = parts[objectsIndex - 1].replace(/\([^)]*\)$/g, '');
+  if (!/^[A-Z][A-Za-z0-9_]*$/.test(modelPart)) { return ''; }
+  return modelPart;
+}
+
+function djangoModelNameFromQuerySetTypeName(typeName: string | undefined): string {
+  const simple = lastQualifiedPart(stripGenericSuffix(typeName ?? ''));
+  return simple.endsWith('QuerySet') && simple.length > 'QuerySet'.length
+    ? simple.slice(0, -'QuerySet'.length)
+    : '';
 }
 
 function findPythonDjangoOrmFallbackMethodMatches(
@@ -7933,15 +8623,7 @@ function dedupeEdges(edges: CallGraphEdge[]): CallGraphEdge[] {
 }
 
 function dedupeReferences(references: CallGraphReference[]): CallGraphReference[] {
-  const seen = new Set<string>();
-  const out: CallGraphReference[] = [];
-  for (const reference of references) {
-    const key = referenceLocationKey(reference);
-    if (seen.has(key)) { continue; }
-    seen.add(key);
-    out.push(reference);
-  }
-  return out;
+  return dedupeCallGraphUsageReferences(references);
 }
 
 function edgeIdentityKey(edge: CallGraphEdge): string {
@@ -8004,6 +8686,350 @@ function confidenceRank(confidence: CallGraphConfidence): number {
     case 'unresolved':
       return 1;
   }
+}
+
+function usageReferenceOccurrenceKey(reference: CallGraphReference): string {
+  return [
+    reference.symbolId,
+    reference.uri,
+    reference.range.startLine,
+    reference.range.startColumn,
+  ].join(':');
+}
+
+function sameUsageSourceOccurrence(
+  a: Pick<CallGraphReference, 'uri' | 'range' | 'name' | 'rawText'>,
+  b: Pick<CallGraphReference, 'uri' | 'range' | 'name' | 'rawText'>,
+): boolean {
+  return a.uri === b.uri &&
+    callGraphRangesOverlap(a.range, b.range) &&
+    (!a.name || !b.name || a.name === b.name || a.rawText.includes(b.name) || b.rawText.includes(a.name));
+}
+
+function usageRefinementDeadlineExceeded(deadline: number | undefined): boolean {
+  return deadline !== undefined && Date.now() >= deadline;
+}
+
+function usageReferenceProviderPositions(reference: CallGraphReference): vscode.Position[] {
+  const columns = new Set<number>();
+  const start = Math.max(0, reference.range.startColumn);
+  columns.add(start);
+  const nameOffset = reference.name && reference.rawText
+    ? reference.rawText.lastIndexOf(reference.name)
+    : -1;
+  if (nameOffset > 0) {
+    columns.add(start + nameOffset);
+  }
+  if (reference.range.endColumn > reference.range.startColumn) {
+    columns.add(Math.max(0, reference.range.endColumn - 1));
+  }
+  return [...columns]
+    .sort((left, right) => left - right)
+    .map((column) => new vscode.Position(reference.range.startLine, column));
+}
+
+function definitionProviderLocationMatchesTarget(
+  location: vscode.Location | vscode.LocationLink,
+  target: CallGraphSymbol,
+): boolean {
+  const uri = isVscodeLocationLink(location) ? location.targetUri : location.uri;
+  if (uri.toString() !== target.uri) { return false; }
+  const range = vscodeRangeToCallGraphRange(
+    isVscodeLocationLink(location)
+      ? location.targetSelectionRange ?? location.targetRange
+      : location.range,
+  );
+  return callGraphRangesOverlap(range, target.range) ||
+    callGraphRangesOverlap(range, target.bodyRange) ||
+    callGraphRangeContainsPosition(target.range, range.startLine, range.startColumn) ||
+    callGraphRangeContainsPosition(target.bodyRange, range.startLine, range.startColumn);
+}
+
+function isVscodeLocationLink(location: vscode.Location | vscode.LocationLink): location is vscode.LocationLink {
+  return 'targetUri' in location;
+}
+
+function vscodeRangeToCallGraphRange(range: vscode.Range): CallGraphRange {
+  return {
+    startLine: range.start.line,
+    startColumn: range.start.character,
+    endLine: range.end.line,
+    endColumn: range.end.character,
+  };
+}
+
+function callGraphRangeContainsPosition(range: CallGraphRange, line: number, column: number): boolean {
+  if (line < range.startLine || line > range.endLine) { return false; }
+  if (line === range.startLine && column < range.startColumn) { return false; }
+  if (line === range.endLine && column > range.endColumn) { return false; }
+  return true;
+}
+
+async function promiseWithTimeout<T>(
+  promise: PromiseLike<T>,
+  timeoutMs: number,
+): Promise<{ value?: T; timedOut: boolean }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) { return; }
+      settled = true;
+      resolve({ timedOut: true });
+    }, Math.max(1, timeoutMs));
+    promise.then(
+      (value) => {
+        if (settled) { return; }
+        settled = true;
+        clearTimeout(timer);
+        resolve({ value, timedOut: false });
+      },
+      () => {
+        if (settled) { return; }
+        settled = true;
+        clearTimeout(timer);
+        resolve({ timedOut: false });
+      },
+    );
+  });
+}
+
+function usageRefinementEvidenceKind(reference: CallGraphReference): string {
+  const evidence = (reference.evidence ?? []).join(' ').toLowerCase();
+  if (evidence.includes('definition provider resolved')) { return 'definition-provider'; }
+  if (evidence.includes('django queryset chain convention')) { return 'django-queryset-chain'; }
+  if (evidence.includes('reference candidate resolved')) { return 'reference-candidate'; }
+  if (evidence.includes('local constructor/type binding')) { return 'local-binding'; }
+  if (evidence.includes('receiver self') || evidence.includes('receiver cls') || evidence.includes('receiver this')) {
+    return 'self-or-this';
+  }
+  if (evidence.includes('same-file symbol name match')) { return 'same-file-unique'; }
+  if (evidence.includes('workspace symbol name match')) { return 'workspace-unique'; }
+  return String(reference.provenance ?? 'source-refinement');
+}
+
+function normalizeRefinedUsageConfidence(reference: CallGraphReference): CallGraphReference {
+  if (callGraphUsageConfidenceBucket(reference) === 'resolved') {
+    return reference;
+  }
+  const rawConfidence = String(reference.confidence ?? '').toLowerCase();
+  if (rawConfidence !== 'exact' && rawConfidence !== 'resolved') {
+    return reference;
+  }
+  return {
+    ...reference,
+    confidence: 'possible',
+  };
+}
+
+function usageRefinementAuditSample(
+  original: CallGraphReference,
+  upgraded: CallGraphReference,
+  evidenceKind: string,
+): string {
+  const location = `${upgraded.relPath || original.relPath}:${upgraded.range.startLine + 1}:${upgraded.range.startColumn + 1}`;
+  const from = `${original.confidence ?? 'unknown'}/${original.provenance ?? 'unknown'}`;
+  const to = `${upgraded.confidence ?? 'unknown'}/${upgraded.provenance ?? 'unknown'}`;
+  const evidence = compactLogField((upgraded.evidence ?? []).join('; '), 220);
+  return `${location} ${upgraded.name || original.name} ${from}->${to} kind=${evidenceKind} evidence="${evidence}"`;
+}
+
+function compactLogField(value: string, maxLength: number): string {
+  const compact = value.replace(/\s+/g, ' ').replace(/["\\]/g, "'").trim();
+  return compact.length > maxLength ? `${compact.slice(0, Math.max(0, maxLength - 1))}...` : compact;
+}
+
+function incrementCount(map: Map<string, number>, key: string): void {
+  map.set(key, (map.get(key) ?? 0) + 1);
+}
+
+function sortedCountObject(map: Map<string, number>): Record<string, number> {
+  return Object.fromEntries([...map.entries()].sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function remainingUsageRefinementTimeoutMs(deadline: number | undefined): number | undefined {
+  if (deadline === undefined) { return undefined; }
+  return Math.max(1, deadline - Date.now());
+}
+
+function usageRefinementTargetContextQueries(target: CallGraphSymbol): string[] {
+  const queries = new Set<string>();
+  if (target.containerName) {
+    queries.add(target.containerName);
+    queries.add(lastQualifiedPart(target.containerName));
+  }
+  if (target.kind === 'class' || target.kind === 'interface' || target.kind === 'type' || target.kind === 'struct') {
+    queries.add(target.qualifiedName);
+    queries.add(target.name);
+  }
+  return [...queries];
+}
+
+function usageRefinementTargetSymbolsFromHints(
+  references: readonly CallGraphReference[],
+  options: CallGraphUsageRefinementOptions,
+): Map<string, CallGraphSymbol> {
+  const out = new Map<string, CallGraphSymbol>();
+  const add = (symbol: CallGraphSymbol): void => {
+    out.set(symbol.id, symbol);
+    const container = syntheticUsageRefinementContainerSymbol(symbol, references);
+    if (container && !out.has(container.id)) {
+      out.set(container.id, container);
+    }
+  };
+  for (const symbol of options.targetSymbols ?? []) {
+    add(symbol);
+  }
+  for (const symbol of syntheticUsageRefinementSymbolsFromLabel(references, options.targetLabel)) {
+    if (!out.has(symbol.id)) {
+      add(symbol);
+    }
+  }
+  return out;
+}
+
+function syntheticUsageRefinementSymbolsFromLabel(
+  references: readonly CallGraphReference[],
+  targetLabel: string | undefined,
+): CallGraphSymbol[] {
+  const label = String(targetLabel ?? '').trim();
+  if (!label || references.length === 0) { return []; }
+  const first = references[0];
+  const language = languageFromRelPath(first.relPath);
+  const dot = label.lastIndexOf('.');
+  const labelName = dot >= 0 ? label.slice(dot + 1).trim() : label;
+  const containerName = dot >= 0 ? label.slice(0, dot).trim() : undefined;
+  const targetName = labelName || first.name;
+  if (!targetName) { return []; }
+  const range = first.range;
+  const symbols: CallGraphSymbol[] = [];
+  for (const symbolId of new Set(references.map((reference) => reference.symbolId).filter(Boolean))) {
+    symbols.push({
+      id: symbolId,
+      name: targetName,
+      qualifiedName: containerName ? `${containerName}.${targetName}` : targetName,
+      kind: containerName ? 'method' : 'function',
+      language,
+      uri: first.uri,
+      relPath: first.relPath,
+      range,
+      bodyRange: range,
+      ...(containerName ? { containerName } : {}),
+    });
+  }
+  return symbols;
+}
+
+function syntheticUsageRefinementContainerSymbol(
+  target: CallGraphSymbol,
+  references: readonly CallGraphReference[],
+): CallGraphSymbol | undefined {
+  if (!target.containerName || isTypeSymbol(target)) { return undefined; }
+  const first = references[0] ?? {
+    uri: target.uri,
+    relPath: target.relPath,
+    range: target.range,
+  };
+  const id = target.containerId ?? `synthetic:type:${stableHash(`${target.language}:${target.containerName}`).slice(0, 16)}`;
+  const name = lastQualifiedPart(target.containerName);
+  if (!name) { return undefined; }
+  return {
+    id,
+    name,
+    qualifiedName: target.containerName,
+    kind: 'class',
+    language: target.language,
+    uri: first.uri,
+    relPath: first.relPath,
+    range: first.range,
+    bodyRange: first.range,
+  };
+}
+
+function isUsageRefinementContextSymbol(symbol: CallGraphSymbol, targets: readonly CallGraphSymbol[]): boolean {
+  if (isTypeSymbol(symbol)) {
+    return targets.some((target) =>
+      target.containerId === symbol.id ||
+      target.containerName === symbol.qualifiedName ||
+      lastQualifiedPart(target.containerName ?? '') === symbol.name ||
+      target.id === symbol.id);
+  }
+  return targets.some((target) =>
+    target.containerId === symbol.id ||
+    target.id === symbol.id ||
+    (target.containerName !== undefined && symbol.qualifiedName === target.containerName));
+}
+
+function preferUsageRefinementContextSymbol(existing: CallGraphSymbol, candidate: CallGraphSymbol): CallGraphSymbol {
+  return usageRefinementContextSymbolScore(candidate) > usageRefinementContextSymbolScore(existing)
+    ? candidate
+    : existing;
+}
+
+function usageRefinementContextSymbolScore(symbol: CallGraphSymbol): number {
+  let score = 0;
+  if (!symbol.id.startsWith('synthetic:')) { score += 4; }
+  if ((symbol.extendsNames?.length ?? 0) > 0) { score += 4; }
+  if ((symbol.implementsNames?.length ?? 0) > 0) { score += 2; }
+  if (symbol.containerId) { score += 1; }
+  if (symbol.signature) { score += 1; }
+  return score;
+}
+
+function callGraphRangesOverlap(a: CallGraphRange, b: CallGraphRange): boolean {
+  if (a.startLine > b.endLine || b.startLine > a.endLine) { return false; }
+  if (a.startLine === b.endLine && a.startColumn > b.endColumn) { return false; }
+  if (b.startLine === a.endLine && b.startColumn > a.endColumn) { return false; }
+  return true;
+}
+
+function symbolsSameLogicalDeclaration(a: CallGraphSymbol, b: CallGraphSymbol): boolean {
+  return a.language === b.language &&
+    a.relPath === b.relPath &&
+    a.kind === b.kind &&
+    a.name === b.name &&
+    a.qualifiedName === b.qualifiedName;
+}
+
+function usageReferencePreferenceScore(reference: CallGraphReference): number {
+  return usageConfidencePreferenceRank(callGraphUsageConfidenceBucket(reference)) * 10_000 +
+    rawReferenceConfidenceRank(reference.confidence) * 1_000 +
+    provenancePreferenceRank(reference.provenance) * 100 +
+    edgeKindPreferenceRank(reference.edgeKind);
+}
+
+function usageConfidencePreferenceRank(bucket: CallGraphUsageConfidence): number {
+  switch (bucket) {
+    case 'resolved': return 3;
+    case 'ambiguous': return 2;
+    case 'textual': return 1;
+  }
+}
+
+function rawReferenceConfidenceRank(confidence: string | undefined): number {
+  switch (String(confidence ?? '').toLowerCase()) {
+    case 'exact': return 4;
+    case 'resolved': return 3;
+    case 'possible': return 2;
+    case 'unresolved': return 1;
+    default: return 0;
+  }
+}
+
+function provenancePreferenceRank(provenance: string | undefined): number {
+  const value = String(provenance ?? '').toLowerCase();
+  if (/\b(?:semantic|typed|type|compiler|lsp|rust-native)\b/.test(value)) { return 4; }
+  if (/\b(?:heuristic|provider|framework)\b/.test(value)) { return 3; }
+  if (/\b(?:zoekt|lexical|textual|text|fallback)\b/.test(value)) { return 1; }
+  return 2;
+}
+
+function edgeKindPreferenceRank(edgeKind: string | undefined): number {
+  const value = String(edgeKind ?? '').toLowerCase();
+  if (value === 'definition' || value === 'import') { return 5; }
+  if (value === 'call' || value === 'construct' || value === 'constructor') { return 4; }
+  if (value === 'method' || value === 'static' || value === 'virtual' || value === 'direct') { return 3; }
+  if (value === 'usage' || value === 'reference') { return 2; }
+  return 1;
 }
 
 function stripMutableSymbol(symbol: MutableSymbol): CallGraphSymbol {
@@ -8209,16 +9235,7 @@ function buildRelationSummaryIndex(edges: CallGraphEdge[], references: CallGraph
   const callersBySymbolId = new Map<string, Set<string>>();
   const calleesBySymbolId = new Map<string, Set<string>>();
   const usagesBySymbolId = new Map<string, CallGraphReference[]>();
-  const usageKeysBySymbolId = new Map<string, Set<string>>();
   const pushUsage = (reference: CallGraphReference) => {
-    const key = referenceLocationKey(reference);
-    let keys = usageKeysBySymbolId.get(reference.symbolId);
-    if (!keys) {
-      keys = new Set<string>();
-      usageKeysBySymbolId.set(reference.symbolId, keys);
-    }
-    if (keys.has(key)) { return; }
-    keys.add(key);
     pushMap(usagesBySymbolId, reference.symbolId, reference);
   };
   for (const edge of edges) {
@@ -8234,7 +9251,11 @@ function buildRelationSummaryIndex(edges: CallGraphEdge[], references: CallGraph
   for (const reference of references) {
     pushUsage(reference);
   }
-  return { callersBySymbolId, calleesBySymbolId, usagesBySymbolId };
+  return {
+    callersBySymbolId,
+    calleesBySymbolId,
+    usagesBySymbolId: dedupeRelationSummaryUsages(usagesBySymbolId),
+  };
 }
 
 function buildRelationSummaryIndexForSymbolIdsFromArrays(
@@ -8245,17 +9266,8 @@ function buildRelationSummaryIndexForSymbolIdsFromArrays(
   const callersBySymbolId = new Map<string, Set<string>>();
   const calleesBySymbolId = new Map<string, Set<string>>();
   const usagesBySymbolId = new Map<string, CallGraphReference[]>();
-  const usageKeysBySymbolId = new Map<string, Set<string>>();
   const pushUsage = (reference: CallGraphReference) => {
     if (!symbolIds.has(reference.symbolId)) { return; }
-    const key = referenceLocationKey(reference);
-    let keys = usageKeysBySymbolId.get(reference.symbolId);
-    if (!keys) {
-      keys = new Set<string>();
-      usageKeysBySymbolId.set(reference.symbolId, keys);
-    }
-    if (keys.has(key)) { return; }
-    keys.add(key);
     pushMap(usagesBySymbolId, reference.symbolId, reference);
   };
   for (const edge of edges) {
@@ -8271,7 +9283,11 @@ function buildRelationSummaryIndexForSymbolIdsFromArrays(
   for (const reference of references) {
     pushUsage(reference);
   }
-  return { callersBySymbolId, calleesBySymbolId, usagesBySymbolId };
+  return {
+    callersBySymbolId,
+    calleesBySymbolId,
+    usagesBySymbolId: dedupeRelationSummaryUsages(usagesBySymbolId),
+  };
 }
 
 function mergeRelationSummaryIndex(target: RelationSummaryIndex, source: RelationSummaryIndex): void {
@@ -8291,15 +9307,29 @@ function mergeRelationSummaryIndex(target: RelationSummaryIndex, source: Relatio
   }
 }
 
+function dedupeRelationSummaryUsages(
+  usagesBySymbolId: Map<string, CallGraphReference[]>,
+): Map<string, CallGraphReference[]> {
+  const out = new Map<string, CallGraphReference[]>();
+  for (const [symbolId, usages] of usagesBySymbolId) {
+    out.set(symbolId, dedupeCallGraphUsageReferences(usages));
+  }
+  return out;
+}
+
 function callsiteReferenceFromEdge(edge: CallGraphEdge, symbolId: string): CallGraphReference {
   return {
     symbolId,
+    edgeKind: edge.callKind,
     name: edge.calleeName,
     rawText: edge.callsite.rawText,
     uri: edge.callsite.uri,
     relPath: edge.callsite.relPath,
     range: edge.callsite.range,
     enclosingSymbolId: edge.callerId,
+    confidence: edge.confidence,
+    provenance: edge.source,
+    evidence: edge.evidence,
   };
 }
 
@@ -8361,15 +9391,7 @@ function callGraphConfidenceFromRustReference(reference: CallGraphReference): Ca
 }
 
 function referenceLocationKey(reference: CallGraphReference): string {
-  if (reference.sourceRefId) {
-    return `${reference.symbolId}:ref:${reference.sourceRefId}`;
-  }
-  return [
-    reference.symbolId,
-    reference.uri,
-    reference.range.startLine,
-    reference.range.startColumn,
-  ].join(':');
+  return usageReferenceOccurrenceKey(reference);
 }
 
 function edgeLocationKey(edge: CallGraphEdge): string {

@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 131;
+export const RENDERER_PATCH_VERSION = 132;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -2156,7 +2156,28 @@ export function getRendererPatchScript(
     '  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;',
     '  text-align: right;',
     '}',
+    '.ij-find-row-confidence {',
+    '  flex: 0 0 auto;',
+    '  font-family: var(--vscode-font-family, system-ui);',
+    '  font-size: 10px;',
+    '  line-height: 14px;',
+    '  padding: 0 5px;',
+    '  border: 1px solid var(--vscode-widget-border, rgba(127,127,127,0.35));',
+    '  color: var(--vscode-descriptionForeground, #9d9d9d);',
+    '  background: var(--vscode-badge-background, rgba(127,127,127,0.14));',
+    '  box-sizing: border-box;',
+    '}',
+    '.ij-find-row-confidence-resolved {',
+    '  color: var(--vscode-testing-iconPassed, #73c991);',
+    '}',
+    '.ij-find-row-confidence-ambiguous {',
+    '  color: var(--vscode-testing-iconQueued, #cca700);',
+    '}',
+    '.ij-find-row-confidence-textual {',
+    '  color: var(--vscode-textLink-foreground, #3794ff);',
+    '}',
     '.ij-find-row.active .ij-find-row-loc { color: inherit; opacity: 0.85; }',
+    '.ij-find-row.active .ij-find-row-confidence { color: inherit; border-color: currentColor; opacity: 0.85; }',
     '.ij-find-row-actions {',
     '  flex: 0 0 auto;',
     '  display: flex; align-items: center; gap: 3px;',
@@ -2534,9 +2555,9 @@ export function getRendererPatchScript(
   var $optRegex = el('button', { className: 'ij-find-opt', title: 'Regex (Alt+R)', text: '.*', attrs: { 'data-opt': 'useRegex', 'aria-pressed': 'false' } });
   var $optRegexMultiline = el('button', { className: 'ij-find-opt', title: 'Regex Multiline / dotAll (Alt+M)', text: 'ML', attrs: { 'data-opt': 'regexMultiline', 'aria-pressed': 'false', 'aria-disabled': 'true' } });
   var $refresh = el('button', { className: 'ij-find-opt ij-find-refresh', title: 'Refresh Search', text: 'Run', attrs: { type: 'button', 'aria-label': 'Refresh search' } });
-  // Find Usages only: toggle the low-confidence (estimated) envelope. Hidden
+  // Find Usages only: toggle the low-confidence candidate envelope. Hidden
   // until the extension sends an estimatedToggle message saying there is one.
-  var $optEst = el('button', { className: 'ij-find-opt ij-find-opt-est', title: 'Show Estimated (Low-Confidence) Usages', text: 'Est', attrs: { type: 'button', 'aria-pressed': 'false', hidden: '' } });
+  var $optEst = el('button', { className: 'ij-find-opt ij-find-opt-est', title: 'Show Candidate Usages', text: 'Cand', attrs: { type: 'button', 'aria-pressed': 'false', hidden: '' } });
   var $opts = el('div', { className: 'ij-find-opts', children: [$optCase, $optWord, $optRegex, $optRegexMultiline, $optEst, $refresh] });
   var $queryGroup = el('div', { className: 'ij-find-query-group', children: [$q, $historyWrap] });
   var $searchRow = el('div', { className: 'ij-find-search-row', children: [$queryGroup, $opts] });
@@ -4289,6 +4310,16 @@ export function getRendererPatchScript(
     var m = f.matches[item.mi];
     var textEl = el('span', { className: 'ij-find-row-text' });
     appendHighlightedInto(textEl, normalizeResultPreview(m.preview), rangesForCurrentQuery(m));
+    var usageConfidence = String(m.usageConfidence || '').toLowerCase();
+    var confidenceEl = null;
+    if (usageConfidence === 'resolved' || usageConfidence === 'ambiguous' || usageConfidence === 'textual') {
+      var confidenceLabel = m.usageConfidenceLabel || (usageConfidence.slice(0, 1).toUpperCase() + usageConfidence.slice(1));
+      confidenceEl = el('span', {
+        className: 'ij-find-row-confidence ij-find-row-confidence-' + usageConfidence,
+        text: confidenceLabel,
+        title: m.usageConfidenceDetail || confidenceLabel,
+      });
+    }
     var targetRanges = rangesForCurrentQuery(m);
     var targetColumn = (targetRanges && targetRanges[0]) ? targetRanges[0].start : 0;
     var slashIdx = f.relPath.lastIndexOf('/');
@@ -4304,6 +4335,7 @@ export function getRendererPatchScript(
       },
       children: [
         textEl,
+        confidenceEl,
         el('span', {
           className: 'ij-find-row-loc',
           title: f.relPath + ':' + (m.line + 1),

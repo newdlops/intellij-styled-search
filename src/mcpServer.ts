@@ -6,6 +6,8 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import {
   CallGraphService,
+  callGraphUsageConfidenceBucket,
+  dedupeCallGraphUsageReferences,
   formatQueryResults,
   type CallGraphEdge,
   type CallGraphQueryResult,
@@ -13,6 +15,7 @@ import {
   type CallGraphReference,
   type CallGraphSnapshot,
   type CallGraphSymbol,
+  type CallGraphUsageConfidence,
 } from './callGraph';
 import {
   mergeFileMatches,
@@ -1987,19 +1990,27 @@ export class CallGraphMcpServer implements vscode.Disposable {
       : await this.callGraph.findTargetsAtPositionResolved(normalized.uri, position);
     const enclosing = await this.resolveEnclosingSymbolAtPosition(normalized, position);
     const edges = this.callGraph.findCallEdgesAtPosition(normalized.uri, position);
-    const target = prefer === 'enclosing_symbol'
+    const rawTarget = prefer === 'enclosing_symbol'
       ? enclosing ?? targets[0]
       : prefer === 'reference_target'
         ? referenceTargets[0] ?? targets[0]
       : targets[0];
+    const target = rawTarget ? await this.canonicalizeResolvedSymbol(rawTarget) : undefined;
+    const canonicalEnclosing = enclosing ? await this.canonicalizeResolvedSymbol(enclosing) : undefined;
+    const canonicalCandidates = includeCandidates
+      ? await Promise.all(targets
+        .filter((symbol) => symbol.id !== rawTarget?.id)
+        .slice(0, 10)
+        .map((symbol) => this.canonicalizeResolvedSymbol(symbol)))
+      : [];
     return {
       ...this.baseEnvelope(this.callGraph.getSnapshot(), target
         ? `Resolved ${normalized.relPath}:${line}:${character} to ${target.qualifiedName}.`
         : `No target symbol resolved at ${normalized.relPath}:${line}:${character}.`),
       target_symbol: target ? this.symbolRef(target) : null,
-      enclosing_symbol: enclosing ? this.symbolRef(enclosing) : null,
+      enclosing_symbol: canonicalEnclosing ? this.symbolRef(canonicalEnclosing) : null,
       reference_edge: edges[0] ? this.edgeRef(edges[0]) : null,
-      candidates: includeCandidates ? targets.filter((symbol) => symbol.id !== target?.id).slice(0, 10).map((symbol) => this.symbolRef(symbol)) : [],
+      candidates: includeCandidates ? canonicalCandidates.map((symbol) => this.symbolRef(symbol)) : [],
     };
   }
 
@@ -2098,6 +2109,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const scopePreset = readEnumArg(args, 'scope_preset', MCP_SCOPE_PRESETS, 'source');
     const includeDefinitions = readBoolArg(args, 'include_definitions', false);
     const includeProviderEdges = readBoolArg(args, 'include_provider_edges', false);
+    const confidenceFilter = readEnumArg(args, 'confidence_filter', ['all', 'resolved', 'ambiguous', 'textual'], 'all');
     const target = await this.resolveSymbolOrPositionArg(args);
     if (!target) {
       return this.errorEnvelope('symbol_not_found', 'No target symbol resolved for references.');
@@ -2111,7 +2123,10 @@ export class CallGraphMcpServer implements vscode.Disposable {
     }
     const wantsReferenceBackedEdges = edgeKinds.has('usage') || edgeKinds.has('call') || edgeKinds.has('construct');
     const usageRefs = wantsReferenceBackedEdges
-      ? (await this.callGraph.findUsagesResolved(target.id, limit))
+      ? dedupeCallGraphUsageReferences(await this.callGraph.refineUsageReferencesWithCurrentSources(
+        await this.callGraph.findUsagesResolved(target.id, limit),
+        { targetSymbols: [target], targetLabel: target.qualifiedName },
+      ))
         .filter((reference) => edgeKinds.has(edgeKindForReference(reference)))
       : [];
     const callerEdges = edgeKinds.has('call') || edgeKinds.has('construct')
@@ -2120,16 +2135,25 @@ export class CallGraphMcpServer implements vscode.Disposable {
         : this.callGraph.getCallers(target.id, limit))[0]?.edges ?? [])
         .filter((edge) => edgeKinds.has(edgeKindForCallEdge(edge)))
       : [];
-    const items = [
+    const allItems = dedupeMcpReferenceItemsBySourceSpan([
       ...usageRefs.map((reference) => this.referenceItem(reference, edgeKindForReference(reference))),
       ...callerEdges.map((edge) => this.callEdgeReferenceItem(edge)),
-    ]
+    ])
       .filter((item) => includeDefinitions || item.edge_kind !== 'definition')
       .filter((item) => {
         const loc = item.location as { file?: string };
         return typeof loc.file === 'string' && relPathAllowedByScopePreset(loc.file, scopePreset);
-      })
-      .slice(0, limit);
+      });
+    const confidenceCounts = countReferenceConfidenceBuckets(allItems);
+    const filteredItems = confidenceFilter === 'all'
+      ? allItems
+      : allItems.filter((item) => item.confidence_bucket === confidenceFilter);
+    const items = filteredItems.slice(0, limit);
+    if (confidenceCounts.ambiguous + confidenceCounts.textual > 0) {
+      warnings.push(
+        'Some references are ambiguous/textual candidates. Use confidence_filter="resolved" for high-precision refactor/delete decisions, and keep confidence_filter="all" for recall.',
+      );
+    }
     if (includeSnippets) {
       for (const item of items) {
         if (token?.isCancellationRequested) {
@@ -2155,10 +2179,12 @@ export class CallGraphMcpServer implements vscode.Disposable {
     }
     const groups = groupReferences(items, groupBy);
     return {
-      ...this.baseEnvelope(snapshot, `${target.qualifiedName} has ${items.length} returned references.`),
+      ...this.baseEnvelope(snapshot, `${target.qualifiedName} has ${items.length} returned references (${confidenceCounts.resolved} resolved, ${confidenceCounts.ambiguous} ambiguous, ${confidenceCounts.textual} textual candidates before pagination/filtering).`),
       target_symbol: this.symbolRef(target),
       counts: {
         total: items.length,
+        total_before_filter: allItems.length,
+        filtered_total: filteredItems.length,
         usage: items.filter((item) => item.edge_kind === 'usage').length,
         call: items.filter((item) => item.edge_kind === 'call').length,
         construct: items.filter((item) => item.edge_kind === 'construct').length,
@@ -2166,15 +2192,27 @@ export class CallGraphMcpServer implements vscode.Disposable {
         definition: items.filter((item) => item.edge_kind === 'definition').length,
         by_edge_kind: countBy(items, (item) => item.edge_kind as string),
         by_confidence: countBy(items, (item) => item.confidence as string),
+        by_confidence_bucket: countBy(items, (item) => String(item.confidence_bucket ?? 'ambiguous')),
+        confidence_buckets_before_filter: confidenceCounts,
       },
+      usage_contract: {
+        default_mode: 'recall',
+        confidence_filter: confidenceFilter,
+        returned_count: items.length,
+        total_count: allItems.length,
+        filtered_count: filteredItems.length,
+        confidence_buckets: confidenceCounts,
+        semantics: 'All mode preserves recall by returning resolved, ambiguous, and textual candidates. Rows expose confidence_bucket and evidence so agents can prioritize safely.',
+      },
+      recommended_use: recommendedUseForConfidenceCounts(confidenceCounts, includeProviderEdges),
       scope: {
         scope_preset: scopePreset,
         semantics: scopePresetSemantics(scopePreset),
         include_definitions: includeDefinitions,
       },
       groups,
-      next_cursor: items.length >= limit ? cursorForOffset(limit) : null,
-      truncated: items.length >= limit,
+      next_cursor: filteredItems.length > items.length ? cursorForOffset(items.length) : null,
+      truncated: filteredItems.length > items.length,
       warnings,
     };
   }
@@ -2247,6 +2285,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const maxEdges = readIntArg(args, 'max_edges', 200, 1, 1000);
     const depth = readIntArg(args, 'depth', 1, 1, 3);
     const includeProviderEdges = readBoolArg(args, 'include_provider_edges', false);
+    const confidenceFilter = readEnumArg(args, 'confidence_filter', ['all', 'resolved', 'ambiguous', 'textual'], 'all');
     const snapshot = this.callGraph.getSnapshot();
     const warnings: string[] = [];
     if ((edgeKinds.has('call') || edgeKinds.has('construct')) && featureConfidence(snapshot).call_graph === 'unavailable') {
@@ -2281,6 +2320,8 @@ export class CallGraphMcpServer implements vscode.Disposable {
       for (const edge of [...incoming, ...outgoing]) {
         const edgeKind = edgeKindForCallEdge(edge);
         if (!edgeKinds.has(edgeKind)) { continue; }
+        const confidenceBucket = confidenceBucketForEdge(edge);
+        if (!mcpConfidenceBucketAllowed(confidenceBucket, confidenceFilter)) { continue; }
         const pair = this.edgeSymbols(edge);
         if (!pair) { continue; }
         nodes.set(pair.from.id, graphNode(pair.from));
@@ -2290,8 +2331,11 @@ export class CallGraphMcpServer implements vscode.Disposable {
           from: pair.from.id,
           to: pair.to.id,
           edge_kind: edgeKind,
-          confidence: confidenceForEdge(edge),
+          confidence: mcpConfidenceForBucket(confidenceBucket),
+          confidence_bucket: confidenceBucket,
+          priority: mcpPriorityForBucket(confidenceBucket),
           source: edge.source,
+          evidence: edgeEvidenceForMcp(edge),
           location: rangeFor(edge.callsite.range, edge.callsite.relPath),
         });
         const next = pair.from.id === current.symbol.id ? pair.to : pair.from;
@@ -2303,13 +2347,18 @@ export class CallGraphMcpServer implements vscode.Disposable {
     }
     const wantsReferenceBackedEdges = edgeKinds.has('usage') || edgeKinds.has('call') || edgeKinds.has('construct');
     if (this.callGraph.isRustNativeIndexOnly() && directions.has('incoming') && wantsReferenceBackedEdges && edges.length < maxEdges) {
-      const usageRefs = await this.callGraph.findUsagesResolved(root.id, maxEdges);
+      const usageRefs = await this.callGraph.refineUsageReferencesWithCurrentSources(
+        await this.callGraph.findUsagesResolved(root.id, maxEdges),
+        { targetSymbols: [root], targetLabel: root.qualifiedName },
+      );
       for (const reference of usageRefs) {
         if (token?.isCancellationRequested) {
           return this.errorEnvelope('cancelled', 'graph_neighbors cancelled during usage expansion.', true);
         }
         const edgeKind = edgeKindForReference(reference);
         if (!edgeKinds.has(edgeKind)) { continue; }
+        const confidenceBucket = callGraphUsageConfidenceBucket(reference);
+        if (!mcpConfidenceBucketAllowed(confidenceBucket, confidenceFilter)) { continue; }
         let fromId = reference.enclosingSymbolId ?? `file:${reference.relPath}`;
         if (!nodes.has(fromId)) {
           const enclosing = reference.enclosingSymbolId
@@ -2333,8 +2382,11 @@ export class CallGraphMcpServer implements vscode.Disposable {
           from: fromId,
           to: root.id,
           edge_kind: edgeKind,
-          confidence: 'static-probable',
-          source: 'rust-native-reference',
+          confidence: mcpConfidenceForBucket(confidenceBucket),
+          confidence_bucket: confidenceBucket,
+          priority: mcpPriorityForBucket(confidenceBucket),
+          source: reference.provenance ?? 'rust-native-reference',
+          evidence: referenceEvidenceForMcp(reference),
           location: rangeFor(reference.range, reference.relPath),
         });
         usedReferenceFallback = true;
@@ -2342,13 +2394,17 @@ export class CallGraphMcpServer implements vscode.Disposable {
       }
     }
     if (this.callGraph.isRustNativeIndexOnly() && directions.has('outgoing') && wantsReferenceBackedEdges && edges.length < maxEdges) {
-      const outgoingRefs = await this.callGraph.findOutgoingUsagesResolved(root.id, Math.max(1, maxEdges - edges.length));
+      const outgoingRefs = await this.callGraph.refineUsageReferencesWithCurrentSources(
+        await this.callGraph.findOutgoingUsagesResolved(root.id, Math.max(1, maxEdges - edges.length)),
+      );
       for (const reference of outgoingRefs) {
         if (token?.isCancellationRequested) {
           return this.errorEnvelope('cancelled', 'graph_neighbors cancelled during outgoing usage expansion.', true);
         }
         const edgeKind = edgeKindForReference(reference);
         if (!edgeKinds.has(edgeKind)) { continue; }
+        const confidenceBucket = callGraphUsageConfidenceBucket(reference);
+        if (!mcpConfidenceBucketAllowed(confidenceBucket, confidenceFilter)) { continue; }
         let toId = reference.symbolId;
         if (!nodes.has(toId)) {
           const target = await this.resolveSymbolByIdOrExternal(reference.symbolId);
@@ -2371,8 +2427,11 @@ export class CallGraphMcpServer implements vscode.Disposable {
           from: root.id,
           to: toId,
           edge_kind: edgeKind,
-          confidence: 'static-probable',
-          source: 'rust-native-outgoing-reference',
+          confidence: mcpConfidenceForBucket(confidenceBucket),
+          confidence_bucket: confidenceBucket,
+          priority: mcpPriorityForBucket(confidenceBucket),
+          source: reference.provenance ?? 'rust-native-outgoing-reference',
+          evidence: referenceEvidenceForMcp(reference),
           location: rangeFor(reference.range, reference.relPath),
         });
         usedReferenceFallback = true;
@@ -2391,7 +2450,15 @@ export class CallGraphMcpServer implements vscode.Disposable {
         construct_edges: edges.filter((edge) => edge.edge_kind === 'construct').length,
         implements_edges: edges.filter((edge) => edge.edge_kind === 'implements').length,
         overrides_edges: edges.filter((edge) => edge.edge_kind === 'overrides').length,
+        by_confidence_bucket: countBy(edges, (edge) => String(edge.confidence_bucket ?? 'ambiguous')),
       },
+      usage_contract: {
+        default_mode: 'recall',
+        confidence_filter: confidenceFilter,
+        returned_count: edges.length,
+        semantics: 'Graph edges preserve recall by default. Use confidence_bucket/priority/evidence to distinguish resolved semantic edges from ambiguous/textual candidates.',
+      },
+      recommended_use: recommendedUseForConfidenceCounts(countReferenceConfidenceBuckets(edges), includeProviderEdges),
       truncated,
       resource_links: [
         resourceLink(`codeidx://graph/${externalSymbolId(root, this.workspaceId())}?depth=${Math.min(3, depth + 1)}`, 'Expand graph', 'Graph expansion link', 'application/json'),
@@ -3284,7 +3351,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     options: { preferEnclosing?: boolean } = {},
   ): Promise<CallGraphSymbol | undefined> {
     const symbol = await this.resolveSymbolArg(args);
-    if (symbol) { return symbol; }
+    if (symbol) { return this.canonicalizeResolvedSymbol(symbol); }
     const file = readOptionalStringArg(args, 'file');
     const line = typeof args.line === 'number' ? args.line : undefined;
     const character = typeof args.character_utf16 === 'number' ? args.character_utf16 : undefined;
@@ -3293,34 +3360,47 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const position = new vscode.Position(Math.max(0, Math.floor(line) - 1), Math.max(0, Math.floor(character)));
     if (options.preferEnclosing) {
       const enclosing = await this.resolveEnclosingSymbolAtPosition(normalized, position);
-      if (enclosing) { return enclosing; }
+      if (enclosing) { return this.canonicalizeResolvedSymbol(enclosing); }
     }
-    return (await this.callGraph.findTargetsAtPositionResolved(normalized.uri, position))[0];
+    const target = (await this.callGraph.findTargetsAtPositionResolved(normalized.uri, position))[0];
+    return target ? this.canonicalizeResolvedSymbol(target) : undefined;
   }
 
   private async resolveSymbolByIdOrExternal(id: string): Promise<CallGraphSymbol | undefined> {
     const snapshot = await this.callGraph.ensureBuilt();
     const normalized = id.startsWith('codeidx://symbol/') ? parseResourcePath(id, 'symbol') ?? id : id;
     const cached = this.recentSymbols.get(normalized);
-    if (cached) { return cached; }
+    if (cached) { return this.canonicalizeResolvedSymbol(cached); }
     const snapshotMatch = snapshot.symbols.find((symbol) =>
       symbol.id === normalized ||
       externalSymbolId(symbol, this.workspaceId()) === normalized ||
       symbolUriFor(symbol, this.workspaceId()) === normalized);
-    if (snapshotMatch) { return snapshotMatch; }
+    if (snapshotMatch) { return this.canonicalizeResolvedSymbol(snapshotMatch); }
     const parsed = parseInternalSymbolId(normalized);
     if (parsed) {
       const revived = await this.resolveCurrentSymbolForParsedInternalId(parsed, snapshot);
       if (revived) {
         this.recentSymbols.set(normalized, revived);
-        return revived;
+        return this.canonicalizeResolvedSymbol(revived);
       }
     }
     const resolved = await this.callGraph.resolveSymbolsResolved(normalized, 1);
-    return resolved.find((symbol) =>
+    const match = resolved.find((symbol) =>
       symbol.id === normalized ||
       externalSymbolId(symbol, this.workspaceId()) === normalized ||
       symbolUriFor(symbol, this.workspaceId()) === normalized) ?? resolved[0];
+    return match ? this.canonicalizeResolvedSymbol(match) : undefined;
+  }
+
+  private async canonicalizeResolvedSymbol(symbol: CallGraphSymbol): Promise<CallGraphSymbol> {
+    if (!this.callGraph.isRustNativeIndexOnly()) { return symbol; }
+    if (isRustNativeCanonicalSymbolId(symbol.id)) { return symbol; }
+    const candidates = await this.callGraph.resolveSymbolsResolved(symbol.qualifiedName || symbol.name, 50);
+    const canonical = chooseCanonicalSymbol(symbol, candidates) ?? symbol;
+    this.recentSymbols.set(canonical.id, canonical);
+    this.recentSymbols.set(externalSymbolId(canonical, this.workspaceId()), canonical);
+    this.recentSymbols.set(symbolUriFor(canonical, this.workspaceId()), canonical);
+    return canonical;
   }
 
   private async resolveCurrentSymbolForParsedInternalId(
@@ -3368,35 +3448,47 @@ export class CallGraphMcpServer implements vscode.Disposable {
   }
 
   private referenceItem(reference: CallGraphReference, edgeKind: string): Record<string, unknown> {
+    const confidenceBucket = callGraphUsageConfidenceBucket(reference);
     return {
       edge_id: `ref_${stableHash(reference.symbolId + ':' + reference.uri + ':' + reference.range.startLine + ':' + reference.range.startColumn).slice(0, 16)}`,
       edge_kind: edgeKind,
       location: rangeFor(reference.range, reference.relPath),
       enclosing_symbol: reference.enclosingSymbolId ? { symbol_id: reference.enclosingSymbolId } : null,
-      confidence: 'static-probable',
-      source: 'semantic',
+      confidence: mcpConfidenceForBucket(confidenceBucket),
+      confidence_bucket: confidenceBucket,
+      priority: mcpPriorityForBucket(confidenceBucket),
+      source: reference.provenance ?? 'semantic',
+      evidence: referenceEvidenceForMcp(reference),
       raw_text: reference.rawText,
     };
   }
 
   private callEdgeReferenceItem(edge: CallGraphEdge): Record<string, unknown> {
+    const confidenceBucket = confidenceBucketForEdge(edge);
     return {
       edge_id: edge.id,
       edge_kind: edgeKindForCallEdge(edge),
       location: rangeFor(edge.callsite.range, edge.callsite.relPath),
       enclosing_symbol: { symbol_id: edge.callerId },
-      confidence: confidenceForEdge(edge),
+      confidence: mcpConfidenceForBucket(confidenceBucket),
+      confidence_bucket: confidenceBucket,
+      priority: mcpPriorityForBucket(confidenceBucket),
       source: edge.source,
+      evidence: edgeEvidenceForMcp(edge),
       raw_text: edge.callsite.rawText,
     };
   }
 
   private edgeRef(edge: CallGraphEdge): Record<string, unknown> {
+    const confidenceBucket = confidenceBucketForEdge(edge);
     return {
       edge_id: edge.id,
       edge_kind: edgeKindForCallEdge(edge),
-      confidence: confidenceForEdge(edge),
+      confidence: mcpConfidenceForBucket(confidenceBucket),
+      confidence_bucket: confidenceBucket,
+      priority: mcpPriorityForBucket(confidenceBucket),
       source: edge.source,
+      evidence: edgeEvidenceForMcp(edge),
       location: rangeFor(edge.callsite.range, edge.callsite.relPath),
     };
   }
@@ -4341,6 +4433,12 @@ function toolDefinitions(): ToolDefinition[] {
         scope_preset: { type: 'string', enum: MCP_SCOPE_PRESETS, default: 'source' },
         include_definitions: { type: 'boolean', default: false },
         include_provider_edges: { type: 'boolean', default: false },
+        confidence_filter: {
+          type: 'string',
+          enum: ['all', 'resolved', 'ambiguous', 'textual'],
+          default: 'all',
+          description: 'all preserves recall; resolved returns only high-confidence semantic references for refactor/delete review.',
+        },
         include_snippets: { type: 'boolean', default: false },
         context_lines: { type: 'integer', minimum: 0, maximum: 10, default: 2 },
         limit: { type: 'integer', minimum: 1, maximum: 500, default: 100 },
@@ -4381,6 +4479,12 @@ function toolDefinitions(): ToolDefinition[] {
         max_nodes: { type: 'integer', minimum: 1, maximum: 300, default: 80 },
         max_edges: { type: 'integer', minimum: 1, maximum: 1000, default: 200 },
         include_provider_edges: { type: 'boolean', default: false },
+        confidence_filter: {
+          type: 'string',
+          enum: ['all', 'resolved', 'ambiguous', 'textual'],
+          default: 'all',
+          description: 'all preserves recall; resolved returns only high-confidence semantic graph edges.',
+        },
         include_snippets: { type: 'boolean', default: false },
         max_chars: { type: 'integer', minimum: 1000, maximum: 200000, default: DEFAULT_MCP_MAX_CHARS },
       }, ['symbol_id']),
@@ -4729,6 +4833,45 @@ function externalSymbolId(symbol: CallGraphSymbol, workspaceId: string): string 
     symbol.relPath,
   ].join('\0');
   return `esy_${stableHash(fingerprint).slice(0, 32)}`;
+}
+
+function chooseCanonicalSymbol(
+  requested: CallGraphSymbol,
+  candidates: readonly CallGraphSymbol[],
+): CallGraphSymbol | undefined {
+  let best: { symbol: CallGraphSymbol; score: number } | undefined;
+  for (const candidate of candidates) {
+    if (candidate.id !== requested.id && candidate.relPath !== requested.relPath && candidate.uri !== requested.uri) {
+      continue;
+    }
+    const score = canonicalSymbolScore(requested, candidate);
+    if (score <= 0) { continue; }
+    if (!best || score > best.score || (score === best.score && candidate.id.localeCompare(best.symbol.id) < 0)) {
+      best = { symbol: candidate, score };
+    }
+  }
+  return best?.score && best.score >= 500 ? best.symbol : undefined;
+}
+
+function isRustNativeCanonicalSymbolId(value: string): boolean {
+  return /^sym:[0-9a-f]{16}$/i.test(value);
+}
+
+function canonicalSymbolScore(requested: CallGraphSymbol, candidate: CallGraphSymbol): number {
+  let score = 0;
+  if (candidate.id === requested.id) { score += 1_000; }
+  if (candidate.relPath === requested.relPath) { score += 300; }
+  if (candidate.uri === requested.uri) { score += 200; }
+  if (candidate.qualifiedName === requested.qualifiedName) { score += 260; }
+  if (candidate.name === requested.name) { score += 120; }
+  if (candidate.language === requested.language) { score += 80; }
+  if (candidate.kind === requested.kind) { score += 40; }
+  if (candidate.containerName && candidate.containerName === requested.containerName) { score += 30; }
+  if (candidate.range.startLine === requested.range.startLine) { score += 30; }
+  if (candidate.range.startColumn === requested.range.startColumn) { score += 20; }
+  const lineDistance = Math.abs(candidate.range.startLine - requested.range.startLine);
+  if (lineDistance > 0 && lineDistance <= 2) { score += 10 - lineDistance; }
+  return score;
 }
 
 function symbolUriFor(symbol: CallGraphSymbol, workspaceId: string): string {
@@ -5208,6 +5351,60 @@ function countBy(items: Record<string, unknown>[], keyFn: (item: Record<string, 
   return out;
 }
 
+function dedupeMcpReferenceItemsBySourceSpan(items: readonly Record<string, unknown>[]): Record<string, unknown>[] {
+  const byLocation = new Map<string, number>();
+  const out: Record<string, unknown>[] = [];
+  for (const item of items) {
+    const key = mcpReferenceSourceSpanKey(item);
+    const existingIndex = byLocation.get(key);
+    if (existingIndex === undefined) {
+      byLocation.set(key, out.length);
+      out.push(item);
+      continue;
+    }
+    if (mcpReferenceItemPreferenceScore(item) > mcpReferenceItemPreferenceScore(out[existingIndex])) {
+      out[existingIndex] = item;
+    }
+  }
+  return out;
+}
+
+function mcpReferenceSourceSpanKey(item: Record<string, unknown>): string {
+  const loc = isObject(item.location) ? item.location as Record<string, unknown> : {};
+  return [
+    loc.file ?? '',
+    loc.start_line ?? '',
+    loc.start_character_utf16 ?? '',
+  ].join(':');
+}
+
+function mcpReferenceItemPreferenceScore(item: Record<string, unknown>): number {
+  const bucket = normalizeMcpConfidenceBucket(item.confidence_bucket);
+  const edgeKind = String(item.edge_kind ?? '').toLowerCase();
+  const edgeKindRank = edgeKind === 'definition' || edgeKind === 'import'
+    ? 5
+    : edgeKind === 'call' || edgeKind === 'construct'
+      ? 4
+      : edgeKind === 'usage'
+        ? 2
+        : 1;
+  return (3 - mcpPriorityForBucket(bucket)) * 1_000 + edgeKindRank;
+}
+
+function countReferenceConfidenceBuckets(items: readonly Record<string, unknown>[]): Record<CallGraphUsageConfidence | 'total', number> {
+  const out: Record<CallGraphUsageConfidence | 'total', number> = {
+    total: items.length,
+    resolved: 0,
+    ambiguous: 0,
+    textual: 0,
+  };
+  for (const item of items) {
+    const bucket = normalizeMcpConfidenceBucket(item.confidence_bucket);
+    out[bucket] += 1;
+  }
+  return out;
+}
+
 function graphNode(symbol: CallGraphSymbol): Record<string, unknown> {
   return {
     id: symbol.id,
@@ -5246,18 +5443,78 @@ function edgeKindForCallEdge(edge: CallGraphEdge): 'call' | 'construct' {
   return edge.callKind === 'constructor' ? 'construct' : 'call';
 }
 
-function confidenceForEdge(edge: CallGraphEdge): string {
-  switch (edge.confidence) {
-    case 'exact':
-    case 'resolved':
-      return 'static-certain';
-    case 'possible':
-      return 'static-probable';
-    case 'unresolved':
-      return 'unresolved-dynamic';
-    default:
-      return 'static-probable';
+function confidenceBucketForEdge(edge: CallGraphEdge): CallGraphUsageConfidence {
+  return callGraphUsageConfidenceBucket({
+    confidence: edge.confidence,
+    provenance: edge.source,
+    edgeKind: edge.callKind,
+    evidence: edge.evidence,
+  });
+}
+
+function normalizeMcpConfidenceBucket(value: unknown): CallGraphUsageConfidence {
+  return value === 'resolved' || value === 'textual' || value === 'ambiguous'
+    ? value
+    : 'ambiguous';
+}
+
+function mcpConfidenceBucketAllowed(bucket: CallGraphUsageConfidence, filter: string): boolean {
+  return filter === 'all' || bucket === filter;
+}
+
+function mcpConfidenceForBucket(bucket: CallGraphUsageConfidence): string {
+  switch (bucket) {
+    case 'resolved': return 'static-certain';
+    case 'textual': return 'textual-candidate';
+    case 'ambiguous': return 'static-probable';
   }
+}
+
+function mcpPriorityForBucket(bucket: CallGraphUsageConfidence): number {
+  switch (bucket) {
+    case 'resolved': return 0;
+    case 'ambiguous': return 1;
+    case 'textual': return 2;
+  }
+}
+
+function referenceEvidenceForMcp(reference: CallGraphReference): Record<string, unknown> {
+  return {
+    raw_confidence: reference.confidence ?? null,
+    provenance: reference.provenance ?? null,
+    edge_kind: reference.edgeKind ?? null,
+    bound_mask: typeof reference.boundMask === 'number' ? reference.boundMask : null,
+    evidence: reference.evidence ?? [],
+  };
+}
+
+function edgeEvidenceForMcp(edge: CallGraphEdge): Record<string, unknown> {
+  return {
+    raw_confidence: edge.confidence,
+    source: edge.source,
+    call_kind: edge.callKind,
+    receiver: edge.receiver ?? null,
+    evidence: edge.evidence,
+  };
+}
+
+function recommendedUseForConfidenceCounts(
+  counts: Record<CallGraphUsageConfidence | 'total', number>,
+  includeProviderEdges: boolean,
+): Record<string, unknown> {
+  const uncertain = (counts.ambiguous ?? 0) + (counts.textual ?? 0);
+  const highPrecisionOnly = uncertain === 0 && !includeProviderEdges;
+  return {
+    safe_for_navigation: true,
+    safe_for_refactor: highPrecisionOnly,
+    safe_for_delete: highPrecisionOnly,
+    safe_for_impact_analysis: highPrecisionOnly,
+    requires_text_crosscheck: uncertain > 0 || includeProviderEdges,
+    default_agent_priority: ['resolved', 'ambiguous', 'textual'],
+    note: highPrecisionOnly
+      ? 'All returned rows are resolved semantic edges under the requested scope.'
+      : 'Use resolved rows first. Treat ambiguous/textual rows as recall-preserving candidates and cross-check before refactor/delete decisions.',
+  };
 }
 
 function stableHash(value: string): string {

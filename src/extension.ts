@@ -4,7 +4,10 @@ import type { FileMatch, MatchRange, SearchEngine, SearchForTestsResult } from '
 import {
   CallGraphService,
   CallGraphRebuildCancelledError,
+  callGraphUsageConfidenceBucket,
+  dedupeCallGraphUsageReferences,
   formatQueryResults,
+  summarizeCallGraphUsageConfidence,
   type CallGraphEdge,
   type CallGraphQueryResult,
   type CallGraphRange,
@@ -12,6 +15,8 @@ import {
   type CallGraphRebuildProgress,
   type CallGraphSymbol,
   type CallGraphSymbolRelationSummary,
+  type CallGraphUsageConfidence,
+  type CallGraphUsageConfidenceCounts,
 } from './callGraph';
 import { CallGraphMcpServer } from './mcpServer';
 
@@ -488,13 +493,13 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       await runDedupedCallGraphSymbolCommand('showUsagesForSymbol', symbolId, () =>
         showCallGraphUsageResult(overlay, callGraph, callGraphLog, symbolId, label, undefined, undefined, expectedUsageCount));
     }),
-    // Re-render the most recent Find Usages result with the low-confidence (추정)
-    // envelope shown. This is also what the default view does unless the user
-    // explicitly configures estimated usages to be folded.
+    // Re-render the most recent Find Usages result with the low-confidence
+    // candidate envelope shown. This is also what the default view does unless
+    // the user explicitly configures candidate usages to be folded.
     vscode.commands.registerCommand('intellijStyledSearch.showEstimatedUsages', async () => {
       if (!lastUsageQuery?.query) {
         vscode.window.showInformationMessage(
-          'Run Find Usages on a symbol first, then use this to expand its estimated (low-confidence) usages.',
+          'Run Find Usages on a symbol first, then use this to expand its candidate usages.',
         );
         return;
       }
@@ -511,7 +516,7 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
         lastUsageQuery.expectedUsageCount,
       );
     }),
-    // Toggle target of the in-panel "Estimated" button (sent over the renderer
+    // Toggle target of the in-panel candidate button (sent over the renderer
     // bridge). Flips the expanded state and re-renders the last Find Usages.
     vscode.commands.registerCommand('intellijStyledSearch.toggleEstimatedUsages', async () => {
       if (!lastUsageQuery?.query) { return; }
@@ -1286,7 +1291,8 @@ async function showCallGraphResultsPanel(
     vscode.window.showInformationMessage(`No ${direction} found for ${targetLabel}.`);
     return;
   }
-  await overlay.showStaticResults(`${title}: ${targetLabel}`, matches);
+  const breakdown = formatUsageConfidenceBreakdown(summarizeFileMatchUsageConfidence(matches));
+  await overlay.showStaticResults(`${title}: ${targetLabel}${breakdown ? ` · ${breakdown}` : ''}`, matches);
 }
 
 async function showCallGraphImplementationResult(
@@ -1352,11 +1358,69 @@ function formatOptionalCount(value: unknown): string {
   return String(normalizeExpectedUsageCount(value) ?? 'unknown');
 }
 
+function usageConfidenceLabel(bucket: CallGraphUsageConfidence): string {
+  switch (bucket) {
+    case 'resolved': return 'Resolved';
+    case 'ambiguous': return 'Ambiguous';
+    case 'textual': return 'Textual';
+  }
+}
+
+function formatUsageConfidenceBreakdown(counts: CallGraphUsageConfidenceCounts): string {
+  if (counts.total <= 0) { return ''; }
+  return `${counts.resolved} resolved, ${counts.ambiguous} ambiguous, ${counts.textual} textual`;
+}
+
+function usageConfidenceDetailForReference(reference: CallGraphReference): string {
+  const parts = [
+    reference.confidence ? `confidence=${reference.confidence}` : '',
+    reference.provenance ? `source=${reference.provenance}` : '',
+    reference.edgeKind ? `edge=${reference.edgeKind}` : '',
+    ...(reference.evidence ?? []),
+  ].filter(Boolean);
+  return parts.join('; ');
+}
+
+function summarizeFileMatchUsageConfidence(matches: FileMatch[]): CallGraphUsageConfidenceCounts {
+  const counts: CallGraphUsageConfidenceCounts = {
+    total: 0,
+    resolved: 0,
+    ambiguous: 0,
+    textual: 0,
+  };
+  for (const fileMatch of matches) {
+    for (const match of fileMatch.matches) {
+      counts.total += 1;
+      const bucket = match.usageConfidence === 'resolved' || match.usageConfidence === 'textual'
+        ? match.usageConfidence
+        : 'ambiguous';
+      counts[bucket] += 1;
+    }
+  }
+  return counts;
+}
+
+function tagFileMatchesWithUsageConfidence(
+  matches: FileMatch[],
+  bucket: CallGraphUsageConfidence,
+  detail: string,
+): FileMatch[] {
+  return matches.map((fileMatch) => ({
+    ...fileMatch,
+    matches: fileMatch.matches.map((match) => ({
+      ...match,
+      usageConfidence: bucket,
+      usageConfidenceLabel: usageConfidenceLabel(bucket),
+      usageConfidenceDetail: detail,
+    })),
+  }));
+}
+
 // A "confirmed" usage is one the resolver bound with high confidence (an exact
 // import/definition match). "possible"/"unresolved" references are heuristic
 // (e.g. unique-name) and are the entire source of the inlay-vs-panel gap.
 function isConfirmedUsage(reference: CallGraphReference): boolean {
-  return reference.confidence === 'exact' || reference.confidence === 'resolved';
+  return callGraphUsageConfidenceBucket(reference) === 'resolved';
 }
 
 // Remembers the most recent Find Usages query so the "Show Estimated Usages"
@@ -1406,21 +1470,28 @@ async function showCallGraphUsageResult(
       const explicitSymbolId = explicitSymbol?.id ?? explicitQuery;
       if (explicitSymbol || isCallGraphSymbolId(explicitSymbolId)) {
         let resolvedExplicitSymbol = explicitSymbol;
+        if (!resolvedExplicitSymbol && isCallGraphSymbolId(explicitSymbolId)) {
+          const needUsageCount = normalizedExpectedUsageCount === undefined;
+          resolvedExplicitSymbol = (await callGraph.resolveSymbolsResolved(explicitSymbolId, 1, {
+            includeImplementationCounts: false,
+            includeUsageCounts: needUsageCount,
+          }))[0];
+        }
         if (normalizedExpectedUsageCount === undefined) {
-          resolvedExplicitSymbol = explicitSymbol ?? (await callGraph.resolveSymbolsResolved(explicitSymbolId, 1))[0];
           normalizedExpectedUsageCount = normalizeExpectedUsageCount(resolvedExplicitSymbol?.usageCount);
           limit = getEffectiveCallGraphUsageLimit(normalizedExpectedUsageCount);
-          lastUsageQuery = {
-            query: explicitQuery,
-            label: explicitLabel,
-            symbol: resolvedExplicitSymbol,
-            expectedUsageCount: normalizedExpectedUsageCount,
-          };
         }
+        lastUsageQuery = {
+          query: explicitQuery,
+          label: explicitLabel,
+          symbol: resolvedExplicitSymbol,
+          expectedUsageCount: normalizedExpectedUsageCount,
+        };
         const cachedUsages = await callGraph.findUsagesForSymbolIdFromCache(explicitSymbolId, limit);
         if (cachedUsages) {
           await showCallGraphUsageMatches(
             overlay,
+            callGraph,
             callGraphLog,
             title,
             explicitQuery,
@@ -1459,6 +1530,7 @@ async function showCallGraphUsageResult(
       : callGraph.findUsages(query, limit);
     await showCallGraphUsageMatches(
       overlay,
+      callGraph,
       callGraphLog,
       title,
       query,
@@ -1478,6 +1550,7 @@ async function showCallGraphUsageResult(
 
 async function showCallGraphUsageMatches(
   overlay: OverlayPanel,
+  callGraph: CallGraphService,
   callGraphLog: vscode.OutputChannel,
   title: string,
   query: string,
@@ -1490,22 +1563,27 @@ async function showCallGraphUsageMatches(
   forceIncludeLowConfidence?: boolean,
 ): Promise<void> {
   let sourceLabel = initialSourceLabel;
+  const targetLabel = targetLabelOverride ?? targetSymbol?.qualifiedName ?? query;
+  const normalizedUsages = dedupeCallGraphUsageReferences(await callGraph.refineUsageReferencesWithCurrentSources(usages, {
+    ...(targetSymbol ? { targetSymbols: [targetSymbol] } : {}),
+    targetLabel,
+  }));
   // Split confirmed vs low-confidence usages. By default we show both so the
   // panel can match the inline "N usages" envelope; users can opt into folding
   // estimated rows out of the primary result set.
   const includeLowConfidence =
     forceIncludeLowConfidence ?? getConfiguredCallGraphIncludeLowConfidenceUsages();
-  const confirmedUsages = usages.filter(isConfirmedUsage);
-  const lowConfidenceCount = usages.length - confirmedUsages.length;
+  const usageConfidenceCounts = summarizeCallGraphUsageConfidence(normalizedUsages);
+  const confirmedUsages = normalizedUsages.filter(isConfirmedUsage);
+  const lowConfidenceCount = usageConfidenceCounts.ambiguous + usageConfidenceCounts.textual;
   const showFolded = includeLowConfidence || confirmedUsages.length === 0;
-  const displayUsages = showFolded ? usages : confirmedUsages;
+  const displayUsages = showFolded ? normalizedUsages : confirmedUsages;
   let matches = await buildCallGraphUsageFileMatches(displayUsages);
   const graphMatchCount = countFileMatchMatches(matches);
   // Gate the text fallback on the FULL graph count, not the (possibly folded)
   // displayed count — otherwise folding a noisy symbol down to a few confirmed
   // rows would wrongly trigger a workspace-wide text search and re-flood it.
-  const graphTotalCount = usages.length;
-  const targetLabel = targetLabelOverride ?? targetSymbol?.qualifiedName ?? query;
+  const graphTotalCount = normalizedUsages.length;
   callGraphLog.appendLine(
     `find usages source: ${initialSourceLabel} query=${JSON.stringify(targetLabel)} ` +
     `matches=${graphMatchCount} confirmed=${confirmedUsages.length} lowConfidence=${lowConfidenceCount} ` +
@@ -1520,7 +1598,12 @@ async function showCallGraphUsageMatches(
         ? searched.result.effectiveEngine
         : `${searched.result.requestedEngine}->${searched.result.effectiveEngine}`;
       sourceLabel = graphMatchCount > 0 ? `${sourceLabel}+${searchLabel}` : searchLabel;
-      matches = graphMatchCount > 0 ? mergeFileMatches(matches, searchMatches) : searchMatches;
+      const taggedSearchMatches = tagFileMatchesWithUsageConfidence(
+        searchMatches,
+        'textual',
+        `text fallback via ${searchLabel}`,
+      );
+      matches = graphMatchCount > 0 ? mergeFileMatches(matches, taggedSearchMatches) : taggedSearchMatches;
     }
     callGraphLog.appendLine(
       `find usages text fallback: query=${JSON.stringify(targetSymbol.name)} requested=${searched.result.requestedEngine} ` +
@@ -1535,14 +1618,18 @@ async function showCallGraphUsageMatches(
     vscode.window.showInformationMessage('No usages found for the selected call graph symbol.');
     return;
   }
-  const statusSuffix =
+  const displayedConfidenceCounts = summarizeFileMatchUsageConfidence(matches);
+  const breakdown = formatUsageConfidenceBreakdown(displayedConfidenceCounts);
+  const statusSuffix = [
+    breakdown ? ` · ${breakdown}` : '',
     !showFolded && lowConfidenceCount > 0
-      ? ` · ${lowConfidenceCount} estimated hidden`
+      ? ` · ${lowConfidenceCount} candidates hidden`
       : showFolded && lowConfidenceCount > 0
-        ? ` · ${lowConfidenceCount} estimated shown`
-        : '';
+        ? ` · ${lowConfidenceCount} candidates shown`
+        : '',
+  ].join('');
   await overlay.showStaticResults(`${title} [${sourceLabel}]: ${targetLabel}${statusSuffix}`, matches);
-  // Drive the in-panel "Estimated" toggle button: visible only when there is a
+  // Drive the in-panel candidate toggle button: visible only when there is a
   // low-confidence envelope to reveal; pressed when it is currently shown.
   overlay.setEstimatedToggleState({ visible: lowConfidenceCount > 0, pressed: showFolded });
 }
@@ -1710,16 +1797,25 @@ export async function buildCallGraphEdgeFileMatches(
     relPath: edge.callsite.relPath,
     range: edge.callsite.range,
     fallbackPreview: edge.callsite.rawText,
+    usageConfidence: callGraphUsageConfidenceBucket({
+      confidence: edge.confidence,
+      provenance: edge.source,
+      edgeKind: edge.callKind,
+      evidence: edge.evidence,
+    }),
+    usageConfidenceDetail: edge.evidence.join('; '),
   })));
   return buildCallGraphLocationFileMatches(locations);
 }
 
 export async function buildCallGraphUsageFileMatches(references: CallGraphReference[]): Promise<FileMatch[]> {
-  return buildCallGraphLocationFileMatches(references.map((reference) => ({
+  return buildCallGraphLocationFileMatches(dedupeCallGraphUsageReferences(references).map((reference) => ({
     uri: reference.uri,
     relPath: reference.relPath,
     range: reference.range,
     fallbackPreview: reference.rawText,
+    usageConfidence: callGraphUsageConfidenceBucket(reference),
+    usageConfidenceDetail: usageConfidenceDetailForReference(reference),
   })));
 }
 
@@ -1737,12 +1833,16 @@ async function buildCallGraphLocationFileMatches(locations: Array<{
   relPath: string;
   range: CallGraphRange;
   fallbackPreview: string;
-}>): Promise<FileMatch[]> {
+  usageConfidence?: CallGraphUsageConfidence;
+  usageConfidenceDetail?: string;
+}>, options: { dedupeLocations?: boolean } = {}): Promise<FileMatch[]> {
   const seenLocations = new Set<string>();
   const byUri = new Map<string, Array<{
     relPath: string;
     range: CallGraphRange;
     fallbackPreview: string;
+    usageConfidence?: CallGraphUsageConfidence;
+    usageConfidenceDetail?: string;
   }>>();
   for (const location of locations) {
     const locationKey = [
@@ -1750,13 +1850,17 @@ async function buildCallGraphLocationFileMatches(locations: Array<{
       location.range.startLine,
       location.range.startColumn,
     ].join(':');
-    if (seenLocations.has(locationKey)) { continue; }
-    seenLocations.add(locationKey);
+    if (options.dedupeLocations !== false) {
+      if (seenLocations.has(locationKey)) { continue; }
+      seenLocations.add(locationKey);
+    }
     const existing = byUri.get(location.uri);
     const entry = {
       relPath: location.relPath,
       range: location.range,
       fallbackPreview: location.fallbackPreview,
+      usageConfidence: location.usageConfidence,
+      usageConfidenceDetail: location.usageConfidenceDetail,
     };
     if (existing) {
       existing.push(entry);
@@ -1782,6 +1886,9 @@ async function buildCallGraphLocationFileMatches(locations: Array<{
           line: entry.range.startLine,
           preview,
           ranges: [toMatchRange(entry.range, preview)],
+          usageConfidence: entry.usageConfidence,
+          usageConfidenceLabel: entry.usageConfidence ? usageConfidenceLabel(entry.usageConfidence) : undefined,
+          usageConfidenceDetail: entry.usageConfidenceDetail,
         };
       });
     out.push({ uri: uriString, relPath, matches });
@@ -2106,10 +2213,13 @@ function buildCallGraphInlayHint(
     ));
   }
   if (summary.usageCount > 0) {
+    const usageCounts = summarizeCallGraphUsageConfidence(summary.usages ?? []);
     appendInlaySeparator(parts);
     parts.push(makeInlayCommandPart(
       `usages ${summary.usageCount}`,
-      '',
+      usageCounts.total > 0
+        ? `${summary.usageCount} usages: ${formatUsageConfidenceBreakdown(usageCounts)}`
+        : '',
       'intellijStyledSearch.showUsagesForSymbol',
       summary.symbol.id,
       summary.symbol.qualifiedName,

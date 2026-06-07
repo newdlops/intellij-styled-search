@@ -765,9 +765,16 @@ suite('Call graph', () => {
         commandParts.every((entry) => !entry.part.tooltip && !entry.hint.tooltip),
         'expected call graph inlay commands to avoid hover-only tooltip actions',
       );
+      assert.match(
+        String(graphPyUsagePart?.part.command?.title ?? ''),
+        /\d+ usages: \d+ resolved, \d+ ambiguous, \d+ textual/,
+        'expected usage inlay hover to expose confidence breakdown',
+      );
       assert.ok(
-        commandParts.every((entry) => entry.part.command?.title === ''),
-        'expected call graph inlay hover to keep underline affordance without command-title tooltip text',
+        commandParts
+          .filter((entry) => entry.part.command?.command !== 'intellijStyledSearch.showUsagesForSymbol')
+          .every((entry) => entry.part.command?.title === ''),
+        'expected non-usage call graph inlay hover to keep underline affordance without command-title tooltip text',
       );
       await vscode.workspace.getConfiguration('intellijStyledSearch').update(
         'callGraphShowCalleeInlayHints',
@@ -1187,6 +1194,417 @@ suite('Call graph', () => {
       try { await vscode.workspace.fs.delete(consumer); } catch {}
       await restoreBackend();
       await api.callGraph.rebuild();
+    }
+  });
+
+  test('labels usage result confidence without dropping fallback rows', async function () {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected a workspace folder');
+    const file = vscode.Uri.joinPath(folder.uri, 'usage_confidence_fixture.py');
+    await vscode.workspace.fs.writeFile(file, Buffer.from([
+      'class Example:',
+      '    def resolved(self):',
+      '        self.target()',
+      'def unknown(source):',
+      '    source.target()',
+      'def textual(candidate):',
+      '    candidate.target()',
+      '',
+    ].join('\n'), 'utf8'));
+    try {
+      const uri = file.toString();
+      const relPath = 'usage_confidence_fixture.py';
+      const matches = await buildCallGraphUsageFileMatches([
+        {
+          symbolId: 'sym:target',
+          edgeKind: 'method',
+          name: 'target',
+          rawText: 'self.target()',
+          uri,
+          relPath,
+          range: { startLine: 2, startColumn: 13, endLine: 2, endColumn: 19 },
+          confidence: 'exact',
+          provenance: 'semantic',
+          evidence: ['receiver self resolved to enclosing class Example'],
+        },
+        {
+          symbolId: 'sym:target',
+          edgeKind: 'method',
+          name: 'target',
+          rawText: 'source.target()',
+          uri,
+          relPath,
+          range: { startLine: 4, startColumn: 11, endLine: 4, endColumn: 17 },
+          confidence: 'resolved',
+          provenance: 'heuristic',
+          evidence: ['receiver source type is unknown; retained framework method fallback by name'],
+        },
+        {
+          symbolId: 'sym:target',
+          edgeKind: 'usage',
+          name: 'target',
+          rawText: 'candidate.target()',
+          uri,
+          relPath,
+          range: { startLine: 6, startColumn: 14, endLine: 6, endColumn: 20 },
+          confidence: 'possible',
+          provenance: 'zoekt-fallback',
+          evidence: ['text match'],
+        },
+      ]);
+      const rows = matches.flatMap((match) => match.matches);
+      assert.strictEqual(rows.length, 3, 'fallback/textual candidates should stay visible');
+      assert.strictEqual(rows[0].usageConfidence, 'resolved');
+      assert.strictEqual(rows[1].usageConfidence, 'ambiguous');
+      assert.strictEqual(rows[2].usageConfidence, 'textual');
+      assert.strictEqual(rows[1].usageConfidenceLabel, 'Ambiguous');
+      const sameLocationMatches = await buildCallGraphUsageFileMatches([
+        {
+          symbolId: 'sym:target',
+          edgeKind: 'usage',
+          name: 'target',
+          rawText: 'self.target()',
+          uri,
+          relPath,
+          range: { startLine: 2, startColumn: 13, endLine: 2, endColumn: 19 },
+          confidence: 'exact',
+          provenance: 'semantic',
+          evidence: ['canonical reference'],
+        },
+        {
+          symbolId: 'sym:target',
+          edgeKind: 'method',
+          name: 'target',
+          rawText: 'self.target()',
+          uri,
+          relPath,
+          range: { startLine: 2, startColumn: 13, endLine: 2, endColumn: 19 },
+          confidence: 'possible',
+          provenance: 'heuristic',
+          evidence: ['same source location retained as a lower-confidence usage candidate'],
+        },
+      ]);
+      const sameLocationRows = sameLocationMatches.flatMap((match) => match.matches);
+      assert.strictEqual(sameLocationRows.length, 1, 'same source location candidates should collapse to one usage row');
+      assert.strictEqual(sameLocationRows[0].usageConfidence, 'resolved', 'same-location dedupe should keep the strongest confidence');
+    } finally {
+      try { await vscode.workspace.fs.delete(file); } catch {}
+    }
+  });
+
+  test('refines ambiguous usages from deterministic source evidence', async function () {
+    const api = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected a workspace folder');
+    const file = vscode.Uri.joinPath(folder.uri, 'usage_refinement_fixture.py');
+    const lines = [
+      'class LazyRefineTarget:',
+      '    def run(self):',
+      '        return 1',
+      '',
+      'def lazy_refine_caller(target: LazyRefineTarget):',
+      '    return target.run()',
+      '',
+    ];
+    await vscode.workspace.fs.writeFile(file, Buffer.from(lines.join('\n'), 'utf8'));
+    try {
+      await api.callGraph.rebuild(undefined, undefined, { force: true });
+      const target = (await api.callGraph.resolveSymbolsResolved('LazyRefineTarget.run', 10))
+        .find((symbol) => symbol.qualifiedName.endsWith('LazyRefineTarget.run'));
+      assert.ok(target, 'expected fixture target method to be indexed');
+      const startColumn = lines[5].indexOf('run');
+      const ambiguous = {
+        symbolId: target.id,
+        edgeKind: 'method',
+        name: 'run',
+        rawText: 'target.run()',
+        uri: file.toString(),
+        relPath: 'usage_refinement_fixture.py',
+        range: { startLine: 5, startColumn, endLine: 5, endColumn: startColumn + 'run'.length },
+        enclosingSymbolId: undefined,
+        confidence: 'possible',
+        provenance: 'zoekt-fallback',
+        evidence: ['synthetic ambiguous usage candidate'],
+      };
+      const refined = await api.callGraph.refineUsageReferencesWithCurrentSources([ambiguous], {
+        targetSymbols: [target],
+        targetLabel: target.qualifiedName,
+      });
+      assert.strictEqual(refined.length, 1);
+      assert.strictEqual(refined[0].symbolId, target.id);
+      assert.ok(
+        refined[0].confidence === 'exact' || refined[0].confidence === 'resolved',
+        `expected source refinement to upgrade confidence, got ${JSON.stringify(refined[0])}`,
+      );
+      assert.strictEqual(refined[0].provenance, 'source-file-refinement');
+    } finally {
+      try { await vscode.workspace.fs.delete(file); } catch {}
+    }
+  });
+
+  test('refines Django QuerySet chain usages to the matching target model', async function () {
+    const api = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected a workspace folder');
+    const file = vscode.Uri.joinPath(folder.uri, 'usage_refinement_queryset_fixture.py');
+    const lines = [
+      'class FirstQuerySet(QuerySet):',
+      '    def opened(self):',
+      '        return self',
+      '',
+      'class SecondQuerySet(QuerySet):',
+      '    def opened(self):',
+      '        return self',
+      '',
+      'class First:',
+      '    objects = None',
+      '',
+      'class Second:',
+      '    objects = None',
+      '',
+      'def caller():',
+      '    models.First.objects.get_queryset().opened()',
+      '    models.Second.objects.get_queryset().opened()',
+      '',
+    ];
+    await vscode.workspace.fs.writeFile(file, Buffer.from(lines.join('\n'), 'utf8'));
+    try {
+      await api.callGraph.rebuild(undefined, undefined, { force: true });
+      const target = (await api.callGraph.resolveSymbolsResolved('FirstQuerySet.opened', 10))
+        .find((symbol) => symbol.qualifiedName.endsWith('FirstQuerySet.opened'));
+      assert.ok(target, 'expected fixture target method to be indexed');
+      const firstColumn = lines[15].indexOf('opened');
+      const secondColumn = lines[16].indexOf('opened');
+      const refined = await api.callGraph.refineUsageReferencesWithCurrentSources([
+        {
+          symbolId: target.id,
+          edgeKind: 'method',
+          name: 'opened',
+          rawText: 'models.First.objects.get_queryset().opened()',
+          uri: file.toString(),
+          relPath: 'usage_refinement_queryset_fixture.py',
+          range: { startLine: 15, startColumn: firstColumn, endLine: 15, endColumn: firstColumn + 'opened'.length },
+          confidence: 'possible',
+          provenance: 'zoekt-fallback',
+          evidence: ['synthetic ambiguous usage candidate'],
+        },
+        {
+          symbolId: target.id,
+          edgeKind: 'method',
+          name: 'opened',
+          rawText: 'models.Second.objects.get_queryset().opened()',
+          uri: file.toString(),
+          relPath: 'usage_refinement_queryset_fixture.py',
+          range: { startLine: 16, startColumn: secondColumn, endLine: 16, endColumn: secondColumn + 'opened'.length },
+          confidence: 'possible',
+          provenance: 'zoekt-fallback',
+          evidence: ['synthetic ambiguous usage candidate'],
+        },
+      ], {
+        targetSymbols: [target],
+        targetLabel: target.qualifiedName,
+      });
+      const byLine = new Map(refined.map((reference) => [reference.range.startLine, reference]));
+      assert.strictEqual(refined.length, 2);
+      assert.strictEqual(byLine.get(15)?.symbolId, target.id);
+      assert.ok(
+        byLine.get(15)?.confidence === 'exact' || byLine.get(15)?.confidence === 'resolved',
+        `expected matching Django QuerySet chain to upgrade, got ${JSON.stringify(byLine.get(15))}`,
+      );
+      assert.ok(
+        byLine.get(15)?.evidence?.some((entry) =>
+          entry.includes('Django QuerySet chain convention') &&
+          entry.includes('owner type is a Django ORM collection')),
+        `expected matching QuerySet upgrade to include structural evidence, got ${JSON.stringify(byLine.get(15)?.evidence)}`,
+      );
+      assert.strictEqual(byLine.get(16)?.confidence, 'possible');
+      assert.strictEqual(byLine.get(16)?.provenance, 'zoekt-fallback');
+    } finally {
+      try { await vscode.workspace.fs.delete(file); } catch {}
+    }
+  });
+
+  test('does not promote Django QuerySet chain usages by suffix alone', async function () {
+    const api = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected a workspace folder');
+    const file = vscode.Uri.joinPath(folder.uri, 'usage_refinement_queryset_suffix_only_fixture.py');
+    const lines = [
+      'class FirstQuerySet:',
+      '    def opened(self):',
+      '        return self',
+      '',
+      'class First:',
+      '    objects = None',
+      '',
+      'def caller():',
+      '    First.objects.get_queryset().opened()',
+      '',
+    ];
+    await vscode.workspace.fs.writeFile(file, Buffer.from(lines.join('\n'), 'utf8'));
+    try {
+      await api.callGraph.rebuild(undefined, undefined, { force: true });
+      const target = (await api.callGraph.resolveSymbolsResolved('FirstQuerySet.opened', 10))
+        .find((symbol) => symbol.qualifiedName.endsWith('FirstQuerySet.opened'));
+      assert.ok(target, 'expected fixture target method to be indexed');
+      const startColumn = lines[8].indexOf('opened');
+      const refined = await api.callGraph.refineUsageReferencesWithCurrentSources([{
+        symbolId: target.id,
+        edgeKind: 'method',
+        name: 'opened',
+        rawText: 'First.objects.get_queryset().opened()',
+        uri: file.toString(),
+        relPath: 'usage_refinement_queryset_suffix_only_fixture.py',
+        range: { startLine: 8, startColumn, endLine: 8, endColumn: startColumn + 'opened'.length },
+        confidence: 'possible',
+        provenance: 'zoekt-fallback',
+        evidence: ['synthetic ambiguous usage candidate'],
+      }], {
+        targetSymbols: [target],
+        targetLabel: target.qualifiedName,
+      });
+      assert.strictEqual(refined.length, 1);
+      assert.strictEqual(refined[0].confidence, 'possible');
+      assert.strictEqual(refined[0].provenance, 'zoekt-fallback');
+    } finally {
+      try { await vscode.workspace.fs.delete(file); } catch {}
+    }
+  });
+
+  test('promotes ambiguous usages when a definition provider resolves the target', async function () {
+    const api = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected a workspace folder');
+    const targetFile = vscode.Uri.joinPath(folder.uri, 'usage_refinement_provider_targets.py');
+    const callerFile = vscode.Uri.joinPath(folder.uri, 'usage_refinement_provider_caller.py');
+    const targetLines = [
+      'class FirstProviderTarget:',
+      '    def run(self):',
+      '        return 1',
+      '',
+      'class SecondProviderTarget:',
+      '    def run(self):',
+      '        return 2',
+      '',
+    ];
+    const callerLines = [
+      'def caller(source):',
+      '    return source.run()',
+      '',
+    ];
+    let provider: vscode.Disposable | undefined;
+    await vscode.workspace.fs.writeFile(targetFile, Buffer.from(targetLines.join('\n'), 'utf8'));
+    await vscode.workspace.fs.writeFile(callerFile, Buffer.from(callerLines.join('\n'), 'utf8'));
+    try {
+      await api.callGraph.rebuild(undefined, undefined, { force: true });
+      const target = (await api.callGraph.resolveSymbolsResolved('FirstProviderTarget.run', 10))
+        .find((symbol) => symbol.qualifiedName.endsWith('FirstProviderTarget.run'));
+      assert.ok(target, 'expected provider target method to be indexed');
+      const startColumn = callerLines[1].indexOf('run');
+      provider = vscode.languages.registerDefinitionProvider({ scheme: 'file', language: 'python' }, {
+        provideDefinition(document, position) {
+          if (document.uri.toString() !== callerFile.toString() ||
+            position.line !== 1 ||
+            position.character < startColumn ||
+            position.character > startColumn + 'run'.length) {
+            return undefined;
+          }
+          return new vscode.Location(
+            targetFile,
+            new vscode.Range(1, targetLines[1].indexOf('run'), 1, targetLines[1].indexOf('run') + 'run'.length),
+          );
+        },
+      });
+      const refined = await api.callGraph.refineUsageReferencesWithCurrentSources([{
+        symbolId: target.id,
+        edgeKind: 'method',
+        name: 'run',
+        rawText: 'source.run()',
+        uri: callerFile.toString(),
+        relPath: 'usage_refinement_provider_caller.py',
+        range: { startLine: 1, startColumn, endLine: 1, endColumn: startColumn + 'run'.length },
+        confidence: 'possible',
+        provenance: 'zoekt-fallback',
+        evidence: ['synthetic ambiguous usage candidate'],
+      }], {
+        targetSymbols: [target],
+        targetLabel: target.qualifiedName,
+      });
+      assert.strictEqual(refined.length, 1);
+      assert.strictEqual(refined[0].confidence, 'resolved');
+      assert.strictEqual(refined[0].provenance, 'definition-provider');
+      assert.ok(
+        refined[0].evidence?.some((entry) => entry.includes('VS Code definition provider resolved this source occurrence')),
+        `expected definition-provider evidence, got ${JSON.stringify(refined[0].evidence)}`,
+      );
+    } finally {
+      provider?.dispose();
+      try { await vscode.workspace.fs.delete(targetFile); } catch {}
+      try { await vscode.workspace.fs.delete(callerFile); } catch {}
+    }
+  });
+
+  test('definition provider overrides ambiguous Django fallback refinements', async function () {
+    const api = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected a workspace folder');
+    const file = vscode.Uri.joinPath(folder.uri, 'usage_refinement_provider_overrides_fallback.py');
+    const lines = [
+      'class FirstQuerySet(QuerySet):',
+      '    def opened(self):',
+      '        return self',
+      '',
+      'class SecondQuerySet(QuerySet):',
+      '    def opened(self):',
+      '        return self',
+      '',
+      'def caller(source):',
+      '    return source.opened()',
+      '',
+    ];
+    let provider: vscode.Disposable | undefined;
+    await vscode.workspace.fs.writeFile(file, Buffer.from(lines.join('\n'), 'utf8'));
+    try {
+      await api.callGraph.rebuild(undefined, undefined, { force: true });
+      const target = (await api.callGraph.resolveSymbolsResolved('FirstQuerySet.opened', 10))
+        .find((symbol) => symbol.qualifiedName.endsWith('FirstQuerySet.opened'));
+      assert.ok(target, 'expected fallback override target method to be indexed');
+      const startColumn = lines[9].indexOf('opened');
+      provider = vscode.languages.registerDefinitionProvider({ scheme: 'file', language: 'python' }, {
+        provideDefinition(document, position) {
+          if (document.uri.toString() !== file.toString() ||
+            position.line !== 9 ||
+            position.character < startColumn ||
+            position.character > startColumn + 'opened'.length) {
+            return undefined;
+          }
+          return new vscode.Location(
+            file,
+            new vscode.Range(1, lines[1].indexOf('opened'), 1, lines[1].indexOf('opened') + 'opened'.length),
+          );
+        },
+      });
+      const refined = await api.callGraph.refineUsageReferencesWithCurrentSources([{
+        symbolId: target.id,
+        edgeKind: 'method',
+        name: 'opened',
+        rawText: 'source.opened()',
+        uri: file.toString(),
+        relPath: 'usage_refinement_provider_overrides_fallback.py',
+        range: { startLine: 9, startColumn, endLine: 9, endColumn: startColumn + 'opened'.length },
+        confidence: 'possible',
+        provenance: 'zoekt-fallback',
+        evidence: ['synthetic ambiguous usage candidate'],
+      }], {
+        targetSymbols: [target],
+        targetLabel: target.qualifiedName,
+      });
+      assert.strictEqual(refined.length, 1);
+      assert.strictEqual(refined[0].confidence, 'resolved');
+      assert.strictEqual(refined[0].provenance, 'definition-provider');
+    } finally {
+      provider?.dispose();
+      try { await vscode.workspace.fs.delete(file); } catch {}
     }
   });
 
@@ -3195,6 +3613,28 @@ suite('Call graph', () => {
       });
       assert.strictEqual(resolveDefinition.result?.isError, false);
       assert.strictEqual(resolveDefinition.result?.structuredContent?.target_symbol?.symbol_id, quickPickSymbol.symbol_id);
+      assert.strictEqual(
+        resolveDefinition.result?.structuredContent?.target_symbol?.internal_symbol_id,
+        quickPickSymbol.internal_symbol_id,
+        `expected resolve_at at a definition to return the same canonical internal symbol as search_symbols, got ${JSON.stringify(resolveDefinition.result?.structuredContent?.target_symbol)}`,
+      );
+      const referencesFromResolveAtId = await postJson(url, {
+        jsonrpc: '2.0',
+        id: 116,
+        method: 'tools/call',
+        params: {
+          name: 'codeidx_find_references',
+          arguments: {
+            symbol_id: resolveDefinition.result?.structuredContent?.target_symbol?.symbol_id,
+            limit: 20,
+          },
+        },
+      });
+      assert.strictEqual(referencesFromResolveAtId.result?.isError, false);
+      assert.ok(
+        (referencesFromResolveAtId.result?.structuredContent?.counts?.total ?? 0) > 0,
+        `expected a symbol_id returned by resolve_at to be accepted by find_references, got ${JSON.stringify(referencesFromResolveAtId.result?.structuredContent)}`,
+      );
       const resolveCall = await postJson(url, {
         jsonrpc: '2.0',
         id: 18,
