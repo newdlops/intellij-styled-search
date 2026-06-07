@@ -842,15 +842,24 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const includeErrors = readBoolArg(args, 'include_errors', false);
     const maxItems = readIntArg(args, 'max_items', 50, 1, 200);
     const snapshot = await this.callGraph.ensureRestoredSnapshot();
-    const warnings = (snapshot?.warnings ?? []).slice(0, maxItems);
-    const overall = snapshot ? 'usable' : 'index_not_ready';
+    const nativeGraph = await this.callGraph.getRustNativeGraphServingStatus();
+    const warnings = [...(snapshot?.warnings ?? [])];
+    if (nativeGraph.available && !nativeGraph.compatible) {
+      warnings.push(
+        `rust-native graph manifest is not usable: ${nativeGraph.reason ?? 'unknown'} ` +
+        `(version=${nativeGraph.version ?? 'unknown'}, expected=${nativeGraph.expectedVersion})`,
+      );
+    }
+    const overall = snapshot ? 'usable' : nativeGraph.available ? 'index_incompatible' : 'index_not_ready';
     const storage = await this.indexStorageStatus();
     const changedStatus = this.changedWorkspaceStatus(maxItems);
     const runtimeFreshness = this.searchBackend?.collectZoektFreshnessForHealth?.();
     const payload: Record<string, unknown> = {
       ...this.baseEnvelope(snapshot, snapshot
-        ? `Index is usable. Call graph has ${snapshot.stats.symbolCount} symbols and ${snapshot.stats.edgeCount} edges.`
-        : 'Index is not built yet. Prepare it outside MCP, then check readiness here.'),
+        ? `Index is usable. Call graph has ${snapshot.stats.symbolCount} symbols and ${snapshot.stats.referenceCount} references.`
+        : nativeGraph.available
+          ? 'Rust-native graph files exist, but the manifest is not compatible with the current graph engine.'
+          : 'Index is not built yet. Prepare it outside MCP, then check readiness here.'),
       status: {
         overall,
         symbol_index: snapshot ? 'fresh' : 'not_ready',
@@ -858,6 +867,17 @@ export class CallGraphMcpServer implements vscode.Disposable {
         runtime_index: 'unavailable',
         last_full_index_at: snapshot ? new Date(snapshot.builtAtUnixMs).toISOString() : null,
         last_incremental_index_at: null,
+        native_graph: {
+          available: nativeGraph.available,
+          compatible: nativeGraph.compatible,
+          reason: nativeGraph.reason ?? null,
+          version: nativeGraph.version ?? null,
+          expected_version: nativeGraph.expectedVersion,
+          built_at: nativeGraph.builtAtUnixMs ? new Date(nativeGraph.builtAtUnixMs).toISOString() : null,
+          symbols: nativeGraph.symbolCount ?? 0,
+          references: nativeGraph.referenceCount ?? 0,
+          manifest_path: nativeGraph.manifestPath ?? null,
+        },
       },
       counts: {
         documents: snapshot?.stats.fileCount ?? 0,
@@ -880,10 +900,10 @@ export class CallGraphMcpServer implements vscode.Disposable {
         ...(runtimeFreshness ? { runtime: runtimeFreshness } : {}),
       },
       stale_files: [],
-      warnings,
+      warnings: warnings.slice(0, maxItems),
     };
     if (includeErrors) {
-      payload.errors = warnings.map((warning) => ({ severity: 'warning', message: warning }));
+      payload.errors = warnings.slice(0, maxItems).map((warning) => ({ severity: 'warning', message: warning }));
     }
     return payload;
   }
@@ -2819,6 +2839,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     const searchReadiness = this.searchBackend?.getSearchReadinessForHealth
       ? await this.searchBackend.getSearchReadinessForHealth()
       : undefined;
+    const nativeGraph = await this.callGraph.getRustNativeGraphServingStatus();
     const searchEngine = vscode.workspace.getConfiguration('intellijStyledSearch')
       .get<string>('engine', 'zoekt');
     const tools = toolDefinitions();
@@ -2852,9 +2873,15 @@ export class CallGraphMcpServer implements vscode.Disposable {
           indexed_at: snapshot ? new Date(snapshot.builtAtUnixMs).toISOString() : null,
           symbols: snapshot?.stats.symbolCount ?? 0,
           edges: snapshot?.stats.edgeCount ?? 0,
+          references: snapshot?.stats.referenceCount ?? 0,
           search_engine: searchEngine,
           search_index_ready: searchReadiness?.ready ?? null,
           last_engine_error: searchReadiness?.ready === false ? searchReadiness.reason ?? null : null,
+          native_graph_available: nativeGraph.available,
+          native_graph_compatible: nativeGraph.compatible,
+          native_graph_reason: nativeGraph.reason ?? null,
+          native_graph_version: nativeGraph.version ?? null,
+          native_graph_expected_version: nativeGraph.expectedVersion,
         },
       },
       discovery,
@@ -4973,13 +5000,25 @@ function featureConfidence(snapshot: CallGraphSnapshot | undefined): Record<stri
       runtime_edges: 'unavailable',
     };
   }
+  const rustNativeReferenceBacked = isRustNativeReferenceBackedSnapshot(snapshot);
   return {
     symbol_index: 'fresh',
     reference_index: 'fresh',
-    call_graph: snapshot.stats.edgeCount > 0 ? 'fresh' : 'unavailable',
+    call_graph: snapshot.stats.edgeCount > 0
+      ? 'fresh'
+      : rustNativeReferenceBacked && snapshot.stats.referenceCount > 0
+        ? 'partial'
+        : 'unavailable',
     implementation_index: snapshot.stats.symbolCount > 0 ? (snapshot.stats.edgeCount > 0 ? 'fresh' : 'partial') : 'unavailable',
     runtime_edges: 'unavailable',
   };
+}
+
+function isRustNativeReferenceBackedSnapshot(snapshot: CallGraphSnapshot): boolean {
+  return snapshot.symbols.length === 0 &&
+    snapshot.edges.length === 0 &&
+    snapshot.references.length === 0 &&
+    snapshot.warnings.some((warning) => warning.includes('rust-native graph rebuild'));
 }
 
 function createPhaseTiming(initialPhase: string): PhaseTimingState {
@@ -5744,6 +5783,13 @@ function classifyIndexStorageFile(relPath: string): 'content' | 'symbol' | 'refe
   if (name === 'callgraph-symbols.ijgs') { return 'symbol'; }
   if (name === 'callgraph-relations.ijg' || name === 'callgraph-manifest.json') { return 'reference'; }
   if (name.startsWith('callgraph-relations-') && name.endsWith('.ijg')) { return 'reference'; }
+  if (/^callgraph-(?:symbols-by-id|symbols-compact-by-file|resolve-by-name|methods-by-container|hierarchy-by-parent|hierarchy-facts-by-file)-\d+\.tsv$/.test(name)) {
+    return 'symbol';
+  }
+  if (/^callgraph-(?:reference-targets|reference-enclosing|ref-sites-by-file|facts-by-file|token-shape-by-key|counts-by-id|outgoing-tally-by-file)-\d+\.tsv$/.test(name)) {
+    return 'reference';
+  }
+  if (name === 'callgraph-file-table.bin' || name === 'callgraph-overlay.bin') { return 'reference'; }
   return 'other';
 }
 

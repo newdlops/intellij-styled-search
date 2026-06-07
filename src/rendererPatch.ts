@@ -6640,6 +6640,7 @@ export function getRendererPatchScript(
           'data-ijss-callgraph-kind': inlay.kind,
           'data-ijss-callgraph-label': inlay.label,
           'data-ijss-callgraph-column': String(inlay.column),
+          'data-ijss-callgraph-count': typeof inlay.count === 'number' ? String(inlay.count) : '',
           'role': 'button',
           'tabindex': '0',
           'aria-label': (inlay.label ? inlay.label + ' ' : '') + inlay.text,
@@ -7353,9 +7354,10 @@ export function getRendererPatchScript(
         // is rendered at this span's center via getTargetAtClientPoint.
         // target.detail.injectedText.options.attachedData carries the
         // InlayHintLabelPart that holds command + arguments (symbolId,
-        // qualifiedName). #50 user request.
+        // qualifiedName, optional count). #50 user request.
         var symbolId = '';
         var symbolLabel = '';
+        var symbolCount = '';
         try {
           var rect = span.getBoundingClientRect();
           var cx = Math.round(rect.left + rect.width / 2);
@@ -7370,6 +7372,9 @@ export function getRendererPatchScript(
             if (args && args.length >= 1 && typeof args[0] === 'string') {
               symbolId = args[0];
               symbolLabel = args.length >= 2 && typeof args[1] === 'string' ? args[1] : '';
+              symbolCount = args.length >= 3 && typeof args[2] === 'number' && Number.isFinite(args[2]) && args[2] >= 0
+                ? String(Math.floor(args[2]))
+                : '';
               symbolHits++;
             }
           }
@@ -7383,6 +7388,9 @@ export function getRendererPatchScript(
           }
           if (symbolLabel) {
             span.setAttribute('data-ijss-render-symbol-label', symbolLabel);
+          }
+          if (symbolCount) {
+            span.setAttribute('data-ijss-render-symbol-count', symbolCount);
           }
           tagged++;
         } catch (eAttr) {}
@@ -7819,6 +7827,7 @@ export function getRendererPatchScript(
         var renderKind = '';
         var renderSymbolId = '';
         var renderSymbolLabel = '';
+        var renderSymbolCount = '';
         try {
           var walk = hit.element;
           for (var depthRt = 0; walk && depthRt < 6; depthRt++, walk = walk.parentElement) {
@@ -7830,6 +7839,7 @@ export function getRendererPatchScript(
               renderKind = walk.getAttribute('data-ijss-render-kind') || hit.kind;
               renderSymbolId = walk.getAttribute('data-ijss-render-symbol-id') || '';
               renderSymbolLabel = walk.getAttribute('data-ijss-render-symbol-label') || '';
+              renderSymbolCount = walk.getAttribute('data-ijss-render-symbol-count') || '';
               break;
             }
           }
@@ -7844,7 +7854,12 @@ export function getRendererPatchScript(
           } catch (eStopSym) {}
           rememberCallGraphInlayActivation(event, hit);
           var symCommand = commandForPreviewCallGraphInlayKind(renderKind);
-          var symArgs = [renderSymbolId, renderSymbolLabel];
+          var symCount = renderSymbolCount && /^\\d+$/.test(renderSymbolCount)
+            ? parseInt(renderSymbolCount, 10)
+            : undefined;
+          var symArgs = typeof symCount === 'number'
+            ? [renderSymbolId, renderSymbolLabel, symCount]
+            : [renderSymbolId, renderSymbolLabel];
           trace('preview/inlay/click', {
             source: 'native-callgraph-render-tagged-symbol',
             kind: renderKind,
@@ -8592,6 +8607,9 @@ export function getRendererPatchScript(
       text: text || kind,
       symbolId: symbolId,
       label: String(raw.label || raw.name || ''),
+      count: typeof raw.count === 'number' && Number.isFinite(raw.count) && raw.count >= 0
+        ? Math.floor(raw.count)
+        : undefined,
     };
   }
 
@@ -8642,6 +8660,7 @@ export function getRendererPatchScript(
         'data-ijss-callgraph-kind': inlay.kind,
         'data-ijss-callgraph-label': inlay.label,
         'data-ijss-callgraph-column': String(inlay.column),
+        'data-ijss-callgraph-count': typeof inlay.count === 'number' ? String(inlay.count) : '',
         'role': 'button',
         'tabindex': '0',
         'aria-label': (inlay.label ? inlay.label + ' ' : '') + inlay.text,
@@ -9117,6 +9136,9 @@ export function getRendererPatchScript(
     if (!symbolId) { return; }
     var kind = inlay.getAttribute('data-ijss-callgraph-kind') || callGraphInlayLabelKindForElement(inlay) || 'usages';
     var label = inlay.getAttribute('data-ijss-callgraph-label') || '';
+    var rawCount = inlay.getAttribute('data-ijss-callgraph-count') || '';
+    var count = rawCount && /^\\d+$/.test(rawCount) ? parseInt(rawCount, 10) : undefined;
+    var args = typeof count === 'number' ? [symbolId, label, count] : [symbolId, label];
     suppressDomPreviewInlayEvent(event);
     try {
       __ijFindLastDomPreviewInlayActivation = {
@@ -9135,12 +9157,12 @@ export function getRendererPatchScript(
       inlayText: ((inlay.textContent || '') + '').slice(0, 80),
       inlayClasses: ((inlay.className || '') + '').slice(0, 120),
       command: resolvedCommand,
-      args: [symbolId, label],
+      args: args,
     });
     sendPersistent({
       type: 'runCommand',
       command: resolvedCommand,
-      args: [symbolId, label],
+      args: args,
     });
   }
 

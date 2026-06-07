@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.709",
+  "version": "0.1.710",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -370,8 +370,8 @@
         },
         "intellijStyledSearch.callGraphIncludeLowConfidenceUsages": {
           "type": "boolean",
-          "default": false,
-          "description": "Show low-confidence (heuristic 'possible'/'unresolved', e.g. cross-module unique-name look-alikes) references in Find Usages results. When false (default), only confirmed usages are shown so the panel count matches the inline 'N usages' hint; the folded count is noted in the panel title."
+          "default": true,
+          "description": "Show low-confidence (heuristic 'possible'/'unresolved', e.g. cross-module unique-name look-alikes) references in Find Usages results. Enabled by default so the panel shows the same result envelope promised by the inline 'N usages' hint; disable to fold estimated references out of the primary view."
         },
         "intellijStyledSearch.callGraphBackend": {
           "type": "string",

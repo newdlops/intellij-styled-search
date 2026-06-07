@@ -7530,7 +7530,8 @@ suite('Renderer — overlay UI probes', () => {
             kind: 'usages',
             text: 'usages 2',
             symbolId: 'python:preview-metadata-inlay.py:PreviewMetadataSymbol:1',
-            label: 'PreviewMetadataSymbol'
+            label: 'PreviewMetadataSymbol',
+            count: 2
           }]
         });
         var inlay = root.querySelector('[data-ijss-callgraph-symbol-id]');
@@ -7571,7 +7572,8 @@ suite('Renderer — overlay UI probes', () => {
         msg.type === 'runCommand' &&
         msg.command === 'intellijStyledSearch.showUsagesForSymbol' &&
         msg.args?.[0] === 'python:preview-metadata-inlay.py:PreviewMetadataSymbol:1' &&
-        msg.args?.[1] === 'PreviewMetadataSymbol'),
+        msg.args?.[1] === 'PreviewMetadataSymbol' &&
+        msg.args?.[2] === 2),
       `preview metadata inlay click should dispatch direct symbol command: ${raw}`,
     );
     assert.ok(
@@ -7784,7 +7786,8 @@ suite('Renderer — overlay UI probes', () => {
               kind: 'usages',
               text: 'usages 2',
               symbolId: 'python:preview-monaco-metadata-inlay.py:PreviewMonacoMetadataSymbol:1',
-              label: 'PreviewMonacoMetadataSymbol'
+              label: 'PreviewMonacoMetadataSymbol',
+              count: 2
             }]
           });
           var initial = {};
@@ -7862,7 +7865,8 @@ suite('Renderer — overlay UI probes', () => {
           msg.type === 'runCommand' &&
           msg.command === 'intellijStyledSearch.showUsagesForSymbol' &&
           msg.args?.[0] === 'python:preview-monaco-metadata-inlay.py:PreviewMonacoMetadataSymbol:1' &&
-          msg.args?.[1] === 'PreviewMonacoMetadataSymbol'),
+          msg.args?.[1] === 'PreviewMonacoMetadataSymbol' &&
+          msg.args?.[2] === 2),
         `Monaco preview metadata inlay click should dispatch direct symbol command: ${raw}`,
       );
     } finally {

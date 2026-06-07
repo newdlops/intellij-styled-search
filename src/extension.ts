@@ -49,6 +49,7 @@ type CallGraphInlayRegistryEntry = {
   readonly symbolId: string;
   readonly label: string;
   readonly hintColumn: number;
+  readonly count?: number;
 };
 
 class CallGraphInlayRegistry {
@@ -475,16 +476,21 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       await runDedupedCallGraphSymbolCommand('showImplementationsForSymbol', symbolId, () =>
         showCallGraphImplementationResult(overlay, callGraph, symbolId, label));
     }),
-    vscode.commands.registerCommand('intellijStyledSearch.showUsagesForSymbol', async (symbolId: string, label?: string) => {
+    vscode.commands.registerCommand('intellijStyledSearch.showUsagesForSymbol', async (
+      symbolId: string,
+      label?: string,
+      expectedUsageCount?: number,
+    ) => {
       callGraphLog.appendLine(
-        `[inlay-resolve] command=showUsagesForSymbol symbolId=${symbolId} label=${label ?? ''} kind=usages`,
+        `[inlay-resolve] command=showUsagesForSymbol symbolId=${symbolId} label=${label ?? ''} ` +
+        `kind=usages expected=${formatOptionalCount(expectedUsageCount)}`,
       );
       await runDedupedCallGraphSymbolCommand('showUsagesForSymbol', symbolId, () =>
-        showCallGraphUsageResult(overlay, callGraph, callGraphLog, symbolId, label));
+        showCallGraphUsageResult(overlay, callGraph, callGraphLog, symbolId, label, undefined, undefined, expectedUsageCount));
     }),
     // Re-render the most recent Find Usages result with the low-confidence (추정)
-    // envelope expanded — the cross-module/heuristic look-alikes that are folded
-    // out of the default view so the panel count tracks the inline "N usages" hint.
+    // envelope shown. This is also what the default view does unless the user
+    // explicitly configures estimated usages to be folded.
     vscode.commands.registerCommand('intellijStyledSearch.showEstimatedUsages', async () => {
       if (!lastUsageQuery?.query) {
         vscode.window.showInformationMessage(
@@ -493,7 +499,17 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
         return;
       }
       const { query, label, symbol } = lastUsageQuery;
-      await showCallGraphUsageResult(overlay, callGraph, callGraphLog, query, label, symbol, true);
+      estimatedUsagesExpanded = true;
+      await showCallGraphUsageResult(
+        overlay,
+        callGraph,
+        callGraphLog,
+        query,
+        label,
+        symbol,
+        true,
+        lastUsageQuery.expectedUsageCount,
+      );
     }),
     // Toggle target of the in-panel "Estimated" button (sent over the renderer
     // bridge). Flips the expanded state and re-renders the last Find Usages.
@@ -502,7 +518,14 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
       estimatedUsagesExpanded = !estimatedUsagesExpanded;
       const { query, label, symbol } = lastUsageQuery;
       await showCallGraphUsageResult(
-        overlay, callGraph, callGraphLog, query, label, symbol, estimatedUsagesExpanded,
+        overlay,
+        callGraph,
+        callGraphLog,
+        query,
+        label,
+        symbol,
+        estimatedUsagesExpanded,
+        lastUsageQuery.expectedUsageCount,
       );
     }),
     vscode.commands.registerCommand('intellijStyledSearch.activateCallGraphInlayAtPosition', async (
@@ -870,7 +893,8 @@ async function activateCallGraphInlayEntry(
   callGraphLog.appendLine(
     `call graph inlay click source: ${source} ` +
     `clickFile=${clickFile} clickLine=${entry.line + 1} kind=${entry.kind} ` +
-    `symbolId=${JSON.stringify(entry.symbolId)} query=${JSON.stringify(entry.label)}`,
+    `symbolId=${JSON.stringify(entry.symbolId)} query=${JSON.stringify(entry.label)} ` +
+    `expected=${formatOptionalCount(entry.count)}`,
   );
   const command = `activateCallGraphInlay:${entry.kind}`;
   await runDedupedCallGraphSymbolCommand(command, entry.symbolId, async () => {
@@ -882,7 +906,7 @@ async function activateCallGraphInlayEntry(
       await showCallGraphQueryResult(overlay, callGraph, callGraphLog, 'callees', entry.symbolId, entry.label);
       return;
     }
-    await showCallGraphUsageResult(overlay, callGraph, callGraphLog, entry.symbolId, entry.label, symbol);
+    await showCallGraphUsageResult(overlay, callGraph, callGraphLog, entry.symbolId, entry.label, symbol, undefined, entry.count);
   });
 }
 
@@ -1307,15 +1331,25 @@ function getConfiguredCallGraphMaxUsageResults(): number {
   return Math.floor(raw);
 }
 
-// Fix-B: when false (default), Find Usages folds low-confidence references
-// ("possible"/"unresolved" — e.g. cross-module unique-name look-alikes) out of
-// the default panel so the visible count tracks the inline "N usages" hint,
-// which only counts confirmed usages. `exactDeficit == 0` corpus-wide proves the
-// confirmed set is always a subset of the inlay count, so this can never make the
-// panel reveal MORE confirmed usages than the hint promised (undercount = 0).
 function getConfiguredCallGraphIncludeLowConfidenceUsages(): boolean {
   const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-  return cfg.get<boolean>('callGraphIncludeLowConfidenceUsages', false) === true;
+  return cfg.get<boolean>('callGraphIncludeLowConfidenceUsages', true) !== false;
+}
+
+function getEffectiveCallGraphUsageLimit(expectedUsageCount?: number): number {
+  const configured = getConfiguredCallGraphMaxUsageResults();
+  const expected = normalizeExpectedUsageCount(expectedUsageCount);
+  return expected === undefined ? configured : Math.max(configured, expected);
+}
+
+function normalizeExpectedUsageCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : undefined;
+}
+
+function formatOptionalCount(value: unknown): string {
+  return String(normalizeExpectedUsageCount(value) ?? 'unknown');
 }
 
 // A "confirmed" usage is one the resolver bound with high confidence (an exact
@@ -1326,11 +1360,15 @@ function isConfirmedUsage(reference: CallGraphReference): boolean {
 }
 
 // Remembers the most recent Find Usages query so the "Show Estimated Usages"
-// command / in-panel toggle can re-render it with the low-confidence envelope
-// expanded. `estimatedUsagesExpanded` is the in-panel toggle's current state; it
-// resets to collapsed whenever a fresh Find Usages runs (a new symbol).
-let lastUsageQuery: { query?: string; label?: string; symbol?: CallGraphSymbol } | undefined;
-let estimatedUsagesExpanded = false;
+// command / in-panel toggle can re-render it without dropping the inlay's count
+// floor. `estimatedUsagesExpanded` mirrors the in-panel toggle state.
+let lastUsageQuery: {
+  query?: string;
+  label?: string;
+  symbol?: CallGraphSymbol;
+  expectedUsageCount?: number;
+} | undefined;
+let estimatedUsagesExpanded = true;
 
 async function showCallGraphUsageResult(
   overlay: OverlayPanel,
@@ -1340,15 +1378,25 @@ async function showCallGraphUsageResult(
   explicitLabel?: string,
   explicitSymbol?: CallGraphSymbol,
   forceIncludeLowConfidence?: boolean,
+  expectedUsageCount?: number,
 ): Promise<void> {
   try {
     const title = 'Find Usages';
     const showedPendingPanel = !!explicitQuery;
-    const limit = getConfiguredCallGraphMaxUsageResults();
+    let normalizedExpectedUsageCount = normalizeExpectedUsageCount(
+      expectedUsageCount ?? explicitSymbol?.usageCount,
+    );
+    let limit = getEffectiveCallGraphUsageLimit(normalizedExpectedUsageCount);
     if (explicitQuery) {
-      lastUsageQuery = { query: explicitQuery, label: explicitLabel, symbol: explicitSymbol };
-      // A fresh Find Usages (not a toggle re-render) starts collapsed.
-      if (forceIncludeLowConfidence === undefined) { estimatedUsagesExpanded = false; }
+      lastUsageQuery = {
+        query: explicitQuery,
+        label: explicitLabel,
+        symbol: explicitSymbol,
+        expectedUsageCount: normalizedExpectedUsageCount,
+      };
+      if (forceIncludeLowConfidence === undefined) {
+        estimatedUsagesExpanded = getConfiguredCallGraphIncludeLowConfidenceUsages();
+      }
     }
     if (explicitQuery) {
       await showCallGraphPendingPanel(overlay, title, explicitLabel ?? explicitQuery);
@@ -1357,6 +1405,18 @@ async function showCallGraphUsageResult(
     if (explicitQuery) {
       const explicitSymbolId = explicitSymbol?.id ?? explicitQuery;
       if (explicitSymbol || isCallGraphSymbolId(explicitSymbolId)) {
+        let resolvedExplicitSymbol = explicitSymbol;
+        if (normalizedExpectedUsageCount === undefined) {
+          resolvedExplicitSymbol = explicitSymbol ?? (await callGraph.resolveSymbolsResolved(explicitSymbolId, 1))[0];
+          normalizedExpectedUsageCount = normalizeExpectedUsageCount(resolvedExplicitSymbol?.usageCount);
+          limit = getEffectiveCallGraphUsageLimit(normalizedExpectedUsageCount);
+          lastUsageQuery = {
+            query: explicitQuery,
+            label: explicitLabel,
+            symbol: resolvedExplicitSymbol,
+            expectedUsageCount: normalizedExpectedUsageCount,
+          };
+        }
         const cachedUsages = await callGraph.findUsagesForSymbolIdFromCache(explicitSymbolId, limit);
         if (cachedUsages) {
           await showCallGraphUsageMatches(
@@ -1364,11 +1424,11 @@ async function showCallGraphUsageResult(
             callGraphLog,
             title,
             explicitQuery,
-            explicitSymbol,
+            resolvedExplicitSymbol,
             cachedUsages,
             'call graph cache-index',
             false,
-            explicitLabel ?? explicitSymbol?.qualifiedName ?? labelFromCallGraphSymbolId(explicitSymbolId),
+            explicitLabel ?? resolvedExplicitSymbol?.qualifiedName ?? labelFromCallGraphSymbolId(explicitSymbolId),
             showedPendingPanel,
             forceIncludeLowConfidence,
           );
@@ -1381,6 +1441,19 @@ async function showCallGraphUsageResult(
     const query = explicitQuery ?? await getCallGraphQuery(callGraph, title);
     if (!query) { return; }
     const targetSymbol = (await callGraph.resolveSymbolsResolved(query, 1))[0];
+    normalizedExpectedUsageCount = normalizeExpectedUsageCount(
+      normalizedExpectedUsageCount ?? targetSymbol?.usageCount,
+    );
+    limit = getEffectiveCallGraphUsageLimit(normalizedExpectedUsageCount);
+    lastUsageQuery = {
+      query,
+      label: explicitLabel,
+      symbol: explicitSymbol ?? targetSymbol,
+      expectedUsageCount: normalizedExpectedUsageCount,
+    };
+    if (!explicitQuery && forceIncludeLowConfidence === undefined) {
+      estimatedUsagesExpanded = getConfiguredCallGraphIncludeLowConfidenceUsages();
+    }
     const usages = targetSymbol && callGraph.isRustNativeIndexOnly()
       ? await callGraph.findUsagesForSymbolIdFromCache(targetSymbol.id, limit) ?? []
       : callGraph.findUsages(query, limit);
@@ -1417,12 +1490,9 @@ async function showCallGraphUsageMatches(
   forceIncludeLowConfidence?: boolean,
 ): Promise<void> {
   let sourceLabel = initialSourceLabel;
-  // Fix-B: split confirmed vs low-confidence usages. Default view shows only
-  // confirmed (so the panel count tracks the inline hint); the low-confidence
-  // envelope is folded out unless the user opts in, or unless there are no
-  // confirmed usages at all (then show the envelope rather than an empty panel).
-  // `forceIncludeLowConfidence` (the "Show Estimated Usages" command) overrides
-  // the config per-invocation so the user can expand the fold on demand.
+  // Split confirmed vs low-confidence usages. By default we show both so the
+  // panel can match the inline "N usages" envelope; users can opt into folding
+  // estimated rows out of the primary result set.
   const includeLowConfidence =
     forceIncludeLowConfidence ?? getConfiguredCallGraphIncludeLowConfidenceUsages();
   const confirmedUsages = usages.filter(isConfirmedUsage);
@@ -2021,6 +2091,7 @@ function buildCallGraphInlayHint(
       'intellijStyledSearch.showCalleesForSymbol',
       summary.symbol.id,
       summary.symbol.qualifiedName,
+      summary.calleeCount,
     ));
   }
   if (shouldShowImplementationInlay(summary)) {
@@ -2031,6 +2102,7 @@ function buildCallGraphInlayHint(
       'intellijStyledSearch.showImplementationsForSymbol',
       summary.symbol.id,
       summary.symbol.qualifiedName,
+      summary.implementationCount,
     ));
   }
   if (summary.usageCount > 0) {
@@ -2041,6 +2113,7 @@ function buildCallGraphInlayHint(
       'intellijStyledSearch.showUsagesForSymbol',
       summary.symbol.id,
       summary.symbol.qualifiedName,
+      summary.usageCount,
     ));
   }
   if (parts.length === 0) { return undefined; }
@@ -2065,13 +2138,13 @@ function buildCallGraphInlayRegistryEntries(
   };
   const entries: CallGraphInlayRegistryEntry[] = [];
   if (showCalleeInlayHints && summary.calleeCount > 0) {
-    entries.push({ ...base, kind: 'callees' });
+    entries.push({ ...base, kind: 'callees', count: summary.calleeCount });
   }
   if (shouldShowImplementationInlay(summary)) {
-    entries.push({ ...base, kind: 'impl' });
+    entries.push({ ...base, kind: 'impl', count: summary.implementationCount });
   }
   if (summary.usageCount > 0) {
-    entries.push({ ...base, kind: 'usages' });
+    entries.push({ ...base, kind: 'usages', count: summary.usageCount });
   }
   return entries;
 }
@@ -2099,12 +2172,18 @@ function makeInlayCommandPart(
   command: string,
   symbolId: string,
   symbolLabel: string,
+  count?: number,
 ): vscode.InlayHintLabelPart {
   const part = new vscode.InlayHintLabelPart(label);
+  const args: unknown[] = [symbolId, symbolLabel];
+  const normalizedCount = normalizeExpectedUsageCount(count);
+  if (normalizedCount !== undefined) {
+    args.push(normalizedCount);
+  }
   part.command = {
     title,
     command,
-    arguments: [symbolId, symbolLabel],
+    arguments: args,
   };
   return part;
 }

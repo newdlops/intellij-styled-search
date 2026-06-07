@@ -747,6 +747,12 @@ suite('Call graph', () => {
         commandParts.some((entry) => entry.part.command?.command === 'intellijStyledSearch.showUsagesForSymbol'),
         'expected usages inlay part to expose a direct command',
       );
+      const graphPyUsagePart = usageInlayPartForSymbol(inlayHints, 'GraphPy');
+      assert.strictEqual(
+        graphPyUsagePart?.part.command?.arguments?.[2],
+        usageInlayCount(graphPyUsagePart),
+        'expected usage inlay command to carry the shown usage count as the query limit floor',
+      );
       assert.ok(
         commandParts.every((entry) => !/[\u200b\u200c\u2063]/.test(entry.part.value)),
         'expected call graph inlay labels to avoid hidden click marker characters',

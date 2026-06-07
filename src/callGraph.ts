@@ -347,6 +347,35 @@ type RustGraphIndexResponse = {
   warnings?: string[];
 };
 
+type RustGraphServingManifest = {
+  engine?: string;
+  type?: string;
+  version?: number;
+  workspaceRoot?: string;
+  indexedAtUnixSecs?: number;
+  builtAtUnixMs?: number;
+  fileCount?: number;
+  symbolCount?: number;
+  referenceCount?: number;
+  bytes?: number;
+};
+
+export type RustNativeGraphServingStatus = {
+  available: boolean;
+  compatible: boolean;
+  expectedVersion: number;
+  manifestPath?: string;
+  reason?: string;
+  version?: number;
+  workspaceRoot?: string;
+  indexedAtUnixSecs?: number;
+  builtAtUnixMs?: number;
+  fileCount?: number;
+  symbolCount?: number;
+  referenceCount?: number;
+  bytes?: number;
+};
+
 type RustGraphSymbol = {
   id?: string;
   name?: string;
@@ -666,6 +695,8 @@ const CALL_GRAPH_SOURCE_GLOB = '**/*.{py,java,kt,kts,ts,tsx,js,jsx,mjs,cjs}';
 // target ids — so this bump discards the v6 cache and forces a one-time reindex.
 // MUST move together with the GRAPH_VERSION bump + the rebuilt binary.
 const CALL_GRAPH_CACHE_VERSION = 15;
+const RUST_NATIVE_GRAPH_MANIFEST_VERSION = 7;
+const RUST_NATIVE_GRAPH_REBUILD_WARNING = 'rust-native graph rebuild stores the primary graph in zoek-rs binary index; JS snapshot arrays are intentionally not materialized';
 const CALL_GRAPH_EXTERNAL_INCREMENTAL_DEBOUNCE_MS = 1_500;
 const CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS = 75;
 // Each incremental graph-update loads the full prior reference set into the
@@ -844,6 +875,19 @@ export class CallGraphService implements vscode.Disposable {
 
   isRustNativeIndexOnly(snapshot = this.snapshot): boolean {
     return isRustNativeIndexOnlySnapshot(snapshot);
+  }
+
+  async getRustNativeGraphServingStatus(): Promise<RustNativeGraphServingStatus> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) {
+      return {
+        available: false,
+        compatible: false,
+        expectedVersion: RUST_NATIVE_GRAPH_MANIFEST_VERSION,
+        reason: 'workspace_not_found',
+      };
+    }
+    return this.readRustNativeGraphServingStatus(folder.uri.fsPath);
   }
 
   private hasRustNativePrimaryGraph(): boolean {
@@ -2299,6 +2343,154 @@ export class CallGraphService implements vscode.Disposable {
     return { snapshot, index };
   }
 
+  private async readRustNativeGraphServingStatus(workspaceRoot: string): Promise<RustNativeGraphServingStatus> {
+    const manifestPath = path.join(workspaceRoot, '.zoek-rs', 'callgraph-manifest.json');
+    let raw: string;
+    try {
+      raw = await fs.promises.readFile(manifestPath, 'utf8');
+    } catch (err) {
+      const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+      return {
+        available: false,
+        compatible: false,
+        expectedVersion: RUST_NATIVE_GRAPH_MANIFEST_VERSION,
+        manifestPath,
+        reason: code === 'ENOENT' ? 'manifest_missing' : `manifest_read_failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    let manifest: RustGraphServingManifest;
+    try {
+      manifest = JSON.parse(raw) as RustGraphServingManifest;
+    } catch (err) {
+      return {
+        available: true,
+        compatible: false,
+        expectedVersion: RUST_NATIVE_GRAPH_MANIFEST_VERSION,
+        manifestPath,
+        reason: `manifest_parse_failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    const status: RustNativeGraphServingStatus = {
+      available: true,
+      compatible: false,
+      expectedVersion: RUST_NATIVE_GRAPH_MANIFEST_VERSION,
+      manifestPath,
+      version: finiteInteger(manifest.version),
+      workspaceRoot: typeof manifest.workspaceRoot === 'string' ? manifest.workspaceRoot : undefined,
+      indexedAtUnixSecs: finiteInteger(manifest.indexedAtUnixSecs),
+      builtAtUnixMs: finiteInteger(manifest.builtAtUnixMs),
+      fileCount: finiteInteger(manifest.fileCount),
+      symbolCount: finiteInteger(manifest.symbolCount),
+      referenceCount: finiteInteger(manifest.referenceCount),
+      bytes: finiteInteger(manifest.bytes),
+    };
+    if (manifest.engine !== 'zoek-rs' || manifest.type !== 'semantic-serving-graph') {
+      return { ...status, reason: 'invalid_manifest_type' };
+    }
+    if (status.version !== RUST_NATIVE_GRAPH_MANIFEST_VERSION) {
+      return { ...status, reason: `incompatible_version:${status.version ?? 'unknown'}` };
+    }
+    if (!status.workspaceRoot || path.resolve(status.workspaceRoot) !== path.resolve(workspaceRoot)) {
+      return { ...status, reason: 'workspace_mismatch' };
+    }
+    if (!status.builtAtUnixMs || status.builtAtUnixMs <= 0) {
+      return { ...status, reason: 'missing_built_at' };
+    }
+    return { ...status, compatible: true, reason: undefined };
+  }
+
+  private rustNativeSnapshotFromServingStatus(
+    workspaceRoot: string,
+    status: RustNativeGraphServingStatus,
+  ): CallGraphSnapshot {
+    const stats: CallGraphStats = {
+      fileCount: status.fileCount ?? 0,
+      symbolCount: status.symbolCount ?? 0,
+      edgeCount: 0,
+      exactEdgeCount: 0,
+      possibleEdgeCount: 0,
+      unresolvedEdgeCount: 0,
+      languageCounts: {
+        python: 0,
+        java: 0,
+        kotlin: 0,
+        typescript: 0,
+        javascript: 0,
+        graphql: 0,
+      },
+      elapsedMs: 0,
+      parseConcurrency: getConfiguredCallGraphConcurrency(),
+      skippedFileCount: 0,
+      callsiteCount: 0,
+      skippedPossibleEdgeCount: 0,
+      skippedUnresolvedEdgeCount: 0,
+      edgeLimitHit: false,
+      referenceCount: status.referenceCount ?? 0,
+    };
+    return {
+      workspaceRoot,
+      builtAtUnixMs: status.builtAtUnixMs ?? 0,
+      symbols: [],
+      edges: [],
+      references: [],
+      warnings: [
+        RUST_NATIVE_GRAPH_REBUILD_WARNING,
+        'rust-native semantic-serving graph restored from .zoek-rs/callgraph-manifest.json',
+      ],
+      stats,
+    };
+  }
+
+  private applyRustNativeSnapshotFromManifest(
+    snapshot: CallGraphSnapshot,
+    configSignature: string,
+  ): void {
+    const manifest: CallGraphCacheManifest = {
+      version: CALL_GRAPH_CACHE_VERSION,
+      workspaceRoot: snapshot.workspaceRoot,
+      configSignature,
+      builtAtUnixMs: snapshot.builtAtUnixMs,
+      chunks: [],
+      recordIndex: [],
+      snapshot: {
+        builtAtUnixMs: snapshot.builtAtUnixMs,
+        stats: snapshot.stats,
+        warnings: snapshot.warnings,
+        symbols: [],
+        edges: [],
+        references: [],
+      },
+    };
+    this.cacheManifest = manifest;
+    this.cacheConfigSignature = configSignature;
+    this.cacheRecordsLoaded = false;
+    this.clearSymbolRelationCache();
+    this.clearDocumentSummaryCache();
+    this.applySnapshot(snapshot, undefined, undefined, configSignature);
+  }
+
+  private async restoreRustNativeServingManifest(configSignature: string, reason: string): Promise<boolean> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) { return false; }
+    const status = await this.readRustNativeGraphServingStatus(folder.uri.fsPath);
+    if (!status.available) { return false; }
+    if (!status.compatible) {
+      this.log.appendLine(
+        `call graph rust-native serving manifest ignored: reason=${status.reason ?? 'unknown'} ` +
+        `version=${status.version ?? 'unknown'} expected=${status.expectedVersion}`,
+      );
+      return false;
+    }
+    const snapshot = this.rustNativeSnapshotFromServingStatus(folder.uri.fsPath, status);
+    this.applyRustNativeSnapshotFromManifest(snapshot, configSignature);
+    this.log.appendLine(
+      `call graph rust-native serving manifest restored: reason=${reason} files=${snapshot.stats.fileCount} ` +
+      `symbols=${snapshot.stats.symbolCount} references=${snapshot.stats.referenceCount} ` +
+      `cachedAt=${new Date(snapshot.builtAtUnixMs).toISOString()}`,
+    );
+    return true;
+  }
+
   private async restorePersistedCacheManifest(): Promise<void> {
     const folder = vscode.workspace.workspaceFolders?.[0];
     if (!folder) { return; }
@@ -2315,10 +2507,12 @@ export class CallGraphService implements vscode.Disposable {
         !Array.isArray(manifest.chunks)
       ) {
         this.log.appendLine('call graph cache ignored: version, workspace, or settings changed; persisted files preserved until explicit rebuild');
+        await this.restoreRustNativeServingManifest(configSignature, 'cache-metadata-invalid');
         return;
       }
       if (!Array.isArray(manifest.recordIndex)) {
         this.log.appendLine('call graph cache ignored: missing record index; persisted files preserved until explicit rebuild');
+        await this.restoreRustNativeServingManifest(configSignature, 'cache-record-index-missing');
         return;
       }
       if (!Array.isArray(manifest.symbolRelations)) {
@@ -2340,6 +2534,18 @@ export class CallGraphService implements vscode.Disposable {
           `documentSummaryFiles=${countDocumentSummaryFiles(this.cacheManifest)} ` +
           `cachedAt=${cachedAt} restore=lazy`,
         );
+        if (isRustNativeGraphManifest(this.cacheManifest)) {
+          const snapshot: CallGraphSnapshot = {
+            workspaceRoot: this.cacheManifest.workspaceRoot,
+            builtAtUnixMs: this.cacheManifest.snapshot!.builtAtUnixMs,
+            symbols: [],
+            edges: [],
+            references: [],
+            stats,
+            warnings: this.cacheManifest.snapshot!.warnings,
+          };
+          this.applySnapshot(snapshot, undefined, undefined, configSignature);
+        }
       } else {
         this.log.appendLine(
           `call graph cache metadata loaded: recordChunks=${this.cacheManifest.chunks.length} ` +
@@ -2355,6 +2561,7 @@ export class CallGraphService implements vscode.Disposable {
       if (code !== 'FileNotFound') {
         this.log.appendLine(`call graph cache metadata skipped: ${err instanceof Error ? err.message : String(err)}`);
       }
+      await this.restoreRustNativeServingManifest(configSignature, code === 'FileNotFound' ? 'cache-metadata-missing' : 'cache-metadata-read-failed');
     }
   }
 
@@ -4285,7 +4492,7 @@ export class CallGraphService implements vscode.Disposable {
     }
     const warnings = [
       ...(response.warnings ?? []),
-      'rust-native graph rebuild stores the primary graph in zoek-rs binary index; JS snapshot arrays are intentionally not materialized',
+      RUST_NATIVE_GRAPH_REBUILD_WARNING,
     ];
     const stats: CallGraphStats = {
       fileCount: response.fileCount ?? 0,
@@ -4741,6 +4948,10 @@ function isRustNativeIndexOnlySnapshot(snapshot: CallGraphSnapshot | undefined):
 
 function isRustNativeGraphManifest(manifest: CallGraphCacheManifest | undefined): boolean {
   return !!manifest?.snapshot?.warnings?.some((warning) => warning.includes('rust-native graph rebuild'));
+}
+
+function finiteInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : undefined;
 }
 
 function safeGraphRangeNumber(value: unknown): number {
