@@ -24,6 +24,13 @@ type CliOptions = {
   timeoutMs: number;
 };
 
+type EndpointHealth = {
+  ok: boolean;
+  workspaceId?: string;
+  mismatch?: boolean;
+  message?: string;
+};
+
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 void main().catch((err) => {
@@ -108,15 +115,27 @@ function readCommand(raw: string | undefined): CliOptions['command'] {
 }
 
 async function resolveEndpoint(options: CliOptions): Promise<URL> {
-  const explicit = options.url ?? process.env.CODEIDX_MCP_URL;
-  if (explicit) { return normalizeMcpUrl(explicit); }
-
   const discoveryPath = options.discoveryFile ?? path.join(options.workspace, '.codeidx', 'mcp-server.json');
   const expectedWorkspaceId = workspaceIdFor(options.workspace);
+  if (options.url) { return normalizeMcpUrl(options.url); }
+
+  const envEndpoint = normalizeOptionalUrl(process.env.CODEIDX_MCP_URL, 'CODEIDX_MCP_URL');
+  if (envEndpoint) {
+    const health = await checkEndpointHealth(envEndpoint, Math.min(1_000, options.timeoutMs), expectedWorkspaceId);
+    if (health.ok) { return envEndpoint; }
+    if (health.mismatch) {
+      log(
+        `ignoring CODEIDX_MCP_URL ${envEndpoint.toString()} for workspace ${options.workspace}; ` +
+        `endpoint reports ${health.workspaceId ?? 'unknown workspace'}`,
+      );
+    }
+  }
+
   const initialDiscovery = readDiscoveryFile(discoveryPath, expectedWorkspaceId);
   if (initialDiscovery?.url) {
     const endpoint = normalizeMcpUrl(initialDiscovery.url);
-    if (await isEndpointHealthy(endpoint, Math.min(1_000, options.timeoutMs))) {
+    const health = await checkEndpointHealth(endpoint, Math.min(1_000, options.timeoutMs), expectedWorkspaceId);
+    if (health.ok) {
       return endpoint;
     }
   }
@@ -130,7 +149,8 @@ async function resolveEndpoint(options: CliOptions): Promise<URL> {
     const discovery = readDiscoveryFile(discoveryPath, expectedWorkspaceId);
     if (discovery?.url) {
       const endpoint = normalizeMcpUrl(discovery.url);
-      if (await isEndpointHealthy(endpoint, Math.min(1_000, Math.max(100, deadline - Date.now())))) {
+      const health = await checkEndpointHealth(endpoint, Math.min(1_000, Math.max(100, deadline - Date.now())), expectedWorkspaceId);
+      if (health.ok) {
         return endpoint;
       }
     }
@@ -144,13 +164,28 @@ async function resolveEndpoint(options: CliOptions): Promise<URL> {
   );
 }
 
-async function isEndpointHealthy(endpoint: URL, timeoutMs: number): Promise<boolean> {
+async function checkEndpointHealth(endpoint: URL, timeoutMs: number, expectedWorkspaceId?: string): Promise<EndpointHealth> {
   try {
     const raw = await getHealth(endpoint, timeoutMs);
-    const parsed = JSON.parse(raw) as { ok?: unknown; running?: unknown };
-    return parsed.ok === true || parsed.running === true;
-  } catch {
-    return false;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) {
+      return { ok: false, message: 'health response was not an object' };
+    }
+    if (parsed.ok !== true && parsed.running !== true) {
+      return { ok: false, message: 'endpoint health did not report ok' };
+    }
+    const workspaceId = extractWorkspaceId(parsed);
+    if (expectedWorkspaceId) {
+      if (!workspaceId) {
+        return { ok: false, message: 'endpoint health did not report workspace_id' };
+      }
+      if (workspaceId !== expectedWorkspaceId) {
+        return { ok: false, workspaceId, mismatch: true };
+      }
+    }
+    return { ok: true, workspaceId };
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -182,12 +217,40 @@ function normalizeMcpUrl(value: string): URL {
   return url;
 }
 
+function normalizeOptionalUrl(value: string | undefined, label: string): URL | undefined {
+  if (!value) { return undefined; }
+  try {
+    return normalizeMcpUrl(value);
+  } catch (err) {
+    log(`ignoring invalid ${label}: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+}
+
 function workspaceIdFor(workspace: string): string {
   return `ws_${stableHash(path.resolve(workspace)).slice(0, 12)}`;
 }
 
 function stableHash(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function extractWorkspaceId(value: unknown): string | undefined {
+  if (!isRecord(value)) { return undefined; }
+  if (typeof value.workspace_id === 'string') { return value.workspace_id; }
+  const snapshot = value.snapshot;
+  if (isRecord(snapshot) && typeof snapshot.workspace_id === 'string') {
+    return snapshot.workspace_id;
+  }
+  const health = value.health;
+  if (isRecord(health) && typeof health.workspace_id === 'string') {
+    return health.workspace_id;
+  }
+  return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 async function runStdioProxy(endpoint: URL, timeoutMs: number): Promise<void> {

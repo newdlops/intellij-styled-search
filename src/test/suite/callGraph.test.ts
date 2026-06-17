@@ -3820,6 +3820,60 @@ suite('Call graph', () => {
       } finally {
         await stopChild(stdioProxy);
       }
+      const outsideWorkspaceProxy = spawn(process.execPath, [cliPath, 'stdio', '--workspace', '.'], {
+        cwd: path.dirname(workspaceRoot),
+        stdio: 'pipe',
+      });
+      let outsideWorkspaceStderr = '';
+      outsideWorkspaceProxy.stderr.on('data', (chunk: Buffer) => {
+        outsideWorkspaceStderr += chunk.toString('utf8');
+      });
+      try {
+        const outsideWorkspaceTools = await sendStdioJson(outsideWorkspaceProxy, {
+          jsonrpc: '2.0',
+          id: 122,
+          method: 'tools/list',
+          params: {},
+        });
+        assert.ok(
+          outsideWorkspaceTools.result?.tools?.some((tool: { name?: string }) => tool.name === 'mcp_health'),
+          `expected generated launcher to resolve --workspace . from its own .codeidx directory; stderr=${outsideWorkspaceStderr}`,
+        );
+      } finally {
+        await stopChild(outsideWorkspaceProxy);
+      }
+      const mismatched = await startMismatchedMcpHealthServer('ws_other_window');
+      const envMismatchProxy = spawn(process.execPath, [cliPath, 'stdio', '--workspace', '.'], {
+        cwd: path.dirname(workspaceRoot),
+        env: {
+          ...process.env,
+          CODEIDX_MCP_URL: mismatched.url,
+        },
+        stdio: 'pipe',
+      });
+      let envMismatchStderr = '';
+      envMismatchProxy.stderr.on('data', (chunk: Buffer) => {
+        envMismatchStderr += chunk.toString('utf8');
+      });
+      try {
+        const envMismatchHealth = await sendStdioJson(envMismatchProxy, {
+          jsonrpc: '2.0',
+          id: 123,
+          method: 'tools/call',
+          params: {
+            name: 'mcp_health',
+            arguments: {},
+          },
+        });
+        assert.strictEqual(envMismatchHealth.result?.structuredContent?.health?.workspace_root, workspaceRoot);
+        assert.ok(
+          /ignoring CODEIDX_MCP_URL/.test(envMismatchStderr),
+          `expected stale env endpoint to be rejected by workspace_id; stderr=${envMismatchStderr}`,
+        );
+      } finally {
+        await stopChild(envMismatchProxy);
+        await mismatched.close();
+      }
     } finally {
       api.mcpServer.stop();
       try { await vscode.workspace.fs.delete(mcpTarget); } catch {}
@@ -3980,6 +4034,47 @@ function postJsonMaybeEmpty(url: string, payload: unknown): Promise<any | undefi
     req.on('error', reject);
     req.write(body);
     req.end();
+  });
+}
+
+function startMismatchedMcpHealthServer(workspaceId: string): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        running: true,
+        snapshot: { workspace_id: workspaceId },
+      }));
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/mcp') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        jsonrpc: '2.0',
+        id: null,
+        error: {
+          code: -32000,
+          message: 'request reached mismatched MCP endpoint',
+        },
+      }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
+      const address = server.address();
+      assert.ok(typeof address === 'object' && address, 'expected mismatched MCP server address');
+      resolve({
+        url: `http://127.0.0.1:${address.port}/mcp`,
+        close: () => new Promise<void>((closeResolve, closeReject) => {
+          server.close((err) => err ? closeReject(err) : closeResolve());
+        }),
+      });
+    });
   });
 }
 

@@ -35,7 +35,7 @@ This repository includes project MCP config files:
 - `.mcp.json` for Claude Code project-scoped MCP discovery.
 - `.codex/config.toml` for Codex project-scoped MCP configuration when supported by the installed Codex CLI.
 
-The MCP clients spawn a stdio proxy, but the proxy still needs the VS Code extension's localhost endpoint. In trusted workspaces the extension auto-starts that endpoint by default. Each VS Code window binds an OS-assigned free port and writes the actual URL to `.codeidx/mcp-server.json`, so multiple projects can run at the same time without sharing a fixed port. The extension also writes `.codeidx/codeidx-mcp-stdio.js`, which lets project MCP configs launch the proxy through `node` without depending on a global `codeidx-mcp` binary.
+The MCP clients spawn a stdio proxy, but the proxy still needs the VS Code extension's localhost endpoint. In trusted workspaces the extension auto-starts that endpoint by default. Each VS Code window binds an OS-assigned free port and writes the actual URL to `.codeidx/mcp-server.json`, so multiple projects can run at the same time without sharing a fixed port. The extension also writes `.codeidx/codeidx-mcp-stdio.js`, which lets project MCP configs launch the proxy through `node` without depending on a global `codeidx-mcp` binary. The generated launcher treats its own `.codeidx` directory as the workspace anchor, so `--workspace .` still resolves to the VS Code project when an MCP client starts the process from a different cwd.
 
 Manual stdio proxy command:
 
@@ -49,7 +49,7 @@ From a workspace where the extension has started, use the generated project laun
 node .codeidx/codeidx-mcp-stdio.js stdio --workspace .
 ```
 
-The proxy discovers the VS Code endpoint from `.codeidx/mcp-server.json`. If you disable `intellijStyledSearch.mcpAutoStart`, run `IntelliJ Search: Start Codeidx MCP Server` in that VS Code window before starting Codex or Claude Code. You can also pass the URL explicitly:
+The proxy discovers the VS Code endpoint from `.codeidx/mcp-server.json` and verifies that the endpoint reports the same workspace ID. A stale `CODEIDX_MCP_URL` from another VS Code window is ignored instead of pinning the proxy to the wrong project. If you disable `intellijStyledSearch.mcpAutoStart`, run `IntelliJ Search: Start Codeidx MCP Server` in that VS Code window before starting Codex or Claude Code. You can also pass the URL explicitly:
 
 ```bash
 codeidx-mcp stdio --url http://127.0.0.1:<port>/mcp
