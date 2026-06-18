@@ -1,6 +1,9 @@
 import * as assert from 'assert';
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as http from 'http';
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
@@ -3898,6 +3901,63 @@ suite('Call graph', () => {
     }
   });
 
+  test('generated MCP launcher prefers cwd workspace discovery and rejects foreign explicit URLs', async function () {
+    this.timeout(10_000);
+    const api = await getApi();
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    assert.ok(workspaceRoot, 'expected fixture workspace root');
+    await api.mcpServer.start(0);
+    const cliPath = path.join(workspaceRoot, '.codeidx', 'codeidx-mcp-stdio.js');
+    await vscode.workspace.fs.stat(vscode.Uri.file(cliPath));
+
+    const otherWorkspaceRoot = path.join(await fs.promises.realpath(os.tmpdir()), `codeidx-mcp-other-${process.pid}-${Date.now()}`);
+    const otherCodeidxDir = path.join(otherWorkspaceRoot, '.codeidx');
+    const otherWorkspaceId = testWorkspaceIdFor(otherWorkspaceRoot);
+    const otherEndpoint = await startMismatchedMcpHealthServer(otherWorkspaceId);
+    try {
+      await vscode.workspace.fs.createDirectory(vscode.Uri.file(otherCodeidxDir));
+      await vscode.workspace.fs.writeFile(vscode.Uri.file(path.join(otherCodeidxDir, 'mcp-server.json')), Buffer.from(JSON.stringify({
+        schema_version: 'codeidx.mcp/0.1',
+        server: 'codeidx-mcp',
+        transport: 'http',
+        url: otherEndpoint.url,
+        workspace_id: otherWorkspaceId,
+        pid: process.pid,
+        started_at: new Date().toISOString(),
+      }, null, 2) + '\n', 'utf8'));
+      const otherWorkspaceHealth = await runChildJson(process.execPath, [
+        cliPath,
+        'health',
+        '--workspace',
+        '.',
+        '--connect-timeout-ms',
+        '1000',
+      ], otherWorkspaceRoot);
+      assert.strictEqual(
+        otherWorkspaceHealth.snapshot?.workspace_id,
+        otherWorkspaceId,
+        `expected generated launcher to prefer cwd workspace discovery, got ${JSON.stringify(otherWorkspaceHealth)}`,
+      );
+      await assert.rejects(
+        runChildJson(process.execPath, [
+          cliPath,
+          'health',
+          '--workspace',
+          '.',
+          '--url',
+          otherEndpoint.url,
+          '--connect-timeout-ms',
+          '1000',
+        ], workspaceRoot),
+        /explicit MCP endpoint .* not workspace/,
+      );
+    } finally {
+      await otherEndpoint.close();
+      api.mcpServer.stop();
+      try { await vscode.workspace.fs.delete(vscode.Uri.file(otherWorkspaceRoot), { recursive: true, useTrash: false }); } catch {}
+    }
+  });
+
   // User-reported regression: when a symbol has more than 500 usages the
   // Find Usages panel only shows 500 rows. Root cause:
   // callGraph.findUsages() / findUsagesForSymbolIdFromCache() both default
@@ -4035,6 +4095,44 @@ function postJsonMaybeEmpty(url: string, payload: unknown): Promise<any | undefi
     req.write(body);
     req.end();
   });
+}
+
+function runChildJson(command: string, args: string[], cwd: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd, stdio: 'pipe' });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch {}
+      reject(new Error(`timed out waiting for child JSON output; stderr=${stderr}`));
+    }, 5_000);
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8');
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+    });
+    child.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`child exited with code=${code} signal=${signal}; stderr=${stderr}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout.trim()));
+      } catch (err) {
+        reject(new Error(`failed to parse child JSON: ${err instanceof Error ? err.message : String(err)}; stdout=${stdout}; stderr=${stderr}`));
+      }
+    });
+  });
+}
+
+function testWorkspaceIdFor(workspace: string): string {
+  return `ws_${crypto.createHash('sha256').update(path.resolve(workspace)).digest('hex').slice(0, 12)}`;
 }
 
 function startMismatchedMcpHealthServer(workspaceId: string): Promise<{ url: string; close: () => Promise<void> }> {

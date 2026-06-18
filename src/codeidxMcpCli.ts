@@ -117,7 +117,22 @@ function readCommand(raw: string | undefined): CliOptions['command'] {
 async function resolveEndpoint(options: CliOptions): Promise<URL> {
   const discoveryPath = options.discoveryFile ?? path.join(options.workspace, '.codeidx', 'mcp-server.json');
   const expectedWorkspaceId = workspaceIdFor(options.workspace);
-  if (options.url) { return normalizeMcpUrl(options.url); }
+  if (options.url) {
+    const endpoint = normalizeMcpUrl(options.url);
+    if (options.command === 'proxy') { return endpoint; }
+    const health = await checkEndpointHealth(endpoint, Math.min(1_000, options.timeoutMs), expectedWorkspaceId);
+    if (health.ok) { return endpoint; }
+    if (health.mismatch) {
+      throw new Error(
+        `explicit MCP endpoint ${endpoint.toString()} is for ${health.workspaceId ?? 'unknown workspace'}, ` +
+        `not workspace ${options.workspace}`,
+      );
+    }
+    throw new Error(
+      `explicit MCP endpoint ${endpoint.toString()} failed workspace health validation: ` +
+      `${health.message ?? 'unknown error'}`,
+    );
+  }
 
   const envEndpoint = normalizeOptionalUrl(process.env.CODEIDX_MCP_URL, 'CODEIDX_MCP_URL');
   if (envEndpoint) {

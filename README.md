@@ -61,7 +61,7 @@ Codex example:
 codex mcp add codeidx -- node .codeidx/codeidx-mcp-stdio.js stdio --workspace .
 ```
 
-If your Codex CLI does not load project-scoped `.codex/config.toml`, run the `codex mcp add` command once to register it in your user config.
+Prefer the project-scoped `.codex/config.toml` when your Codex CLI supports it. If you register codeidx in a user/global MCP config, make sure the MCP client starts it with the target workspace as `cwd`, or use a globally installed `codeidx-mcp stdio --workspace .` command. Do not pin a global config to one project's absolute `.codeidx/codeidx-mcp-stdio.js` path unless your client also runs it from the workspace you want to inspect.
 
 Claude Code example:
 

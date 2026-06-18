@@ -5131,6 +5131,23 @@ pub fn query_graph_symbols_with_options(
         })
         .cloned()
         .collect();
+    merge_overlay_symbols(
+        workspace_root,
+        config,
+        store.built_at_unix_ms,
+        &mut symbols,
+        |symbol| {
+            query.is_empty()
+                || symbol.id.eq_ignore_ascii_case(query)
+                || symbol.name.eq_ignore_ascii_case(query)
+                || symbol.qualified_name.eq_ignore_ascii_case(query)
+                || symbol.name.to_ascii_lowercase().contains(&query_lower)
+                || symbol
+                    .qualified_name
+                    .to_ascii_lowercase()
+                    .contains(&query_lower)
+        },
+    );
     symbols.sort_by(|left, right| {
         score_symbol_match(left, query)
             .cmp(&score_symbol_match(right, query))
@@ -5179,6 +5196,13 @@ fn query_graph_symbol_id_with_options(
     let mut symbols = read_symbols_matching(read_path, &file_table, |s| {
         s.id.eq_ignore_ascii_case(symbol_id)
     })?;
+    merge_overlay_symbols(
+        workspace_root,
+        config,
+        built_at_unix_ms,
+        &mut symbols,
+        |symbol| symbol.id.eq_ignore_ascii_case(symbol_id),
+    );
     symbols.sort_by(|left, right| {
         score_symbol_match(left, symbol_id)
             .cmp(&score_symbol_match(right, symbol_id))
@@ -5256,6 +5280,13 @@ pub fn query_graph_document_symbols_with_options(
             .filter(|s| s.uri == uri && s.start_line <= end && s.end_line >= start)
             .collect()
     };
+    merge_overlay_symbols(
+        workspace_root,
+        config,
+        built_at_unix_ms,
+        &mut symbols,
+        |symbol| symbol.uri == uri && symbol.start_line <= end && symbol.end_line >= start,
+    );
     symbols.sort_by(|left, right| {
         left.start_line
             .cmp(&right.start_line)
@@ -5541,6 +5572,30 @@ fn merge_overlay_count_deltas(
         count.usage_likely = (count.usage_likely as i64 + usage_delta).max(0) as usize;
         count.calls_in_likely = (count.calls_in_likely as i64 + calls_delta).max(0) as usize;
     }
+}
+
+fn merge_overlay_symbols(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    built_at_unix_ms: u64,
+    base_symbols: &mut Vec<GraphSymbol>,
+    keep_overlay_symbol: impl Fn(&GraphSymbol) -> bool,
+) {
+    let overlay =
+        crate::graph_overlay::GraphOverlay::load_valid(workspace_root, config, built_at_unix_ms);
+    if overlay.is_empty() {
+        return;
+    }
+    let symbol_superseded = overlay.symbol_superseded();
+    if !symbol_superseded.is_empty() {
+        base_symbols.retain(|symbol| !symbol_superseded.contains(&*symbol.rel_path));
+    }
+    base_symbols.extend(
+        overlay
+            .live_symbols()
+            .filter(|symbol| keep_overlay_symbol(symbol))
+            .cloned(),
+    );
 }
 
 fn merge_overlay_query_refs(
@@ -18576,6 +18631,169 @@ mod tests {
             modified_unix_secs: 0,
             encoding: TextEncoding::Utf8,
         }
+    }
+
+    fn unique_temp_workspace(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn graph_symbol_query_uses_overlay_symbols_for_changed_documents() {
+        let ws = unique_temp_workspace("zoek-overlay-symbol-query");
+        let _ = fs::remove_dir_all(&ws);
+        let config = EngineConfig::default();
+        fs::create_dir_all(ws.join("pkg")).expect("create fixture package");
+        fs::write(ws.join("pkg/__init__.py"), "").expect("write package marker");
+        fs::write(ws.join("pkg/model.py"), "class Target:\n    pass\n").expect("write model");
+        fs::write(
+            ws.join("pkg/use.py"),
+            "from pkg.model import Target\n\n\ndef build():\n    return Target()\n",
+        )
+        .expect("write user");
+
+        let built_at = unix_millis_now();
+        let mut noop = |_progress: GraphRebuildProgress| {};
+        rebuild_graph_native(&ws, built_at, &config, 0, &mut noop).expect("full graph rebuild");
+        let model_uri = file_uri(&ws.join("pkg/model.py"));
+        let before = query_graph_document_symbols_with_options(
+            &ws,
+            &model_uri,
+            None,
+            None,
+            100,
+            &config,
+            GraphSymbolQueryOptions::default(),
+        )
+        .expect("query before edit")
+        .expect("symbol index before edit");
+        assert_eq!(
+            before.built_at_unix_ms, built_at,
+            "base document query must preserve the manifest build id"
+        );
+        let target = before
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Target")
+            .expect("base query should find Target");
+        assert!(
+            target.usage_count.unwrap_or(0) > 0,
+            "base document summary should expose Target usages"
+        );
+
+        fs::write(ws.join("pkg/model.py"), "class Replacement:\n    pass\n").expect("edit model");
+        fs::write(
+            ws.join("pkg/use.py"),
+            "from pkg.model import Replacement\n\n\ndef build():\n    return Replacement()\n",
+        )
+        .expect("edit user");
+        let update = overlay_update_graph_native(
+            &ws,
+            &[ws.join("pkg/model.py"), ws.join("pkg/use.py")],
+            &[],
+            before.built_at_unix_ms,
+            &config,
+            0,
+        )
+        .expect("overlay update");
+        assert_eq!(
+            update.built_at_unix_ms, before.built_at_unix_ms,
+            "overlay update must preserve the base build id"
+        );
+        let overlay =
+            crate::graph_overlay::GraphOverlay::load_valid(&ws, &config, before.built_at_unix_ms);
+        assert!(
+            overlay.entry_count() > 0,
+            "test must exercise the overlay path, not a full-update fallback"
+        );
+
+        let after = query_graph_document_symbols_with_options(
+            &ws,
+            &model_uri,
+            None,
+            None,
+            100,
+            &config,
+            GraphSymbolQueryOptions::default(),
+        )
+        .expect("query after edit")
+        .expect("symbol index after edit");
+        assert!(
+            after.symbols.iter().all(|symbol| symbol.name != "Target"),
+            "overlay query must remove base symbols superseded by the edited file: {:?}",
+            after
+                .symbols
+                .iter()
+                .map(|symbol| symbol.name.to_string())
+                .collect::<Vec<String>>()
+        );
+        let replacement = after
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Replacement")
+            .expect("overlay query should find Replacement");
+        assert!(
+            replacement.usage_count.unwrap_or(0) > 0,
+            "overlay document summary should expose Replacement usages"
+        );
+
+        let by_id = query_graph_symbols_with_options(
+            &ws,
+            &replacement.id,
+            10,
+            &config,
+            GraphSymbolQueryOptions::default(),
+        )
+        .expect("query by id")
+        .expect("symbol index by id");
+        assert!(
+            by_id
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "Replacement"),
+            "symbol-id query must also see overlay symbols"
+        );
+
+        let new_model = ws.join("pkg/new_model.py");
+        fs::write(&new_model, "class Added:\n    pass\n").expect("add new model");
+        fs::write(
+            ws.join("pkg/use.py"),
+            "from pkg.model import Replacement\nfrom pkg.new_model import Added\n\n\ndef build():\n    return Replacement(), Added()\n",
+        )
+        .expect("edit user for new model");
+        overlay_update_graph_native(
+            &ws,
+            &[new_model.clone(), ws.join("pkg/use.py")],
+            &[],
+            before.built_at_unix_ms,
+            &config,
+            0,
+        )
+        .expect("overlay update for added file");
+        let added_doc = query_graph_document_symbols_with_options(
+            &ws,
+            &file_uri(&new_model),
+            None,
+            None,
+            100,
+            &config,
+            GraphSymbolQueryOptions::default(),
+        )
+        .expect("query added file")
+        .expect("symbol index for added file");
+        let added = added_doc
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Added")
+            .expect("overlay query should find symbols from added files");
+        assert!(
+            added.usage_count.unwrap_or(0) > 0,
+            "overlay document summary should expose usages for added-file symbols"
+        );
+        let _ = fs::remove_dir_all(&ws);
     }
 
     fn resolve_test_entries(entries: &[CorpusEntry]) -> (Vec<GraphSymbol>, ResolutionResult) {
