@@ -3901,7 +3901,7 @@ suite('Call graph', () => {
     }
   });
 
-  test('generated MCP launcher prefers cwd workspace discovery and rejects foreign explicit URLs', async function () {
+  test('generated MCP launcher prefers cwd workspace discovery and reports stopped health offline', async function () {
     this.timeout(10_000);
     const api = await getApi();
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -3909,6 +3909,12 @@ suite('Call graph', () => {
     await api.mcpServer.start(0);
     const cliPath = path.join(workspaceRoot, '.codeidx', 'codeidx-mcp-stdio.js');
     await vscode.workspace.fs.stat(vscode.Uri.file(cliPath));
+    const workspaceMcpJson = path.join(workspaceRoot, '.mcp.json');
+    const workspaceCodexDir = path.join(workspaceRoot, '.codex');
+    const workspaceCodexConfig = path.join(workspaceCodexDir, 'config.toml');
+    const hadWorkspaceMcpJson = fs.existsSync(workspaceMcpJson);
+    const hadWorkspaceCodexDir = fs.existsSync(workspaceCodexDir);
+    const hadWorkspaceCodexConfig = fs.existsSync(workspaceCodexConfig);
 
     const otherWorkspaceRoot = path.join(await fs.promises.realpath(os.tmpdir()), `codeidx-mcp-other-${process.pid}-${Date.now()}`);
     const otherCodeidxDir = path.join(otherWorkspaceRoot, '.codeidx');
@@ -3938,23 +3944,68 @@ suite('Call graph', () => {
         otherWorkspaceId,
         `expected generated launcher to prefer cwd workspace discovery, got ${JSON.stringify(otherWorkspaceHealth)}`,
       );
-      await assert.rejects(
-        runChildJson(process.execPath, [
-          cliPath,
-          'health',
-          '--workspace',
-          '.',
-          '--url',
-          otherEndpoint.url,
-          '--connect-timeout-ms',
-          '1000',
-        ], workspaceRoot),
-        /explicit MCP endpoint .* not workspace/,
+      const foreignEndpointHealth = await runChildJson(process.execPath, [
+        cliPath,
+        'health',
+        '--workspace',
+        '.',
+        '--url',
+        otherEndpoint.url,
+        '--connect-timeout-ms',
+        '1000',
+      ], workspaceRoot);
+      assert.strictEqual(foreignEndpointHealth.health?.mcp_connection, 'stopped');
+      assert.strictEqual(foreignEndpointHealth.auto_setup?.ready_for_next_client, true);
+
+      api.mcpServer.stop();
+      const stoppedProxy = spawn(process.execPath, [cliPath, 'stdio', '--workspace', '.', '--connect-timeout-ms', '100'], {
+        cwd: workspaceRoot,
+        stdio: 'pipe',
+      });
+      try {
+        const stoppedInit = await sendStdioJson(stoppedProxy, {
+          jsonrpc: '2.0',
+          id: 221,
+          method: 'initialize',
+          params: { protocolVersion: '2025-11-25' },
+        });
+        assert.strictEqual(stoppedInit.result?.serverInfo?.name, 'codeidx-mcp');
+        const stoppedTools = await sendStdioJson(stoppedProxy, {
+          jsonrpc: '2.0',
+          id: 222,
+          method: 'tools/list',
+          params: {},
+        });
+        assert.deepStrictEqual(
+          stoppedTools.result?.tools?.map((tool: { name?: string }) => tool.name),
+          ['mcp_health'],
+        );
+        const stoppedHealth = await sendStdioJson(stoppedProxy, {
+          jsonrpc: '2.0',
+          id: 223,
+          method: 'tools/call',
+          params: {
+            name: 'mcp_health',
+            arguments: { include_tools: true },
+          },
+        });
+        assert.strictEqual(stoppedHealth.result?.structuredContent?.health?.mcp_connection, 'stopped');
+        assert.strictEqual(stoppedHealth.result?.structuredContent?.auto_setup?.ready_for_next_client, true);
+        assert.deepStrictEqual(stoppedHealth.result?.structuredContent?.tools, ['mcp_health']);
+      } finally {
+        await stopChild(stoppedProxy);
+      }
+      assert.ok(
+        fs.existsSync(path.join(workspaceRoot, '.codeidx', 'codeidx-mcp-stdio.js')),
+        'offline health should keep the workspace stdio launcher installed',
       );
     } finally {
       await otherEndpoint.close();
       api.mcpServer.stop();
       try { await vscode.workspace.fs.delete(vscode.Uri.file(otherWorkspaceRoot), { recursive: true, useTrash: false }); } catch {}
+      if (!hadWorkspaceMcpJson) { try { await vscode.workspace.fs.delete(vscode.Uri.file(workspaceMcpJson)); } catch {} }
+      if (!hadWorkspaceCodexConfig) { try { await vscode.workspace.fs.delete(vscode.Uri.file(workspaceCodexConfig)); } catch {} }
+      if (!hadWorkspaceCodexDir) { try { await vscode.workspace.fs.delete(vscode.Uri.file(workspaceCodexDir)); } catch {} }
     }
   });
 
