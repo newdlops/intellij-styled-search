@@ -118,11 +118,11 @@ type McpTopFileGroupBy = typeof MCP_TOP_FILE_GROUP_BY[number];
 const MCP_SCOPE_PRESETS = ['source', 'tests', 'production', 'all'] as const;
 type McpScopePreset = typeof MCP_SCOPE_PRESETS[number];
 
-const AGENT_POLICY_VERSION = 'codeidx-agent-policy-2026-05-20';
+const AGENT_POLICY_VERSION = 'codeidx-agent-policy-2026-06-20';
 const AGENT_INITIALIZATION_INSTRUCTIONS = [
   'Use codeidx as a token-first repository exploration layer, not a full rg replacement.',
   'Unless higher-priority user/project policy such as AGENTS.md, CLAUDE.md, or direct user instructions says otherwise, automatically use codeidx before broad grep or reading whole files.',
-  'On startup call mcp_health(include_agent_policy=true, include_discovery=true); do not request index refresh/rebuild from MCP.',
+  'On startup call mcp_health(include_agent_policy=true, include_discovery=true); if it reports health.mcp_connection == stopped and mcp_start is available, call mcp_start once for that workspace, rediscover, then call mcp_health again; do not request index refresh/rebuild from MCP.',
   'MCP HTTP endpoint ports can change; on reconnect or transport recovery, rediscover the current endpoint before calling tools.',
   'Default flow: codeidx_probe/codeidx_exists for cardinality, codeidx_search_code(output_mode="minimal", structured=false) for path:line candidates, then codeidx_read_snippets or codeidx_symbol_slice only for selected ranges.',
   'For known identifiers, start with codeidx_search_symbols, then codeidx_signature/symbol_details/find_references; verify high-risk or freshness-sensitive conclusions with text search or rg.',
@@ -177,6 +177,16 @@ function agentInitializationPolicy(): Record<string, unknown> {
         ],
       },
       {
+        step: 'stopped_endpoint_recovery',
+        tool: 'mcp_start',
+        applies_when: 'mcp_health reports health.mcp_connection == stopped from the workspace stdio fallback.',
+        require: [
+          'call mcp_start once when the tool is advertised for the same workspace',
+          'rediscover the MCP endpoint after mcp_start completes',
+          'call mcp_health(include_agent_policy=true, include_discovery=true) again before using search, symbol, reference, or graph tools',
+        ],
+      },
+      {
         step: 'changed_files',
         tool: 'codeidx_changed',
         purpose: 'Inspect active user/agent edits before relying on cached semantic results.',
@@ -219,6 +229,7 @@ function agentInitializationPolicy(): Record<string, unknown> {
     ],
     fallback_rules: [
       'Rediscover the MCP endpoint before fallback when discovery is inconsistent or a transport was reconnected.',
+      'If the workspace stdio fallback reports health.mcp_connection == stopped and advertises mcp_start, call mcp_start once before falling back.',
       'Use rg when search_index_ready is false, last_engine_error is set, rediscovery still leaves discovery inconsistent, or a tool returns fallback_policy_requires_full_scan.',
       'Use rg for workflows that require rg path order, exact whole-workspace audit, or final refactor/delete safety checks.',
       'Use fallback_policy=always only when the user intentionally requests generated/dependency/full-scan coverage.',
@@ -279,6 +290,7 @@ const MCP_SEARCH_CONCURRENCY = 4;
 const MCP_FULL_SCAN_CONCURRENCY = 1;
 const MCP_GENERATED_MAX_FILE_SIZE_BYTES = 16 * 1024 * 1024;
 const STDIO_LAUNCHER_FILE = 'codeidx-mcp-stdio.js';
+const MCP_CONTROL_FILE = 'mcp-control.json';
 
 const SENSITIVE_EXCLUDE_GLOBS = [
   '**/.env',
@@ -404,6 +416,10 @@ export class CallGraphMcpServer implements vscode.Disposable {
   private server: http.Server | undefined;
   private port: number | undefined;
   private startPromise: Promise<string> | undefined;
+  private controlServer: http.Server | undefined;
+  private controlPort: number | undefined;
+  private controlStartPromise: Promise<string> | undefined;
+  private controlToken: string | undefined;
   private readonly searchGate = new AsyncSemaphore(MCP_SEARCH_CONCURRENCY);
   private readonly fullScanGate = new AsyncSemaphore(MCP_FULL_SCAN_CONCURRENCY);
   private readonly snippets = new Map<string, SnippetRecord>();
@@ -420,6 +436,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
 
   dispose(): void {
     this.stop();
+    this.stopControlServer();
   }
 
   isRunning(): boolean {
@@ -428,6 +445,62 @@ export class CallGraphMcpServer implements vscode.Disposable {
 
   getAddress(): string | undefined {
     return this.port === undefined ? undefined : `http://127.0.0.1:${this.port}/mcp`;
+  }
+
+  getControlAddress(): string | undefined {
+    return this.controlPort === undefined ? undefined : `http://127.0.0.1:${this.controlPort}`;
+  }
+
+  async startControlServer(): Promise<string> {
+    if (this.controlServer && this.controlPort !== undefined) {
+      const url = this.getControlAddress()!;
+      await this.writeControlFile(url);
+      return url;
+    }
+    if (this.controlStartPromise) { return this.controlStartPromise; }
+    this.controlToken ??= crypto.randomBytes(24).toString('hex');
+    this.controlServer = http.createServer((req, res) => {
+      void this.handleControlRequest(req, res).catch((err) => {
+        this.writeJson(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+      });
+    });
+    this.controlServer.keepAliveTimeout = 10_000;
+    this.controlServer.headersTimeout = 15_000;
+    this.controlServer.requestTimeout = 30_000;
+    this.controlStartPromise = new Promise<string>((resolve, reject) => {
+      const server = this.controlServer!;
+      const onError = (err: Error) => {
+        server.off('listening', onListening);
+        this.controlStartPromise = undefined;
+        this.controlServer = undefined;
+        reject(err);
+      };
+      const onListening = () => {
+        server.off('error', onError);
+        const address = server.address();
+        if (!address || typeof address === 'string') {
+          this.controlStartPromise = undefined;
+          this.controlServer = undefined;
+          reject(new Error('unexpected MCP control server address'));
+          return;
+        }
+        this.controlPort = address.port;
+        const url = this.getControlAddress()!;
+        this.writeControlFile(url)
+          .then(() => {
+            this.log.appendLine(`codeidx MCP control server started: ${url}`);
+            resolve(url);
+          })
+          .catch(reject)
+          .finally(() => {
+            this.controlStartPromise = undefined;
+          });
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(0, '127.0.0.1', 64);
+    });
+    return this.controlStartPromise;
   }
 
   async start(port = 0): Promise<string> {
@@ -485,6 +558,9 @@ export class CallGraphMcpServer implements vscode.Disposable {
     this.port = typeof address === 'object' && address ? address.port : boundedPort;
     const url = this.getAddress()!;
     await this.writeDiscoveryFile(url);
+    if (this.controlServer && this.getControlAddress()) {
+      await this.writeControlFile(this.getControlAddress()!);
+    }
     this.log.appendLine(`codeidx MCP server started: ${url}`);
     return url;
   }
@@ -496,12 +572,91 @@ export class CallGraphMcpServer implements vscode.Disposable {
     this.server = undefined;
     this.port = undefined;
     void this.removeDiscoveryFile(previousUrl);
+    if (this.controlServer && this.getControlAddress()) {
+      void this.writeControlFile(this.getControlAddress()!);
+    }
     server.close((err) => {
       if (err) {
         this.log.appendLine(`codeidx MCP server stop failed: ${err.message}`);
       } else {
         this.log.appendLine('codeidx MCP server stopped');
       }
+    });
+  }
+
+  stopControlServer(): void {
+    if (!this.controlServer) { return; }
+    const server = this.controlServer;
+    const previousUrl = this.getControlAddress();
+    this.controlServer = undefined;
+    this.controlPort = undefined;
+    this.controlStartPromise = undefined;
+    void this.removeControlFile(previousUrl);
+    server.close((err) => {
+      if (err) {
+        this.log.appendLine(`codeidx MCP control server stop failed: ${err.message}`);
+      } else {
+        this.log.appendLine('codeidx MCP control server stopped');
+      }
+    });
+  }
+
+  private async handleControlRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    if (!isAllowedOrigin(req.headers.origin)) {
+      this.writeJson(res, 403, { ok: false, error: 'origin not allowed' });
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/health') {
+      this.writeJson(res, 200, {
+        ok: true,
+        server: 'codeidx-mcp-control',
+        workspace_id: this.workspaceId(),
+        workspace_root: this.workspaceRootPath() ?? null,
+        mcp_running: this.isRunning(),
+        mcp_endpoint: this.getAddress() ?? null,
+      });
+      return;
+    }
+    if (req.method !== 'POST' || req.url !== '/start') {
+      this.writeJson(res, 404, { ok: false, error: 'not found' });
+      return;
+    }
+    const bodyText = await readBody(req, 64 * 1024);
+    const body = bodyText ? JSON.parse(bodyText) as unknown : {};
+    if (!isObject(body)) {
+      this.writeJson(res, 400, { ok: false, error: 'invalid request body' });
+      return;
+    }
+    const expectedWorkspace = this.workspaceId();
+    if (body.workspace_id !== expectedWorkspace) {
+      this.writeJson(res, 409, {
+        ok: false,
+        error: 'workspace mismatch',
+        expected_workspace_id: expectedWorkspace,
+        actual_workspace_id: typeof body.workspace_id === 'string' ? body.workspace_id : null,
+      });
+      return;
+    }
+    const headerToken = typeof req.headers.authorization === 'string'
+      ? req.headers.authorization.replace(/^Bearer\s+/i, '')
+      : undefined;
+    const token = typeof body.token === 'string' ? body.token : headerToken;
+    if (!this.controlToken || token !== this.controlToken) {
+      this.writeJson(res, 403, { ok: false, error: 'invalid control token' });
+      return;
+    }
+    const wasRunning = this.isRunning();
+    const configuredPort = vscode.workspace.getConfiguration('intellijStyledSearch').get<number>('mcpPort', 0);
+    const endpoint = await this.start(configuredPort);
+    await this.writeControlFile(this.getControlAddress()!);
+    this.writeJson(res, 200, {
+      ok: true,
+      status: wasRunning ? 'already_running' : 'started',
+      server: 'codeidx-mcp-control',
+      workspace_id: expectedWorkspace,
+      workspace_root: this.workspaceRootPath() ?? null,
+      mcp_endpoint: endpoint,
+      discovery_path: this.discoveryFilePath() ?? null,
     });
   }
 
@@ -692,6 +847,8 @@ export class CallGraphMcpServer implements vscode.Disposable {
           return toolResult(this.capEnvelope(await this.explainSearchQuery(args), DEFAULT_MCP_MAX_CHARS));
         case 'mcp_health':
           return toolResult(this.capEnvelope(await this.mcpHealth(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+        case 'mcp_start':
+          return toolResult(this.capEnvelope(await this.mcpStart(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
 
         // Legacy compatibility for users who already configured the original
         // call-graph-only endpoint. These aliases are intentionally omitted
@@ -2963,6 +3120,50 @@ export class CallGraphMcpServer implements vscode.Disposable {
     return payload;
   }
 
+  private async mcpStart(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const includeDiscovery = readBoolArg(args, 'include_discovery', true);
+    const wasRunning = this.isRunning();
+    const configuredPort = vscode.workspace.getConfiguration('intellijStyledSearch').get<number>('mcpPort', 0);
+    const endpoint = await this.start(configuredPort);
+    let controlEndpoint: string | null = null;
+    const warnings: string[] = [];
+    try {
+      controlEndpoint = await this.startControlServer();
+    } catch (err) {
+      warnings.push(`control server start failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const snapshot = await this.callGraph.ensureRestoredSnapshot();
+    const discovery = includeDiscovery ? await this.readDiscoveryStatus() : undefined;
+    const payload: Record<string, unknown> = {
+      ...this.baseEnvelope(
+        snapshot,
+        wasRunning
+          ? 'Workspace MCP endpoint is already running.'
+          : 'Workspace MCP endpoint was started.',
+      ),
+      status: wasRunning ? 'already_running' : 'started',
+      health: {
+        mcp_connection: 'ok',
+        running: true,
+        endpoint,
+        control_endpoint: controlEndpoint,
+        transport: 'http-endpoint',
+        workspace_root: this.workspaceRootPath() ?? null,
+        workspace_id: this.workspaceId(),
+        server_pid: process.pid,
+      },
+      next_steps: [
+        'Call mcp_health(include_agent_policy=true, include_discovery=true) again.',
+        'Rediscover the endpoint before retrying codeidx search, symbol, reference, or graph tools.',
+      ],
+      warnings,
+    };
+    if (includeDiscovery) {
+      payload.discovery = discovery;
+    }
+    return payload;
+  }
+
   private async runSearchBackendWithTimeout(
     options: SearchOptions,
     timeoutMs: number,
@@ -3740,9 +3941,52 @@ export class CallGraphMcpServer implements vscode.Disposable {
     return dir ? path.join(dir, 'mcp-server.json') : undefined;
   }
 
+  private controlFilePath(): string | undefined {
+    const dir = this.codeidxDirPath();
+    return dir ? path.join(dir, MCP_CONTROL_FILE) : undefined;
+  }
+
   private stdioLauncherPath(): string | undefined {
     const dir = this.codeidxDirPath();
     return dir ? path.join(dir, STDIO_LAUNCHER_FILE) : undefined;
+  }
+
+  private async writeControlFile(controlUrl: string): Promise<void> {
+    const filePath = this.controlFilePath();
+    const token = this.controlToken;
+    if (!filePath || !token) { return; }
+    const dirPath = path.dirname(filePath);
+    const payload = {
+      schema_version: SCHEMA_VERSION,
+      server: 'codeidx-mcp-control',
+      transport: 'http',
+      url: `${controlUrl}/start`,
+      health_url: `${controlUrl}/health`,
+      workspace_id: this.workspaceId(),
+      pid: process.pid,
+      token,
+      mcp_endpoint: this.getAddress() ?? null,
+      started_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      lease_expires_at: new Date(Date.now() + 60_000).toISOString(),
+    };
+    await fs.promises.mkdir(dirPath, { recursive: true });
+    await this.writeStdioLauncher(dirPath);
+    const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    await fs.promises.writeFile(tmpPath, JSON.stringify(payload, null, 2) + '\n', 'utf8');
+    await fs.promises.rename(tmpPath, filePath);
+  }
+
+  private async removeControlFile(expectedControlUrl?: string): Promise<void> {
+    const filePath = this.controlFilePath();
+    if (!filePath) { return; }
+    try {
+      const raw = await fs.promises.readFile(filePath, 'utf8');
+      const parsed = JSON.parse(raw) as { url?: unknown; pid?: unknown };
+      if (typeof parsed.url === 'string' && expectedControlUrl && parsed.url !== `${expectedControlUrl}/start`) { return; }
+      if (typeof parsed.pid === 'number' && parsed.pid !== process.pid) { return; }
+      await fs.promises.rm(filePath, { force: true });
+    } catch {}
   }
 
   private async writeDiscoveryFile(url: string): Promise<void> {
@@ -3763,7 +4007,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     try {
       await fs.promises.mkdir(dirPath, { recursive: true });
       await this.writeStdioLauncher(dirPath);
-      const tmpPath = `${filePath}.${process.pid}.tmp`;
+      const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
       await fs.promises.writeFile(tmpPath, JSON.stringify(payload, null, 2) + '\n', 'utf8');
       await fs.promises.rename(tmpPath, filePath);
     } catch (err) {
@@ -3798,8 +4042,9 @@ export class CallGraphMcpServer implements vscode.Disposable {
   private async readDiscoveryStatus(): Promise<Record<string, unknown>> {
     const filePath = this.discoveryFilePath();
     const launcher = await this.readStdioLauncherStatus();
+    const control = await this.readControlStatus();
     if (!filePath) {
-      return { exists: false, path: null, stdio_launcher: launcher };
+      return { exists: false, path: null, stdio_launcher: launcher, control };
     }
     const buildStatus = (parsed: Record<string, unknown>): Record<string, unknown> => {
       const currentEndpoint = this.getAddress();
@@ -3834,6 +4079,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
         updated_at: typeof parsed.updated_at === 'string' ? parsed.updated_at : null,
         lease_expires_at: typeof parsed.lease_expires_at === 'string' ? parsed.lease_expires_at : null,
         stdio_launcher: launcher,
+        control,
       };
     };
     try {
@@ -3861,6 +4107,70 @@ export class CallGraphMcpServer implements vscode.Disposable {
         path: filePath,
         error: err instanceof Error ? err.message : String(err),
         stdio_launcher: launcher,
+        control,
+      };
+    }
+  }
+
+  private async readControlStatus(): Promise<Record<string, unknown>> {
+    const filePath = this.controlFilePath();
+    if (!filePath) {
+      return { exists: false, path: null };
+    }
+    const currentUrl = this.getControlAddress();
+    const buildStatus = (parsed: Record<string, unknown>): Record<string, unknown> => {
+      const url = typeof parsed.url === 'string' ? parsed.url : null;
+      const pid = typeof parsed.pid === 'number' ? parsed.pid : null;
+      const pidAlive = pid !== null ? isProcessAlive(pid) : null;
+      const expectedUrl = currentUrl ? `${currentUrl}/start` : null;
+      const matchesCurrentEndpoint = typeof url === 'string' && expectedUrl !== null && url === expectedUrl;
+      return {
+        exists: true,
+        path: filePath,
+        url,
+        health_url: typeof parsed.health_url === 'string' ? parsed.health_url : null,
+        current_endpoint: expectedUrl,
+        matches_current_endpoint: matchesCurrentEndpoint,
+        pid,
+        current_pid: process.pid,
+        pid_alive: pidAlive,
+        stale: !matchesCurrentEndpoint,
+        status_reason: matchesCurrentEndpoint
+          ? 'current_control_endpoint'
+          : pidAlive === false
+            ? 'dead_process'
+            : 'stale_or_missing_control_endpoint',
+        mcp_endpoint: typeof parsed.mcp_endpoint === 'string' ? parsed.mcp_endpoint : null,
+        token_present: typeof parsed.token === 'string' && parsed.token.length > 0,
+        updated_at: typeof parsed.updated_at === 'string' ? parsed.updated_at : null,
+        lease_expires_at: typeof parsed.lease_expires_at === 'string' ? parsed.lease_expires_at : null,
+      };
+    };
+    try {
+      const raw = await fs.promises.readFile(filePath, 'utf8');
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const status = buildStatus(parsed);
+      if (status.stale === true && currentUrl && this.controlToken) {
+        await this.writeControlFile(currentUrl);
+        try {
+          const repairedRaw = await fs.promises.readFile(filePath, 'utf8');
+          const repaired = buildStatus(JSON.parse(repairedRaw) as Record<string, unknown>);
+          repaired.repaired_stale_control = true;
+          return repaired;
+        } catch (err) {
+          return {
+            ...status,
+            repair_failed: err instanceof Error ? err.message : String(err),
+          };
+        }
+      }
+      return status;
+    } catch (err) {
+      return {
+        exists: false,
+        path: filePath,
+        current_endpoint: currentUrl ? `${currentUrl}/start` : null,
+        error: err instanceof Error ? err.message : String(err),
       };
     }
   }
@@ -4561,6 +4871,16 @@ function toolDefinitions(): ToolDefinition[] {
       }),
       annotations: readOnlyAnnotations(),
     },
+    {
+      name: 'mcp_start',
+      title: 'Start MCP Endpoint',
+      description: 'Idempotently ask the extension to start the current workspace Codeidx MCP endpoint, then return rediscovery guidance.',
+      inputSchema: objectSchema({
+        include_discovery: { type: 'boolean', default: true },
+        max_chars: { type: 'integer', minimum: 1000, maximum: 200000, default: DEFAULT_MCP_MAX_CHARS },
+      }),
+      annotations: idempotentControlAnnotations(),
+    },
   ];
 }
 
@@ -4709,6 +5029,15 @@ function compactSearchProperties(extra: Record<string, unknown> = {}): Record<st
 function readOnlyAnnotations(): Record<string, unknown> {
   return {
     readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  };
+}
+
+function idempotentControlAnnotations(): Record<string, unknown> {
+  return {
+    readOnlyHint: false,
     destructiveHint: false,
     idempotentHint: true,
     openWorldHint: false,
@@ -5536,30 +5865,32 @@ function stdioLauncherContent(cliPath: string): string {
     '  const index = arg.indexOf("=");',
     '  return index === -1 ? undefined : arg.slice(index + 1);',
     '}',
-    'function hasWorkspaceDiscovery(dir) {',
-    '  try {',
-    '    const raw = fs.readFileSync(path.join(dir, ".codeidx", "mcp-server.json"), "utf8");',
-    '    const parsed = JSON.parse(raw);',
-    '    return parsed && typeof parsed.url === "string";',
-    '  } catch (_) {',
-    '    return false;',
-    '  }',
-    '}',
     'function dotWorkspaceArg() {',
     '  const cwd = path.resolve(process.cwd());',
-    '  if (cwd !== workspaceRoot && hasWorkspaceDiscovery(cwd)) {',
+    '  if (cwd !== workspaceRoot) {',
     '    return cwd;',
     '  }',
     '  return workspaceRoot;',
+    '}',
+    'function normalizeWorkspaceArg(value) {',
+    '  if (value === ".") {',
+    '    return dotWorkspaceArg();',
+    '  }',
+    '  try {',
+    '    if (path.resolve(value) === workspaceRoot && path.resolve(process.cwd()) !== workspaceRoot) {',
+    '      return path.resolve(process.cwd());',
+    '    }',
+    '  } catch (_) {}',
+    '  return value;',
     '}',
     'const workspaceIndex = argIndex(["--workspace", "-w"]);',
     'if (workspaceIndex >= 0) {',
     '  const arg = process.argv[workspaceIndex];',
     '  const value = inlineValue(arg);',
-    '  if (value === ".") {',
-    '    process.argv[workspaceIndex] = arg.slice(0, arg.indexOf("=") + 1) + dotWorkspaceArg();',
-    '  } else if (value === undefined && process.argv[workspaceIndex + 1] === ".") {',
-    '    process.argv[workspaceIndex + 1] = dotWorkspaceArg();',
+    '  if (value !== undefined) {',
+    '    process.argv[workspaceIndex] = arg.slice(0, arg.indexOf("=") + 1) + normalizeWorkspaceArg(value);',
+    '  } else if (process.argv[workspaceIndex + 1]) {',
+    '    process.argv[workspaceIndex + 1] = normalizeWorkspaceArg(process.argv[workspaceIndex + 1]);',
     '  }',
     '} else if (argIndex(["--url", "--port", "--discovery-file"]) < 0) {',
     '  process.argv.push("--workspace", dotWorkspaceArg());',

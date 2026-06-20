@@ -531,6 +531,29 @@ suite('Activation', () => {
     assert.strictEqual(service.defaultRustGraphTimeoutMs('graph-rebuild'), 0);
   });
 
+  test('call graph excludes common dependency and build output folders by default', () => {
+    const ext = vscode.extensions.getExtension<ExtensionTestApi>(EXTENSION_ID);
+    const properties = ext?.packageJSON?.contributes?.configuration?.properties ?? {};
+    const searchDefault = properties['intellijStyledSearch.excludeGlobs']?.default ?? [];
+    const graphDefault = properties['intellijStyledSearch.callGraphExcludeGlobs']?.default ?? [];
+
+    assert.deepStrictEqual(searchDefault, [], 'text search excludes stay user-controlled by default');
+    for (const expected of [
+      '**/node_modules/**',
+      '**/target/**',
+      '**/out/**',
+      '**/dist/**',
+      '**/build/**',
+      '**/.venv/**',
+      '**/.gradle/**',
+    ]) {
+      assert.ok(
+        graphDefault.includes(expected),
+        `expected default call graph excludes to include ${expected}`,
+      );
+    }
+  });
+
   test('call graph rust JSON parser tolerates diagnostic stdout before final JSON', async () => {
     const { callGraph } = await getApi();
     const service = callGraph as any;

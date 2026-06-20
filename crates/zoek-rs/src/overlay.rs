@@ -2,8 +2,9 @@ use crate::config::EngineConfig;
 use crate::corpus::{decode_bytes, looks_binary_bytes};
 use crate::mmap_store::{write_atomically, StoreLayout};
 use crate::protocol::json_string;
+use crate::shard::ShardReader;
 use crate::watcher::{ChangeBatch, FileChange, FileChangeKind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
@@ -362,13 +363,61 @@ fn compact_overlay_manifest(
     manifest: &mut OverlayManifest,
 ) -> io::Result<()> {
     let latest = manifest.latest_entries();
-    manifest.entries = latest.into_iter().map(|(_, entry)| entry).collect();
+    let base_tombstone_paths = base_paths_for_tombstones(layout, latest.values());
+    manifest.entries = latest
+        .into_iter()
+        .filter_map(|(rel_path, entry)| {
+            if entry.tombstone && !base_tombstone_paths.contains(&rel_path) {
+                None
+            } else {
+                Some(entry)
+            }
+        })
+        .collect();
     manifest.save(&layout.overlay_path)?;
     match fs::remove_file(&layout.overlay_journal_path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+fn base_paths_for_tombstones<'a>(
+    layout: &StoreLayout,
+    entries: impl Iterator<Item = &'a OverlayEntry>,
+) -> BTreeSet<String> {
+    let tombstone_paths = entries
+        .filter(|entry| entry.tombstone)
+        .map(|entry| entry.rel_path.clone())
+        .collect::<BTreeSet<_>>();
+    if tombstone_paths.is_empty() {
+        return BTreeSet::new();
+    }
+
+    let shard_paths = match layout.list_shard_paths() {
+        Ok(paths) => paths,
+        Err(_) => return tombstone_paths,
+    };
+    let mut found = BTreeSet::new();
+    for shard_path in shard_paths {
+        let reader = match ShardReader::open(&shard_path) {
+            Ok(reader) => reader,
+            Err(_) => return tombstone_paths,
+        };
+        let documents = match reader.documents() {
+            Ok(documents) => documents,
+            Err(_) => return tombstone_paths,
+        };
+        for document in documents {
+            if tombstone_paths.contains(&document.rel_path) {
+                found.insert(document.rel_path);
+                if found.len() == tombstone_paths.len() {
+                    return found;
+                }
+            }
+        }
+    }
+    found
 }
 
 fn build_entry_for_path(
@@ -832,6 +881,7 @@ fn decode_json_string(text: &str) -> Result<String, ()> {
 mod tests {
     use super::{apply_change_batch, load_overlay_with_recovery, OverlayEntry, OverlayManifest};
     use crate::config::EngineConfig;
+    use crate::indexer::index_directory;
     use crate::mmap_store::StoreLayout;
     use crate::watcher::build_change_batch;
     use std::fs;
@@ -960,6 +1010,67 @@ mod tests {
         let overlay = OverlayManifest::load(&layout.overlay_path)?;
         assert_eq!(overlay.entries.len(), 1);
         assert_eq!(overlay.entries[0].generation, generation);
+        assert!(!layout.overlay_journal_path.exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_drops_tombstone_for_path_absent_from_base() -> io::Result<()> {
+        let root = temp_dir("overlay-transient-tombstone");
+        fs::create_dir_all(root.join("src"))?;
+        let mut config = EngineConfig::default();
+        config.overlay_compaction_entry_threshold = 2;
+        let layout = StoreLayout::for_workspace(&root, &config);
+
+        fs::write(root.join("src/transient.rs"), "struct Transient {}\n")?;
+        let batch = build_change_batch(0, &[String::from("src/transient.rs")], &[], &[]);
+        let summary = apply_change_batch(&root, &layout, &config, &batch)?;
+        assert_eq!(summary.overlay_total_entries, 1);
+
+        fs::remove_file(root.join("src/transient.rs"))?;
+        let batch = build_change_batch(
+            summary.generation,
+            &[],
+            &[String::from("src/transient.rs")],
+            &[],
+        );
+        let summary = apply_change_batch(&root, &layout, &config, &batch)?;
+        assert!(summary.compaction_performed);
+        assert_eq!(summary.entries_written, 1);
+        assert_eq!(summary.tombstones, 1);
+        assert_eq!(summary.overlay_total_entries, 0);
+        assert_eq!(summary.latest_visible_entries, 0);
+        assert!(!summary.compaction_suggested);
+
+        let overlay = OverlayManifest::load(&layout.overlay_path)?;
+        assert!(overlay.entries.is_empty());
+        assert!(!layout.overlay_journal_path.exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_keeps_tombstone_for_path_present_in_base() -> io::Result<()> {
+        let root = temp_dir("overlay-base-tombstone");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/base.rs"), "struct BaseDocument {}\n")?;
+        let mut config = EngineConfig::default();
+        config.overlay_compaction_entry_threshold = 1;
+        let layout = StoreLayout::for_workspace(&root, &config);
+        index_directory(&root, &config)?;
+
+        fs::remove_file(root.join("src/base.rs"))?;
+        let batch = build_change_batch(0, &[], &[String::from("src/base.rs")], &[]);
+        let summary = apply_change_batch(&root, &layout, &config, &batch)?;
+        assert!(summary.compaction_performed);
+        assert_eq!(summary.overlay_total_entries, 1);
+        assert_eq!(summary.latest_visible_entries, 1);
+
+        let latest = OverlayManifest::load(&layout.overlay_path)?.latest_entries();
+        assert!(latest["src/base.rs"].tombstone);
         assert!(!layout.overlay_journal_path.exists());
 
         fs::remove_dir_all(root)?;

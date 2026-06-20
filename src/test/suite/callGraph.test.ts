@@ -3906,6 +3906,7 @@ suite('Call graph', () => {
     const api = await getApi();
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     assert.ok(workspaceRoot, 'expected fixture workspace root');
+    await api.mcpServer.startControlServer();
     await api.mcpServer.start(0);
     const cliPath = path.join(workspaceRoot, '.codeidx', 'codeidx-mcp-stdio.js');
     await vscode.workspace.fs.stat(vscode.Uri.file(cliPath));
@@ -3920,6 +3921,8 @@ suite('Call graph', () => {
     const otherCodeidxDir = path.join(otherWorkspaceRoot, '.codeidx');
     const otherWorkspaceId = testWorkspaceIdFor(otherWorkspaceRoot);
     const otherEndpoint = await startMismatchedMcpHealthServer(otherWorkspaceId);
+    const emptyWorkspaceRoot = path.join(await fs.promises.realpath(os.tmpdir()), `codeidx-mcp-empty-${process.pid}-${Date.now()}`);
+    const globalHomeRoot = path.join(await fs.promises.realpath(os.tmpdir()), `codeidx-mcp-home-${process.pid}-${Date.now()}`);
     try {
       await vscode.workspace.fs.createDirectory(vscode.Uri.file(otherCodeidxDir));
       await vscode.workspace.fs.writeFile(vscode.Uri.file(path.join(otherCodeidxDir, 'mcp-server.json')), Buffer.from(JSON.stringify({
@@ -3957,6 +3960,100 @@ suite('Call graph', () => {
       assert.strictEqual(foreignEndpointHealth.health?.mcp_connection, 'stopped');
       assert.strictEqual(foreignEndpointHealth.auto_setup?.ready_for_next_client, true);
 
+      await vscode.workspace.fs.createDirectory(vscode.Uri.file(emptyWorkspaceRoot));
+      const globalCodexDir = path.join(globalHomeRoot, '.codex');
+      await fs.promises.mkdir(globalCodexDir, { recursive: true });
+      await fs.promises.writeFile(path.join(globalCodexDir, 'config.toml'), [
+        '[mcp_servers.codeidx]',
+        'command = "node"',
+        `args = ["${cliPath}", "stdio", "--workspace", "${workspaceRoot}"]`,
+        '',
+      ].join('\n'), 'utf8');
+      const emptyWorkspaceHealth = await runChildJson(process.execPath, [
+        cliPath,
+        'health',
+        '--workspace',
+        '.',
+        '--connect-timeout-ms',
+        '100',
+      ], emptyWorkspaceRoot, { HOME: globalHomeRoot });
+      assert.strictEqual(
+        emptyWorkspaceHealth.snapshot?.workspace_id,
+        testWorkspaceIdFor(emptyWorkspaceRoot),
+        'generated launcher must use cwd workspace even before that workspace has MCP discovery',
+      );
+      assert.strictEqual(emptyWorkspaceHealth.health?.workspace_root, emptyWorkspaceRoot);
+      assert.strictEqual(emptyWorkspaceHealth.auto_setup?.global_config_policy, 'project_local_only');
+      assert.match(
+        String(emptyWorkspaceHealth.auto_setup?.global_codex_config?.error ?? ''),
+        /Global Codex codeidx config is workspace-specific/,
+      );
+      const emptyWorkspaceCodexConfig = await fs.promises.readFile(
+        path.join(emptyWorkspaceRoot, '.codex', 'config.toml'),
+        'utf8',
+      );
+      assert.ok(
+        !emptyWorkspaceCodexConfig.includes(emptyWorkspaceRoot),
+        'project-local Codex config must stay cwd-relative and not pin an absolute workspace path',
+      );
+      const pinnedLauncherWorkspaceHealth = await runChildJson(process.execPath, [
+        cliPath,
+        'health',
+        '--workspace',
+        workspaceRoot,
+        '--connect-timeout-ms',
+        '100',
+      ], emptyWorkspaceRoot);
+      assert.strictEqual(
+        pinnedLauncherWorkspaceHealth.snapshot?.workspace_id,
+        testWorkspaceIdFor(emptyWorkspaceRoot),
+        'generated launcher must rewrite stale global configs pinned to the launcher workspace',
+      );
+      assert.strictEqual(pinnedLauncherWorkspaceHealth.health?.workspace_root, emptyWorkspaceRoot);
+
+      const staleEndpointProxy = spawn(process.execPath, [cliPath, 'stdio', '--workspace', '.', '--connect-timeout-ms', '100'], {
+        cwd: workspaceRoot,
+        stdio: 'pipe',
+      });
+      try {
+        const liveProxyInit = await sendStdioJson(staleEndpointProxy, {
+          jsonrpc: '2.0',
+          id: 211,
+          method: 'initialize',
+          params: { protocolVersion: '2025-11-25' },
+        });
+        assert.strictEqual(liveProxyInit.result?.serverInfo?.name, 'codeidx-mcp');
+        const liveProxyTools = await sendStdioJson(staleEndpointProxy, {
+          jsonrpc: '2.0',
+          id: 212,
+          method: 'tools/list',
+          params: {},
+        });
+        const liveProxyToolNames = liveProxyTools.result?.tools?.map((tool: { name?: string }) => tool.name) ?? [];
+        assert.ok(liveProxyToolNames.includes('codeidx_search_code'), 'expected initial stdio proxy to forward to the live MCP endpoint');
+
+        api.mcpServer.stop();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        assert.strictEqual(api.mcpServer.isRunning(), false, 'test setup should leave the proxy holding a stale endpoint');
+        const staleStartResult = await sendStdioJson(staleEndpointProxy, {
+          jsonrpc: '2.0',
+          id: 213,
+          method: 'tools/call',
+          params: {
+            name: 'mcp_start',
+            arguments: { timeout_ms: 5000 },
+          },
+        });
+        assert.strictEqual(staleStartResult.result?.structuredContent?.ok, true);
+        assert.match(String(staleStartResult.result?.structuredContent?.status ?? ''), /started|already_running/);
+        assert.ok(
+          api.mcpServer.isRunning(),
+          'mcp_start should recover even when the stdio proxy first tries a stale HTTP endpoint',
+        );
+      } finally {
+        await stopChild(staleEndpointProxy);
+      }
+
       api.mcpServer.stop();
       const stoppedProxy = spawn(process.execPath, [cliPath, 'stdio', '--workspace', '.', '--connect-timeout-ms', '100'], {
         cwd: workspaceRoot,
@@ -3970,6 +4067,7 @@ suite('Call graph', () => {
           params: { protocolVersion: '2025-11-25' },
         });
         assert.strictEqual(stoppedInit.result?.serverInfo?.name, 'codeidx-mcp');
+        assert.match(String(stoppedInit.result?.instructions ?? ''), /mcp_start/);
         const stoppedTools = await sendStdioJson(stoppedProxy, {
           jsonrpc: '2.0',
           id: 222,
@@ -3978,7 +4076,7 @@ suite('Call graph', () => {
         });
         assert.deepStrictEqual(
           stoppedTools.result?.tools?.map((tool: { name?: string }) => tool.name),
-          ['mcp_health'],
+          ['mcp_health', 'mcp_start'],
         );
         const stoppedHealth = await sendStdioJson(stoppedProxy, {
           jsonrpc: '2.0',
@@ -3990,8 +4088,29 @@ suite('Call graph', () => {
           },
         });
         assert.strictEqual(stoppedHealth.result?.structuredContent?.health?.mcp_connection, 'stopped');
+        assert.strictEqual(stoppedHealth.result?.structuredContent?.control?.available, true);
         assert.strictEqual(stoppedHealth.result?.structuredContent?.auto_setup?.ready_for_next_client, true);
-        assert.deepStrictEqual(stoppedHealth.result?.structuredContent?.tools, ['mcp_health']);
+        assert.deepStrictEqual(stoppedHealth.result?.structuredContent?.tools, ['mcp_health', 'mcp_start']);
+        const startResult = await sendStdioJson(stoppedProxy, {
+          jsonrpc: '2.0',
+          id: 224,
+          method: 'tools/call',
+          params: {
+            name: 'mcp_start',
+            arguments: { timeout_ms: 5000 },
+          },
+        });
+        assert.strictEqual(startResult.result?.structuredContent?.ok, true);
+        assert.match(String(startResult.result?.structuredContent?.status ?? ''), /started|already_running/);
+        assert.ok(api.mcpServer.isRunning(), 'mcp_start should start the workspace MCP endpoint through the extension control API');
+        const liveTools = await sendStdioJson(stoppedProxy, {
+          jsonrpc: '2.0',
+          id: 225,
+          method: 'tools/list',
+          params: {},
+        });
+        const liveToolNames = liveTools.result?.tools?.map((tool: { name?: string }) => tool.name) ?? [];
+        assert.ok(liveToolNames.includes('codeidx_search_code'), 'expected stdio proxy to rediscover and forward to live MCP endpoint');
       } finally {
         await stopChild(stoppedProxy);
       }
@@ -4003,6 +4122,8 @@ suite('Call graph', () => {
       await otherEndpoint.close();
       api.mcpServer.stop();
       try { await vscode.workspace.fs.delete(vscode.Uri.file(otherWorkspaceRoot), { recursive: true, useTrash: false }); } catch {}
+      try { await vscode.workspace.fs.delete(vscode.Uri.file(emptyWorkspaceRoot), { recursive: true, useTrash: false }); } catch {}
+      try { await vscode.workspace.fs.delete(vscode.Uri.file(globalHomeRoot), { recursive: true, useTrash: false }); } catch {}
       if (!hadWorkspaceMcpJson) { try { await vscode.workspace.fs.delete(vscode.Uri.file(workspaceMcpJson)); } catch {} }
       if (!hadWorkspaceCodexConfig) { try { await vscode.workspace.fs.delete(vscode.Uri.file(workspaceCodexConfig)); } catch {} }
       if (!hadWorkspaceCodexDir) { try { await vscode.workspace.fs.delete(vscode.Uri.file(workspaceCodexDir)); } catch {} }
@@ -4148,9 +4269,9 @@ function postJsonMaybeEmpty(url: string, payload: unknown): Promise<any | undefi
   });
 }
 
-function runChildJson(command: string, args: string[], cwd: string): Promise<any> {
+function runChildJson(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv = {}): Promise<any> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, stdio: 'pipe' });
+    const child = spawn(command, args, { cwd, env: { ...process.env, ...env }, stdio: 'pipe' });
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => {

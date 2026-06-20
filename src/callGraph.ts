@@ -787,13 +787,12 @@ const RUST_NATIVE_GRAPH_MANIFEST_VERSION = 7;
 const RUST_NATIVE_GRAPH_REBUILD_WARNING = 'rust-native graph rebuild stores the primary graph in zoek-rs binary index; JS snapshot arrays are intentionally not materialized';
 const CALL_GRAPH_EXTERNAL_INCREMENTAL_DEBOUNCE_MS = 1_500;
 const CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS = 75;
-// Each incremental graph-update loads the full prior reference set into the
-// rust process; running several at once (an edit storm during a long update) is
-// the OOM risk. The drain loop serializes them — at most one update process at
-// a time — and coalesces files that change mid-update into a single follow-up
-// pass. These bound that loop:
+// Incremental graph updates rewrite a shared overlay and can fall back to a heavy
+// full update when sidecars are missing. The drain loop serializes them — at most
+// one update process at a time — and coalesces files that change mid-update into
+// a single follow-up pass. These bound that loop:
 //   - a coalesced batch this large is cheaper + memory-bounded as ONE full
-//     rebuild than as a giant incremental (mass edit / branch switch);
+//     rebuild than as a giant overlay/update batch (mass edit / branch switch);
 const CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD = 200;
 //   - and continuous editing can't hold one update in flight forever: after
 //     this many back-to-back passes the loop releases and the next debounce
@@ -2466,10 +2465,9 @@ export class CallGraphService implements vscode.Disposable {
   // Single-flight gate: at most ONE incremental drain runs at a time. Changes
   // that arrive while it runs accumulate in pendingChangedUris and are picked up
   // by the same drain loop — coalesced into one more pass instead of spawning
-  // concurrent graph-update processes. Each incremental loads the full prior
-  // reference set, so the old "await the in-flight promise, then start mine"
-  // path let N piled-up callers all resume and run at once → an edit storm could
-  // exhaust memory. Serializing + coalescing bounds it to a single process.
+  // concurrent graph-update processes. The overlay file and sidecars are shared,
+  // and an incremental can still fall back to the full path when old sidecars are
+  // missing. Serializing + coalescing bounds it to a single process.
   private kickIncrementalRefresh(): Promise<void> {
     if (this.incrementalPromise) { return this.incrementalPromise; }
     this.incrementalPromise = this.drainIncrementalRefresh().finally(() => {

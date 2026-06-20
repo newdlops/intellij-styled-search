@@ -487,8 +487,27 @@
         },
         "intellijStyledSearch.callGraphExcludeGlobs": {
           "type": "array",
-          "default": [],
-          "description": "User-controlled glob patterns excluded only from call graph rebuilds. Binary and oversized files are filtered separately."
+          "default": [
+            "**/node_modules/**",
+            "**/target/**",
+            "**/out/**",
+            "**/dist/**",
+            "**/build/**",
+            "**/coverage/**",
+            "**/.next/**",
+            "**/.nuxt/**",
+            "**/.svelte-kit/**",
+            "**/.angular/**",
+            "**/.venv/**",
+            "**/venv/**",
+            "**/__pycache__/**",
+            "**/.mypy_cache/**",
+            "**/.pytest_cache/**",
+            "**/.ruff_cache/**",
+            "**/.gradle/**",
+            "**/.tox/**"
+          ],
+          "description": "Glob patterns excluded only from call graph rebuilds. Defaults skip common dependency, build output, and tool cache folders; set to [] to include them intentionally. Binary and oversized files are filtered separately."
         },
         "intellijStyledSearch.callGraphIncludePossibleEdges": {
           "type": "boolean",

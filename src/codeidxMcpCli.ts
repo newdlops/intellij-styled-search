@@ -44,6 +44,8 @@ type AutoSetupStatus = {
   stdio_launcher: SetupFileStatus;
   mcp_json: SetupFileStatus;
   codex_config: SetupFileStatus;
+  global_config_policy: 'project_local_only';
+  global_codex_config: SetupFileStatus;
   ready_for_next_client: boolean;
   requires_vscode_extension: boolean;
   next_steps: string[];
@@ -56,6 +58,8 @@ type OfflineMcpState = {
   workspaceId: string;
   discoveryPath: string;
   discovery: Record<string, unknown>;
+  controlPath: string;
+  control: Record<string, unknown>;
   autoSetup: AutoSetupStatus;
 };
 
@@ -63,6 +67,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const STDIO_INITIAL_DISCOVERY_TIMEOUT_MS = 1_500;
 const STDIO_REDISCOVERY_TIMEOUT_MS = 250;
 const SCHEMA_VERSION = 'codeidx.mcp/0.1';
+const MCP_CONTROL_FILE = 'mcp-control.json';
 const TARGET_MCP_PROTOCOL_VERSION = '2025-11-25';
 const SUPPORTED_MCP_PROTOCOL_VERSIONS = new Set([
   TARGET_MCP_PROTOCOL_VERSION,
@@ -90,6 +95,26 @@ const OFFLINE_HEALTH_TOOL = {
     openWorldHint: false,
   },
 };
+const OFFLINE_START_TOOL = {
+  name: 'mcp_start',
+  title: 'Start MCP Endpoint',
+  description: 'Ask the VS Code extension control API to start this workspace Codeidx MCP endpoint.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      timeout_ms: { type: 'integer', minimum: 100, maximum: 120000, default: 5000 },
+      max_chars: { type: 'integer', minimum: 1000, maximum: 200000, default: 100000 },
+    },
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+};
+const OFFLINE_TOOLS = [OFFLINE_HEALTH_TOOL, OFFLINE_START_TOOL];
 
 void main().catch((err) => {
   log(`fatal: ${err instanceof Error ? err.message : String(err)}`);
@@ -333,6 +358,108 @@ function readDiscoveryStatus(filePath: string, expectedWorkspaceId: string): Rec
   }
 }
 
+function readControlStatus(filePath: string, expectedWorkspaceId: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Record<string, unknown>;
+    const url = typeof parsed.url === 'string' ? parsed.url : null;
+    const workspaceId = typeof parsed.workspace_id === 'string' ? parsed.workspace_id : null;
+    const pid = typeof parsed.pid === 'number' ? parsed.pid : null;
+    const pidAlive = pid !== null ? isProcessAlive(pid) : null;
+    const tokenPresent = typeof parsed.token === 'string' && parsed.token.length > 0;
+    const workspaceMatches = workspaceId === expectedWorkspaceId;
+    const available = typeof url === 'string' && tokenPresent && workspaceMatches && pidAlive !== false;
+    return {
+      exists: true,
+      path: filePath,
+      url,
+      health_url: typeof parsed.health_url === 'string' ? parsed.health_url : null,
+      workspace_id: workspaceId,
+      expected_workspace_id: expectedWorkspaceId,
+      workspace_id_matches: workspaceMatches,
+      pid,
+      pid_alive: pidAlive,
+      token_present: tokenPresent,
+      available,
+      stale: !available,
+      status_reason: workspaceMatches
+        ? pidAlive === false
+          ? 'dead_process'
+          : tokenPresent && typeof url === 'string'
+            ? 'control_available'
+            : 'missing_control_url_or_token'
+        : 'workspace_mismatch',
+      mcp_endpoint: typeof parsed.mcp_endpoint === 'string' ? parsed.mcp_endpoint : null,
+      updated_at: typeof parsed.updated_at === 'string' ? parsed.updated_at : null,
+      lease_expires_at: typeof parsed.lease_expires_at === 'string' ? parsed.lease_expires_at : null,
+    };
+  } catch (err) {
+    return {
+      exists: false,
+      path: filePath,
+      expected_workspace_id: expectedWorkspaceId,
+      available: false,
+      stale: true,
+      status_reason: 'missing_or_unreadable',
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+type ControlFileRead =
+  | { ok: true; url: string; token: string }
+  | { ok: false; code: string; message: string };
+
+function readControlFile(filePath: string, expectedWorkspaceId: string): ControlFileRead {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Record<string, unknown>;
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'mcp_control_unavailable',
+      message: `Workspace MCP control file is not available at ${filePath}: ${err instanceof Error ? err.message : String(err)}.`,
+    };
+  }
+  const workspaceId = typeof parsed.workspace_id === 'string' ? parsed.workspace_id : undefined;
+  if (workspaceId !== expectedWorkspaceId) {
+    return {
+      ok: false,
+      code: 'mcp_control_workspace_mismatch',
+      message: `Workspace MCP control file belongs to ${workspaceId ?? 'unknown workspace'}, not ${expectedWorkspaceId}.`,
+    };
+  }
+  const url = typeof parsed.url === 'string' ? parsed.url : undefined;
+  const token = typeof parsed.token === 'string' ? parsed.token : undefined;
+  if (!url || !token) {
+    return {
+      ok: false,
+      code: 'mcp_control_unavailable',
+      message: 'Workspace MCP control file is missing the control URL or token.',
+    };
+  }
+  const pid = typeof parsed.pid === 'number' ? parsed.pid : undefined;
+  if (pid !== undefined && !isProcessAlive(pid)) {
+    return {
+      ok: false,
+      code: 'mcp_control_stale',
+      message: `Workspace MCP control owner process ${pid} is not running.`,
+    };
+  }
+  try {
+    const endpoint = new URL(url);
+    if (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') {
+      throw new Error(`unsupported protocol ${endpoint.protocol}`);
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'mcp_control_invalid_url',
+      message: `Workspace MCP control URL is invalid: ${err instanceof Error ? err.message : String(err)}.`,
+    };
+  }
+  return { ok: true, url, token };
+}
+
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -415,8 +542,23 @@ async function runStdioProxy(initialEndpoint: URL | undefined, options: CliOptio
           }
         }
         if (endpoint) {
-          await forwardLine(endpoint, trimmed, options.timeoutMs);
-          return;
+          try {
+            await forwardLine(endpoint, trimmed, options.timeoutMs);
+            return;
+          } catch (err) {
+            log(`stdio proxy lost endpoint ${endpoint.toString()}: ${err instanceof Error ? err.message : String(err)}`);
+            endpoint = await tryResolveEndpoint({ ...options, timeoutMs: STDIO_REDISCOVERY_TIMEOUT_MS });
+            if (endpoint) {
+              log(`stdio proxy rediscovered endpoint ${endpoint.toString()}`);
+              try {
+                await forwardLine(endpoint, trimmed, options.timeoutMs);
+                return;
+              } catch (retryErr) {
+                log(`stdio proxy rediscovered endpoint failed ${endpoint.toString()}: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
+                endpoint = undefined;
+              }
+            }
+          }
         }
         await handleOfflineLine(options, offlineState ?? buildOfflineMcpState(options, 'endpoint_not_discovered'), trimmed);
       })
@@ -441,17 +583,22 @@ async function handleOfflineLine(options: CliOptions, state: OfflineMcpState, li
     return;
   }
 
-  const response = Array.isArray(message)
-    ? message
-      .map((item) => offlineResponseForMessage(options, state, item))
-      .filter((item): item is Record<string, unknown> => !!item)
-    : offlineResponseForMessage(options, state, message);
-  if (Array.isArray(response) && response.length === 0) { return; }
+  if (Array.isArray(message)) {
+    const responses = await Promise.all(
+      message.map((item) => offlineResponseForMessage(options, state, item)),
+    );
+    const filtered = responses
+      .filter((item): item is Record<string, unknown> => !!item);
+    if (filtered.length === 0) { return; }
+    writeStdoutJson(filtered);
+    return;
+  }
+  const response = await offlineResponseForMessage(options, state, message);
   if (!response) { return; }
   writeStdoutJson(response);
 }
 
-function offlineResponseForMessage(options: CliOptions, state: OfflineMcpState, message: JsonRpcMessage): Record<string, unknown> | null {
+async function offlineResponseForMessage(options: CliOptions, state: OfflineMcpState, message: JsonRpcMessage): Promise<Record<string, unknown> | null> {
   if (message.jsonrpc !== '2.0' || typeof message.method !== 'string') {
     return jsonRpcError(message.id ?? null, -32600, 'Invalid JSON-RPC request.');
   }
@@ -465,7 +612,7 @@ function offlineResponseForMessage(options: CliOptions, state: OfflineMcpState, 
     case 'ping':
       return jsonRpcResult(id, {});
     case 'tools/list':
-      return jsonRpcResult(id, { tools: [OFFLINE_HEALTH_TOOL] });
+      return jsonRpcResult(id, { tools: OFFLINE_TOOLS });
     case 'tools/call': {
       const params = isRecord(message.params) ? message.params : {};
       const name = typeof params.name === 'string' ? params.name : undefined;
@@ -474,9 +621,12 @@ function offlineResponseForMessage(options: CliOptions, state: OfflineMcpState, 
         const latest = buildOfflineMcpState(options, state.reason, state.message);
         return jsonRpcResult(id, toolResult(offlineHealthEnvelope(latest, args, true)));
       }
+      if (name === 'mcp_start') {
+        return jsonRpcResult(id, await startWorkspaceMcpEndpoint(options, state, args));
+      }
       return jsonRpcResult(id, toolErrorResult(
         'mcp_stopped',
-        `Codeidx MCP endpoint is not running for workspace ${options.workspace}. Call mcp_health for setup status.`,
+        `Codeidx MCP endpoint is not running for workspace ${options.workspace}. Call mcp_start if mcp_health reports control.available == true.`,
       ));
     }
     case 'resources/list':
@@ -509,20 +659,24 @@ function offlineInitializeResult(params: unknown): Record<string, unknown> {
       name: 'codeidx-mcp',
       title: 'Codebase Index MCP',
       version: 'offline-stdio',
-      description: 'Workspace Codeidx MCP endpoint is stopped; only mcp_health is available until the VS Code extension starts the endpoint.',
+      description: 'Workspace Codeidx MCP endpoint is stopped; mcp_health and mcp_start are available until the VS Code extension starts the endpoint.',
     },
     instructions: [
       'The workspace Codeidx MCP endpoint is not running.',
-      'Call mcp_health to inspect stopped state and local auto-setup status.',
-      'Open this workspace in VS Code with IntelliJ Styled Search enabled, or run the Start Codeidx MCP Server command there.',
+      'Call mcp_health to inspect stopped state, control API status, and local auto-setup status.',
+      'If mcp_health reports health.mcp_connection == stopped and control.available == true, call mcp_start once, then call mcp_health again before using codeidx tools.',
+      'If control.available is false, open this workspace in VS Code with IntelliJ Styled Search enabled.',
     ].join('\n'),
   };
 }
 
 function buildOfflineMcpState(options: CliOptions, reason: string, message?: string): OfflineMcpState {
-  const discoveryPath = options.discoveryFile ?? path.join(options.workspace, '.codeidx', 'mcp-server.json');
+  const codeidxDir = path.join(options.workspace, '.codeidx');
+  const discoveryPath = options.discoveryFile ?? path.join(codeidxDir, 'mcp-server.json');
+  const controlPath = path.join(codeidxDir, MCP_CONTROL_FILE);
   const workspaceId = workspaceIdFor(options.workspace);
   const discovery = readDiscoveryStatus(discoveryPath, workspaceId);
+  const control = readControlStatus(controlPath, workspaceId);
   const autoSetup = ensureWorkspaceMcpSetup(options.workspace);
   return {
     reason,
@@ -531,6 +685,8 @@ function buildOfflineMcpState(options: CliOptions, reason: string, message?: str
     workspaceId,
     discoveryPath,
     discovery,
+    controlPath,
+    control,
     autoSetup,
   };
 }
@@ -564,10 +720,7 @@ function offlineHealthEnvelope(state: OfflineMcpState, args: Record<string, unkn
     resource_links: [],
     next_cursor: null,
     truncated: false,
-    warnings: [
-      'Only mcp_health is available while the workspace HTTP endpoint is stopped.',
-      'Open this workspace in VS Code with IntelliJ Styled Search enabled, or run Start Codeidx MCP Server in that window.',
-    ],
+    warnings: offlineStoppedWarnings(state),
     health: {
       mcp_connection: 'stopped',
       running: false,
@@ -606,8 +759,9 @@ function offlineHealthEnvelope(state: OfflineMcpState, args: Record<string, unkn
         native_graph_expected_version: null,
       },
     },
+    control: state.control,
     auto_setup: state.autoSetup,
-    tool_count: 1,
+    tool_count: OFFLINE_TOOLS.length,
   };
   if (includeDiscovery) {
     payload.discovery = state.discovery;
@@ -616,33 +770,122 @@ function offlineHealthEnvelope(state: OfflineMcpState, args: Record<string, unkn
     payload.agent_policy = offlineAgentPolicy();
   }
   if (includeTools) {
-    payload.tools = [OFFLINE_HEALTH_TOOL.name];
+    payload.tools = OFFLINE_TOOLS.map((tool) => tool.name);
   }
   return payload;
+}
+
+function offlineStoppedWarnings(state: OfflineMcpState): string[] {
+  const canStart = state.control.available === true;
+  return [
+    'Only mcp_health and mcp_start are available while the workspace HTTP endpoint is stopped.',
+    canStart
+      ? 'Call mcp_start once to ask the VS Code extension to start this workspace MCP endpoint, then call mcp_health again.'
+      : 'Open this workspace in VS Code with IntelliJ Styled Search enabled so the extension can publish the workspace control API.',
+  ];
+}
+
+async function startWorkspaceMcpEndpoint(
+  options: CliOptions,
+  state: OfflineMcpState,
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const latest = buildOfflineMcpState(options, state.reason, state.message);
+  const timeoutMs = readIntArg(args, 'timeout_ms', Math.min(options.timeoutMs, 5_000), 100, 120_000);
+  const control = readControlFile(latest.controlPath, latest.workspaceId);
+  if (!control.ok) {
+    return toolErrorResult(
+      control.code,
+      `${control.message} Call mcp_health(include_agent_policy=true, include_discovery=true) for current setup details.`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    const raw = await postJson(
+      new URL(control.url),
+      JSON.stringify({ workspace_id: latest.workspaceId, token: control.token }),
+      timeoutMs,
+    );
+    parsed = raw.trim() ? JSON.parse(raw) as unknown : {};
+  } catch (err) {
+    return toolErrorResult(
+      'mcp_control_request_failed',
+      `Failed to request MCP start for workspace ${options.workspace}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (!isRecord(parsed) || parsed.ok !== true) {
+    const message = isRecord(parsed) && typeof parsed.error === 'string'
+      ? parsed.error
+      : 'control API did not report ok';
+    return toolErrorResult('mcp_control_start_failed', message);
+  }
+  const endpoint = await tryResolveEndpoint({ ...options, timeoutMs: Math.min(timeoutMs, 3_000) });
+  const refreshed = buildOfflineMcpState(options, state.reason, state.message);
+  const envelope = {
+    schema_version: SCHEMA_VERSION,
+    ok: true,
+    summary: 'Requested the VS Code extension to start this workspace Codeidx MCP endpoint.',
+    status: typeof parsed.status === 'string' ? parsed.status : 'started',
+    health: {
+      mcp_connection: endpoint ? 'ok' : 'starting',
+      endpoint: endpoint?.toString() ?? (typeof parsed.mcp_endpoint === 'string' ? parsed.mcp_endpoint : null),
+      transport: 'stdio-offline-control',
+      workspace_root: options.workspace,
+      workspace_id: latest.workspaceId,
+      server_pid: null,
+    },
+    control: refreshed.control,
+    discovery: refreshed.discovery,
+    results: [],
+    resource_links: [],
+    next_cursor: null,
+    truncated: false,
+    warnings: endpoint
+      ? []
+      : ['Start request succeeded, but endpoint rediscovery has not confirmed health yet. Call mcp_health again.'],
+    next_steps: [
+      'Call mcp_health(include_agent_policy=true, include_discovery=true) again.',
+      'Retry the original codeidx tool only after health.mcp_connection == ok.',
+    ],
+  };
+  return toolResult(envelope);
 }
 
 function offlineAgentPolicy(): Record<string, unknown> {
   return {
     version: 'codeidx-agent-policy-offline-2026-06-20',
-    role: 'offline_health_only',
+    role: 'offline_workspace_mcp_control',
     default_behavior: {
-      auto_use_mcp: false,
-      applies_when: 'The workspace Codeidx MCP HTTP endpoint is not running.',
+      auto_use_mcp: true,
+      applies_when: 'The workspace Codeidx MCP HTTP endpoint is not running, but the stdio fallback is available.',
     },
     startup_sequence: [
       {
         step: 'health_gate',
         tool: 'mcp_health',
-        require: ['health.mcp_connection == ok before using search, symbol, reference, or graph tools'],
+        arguments: { include_agent_policy: true, include_discovery: true },
+        require: ['inspect health.mcp_connection and control.available before using search, symbol, reference, or graph tools'],
       },
       {
         step: 'start_workspace_endpoint',
-        purpose: 'Open the target workspace in VS Code with IntelliJ Styled Search enabled, or run Start Codeidx MCP Server in that window.',
+        tool: 'mcp_start',
+        applies_when: 'health.mcp_connection == stopped and control.available == true',
+        require: [
+          'call mcp_start once for the same workspace',
+          'rediscover the MCP endpoint after mcp_start returns',
+          'call mcp_health(include_agent_policy=true, include_discovery=true) again',
+        ],
+      },
+      {
+        step: 'manual_extension_activation',
+        applies_when: 'control.available != true',
+        purpose: 'Open the target workspace in VS Code with IntelliJ Styled Search enabled so the extension can publish the workspace control API.',
       },
     ],
     fallback_rules: [
-      'Do not use search/symbol/reference tools from this offline stdio fallback.',
-      'Use rg or local filesystem tools until the workspace MCP endpoint reports health.mcp_connection == ok.',
+      'Do not use search/symbol/reference/graph tools from this offline stdio fallback.',
+      'After mcp_start, use codeidx tools only when a follow-up mcp_health reports health.mcp_connection == ok.',
+      'Use rg or local filesystem tools when control.available is false, mcp_start fails, or rediscovery still cannot confirm the workspace endpoint.',
     ],
   };
 }
@@ -656,7 +899,17 @@ function ensureWorkspaceMcpSetup(workspace: string): AutoSetupStatus {
   const launcherStatus = ensureTextFile(launcherPath, stdioLauncherContent(__filename), 0o755, true);
   const mcpJsonStatus = ensureMcpJson(mcpJsonPath);
   const codexConfigStatus = ensureCodexConfig(codexConfigPath);
+  const globalCodexStatus = inspectGlobalCodexConfig(workspace);
   const statuses = [codeidxStatus, launcherStatus, mcpJsonStatus, codexConfigStatus];
+  const nextSteps = [
+    'Open this workspace in VS Code with IntelliJ Styled Search enabled.',
+    'If mcp_health reports control.available == true, call mcp_start from this MCP client to start the workspace endpoint.',
+    'If control.available is false but the extension is active, run IntelliJ Search: Start Codeidx MCP Server or Restart Codeidx MCP Server.',
+    'Reconnect the MCP client after mcp_health reports health.mcp_connection == ok.',
+  ];
+  if (globalCodexStatus.error) {
+    nextSteps.push(globalCodexStatus.error);
+  }
   return {
     attempted: true,
     workspace_root: workspace,
@@ -664,13 +917,11 @@ function ensureWorkspaceMcpSetup(workspace: string): AutoSetupStatus {
     stdio_launcher: launcherStatus,
     mcp_json: mcpJsonStatus,
     codex_config: codexConfigStatus,
+    global_config_policy: 'project_local_only',
+    global_codex_config: globalCodexStatus,
     ready_for_next_client: statuses.every((status) => status.status !== 'error'),
     requires_vscode_extension: true,
-    next_steps: [
-      'Open this workspace in VS Code with IntelliJ Styled Search enabled.',
-      'If the extension is already active, run IntelliJ Search: Start Codeidx MCP Server or Restart Codeidx MCP Server.',
-      'Reconnect the MCP client after mcp_health reports health.mcp_connection == ok.',
-    ],
+    next_steps: nextSteps,
   };
 }
 
@@ -766,6 +1017,82 @@ function ensureCodexConfig(filePath: string): SetupFileStatus {
   }
 }
 
+function inspectGlobalCodexConfig(workspace: string): SetupFileStatus {
+  const home = process.env.HOME || process.env.USERPROFILE;
+  const filePath = home ? path.join(home, '.codex', 'config.toml') : path.join('~', '.codex', 'config.toml');
+  if (!home) {
+    return { path: filePath, status: 'skipped', error: 'global Codex config was not inspected because HOME is not set' };
+  }
+  if (!fs.existsSync(filePath)) {
+    return { path: filePath, status: 'skipped' };
+  }
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const block = extractTomlTable(raw, 'mcp_servers.codeidx');
+    if (!block) {
+      return { path: filePath, status: 'unchanged' };
+    }
+    const pinnedWorkspace = readWorkspaceArgFromTomlArrayBlock(block);
+    const projectLauncher = readProjectLauncherFromTomlArrayBlock(block);
+    const issues: string[] = [];
+    if (pinnedWorkspace && pinnedWorkspace !== '.' && path.isAbsolute(pinnedWorkspace)) {
+      issues.push(`--workspace is pinned to ${pinnedWorkspace}`);
+    }
+    if (projectLauncher) {
+      issues.push(`launcher is pinned to ${projectLauncher}`);
+    }
+    if (issues.length === 0) {
+      return { path: filePath, status: 'unchanged' };
+    }
+    return {
+      path: filePath,
+      status: 'skipped',
+      error: `Global Codex codeidx config is workspace-specific (${issues.join(', ')}). This extension only writes project-local ${path.join(workspace, '.codex', 'config.toml')}; remove or replace the global entry with a cwd-based command.`,
+    };
+  } catch (err) {
+    return { path: filePath, status: 'skipped', error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+function extractTomlTable(raw: string, tableName: string): string | undefined {
+  const table = `[${tableName}]`;
+  const lines = raw.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === table);
+  if (start < 0) { return undefined; }
+  const block: string[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (/^\[[^\]]+\]$/u.test(trimmed)) { break; }
+    block.push(lines[i]);
+  }
+  return block.join('\n');
+}
+
+function readWorkspaceArgFromTomlArrayBlock(block: string): string | undefined {
+  const values = readTomlArgsArray(block);
+  const index = values.findIndex((value) => value === '--workspace' || value === '-w');
+  return index >= 0 ? values[index + 1] : undefined;
+}
+
+function readProjectLauncherFromTomlArrayBlock(block: string): string | undefined {
+  const values = readTomlArgsArray(block);
+  return values.find((value) =>
+    path.isAbsolute(value) &&
+    value.replace(/\\/g, '/').endsWith('/.codeidx/codeidx-mcp-stdio.js'));
+}
+
+function readTomlArgsArray(block: string): string[] {
+  const match = block.match(/^\s*args\s*=\s*\[([\s\S]*?)\]\s*$/mu);
+  if (!match) { return []; }
+  const values: string[] = [];
+  const re = /"((?:\\.|[^"\\])*)"/gu;
+  let item: RegExpExecArray | null;
+  while ((item = re.exec(match[1])) !== null) {
+    values.push(item[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\'));
+  }
+  return values;
+}
+
 function stdioLauncherContent(cliPath: string): string {
   return [
     '#!/usr/bin/env node',
@@ -781,30 +1108,32 @@ function stdioLauncherContent(cliPath: string): string {
     '  const index = arg.indexOf("=");',
     '  return index === -1 ? undefined : arg.slice(index + 1);',
     '}',
-    'function hasWorkspaceDiscovery(dir) {',
-    '  try {',
-    '    const raw = fs.readFileSync(path.join(dir, ".codeidx", "mcp-server.json"), "utf8");',
-    '    const parsed = JSON.parse(raw);',
-    '    return parsed && typeof parsed.url === "string";',
-    '  } catch (_) {',
-    '    return false;',
-    '  }',
-    '}',
     'function dotWorkspaceArg() {',
     '  const cwd = path.resolve(process.cwd());',
-    '  if (cwd !== workspaceRoot && hasWorkspaceDiscovery(cwd)) {',
+    '  if (cwd !== workspaceRoot) {',
     '    return cwd;',
     '  }',
     '  return workspaceRoot;',
+    '}',
+    'function normalizeWorkspaceArg(value) {',
+    '  if (value === ".") {',
+    '    return dotWorkspaceArg();',
+    '  }',
+    '  try {',
+    '    if (path.resolve(value) === workspaceRoot && path.resolve(process.cwd()) !== workspaceRoot) {',
+    '      return path.resolve(process.cwd());',
+    '    }',
+    '  } catch (_) {}',
+    '  return value;',
     '}',
     'const workspaceIndex = argIndex(["--workspace", "-w"]);',
     'if (workspaceIndex >= 0) {',
     '  const arg = process.argv[workspaceIndex];',
     '  const value = inlineValue(arg);',
-    '  if (value === ".") {',
-    '    process.argv[workspaceIndex] = arg.slice(0, arg.indexOf("=") + 1) + dotWorkspaceArg();',
-    '  } else if (value === undefined && process.argv[workspaceIndex + 1] === ".") {',
-    '    process.argv[workspaceIndex + 1] = dotWorkspaceArg();',
+    '  if (value !== undefined) {',
+    '    process.argv[workspaceIndex] = arg.slice(0, arg.indexOf("=") + 1) + normalizeWorkspaceArg(value);',
+    '  } else if (process.argv[workspaceIndex + 1]) {',
+    '    process.argv[workspaceIndex + 1] = normalizeWorkspaceArg(process.argv[workspaceIndex + 1]);',
     '  }',
     '} else if (argIndex(["--url", "--port", "--discovery-file"]) < 0) {',
     '  process.argv.push("--workspace", dotWorkspaceArg());',
@@ -821,35 +1150,16 @@ function stdioLauncherContent(cliPath: string): string {
 }
 
 async function forwardLine(endpoint: URL, line: string, timeoutMs: number): Promise<void> {
-  let message: JsonRpcMessage | JsonRpcMessage[];
   try {
-    message = JSON.parse(line) as JsonRpcMessage | JsonRpcMessage[];
+    JSON.parse(line) as JsonRpcMessage | JsonRpcMessage[];
   } catch (err) {
     writeStdoutJson(jsonRpcError(null, -32700, err instanceof Error ? err.message : String(err)));
     return;
   }
 
-  try {
-    const responseText = await postJson(endpoint, line, timeoutMs);
-    if (responseText.trim().length === 0) { return; }
-    process.stdout.write(responseText.replace(/\n+$/g, '') + '\n');
-  } catch (err) {
-    const response = errorResponseForMessage(message, err instanceof Error ? err.message : String(err));
-    if (response) {
-      writeStdoutJson(response);
-    }
-  }
-}
-
-function errorResponseForMessage(message: JsonRpcMessage | JsonRpcMessage[], messageText: string): Record<string, unknown> | Record<string, unknown>[] | null {
-  if (Array.isArray(message)) {
-    const responses = message
-      .filter((item) => Object.prototype.hasOwnProperty.call(item, 'id'))
-      .map((item) => jsonRpcError(item.id ?? null, -32000, `codeidx HTTP MCP endpoint unavailable: ${messageText}`));
-    return responses.length > 0 ? responses : null;
-  }
-  if (!Object.prototype.hasOwnProperty.call(message, 'id')) { return null; }
-  return jsonRpcError(message.id ?? null, -32000, `codeidx HTTP MCP endpoint unavailable: ${messageText}`);
+  const responseText = await postJson(endpoint, line, timeoutMs);
+  if (responseText.trim().length === 0) { return; }
+  process.stdout.write(responseText.replace(/\n+$/g, '') + '\n');
 }
 
 function postJson(endpoint: URL, body: string, timeoutMs: number): Promise<string> {
@@ -971,6 +1281,14 @@ function parsePort(value: string, key: string): number {
 function readBoolArg(args: Record<string, unknown>, key: string, fallback: boolean): boolean {
   const value = args[key];
   return typeof value === 'boolean' ? value : fallback;
+}
+
+function readIntArg(args: Record<string, unknown>, key: string, fallback: number, min: number, max: number): number {
+  const value = args[key];
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.floor(value)));
 }
 
 function looksJson(text: string): boolean {

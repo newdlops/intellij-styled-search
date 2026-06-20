@@ -176,6 +176,13 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
     mcpServer,
     { dispose: () => overlay.setPreviewCallGraphInlayProvider(undefined) },
   );
+  if (vscode.workspace.isTrusted && vscode.workspace.workspaceFolders?.length) {
+    void mcpServer.startControlServer().catch((err) => {
+      callGraphLog.appendLine(`codeidx MCP control start failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  } else if (!vscode.workspace.isTrusted) {
+    callGraphLog.appendLine('codeidx MCP control start skipped: workspace is not trusted');
+  }
   const mcpAutoStart = vscode.workspace.getConfiguration('intellijStyledSearch').get<boolean>('mcpAutoStart', true);
   if (mcpAutoStart && vscode.workspace.isTrusted && vscode.workspace.workspaceFolders?.length) {
     void (async () => {
