@@ -1496,6 +1496,70 @@ suite('Activation', () => {
     }
   });
 
+  test('large preview payloads include the full file so preview edits can be saved', async () => {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const uri = vscode.Uri.joinPath(folder.uri, `ijss-large-preview-${Date.now()}.txt`);
+    const originalProvider = anyOverlay.previewCallGraphInlayProvider;
+    const originalPostToRenderer = anyOverlay.postToRenderer.bind(anyOverlay);
+    const posted: unknown[] = [];
+    const focusLine = 320;
+    const longPrefix = 'x'.repeat(1900);
+    const longFocusText = `${longPrefix}needle${'y'.repeat(300)}`;
+    const lines = Array.from({ length: 640 }, (_unused, index) => (
+      index === focusLine ? longFocusText : `line-${index}`
+    ));
+
+    anyOverlay.postToRenderer = async (msg: unknown) => {
+      posted.push(msg);
+    };
+    overlay.setPreviewCallGraphInlayProvider(undefined);
+    try {
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(lines.join('\n'), 'utf8'));
+      const sent = await anyOverlay.sendPreview(
+        uri.toString(),
+        focusLine,
+        0,
+        [{ start: longPrefix.length, end: longPrefix.length + 'needle'.length }],
+        1234,
+      );
+      assert.strictEqual(sent, true, 'sendPreview should send the full preview');
+      const preview = posted.find((msg) => (msg as { type?: string }).type === 'preview') as
+        | {
+            baseLine?: number;
+            focusLine?: number;
+            fullFile?: boolean;
+            lines?: Array<{ lineNumber: number; text: string }>;
+            ranges?: Array<{ start: number; end: number }>;
+          }
+        | undefined;
+      assert.ok(preview, `expected preview message, got ${JSON.stringify(posted)}`);
+      assert.strictEqual(preview.fullFile, true, 'large previews should remain saveable full-file previews');
+      assert.strictEqual(preview.focusLine, focusLine, 'focus line should stay on the selected result');
+      assert.strictEqual(preview.baseLine, 0, 'full-file previews should start at the first line');
+      assert.strictEqual(preview.lines?.length, lines.length, 'preview should send every file line');
+      assert.strictEqual(preview.lines?.[0]?.lineNumber, 0);
+      assert.ok(
+        preview.lines?.some((line) => line.lineNumber === focusLine),
+        'full-file preview should include the selected line',
+      );
+      const focus = preview.lines?.find((line) => line.lineNumber === focusLine);
+      assert.ok(focus, 'expected selected line in preview payload');
+      assert.strictEqual(focus.text, longFocusText, 'long selected lines should not be clipped');
+      assert.deepStrictEqual(
+        preview.ranges,
+        [{ start: longPrefix.length, end: longPrefix.length + 'needle'.length }],
+        'match range should stay in full-line coordinates',
+      );
+    } finally {
+      overlay.setPreviewCallGraphInlayProvider(originalProvider);
+      anyOverlay.postToRenderer = originalPostToRenderer;
+      try { await vscode.workspace.fs.delete(uri, { useTrash: false }); } catch {}
+    }
+  });
+
   test('preview messages include call graph inlay provider metadata', async () => {
     const { overlay } = await getApi();
     const anyOverlay = overlay as any;

@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 132;
+export const RENDERER_PATCH_VERSION = 135;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -1189,6 +1189,10 @@ export function getRendererPatchScript(
         trace('preview/hydrate/skip', { reason: 'no-editor-or-msg', hasEditor: !!editor, hasMsg: !!msg });
         return;
       }
+      if (msg.fullFile === false) {
+        trace('preview/hydrate/skip', { reason: 'partial-preview', targetUri: msg.uri });
+        return;
+      }
       var existingModel = editor.getModel && editor.getModel();
       var existingUri = existingModel && existingModel.uri ? String(existingModel.uri.toString()) : '';
       if (existingUri === msg.uri) {
@@ -1237,6 +1241,7 @@ export function getRendererPatchScript(
         if (hydrateViewState) {
           try { editor.restoreViewState && editor.restoreViewState(hydrateViewState); } catch (eHydrateRestore) {}
         }
+        attachPreviewDirtyListener(editor);
         if (existingModel && existingModel !== resourceModel && existingModel.dispose) {
           try { existingModel.dispose(); state.previewOwnedModelDisposes++; } catch (eDispose) {}
         }
@@ -2248,16 +2253,34 @@ export function getRendererPatchScript(
     '  flex: 1 1 auto; min-width: 0;',
     '  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;',
     '}',
-    '.ij-find-minimap-toggle {',
+    '.ij-find-minimap-toggle,',
+    '.ij-find-preview-save {',
     '  flex: 0 0 auto;',
     '  font-size: 10px; padding: 1px 6px;',
     '  background: transparent;',
     '  color: inherit;',
     '  border: 1px solid var(--vscode-widget-border, #555);',
     '  border-radius: 3px; cursor: pointer;',
-    '}',
-    '.ij-find-minimap-toggle:hover { background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)); }',
-    '.ij-find-minimap-toggle[aria-pressed="true"] {',
+	    '}',
+	    '.ij-find-minimap-toggle:hover,',
+	    '.ij-find-preview-save:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)); }',
+	    '.ij-find-preview-save:disabled {',
+	    '  opacity: 0.55;',
+	    '  cursor: default;',
+	    '}',
+	    '.ij-find-preview-save[aria-disabled="false"] {',
+	    '  color: var(--vscode-button-foreground, var(--vscode-foreground, #ffffff));',
+	    '  border-color: var(--vscode-focusBorder, var(--vscode-widget-border, #555));',
+	    '}',
+	    '.ij-find-preview-save[data-dirty="true"][aria-disabled="false"] {',
+	    '  background: var(--vscode-button-background, #0e639c);',
+	    '  color: var(--vscode-button-foreground, #ffffff);',
+	    '  border-color: var(--vscode-button-background, #0e639c);',
+	    '}',
+	    '.ij-find-preview-save[data-dirty="true"][aria-disabled="false"]:hover {',
+	    '  background: var(--vscode-button-hoverBackground, #1177bb);',
+	    '}',
+	    '.ij-find-minimap-toggle[aria-pressed="true"] {',
     '  background: var(--vscode-inputOption-activeBackground, rgba(14,99,156,0.5));',
     '  color: var(--vscode-inputOption-activeForeground, #ffffff);',
     '  border-color: var(--vscode-inputOption-activeBorder, #007acc);',
@@ -2400,6 +2423,59 @@ export function getRendererPatchScript(
     '  font-family: var(--vscode-editor-font-family, monospace);',
     '  font-size: 12px; line-height: 18px;',
     '  white-space: pre; tab-size: 4;',
+    '}',
+    '.ij-find-dirty-dialog-backdrop {',
+    '  position: absolute; inset: 0;',
+    '  display: flex; align-items: center; justify-content: center;',
+    '  padding: 16px;',
+    '  background: rgba(0,0,0,0.28);',
+    '  z-index: 60;',
+    '}',
+    '.ij-find-dirty-dialog {',
+    '  width: min(360px, calc(100% - 20px));',
+    '  padding: 14px;',
+    '  background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background, #252526));',
+    '  color: var(--vscode-editorWidget-foreground, var(--vscode-foreground, #cccccc));',
+    '  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, #454545));',
+    '  border-radius: 4px;',
+    '  box-shadow: 0 8px 24px rgba(0,0,0,0.35);',
+    '  font-family: var(--vscode-font-family, sans-serif);',
+    '}',
+    '.ij-find-dirty-dialog-title {',
+    '  font-size: 13px;',
+    '  font-weight: 600;',
+    '  margin-bottom: 6px;',
+    '}',
+    '.ij-find-dirty-dialog-file {',
+    '  font-size: 12px;',
+    '  color: var(--vscode-descriptionForeground, #9d9d9d);',
+    '  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;',
+    '  margin-bottom: 12px;',
+    '}',
+    '.ij-find-dirty-dialog-actions {',
+    '  display: flex; justify-content: flex-end; gap: 8px;',
+    '}',
+    '.ij-find-dirty-dialog button {',
+    '  font-size: 12px; padding: 3px 10px;',
+    '  color: var(--vscode-button-foreground, #ffffff);',
+    '  background: var(--vscode-button-background, #0e639c);',
+    '  border: 1px solid var(--vscode-button-border, transparent);',
+    '  border-radius: 3px;',
+    '  cursor: pointer;',
+    '}',
+    '.ij-find-dirty-dialog button.secondary {',
+    '  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground, #cccccc));',
+    '  background: var(--vscode-button-secondaryBackground, transparent);',
+    '}',
+    '.ij-find-dirty-dialog button:hover:not(:disabled) {',
+    '  background: var(--vscode-button-hoverBackground, #1177bb);',
+    '}',
+    '.ij-find-dirty-dialog button.secondary:hover:not(:disabled) {',
+    '  background: var(--vscode-button-secondaryHoverBackground, var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)));',
+    '}',
+    '.ij-find-dirty-dialog button:disabled {',
+    '  opacity: 0.55;',
+    '  cursor: default;',
     '}',
 
     // Token classes for our fallback regex tokenizer.
@@ -2584,13 +2660,19 @@ export function getRendererPatchScript(
 
   var $modifiedDot = el('span', { className: 'ij-find-modified-dot', title: 'Unsaved changes' });
   var $previewPath = el('span', { className: 'ij-find-preview-path', text: '' });
+  var $savePreview = el('button', {
+    className: 'ij-find-preview-save',
+    title: 'Save preview edits (Cmd/Ctrl+S)',
+    text: 'Save',
+    attrs: { type: 'button', 'aria-label': 'Save preview edits', disabled: 'true' },
+  });
   var $minimapToggle = el('button', {
     className: 'ij-find-minimap-toggle',
     title: 'Toggle minimap',
     text: 'Map',
     attrs: { type: 'button', 'aria-pressed': 'true' },
   });
-  var $previewHeader = el('div', { className: 'ij-find-preview-header', children: [$modifiedDot, $previewPath, $minimapToggle] });
+  var $previewHeader = el('div', { className: 'ij-find-preview-header', children: [$modifiedDot, $previewPath, $savePreview, $minimapToggle] });
   var $previewBody = el('div', { className: 'ij-find-preview-body' });
   var $preview = el('div', { className: 'ij-find-preview', children: [$previewHeader, $previewBody] });
 
@@ -2651,11 +2733,18 @@ export function getRendererPatchScript(
     searching: false,
     debounce: null,
     lastPreviewKey: '',
+    previewRenderedKey: '',
     activePreviewSeq: 0,
     previewUri: '',
     previewLanguageId: '',
     previewBaseLine: 0,
     previewFullFile: true,
+    previewDirty: false,
+    previewCleanUri: '',
+    previewCleanContent: '',
+    previewSuppressDirty: false,
+    previewDirtyDialogOpen: false,
+    previewDirtyDialogContinuation: null,
     hoverReqId: 0,
     hoverTimer: null,
     lastHoverKey: '',
@@ -2725,6 +2814,228 @@ export function getRendererPatchScript(
 		  matchCount: 0,
 		  recoveryUntil: 0,
 		};
+	  function getPreviewSaveEditor() {
+	    return state.previewMonacoEditor || state.monacoEditor;
+	  }
+	
+	  function previewSaveEditorIsMounted(editor) {
+	    try {
+	      if (!editor) { return false; }
+	      if (editor === state.previewMonacoEditor) {
+	        return !!(state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody);
+	      }
+	      if (editor === state.monacoEditor) {
+	        return !!(state.monacoHost && state.monacoHost.parentElement === $previewBody);
+	      }
+	      var dom = editor.getDomNode && editor.getDomNode();
+	      return !!(dom && $previewBody && $previewBody.contains(dom));
+	    } catch (eMounted) {
+	      return false;
+	    }
+	  }
+	
+	  function canSavePreviewContent() {
+	    if (!state.previewUri || state.previewFullFile === false) { return false; }
+	    var ed = getPreviewSaveEditor();
+	    var model = ed && ed.getModel && ed.getModel();
+	    if (!model) { return false; }
+	    return previewSaveEditorIsMounted(ed) && (
+	      state.previewMode === 'monaco' ||
+	      ed === state.previewMonacoEditor ||
+	      ed === state.monacoEditor
+	    );
+	  }
+
+  function setPreviewDirty(dirty) {
+    state.previewDirty = !!dirty;
+    $preview.classList.toggle('ij-find-modified', !!dirty);
+    syncPreviewSaveButton();
+  }
+
+  function previewMessageText(msg) {
+    return (msg && msg.lines ? msg.lines : []).map(function (l) { return l.text; }).join('\\n');
+  }
+
+  function setPreviewCleanSnapshot(uri, content) {
+    state.previewCleanUri = uri || '';
+    state.previewCleanContent = content || '';
+    state.previewSuppressDirty = false;
+    setPreviewDirty(false);
+  }
+
+  function updatePreviewDirtyFromModel(model) {
+    if (state.previewSuppressDirty) { return; }
+    var dirty = false;
+    try {
+      if (
+        state.previewUri &&
+        state.previewFullFile !== false &&
+        state.previewCleanUri === state.previewUri &&
+        model &&
+        typeof model.getValue === 'function'
+      ) {
+        dirty = model.getValue() !== state.previewCleanContent;
+      }
+    } catch (eDirtyProbe) {
+      dirty = true;
+    }
+    setPreviewDirty(dirty);
+  }
+
+  function attachPreviewDirtyListener(editor) {
+    try {
+      if (state.monacoChangeListener && state.monacoChangeListener.dispose) {
+        state.monacoChangeListener.dispose();
+      }
+    } catch (eDisposeChange) {}
+    state.monacoChangeListener = null;
+    try {
+      var model = editor && editor.getModel && editor.getModel();
+      if (model && typeof model.onDidChangeContent === 'function') {
+        state.monacoChangeListener = model.onDidChangeContent(function () {
+          updatePreviewDirtyFromModel(model);
+        });
+      }
+      updatePreviewDirtyFromModel(model);
+    } catch (eChangeListener) {
+      send({ type: 'log', msg: 'preview change listener failed: ' + (eChangeListener && eChangeListener.message) });
+    }
+  }
+
+	  function syncPreviewSaveButton() {
+	    try {
+	      var title = 'Save preview edits (Cmd/Ctrl+S)';
+	      var disabled = false;
+	      var canSave = canSavePreviewContent();
+	      if (!state.previewUri) {
+	        disabled = true;
+	        title = 'No preview file to save';
+	      } else if (state.previewFullFile === false) {
+	        disabled = true;
+	        title = 'Saving is disabled for partial previews';
+	      } else if (!canSave) {
+	        disabled = true;
+	        title = 'Editable preview is not ready';
+	      } else if (!state.previewDirty) {
+	        disabled = true;
+	        title = 'No preview changes to save';
+	      }
+	      $savePreview.disabled = disabled;
+	      $savePreview.title = title;
+	      $savePreview.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+	      $savePreview.setAttribute('data-savable', canSave ? 'true' : 'false');
+	      $savePreview.setAttribute('data-dirty', state.previewDirty ? 'true' : 'false');
+	    } catch (eSyncSaveButton) {}
+	  }
+
+  function discardPreviewChanges() {
+    try {
+      var ed = getPreviewSaveEditor();
+      var model = ed && ed.getModel && ed.getModel();
+      if (
+        model &&
+        state.previewUri &&
+        state.previewCleanUri === state.previewUri &&
+        typeof model.getValue === 'function' &&
+        model.getValue() !== state.previewCleanContent
+      ) {
+        state.previewSuppressDirty = true;
+        try {
+          if (typeof model.setValue === 'function') {
+            model.setValue(state.previewCleanContent);
+          } else if (ed && typeof ed.setValue === 'function') {
+            ed.setValue(state.previewCleanContent);
+          }
+        } finally {
+          state.previewSuppressDirty = false;
+        }
+      }
+      setPreviewDirty(false);
+    } catch (eDiscardPreview) {
+      state.previewSuppressDirty = false;
+      send({ type: 'log', msg: 'preview discard changes failed: ' + (eDiscardPreview && eDiscardPreview.message) });
+      setPreviewDirty(false);
+    }
+  }
+
+  function shouldConfirmPreviewSwitch(nextKey) {
+    var currentKey = state.previewRenderedKey || state.lastPreviewKey;
+    return !!(state.previewDirty && nextKey && nextKey !== currentKey);
+  }
+
+  function resolveDirtyPreviewDecision(action) {
+    var continuation = state.previewDirtyDialogContinuation;
+    state.previewDirtyDialogContinuation = null;
+    state.previewDirtyDialogOpen = false;
+    if (action === 'save') {
+      savePreviewMonacoModel();
+    } else if (action === 'discard') {
+      discardPreviewChanges();
+    } else {
+      return;
+    }
+    if (typeof continuation === 'function') {
+      try { continuation(); } catch (eContinueDirtyPreview) {
+        send({ type: 'log', msg: 'preview switch continuation failed: ' + (eContinueDirtyPreview && eContinueDirtyPreview.message) });
+      }
+    }
+  }
+
+  function confirmDirtyPreviewSwitch(continuation) {
+    state.previewDirtyDialogContinuation = continuation;
+    if (!state.previewDirty || !state.previewUri) {
+      resolveDirtyPreviewDecision('discard');
+      return;
+    }
+    if (state.previewDirtyDialogOpen) { return; }
+    state.previewDirtyDialogOpen = true;
+    var backdrop = el('div', { className: 'ij-find-dirty-dialog-backdrop' });
+    var fileLabel = ($previewPath && $previewPath.textContent) ? $previewPath.textContent : state.previewUri;
+    var saveButton = el('button', { text: 'Save', attrs: { type: 'button' } });
+    var discardButton = el('button', { className: 'secondary', text: 'Discard Changes', attrs: { type: 'button' } });
+    if (!canSavePreviewContent()) {
+      saveButton.setAttribute('disabled', 'true');
+      saveButton.title = 'Editable preview is not ready';
+    }
+    var dialog = el('div', {
+      className: 'ij-find-dirty-dialog',
+      children: [
+        el('div', { className: 'ij-find-dirty-dialog-title', text: 'Save preview changes?' }),
+        el('div', { className: 'ij-find-dirty-dialog-file', text: fileLabel }),
+        el('div', { className: 'ij-find-dirty-dialog-actions', children: [discardButton, saveButton] }),
+      ],
+    });
+    backdrop.appendChild(dialog);
+    function closeWith(action) {
+      try {
+        if (backdrop.parentElement) { backdrop.parentElement.removeChild(backdrop); }
+      } catch (eRemoveDirtyDialog) {}
+      resolveDirtyPreviewDecision(action);
+    }
+    on(saveButton, 'click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      closeWith('save');
+    });
+    on(discardButton, 'click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      closeWith('discard');
+    });
+    try { panel.appendChild(backdrop); } catch (eAppendDirtyDialog) {
+      state.previewDirtyDialogOpen = false;
+      state.previewDirtyDialogContinuation = null;
+      discardPreviewChanges();
+      if (typeof continuation === 'function') { continuation(); }
+      return;
+    }
+    setTimeout(function () {
+      try {
+        if (canSavePreviewContent()) { saveButton.focus(); }
+        else { discardButton.focus(); }
+      } catch (eFocusDirtyDialog) {}
+    }, 0);
+  }
   function irLightStatus() {
     var out = {};
     try {
@@ -4128,7 +4439,7 @@ export function getRendererPatchScript(
 
   function clearPreview() {
     $previewPath.textContent = '';
-    $preview.classList.remove('ij-find-modified');
+    setPreviewCleanSnapshot('', '');
     clearPreviewMonacoCallGraphInlays();
     if (state.previewRecoveryTimer) {
       clearTimeout(state.previewRecoveryTimer);
@@ -4159,11 +4470,13 @@ export function getRendererPatchScript(
       clearChildren($previewBody);
     }
     state.lastPreviewKey = '';
+    state.previewRenderedKey = '';
     state.activePreviewSeq++;
     state.previewUri = '';
     state.previewMode = '';
     state.lastPreviewMsg = null;
     state.previewLanguageId = '';
+    syncPreviewSaveButton();
     hideHover();
   }
 
@@ -4532,8 +4845,18 @@ export function getRendererPatchScript(
       fn();
     }
   }
-  function requestPreviewThrottled(sendFn) {
-    var now = perfNow();
+	  function requestPreviewThrottled(sendFn, immediate) {
+	    if (immediate) {
+	      if (state.previewRequestTimer) {
+	        clearTimeout(state.previewRequestTimer);
+	        state.previewRequestTimer = null;
+	      }
+	      state.previewRequestPending = null;
+	      state.lastPreviewRequestAt = perfNow();
+	      sendFn();
+	      return;
+	    }
+	    var now = perfNow();
     var sinceLast = now - (state.lastPreviewRequestAt || 0);
     if (!state.previewRequestTimer && sinceLast >= PREVIEW_REQUEST_THROTTLE_MS) {
       state.lastPreviewRequestAt = now;
@@ -4549,9 +4872,27 @@ export function getRendererPatchScript(
     }
   }
 
-  function selectMatch(flatIdx) {
-    if (flatIdx < 0 || flatIdx >= state.flat.length) { return; }
-    var selectT0 = perfNow();
+  function previewKeyForFlatIndex(flatIdx) {
+    if (flatIdx < 0 || flatIdx >= state.flat.length) { return ''; }
+    var fm = state.flat[flatIdx];
+    if (fm.pendingUri) { return fm.pendingUri + '#pending'; }
+    var f = state.files[fm.fi];
+    var m = f && f.matches ? f.matches[fm.mi] : null;
+    return f && m ? f.uri + '#' + m.line : '';
+  }
+
+	  function selectMatch(flatIdx, opts) {
+	    if (flatIdx < 0 || flatIdx >= state.flat.length) { return; }
+	    opts = opts || {};
+	    var immediatePreview = !!opts.immediatePreview;
+	    var selectT0 = perfNow();
+	    var nextPreviewKey = previewKeyForFlatIndex(flatIdx);
+	    if (shouldConfirmPreviewSwitch(nextPreviewKey)) {
+	      confirmDirtyPreviewSwitch(function () {
+	        selectMatch(flatIdx, opts);
+	      });
+	      return;
+    }
     state.activeIndex = flatIdx;
     applyActive(true);
     var fm = state.flat[flatIdx];
@@ -4564,18 +4905,18 @@ export function getRendererPatchScript(
         return;
       }
       state.lastPreviewKey = pkey;
-      requestPreviewThrottled(function () {
-        state.activePreviewSeq++;
-        trace('preview/select', {
+	      requestPreviewThrottled(function () {
+	        state.activePreviewSeq++;
+	        trace('preview/select', {
           path: 'pending',
           flatIdx: flatIdx,
           previewSeq: state.activePreviewSeq,
           applyActiveMs: Math.round(perfNow() - selectT0),
-        });
-        send({ type: 'requestPreview', uri: fm.pendingUri, line: 0, contextLines: 0, previewSeq: state.activePreviewSeq });
-      });
-      return;
-    }
+	        });
+	        send({ type: 'requestPreview', uri: fm.pendingUri, line: 0, contextLines: 0, previewSeq: state.activePreviewSeq });
+	      }, immediatePreview);
+	      return;
+	    }
     var f = state.files[fm.fi];
     var m = f.matches[fm.mi];
     var key = f.uri + '#' + m.line;
@@ -4591,18 +4932,18 @@ export function getRendererPatchScript(
     var previewRanges = rangesForCurrentQuery(m);
     // Only refresh the overlay's preview pane; do NOT touch VSCode's editor
     // area at all. Arrow-key browsing leaves no trace.
-    requestPreviewThrottled(function () {
-      state.activePreviewSeq++;
-      trace('preview/select', {
+	    requestPreviewThrottled(function () {
+	      state.activePreviewSeq++;
+	      trace('preview/select', {
         path: 'match',
         flatIdx: flatIdx,
         previewSeq: state.activePreviewSeq,
         line: m.line,
         applyActiveMs: Math.round(perfNow() - selectT0),
-      });
-      send({ type: 'requestPreview', uri: f.uri, line: m.line, ranges: previewRanges, contextLines: 0, previewSeq: state.activePreviewSeq });
-    });
-  }
+	      });
+	      send({ type: 'requestPreview', uri: f.uri, line: m.line, ranges: previewRanges, contextLines: 0, previewSeq: state.activePreviewSeq });
+	    }, immediatePreview);
+	  }
 
   // If we're in extension-filter mode, compute single-line ranges for the
   // user's NEW query against the match preview. Falls back to whatever rg
@@ -4938,6 +5279,14 @@ export function getRendererPatchScript(
   });
   on($optRegexMultiline, 'click', function () { toggleOpt('regexMultiline', $optRegexMultiline); });
   on($refresh, 'click', refreshSearch);
+  syncPreviewSaveButton();
+  on($savePreview, 'click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    savePreviewMonacoModel();
+    var ed = getPreviewSaveEditor();
+    if (ed && typeof ed.focus === 'function') { try { ed.focus(); } catch (eF) {} }
+  });
   function applyMinimapSetting() {
     var ed = state.previewMonacoEditor || state.monacoEditor;
     if (ed && typeof ed.updateOptions === 'function') {
@@ -4960,14 +5309,50 @@ export function getRendererPatchScript(
     e.stopPropagation();
     toggleSearchPanelMinimized();
   });
-  on($close, 'click', function () { hideSearchPanel(); });
-  syncCaseUi();
-  syncRegexMultilineUi();
-  renderSearchHistory();
-
-  on($results, 'click', function (e) {
-    var actionBtn = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row-action') : null;
-    if (actionBtn) {
+	  on($close, 'click', function () { hideSearchPanel(); });
+	  syncCaseUi();
+	  syncRegexMultilineUi();
+	  renderSearchHistory();
+	
+	  var lastPointerResultSelectFlatIdx = -1;
+	  var lastPointerResultSelectAt = 0;
+	  function resultRowFlatIndexFromEvent(e) {
+	    try {
+	      if (!(e.target instanceof HTMLElement)) { return -1; }
+	      if (e.target.closest('.ij-find-row-action')) { return -1; }
+	      var row = e.target.closest('.ij-find-row');
+	      if (!row || row.classList.contains('ij-find-row-info')) { return -1; }
+	      return parseInt(row.getAttribute('data-flat') || '-1', 10);
+	    } catch (eRowFromEvent) {
+	      return -1;
+	    }
+	  }
+	  function markPointerResultSelection(flatIdx) {
+	    lastPointerResultSelectFlatIdx = flatIdx;
+	    lastPointerResultSelectAt = perfNow();
+	  }
+	  function wasRecentlyPointerSelected(flatIdx) {
+	    return flatIdx >= 0 &&
+	      flatIdx === lastPointerResultSelectFlatIdx &&
+	      perfNow() - lastPointerResultSelectAt < 700;
+	  }
+	  function handleResultPointerSelection(e) {
+	    if (e && typeof e.button === 'number' && e.button !== 0) { return; }
+	    var flatIdx = resultRowFlatIndexFromEvent(e);
+	    if (flatIdx < 0) { return; }
+	    try { e.preventDefault(); } catch (ePreventPointer) {}
+	    markPointerResultSelection(flatIdx);
+	    selectMatch(flatIdx, { immediatePreview: true });
+	  }
+	  on($results, 'pointerdown', handleResultPointerSelection, true);
+	  on($results, 'mousedown', function (e) {
+	    if (window.PointerEvent) { return; }
+	    handleResultPointerSelection(e);
+	  }, true);
+	
+	  on($results, 'click', function (e) {
+	    var actionBtn = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row-action') : null;
+	    if (actionBtn) {
       e.preventDefault();
       e.stopPropagation();
       var actionRow = actionBtn.closest('.ij-find-row');
@@ -4981,11 +5366,17 @@ export function getRendererPatchScript(
       }
       return;
     }
-    var row = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row') : null;
-    if (!row) { return; }
-    var flatIdx = parseInt(row.getAttribute('data-flat') || '-1', 10);
-    if (flatIdx >= 0) { selectMatch(flatIdx); $q.focus(); }
-  });
+	    var row = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row') : null;
+	    if (!row) { return; }
+	    var flatIdx = parseInt(row.getAttribute('data-flat') || '-1', 10);
+	    if (flatIdx >= 0) {
+	      if (wasRecentlyPointerSelected(flatIdx)) {
+	        try { e.preventDefault(); } catch (ePreventClick) {}
+	        return;
+	      }
+	      selectMatch(flatIdx, { immediatePreview: true });
+	    }
+	  });
   on($results, 'dblclick', function (e) {
     if (e.target instanceof HTMLElement && e.target.closest('.ij-find-row-action')) { return; }
     var row = e.target instanceof HTMLElement ? e.target.closest('.ij-find-row') : null;
@@ -5590,9 +5981,27 @@ export function getRendererPatchScript(
     state.previewRecoveryTimer = setTimeout(attempt, 16);
   }
 
+  function previewKeyForMessage(msg) {
+    if (!msg || !msg.uri) { return ''; }
+    var line = typeof msg.focusLine === 'number' ? msg.focusLine : 'preview';
+    return String(msg.uri) + '#' + line;
+  }
+
   function renderPreview(msg) {
     if (previewMessageIsStale(msg)) {
       send({ type: 'log', msg: 'ignored stale preview seq=' + msg.previewSeq + ' active=' + state.activePreviewSeq + ' uri=' + (msg.uri || '') });
+      return;
+    }
+    var incomingPreviewKey = previewKeyForMessage(msg);
+    if (state.previewDirty) {
+      var currentPreviewKey = state.previewRenderedKey || state.lastPreviewKey;
+      if (incomingPreviewKey && incomingPreviewKey !== currentPreviewKey) {
+        confirmDirtyPreviewSwitch(function () {
+          renderPreview(msg);
+        });
+      } else {
+        send({ type: 'log', msg: 'ignored same-preview refresh while preview has unsaved changes uri=' + (msg.uri || '') });
+      }
       return;
     }
     if (
@@ -5622,7 +6031,9 @@ export function getRendererPatchScript(
       ? msg.baseLine
       : (msg.lines && msg.lines.length > 0 && typeof msg.lines[0].lineNumber === 'number' ? msg.lines[0].lineNumber : 0);
     state.previewFullFile = msg.fullFile !== false;
-    $preview.classList.remove('ij-find-modified');
+    state.previewRenderedKey = previewKeyForMessage(msg);
+    setPreviewCleanSnapshot(msg.uri, previewMessageText(msg));
+    syncPreviewSaveButton();
     var m = window.__ijFindDisableMonacoProbes ? null : getMonacoFactorySingleton();
     var monacoStatus = 'disabled';
     if (!window.__ijFindDisableMonacoProbes) {
@@ -5973,6 +6384,7 @@ export function getRendererPatchScript(
         renderPreviewMonacoCallGraphInlays(state.previewMonacoEditor, msg);
         var inlayMs = Math.round(perfNow() - inlayT0);
         state.previewMode = 'monaco';
+        syncPreviewSaveButton();
         state.lastRenderedPreviewUri = msg.uri;
         state.lastRenderedPreviewFocusLine = msgFocusLine;
         scheduleSettledPreviewHydrate();
@@ -6110,16 +6522,27 @@ export function getRendererPatchScript(
 
   function savePreviewMonacoModel() {
     try {
-      var ed = state.previewMonacoEditor || state.monacoEditor;
+      if (state.previewFullFile === false) {
+        send({ type: 'log', msg: 'preview save skipped: partial preview' });
+        syncPreviewSaveButton();
+        return;
+      }
+      if (!canSavePreviewContent()) {
+        send({ type: 'log', msg: 'preview save skipped: editable preview not ready' });
+        syncPreviewSaveButton();
+        return;
+      }
+      var ed = getPreviewSaveEditor();
       var model = ed && ed.getModel && ed.getModel();
       if (!model || !state.previewUri) {
         send({ type: 'log', msg: 'preview save skipped: no model or uri' });
+        syncPreviewSaveButton();
         return;
       }
       var content = model.getValue ? model.getValue() : '';
       send({ type: 'log', msg: 'preview save requested uri=' + state.previewUri + ' bytes=' + content.length });
       send({ type: 'saveFile', uri: state.previewUri, content: content });
-      $preview.classList.remove('ij-find-modified');
+      setPreviewCleanSnapshot(state.previewUri, content);
     } catch (eSavePreview) {
       send({ type: 'log', msg: 'preview save threw: ' + (eSavePreview && eSavePreview.message) });
     }
@@ -6436,6 +6859,7 @@ export function getRendererPatchScript(
 
   function wirePreviewMonacoEditor(editor) {
     registerPreviewSaveKeybinding(editor);
+    syncPreviewSaveButton();
     try {
       if (editor && typeof editor.updateOptions === 'function') {
         editor.updateOptions({
@@ -6448,22 +6872,7 @@ export function getRendererPatchScript(
     } catch (eOptions) {
       send({ type: 'log', msg: 'preview editor option refresh failed: ' + (eOptions && eOptions.message) });
     }
-    try {
-      if (state.monacoChangeListener && state.monacoChangeListener.dispose) {
-        state.monacoChangeListener.dispose();
-      }
-    } catch (eDisposeChange) {}
-    state.monacoChangeListener = null;
-    try {
-      var model = editor && editor.getModel && editor.getModel();
-      if (model && typeof model.onDidChangeContent === 'function') {
-        state.monacoChangeListener = model.onDidChangeContent(function () {
-          $preview.classList.add('ij-find-modified');
-        });
-      }
-    } catch (eChangeListener) {
-      send({ type: 'log', msg: 'preview change listener failed: ' + (eChangeListener && eChangeListener.message) });
-    }
+    attachPreviewDirtyListener(editor);
     wirePreviewMonacoDiagnostics(editor);
     wirePreviewMonacoHealObserver(editor, state.previewMonacoHost);
     wirePreviewIntellisenseProbes(editor);
@@ -6860,6 +7269,7 @@ export function getRendererPatchScript(
     state.previewMonacoEditor = null;
     state.previewMonacoHost = null;
     $previewBody.classList.remove('ij-find-editor-mounted');
+    syncPreviewSaveButton();
   }
 
   window.__ijFindForceStopMonacoCapture = function (reason) {
@@ -6915,8 +7325,10 @@ export function getRendererPatchScript(
       state.hasMoreResults = false;
       state.resultsInfoText = '';
       state.lastPreviewKey = '';
+      state.previewRenderedKey = '';
       state.previewUri = '';
       state.previewLanguageId = '';
+      setPreviewCleanSnapshot('', '');
       out.push('state=cleared');
     } catch (eState) { out.push('state=err'); }
     try {
@@ -8481,16 +8893,7 @@ export function getRendererPatchScript(
     state.monacoEditor = editor;
     try {
       editor.addCommand(api.KeyMod.CtrlCmd | api.KeyCode.KeyS, function () {
-        var ed = state.monacoEditor;
-        var model = ed && ed.getModel();
-        if (!model || !state.previewUri) {
-          send({ type: 'log', msg: 'save skipped: no model or uri' });
-          return;
-        }
-        var content = model.getValue();
-        send({ type: 'log', msg: 'Cmd+S pressed; saving uri=' + state.previewUri + ' bytes=' + content.length });
-        send({ type: 'saveFile', uri: state.previewUri, content: content });
-        $preview.classList.remove('ij-find-modified');
+        savePreviewMonacoModel();
       });
       send({ type: 'log', msg: 'save command registered' });
     } catch (e) {
@@ -8539,10 +8942,7 @@ export function getRendererPatchScript(
       return;
     }
 
-    if (state.monacoChangeListener) { try { state.monacoChangeListener.dispose(); } catch (e) {} }
-    state.monacoChangeListener = model.onDidChangeContent(function (ev) {
-      $preview.classList.add('ij-find-modified');
-    });
+    attachPreviewDirtyListener(editor);
     send({ type: 'log', msg: 'change listener attached' });
 
     // Reveal focus line and place caret at first match.
@@ -8589,32 +8989,13 @@ export function getRendererPatchScript(
 
   function boundedPreviewLines(msg) {
     var rawLines = Array.isArray(msg && msg.lines) ? msg.lines : [];
-    var maxLines = 360;
-    var maxChars = 1600;
-    var startIdx = 0;
-    var endIdx = rawLines.length;
-    var omittedBefore = 0;
-    var omittedAfter = 0;
-    if (rawLines.length > maxLines) {
-      var focusIdx = -1;
-      for (var fi = 0; fi < rawLines.length; fi++) {
-        if (rawLines[fi] && rawLines[fi].lineNumber === msg.focusLine) { focusIdx = fi; break; }
-      }
-      if (focusIdx < 0) { focusIdx = 0; }
-      var half = Math.floor(maxLines / 2);
-      startIdx = Math.max(0, Math.min(focusIdx - half, rawLines.length - maxLines));
-      endIdx = Math.min(rawLines.length, startIdx + maxLines);
-      omittedBefore = startIdx;
-      omittedAfter = rawLines.length - endIdx;
-    }
     var out = [];
-    for (var i = startIdx; i < endIdx; i++) {
+    for (var i = 0; i < rawLines.length; i++) {
       var line = rawLines[i] || {};
       var text = String(line.text || '');
-      if (text.length > maxChars) { text = text.slice(0, maxChars) + '...'; }
       out.push({ lineNumber: line.lineNumber, text: text });
     }
-    return { lines: out, omittedBefore: omittedBefore, omittedAfter: omittedAfter };
+    return { lines: out, omittedBefore: 0, omittedAfter: 0 };
   }
 
   function normalizePreviewCallGraphInlay(raw) {
@@ -8727,6 +9108,7 @@ export function getRendererPatchScript(
       ensureFullPanelStructure('preview-dom-start');
       if (state.stolenEditor) { restoreStolenEditor(); }
       state.previewMode = 'dom';
+      syncPreviewSaveButton();
       clearPreviewMonacoCallGraphInlays();
       // If we previously hosted Monaco, detach it.
       if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
@@ -9610,9 +9992,14 @@ export function getRendererPatchScript(
         flatCount: (state.flat || []).length,
         activeIndex: typeof state.activeIndex === 'number' ? state.activeIndex : -1,
         activePreviewSeq: typeof state.activePreviewSeq === 'number' ? state.activePreviewSeq : 0,
-        previewMode: state.previewMode || null,
-        previewUri: state.previewUri || null,
-        previewModelUri: state.previewMonacoEditor && state.previewMonacoEditor.getModel && state.previewMonacoEditor.getModel() && state.previewMonacoEditor.getModel().uri
+	        previewMode: state.previewMode || null,
+	        previewUri: state.previewUri || null,
+	        previewDirty: !!state.previewDirty,
+	        previewCanSave: canSavePreviewContent(),
+	        saveButtonDisabled: !!($savePreview && $savePreview.disabled),
+	        saveButtonAriaDisabled: $savePreview ? $savePreview.getAttribute('aria-disabled') : null,
+	        saveButtonDirty: $savePreview ? $savePreview.getAttribute('data-dirty') : null,
+	        previewModelUri: state.previewMonacoEditor && state.previewMonacoEditor.getModel && state.previewMonacoEditor.getModel() && state.previewMonacoEditor.getModel().uri
           ? String(state.previewMonacoEditor.getModel().uri.toString())
           : null,
         previewResourceModelCreates: state.previewResourceModelCreates || 0,

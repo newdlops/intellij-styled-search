@@ -261,6 +261,35 @@ function stableSearchHash(value: string): string {
   return `${(h2 >>> 0).toString(36)}${(h1 >>> 0).toString(36)}`;
 }
 
+function buildPreviewPayload(
+  doc: vscode.TextDocument,
+  requestedLine: number,
+  ranges: MatchRange[] | undefined,
+): {
+  focusLine: number;
+  start: number;
+  end: number;
+  lines: PreviewLine[];
+  ranges: MatchRange[] | undefined;
+  fullFile: boolean;
+} {
+  const lineCount = Math.max(1, doc.lineCount);
+  const normalizedLine = Number.isFinite(requestedLine) ? Math.floor(requestedLine) : 0;
+  const focusLine = Math.max(0, Math.min(normalizedLine, lineCount - 1));
+  const lines: PreviewLine[] = [];
+  for (let i = 0; i < lineCount; i++) {
+    lines.push({ lineNumber: i, text: doc.lineAt(i).text });
+  }
+  return {
+    focusLine,
+    start: 0,
+    end: lineCount,
+    lines,
+    ranges,
+    fullFile: true,
+  };
+}
+
 export class OverlayPanel {
   private static instance: OverlayPanel | undefined;
   private ws: WebSocket | undefined;
@@ -3700,13 +3729,7 @@ export class OverlayPanel {
       this.lastPreviewLineForDiagnostics = line;
       const uri = vscode.Uri.parse(uriStr);
       const doc = await vscode.workspace.openTextDocument(uri);
-      const allLines = doc.getText().split(/\r?\n/);
-      let start = 0;
-      let end = allLines.length;
-      const lines: PreviewLine[] = [];
-      for (let i = start; i < end; i++) {
-        lines.push({ lineNumber: i, text: allLines[i] ?? '' });
-      }
+      const preview = buildPreviewPayload(doc, line, ranges);
       if (!shouldSend()) { return false; }
       const relPath = vscode.workspace.asRelativePath(uri, false);
       if (!shouldSend()) { return false; }
@@ -3714,15 +3737,15 @@ export class OverlayPanel {
         type: 'preview',
         uri: uriStr,
         relPath,
-        focusLine: line,
-        ranges,
+        focusLine: preview.focusLine,
+        ranges: preview.ranges,
         previewSeq,
-        lines,
+        lines: preview.lines,
         languageId: doc.languageId,
-        baseLine: start,
-        fullFile: start === 0 && end === allLines.length,
+        baseLine: preview.start,
+        fullFile: preview.fullFile,
       });
-      this.sendPreviewCallGraphInlays(uri, doc, start, end, previewSeq, shouldSend);
+      this.sendPreviewCallGraphInlays(uri, doc, preview.start, preview.end, previewSeq, shouldSend);
       return true;
     } catch (err) {
       this.log.appendLine(`preview fetch failed: ${err instanceof Error ? err.message : err}`);

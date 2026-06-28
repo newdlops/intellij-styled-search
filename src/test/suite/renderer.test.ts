@@ -330,7 +330,7 @@ suite('Renderer — overlay UI probes', () => {
       await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
       try {
         await overlay.evalInActiveWindowForTests(
-          `(function(){
+        `(async function(){
             Array.from(document.querySelectorAll('.ij-find-overlay.visible .ij-find-close')).forEach(function (btn) {
               btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
             });
@@ -662,7 +662,7 @@ suite('Renderer — overlay UI probes', () => {
       await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
       try {
         await overlay.evalInActiveWindowForTests(
-          `(function(){
+        `(async function(){
             Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
               var query = root.querySelector('.ij-find-query');
               if (!query || query.value !== 'PreviewClickSurvivesProbe') { return; }
@@ -9231,14 +9231,20 @@ suite('Renderer — overlay UI probes', () => {
           __targetSrc: targetSrc,
           match: { uri: alpha, relPath: 'alpha.py', matches: alphaMatches }
         });
-        window.__ijFindOnMessage({
-          type: 'results:file',
-          searchId: 940,
-          __targetSrc: targetSrc,
-          match: { uri: beta, relPath: 'beta.js', matches: betaMatches }
-        });
-        window.__ijFindOnMessage({ type: 'results:done', searchId: 940, totalFiles: 2, totalMatches: 32, truncated: false, __targetSrc: targetSrc });
-        var oldBridge = globalThis.irSearchEvent;
+          window.__ijFindOnMessage({
+            type: 'results:file',
+            searchId: 940,
+            __targetSrc: targetSrc,
+            match: { uri: beta, relPath: 'beta.js', matches: betaMatches }
+          });
+          window.__ijFindOnMessage({ type: 'results:done', searchId: 940, totalFiles: 2, totalMatches: 32, truncated: false, __targetSrc: targetSrc });
+          function resultRow(idx) {
+            return document.querySelector('.ij-find-row[data-flat="' + idx + '"]');
+          }
+          for (var rowWait = 0; rowWait < 20 && !resultRow(1); rowWait++) {
+            await new Promise(function (resolve) { setTimeout(resolve, 10); });
+          }
+          var oldBridge = globalThis.irSearchEvent;
         var sent = [];
         globalThis.irSearchEvent = function (payload) {
           try {
@@ -9250,7 +9256,7 @@ suite('Renderer — overlay UI probes', () => {
         var requestTimings = [];
         var renderTimings = [];
         for (var idx = 1; idx <= 16; idx++) {
-          var row = document.querySelector('.ij-find-row[data-flat="' + idx + '"]');
+            var row = resultRow(idx);
           if (!row) {
             globalThis.irSearchEvent = oldBridge;
             window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
@@ -9329,6 +9335,95 @@ suite('Renderer — overlay UI probes', () => {
     assert.strictEqual(parsed.renderTimings.length, 16, `expected every loaded click to render preview: ${raw}`);
     assertTimingsWithin('result click preview request latency', parsed.requestTimings, 10);
     assertTimingsWithin('result click preview render latency', parsed.renderTimings, 10);
+  });
+
+  test('same-file result pointerdown requests the selected match preview immediately', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const alphaUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py').toString();
+
+      await overlay.show('PreviewPointerSameFile', { forceLiteral: true, suppressSearch: true });
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+        var alpha = ${JSON.stringify(alphaUri)};
+        var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+          var query = node.querySelector('.ij-find-query');
+          return query && query.value === 'PreviewPointerSameFile';
+        }) || document.querySelector('.ij-find-overlay.visible');
+        var targetSrc = root ? root.getAttribute('data-ij-find-src') || '' : '';
+        var q = root ? root.querySelector('.ij-find-query') : document.querySelector('.ij-find-query');
+        if (q) { q.value = ''; }
+        if (window.__ijFindRefreshSearch) { window.__ijFindRefreshSearch(targetSrc); }
+        window.__ijFindOnMessage({ type: 'results:start', searchId: 943, __targetSrc: targetSrc });
+        window.__ijFindOnMessage({
+          type: 'results:file',
+          searchId: 943,
+          __targetSrc: targetSrc,
+          match: {
+            uri: alpha,
+            relPath: 'alpha.py',
+            matches: [
+              { line: 0, preview: 'class AlphaService first same-file row', ranges: [{ start: 6, end: 18 }] },
+              { line: 7, preview: 'class AlphaService second same-file row', ranges: [{ start: 6, end: 18 }] },
+              { line: 14, preview: 'class AlphaService third same-file row', ranges: [{ start: 6, end: 18 }] }
+            ]
+          }
+          });
+            window.__ijFindOnMessage({ type: 'results:done', searchId: 943, totalFiles: 1, totalMatches: 3, truncated: false, __targetSrc: targetSrc });
+            function selectedRow() {
+              return root && root.querySelector('.ij-find-row[data-flat="2"]');
+            }
+            for (var wait = 0; wait < 20 && !selectedRow(); wait++) {
+              await new Promise(function (resolve) { setTimeout(resolve, 10); });
+            }
+            var oldBridge = globalThis.irSearchEvent;
+        var sent = [];
+        globalThis.irSearchEvent = function (payload) {
+          try { sent.push(JSON.parse(String(payload))); } catch (e) {}
+        };
+        try {
+            var row = selectedRow();
+          if (!row) { return JSON.stringify({ err: 'missing row', state: window.__ijFindGetSearchState(targetSrc) }); }
+          var started = performance.now();
+          var down = typeof PointerEvent === 'function'
+            ? new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerType: 'mouse' })
+            : new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0, buttons: 1 });
+          row.dispatchEvent(down);
+          var requestAtMs = performance.now() - started;
+          var previewRequestsAfterDown = sent.filter(function (msg) { return msg.type === 'requestPreview'; });
+          row.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+          var previewRequestsAfterClick = sent.filter(function (msg) { return msg.type === 'requestPreview'; });
+          var state = window.__ijFindGetSearchState(targetSrc);
+          return JSON.stringify({
+            requestAtMs: Math.round(requestAtMs),
+            afterDownCount: previewRequestsAfterDown.length,
+            afterClickCount: previewRequestsAfterClick.length,
+            request: previewRequestsAfterDown[0] || null,
+            activeIndex: state.activeIndex
+          });
+        } finally {
+          globalThis.irSearchEvent = oldBridge;
+        }
+      })()`,
+    );
+    const parsed = JSON.parse(raw) as {
+      err?: string;
+      requestAtMs: number;
+      afterDownCount: number;
+      afterClickCount: number;
+      request: { type: string; uri?: string; line?: number } | null;
+      activeIndex: number;
+    };
+    assert.strictEqual(parsed.err, undefined, `expected same-file result row: ${raw}`);
+    assert.strictEqual(parsed.afterDownCount, 1, `pointerdown should send one preview request immediately: ${raw}`);
+    assert.strictEqual(parsed.afterClickCount, 1, `subsequent click should not duplicate the pointerdown preview request: ${raw}`);
+    assert.strictEqual(parsed.request?.uri, alphaUri, `request should target the selected file: ${raw}`);
+    assert.strictEqual(parsed.request?.line, 14, `request should target the clicked same-file match line: ${raw}`);
+    assert.strictEqual(parsed.activeIndex, 2, `pointerdown should select the clicked row immediately: ${raw}`);
+    assertTimingsWithin('same-file pointerdown preview request latency', [parsed.requestAtMs], 10);
   });
 
   test('rapid result clicks ignore stale out-of-order preview responses under load', async function () {
