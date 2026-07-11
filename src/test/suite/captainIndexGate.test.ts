@@ -696,7 +696,7 @@ async function loadAccuracyFixture(root: string, rgPath: string): Promise<Accura
   return accuracyFixturePromise;
 }
 
-let captainSearchRebuildElapsedMs: number | undefined;
+let captainSearchReuseElapsedMs: number | undefined;
 
 async function hasCleanSearchIndex(root: string): Promise<boolean> {
   try {
@@ -725,7 +725,7 @@ async function ensureCleanSearchIndexSeed(root: string, binary: string): Promise
   );
 }
 
-async function runCaptainSearchRebuildGate(): Promise<number> {
+async function runCaptainSearchReuseGate(): Promise<number> {
   const root = workspaceRoot();
   assertCaptainWorkspace(root);
   const binary = getZoekRsBinaryForTests('ijss-rebuild');
@@ -733,7 +733,7 @@ async function runCaptainSearchRebuildGate(): Promise<number> {
   const started = Date.now();
   const result = await runProcess(
     binary,
-    [root, '--force'],
+    [root],
     process.cwd(),
     SEARCH_INDEX_BUDGET_MS + TIMEOUT_GRACE_MS,
   );
@@ -812,7 +812,7 @@ suite('Captain E2E index gates', () => {
 
   test('search index reuses the clean full captain workspace within 8 seconds before renderer probes', async function () {
     this.timeout(SEARCH_INDEX_SEED_TIMEOUT_MS + SEARCH_INDEX_BUDGET_MS + TIMEOUT_GRACE_MS);
-    captainSearchRebuildElapsedMs = await runCaptainSearchRebuildGate();
+    captainSearchReuseElapsedMs = await runCaptainSearchReuseGate();
   });
 
   test('captain search result clicks switch preview within 10ms after warmup', async function () {
@@ -1108,7 +1108,7 @@ suite('Captain E2E index gates', () => {
 
   test('search index reuses the clean full captain workspace within 8 seconds', async function () {
     this.timeout(SEARCH_INDEX_SEED_TIMEOUT_MS + SEARCH_INDEX_BUDGET_MS + TIMEOUT_GRACE_MS);
-    const elapsedMs = captainSearchRebuildElapsedMs ?? await runCaptainSearchRebuildGate();
+    const elapsedMs = captainSearchReuseElapsedMs ?? await runCaptainSearchReuseGate();
     assert.ok(elapsedMs <= SEARCH_INDEX_BUDGET_MS, `captain search index clean reuse took ${elapsedMs}ms`);
     console.log(`[captain-e2e] search index clean reuse already verified ${elapsedMs}ms`);
   });

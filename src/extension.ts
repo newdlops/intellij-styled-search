@@ -166,7 +166,11 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   const overlay = OverlayPanel.get(context);
   activeOverlay = overlay;
   const callGraphLog = overlay.getLogChannel();
-  const callGraph = new CallGraphService(context, callGraphLog);
+  const callGraph = new CallGraphService(
+    context,
+    callGraphLog,
+    (allowBuild) => overlay.resolveZoekEngineBinaryForGraph(allowBuild),
+  );
   const callGraphInlayRegistry = new CallGraphInlayRegistry();
   overlay.setPreviewCallGraphInlayProvider((uri, document, range) =>
     buildPreviewCallGraphInlays(callGraph, callGraphLog, uri, document, range));

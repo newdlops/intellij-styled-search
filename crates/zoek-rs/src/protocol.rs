@@ -308,7 +308,16 @@ pub struct ErrorResponse {
 }
 
 #[derive(Clone, Debug)]
+pub struct CapabilitiesResponse {
+    pub ok: bool,
+    pub engine: EngineInfo,
+    pub commands: Vec<String>,
+    pub features: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
 pub enum EngineResponse {
+    Capabilities(CapabilitiesResponse),
     Index(IndexResponse),
     Info(InfoResponse),
     Search(SearchResponse),
@@ -343,6 +352,7 @@ impl EngineInfo {
 impl EngineResponse {
     pub fn to_json(&self) -> String {
         match self {
+            EngineResponse::Capabilities(response) => response.to_json(),
             EngineResponse::Index(response) => response.to_json(),
             EngineResponse::Info(response) => response.to_json(),
             EngineResponse::Search(response) => response.to_json(),
@@ -354,6 +364,18 @@ impl EngineResponse {
             EngineResponse::GraphSymbolQuery(response) => response.to_json(),
             EngineResponse::Error(response) => response.to_json(),
         }
+    }
+}
+
+impl CapabilitiesResponse {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"type\":\"capabilities\",\"ok\":{},\"engine\":{},\"commands\":[{}],\"features\":[{}]}}",
+            self.ok,
+            self.engine.to_json(),
+            json_string_vec(&self.commands),
+            json_string_vec(&self.features),
+        )
     }
 }
 

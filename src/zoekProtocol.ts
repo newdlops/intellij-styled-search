@@ -10,6 +10,14 @@ export interface ZoektRuntimeStats {
   majorPageFaults: number;
 }
 
+export interface ZoektCapabilitiesResponse {
+  type: 'capabilities';
+  ok: boolean;
+  engine: ZoektEngineInfo;
+  commands: string[];
+  features: string[];
+}
+
 export interface ZoektIndexRequest {
   workspaceRoot: string;
   indexDir?: string;
@@ -209,6 +217,7 @@ export interface ZoektErrorResponse {
 }
 
 export type ZoektEngineResponse =
+  | ZoektCapabilitiesResponse
   | ZoektIndexResponse
   | ZoektInfoResponse
   | ZoektSearchResponse

@@ -861,6 +861,8 @@ type RustGraphInvokeOptions = {
   cancelError?: Error;
 };
 
+type RustGraphBinaryResolver = (allowBuild: boolean) => Promise<string | undefined>;
+
 export class CallGraphService implements vscode.Disposable {
   private snapshot: CallGraphSnapshot | undefined;
   private rebuildPromise: Promise<CallGraphSnapshot> | undefined;
@@ -906,6 +908,7 @@ export class CallGraphService implements vscode.Disposable {
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly log: vscode.OutputChannel,
+    private readonly rustGraphBinaryResolver?: RustGraphBinaryResolver,
   ) {
     const disposables: vscode.Disposable[] = [];
     if (this.shouldWatchExternalFileChanges()) {
@@ -4289,6 +4292,9 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   private async resolveRustGraphBinary(allowBuild: boolean): Promise<string | undefined> {
+    if (this.rustGraphBinaryResolver) {
+      return this.rustGraphBinaryResolver(allowBuild);
+    }
     const existing = this.findRustGraphBinary({ includeDebug: !allowBuild });
     if (existing || !allowBuild) { return existing; }
     if (this.rustGraphBuildPromise) { return this.rustGraphBuildPromise; }

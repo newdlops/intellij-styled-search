@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+use rayon::prelude::*;
 use zoek_rs::config::EngineConfig;
 use zoek_rs::graph::{
     audit_usage_counts, compact_graph_overlay, dump_references_tsv, dump_references_with_overlay_tsv,
@@ -14,15 +15,17 @@ use zoek_rs::graph::{
     query_graph_symbols_with_options, rebuild_graph_native, update_graph_native, GraphSymbol,
     GraphSymbolQueryOptions,
 };
-use zoek_rs::indexer::index_directory_with_progress;
+use zoek_rs::indexer::{
+    index_directory_with_options, index_directory_with_progress, IndexBuildOptions,
+};
 use zoek_rs::mmap_store::StoreLayout;
 use zoek_rs::ops::{benchmark_workspaces, collect_info, diagnose_query};
 use zoek_rs::overlay::{apply_change_batch, load_overlay_with_recovery};
 use zoek_rs::protocol::{
-    BenchmarkResponse, DiagnoseResponse, EngineInfo, EngineResponse, ErrorResponse,
-    GraphIndexResponse, GraphQueryReference, GraphQueryResponse, GraphSymbolQueryResponse,
-    GraphSymbolResponse, IndexRequest, IndexResponse, IndexStats, InfoResponse,
-    OverlayUpdateResponse, SearchRequest,
+    BenchmarkResponse, CapabilitiesResponse, DiagnoseResponse, EngineInfo, EngineResponse,
+    ErrorResponse, GraphIndexResponse, GraphQueryReference, GraphQueryResponse,
+    GraphSymbolQueryResponse, GraphSymbolResponse, IndexRequest, IndexResponse, IndexStats,
+    InfoResponse, OverlayUpdateResponse, SearchRequest,
 };
 use zoek_rs::searcher::{search_workspace, search_workspace_streaming};
 use zoek_rs::shard::ShardReader;
@@ -47,6 +50,7 @@ fn run(args: Vec<String>) -> Result<EngineResponse, String> {
         return Err(usage());
     };
     match command.as_str() {
+        "capabilities" => Ok(engine_capabilities()),
         "index" => run_index(&args[1..]),
         "compact" => run_compact(&args[1..]),
         "update" => run_update(&args[1..]),
@@ -68,6 +72,43 @@ fn run(args: Vec<String>) -> Result<EngineResponse, String> {
         "graph-audit-counts" => run_graph_audit_counts(&args[1..]),
         _ => Err(usage()),
     }
+}
+
+fn engine_capabilities() -> EngineResponse {
+    EngineResponse::Capabilities(CapabilitiesResponse {
+        ok: true,
+        engine: EngineInfo::current(),
+        commands: [
+            "index",
+            "compact",
+            "update",
+            "search",
+            "info",
+            "diagnose",
+            "benchmark",
+            "graph-rebuild",
+            "graph-index",
+            "graph-update",
+            "graph-overlay-update",
+            "graph-compact",
+            "graph-query",
+            "graph-callees",
+            "graph-symbol-query",
+            "graph-implementations",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        features: [
+            "force-index-rebuild",
+            "search-exclude-globs",
+            "streaming-search",
+            "rust-native-call-graph",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    })
 }
 
 fn run_index(args: &[String]) -> Result<EngineResponse, String> {
@@ -98,9 +139,16 @@ fn run_index(args: &[String]) -> Result<EngineResponse, String> {
         }
     }
 
-    let artifacts = index_directory_with_progress(&workspace_root, &config, &mut |progress| {
-        eprintln!("{}", progress.to_stderr_line());
-    })
+    let artifacts = index_directory_with_options(
+        &workspace_root,
+        &config,
+        IndexBuildOptions {
+            force: request.force,
+        },
+        &mut |progress| {
+            eprintln!("{}", progress.to_stderr_line());
+        },
+    )
     .map_err(|err| err.to_string())?;
     Ok(EngineResponse::Index(IndexResponse {
         ok: true,
@@ -190,6 +238,9 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
                 renamed_paths.push((old_path.clone(), new_path.clone()));
                 idx += 3;
             }
+            other if other.starts_with("--") => {
+                return Err(format!("unknown update flag: {other}"));
+            }
             other => {
                 changed_paths.push(other.to_string());
                 idx += 1;
@@ -234,6 +285,63 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
         elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         warnings,
     }))
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{engine_capabilities, run_index, run_update};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use zoek_rs::protocol::EngineResponse;
+
+    #[test]
+    fn capabilities_advertise_search_graph_and_force_contracts() {
+        let json = engine_capabilities().to_json();
+        assert!(json.contains("\"protocolVersion\":1"));
+        assert!(json.contains("\"schemaVersion\":20"));
+        assert!(json.contains("\"graph-rebuild\""));
+        assert!(json.contains("\"force-index-rebuild\""));
+        assert!(json.contains("\"search-exclude-globs\""));
+    }
+
+    #[test]
+    fn update_rejects_force_instead_of_treating_it_as_a_changed_path() {
+        let workspace = std::env::temp_dir()
+            .join(format!("zoek-rs-update-flags-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let args = vec![workspace, "--force".to_string()];
+        let error = run_update(&args).err().expect("--force must be rejected");
+        assert_eq!(error, "unknown update flag: --force");
+    }
+
+    #[test]
+    fn sync_immediately_after_base_build_is_a_noop() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "zoek-rs-base-sync-contract-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("src")).expect("create neutral fixture directory");
+        fs::write(root.join("src/record.rs"), "pub fn value() -> u32 { 7 }\n")
+            .expect("write neutral fixture source");
+        let root_arg = root.to_string_lossy().into_owned();
+
+        let indexed = run_index(&[root_arg.clone(), "--force".to_string()])
+            .expect("base build must succeed");
+        assert!(matches!(indexed, EngineResponse::Index(response) if response.ok));
+        let updated = run_update(&[root_arg, "--sync".to_string()])
+            .expect("workspace sync must succeed");
+        assert!(matches!(
+            updated,
+            EngineResponse::Update(response) if response.ok && response.entries_written == 0
+        ));
+
+        fs::remove_dir_all(root).expect("remove neutral fixture directory");
+    }
 }
 
 fn build_workspace_sync_batch(
@@ -399,35 +507,39 @@ fn stat_current_candidates(
     config: &EngineConfig,
     files: Vec<String>,
 ) -> io::Result<BTreeMap<String, u64>> {
-    let mut out = BTreeMap::new();
-    for rel_path in files {
-        if rel_path.is_empty() || config.is_overlay_update_excluded_relative_path(&rel_path) {
-            continue;
-        }
-        let abs_path = workspace_root.join(&rel_path);
-        if config.is_binary_extension(&abs_path) {
-            continue;
-        }
-        let metadata = match fs::metadata(&abs_path) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
-        };
-        if !metadata.is_file() || metadata.len() > config.max_file_size_bytes {
-            continue;
-        }
-        let modified_unix_secs = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|value| value.as_secs())
-            .unwrap_or(0);
-        out.insert(
-            rel_path.clone(),
-            zoek_rs::indexer::stable_record_hash(&rel_path, metadata.len(), modified_unix_secs),
-        );
-    }
-    Ok(out)
+    let entries = files
+        .into_par_iter()
+        .map(|rel_path| -> io::Result<Option<(String, u64)>> {
+            if rel_path.is_empty() || config.is_overlay_update_excluded_relative_path(&rel_path) {
+                return Ok(None);
+            }
+            let abs_path = workspace_root.join(&rel_path);
+            if config.is_binary_extension(&abs_path) {
+                return Ok(None);
+            }
+            let metadata = match fs::metadata(&abs_path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => return Err(err),
+            };
+            if !metadata.is_file() || metadata.len() > config.max_file_size_bytes {
+                return Ok(None);
+            }
+            let modified_unix_secs = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_secs())
+                .unwrap_or(0);
+            let hash = zoek_rs::indexer::stable_record_hash(
+                &rel_path,
+                metadata.len(),
+                modified_unix_secs,
+            );
+            Ok(Some((rel_path, hash)))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok(entries.into_iter().flatten().collect())
 }
 
 fn normalize_sync_rel_path(path: &str) -> String {

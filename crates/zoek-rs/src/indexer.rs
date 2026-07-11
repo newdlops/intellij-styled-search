@@ -52,6 +52,15 @@ pub struct IndexArtifacts {
     pub fingerprint: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IndexBuildOptions {
+    /// Rebuild base shards even when the existing index passes the clean
+    /// workspace validation. The old CLI parsed --force but never carried it
+    /// into the indexer, so a supposed cold benchmark could silently measure
+    /// the clean-reuse path instead.
+    pub force: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct IndexProgress {
     pub phase: &'static str,
@@ -110,6 +119,23 @@ pub fn index_directory_with_progress<F>(
 where
     F: FnMut(IndexProgress),
 {
+    index_directory_with_options(
+        workspace_root,
+        config,
+        IndexBuildOptions::default(),
+        progress,
+    )
+}
+
+pub fn index_directory_with_options<F>(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    options: IndexBuildOptions,
+    progress: &mut F,
+) -> io::Result<IndexArtifacts>
+where
+    F: FnMut(IndexProgress),
+{
     let layout = StoreLayout::for_workspace(workspace_root, config);
     layout.ensure_dirs()?;
     let _ = layout.cleanup_stale_temp_files(30);
@@ -119,7 +145,15 @@ where
         .map(|value| value.as_secs())
         .unwrap_or(0);
 
-    if let Some(artifacts) =
+    if options.force {
+        progress(IndexProgress {
+            phase: "scan",
+            current: 0,
+            total: 1,
+            percent: 0,
+            detail: "force rebuild bypassing clean index reuse".to_string(),
+        });
+    } else if let Some(artifacts) =
         try_reuse_clean_existing_index(workspace_root, config, &layout, now, progress)?
     {
         return Ok(artifacts);
@@ -1103,6 +1137,17 @@ fn build_indexed_document_from_record(
             }
             Err(err) => return Err(err),
         };
+        // The rg enumeration path intentionally avoids a separate stat pass,
+        // but update --sync compares path+size+mtime hashes. Reuse the already
+        // opened descriptor's metadata so base documents and sync speak the
+        // same hash contract without adding another workspace traversal.
+        let modified_unix_secs = file
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_secs())
+            .unwrap_or(0);
         let (outcome, actual_size_bytes, sampled) =
             match read_index_bytes_from_unknown_size_file_if_not_binary(
                 &mut file,
@@ -1125,7 +1170,7 @@ fn build_indexed_document_from_record(
             ReadTextBytesOutcome::Binary => return Ok(IndexedRecordOutcome::SkippedBinary),
             ReadTextBytesOutcome::TooLarge => return Ok(IndexedRecordOutcome::SkippedTooLarge),
         };
-        (bytes, actual_size_bytes, 0, sampled)
+        (bytes, actual_size_bytes, modified_unix_secs, sampled)
     };
     let (text, encoding) = decode_bytes_owned(bytes);
     let gram_limit = max_grams_for_file(config, size_bytes, &record.rel_path);
@@ -1644,7 +1689,7 @@ fn _artifact_paths(artifacts: &IndexArtifacts) -> (&PathBuf, &PathBuf, &PathBuf)
 
 #[cfg(test)]
 mod tests {
-    use super::index_directory;
+    use super::{index_directory, index_directory_with_options, IndexBuildOptions};
     use crate::config::EngineConfig;
     use crate::shard::ShardReader;
     use std::fs;
@@ -1672,6 +1717,99 @@ mod tests {
 
         let reader = ShardReader::open(&root.join(".zoek-rs/base-shard-0000.zrs"))?;
         assert_eq!(reader.header().doc_count, 1);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn force_rebuild_bypasses_clean_index_reuse() -> io::Result<()> {
+        let root = temp_dir("force-rebuild");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/record.rs"), "pub const VALUE: usize = 1;\n")?;
+        let config = EngineConfig::default();
+
+        let initial = index_directory(&root, &config)?;
+        let mut reuse_details = Vec::new();
+        let reused = index_directory_with_options(
+            &root,
+            &config,
+            IndexBuildOptions::default(),
+            &mut |progress| reuse_details.push(progress.detail),
+        )?;
+        assert!(
+            reuse_details
+                .iter()
+                .any(|detail| detail.starts_with("reused clean index from ")),
+            "a normal rebuild should retain the validated clean-reuse path"
+        );
+        assert_eq!(
+            reused.fingerprint, initial.fingerprint,
+            "a clean workspace should reuse the existing base snapshot"
+        );
+
+        fs::write(
+            root.join("src/record.rs"),
+            "pub const REPLACEMENT_VALUE: usize = 10_000;\n",
+        )?;
+        let mut forced_details = Vec::new();
+        let forced = index_directory_with_options(
+            &root,
+            &config,
+            IndexBuildOptions { force: true },
+            &mut |progress| forced_details.push(progress.detail),
+        )?;
+        assert!(
+            forced_details
+                .iter()
+                .any(|detail| detail == "force rebuild bypassing clean index reuse"),
+            "force must reach the indexer instead of stopping at CLI parsing"
+        );
+        assert!(
+            !forced_details
+                .iter()
+                .any(|detail| detail.starts_with("reused clean index from ")),
+            "force must not report a clean index reuse"
+        );
+        assert_ne!(
+            forced.fingerprint, initial.fingerprint,
+            "force should rebuild base shards from the changed workspace"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn base_document_hash_matches_incremental_sync_metadata_contract() -> io::Result<()> {
+        let root = temp_dir("metadata-contract");
+        fs::create_dir_all(root.join("src"))?;
+        let file_path = root.join("src/record.rs");
+        let source = "pub fn compute(value: usize) -> usize { value + 1 }\n";
+        fs::write(&file_path, source)?;
+        let config = EngineConfig::default();
+        let artifacts = index_directory(&root, &config)?;
+
+        let metadata = fs::metadata(&file_path)?;
+        let modified_unix_secs = metadata
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or(0);
+        let expected = super::stable_record_hash(
+            "src/record.rs",
+            metadata.len(),
+            modified_unix_secs,
+        );
+        let mut actual = None;
+        for shard in &artifacts.shards {
+            for document in ShardReader::open(&shard.path)?.documents()? {
+                if document.rel_path == "src/record.rs" {
+                    actual = Some(document.content_hash);
+                }
+            }
+        }
+        assert_eq!(actual, Some(expected));
 
         fs::remove_dir_all(root)?;
         Ok(())

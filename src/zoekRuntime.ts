@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { type ChildProcess, spawn } from 'child_process';
+import { createHash } from 'crypto';
 import * as vscode from 'vscode';
 import {
   compilePathScopeMatcher,
@@ -72,6 +73,7 @@ const AUTO_BASE_REFRESH_MIN_INTERVAL_MS = 60_000;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
 const ZOEKT_PROGRESS_PREFIX = '__ZOEK_PROGRESS__';
 const ZOEKT_SEARCH_EVENT_PREFIX = '__ZOEK_SEARCH__';
+const ZOEKT_PROTOCOL_VERSION = 1;
 // MUST match `SCHEMA_VERSION` in crates/zoek-rs/src/config.rs — the rust binary
 // stamps it into .zoek-rs/manifest.json and hasReadyIndex() rejects any other
 // value as "incomplete" (→ codesearch fallback). The rust schema was bumped to
@@ -100,6 +102,7 @@ type InvokeTextResult = {
 
 type InvokeTextHooks = {
   onStderrLine?: (line: string) => boolean | void;
+  env?: NodeJS.ProcessEnv;
 };
 
 type IndexProgressListener = (message: string, percent?: number) => void;
@@ -131,6 +134,14 @@ type TrackedChild = {
   killTimer: ReturnType<typeof setTimeout> | undefined;
 };
 
+type BinaryPairManifest = {
+  formatVersion?: unknown;
+  sourceFingerprint?: unknown;
+  platform?: unknown;
+  artifactId?: unknown;
+  files?: Record<string, unknown>;
+};
+
 export class ZoektRuntime implements vscode.Disposable {
   private readonly extensionRoot: string;
   private readonly watcher: vscode.FileSystemWatcher | undefined;
@@ -138,6 +149,9 @@ export class ZoektRuntime implements vscode.Disposable {
   private readonly lifecycleCts = new vscode.CancellationTokenSource();
   private binaryPath: string | undefined;
   private rebuildBinaryPath: string | undefined;
+  private rustSourceFingerprint: string | undefined;
+  private packagedBinaryPairValid: boolean | undefined;
+  private readonly globalBinaryPairValidity = new Map<string, { signature: string; valid: boolean }>();
   private readonly binaryCompatibility = new Map<string, boolean>();
   private buildPromise: Promise<void> | undefined;
   private readonly indexPromises = new Map<string, Promise<boolean>>();
@@ -1583,20 +1597,323 @@ export class ZoektRuntime implements vscode.Disposable {
 
   private getBinaryCandidatesFor(target: BinaryTarget, exeSuffix = process.platform === 'win32' ? '.exe' : ''): string[] {
     const baseName = target === 'rebuild' ? 'ijss-rebuild' : 'zoek-rs';
-    return [
+    const candidates: string[] = [];
+    for (const globalCacheDir of this.getCompleteGlobalBinaryCacheDirs(exeSuffix)) {
+      candidates.push(path.join(globalCacheDir, `${baseName}${exeSuffix}`));
+    }
+    if (this.isPackagedBinaryPairValid()) {
+      candidates.push(path.join(this.getPackagedBinaryDir(), `${baseName}${exeSuffix}`));
+    }
+    candidates.push(
       path.join(this.extensionRoot, 'target', 'release', `${baseName}${exeSuffix}`),
       path.join(this.extensionRoot, 'target', 'debug', `${baseName}${exeSuffix}`),
-    ];
+    );
+    return candidates;
   }
 
-  private isDebugBuildCandidate(candidate: string): boolean {
-    return candidate.replace(/\\/g, '/').includes('/target/debug/');
+  private getBinaryPlatformKey(): string {
+    return `${process.platform}-${process.arch}`;
+  }
+
+  private getGlobalBinaryCacheDir(): string {
+    return path.join(
+      this.context.globalStorageUri.fsPath,
+      'zoek-rs',
+      'runtime',
+      this.getBinaryPlatformKey(),
+      this.getRustSourceFingerprint(),
+    );
+  }
+
+  private getPackagedBinaryDir(): string {
+    return path.join(
+      this.extensionRoot,
+      'resources',
+      'bin',
+      this.getBinaryPlatformKey(),
+    );
+  }
+
+  private isPackagedBinaryPairValid(): boolean {
+    if (this.packagedBinaryPairValid !== undefined) { return this.packagedBinaryPairValid; }
+    const exeSuffix = process.platform === 'win32' ? '.exe' : '';
+    try {
+      const packagedDir = this.getPackagedBinaryDir();
+      const manifest = JSON.parse(fs.readFileSync(path.join(packagedDir, 'manifest.json'), 'utf8')) as {
+        formatVersion?: unknown;
+        platformKey?: unknown;
+        protocolVersion?: unknown;
+        schemaVersion?: unknown;
+        sourceFingerprint?: unknown;
+        artifactId?: unknown;
+        files?: Record<string, unknown>;
+      };
+      if (manifest.formatVersion !== 2 ||
+          manifest.platformKey !== this.getBinaryPlatformKey() ||
+          manifest.protocolVersion !== ZOEKT_PROTOCOL_VERSION ||
+          manifest.schemaVersion !== ZOEKT_SCHEMA_VERSION ||
+          manifest.sourceFingerprint !== this.getRustSourceFingerprint()) {
+        this.packagedBinaryPairValid = false;
+        return false;
+      }
+      const files: Record<string, string> = {};
+      for (const baseName of ['zoek-rs', 'ijss-rebuild']) {
+        const expected = manifest.files?.[baseName];
+        if (typeof expected !== 'string') {
+          this.packagedBinaryPairValid = false;
+          return false;
+        }
+        const binaryPath = path.join(packagedDir, `${baseName}${exeSuffix}`);
+        const actual = createHash('sha256').update(fs.readFileSync(binaryPath)).digest('hex');
+        if (actual !== expected) {
+          this.packagedBinaryPairValid = false;
+          return false;
+        }
+        files[baseName] = actual;
+      }
+      if (manifest.artifactId !== this.binaryPairArtifactId(files)) {
+        this.packagedBinaryPairValid = false;
+        return false;
+      }
+      this.packagedBinaryPairValid = true;
+      return true;
+    } catch {
+      this.packagedBinaryPairValid = false;
+      return false;
+    }
+  }
+
+  private getSharedCargoTargetDir(): string {
+    return path.join(
+      this.context.globalStorageUri.fsPath,
+      'zoek-rs',
+      'cargo-target',
+      this.getBinaryPlatformKey(),
+      this.getRustSourceFingerprint(),
+    );
+  }
+
+  private getRustSourceFingerprint(): string {
+    if (this.rustSourceFingerprint) { return this.rustSourceFingerprint; }
+    const hash = createHash('sha256');
+    const inputs: string[] = [];
+    const addFile = (filePath: string) => {
+      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) { return; }
+      inputs.push(filePath);
+    };
+    const walk = (dirPath: string) => {
+      if (!fs.existsSync(dirPath)) { return; }
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true })
+        .sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of entries) {
+        const entryPath = path.join(dirPath, entry.name);
+        if (entry.isDirectory()) { walk(entryPath); }
+        else if (entry.isFile() && (entry.name.endsWith('.rs') || entry.name === 'Cargo.toml')) {
+          addFile(entryPath);
+        }
+      }
+    };
+    addFile(path.join(this.extensionRoot, 'Cargo.lock'));
+    addFile(path.join(this.extensionRoot, 'Cargo.toml'));
+    walk(path.join(this.extensionRoot, 'crates', 'zoek-rs'));
+    inputs.sort();
+    if (inputs.length === 0) {
+      hash.update(String(this.context.extension?.packageJSON?.version ?? 'unknown'));
+    } else {
+      for (const input of inputs) {
+        hash.update(path.relative(this.extensionRoot, input).replace(/\\/g, '/'));
+        hash.update('\0');
+        hash.update(fs.readFileSync(input));
+        hash.update('\0');
+      }
+    }
+    this.rustSourceFingerprint = hash.digest('hex').slice(0, 24);
+    return this.rustSourceFingerprint;
+  }
+
+  private getCompleteGlobalBinaryCacheDirs(exeSuffix: string): string[] {
+    const rootDir = this.getGlobalBinaryCacheDir();
+    try {
+      return fs.readdirSync(rootDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.tmp-'))
+        .map((entry) => path.join(rootDir, entry.name))
+        .filter((dirPath) => this.isCompleteGlobalBinaryCache(dirPath, exeSuffix))
+        .sort();
+    } catch {
+      return [];
+    }
+  }
+
+  private binaryPairArtifactId(files: Record<string, string>): string {
+    const hash = createHash('sha256');
+    for (const baseName of ['zoek-rs', 'ijss-rebuild']) {
+      hash.update(baseName);
+      hash.update('\0');
+      hash.update(files[baseName] ?? '');
+      hash.update('\0');
+    }
+    return hash.digest('hex');
+  }
+
+  private isCompleteGlobalBinaryCache(dirPath: string, exeSuffix: string): boolean {
+    try {
+      const manifestPath = path.join(dirPath, 'install.json');
+      const manifestText = fs.readFileSync(manifestPath, 'utf8');
+      const manifest = JSON.parse(manifestText) as BinaryPairManifest;
+      const binaryPaths = ['zoek-rs', 'ijss-rebuild'].map((baseName) =>
+        path.join(dirPath, `${baseName}${exeSuffix}`),
+      );
+      const stats = binaryPaths.map((binaryPath) => fs.statSync(binaryPath));
+      if (stats.some((stat) => !stat.isFile())) { return false; }
+      if (process.platform !== 'win32') {
+        for (const binaryPath of binaryPaths) {
+          fs.accessSync(binaryPath, fs.constants.X_OK);
+        }
+      }
+      const signature = [
+        manifestText,
+        ...stats.map((stat) => `${stat.size}:${stat.mtimeMs}:${stat.mode}`),
+      ].join('\0');
+      const cached = this.globalBinaryPairValidity.get(dirPath);
+      if (cached?.signature === signature) { return cached.valid; }
+      const files: Record<string, string> = {};
+      for (let index = 0; index < binaryPaths.length; index += 1) {
+        files[index === 0 ? 'zoek-rs' : 'ijss-rebuild'] = createHash('sha256')
+          .update(fs.readFileSync(binaryPaths[index]))
+          .digest('hex');
+      }
+      const artifactId = this.binaryPairArtifactId(files);
+      const valid = manifest.formatVersion === 2 &&
+        manifest.sourceFingerprint === this.getRustSourceFingerprint() &&
+        manifest.platform === this.getBinaryPlatformKey() &&
+        manifest.artifactId === artifactId &&
+        manifest.files?.['zoek-rs'] === files['zoek-rs'] &&
+        manifest.files?.['ijss-rebuild'] === files['ijss-rebuild'];
+      this.globalBinaryPairValidity.set(dirPath, { signature, valid });
+      return valid;
+    } catch {
+      return false;
+    }
+  }
+
+  private async materializePackagedBinaryPair(): Promise<void> {
+    if (!this.isPackagedBinaryPairValid()) { return; }
+    await this.installBinaryPairFromDir(this.getPackagedBinaryDir());
+  }
+
+  private async installBuiltBinaryPair(cargoTargetDir: string, cargoStdout = ''): Promise<void> {
+    const artifacts = this.parseCargoBinaryArtifacts(cargoStdout);
+    if (artifacts['zoek-rs'] && artifacts['ijss-rebuild']) {
+      await this.installBinaryPairFromPaths(artifacts);
+      return;
+    }
+    await this.installBinaryPairFromDir(path.join(cargoTargetDir, 'release'));
+  }
+
+  private parseCargoBinaryArtifacts(stdout: string): Record<string, string> {
+    const artifacts: Record<string, string> = {};
+    for (const line of stdout.split(/\r?\n/)) {
+      if (!line.trim()) { continue; }
+      try {
+        const message = JSON.parse(line) as {
+          reason?: unknown;
+          executable?: unknown;
+          target?: { name?: unknown; kind?: unknown };
+        };
+        const name = message.target?.name;
+        if (message.reason !== 'compiler-artifact' ||
+            typeof message.executable !== 'string' ||
+            (name !== 'zoek-rs' && name !== 'ijss-rebuild') ||
+            !Array.isArray(message.target?.kind) ||
+            !message.target.kind.includes('bin')) {
+          continue;
+        }
+        artifacts[name] = message.executable;
+      } catch {}
+    }
+    return artifacts;
+  }
+
+  private async installBinaryPairFromDir(sourceDir: string): Promise<void> {
+    const exeSuffix = process.platform === 'win32' ? '.exe' : '';
+    await this.installBinaryPairFromPaths({
+      'zoek-rs': path.join(sourceDir, `zoek-rs${exeSuffix}`),
+      'ijss-rebuild': path.join(sourceDir, `ijss-rebuild${exeSuffix}`),
+    });
+  }
+
+  private async installBinaryPairFromPaths(sourcePaths: Record<string, string>): Promise<void> {
+    const exeSuffix = process.platform === 'win32' ? '.exe' : '';
+    const files: Record<string, string> = {};
+    for (const baseName of ['zoek-rs', 'ijss-rebuild']) {
+      const source = sourcePaths[baseName];
+      if (!source) { throw new Error(`missing Cargo artifact path for ${baseName}`); }
+      files[baseName] = createHash('sha256').update(await fs.promises.readFile(source)).digest('hex');
+    }
+    const artifactId = this.binaryPairArtifactId(files);
+    const cacheRoot = this.getGlobalBinaryCacheDir();
+    const finalDir = path.join(cacheRoot, artifactId);
+    if (this.getCompleteGlobalBinaryCacheDirs(exeSuffix).some((dirPath) => {
+      const name = path.basename(dirPath);
+      return name === artifactId || name.startsWith(`${artifactId}-repair-`);
+    })) { return; }
+    await fs.promises.mkdir(cacheRoot, { recursive: true });
+    const stageDir = await fs.promises.mkdtemp(path.join(cacheRoot, '.tmp-'));
+    try {
+      for (const baseName of ['zoek-rs', 'ijss-rebuild']) {
+        const source = sourcePaths[baseName];
+        const destination = path.join(stageDir, `${baseName}${exeSuffix}`);
+        await fs.promises.copyFile(source, destination);
+        if (process.platform !== 'win32') {
+          await fs.promises.chmod(destination, 0o755);
+        }
+      }
+      await fs.promises.writeFile(
+        path.join(stageDir, 'install.json'),
+        `${JSON.stringify({
+          formatVersion: 2,
+          sourceFingerprint: this.getRustSourceFingerprint(),
+          platform: this.getBinaryPlatformKey(),
+          artifactId,
+          files,
+        })}\n`,
+        'utf8',
+      );
+      if (!this.isCompleteGlobalBinaryCache(stageDir, exeSuffix)) {
+        throw new Error('zoek-rs binary pair changed while it was being installed');
+      }
+      try {
+        await fs.promises.rename(stageDir, finalDir);
+      } catch (err) {
+        if (this.isCompleteGlobalBinaryCache(finalDir, exeSuffix)) { return; }
+        // A corrupt directory must never be removed in place: another
+        // extension host may be resolving it concurrently. Publish the valid
+        // repair as another immutable artifact instead.
+        const repairDir = path.join(
+          cacheRoot,
+          `${artifactId}-repair-${path.basename(stageDir).slice('.tmp-'.length)}`,
+        );
+        await fs.promises.rename(stageDir, repairDir);
+      }
+    } finally {
+      this.globalBinaryPairValidity.delete(stageDir);
+      await fs.promises.rm(stageDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  private isUnstampedCheckoutBuildCandidate(candidate: string): boolean {
+    const relative = path.relative(path.join(this.extensionRoot, 'target'), candidate);
+    return !!relative && !relative.startsWith('..') && !path.isAbsolute(relative);
   }
 
   /** Public entry point used by the "Install zoek-rs binaries" command and
    *  by tests. Reports progress through the optional callback and returns
    *  a structured result so the UI can show a clear "missing Rust" message
    *  instead of a generic stack trace when cargo isn't on PATH. */
+  async resolveEngineBinaryForGraph(allowBuild: boolean): Promise<string | undefined> {
+    return (await this.resolveBinary(allowBuild, 'engine')) ?? undefined;
+  }
+
   async installBinary(report?: (message: string) => void): Promise<{
     ok: boolean;
     alreadyInstalled?: boolean;
@@ -1657,20 +1974,38 @@ export class ZoektRuntime implements vscode.Disposable {
 
   private async resolveBinary(allowBuild: boolean, target: BinaryTarget = 'engine'): Promise<string | null> {
     if (this.disposed) { return null; }
+    if (allowBuild && !this.buildPromise) {
+      const previousFingerprint = this.rustSourceFingerprint;
+      this.rustSourceFingerprint = undefined;
+      this.packagedBinaryPairValid = undefined;
+      const currentFingerprint = this.getRustSourceFingerprint();
+      if (previousFingerprint && previousFingerprint !== currentFingerprint) {
+        this.log.appendLine(
+          `zoek-rs Rust source changed: ${previousFingerprint} -> ${currentFingerprint}`,
+        );
+      }
+      // Re-resolve source-stamped candidates after refreshing the fingerprint.
+      this.binaryPath = undefined;
+      this.rebuildBinaryPath = undefined;
+    }
     const cached = target === 'rebuild' ? this.rebuildBinaryPath : this.binaryPath;
-    if (cached && fs.existsSync(cached)) {
+    if (cached && fs.existsSync(cached) && !(allowBuild && this.isUnstampedCheckoutBuildCandidate(cached))) {
       if (await this.isBinaryCompatible(cached, target)) {
         return cached;
       }
       this.log.appendLine(`zoek-rs binary skipped: incompatible or stale runtime at ${cached}`);
       this.clearResolvedBinary(target, cached);
     }
+    try {
+      await this.materializePackagedBinaryPair();
+    } catch (err) {
+      this.log.appendLine(
+        `zoek-rs packaged binary cache skipped: ${err instanceof Error ? err.message : err}`,
+      );
+    }
     const candidates = target === 'engine' ? this.getBinaryCandidates() : this.getBinaryCandidatesFor(target);
-    const skipDebugBeforeBuild = allowBuild && candidates.some((candidate) =>
-      candidate.replace(/\\/g, '/').includes('/target/release/'),
-    );
     for (const candidate of candidates) {
-      if (skipDebugBeforeBuild && this.isDebugBuildCandidate(candidate)) {
+      if (allowBuild && this.isUnstampedCheckoutBuildCandidate(candidate)) {
         continue;
       }
       if (fs.existsSync(candidate) && await this.isBinaryCompatible(candidate, target)) {
@@ -1683,7 +2018,13 @@ export class ZoektRuntime implements vscode.Disposable {
     }
     if (this.buildPromise) {
       await this.buildPromise;
-      for (const candidate of candidates) {
+      // The completed build installs a source-fingerprinted global cache that
+      // did not exist when this waiter captured `candidates` above.
+      const builtCandidates = target === 'engine'
+        ? this.getBinaryCandidates()
+        : this.getBinaryCandidatesFor(target);
+      for (const candidate of builtCandidates) {
+        if (this.isUnstampedCheckoutBuildCandidate(candidate)) { continue; }
         if (fs.existsSync(candidate) && await this.isBinaryCompatible(candidate, target, true)) {
           this.cacheResolvedBinary(target, candidate);
           return candidate;
@@ -1695,10 +2036,34 @@ export class ZoektRuntime implements vscode.Disposable {
     if (!fs.existsSync(cargoToml)) {
       return null;
     }
-    this.buildPromise = (async () => {
-      this.log.appendLine('zoek-rs build: cargo build -q --release -p zoek-rs');
+    const buildPromise = (async () => {
+      const buildSourceFingerprint = this.getRustSourceFingerprint();
+      const cargoTargetDir = this.getSharedCargoTargetDir();
+      this.log.appendLine(
+        `zoek-rs build: cargo build -q --release -p zoek-rs --bins target=${cargoTargetDir}`,
+      );
       try {
-        const result = await this.invokeText(['cargo', 'build', '-q', '--release', '-p', 'zoek-rs'], this.extensionRoot, this.lifecycleCts.token);
+        await fs.promises.mkdir(cargoTargetDir, { recursive: true });
+        const result = await this.invokeText(
+          [
+            'cargo',
+            'build',
+            '-q',
+            '--release',
+            '-p',
+            'zoek-rs',
+            '--bins',
+            '--message-format=json-render-diagnostics',
+          ],
+          this.extensionRoot,
+          this.lifecycleCts.token,
+          {
+            env: {
+              ...process.env,
+              CARGO_TARGET_DIR: cargoTargetDir,
+            },
+          },
+        );
         if (result.cancelled) {
           throw new ProcessCancelledError('cargo build cancelled');
         }
@@ -1709,6 +2074,15 @@ export class ZoektRuntime implements vscode.Disposable {
             (result.signal ? `cargo build terminated by ${result.signal}` : `cargo build exited with code ${result.code}`),
           );
         }
+        this.rustSourceFingerprint = undefined;
+        this.packagedBinaryPairValid = undefined;
+        const currentSourceFingerprint = this.getRustSourceFingerprint();
+        if (currentSourceFingerprint !== buildSourceFingerprint) {
+          throw new Error(
+            `Rust sources changed while Cargo was building (${buildSourceFingerprint} -> ${currentSourceFingerprint})`,
+          );
+        }
+        await this.installBuiltBinaryPair(cargoTargetDir, result.stdout);
       } catch (err) {
         if (err instanceof ProcessCancelledError) {
           this.log.appendLine('zoek-rs build cancelled.');
@@ -1716,19 +2090,19 @@ export class ZoektRuntime implements vscode.Disposable {
         }
         this.log.appendLine(`zoek-rs build failed: ${err instanceof Error ? err.message : err}`);
         return;
-      } finally {
-        this.buildPromise = undefined;
-      }
-      const engineCandidate = this.getBinaryCandidatesFor('engine').find((candidate) => fs.existsSync(candidate));
-      if (engineCandidate) {
-        this.binaryCompatibility.delete(engineCandidate);
-        this.binaryPath = engineCandidate;
-        this.log.appendLine(`zoek-rs build ready: ${engineCandidate}`);
       }
     })();
-    await this.buildPromise;
+    this.buildPromise = buildPromise;
+    try {
+      await buildPromise;
+    } finally {
+      if (this.buildPromise === buildPromise) {
+        this.buildPromise = undefined;
+      }
+    }
     const builtCandidates = target === 'engine' ? this.getBinaryCandidates() : this.getBinaryCandidatesFor(target);
     for (const candidate of builtCandidates) {
+      if (this.isUnstampedCheckoutBuildCandidate(candidate)) { continue; }
       if (fs.existsSync(candidate) && await this.isBinaryCompatible(candidate, target, true)) {
         this.cacheResolvedBinary(target, candidate);
         return candidate;
@@ -1738,57 +2112,83 @@ export class ZoektRuntime implements vscode.Disposable {
   }
 
   private async isBinaryCompatible(candidate: string, target: BinaryTarget, forceProbe = false): Promise<boolean> {
-    if (target === 'rebuild') { return true; }
     if (!forceProbe && this.binaryCompatibility.has(candidate)) {
       return this.binaryCompatibility.get(candidate) === true;
     }
-    const compatible = await this.probeEngineBinaryCompatibility(candidate);
+    const compatible = target === 'rebuild'
+      ? await this.probeBinaryCapabilities(
+        candidate,
+        ['--capabilities'],
+        ['index'],
+        ['force-index-rebuild'],
+      )
+      : await this.probeBinaryCapabilities(
+        candidate,
+        ['capabilities'],
+        [
+          'index',
+          'compact',
+          'update',
+          'search',
+          'info',
+          'diagnose',
+          'benchmark',
+          'graph-rebuild',
+          'graph-index',
+          'graph-update',
+          'graph-overlay-update',
+          'graph-compact',
+          'graph-query',
+          'graph-callees',
+          'graph-symbol-query',
+          'graph-implementations',
+        ],
+        [
+          'force-index-rebuild',
+          'search-exclude-globs',
+          'streaming-search',
+          'rust-native-call-graph',
+        ],
+      );
     this.binaryCompatibility.set(candidate, compatible);
     return compatible;
   }
 
-  private async probeEngineBinaryCompatibility(candidate: string): Promise<boolean> {
+  private async probeBinaryCapabilities(
+    candidate: string,
+    args: string[],
+    requiredCommands: string[],
+    requiredFeatures: string[],
+  ): Promise<boolean> {
     try {
-      const result = await this.invokeText([
-        candidate,
-        'diagnose',
+      const result = await this.invokeText(
+        [candidate, ...args],
         this.extensionRoot,
-        '__codeidx_flag_probe__',
-        '--exclude',
-        '__codeidx_never__',
-      ], this.extensionRoot, this.lifecycleCts.token);
-      const output = `${result.stdout}\n${result.stderr}`;
-      if (/unknown (?:diagnose|search) flag: --exclude/.test(output)) {
+        this.lifecycleCts.token,
+      );
+      if (result.code !== 0 || result.cancelled) { return false; }
+      const parsed = JSON.parse(result.stdout.trim() || '{}') as {
+        type?: unknown;
+        ok?: unknown;
+        engine?: { name?: unknown; protocolVersion?: unknown; schemaVersion?: unknown };
+        commands?: unknown;
+        features?: unknown;
+      };
+      if (parsed.type !== 'capabilities' || parsed.ok !== true ||
+          parsed.engine?.name !== 'zoek-rs' ||
+          parsed.engine.protocolVersion !== ZOEKT_PROTOCOL_VERSION ||
+          parsed.engine.schemaVersion !== ZOEKT_SCHEMA_VERSION ||
+          !Array.isArray(parsed.commands) || !Array.isArray(parsed.features)) {
         return false;
       }
-      if (!(result.code === 0 || output.trim().length > 0)) {
-        return false;
-      }
-      // Probe `capabilities` to catch binaries that predate the feature
-      // negotiation handshake. We only reject when the binary explicitly
-      // says "unknown command/subcommand" — older releases that respond
-      // with a generic usage banner (current behavior) still know enough
-      // of the CLI to be usable in practice.
-      try {
-        const caps = await this.invokeText([
-          candidate,
-          'capabilities',
-        ], this.extensionRoot, this.lifecycleCts.token);
-        const capsOutput = `${caps.stdout}\n${caps.stderr}`;
-        if (/unknown (?:command|subcommand)/i.test(capsOutput)) { return false; }
-        try {
-          const parsed = JSON.parse(caps.stdout.trim() || '{}') as { type?: string; ok?: boolean; message?: string };
-          if (parsed.ok === false && typeof parsed.message === 'string' && /unknown (?:command|subcommand)/i.test(parsed.message)) {
-            return false;
-          }
-        } catch {}
-      } catch (capsErr) {
-        this.log.appendLine(`zoek-rs capabilities probe failed for ${candidate}: ${capsErr instanceof Error ? capsErr.message : capsErr}`);
-        return false;
-      }
-      return true;
+      const commands = new Set(parsed.commands.filter((value): value is string => typeof value === 'string'));
+      const features = new Set(parsed.features.filter((value): value is string => typeof value === 'string'));
+      return requiredCommands.every((command) => commands.has(command)) &&
+        requiredFeatures.every((feature) => features.has(feature));
     } catch (err) {
-      this.log.appendLine(`zoek-rs binary compatibility probe failed for ${candidate}: ${err instanceof Error ? err.message : err}`);
+      this.log.appendLine(
+        `zoek-rs capabilities probe failed for ${candidate}: ${err instanceof Error ? err.message : err}`,
+      );
       return false;
     }
   }
@@ -1844,6 +2244,7 @@ export class ZoektRuntime implements vscode.Disposable {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
         detached: process.platform !== 'win32',
+        ...(hooks?.env ? { env: hooks.env } : {}),
         ...(argv0 ? { argv0 } : {}),
       });
       const tracked = this.trackChild(child, [path.basename(command), ...rest.slice(0, 2)].join(' '), kind);

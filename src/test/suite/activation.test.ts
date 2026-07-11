@@ -1,10 +1,62 @@
 import * as assert from 'assert';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { ExtensionTestApi } from '../../extension';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
+
+const REQUIRED_ENGINE_COMMANDS = [
+  'index',
+  'compact',
+  'update',
+  'search',
+  'info',
+  'diagnose',
+  'benchmark',
+  'graph-rebuild',
+  'graph-index',
+  'graph-update',
+  'graph-overlay-update',
+  'graph-compact',
+  'graph-query',
+  'graph-callees',
+  'graph-symbol-query',
+  'graph-implementations',
+];
+
+const REQUIRED_ENGINE_FEATURES = [
+  'force-index-rebuild',
+  'search-exclude-globs',
+  'streaming-search',
+  'rust-native-call-graph',
+];
+
+function engineCapabilitiesJson(commands = REQUIRED_ENGINE_COMMANDS): string {
+  return JSON.stringify({
+    type: 'capabilities',
+    ok: true,
+    engine: { name: 'zoek-rs', protocolVersion: 1, schemaVersion: 20 },
+    commands,
+    features: REQUIRED_ENGINE_FEATURES,
+  });
+}
+
+function sha256(value: string | Buffer): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function binaryPairArtifactId(files: Record<string, string>): string {
+  const hash = createHash('sha256');
+  for (const baseName of ['zoek-rs', 'ijss-rebuild']) {
+    hash.update(baseName);
+    hash.update('\0');
+    hash.update(files[baseName] ?? '');
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
 
 async function getApi(): Promise<ExtensionTestApi> {
   const ext = vscode.extensions.getExtension<ExtensionTestApi>(EXTENSION_ID);
@@ -398,7 +450,7 @@ suite('Activation', () => {
       }
       if (args[1] === 'capabilities') {
         return {
-          stdout: '{"type":"capabilities","ok":true,"engine":{"name":"zoek-rs","protocolVersion":2,"schemaVersion":3},"optimizedCandidateLoading":true,"virtualIndexBenchmark":true,"incompleteDocSentinel":true,"maxFilesPerShard":50000}',
+          stdout: engineCapabilitiesJson(),
           stderr: '',
           code: 0,
           signal: null,
@@ -426,6 +478,415 @@ suite('Activation', () => {
       try { fs.unlinkSync(staleBinary); } catch {}
       try { fs.unlinkSync(oldBinary); } catch {}
       try { fs.unlinkSync(freshBinary); } catch {}
+    }
+  });
+
+  test('source-fingerprinted global binaries precede packaged and checkout candidates', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const originalFingerprint = runtime.getRustSourceFingerprint.bind(runtime);
+    const originalPlatformKey = runtime.getBinaryPlatformKey.bind(runtime);
+    const originalPackagedValidation = runtime.isPackagedBinaryPairValid.bind(runtime);
+    const platformKey = `fixture-${process.pid}-${Date.now()}`;
+    const fingerprint = 'fixture-source-fingerprint';
+    runtime.getRustSourceFingerprint = () => fingerprint;
+    runtime.getBinaryPlatformKey = () => platformKey;
+    runtime.isPackagedBinaryPairValid = () => true;
+    const cacheRoot = runtime.getGlobalBinaryCacheDir();
+    const exeSuffix = process.platform === 'win32' ? '.exe' : '';
+    const files = { 'zoek-rs': sha256('engine'), 'ijss-rebuild': sha256('rebuild') };
+    const artifactId = binaryPairArtifactId(files);
+    const cacheDir = path.join(cacheRoot, artifactId);
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(path.join(cacheDir, `zoek-rs${exeSuffix}`), 'engine', { mode: 0o755 });
+    fs.writeFileSync(path.join(cacheDir, `ijss-rebuild${exeSuffix}`), 'rebuild', { mode: 0o755 });
+    fs.writeFileSync(path.join(cacheDir, 'install.json'), `${JSON.stringify({
+      formatVersion: 2,
+      sourceFingerprint: fingerprint,
+      platform: platformKey,
+      artifactId,
+      files,
+    })}\n`);
+
+    try {
+      const candidates = runtime.getBinaryCandidatesFor('engine') as string[];
+      assert.strictEqual(candidates[0], path.join(cacheDir, `zoek-rs${exeSuffix}`));
+      assert.strictEqual(
+        runtime.getSharedCargoTargetDir(),
+        path.join(runtime.context.globalStorageUri.fsPath, 'zoek-rs', 'cargo-target', platformKey, fingerprint),
+      );
+      assert.strictEqual(
+        candidates[1],
+        path.join(runtime.extensionRoot, 'resources', 'bin', platformKey, `zoek-rs${exeSuffix}`),
+      );
+      assert.strictEqual(
+        candidates[2],
+        path.join(runtime.extensionRoot, 'target', 'release', `zoek-rs${exeSuffix}`),
+      );
+    } finally {
+      runtime.getRustSourceFingerprint = originalFingerprint;
+      runtime.getBinaryPlatformKey = originalPlatformKey;
+      runtime.isPackagedBinaryPairValid = originalPackagedValidation;
+      fs.rmSync(path.join(runtime.context.globalStorageUri.fsPath, 'zoek-rs', 'runtime', platformKey), {
+        recursive: true,
+        force: true,
+      });
+    }
+  });
+
+  test('packaged binary tuples require the current Rust source fingerprint and exact pair hashes', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+    const packagedDir = path.join(workspaceRoot, `.tmp-packaged-zoek-${process.pid}-${Date.now()}`);
+    const exeSuffix = process.platform === 'win32' ? '.exe' : '';
+    const platformKey = 'fixture-packaged-platform';
+    const sourceFingerprint = 'fixture-packaged-source';
+    const files = { 'zoek-rs': sha256('engine'), 'ijss-rebuild': sha256('rebuild') };
+    const originalPackagedDir = runtime.getPackagedBinaryDir.bind(runtime);
+    const originalPlatformKey = runtime.getBinaryPlatformKey.bind(runtime);
+    const originalFingerprint = runtime.getRustSourceFingerprint.bind(runtime);
+    const originalCachedValidation = runtime.packagedBinaryPairValid;
+    fs.mkdirSync(packagedDir, { recursive: true });
+    fs.writeFileSync(path.join(packagedDir, `zoek-rs${exeSuffix}`), 'engine', { mode: 0o755 });
+    fs.writeFileSync(path.join(packagedDir, `ijss-rebuild${exeSuffix}`), 'rebuild', { mode: 0o755 });
+    fs.writeFileSync(path.join(packagedDir, 'manifest.json'), `${JSON.stringify({
+      formatVersion: 2,
+      platformKey,
+      protocolVersion: 1,
+      schemaVersion: 20,
+      sourceFingerprint,
+      artifactId: binaryPairArtifactId(files),
+      files,
+    })}\n`);
+    runtime.getPackagedBinaryDir = () => packagedDir;
+    runtime.getBinaryPlatformKey = () => platformKey;
+    runtime.getRustSourceFingerprint = () => sourceFingerprint;
+    runtime.packagedBinaryPairValid = undefined;
+
+    try {
+      assert.strictEqual(runtime.isPackagedBinaryPairValid(), true);
+      runtime.getRustSourceFingerprint = () => 'different-source';
+      runtime.packagedBinaryPairValid = undefined;
+      assert.strictEqual(runtime.isPackagedBinaryPairValid(), false);
+
+      runtime.getRustSourceFingerprint = () => sourceFingerprint;
+      fs.writeFileSync(path.join(packagedDir, `zoek-rs${exeSuffix}`), 'tampered', { mode: 0o755 });
+      runtime.packagedBinaryPairValid = undefined;
+      assert.strictEqual(runtime.isPackagedBinaryPairValid(), false);
+    } finally {
+      runtime.getPackagedBinaryDir = originalPackagedDir;
+      runtime.getBinaryPlatformKey = originalPlatformKey;
+      runtime.getRustSourceFingerprint = originalFingerprint;
+      runtime.packagedBinaryPairValid = originalCachedValidation;
+      fs.rmSync(packagedDir, { recursive: true, force: true });
+    }
+  });
+
+  test('engine capability handshake rejects missing index and graph query commands', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+    const originalInvokeText = runtime.invokeText.bind(runtime);
+    const candidates = ['index', 'graph-query'].map((missing) => ({
+      missing,
+      path: path.join(workspaceRoot, `.tmp-zoek-missing-${missing}-${process.pid}-${Date.now()}`),
+    }));
+    for (const candidate of candidates) { fs.writeFileSync(candidate.path, ''); }
+    runtime.binaryCompatibility?.clear?.();
+    runtime.invokeText = async (args: string[]) => {
+      const candidate = candidates.find((item) => item.path === args[0]);
+      return {
+        stdout: engineCapabilitiesJson(
+          REQUIRED_ENGINE_COMMANDS.filter((command) => command !== candidate?.missing),
+        ),
+        stderr: '',
+        code: 0,
+        signal: null,
+        cancelled: false,
+      };
+    };
+    try {
+      for (const candidate of candidates) {
+        assert.strictEqual(await runtime.isBinaryCompatible(candidate.path, 'engine', true), false);
+      }
+    } finally {
+      runtime.invokeText = originalInvokeText;
+      runtime.binaryCompatibility?.clear?.();
+      for (const candidate of candidates) {
+        try { fs.unlinkSync(candidate.path); } catch {}
+      }
+    }
+  });
+
+  test('Cargo fallback installs an atomic pair and concurrent targets see the new global cache', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+    const tempRoot = path.join(workspaceRoot, `.tmp-zoek-binary-cache-${process.pid}-${Date.now()}`);
+    const cargoTargetDir = path.join(tempRoot, 'cargo-target');
+    const cacheDir = path.join(tempRoot, 'runtime');
+    const exeSuffix = process.platform === 'win32' ? '.exe' : '';
+    const staleCheckoutEngine = path.join(runtime.extensionRoot, 'target', 'release', `.tmp-stale-zoek-${process.pid}`);
+    const staleCheckoutRebuild = path.join(runtime.extensionRoot, 'target', 'release', `.tmp-stale-rebuild-${process.pid}`);
+    const originalInvokeText = runtime.invokeText.bind(runtime);
+    const originalCandidates = runtime.getBinaryCandidates.bind(runtime);
+    const originalCandidatesFor = runtime.getBinaryCandidatesFor.bind(runtime);
+    const originalCargoTargetDir = runtime.getSharedCargoTargetDir.bind(runtime);
+    const originalCacheDir = runtime.getGlobalBinaryCacheDir.bind(runtime);
+    const originalFingerprint = runtime.getRustSourceFingerprint.bind(runtime);
+    const originalPlatformKey = runtime.getBinaryPlatformKey.bind(runtime);
+    const originalBinaryPath = runtime.binaryPath;
+    const originalRebuildBinaryPath = runtime.rebuildBinaryPath;
+    const originalBuildPromise = runtime.buildPromise;
+    let cargoEnv: NodeJS.ProcessEnv | undefined;
+    let cargoArgs: string[] | undefined;
+    let releaseCargo!: () => void;
+    const cargoGate = new Promise<void>((resolve) => { releaseCargo = resolve; });
+    let markCargoStarted!: () => void;
+    const cargoStarted = new Promise<void>((resolve) => { markCargoStarted = resolve; });
+    let markRebuildWaiterCaptured!: () => void;
+    const rebuildWaiterCaptured = new Promise<void>((resolve) => { markRebuildWaiterCaptured = resolve; });
+
+    fs.mkdirSync(path.dirname(staleCheckoutEngine), { recursive: true });
+    fs.writeFileSync(staleCheckoutEngine, 'stale', { mode: 0o755 });
+    fs.writeFileSync(staleCheckoutRebuild, 'stale', { mode: 0o755 });
+    runtime.binaryPath = staleCheckoutEngine;
+    runtime.rebuildBinaryPath = undefined;
+    runtime.buildPromise = undefined;
+    runtime.binaryCompatibility?.clear?.();
+    runtime.getSharedCargoTargetDir = () => cargoTargetDir;
+    runtime.getGlobalBinaryCacheDir = () => cacheDir;
+    runtime.getRustSourceFingerprint = () => 'fixture-build-source';
+    runtime.getBinaryPlatformKey = () => 'fixture-build-platform';
+    const installedArtifactDir = () => {
+      try {
+        return fs.readdirSync(cacheDir, { withFileTypes: true })
+          .find((entry) => entry.isDirectory() && !entry.name.startsWith('.tmp-') &&
+            fs.existsSync(path.join(cacheDir, entry.name, 'install.json')))
+          ?.name;
+      } catch {
+        return undefined;
+      }
+    };
+    const candidatesFor = (target: string) => {
+      const installed = installedArtifactDir();
+      if (!installed && target === 'rebuild' && runtime.buildPromise) {
+        markRebuildWaiterCaptured();
+      }
+      return [installed
+        ? path.join(cacheDir, installed, `${target === 'rebuild' ? 'ijss-rebuild' : 'zoek-rs'}${exeSuffix}`)
+        : (target === 'rebuild' ? staleCheckoutRebuild : staleCheckoutEngine)];
+    };
+    runtime.getBinaryCandidates = () => candidatesFor('engine');
+    runtime.getBinaryCandidatesFor = (target: string) => candidatesFor(target);
+    runtime.invokeText = async (args: string[], _cwd: string, _token: unknown, hooks?: { env?: NodeJS.ProcessEnv }) => {
+      if (args[0] === 'cargo') {
+        cargoArgs = args;
+        cargoEnv = hooks?.env;
+        const releaseDir = path.join(cargoTargetDir, 'fixture-custom-target', 'release');
+        fs.mkdirSync(releaseDir, { recursive: true });
+        const engineArtifact = path.join(releaseDir, `zoek-rs${exeSuffix}`);
+        const rebuildArtifact = path.join(releaseDir, `ijss-rebuild${exeSuffix}`);
+        fs.writeFileSync(engineArtifact, 'engine');
+        fs.writeFileSync(rebuildArtifact, 'rebuild');
+        markCargoStarted();
+        await cargoGate;
+        return {
+          stdout: [
+            JSON.stringify({
+              reason: 'compiler-artifact',
+              target: { name: 'zoek-rs', kind: ['bin'] },
+              executable: engineArtifact,
+            }),
+            JSON.stringify({
+              reason: 'compiler-artifact',
+              target: { name: 'ijss-rebuild', kind: ['bin'] },
+              executable: rebuildArtifact,
+            }),
+          ].join('\n'),
+          stderr: '',
+          code: 0,
+          signal: null,
+          cancelled: false,
+        };
+      }
+      return {
+        stdout: args[1] === '--capabilities'
+          ? '{"type":"capabilities","ok":true,"engine":{"name":"zoek-rs","protocolVersion":1,"schemaVersion":20},"commands":["index"],"features":["force-index-rebuild"]}'
+          : engineCapabilitiesJson(),
+        stderr: '',
+        code: 0,
+        signal: null,
+        cancelled: false,
+      };
+    };
+
+    try {
+      const enginePromise = runtime.resolveBinary(true, 'engine');
+      await cargoStarted;
+      const rebuildPromise = runtime.resolveBinary(true, 'rebuild');
+      await rebuildWaiterCaptured;
+      releaseCargo();
+      const enginePath = await enginePromise;
+      const rebuildPath = await rebuildPromise;
+      assert.ok(enginePath);
+      assert.ok(rebuildPath);
+      assert.strictEqual(path.dirname(enginePath), path.dirname(rebuildPath));
+      assert.strictEqual(cargoEnv?.CARGO_TARGET_DIR, cargoTargetDir);
+      assert.ok(cargoArgs?.includes('--message-format=json-render-diagnostics'));
+      assert.ok(cargoArgs?.includes('--bins'));
+      assert.strictEqual(fs.readFileSync(enginePath, 'utf8'), 'engine');
+      assert.strictEqual(fs.readFileSync(rebuildPath, 'utf8'), 'rebuild');
+      const install = JSON.parse(fs.readFileSync(path.join(path.dirname(enginePath), 'install.json'), 'utf8')) as {
+        formatVersion?: number;
+        sourceFingerprint?: string;
+        platform?: string;
+        artifactId?: string;
+        files?: Record<string, string>;
+      };
+      assert.strictEqual(install.formatVersion, 2);
+      assert.strictEqual(install.sourceFingerprint, 'fixture-build-source');
+      assert.strictEqual(install.platform, 'fixture-build-platform');
+      assert.strictEqual(install.artifactId, path.basename(path.dirname(enginePath)));
+      assert.strictEqual(install.files?.['zoek-rs'], sha256('engine'));
+      assert.strictEqual(install.files?.['ijss-rebuild'], sha256('rebuild'));
+    } finally {
+      runtime.invokeText = originalInvokeText;
+      runtime.getBinaryCandidates = originalCandidates;
+      runtime.getBinaryCandidatesFor = originalCandidatesFor;
+      runtime.getSharedCargoTargetDir = originalCargoTargetDir;
+      runtime.getGlobalBinaryCacheDir = originalCacheDir;
+      runtime.getRustSourceFingerprint = originalFingerprint;
+      runtime.getBinaryPlatformKey = originalPlatformKey;
+      runtime.binaryPath = originalBinaryPath;
+      runtime.rebuildBinaryPath = originalRebuildBinaryPath;
+      runtime.buildPromise = originalBuildPromise;
+      runtime.binaryCompatibility?.clear?.();
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+      try { fs.unlinkSync(staleCheckoutEngine); } catch {}
+      try { fs.unlinkSync(staleCheckoutRebuild); } catch {}
+    }
+  });
+
+  test('corrupt or non-executable global artifacts are repaired without deleting published paths', async function () {
+    if (process.platform === 'win32') { this.skip(); }
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+    const tempRoot = path.join(workspaceRoot, `.tmp-zoek-repair-${process.pid}-${Date.now()}`);
+    const sourceDir = path.join(tempRoot, 'source');
+    const cacheRoot = path.join(tempRoot, 'cache');
+    const sourceFingerprint = 'fixture-repair-source';
+    const platformKey = 'fixture-repair-platform';
+    const files = { 'zoek-rs': sha256('engine'), 'ijss-rebuild': sha256('rebuild') };
+    const artifactId = binaryPairArtifactId(files);
+    const corruptDir = path.join(cacheRoot, artifactId);
+    const originalCacheDir = runtime.getGlobalBinaryCacheDir.bind(runtime);
+    const originalFingerprint = runtime.getRustSourceFingerprint.bind(runtime);
+    const originalPlatformKey = runtime.getBinaryPlatformKey.bind(runtime);
+    fs.mkdirSync(sourceDir, { recursive: true });
+    fs.mkdirSync(corruptDir, { recursive: true });
+    fs.writeFileSync(path.join(sourceDir, 'zoek-rs'), 'engine', { mode: 0o755 });
+    fs.writeFileSync(path.join(sourceDir, 'ijss-rebuild'), 'rebuild', { mode: 0o755 });
+    fs.writeFileSync(path.join(corruptDir, 'zoek-rs'), 'corrupt', { mode: 0o755 });
+    fs.writeFileSync(path.join(corruptDir, 'ijss-rebuild'), 'rebuild', { mode: 0o755 });
+    fs.writeFileSync(path.join(corruptDir, 'install.json'), `${JSON.stringify({
+      formatVersion: 2,
+      sourceFingerprint,
+      platform: platformKey,
+      artifactId,
+      files,
+    })}\n`);
+    runtime.getGlobalBinaryCacheDir = () => cacheRoot;
+    runtime.getRustSourceFingerprint = () => sourceFingerprint;
+    runtime.getBinaryPlatformKey = () => platformKey;
+    runtime.globalBinaryPairValidity?.clear?.();
+
+    try {
+      await runtime.installBinaryPairFromDir(sourceDir);
+      let validDirs = runtime.getCompleteGlobalBinaryCacheDirs('') as string[];
+      assert.strictEqual(validDirs.length, 1);
+      assert.notStrictEqual(validDirs[0], corruptDir);
+      assert.strictEqual(fs.readFileSync(path.join(corruptDir, 'zoek-rs'), 'utf8'), 'corrupt');
+      assert.strictEqual(fs.readFileSync(path.join(validDirs[0], 'zoek-rs'), 'utf8'), 'engine');
+
+      fs.chmodSync(path.join(validDirs[0], 'zoek-rs'), 0o644);
+      await runtime.installBinaryPairFromDir(sourceDir);
+      validDirs = runtime.getCompleteGlobalBinaryCacheDirs('') as string[];
+      assert.strictEqual(validDirs.length, 1);
+      fs.accessSync(path.join(validDirs[0], 'zoek-rs'), fs.constants.X_OK);
+      assert.strictEqual(fs.readFileSync(path.join(validDirs[0], 'zoek-rs'), 'utf8'), 'engine');
+    } finally {
+      runtime.getGlobalBinaryCacheDir = originalCacheDir;
+      runtime.getRustSourceFingerprint = originalFingerprint;
+      runtime.getBinaryPlatformKey = originalPlatformKey;
+      runtime.globalBinaryPairValidity?.clear?.();
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('dedicated rebuild binaries require an exact capability handshake', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+    const staleBinary = path.join(workspaceRoot, '.tmp-stale-ijss-rebuild');
+    const freshBinary = path.join(workspaceRoot, '.tmp-fresh-ijss-rebuild');
+    const originalInvokeText = runtime.invokeText.bind(runtime);
+    const originalCandidates = runtime.getBinaryCandidatesFor.bind(runtime);
+    const originalRebuildBinaryPath = runtime.rebuildBinaryPath;
+    fs.writeFileSync(staleBinary, '');
+    fs.writeFileSync(freshBinary, '');
+    runtime.rebuildBinaryPath = undefined;
+    runtime.binaryCompatibility?.clear?.();
+    runtime.getBinaryCandidatesFor = () => [staleBinary, freshBinary];
+    runtime.invokeText = async (args: string[]) => ({
+      stdout: args[0] === staleBinary
+        ? '{"type":"capabilities","ok":true,"engine":{"name":"zoek-rs","protocolVersion":1,"schemaVersion":19},"commands":["index"],"features":["force-index-rebuild"]}'
+        : '{"type":"capabilities","ok":true,"engine":{"name":"zoek-rs","protocolVersion":1,"schemaVersion":20},"commands":["index"],"features":["force-index-rebuild"]}',
+      stderr: '',
+      code: 0,
+      signal: null,
+      cancelled: false,
+    });
+    try {
+      const binary = await runtime.resolveBinary(false, 'rebuild');
+      assert.strictEqual(binary, freshBinary);
+    } finally {
+      runtime.invokeText = originalInvokeText;
+      runtime.getBinaryCandidatesFor = originalCandidates;
+      runtime.rebuildBinaryPath = originalRebuildBinaryPath;
+      runtime.binaryCompatibility?.clear?.();
+      try { fs.unlinkSync(staleBinary); } catch {}
+      try { fs.unlinkSync(freshBinary); } catch {}
+    }
+  });
+
+  test('call graph uses the same zoek-rs resolver and build promise as search', async () => {
+    const { overlay, callGraph } = await getApi();
+    const originalResolver = overlay.resolveZoekEngineBinaryForGraph.bind(overlay);
+    const calls: boolean[] = [];
+    (overlay as any).resolveZoekEngineBinaryForGraph = async (allowBuild: boolean) => {
+      calls.push(allowBuild);
+      return '/tmp/shared-zoek-rs';
+    };
+    try {
+      assert.strictEqual(
+        await (callGraph as any).resolveRustGraphBinary(false),
+        '/tmp/shared-zoek-rs',
+      );
+      assert.strictEqual(
+        await (callGraph as any).resolveRustGraphBinary(true),
+        '/tmp/shared-zoek-rs',
+      );
+      assert.deepStrictEqual(calls, [false, true]);
+    } finally {
+      (overlay as any).resolveZoekEngineBinaryForGraph = originalResolver;
     }
   });
 
@@ -482,9 +943,11 @@ suite('Activation', () => {
     const originalResolveBinary = runtime.resolveBinary.bind(runtime);
     const originalInvokeJson = runtime.invokeJson.bind(runtime);
     let onStderrLine: ((line: string) => boolean | void) | undefined;
+    let invokedArgs: string[] | undefined;
 
     runtime.resolveBinary = async () => '/tmp/zoek-rs';
-    runtime.invokeJson = async (_args: string[], _token: unknown, hooks?: { onStderrLine?: (line: string) => boolean | void }) => {
+    runtime.invokeJson = async (args: string[], _token: unknown, hooks?: { onStderrLine?: (line: string) => boolean | void }) => {
+      invokedArgs = args;
       onStderrLine = hooks?.onStderrLine;
       return {
         type: 'index',
@@ -497,6 +960,7 @@ suite('Activation', () => {
     try {
       const result = await runtime.ensureIndexed(workspaceRoot, 'activation-test');
       assert.strictEqual(result, true);
+      assert.deepStrictEqual(invokedArgs, ['/tmp/zoek-rs', 'index', workspaceRoot]);
       assert.ok(onStderrLine, 'expected background index to pass a stderr progress hook');
       assert.strictEqual(
         onStderrLine?.('__ZOEK_PROGRESS__{"phase":"scan","current":128,"total":1024,"percent":9,"detail":"scanning files 128/1024"}'),

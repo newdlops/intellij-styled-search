@@ -11,18 +11,21 @@ The current codebase defaults to the `zoekt` engine, and that engine uses two Ru
 - `zoek-rs`: search, update, diagnostics, and general engine work
 - `ijss-rebuild`: dedicated full-index rebuild entrypoint
 
-The extension resolves binaries from:
+The extension resolves a source-fingerprinted pair from global storage first,
+then checks a packaged platform tuple and development checkout outputs:
 
+- `<globalStorage>/zoek-rs/runtime/<platform-arch>/<source-fingerprint>/<artifact-id>/`
+- `resources/bin/<platform-arch>/`
 - `target/debug/zoek-rs`
 - `target/release/zoek-rs`
 - `target/debug/ijss-rebuild`
 - `target/release/ijss-rebuild`
 
-If a binary is missing and `Cargo.toml` is present, the extension attempts a local fallback build with:
-
-```bash
-cargo build -q -p zoek-rs
-```
+If a binary is missing and `Cargo.toml` is present, the extension attempts a
+release Cargo build. Its Cargo target lives under extension global storage and
+is isolated by platform and Rust-source fingerprint. The same source revision
+reuses its compiled dependencies; different revisions cannot overwrite one
+another's output while extension hosts run concurrently.
 
 ## Prerequisites
 
@@ -84,31 +87,45 @@ Use this mode when:
 
 ## Self-contained VSIX
 
-If you want the VSIX itself to contain runnable Rust binaries, you must ship the `target/release` artifacts.
-
-The current codebase does not have a dedicated packaging script for this. The required manual step is to allow the release binaries through `.vscodeignore` before packaging.
+If you want the VSIX itself to contain runnable Rust binaries, generate a
+platform tuple under `resources/bin/`. This path is already included by the
+default `.vscodeignore`.
 
 At minimum, the VSIX must include:
 
-- `target/release/zoek-rs`
-- `target/release/ijss-rebuild`
+- `resources/bin/<platform-arch>/zoek-rs`
+- `resources/bin/<platform-arch>/ijss-rebuild`
+- `resources/bin/<platform-arch>/manifest.json`
 
 Recommended flow:
 
-1. Build release binaries:
+1. Build and stage the host tuple:
 
 ```bash
-cargo build --release -p zoek-rs
+npm run build:zoek-runtime
 ```
 
-2. Update `.vscodeignore` so `target/release/zoek-rs*` and `target/release/ijss-rebuild*` are included.
-3. Package the extension:
+   Cross-compilation must name both the Rust target and VS Code platform tuple,
+   for example:
 
 ```bash
-vsce package
+node scripts/buildZoekRuntime.js \
+  --rust-target aarch64-apple-darwin \
+  --platform-key darwin-arm64
 ```
 
-4. Install and verify the packaged VSIX on a machine without relying on repo-local state.
+   The script copies both binaries, sets Unix execute permissions, and writes a
+   manifest containing protocol/schema metadata, the exact Rust-source
+   fingerprint, and SHA-256 pair identity. It fails if the Rust sources change
+   while Cargo is building.
+
+2. Package the extension for that same target:
+
+```bash
+vsce package --target <platform-arch>
+```
+
+3. Install and verify the packaged VSIX on a machine without Cargo or repo-local state.
 
 ## Local Verification
 

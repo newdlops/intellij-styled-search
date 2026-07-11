@@ -1526,6 +1526,10 @@ export class OverlayPanel {
     return { ready: this.trigramIndex.isReady, reason: this.trigramIndex.isReady ? undefined : 'codesearch trigram index not ready' };
   }
 
+  async resolveZoekEngineBinaryForGraph(allowBuild: boolean): Promise<string | undefined> {
+    return this.zoektRuntime.resolveEngineBinaryForGraph(allowBuild);
+  }
+
   collectZoektFreshnessForHealth(): ZoektFreshnessStatus {
     return this.zoektRuntime.getFreshnessStatus();
   }

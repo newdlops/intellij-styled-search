@@ -2,9 +2,10 @@ use std::env;
 use std::path::PathBuf;
 
 use zoek_rs::config::EngineConfig;
-use zoek_rs::indexer::index_directory_with_progress;
+use zoek_rs::indexer::{index_directory_with_options, IndexBuildOptions};
 use zoek_rs::protocol::{
-    EngineInfo, EngineResponse, ErrorResponse, IndexRequest, IndexResponse, IndexStats,
+    CapabilitiesResponse, EngineInfo, EngineResponse, ErrorResponse, IndexRequest, IndexResponse,
+    IndexStats,
 };
 
 fn main() {
@@ -20,6 +21,14 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> Result<EngineResponse, String> {
+    if args.as_slice() == ["--capabilities"] {
+        return Ok(EngineResponse::Capabilities(CapabilitiesResponse {
+            ok: true,
+            engine: EngineInfo::current(),
+            commands: vec!["index".to_string()],
+            features: vec!["force-index-rebuild".to_string()],
+        }));
+    }
     let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
     let mut config = EngineConfig::for_workspace(&workspace_root);
     let mut request = IndexRequest {
@@ -47,9 +56,16 @@ fn run(args: Vec<String>) -> Result<EngineResponse, String> {
         }
     }
 
-    let artifacts = index_directory_with_progress(&workspace_root, &config, &mut |progress| {
-        eprintln!("{}", progress.to_stderr_line());
-    })
+    let artifacts = index_directory_with_options(
+        &workspace_root,
+        &config,
+        IndexBuildOptions {
+            force: request.force,
+        },
+        &mut |progress| {
+            eprintln!("{}", progress.to_stderr_line());
+        },
+    )
     .map_err(|err| err.to_string())?;
 
     Ok(EngineResponse::Index(IndexResponse {
@@ -76,4 +92,19 @@ fn run(args: Vec<String>) -> Result<EngineResponse, String> {
 
 fn usage() -> String {
     "usage: ijss-rebuild <workspace> [--out <path>] [--force]".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+
+    #[test]
+    fn capabilities_advertise_force_rebuild_contract() {
+        let response = run(vec!["--capabilities".to_string()]).expect("capabilities response");
+        let json = response.to_json();
+        assert!(json.contains("\"protocolVersion\":1"));
+        assert!(json.contains("\"schemaVersion\":20"));
+        assert!(json.contains("\"commands\":[\"index\"]"));
+        assert!(json.contains("\"features\":[\"force-index-rebuild\"]"));
+    }
 }
