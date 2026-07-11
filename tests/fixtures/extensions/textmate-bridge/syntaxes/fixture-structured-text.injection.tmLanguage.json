@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Fixture Structured Text Injection",
+  "scopeName": "source.fixture-structured-text.injection",
+  "injectionSelector": "L:source.fixture-structured-text -comment -string",
+  "patterns": [
+    {
+      "match": "@[a-z][a-z0-9-]*\\b",
+      "name": "support.function.directive.injected.fixture-structured-text"
+    }
+  ]
+}

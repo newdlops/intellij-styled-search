@@ -1,0 +1,56 @@
+{
+  "name": "textmate-bridge-fixture",
+  "displayName": "TextMate Bridge Fixture",
+  "description": "An inactive grammar-only extension used by structural TextMate bridge tests.",
+  "version": "1.0.0",
+  "publisher": "fixture",
+  "private": true,
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "fixture-structured-text",
+        "aliases": [
+          "Fixture Structured Text"
+        ],
+        "extensions": [
+          ".fixturetext"
+        ]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "fixture-structured-text",
+        "scopeName": "source.fixture-structured-text",
+        "path": "./syntaxes/fixture-structured-text.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.fixture-structured-text": "plaintext"
+        },
+        "tokenTypes": {
+          "comment.line.fixture-structured-text": "comment",
+          "string.quoted.double.fixture-structured-text": "string",
+          "meta.embedded.block.fixture-structured-text": "other"
+        },
+        "balancedBracketScopes": [
+          "*"
+        ],
+        "unbalancedBracketScopes": [
+          "comment.line.fixture-structured-text",
+          "string.quoted.double.fixture-structured-text"
+        ]
+      },
+      {
+        "scopeName": "source.fixture-structured-text.injection",
+        "path": "./syntaxes/fixture-structured-text.injection.tmLanguage.json",
+        "injectTo": [
+          "source.fixture-structured-text"
+        ]
+      }
+    ]
+  }
+}

@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.7114",
+  "version": "0.1.7123",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -304,7 +304,12 @@
         "intellijStyledSearch.disableMonacoCapture": {
           "type": "boolean",
           "default": false,
-          "description": "Disable Monaco capture/prototype probing for search previews. When disabled, previews use a real Monaco editor with shared buffers, language services, minimap, syntax highlighting, and save support."
+          "description": "Disable private VS Code Monaco capture/prototype probing for search previews. The bundled Monaco preview remains available and does not open editor tabs."
+        },
+        "intellijStyledSearch.allowTransientPreviewCaptureEditor": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow the preview to temporarily open an editor tab to upgrade from bundled Monaco to VS Code's native language-service editor. Disabled by default so opening, previewing, or closing Search never changes editor tabs."
         },
         "intellijStyledSearch.closeMainInspectorAfterSearch": {
           "type": "boolean",
@@ -334,7 +339,7 @@
         "intellijStyledSearch.previewLanguageFeatures": {
           "type": "boolean",
           "default": true,
-          "description": "Enable Pylance/LSP hover, autocomplete, and other language features inside the preview pane. Creates the embed Monaco editor with isSimpleWidget=false. Default ON because captain log analysis proved isSimpleWidget=true silently suppresses Pylance hover. If you see the preview go blank on click (workbench takeover regression), flip this to false."
+          "description": "Enable VS Code language providers in the preview. The bundled editor relays hover, completions, navigation, diagnostics, and semantic tokens without opening a tab; a captured native editor is created with its full language-feature service set."
         },
         "intellijStyledSearch.keepCdpOpenWhileSearchUiVisible": {
           "type": "boolean",
@@ -558,7 +563,9 @@
     "glob": "^8.1.0",
     "mocha": "^10.2.0",
     "monaco-editor": "^0.52.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
   },
   "dependencies": {
     "ws": "^8.18.0"

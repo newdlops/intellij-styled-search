@@ -8,7 +8,7 @@ IntelliJ Styled Search adds an IntelliJ IDEA-like project search panel to VS Cod
 
 - Find in project from a movable IntelliJ-style overlay.
 - Search the selected text directly from the editor context menu or keybinding.
-- Preview matches in an embedded Monaco editor with hover, completions, and editor-style highlighting when renderer capture is available.
+- Preview matches in an embedded Monaco editor with installed VS Code TextMate grammars, immediate lexical hover, and VS Code semantic hover, completions, navigation, diagnostics, and semantic highlighting relayed into the bundled editor.
 - Narrow large searches with a local trigram index, then verify results with ripgrep.
 - Support literal, regex, case-sensitive, whole-word, and multi-line searches.
 - Keep results responsive by streaming matches and showing candidate files while ripgrep is still running.
@@ -123,6 +123,9 @@ Use the codeidx MCP mcp_health tool, then search for "UserService" with codeidx_
 | `intellijStyledSearch.engine` | `zoekt` | Search engine selection. `zoekt` uses the Rust local shard/mmap engine and falls back to `codesearch` while the runtime is unavailable or still preparing its index. `codesearch` is the current TypeScript codesearch planner plus ripgrep verifier. |
 | `intellijStyledSearch.excludeGlobs` | `[]` | User-controlled glob patterns excluded from full searches. |
 | `intellijStyledSearch.callGraphExcludeGlobs` | common dependency/build/cache folders | Glob patterns excluded only from call graph rebuilds; set to `[]` to include those folders intentionally. |
+| `intellijStyledSearch.disableMonacoCapture` | `false` | Disable probing VS Code's private Monaco services. The bundled Monaco preview and its VS Code language-provider bridge remain available. |
+| `intellijStyledSearch.allowTransientPreviewCaptureEditor` | `false` | Allow a temporary editor tab when passive capture cannot upgrade the bundled preview to VS Code's native editor. |
+| `intellijStyledSearch.previewLanguageFeatures` | `true` | Enable bundled TextMate/lexical hover and relay semantic hover, completions, navigation, diagnostics, and semantic tokens from VS Code language providers. |
 | `intellijStyledSearch.maxFileSize` | `1048576` | Maximum file size in bytes to search. |
 | `intellijStyledSearch.maxResults` | `2000` | Match lines to load per batch. Scrolling near the bottom loads the next batch. Values at or below `0` use the built-in default. |
 | `intellijStyledSearch.searchHistoryLimit` | `100` | Executed search queries to keep in the History dropdown. Set to `0` to disable storing search history. |
@@ -133,7 +136,7 @@ On first activation, the extension attempts to install a platform-specific ripgr
 
 Zoekt indexes are kept fresh with incremental updates for VS Code create/save/delete/rename operations plus external filesystem create/change/delete events. A search drains queued updates before querying the index; unsaved editor buffers are reported as dirty overlay state because they are not yet durable index input. Symbol search also filters deleted/missing-file results before returning them and queues a semantic incremental update when stale symbols are observed.
 
-The editable preview relies on VS Code renderer internals. If the overlay appears but the preview falls back to plain DOM rendering, run `IntelliJ Search: Reinject Renderer Patch (Recovery)`.
+The tab-free bundled preview is the guaranteed path. It uses real file URIs, lazily reads the installed extensions' `contributes.languages`/`contributes.grammars` assets without activating those extensions, and relays VS Code language providers without opening an editor tab. TextMate grammar failures or safety-budget overruns fall back to Monaco's bundled tokenizer. When passive renderer capture is available, the preview may upgrade to VS Code's native editor services. Workspace language requests use the saved VS Code document snapshot, so a bundled preview pauses them while it has unsaved edits and resumes them after a successful save instead of showing stale ranges. If the overlay or preview fails to mount after a VS Code update, run `IntelliJ Search: Reinject Renderer Patch (Recovery)`.
 
 ## Development
 

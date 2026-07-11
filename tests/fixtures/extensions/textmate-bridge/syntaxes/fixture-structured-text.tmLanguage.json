@@ -1,0 +1,101 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Fixture Structured Text",
+  "scopeName": "source.fixture-structured-text",
+  "patterns": [
+    {
+      "include": "#line-comment"
+    },
+    {
+      "include": "#multiline-block"
+    },
+    {
+      "include": "#embedded-block"
+    },
+    {
+      "include": "#control-word"
+    },
+    {
+      "include": "#quoted-string"
+    }
+  ],
+  "repository": {
+    "line-comment": {
+      "match": "//.*$",
+      "name": "comment.line.fixture-structured-text"
+    },
+    "multiline-block": {
+      "begin": "\\[\\[",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.block.begin.fixture-structured-text"
+        }
+      },
+      "end": "\\]\\]",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.block.end.fixture-structured-text"
+        }
+      },
+      "name": "meta.block.multiline.fixture-structured-text",
+      "patterns": [
+        {
+          "include": "#line-comment"
+        },
+        {
+          "include": "#block-type"
+        },
+        {
+          "include": "#quoted-string"
+        }
+      ]
+    },
+    "block-type": {
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b",
+      "name": "entity.name.type.inside-block.fixture-structured-text"
+    },
+    "embedded-block": {
+      "begin": "<%",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.section.embedded.begin.fixture-structured-text"
+        }
+      },
+      "end": "%>",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.section.embedded.end.fixture-structured-text"
+        }
+      },
+      "name": "meta.embedded.block.fixture-structured-text",
+      "patterns": [
+        {
+          "include": "#embedded-identifier"
+        }
+      ]
+    },
+    "embedded-identifier": {
+      "match": "\\b[a-z][A-Za-z0-9_]*\\b",
+      "name": "variable.other.embedded.fixture-structured-text"
+    },
+    "control-word": {
+      "match": "\\b(?:declare|yield)\\b",
+      "name": "keyword.control.fixture-structured-text"
+    },
+    "quoted-string": {
+      "begin": "\"",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.begin.fixture-structured-text"
+        }
+      },
+      "end": "\"",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.end.fixture-structured-text"
+        }
+      },
+      "name": "string.quoted.double.fixture-structured-text"
+    }
+  }
+}

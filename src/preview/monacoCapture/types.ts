@@ -5,6 +5,7 @@ export type CaptureDiagnosticOptions = {
   forceOpenUri?: vscode.Uri;
   holdForceOpenedTab?: boolean;
   reason?: string;
+  shouldContinue?: () => boolean;
 };
 
 export type MonacoCaptureRuntime = {

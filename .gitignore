@@ -3,6 +3,7 @@ node_modules/
 .vscode-test/
 *.vsix
 resources/monaco.bundle.js
+resources/monaco.third-party-notices.txt
 target/
 .zoek-rs/
 .codeidx/

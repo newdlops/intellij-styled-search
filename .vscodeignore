@@ -22,5 +22,4 @@ vscode_monacoeditor_monkeypatch.md
 target/**
 reports
 .django-shell
-resources/monaco.bundle.js
 Trace-*.json

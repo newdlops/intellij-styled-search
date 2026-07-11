@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 135;
+export const RENDERER_PATCH_VERSION = 140;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -7,11 +7,9 @@ export function getRendererPatchScript(
   enableRendererInlayClickHook = true,
   disposeRendererPatchOnHide = true,
   installAdditionalSearchInstance = false,
-  // #47: opt-in to enable Pylance/LSP hover + autocomplete in preview by
-  // creating the embed editor with isSimpleWidget=false. Trade-off: the
-  // workbench's EditorService may try to take over the editor on focus
-  // (see rendererPatch.ts createPreviewEditor comment) — but #46-1 and
-  // hide/show preservation guards mitigate most user-visible damage.
+  // Enable VS Code-backed preview language features. Bundled Monaco relays
+  // provider requests through the extension host; captured native editors
+  // additionally opt into their workbench language-feature service set.
   enablePreviewLanguageFeatures = false,
 ): string {
   const enableMonacoPreviewCaptureLiteral = enableMonacoPreviewCapture ? 'true' : 'false';
@@ -38,12 +36,44 @@ export function getRendererPatchScript(
       window.__ijFindDisposeSearchUi('patch-upgrade');
     }
   } catch (eDisposePrevious) {}
+  if (!__ijFindInstallAdditionalInstance) {
+    // v136 created StandaloneThemeService in the light DOM. Its unscoped
+    // .mtk* and --vscode-* rules can recolor every normal workbench editor.
+    // Remove that known-owned sheet immediately when this patch replaces it.
+    try {
+      var __ijFindLeakedThemeStyles = document.head.querySelectorAll(
+        'style[data-ijss-standalone-theme="true"]'
+      );
+      for (var __ijFindLts = 0; __ijFindLts < __ijFindLeakedThemeStyles.length; __ijFindLts++) {
+        try { __ijFindLeakedThemeStyles[__ijFindLts].remove(); } catch (eRemoveLeakedTheme) {}
+      }
+      try { delete window.__ijFindWorkbenchMonacoColorStyles; } catch (eDropThemeBaseline) {}
+    } catch (eThemeCleanup) {}
+    // Do not reuse a pre-isolation bundle left alive by an extension reload.
+    // The v6 bundle includes ShadowRoot CSS, an isolated TrustedHTML policy
+    // registry, and only the worker-free language contributions used by the
+    // VS Code provider bridge.
+    try {
+      if (globalThis.__ijFindMonacoBundleVersion !== 6 ||
+          typeof globalThis.__ijFindMonacoCssText !== 'string' ||
+          globalThis.__ijFindMonacoCssText.length < 1000) {
+        globalThis.__ijFindMonacoApi = null;
+        globalThis.__ijFindMonacoBundleVersion = 0;
+        globalThis.__ijFindMonacoCssText = '';
+      }
+    } catch (eDropLegacyBundle) {}
+  }
   if (!__ijFindInstallAdditionalInstance && window.__ijFindPatchVersion === __ijFindPatchVersion && window.__ijFindPatchedV100) {
     try { window.__ijFindDisableMonacoProbes = !__ijFindEnableMonacoPreviewCapture; } catch (eFlag) {}
     try { window.__ijFindPerfDiagnostics = !!__ijFindEnablePerfDiagnostics; } catch (ePerfFlag) {}
     try { window.__ijFindShouldSuspendIntelliSenseRecursionCapture = !!__ijFindShouldSuspendIntelliSenseRecursionCapture; } catch (eIrFlag) {}
     try { window.__ijFindEnableRendererInlayClickHook = !!__ijFindEnableRendererInlayClickHook; } catch (eInlayFlag) {}
     try { window.__ijFindDisposeRendererPatchOnHide = !!__ijFindDisposeRendererPatchOnHide; } catch (eDisposeFlag) {}
+    // Settings can change while the renderer patch itself stays installed.
+    // Keep this flag on the shared window rather than trapping the value in
+    // the original patch closure, otherwise a retained patch can permanently
+    // skip the bundled hover/completion provider bridge until VS Code reloads.
+    try { window.__ijFindEnablePreviewLanguageFeatures = !!__ijFindEnablePreviewLanguageFeatures; } catch (eLanguageFeatureFlag) {}
   if (!__ijFindEnableMonacoPreviewCapture) {
       try { if (window.__ijFindStopCapture) { window.__ijFindStopCapture('already-patched-monaco-disabled'); } } catch (eStopAlready) {}
       try { window.__ijFindMonaco = null; } catch (eMonacoAlready) {}
@@ -65,6 +95,7 @@ export function getRendererPatchScript(
   window.__ijFindShouldSuspendIntelliSenseRecursionCapture = !!__ijFindShouldSuspendIntelliSenseRecursionCapture;
   window.__ijFindEnableRendererInlayClickHook = !!__ijFindEnableRendererInlayClickHook;
   window.__ijFindDisposeRendererPatchOnHide = !!__ijFindDisposeRendererPatchOnHide;
+  window.__ijFindEnablePreviewLanguageFeatures = !!__ijFindEnablePreviewLanguageFeatures;
   function isRendererDiagnosticsEnabled() {
     try { return window.__ijFindPerfDiagnostics === true || window.__ijFindRendererTrace === true; }
     catch (eDiagFlag) { return false; }
@@ -273,6 +304,19 @@ export function getRendererPatchScript(
     try { if (typeof state !== 'undefined' && state && state.searchTicker) { clearInterval(state.searchTicker); state.searchTicker = null; out.push('ticker=cleared'); } } catch (eTicker) {}
     try { if (typeof state !== 'undefined' && state && state.debounce) { clearTimeout(state.debounce); state.debounce = null; out.push('debounce=cleared'); } } catch (eDebounce) {}
     try { if (typeof state !== 'undefined' && state && state.hoverTimer) { clearTimeout(state.hoverTimer); state.hoverTimer = null; out.push('hoverTimer=cleared'); } } catch (eHoverTimer) {}
+    try { if (typeof cancelStandaloneNativePromotion === 'function') { cancelStandaloneNativePromotion(); out.push('nativePromotion=cleared'); } } catch (eNativePromotion) {}
+    try { if (typeof cancelStandaloneTextMateRequests === 'function') { cancelStandaloneTextMateRequests('preview disposed'); out.push('textMateRequests=cleared'); } } catch (eTextMateRequests) {}
+    try {
+      if (typeof state !== 'undefined' && state && state.previewSavePending) {
+        for (var saveRequestId in state.previewSavePending) {
+          if (!Object.prototype.hasOwnProperty.call(state.previewSavePending, saveRequestId)) { continue; }
+          var savePending = state.previewSavePending[saveRequestId];
+          if (savePending && savePending.timer) { clearTimeout(savePending.timer); }
+        }
+        state.previewSavePending = {};
+        out.push('saveRequests=cleared');
+      }
+    } catch (eSaveRequests) {}
     try { if (typeof hoverHideTimer !== 'undefined' && hoverHideTimer) { clearTimeout(hoverHideTimer); hoverHideTimer = null; out.push('hoverHide=cleared'); } } catch (eHoverHide) {}
     try { if (typeof restoreStolenEditor === 'function' && state && state.stolenEditor) { restoreStolenEditor(); out.push('stolen=restored'); } } catch (eStolen) {}
     try { if (typeof disposePreviewMonacoEditor === 'function') { disposePreviewMonacoEditor(); out.push('preview=disposed'); } } catch (ePreview) {}
@@ -351,7 +395,7 @@ export function getRendererPatchScript(
   // Keep the Monaco editor factory across additional/spawned panel installs.
   // The factory stores constructor + DI services, not a preview widget, so it
   // is safe to reuse for the lifetime of this renderer/workspace and avoids
-  // reopening a tab just to recover from DOM fallback.
+  // reopening a tab just to upgrade the bundled Monaco preview.
   try {
     var preservedMonacoFactory = window.__ijFindMonacoFactory ||
       (window.__ijFindMonaco && window.__ijFindMonaco.factorySingleton ? window.__ijFindMonaco : null);
@@ -395,9 +439,14 @@ export function getRendererPatchScript(
     var capturing = true;
     function sniff(v, src, k) {
       if (!capturing) { return null; }
+      try { if (window.__ijFindStandaloneMonacoInitializing === true) { return null; } } catch (eStandaloneInit) {}
       if (!v || typeof v !== 'object') { return null; }
       try {
         if (typeof v.layout === 'function' && typeof v.getModel === 'function' && typeof v.getDomNode === 'function') {
+          try {
+            var widgetDom = v.getDomNode();
+            if (widgetDom && widgetDom.closest && widgetDom.closest('.ij-find-overlay')) { return null; }
+          } catch (eOverlayWidget) {}
           if (caps.widgets.length < 50) {
             caps.widgets.push({ v: v, src: src, key: stringifyKey(k) });
           }
@@ -1029,8 +1078,9 @@ export function getRendererPatchScript(
     // claimed this keeps hover/inlay/intellisense intact; #47 found that
     // claim was wrong for LSP providers like Pylance — they need
     // isSimpleWidget=false to fire hover + autocomplete in the embed.
-    // Opt-in via intellijStyledSearch.previewLanguageFeatures (default
-    // off so existing users don't hit the takeover regression).
+    // Controlled by intellijStyledSearch.previewLanguageFeatures. Read the
+    // shared runtime flag so a same-version retained patch observes setting
+    // changes without replacing the editor or model.
     var widgetOptions = {};
     if (m.widgetOptions && typeof m.widgetOptions === 'object') {
       try {
@@ -1041,7 +1091,7 @@ export function getRendererPatchScript(
         }
       } catch (eWidgetOpts) {}
     }
-    widgetOptions.isSimpleWidget = !__ijFindEnablePreviewLanguageFeatures;
+    widgetOptions.isSimpleWidget = !window.__ijFindEnablePreviewLanguageFeatures;
     var triedDirectNew = false;
     function tryDirectNew(label) {
       if (triedDirectNew) { return null; }
@@ -1210,7 +1260,7 @@ export function getRendererPatchScript(
         trace('preview/hydrate/skip', { reason: 'parse-uri-failed', targetUri: msg.uri });
         return;
       }
-      var fullText = (msg.lines || []).map(function (l) { return l.text; }).join('\\n');
+      var fullText = (msg.lines || []).map(function (l) { return l.text; }).join(previewMessageEol(msg));
       var lang = msg.languageId || 'plaintext';
       var resourceModel = null;
       var reusedModel = false;
@@ -1292,33 +1342,9 @@ export function getRendererPatchScript(
           matchDecorsReapplied: matchDecorsReapplied,
           intellisense: gatherEmbedEditorIntellisenseSnapshot(editor),
         });
-        // #47 auto-probe at a KNOWN meaningful position: the search
-        // match's start column on focusLine. col=0 (line start) gives
-        // word-based fallback completions and 0 hovers (no symbol
-        // there); the match column actually sits on a symbol token so
-        // Pylance's intelligent providers should respond if they're
-        // bound to this URI. Dedupe is host-side per (uri, line, col).
-        try {
-          var probeLine0 = -1;
-          var probeCol0 = -1;
-          if (msg && typeof msg.focusLine === 'number') {
-            probeLine0 = Math.max(0, msg.focusLine);
-            if (Array.isArray(msg.ranges) && msg.ranges.length > 0 && typeof msg.ranges[0].start === 'number') {
-              probeCol0 = Math.max(0, msg.ranges[0].start);
-            } else {
-              probeCol0 = 0;
-            }
-          }
-          if (probeLine0 >= 0 && probeCol0 >= 0 && msg && msg.uri) {
-            send({
-              type: 'requestIntellisenseProbe',
-              uri: String(msg.uri),
-              line: probeLine0,
-              column: probeCol0,
-              source: 'hydrate-success-match-pos',
-            });
-          }
-        } catch (eAutoProbe) {}
+        // Do not execute hover/completion providers as a hydrate diagnostic.
+        // The native editor will request them when the user actually invokes
+        // the feature; eagerly probing here duplicated language-server work.
       } catch (eSet) {
         send({ type: 'log', msg: 'lspPressure cooldown hydrate setModel err: ' + (eSet && eSet.message) });
         trace('preview/hydrate/error', { stage: 'setModel', err: String(eSet && eSet.message || eSet).slice(0, 160) });
@@ -1924,9 +1950,6 @@ export function getRendererPatchScript(
     '.ij-find-overlay.ij-find-detached .ij-find-preview-body.ij-find-detached-preview-snapshot * {',
     '  user-select: text;',
     '}',
-    '.ij-find-overlay.ij-find-detached .ij-find-preview-body.ij-find-detached-preview-snapshot .ij-find-preview-lineno {',
-    '  user-select: none;',
-    '}',
     '.ij-find-overlay.ij-find-detached .ij-find-query,',
     '.ij-find-overlay.ij-find-detached .ij-find-scope {',
     '  cursor: default;',
@@ -2293,16 +2316,13 @@ export function getRendererPatchScript(
     '  min-width: 0; min-height: 0;',
     '  scrollbar-gutter: stable both-edges;',
     '}',
-	    '.ij-find-preview-content {',
-	    '  min-width: 100%;',
-	    '  width: max-content;',
-	    '  min-height: 100%;',
-	    '}',
-	    '.ij-find-preview-truncated {',
-	    '  padding: 2px 10px;',
+	    '.ij-find-preview-monaco-status {',
+	    '  width: 100%; height: 100%; box-sizing: border-box;',
+	    '  display: flex; align-items: center; justify-content: center; gap: 8px;',
+	    '  padding: 16px; text-align: center;',
 	    '  color: var(--vscode-descriptionForeground, #9d9d9d);',
-	    '  font-style: italic;',
 	    '}',
+	    '.ij-find-preview-monaco-status .ij-find-spinner { flex: 0 0 auto; }',
     // When a stolen monaco editor is mounted in this body, keep our own
     // padding / typography rules from bleeding into it. Nothing is forced
     // on the .monaco-editor child — we size it via inline style in JS.
@@ -2316,20 +2336,6 @@ export function getRendererPatchScript(
     '  color: unset;',
     '  scrollbar-gutter: auto;',
     '}',
-    '.ij-find-preview-line {',
-    '  display: flex; gap: 8px; padding: 0 10px; white-space: pre;',
-    '  width: max-content; min-width: 100%; box-sizing: border-box;',
-    '  color: var(--vscode-editor-foreground, #d4d4d4);',
-    '}',
-    '.ij-find-preview-line.focus {',
-    '  background: var(--vscode-editor-rangeHighlightBackground, rgba(255,255,255,0.06));',
-    '}',
-    '.ij-find-preview-lineno {',
-    '  flex: 0 0 44px; text-align: right;',
-    '  color: var(--vscode-editorLineNumber-foreground, #858585);',
-    '  user-select: none;',
-    '}',
-    '.ij-find-preview-text { flex: 0 0 auto; min-width: 0; }',
     '.ij-find-preview-inlay {',
     '  flex: 0 0 auto;',
     '  display: inline-flex; align-items: center;',
@@ -2749,14 +2755,19 @@ export function getRendererPatchScript(
     hoverTimer: null,
     lastHoverKey: '',
     monacoEditor: null,        // monaco.editor.IStandaloneCodeEditor
-    monacoHost: null,          // div hosting the editor
+    monacoHost: null,          // light-DOM host mounted in the preview body
+    monacoEditorHost: null,    // actual editor container inside monacoHost's ShadowRoot
+    monacoShadowRoot: null,
+    standaloneMonacoTheme: '',
+    standaloneMonacoThemeObserver: null,
     monacoChangeListener: null,
     minimapEnabled: true,      // persisted via $minimapToggle; every new preview editor honours it
     minimized: false,
     minimizedLayout: null,
     searchStartTs: 0,          // ms timestamp when results:start arrived; feeds the elapsed-time counter
     searchTicker: null,        // setInterval handle refreshing the status with live elapsed time
-    previewMode: '',           // 'monaco' | 'stolen' | 'dom'
+    previewMode: '',           // 'monaco' | 'stolen' | 'monaco-loading' | 'monaco-error'
+    previewEngine: '',         // 'native' | 'standalone'
     lastPreviewMsg: null,
     // True once the settle hydrate has upgraded the preview model to a
     // file://-bound resource model. At that point VSCode's
@@ -2766,7 +2777,6 @@ export function getRendererPatchScript(
     // twice on the same line. Reset to false on every new-URI preview
     // render so the immediate inlay paint still uses our fast path.
     previewHydrated: false,
-    previewRecoveryTimer: null,
     previewResourceModelCreates: 0,
     previewIsolatedModelCreates: 0,
     previewOwnedModelDisposes: 0,
@@ -2801,12 +2811,53 @@ export function getRendererPatchScript(
     previewMonacoInlayDisposers: [],
     previewMonacoSaveEditor: null,
     previewMonacoKeydownListener: null,
+    previewSaveRequestId: 0,
+    previewSavePending: {},
     previewMonacoDiagDisposers: [],
     previewMonacoDiagObserver: null,
     previewMonacoHealObserver: null,
     previewMonacoHealPending: false,
     previewMonacoHealRecursion: 0,
     previewMonacoHealLastAt: 0,
+    // Monotonic engine policy for the lifetime of this renderer instance:
+    // bundled Monaco may be upgraded to captured native Monaco, but a native
+    // preview that has successfully painted must never be downgraded again.
+    // previewEngine alone cannot enforce this because clearPreview() keeps the
+    // editor alive while resetting per-result state.
+    previewNativeCommitted: false,
+    previewNativeRecoveryTimer: null,
+    previewNativeRecoveryAttempt: 0,
+    previewNativeRecoveryKey: '',
+    previewNativeRecoverySnapshot: null,
+    previewNativePromotionTimer: null,
+    previewNativePromotionAttempt: 0,
+    previewNativePromotionKey: '',
+    standaloneMonacoRequestAt: 0,
+    standaloneMonacoLoadingUri: '',
+    standaloneLanguageFeatureRequestId: 0,
+    standaloneLanguageFeaturePending: {},
+    standaloneHoverRequestCache: {},
+    standaloneTextMateRequestId: 0,
+    standaloneTextMatePending: {},
+    standaloneTextMateLanguages: Object.create(null),
+    standaloneTextMateEpochs: Object.create(null),
+    standaloneTextMateCatalogEpoch: 0,
+    standaloneTextMateLanguageCatalogEpochs: Object.create(null),
+    standaloneLanguageFeatureDisposers: [],
+    standaloneLanguageFeatureLanguages: {},
+    standaloneCompletionCommandId: '',
+    standaloneSemanticTokensDisposable: null,
+    standaloneSemanticTokenCount: 0,
+    // Decoded VS Code semantic tokens for the active bundled model. Monaco's
+    // semantic-token provider consumes the encoded Uint32Array for coloring;
+    // hover needs a line-indexed snapshot so it can synchronously describe the
+    // token under the pointer while the host hover provider resolves.
+    standaloneSemanticHoverModel: null,
+    standaloneSemanticHoverModelVersion: 0,
+    standaloneSemanticHoverByLine: {},
+    standaloneLexicalHoverLineCache: null,
+    standaloneDiagnosticMarkerCount: 0,
+    standaloneOwnedModel: null,
     resultsInfoText: '',
     rgScope: '',
 	    searchHistory: [],
@@ -2847,13 +2898,61 @@ export function getRendererPatchScript(
 	  }
 
   function setPreviewDirty(dirty) {
+    var wasDirty = !!state.previewDirty;
     state.previewDirty = !!dirty;
+    if (state.previewDirty) {
+      try { cancelStandaloneNativePromotion(); } catch (eCancelDirtyPromotion) {}
+    } else if (wasDirty && state.previewEngine === 'standalone' && state.lastPreviewMsg) {
+      // A bundled buffer must never be replaced while it has unsaved edits.
+      // Once save/discard returns it to the clean snapshot, give the passive
+      // native upgrade a fresh bounded retry budget.
+      try { scheduleStandaloneNativePromotion(state.lastPreviewMsg, 'preview-clean'); }
+      catch (eResumeCleanPromotion) {}
+    }
+    if (state.previewDirty) {
+      cancelStandaloneLanguageFeatureRequests();
+      state.standaloneSemanticTokenCount = 0;
+      clearStandaloneSemanticHoverSnapshot();
+      clearStandaloneLexicalHoverCache();
+    }
+    if (state.previewDirty && state.standaloneSemanticTokensDisposable) {
+      try { state.standaloneSemanticTokensDisposable.dispose(); } catch (eDirtySemanticDispose) {}
+      state.standaloneSemanticTokensDisposable = null;
+    }
+    if (state.previewDirty && state.monacoEditor) {
+      state.standaloneDiagnosticMarkerCount = 0;
+      try {
+        var bundled = findBundledMonacoSync();
+        var model = state.monacoEditor.getModel && state.monacoEditor.getModel();
+        if (bundled && model) {
+          bundled.api.editor.setModelMarkers(model, 'ijss-vscode-language-service', []);
+        }
+      } catch (eDirtyMarkersDispose) {}
+    }
     $preview.classList.toggle('ij-find-modified', !!dirty);
     syncPreviewSaveButton();
   }
 
+  function previewMessageEol(msg) {
+    return msg && msg.eol === '\\r\\n' ? '\\r\\n' : '\\n';
+  }
+
   function previewMessageText(msg) {
-    return (msg && msg.lines ? msg.lines : []).map(function (l) { return l.text; }).join('\\n');
+    return (msg && msg.lines ? msg.lines : []).map(function (l) { return l.text; }).join(previewMessageEol(msg));
+  }
+
+  function previewContentHash(value) {
+    var text = String(value == null ? '' : value);
+    var h1 = 0xdeadbeef ^ text.length;
+    var h2 = 0x41c6ce57 ^ text.length;
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761);
+      h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (h2 >>> 0).toString(36) + (h1 >>> 0).toString(36);
   }
 
   function setPreviewCleanSnapshot(uri, content) {
@@ -2932,6 +3031,14 @@ export function getRendererPatchScript(
     try {
       var ed = getPreviewSaveEditor();
       var model = ed && ed.getModel && ed.getModel();
+      // A bundled file model is shared by every spawned preview showing the
+      // same URI. Closing/switching one view must not revert edits that are
+      // still visible in another owner; the last owner may perform the actual
+      // discard once the shared reference count reaches one.
+      if (ed === state.monacoEditor && standalonePreviewModelRefCount(model) > 1) {
+        setPreviewDirty(false);
+        return;
+      }
       if (
         model &&
         state.previewUri &&
@@ -2949,6 +3056,10 @@ export function getRendererPatchScript(
         } finally {
           state.previewSuppressDirty = false;
         }
+      }
+      if (ed === state.monacoEditor && model) {
+        markStandalonePreviewModelClean(model, state.previewCleanContent);
+        syncStandaloneSharedModelCleanState(model, state.previewCleanContent);
       }
       setPreviewDirty(false);
     } catch (eDiscardPreview) {
@@ -2968,7 +3079,11 @@ export function getRendererPatchScript(
     state.previewDirtyDialogContinuation = null;
     state.previewDirtyDialogOpen = false;
     if (action === 'save') {
-      savePreviewMonacoModel();
+      // Do not navigate away until the extension host confirms that the
+      // write completed. A failed/oversized save must leave the editable
+      // model mounted, and edits made while the save is in flight stay dirty.
+      savePreviewMonacoModel(continuation);
+      return;
     } else if (action === 'discard') {
       discardPreviewChanges();
     } else {
@@ -4087,63 +4202,13 @@ export function getRendererPatchScript(
       body.style.removeProperty('font-size');
       body.style.removeProperty('line-height');
       clearChildren(body);
-      var msg = state.lastPreviewMsg;
-      if (!msg || !Array.isArray(msg.lines) || msg.lines.length === 0) {
-        body.appendChild(el('div', {
-          className: 'ij-find-preview-content',
-          children: [
-            el('div', {
-              className: 'ij-find-preview-line ij-find-preview-truncated',
-              text: 'Preview snapshot unavailable',
-            }),
-          ],
-        }));
-        return;
-      }
-      var bounded = boundedPreviewLines(msg);
-      var contentEl = el('div', { className: 'ij-find-preview-content' });
-      var frag = document.createDocumentFragment();
-      var focusEl = null;
-      if (bounded.omittedBefore > 0) {
-        frag.appendChild(el('div', {
-          className: 'ij-find-preview-line ij-find-preview-truncated',
-          text: '... ' + bounded.omittedBefore + ' earlier line(s) omitted',
-        }));
-      }
-      for (var i = 0; i < bounded.lines.length; i++) {
-        var line = bounded.lines[i];
-        var isFocus = line.lineNumber === msg.focusLine;
-        var lineEl = el('div', {
-          className: 'ij-find-preview-line' + (isFocus ? ' focus' : ''),
-          attrs: { 'data-line': String(line.lineNumber) },
-        });
-        lineEl.appendChild(el('span', {
-          className: 'ij-find-preview-lineno',
-          text: String(line.lineNumber + 1),
-        }));
-        var textSpan = el('span', { className: 'ij-find-preview-text' });
-        if (isFocus && msg.ranges && msg.ranges.length > 0) {
-          appendHighlightedInto(textSpan, line.text, msg.ranges);
-        } else if (!fallbackHighlight(textSpan, line.text, msg.languageId || state.previewLanguageId || '')) {
-          textSpan.textContent = line.text;
-        }
-        lineEl.appendChild(textSpan);
-        frag.appendChild(lineEl);
-        if (isFocus) { focusEl = lineEl; }
-      }
-      if (bounded.omittedAfter > 0) {
-        frag.appendChild(el('div', {
-          className: 'ij-find-preview-line ij-find-preview-truncated',
-          text: '... ' + bounded.omittedAfter + ' later line(s) omitted',
-        }));
-      }
-      contentEl.appendChild(frag);
-      body.appendChild(contentEl);
-      if (focusEl) {
-        setTimeout(function () {
-          try { focusEl.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (eScrollDetachedPreview) {}
-        }, 0);
-      }
+      // A cloned Monaco DOM is not a live editor and must not masquerade as a
+      // code preview. Detached history panels keep their results, while code
+      // remains available only in a live Monaco-backed overlay instance.
+      body.appendChild(el('div', {
+        className: 'ij-find-preview-monaco-status',
+        text: 'Select a result in the active overlay to open its Monaco preview.',
+      }));
     } catch (eDetachedPreview) {}
   }
 
@@ -4438,13 +4503,10 @@ export function getRendererPatchScript(
   }
 
   function clearPreview() {
+    cancelStandaloneNativePromotion();
     $previewPath.textContent = '';
     setPreviewCleanSnapshot('', '');
     clearPreviewMonacoCallGraphInlays();
-    if (state.previewRecoveryTimer) {
-      clearTimeout(state.previewRecoveryTimer);
-      state.previewRecoveryTimer = null;
-    }
     if (state.previewRequestTimer) {
       clearTimeout(state.previewRequestTimer);
       state.previewRequestTimer = null;
@@ -4464,8 +4526,20 @@ export function getRendererPatchScript(
       } catch (eClearMatchDecos) {}
       state.previewHydrated = false;
     } else if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
-      // Legacy stolen-monaco path: keep editor in memory; blank out the model.
-      try { state.monacoEditor.setValue(''); } catch (e) {}
+      // Bundled models are registered under their real file URI and may be
+      // shared by another preview. Detach the model to blank this view without
+      // mutating the shared buffer or turning a clean snapshot into a phantom
+      // unsaved edit.
+      cancelStandaloneLanguageFeatureRequests();
+      clearStandaloneSemanticHoverSnapshot();
+      clearStandaloneLexicalHoverCache();
+      try {
+        if (state.monacoChangeListener && state.monacoChangeListener.dispose) {
+          state.monacoChangeListener.dispose();
+        }
+      } catch (eClearChangeListener) {}
+      state.monacoChangeListener = null;
+      try { state.monacoEditor.setModel(null); } catch (eDetachClearModel) {}
     } else {
       clearChildren($previewBody);
     }
@@ -4474,6 +4548,10 @@ export function getRendererPatchScript(
     state.activePreviewSeq++;
     state.previewUri = '';
     state.previewMode = '';
+    // The native editor is intentionally preserved across clears. Preserve
+    // the monotonic engine commitment too, otherwise a transient capture
+    // status on the next result can dispose it and create bundled Monaco.
+    state.previewEngine = state.previewNativeCommitted ? 'native' : '';
     state.lastPreviewMsg = null;
     state.previewLanguageId = '';
     syncPreviewSaveButton();
@@ -5516,11 +5594,26 @@ export function getRendererPatchScript(
   // diagnosed from the output channel.
   var monacoState = { tried: false, api: null, source: '' };
 
+  function findBundledMonacoSync() {
+    try {
+      if (globalThis.__ijFindMonacoBundleVersion === 6 &&
+          typeof globalThis.__ijFindMonacoCssText === 'string' &&
+          globalThis.__ijFindMonacoCssText.length >= 1000 &&
+          globalThis.__ijFindMonacoApi &&
+          globalThis.__ijFindMonacoApi.editor &&
+          typeof globalThis.__ijFindMonacoApi.editor.create === 'function') {
+        return { api: globalThis.__ijFindMonacoApi, source: 'bundled (__ijFindMonacoApi)' };
+      }
+    } catch (e) {}
+    return null;
+  }
+
   function findMonacoSync() {
     // First check our private bundle's global (set by monaco-entry.mjs) — we
     // use a non-conflicting name so we don't clobber anything VSCode itself
     // might reference as \`monaco\`.
-    try { if (globalThis.__ijFindMonacoApi && globalThis.__ijFindMonacoApi.editor && typeof globalThis.__ijFindMonacoApi.editor.create === 'function') { return { api: globalThis.__ijFindMonacoApi, source: 'bundled (__ijFindMonacoApi)' }; } } catch (e) {}
+    var bundled = findBundledMonacoSync();
+    if (bundled) { return bundled; }
     // Then fall back to any monaco VSCode may have exposed natively.
     try { if (typeof monaco !== 'undefined' && monaco && monaco.editor && typeof monaco.editor.create === 'function') { return { api: monaco, source: 'global monaco' }; } } catch (e) {}
     try { if (window.monaco && window.monaco.editor && typeof window.monaco.editor.create === 'function') { return { api: window.monaco, source: 'window.monaco' }; } } catch (e) {}
@@ -5654,6 +5747,17 @@ export function getRendererPatchScript(
   window.__ijFindProbe = probeReport;
 
   function ensureMonaco(cb) {
+    // disableMonacoProbes only disables private VS Code capture/probing. The
+    // extension-owned standalone bundle is the guaranteed, tab-free preview
+    // implementation and must remain usable when that setting is enabled.
+    var bundled = findBundledMonacoSync();
+    if (bundled) {
+      monacoState.api = bundled.api;
+      monacoState.source = bundled.source;
+      monacoState.tried = true;
+      cb(bundled.api);
+      return;
+    }
     if (window.__ijFindDisableMonacoProbes) {
       monacoState.tried = true;
       monacoState.api = null;
@@ -5883,54 +5987,6 @@ export function getRendererPatchScript(
     }
     return tokens;
   }
-  function fallbackHighlight(textSpan, lineText, langId) {
-    var p = langProfile(langId);
-    if (!p) { return false; }
-    var tokens = tokenizeLine(lineText, p);
-    clearChildren(textSpan);
-    for (var i = 0; i < tokens.length; i++) {
-      var t = tokens[i];
-      if (!t.text) { continue; }
-      if (t.type === 'default') { textSpan.appendChild(document.createTextNode(t.text)); }
-      else { textSpan.appendChild(el('span', { className: 'ij-tk-' + t.type, text: t.text })); }
-    }
-    return true;
-  }
-
-  // ── Monaco full-text colorize (when available) ───────────────────────
-  var domParser = new DOMParser();
-  function applyMonacoFullText(api, fullText, langId, lineEls) {
-    try {
-      api.editor.colorize(fullText, langId, { tabSize: 4 }).then(function (html) {
-        if (typeof html !== 'string' || !html) { return; }
-        // Split HTML at <br> boundaries by parsing.
-        var doc = domParser.parseFromString('<body>' + html + '</body>', 'text/html');
-        var body = doc.body;
-        var perLine = [[]];
-        var node = body.firstChild;
-        while (node) {
-          var next = node.nextSibling;
-          if (node.nodeName === 'BR') { perLine.push([]); }
-          else { perLine[perLine.length - 1].push(node); }
-          node = next;
-        }
-        var maxLen = Math.min(perLine.length, lineEls.length);
-        for (var i = 0; i < maxLen; i++) {
-          var ts = lineEls[i].querySelector('.ij-find-preview-text');
-          if (!ts) { continue; }
-          clearChildren(ts);
-          for (var j = 0; j < perLine[i].length; j++) {
-            ts.appendChild(document.importNode(perLine[i][j], true));
-          }
-        }
-      }).catch(function (err) {
-        send({ type: 'log', msg: 'monaco colorize failed: ' + (err && err.message ? err.message : err) });
-      });
-    } catch (e) {
-      send({ type: 'log', msg: 'monaco colorize threw: ' + (e && e.message) });
-    }
-  }
-
   function previewMessageIsStale(msg) {
     if (!msg) { return false; }
     if (typeof msg.previewSeq === 'number') {
@@ -5941,51 +5997,1722 @@ export function getRendererPatchScript(
     return !!selectedUri && msg.uri !== selectedUri;
   }
 
-  function scheduleDomPreviewRecovery(msg) {
-    if (!msg || previewMessageIsStale(msg)) { return; }
-    if (state.previewRecoveryTimer) {
-      clearTimeout(state.previewRecoveryTimer);
-      state.previewRecoveryTimer = null;
-    }
-    var deadline = perfNow() + 1000;
-    var expectedUri = msg.uri;
-    var expectedSeq = typeof msg.previewSeq === 'number' ? msg.previewSeq : null;
-    var attempt = function () {
-      state.previewRecoveryTimer = null;
-      if (expectedSeq !== null && expectedSeq < state.activePreviewSeq) { return; }
-      if (state.previewMode !== 'dom' || state.previewUri !== expectedUri || state.lastPreviewMsg !== msg) { return; }
-      if (!window.__ijFindDisableMonacoProbes) {
-        var m = null;
-        var monacoStatus = 'disabled';
-        try { monacoStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status'; }
-        catch (eStatus) { monacoStatus = 'status-err:' + (eStatus && eStatus.message); }
-        if (monacoStatus !== 'ready' && typeof window.__ijFindTestCreateWidget === 'function') {
-          try { window.__ijFindTestCreateWidget(); } catch (ePromote) {}
-          try { monacoStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : monacoStatus; }
-          catch (eStatusAfterPromote) {}
-        }
-        try { m = getMonacoFactorySingleton(); } catch (eMonaco) {}
-        if (monacoStatus === 'ready' && m && m.ctor) {
-          try {
-            renderPreviewMonacoReal(msg, 'message-coldwarm');
-            return;
-          } catch (eRender) {
-            send({ type: 'log', msg: 'preview auto-recovery render threw: ' + (eRender && eRender.message) });
-          }
-        }
-      }
-      if (perfNow() < deadline) {
-        state.previewRecoveryTimer = setTimeout(attempt, 40);
-      }
-    };
-    state.previewRecoveryTimer = setTimeout(attempt, 16);
-  }
-
   function previewKeyForMessage(msg) {
     if (!msg || !msg.uri) { return ''; }
     var line = typeof msg.focusLine === 'number' ? msg.focusLine : 'preview';
     return String(msg.uri) + '#' + line;
   }
+
+  function requestStandaloneMonacoForPreview(msg) {
+    try {
+      // Always track the newest requested URI, even when an older request is
+      // inside the injection debounce window. The one bundle-ready callback
+      // must render the latest preview rather than strand it behind A's URI.
+      state.standaloneMonacoLoadingUri = String(msg && msg.uri || '');
+      if (findBundledMonacoSync()) {
+        // The bundle is already loaded, so another injection request cannot
+        // repair a one-off mount failure. Retry exactly once through the ready
+        // path; it converts a repeated failure into an explicit error state.
+        setTimeout(function () {
+          try { renderStandaloneMonacoWhenReady('request-already-loaded'); } catch (eRetryLoadedBundle) {}
+        }, 0);
+        return;
+      }
+      var now = Date.now();
+      // Deduplicate renderer retries, while still allowing a later preview to
+      // recover if an earlier injection was interrupted by a window reload.
+      if (state.standaloneMonacoRequestAt && now - state.standaloneMonacoRequestAt < 2000) { return; }
+      state.standaloneMonacoRequestAt = now;
+      sendPersistent({ type: 'requestStandaloneMonaco' });
+    } catch (eRequestStandalone) {
+      send({ type: 'log', msg: 'standalone Monaco request threw: ' + (eRequestStandalone && eRequestStandalone.message) });
+    }
+  }
+
+  // The extension-owned Monaco copy has its own language-feature registry.
+  // Relay provider requests through the extension host so bundled previews use
+  // the same VS Code providers as a normal file editor without opening a tab.
+  function standalonePreviewOwnsModel(model) {
+    try {
+      return !!(model && state.monacoEditor && state.monacoEditor.getModel &&
+        state.monacoEditor.getModel() === model && state.previewUri);
+    } catch (eOwnsModel) {
+      return false;
+    }
+  }
+
+  function claimStandaloneLanguageFeatureModel(model) {
+    if (!model) { return; }
+    try {
+      var owners = window.__ijFindStandaloneLanguageFeatureOwners;
+      if (!owners || typeof owners.get !== 'function' || typeof owners.set !== 'function') {
+        owners = new WeakMap();
+        window.__ijFindStandaloneLanguageFeatureOwners = owners;
+      }
+      owners.set(model, __ijFindInstanceId);
+    } catch (eClaimLanguageModel) {}
+  }
+
+  function standalonePreviewHandlesLanguageFeature(model) {
+    if (!standalonePreviewOwnsModel(model)) { return false; }
+    try {
+      if (!panel.classList.contains('visible') || (typeof panel.isConnected === 'boolean' && !panel.isConnected)) {
+        return false;
+      }
+      if (state.monacoEditor && typeof state.monacoEditor.hasTextFocus === 'function' && state.monacoEditor.hasTextFocus()) {
+        claimStandaloneLanguageFeatureModel(model);
+        return true;
+      }
+      var owners = window.__ijFindStandaloneLanguageFeatureOwners;
+      var ownerId = owners && typeof owners.get === 'function' ? String(owners.get(model) || '') : '';
+      if (ownerId && ownerId !== __ijFindInstanceId) {
+        var registry = searchInstanceRegistry();
+        var owner = registry[ownerId];
+        if (owner && isRegisteredSearchInstanceVisible(owner) &&
+            typeof owner.ownsPreviewModel === 'function' && owner.ownsPreviewModel(model)) {
+          return false;
+        }
+      }
+      claimStandaloneLanguageFeatureModel(model);
+    } catch (eChooseLanguageOwner) {}
+    return true;
+  }
+
+  function disposeStandaloneLanguageFeatureRequest(entry) {
+    if (!entry) { return; }
+    try { if (entry.timer) { clearTimeout(entry.timer); } } catch (eTimer) {}
+    try { if (entry.cancelListener && entry.cancelListener.dispose) { entry.cancelListener.dispose(); } } catch (eCancel) {}
+  }
+
+  function cancelStandaloneLanguageFeatureRequests() {
+    var pending = state.standaloneLanguageFeaturePending || {};
+    state.standaloneLanguageFeaturePending = {};
+    state.standaloneHoverRequestCache = {};
+    for (var key in pending) {
+      if (!Object.prototype.hasOwnProperty.call(pending, key)) { continue; }
+      var entry = pending[key];
+      disposeStandaloneLanguageFeatureRequest(entry);
+      try { entry.resolve(null); } catch (eResolveCancelled) {}
+    }
+  }
+
+  function disposeStandaloneTextMateRequest(entry) {
+    if (!entry) { return; }
+    try { if (entry.timer) { clearTimeout(entry.timer); } } catch (eTextMateTimer) {}
+  }
+
+  function cancelStandaloneTextMateRequests(reason) {
+    var pending = state.standaloneTextMatePending || {};
+    state.standaloneTextMatePending = {};
+    for (var key in pending) {
+      if (!Object.prototype.hasOwnProperty.call(pending, key)) { continue; }
+      var entry = pending[key];
+      disposeStandaloneTextMateRequest(entry);
+      try { entry.reject(new Error(reason || 'TextMate request cancelled')); } catch (eRejectTextMate) {}
+    }
+  }
+
+  function requestStandaloneTextMateCatalog(languageId) {
+    var requestId = ++state.standaloneTextMateRequestId;
+    return new Promise(function (resolve, reject) {
+      var entry = {
+        requestId: requestId,
+        kind: 'catalog',
+        resolve: resolve,
+        reject: reject,
+        timer: null,
+      };
+      entry.timer = setTimeout(function () {
+        if (state.standaloneTextMatePending[requestId] !== entry) { return; }
+        delete state.standaloneTextMatePending[requestId];
+        reject(new Error('TextMate catalog request timed out'));
+      }, 10000);
+      state.standaloneTextMatePending[requestId] = entry;
+      send({
+        type: 'requestPreviewTextMateGrammar',
+        requestId: requestId,
+        kind: 'catalog',
+        languageId: String(languageId || ''),
+      });
+    });
+  }
+
+  function requestStandaloneTextMateAsset(generation, assetId) {
+    var requestId = ++state.standaloneTextMateRequestId;
+    return new Promise(function (resolve, reject) {
+      var entry = {
+        requestId: requestId,
+        kind: 'asset',
+        generation: generation,
+        assetId: String(assetId || ''),
+        chunks: [],
+        chunkCount: 0,
+        receivedBytes: 0,
+        resolve: resolve,
+        reject: reject,
+        timer: null,
+      };
+      entry.timer = setTimeout(function () {
+        if (state.standaloneTextMatePending[requestId] !== entry) { return; }
+        delete state.standaloneTextMatePending[requestId];
+        reject(new Error('TextMate grammar asset request timed out'));
+      }, 30000);
+      state.standaloneTextMatePending[requestId] = entry;
+      send({
+        type: 'requestPreviewTextMateGrammar',
+        requestId: requestId,
+        kind: 'asset',
+        generation: generation,
+        assetId: String(assetId || ''),
+      });
+    });
+  }
+
+  function decodeStandaloneTextMateBase64(value) {
+    var binary = atob(String(value || ''));
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) { bytes[i] = binary.charCodeAt(i); }
+    return bytes;
+  }
+
+  function standaloneTextMateSha256(bytes) {
+    if (!globalThis.crypto || !globalThis.crypto.subtle || typeof globalThis.crypto.subtle.digest !== 'function') {
+      return Promise.resolve('');
+    }
+    return globalThis.crypto.subtle.digest('SHA-256', bytes).then(function (digest) {
+      var parts = [];
+      var view = new Uint8Array(digest);
+      for (var i = 0; i < view.length; i++) { parts.push(view[i].toString(16).padStart(2, '0')); }
+      return parts.join('');
+    });
+  }
+
+  function resolveStandaloneTextMateMessage(msg) {
+    var requestId = msg && msg.requestId;
+    var entry = state.standaloneTextMatePending && state.standaloneTextMatePending[requestId];
+    if (!entry) { return 'missing'; }
+    if (msg.error) {
+      delete state.standaloneTextMatePending[requestId];
+      disposeStandaloneTextMateRequest(entry);
+      try { entry.reject(new Error(String(msg.error))); } catch (eRejectTextMateError) {}
+      return 'resolved:error';
+    }
+    if (msg.kind === 'catalog' && entry.kind === 'catalog') {
+      delete state.standaloneTextMatePending[requestId];
+      disposeStandaloneTextMateRequest(entry);
+      try { entry.resolve(msg.value || null); } catch (eResolveTextMateCatalog) {}
+      return 'resolved:catalog';
+    }
+    if (msg.kind !== 'asset' || entry.kind !== 'asset') { return 'mismatch'; }
+    if (Number(msg.generation) !== Number(entry.generation) || String(msg.assetId || '') !== entry.assetId) {
+      delete state.standaloneTextMatePending[requestId];
+      disposeStandaloneTextMateRequest(entry);
+      try { entry.reject(new Error('Stale TextMate grammar asset response')); } catch (eRejectStaleTextMate) {}
+      return 'resolved:stale';
+    }
+    var chunkIndex = Number(msg.chunkIndex);
+    var chunkCount = Number(msg.chunkCount);
+    if (!Number.isInteger(chunkIndex) || !Number.isInteger(chunkCount) || chunkIndex < 0 ||
+        chunkCount < 1 || chunkCount > 256 || chunkIndex >= chunkCount) {
+      delete state.standaloneTextMatePending[requestId];
+      disposeStandaloneTextMateRequest(entry);
+      try { entry.reject(new Error('Invalid TextMate grammar asset chunk')); } catch (eRejectTextMateChunk) {}
+      return 'resolved:invalid-chunk';
+    }
+    try {
+      if (entry.chunkCount && entry.chunkCount !== chunkCount) {
+        throw new Error('TextMate grammar asset chunk count changed');
+      }
+      if (!entry.chunks[chunkIndex]) {
+        var bytes = decodeStandaloneTextMateBase64(msg.base64);
+        entry.chunks[chunkIndex] = bytes;
+        entry.receivedBytes += bytes.byteLength;
+      }
+      entry.chunkCount = chunkCount;
+      if (entry.receivedBytes > 8 * 1024 * 1024) { throw new Error('TextMate grammar asset exceeds renderer size limit'); }
+      try { if (entry.timer) { clearTimeout(entry.timer); } } catch (eResetTextMateTimer) {}
+      entry.timer = setTimeout(function () {
+        if (state.standaloneTextMatePending[requestId] !== entry) { return; }
+        delete state.standaloneTextMatePending[requestId];
+        entry.reject(new Error('TextMate grammar asset request timed out'));
+      }, 30000);
+    } catch (eDecodeTextMateChunk) {
+      delete state.standaloneTextMatePending[requestId];
+      disposeStandaloneTextMateRequest(entry);
+      try { entry.reject(eDecodeTextMateChunk); } catch (eRejectDecodedTextMate) {}
+      return 'resolved:decode-error';
+    }
+    for (var ci = 0; ci < entry.chunkCount; ci++) {
+      if (!entry.chunks[ci]) { return 'pending:asset'; }
+    }
+    delete state.standaloneTextMatePending[requestId];
+    disposeStandaloneTextMateRequest(entry);
+    var combined = new Uint8Array(entry.receivedBytes);
+    var offset = 0;
+    for (var bi = 0; bi < entry.chunkCount; bi++) {
+      combined.set(entry.chunks[bi], offset);
+      offset += entry.chunks[bi].byteLength;
+    }
+    var expectedBytes = Number(msg.byteLength);
+    if (Number.isFinite(expectedBytes) && expectedBytes !== combined.byteLength) {
+      try { entry.reject(new Error('TextMate grammar asset byte length mismatch')); } catch (eRejectTextMateLength) {}
+      return 'resolved:length-mismatch';
+    }
+    standaloneTextMateSha256(combined).then(function (actualSha) {
+      var expectedSha = String(msg.sha256 || '').toLowerCase();
+      if (actualSha && expectedSha && actualSha !== expectedSha) {
+        throw new Error('TextMate grammar asset checksum mismatch');
+      }
+      return {
+        content: new TextDecoder('utf-8', { fatal: true }).decode(combined),
+        byteLength: combined.byteLength,
+        sha256: expectedSha,
+        pathHint: String(msg.pathHint || 'grammar.tmLanguage.json'),
+      };
+    }).then(entry.resolve, entry.reject);
+    return 'resolved:asset';
+  }
+
+  function ensureStandaloneTextMateGrammar(api, languageId, forceCatalogRefresh) {
+    var id = String(languageId || 'plaintext');
+    var catalogEpoch = Number(state.standaloneTextMateCatalogEpoch || 0);
+    if (catalogEpoch > 0 && state.standaloneTextMateLanguageCatalogEpochs[id] !== catalogEpoch) {
+      forceCatalogRefresh = true;
+    }
+    var textMateApi = null;
+    try { textMateApi = globalThis.__ijFindTextMateApi; } catch (eTextMateApi) {}
+    if (!api || api !== globalThis.__ijFindMonacoApi || !textMateApi ||
+        typeof textMateApi.installGrammarCatalog !== 'function') { return; }
+    var languageState = state.standaloneTextMateLanguages[id];
+    if (!forceCatalogRefresh && languageState && (languageState.status === 'loading' || languageState.status === 'ready' ||
+        languageState.status === 'unavailable')) { return; }
+    try {
+      var installed = typeof textMateApi.getStatus === 'function' ? textMateApi.getStatus(id) : null;
+      if (!forceCatalogRefresh && installed && installed.status === 'ready') {
+        state.standaloneTextMateLanguages[id] = installed;
+        return;
+      }
+    } catch (eReadTextMateStatus) {}
+    var epoch = Number(state.standaloneTextMateEpochs[id] || 0) + 1;
+    state.standaloneTextMateEpochs[id] = epoch;
+    languageState = { status: 'loading', languageId: id, error: '', epoch: epoch };
+    state.standaloneTextMateLanguages[id] = languageState;
+    requestStandaloneTextMateCatalog(id).then(function (catalog) {
+      if (state.standaloneTextMateEpochs[id] !== epoch || state.standaloneTextMateLanguages[id] !== languageState) {
+        return null;
+      }
+      if (!catalog || !catalog.rootScopeName) {
+        try {
+          if (typeof textMateApi.removeGrammar === 'function') { textMateApi.removeGrammar(id); }
+        } catch (eRemoveUnavailableTextMate) {}
+        languageState.status = 'unavailable';
+        state.standaloneTextMateLanguageCatalogEpochs[id] = catalogEpoch;
+        return null;
+      }
+      languageState.generation = catalog.generation;
+      languageState.rootScopeName = catalog.rootScopeName;
+      return textMateApi.installGrammarCatalog(catalog, function (assetId) {
+        return requestStandaloneTextMateAsset(catalog.generation, assetId);
+      });
+    }).then(function (installedStatus) {
+      if (!installedStatus || installedStatus.status === 'superseded' ||
+          state.standaloneTextMateEpochs[id] !== epoch || state.standaloneTextMateLanguages[id] !== languageState) { return; }
+      state.standaloneTextMateLanguages[id] = installedStatus;
+      state.standaloneTextMateLanguageCatalogEpochs[id] = catalogEpoch;
+      send({ type: 'log', msg: 'TextMate grammar ready lang=' + id + ' scope=' + String(installedStatus.rootScopeName || '') + ' assets=' + String(installedStatus.loadedAssetCount || 0) });
+    }).catch(function (error) {
+      if (state.standaloneTextMateEpochs[id] !== epoch || state.standaloneTextMateLanguages[id] !== languageState) { return; }
+      languageState.status = 'error';
+      languageState.error = String(error && error.message || error).slice(0, 500);
+      send({ type: 'log', msg: 'TextMate grammar fallback lang=' + id + ' error=' + languageState.error });
+    });
+  }
+
+  function refreshStandaloneTextMateGrammarAfterInvalidation() {
+    cancelStandaloneTextMateRequests('TextMate grammar catalog invalidated');
+    state.standaloneTextMateCatalogEpoch = Number(state.standaloneTextMateCatalogEpoch || 0) + 1;
+    state.standaloneTextMateLanguages = Object.create(null);
+    try {
+      var bundled = findBundledMonacoSync();
+      var editor = state.monacoEditor;
+      var model = editor && editor.getModel && editor.getModel();
+      if (bundled && model) {
+        var languageId = model.getLanguageId ? model.getLanguageId() : state.previewLanguageId;
+        ensureStandaloneTextMateGrammar(bundled.api, languageId, true);
+      }
+    } catch (eRefreshTextMateGrammar) {}
+  }
+
+  function requestStandaloneLanguageFeature(feature, model, position, context, token) {
+    // The extension host analyzes VS Code's TextDocument. Until bundled edits
+    // are saved, querying that document would return ranges/content for a
+    // different snapshot, so fail soft instead of displaying stale results.
+    if (!standalonePreviewHandlesLanguageFeature(model) || state.previewDirty ||
+        (token && token.isCancellationRequested)) { return Promise.resolve(null); }
+    var requestId = ++state.standaloneLanguageFeatureRequestId;
+    var uri = state.previewUri;
+    var line = position && typeof position.lineNumber === 'number'
+      ? (state.previewBaseLine || 0) + position.lineNumber - 1
+      : undefined;
+    var column = position && typeof position.column === 'number'
+      ? position.column - 1
+      : undefined;
+    return new Promise(function (resolve) {
+      var entry = {
+        requestId: requestId,
+        feature: feature,
+        uri: uri,
+        model: model,
+        modelVersion: model && model.getVersionId ? model.getVersionId() : 0,
+        baseLine: state.previewBaseLine || 0,
+        contentHash: previewContentHash(model && model.getValue ? model.getValue() : ''),
+        resolve: resolve,
+        timer: null,
+        cancelListener: null,
+      };
+      entry.timer = setTimeout(function () {
+        if (state.standaloneLanguageFeaturePending[requestId] !== entry) { return; }
+        delete state.standaloneLanguageFeaturePending[requestId];
+        disposeStandaloneLanguageFeatureRequest(entry);
+        resolve(null);
+      }, 10000);
+      // Publish before wiring cancellation. Some Monaco tokens synchronously
+      // invoke the listener when they are already cancelled.
+      state.standaloneLanguageFeaturePending[requestId] = entry;
+      try {
+        if (token && typeof token.onCancellationRequested === 'function') {
+          entry.cancelListener = token.onCancellationRequested(function () {
+            if (state.standaloneLanguageFeaturePending[requestId] !== entry) { return; }
+            delete state.standaloneLanguageFeaturePending[requestId];
+            disposeStandaloneLanguageFeatureRequest(entry);
+            resolve(null);
+          });
+        }
+      } catch (eCancellationWire) {}
+      if (token && token.isCancellationRequested) {
+        if (state.standaloneLanguageFeaturePending[requestId] === entry) {
+          delete state.standaloneLanguageFeaturePending[requestId];
+          disposeStandaloneLanguageFeatureRequest(entry);
+          resolve(null);
+        }
+        return;
+      }
+      send({
+        type: 'requestPreviewLanguageFeature',
+        requestId: requestId,
+        feature: feature,
+        uri: uri,
+        line: line,
+        column: column,
+        context: context || {},
+      });
+    });
+  }
+
+  function standaloneHoverRequestKey(model, position) {
+    var version = 0;
+    try { version = model && model.getVersionId ? model.getVersionId() : 0; } catch (eHoverKeyVersion) {}
+    var word = standaloneHoverWordAtPosition(model, position);
+    var line = position && position.lineNumber || 0;
+    var start = word && word.startColumn || (position && position.column) || 0;
+    var end = word && word.endColumn || start;
+    return String(state.previewUri || '') + '|' + version + '|' + line + '|' + start + '|' + end;
+  }
+
+  function requestStandaloneSemanticHover(model, position, token) {
+    if (token && token.isCancellationRequested) { return Promise.resolve(null); }
+    var key = standaloneHoverRequestKey(model, position);
+    var cache = state.standaloneHoverRequestCache || (state.standaloneHoverRequestCache = {});
+    var now = Date.now();
+    var cached = cache[key];
+    if (cached && (!cached.settled || cached.expiresAt > now)) { return cached.promise; }
+    if (cached) { delete cache[key]; }
+    var entry = { promise: null, settled: false, expiresAt: 0 };
+    // Do not bind the underlying host request to one Monaco hover token. A
+    // pointer can cancel/restart the same word while VS Code's provider is
+    // still running; sharing the in-flight request avoids duplicate LSP work.
+    entry.promise = requestStandaloneLanguageFeature('hover', model, position, {}, null).then(function (raw) {
+      entry.settled = true;
+      if (raw == null) {
+        if (cache[key] === entry) { delete cache[key]; }
+      } else {
+        entry.expiresAt = Date.now() + 750;
+      }
+      return raw;
+    });
+    cache[key] = entry;
+    var keys = Object.keys(cache);
+    if (keys.length > 16) {
+      for (var i = 0; i < keys.length - 16; i++) {
+        if (cache[keys[i]] && cache[keys[i]].settled) { delete cache[keys[i]]; }
+      }
+    }
+    return entry.promise;
+  }
+
+  function resolveStandaloneLanguageFeature(msg) {
+    var requestId = msg && msg.requestId;
+    var entry = state.standaloneLanguageFeaturePending && state.standaloneLanguageFeaturePending[requestId];
+    if (!entry) { return 'ignored:unknown-request'; }
+    delete state.standaloneLanguageFeaturePending[requestId];
+    disposeStandaloneLanguageFeatureRequest(entry);
+    var currentModel = null;
+    try { currentModel = state.monacoEditor && state.monacoEditor.getModel && state.monacoEditor.getModel(); } catch (eCurrentFeatureModel) {}
+    var currentVersion = 0;
+    try { currentVersion = entry.model && entry.model.getVersionId ? entry.model.getVersionId() : 0; } catch (eCurrentFeatureVersion) {}
+    if (entry.feature !== msg.feature || entry.uri !== msg.uri || msg.error ||
+        currentModel !== entry.model || currentVersion !== entry.modelVersion ||
+        (state.previewBaseLine || 0) !== entry.baseLine ||
+        (typeof msg.documentHash === 'string' && msg.documentHash !== entry.contentHash)) {
+      try { entry.resolve(null); } catch (eResolveMismatch) {}
+      return msg.error ? 'resolved:error' : 'resolved:mismatch';
+    }
+    try { entry.resolve(msg.value == null ? null : msg.value); } catch (eResolveFeature) {}
+    return 'resolved';
+  }
+
+  function monacoPositionFromSerialized(api, raw, baseLine) {
+    if (!raw || typeof raw.line !== 'number' || typeof raw.character !== 'number') { return null; }
+    return {
+      lineNumber: Math.max(1, raw.line - (baseLine || 0) + 1),
+      column: Math.max(1, raw.character + 1),
+    };
+  }
+
+  function monacoRangeFromSerialized(api, raw, baseLine) {
+    if (!raw || !raw.start || !raw.end) { return null; }
+    var start = monacoPositionFromSerialized(api, raw.start, baseLine);
+    var end = monacoPositionFromSerialized(api, raw.end, baseLine);
+    if (!start || !end) { return null; }
+    return new api.Range(start.lineNumber, start.column, end.lineNumber, end.column);
+  }
+
+  function monacoMarkdownFromSerialized(api, raw) {
+    if (typeof raw === 'string') { return raw; }
+    if (!raw || typeof raw.value !== 'string') { return { value: String(raw == null ? '' : raw) }; }
+    var result = { value: raw.value };
+    if (raw.isTrusted !== undefined) { result.isTrusted = raw.isTrusted; }
+    if (raw.supportHtml !== undefined) { result.supportHtml = !!raw.supportHtml; }
+    if (raw.supportThemeIcons !== undefined) { result.supportThemeIcons = !!raw.supportThemeIcons; }
+    if (raw.baseUri) {
+      try { result.baseUri = api.Uri.parse(String(raw.baseUri)); } catch (eBaseUri) {}
+    }
+    return result;
+  }
+
+  function standaloneHoverWordAtPosition(model, position) {
+    try {
+      if (!model || !position || typeof model.getWordAtPosition !== 'function') { return null; }
+      return model.getWordAtPosition(position) || null;
+    } catch (eHoverWord) {
+      return null;
+    }
+  }
+
+  function standaloneHoverRangeForPosition(api, model, position, preferredRange) {
+    // Both the immediate lexical row and the delayed host hover must share the
+    // same local word anchor; otherwise Monaco may split or replace the hover
+    // as providers settle. Host ranges are used only when no word exists.
+    var word = standaloneHoverWordAtPosition(model, position);
+    if (word && position) {
+      return new api.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn);
+    }
+    try {
+      if (preferredRange && position && typeof preferredRange.containsPosition === 'function' &&
+          preferredRange.containsPosition(position)) {
+        return preferredRange;
+      }
+    } catch (ePreferredHoverRange) {}
+    if (position) {
+      return new api.Range(position.lineNumber, position.column, position.lineNumber, position.column);
+    }
+    return new api.Range(1, 1, 1, 1);
+  }
+
+  function normalizeStandaloneLexicalTokenType(rawType, languageId, hasWord) {
+    var value = String(rawType || '').trim().split(/\\s+/)[0] || '';
+    var suffix = languageId ? '.' + String(languageId).toLowerCase() : '';
+    if (suffix && value.toLowerCase().slice(-suffix.length) === suffix) {
+      value = value.slice(0, -suffix.length);
+    }
+    value = value.replace(/[^A-Za-z0-9_.:-]+/g, '').slice(0, 120);
+    if (!value && hasWord) { value = 'identifier'; }
+    return value;
+  }
+
+  function standaloneLexicalTokenAtPosition(api, model, position, languageId) {
+    if (!api || !api.editor || !model || !position) { return null; }
+    var line = '';
+    try { line = model.getLineContent(position.lineNumber); } catch (eHoverLine) { return null; }
+    var word = standaloneHoverWordAtPosition(model, position);
+    if (!word || !word.word) { return null; }
+    var rawType = '';
+    var rawScopes = [];
+    var tokenStartColumn = word ? word.startColumn : position.column;
+    var tokenEndColumn = word ? word.endColumn : position.column;
+    try {
+      var textMateApi = globalThis.__ijFindTextMateApi;
+      if (textMateApi && typeof textMateApi.getTokenAtPosition === 'function') {
+        var textMateToken = textMateApi.getTokenAtPosition(
+          languageId || (model.getLanguageId && model.getLanguageId()) || 'plaintext',
+          model,
+          position
+        );
+        if (textMateToken) {
+          rawType = String(textMateToken.type || '');
+          rawScopes = Array.isArray(textMateToken.scopes) ? textMateToken.scopes.slice() : [];
+          tokenStartColumn = Number(textMateToken.startColumn) || tokenStartColumn;
+          tokenEndColumn = Number(textMateToken.endColumn) || tokenEndColumn;
+        }
+      }
+    } catch (eTextMateHover) {}
+    try {
+      if (!rawType && typeof api.editor.tokenize === 'function' && line.length <= 20000) {
+        var resolvedLanguageId = languageId || (model.getLanguageId && model.getLanguageId()) || 'plaintext';
+        var modelVersion = model.getVersionId ? model.getVersionId() : 0;
+        var cache = state.standaloneLexicalHoverLineCache;
+        var tokens = null;
+        if (cache && cache.model === model && cache.modelVersion === modelVersion &&
+            cache.lineNumber === position.lineNumber && cache.languageId === resolvedLanguageId) {
+          tokens = cache.tokens;
+        } else {
+          var tokenized = api.editor.tokenize(line, resolvedLanguageId);
+          tokens = tokenized && tokenized[0];
+          state.standaloneLexicalHoverLineCache = {
+            model: model,
+            modelVersion: modelVersion,
+            lineNumber: position.lineNumber,
+            languageId: resolvedLanguageId,
+            tokens: Array.isArray(tokens) ? tokens : [],
+          };
+        }
+        var offset = Math.max(0, Math.min(line.length, position.column - 1));
+        if (Array.isArray(tokens)) {
+          for (var i = 0; i < tokens.length; i++) {
+            var startOffset = typeof tokens[i].offset === 'number' ? tokens[i].offset : 0;
+            var endOffset = i + 1 < tokens.length && typeof tokens[i + 1].offset === 'number'
+              ? tokens[i + 1].offset
+              : line.length;
+            if (offset >= startOffset && (offset < endOffset || (offset === line.length && endOffset === line.length))) {
+              rawType = String(tokens[i].type || '');
+              if (!word) {
+                tokenStartColumn = startOffset + 1;
+                tokenEndColumn = Math.max(tokenStartColumn, endOffset + 1);
+              }
+              break;
+            }
+          }
+        }
+      }
+    } catch (eTokenizeHover) {}
+    var type = normalizeStandaloneLexicalTokenType(rawType, languageId, !!word);
+    if (!type || /^(?:white|whitespace)$/.test(type)) { return null; }
+    return {
+      word: word && typeof word.word === 'string' ? word.word : '',
+      type: type,
+      scopes: rawScopes,
+      range: new api.Range(position.lineNumber, tokenStartColumn, position.lineNumber, tokenEndColumn),
+    };
+  }
+
+  function standaloneSemanticHoverTokenAtPosition(model, position) {
+    if (!model || !position || state.standaloneSemanticHoverModel !== model) { return null; }
+    try {
+      if (model.getVersionId && model.getVersionId() !== state.standaloneSemanticHoverModelVersion) { return null; }
+    } catch (eSemanticHoverVersion) { return null; }
+    var tokens = state.standaloneSemanticHoverByLine[String(position.lineNumber)] || [];
+    for (var i = 0; i < tokens.length; i++) {
+      var token = tokens[i];
+      if (position.column >= token.startColumn && position.column < token.endColumn) { return token; }
+    }
+    return null;
+  }
+
+  function standaloneHoverInlineCode(value) {
+    var text = String(value == null ? '' : value).replace(/[\\r\\n]+/g, ' ').slice(0, 240);
+    var tick = String.fromCharCode(96);
+    var longest = 0;
+    var run = 0;
+    for (var i = 0; i < text.length; i++) {
+      if (text.charAt(i) === tick) { run++; longest = Math.max(longest, run); }
+      else { run = 0; }
+    }
+    var fence = new Array(longest + 2).join(tick);
+    var pad = text.charAt(0) === tick || text.charAt(text.length - 1) === tick ? ' ' : '';
+    return fence + pad + text + pad + fence;
+  }
+
+  function standaloneLexicalSemanticHover(api, model, position, languageId) {
+    if (!standalonePreviewHandlesLanguageFeature(model)) { return null; }
+    var lexical = standaloneLexicalTokenAtPosition(api, model, position, languageId);
+    var semantic = standaloneSemanticHoverTokenAtPosition(model, position);
+    if (lexical && !semantic && /^(?:comment|string)(?:\\.|$)/.test(lexical.type)) { lexical = null; }
+    if (!lexical && !semantic) { return null; }
+    var details = [];
+    if (lexical && lexical.type) {
+      details.push('Lexical ' + standaloneHoverInlineCode(lexical.type));
+      if (lexical.scopes && lexical.scopes.length) {
+        details.push('TextMate ' + lexical.scopes.slice(-3).map(standaloneHoverInlineCode).join(' → '));
+      }
+    }
+    if (semantic && semantic.type) {
+      var semanticText = 'Semantic ' + standaloneHoverInlineCode(semantic.type);
+      if (semantic.modifiers && semantic.modifiers.length) {
+        semanticText += ' (' + semantic.modifiers.map(standaloneHoverInlineCode).join(', ') + ')';
+      }
+      details.push(semanticText);
+    }
+    if (!details.length) { return null; }
+    var word = lexical && lexical.word ? lexical.word : '';
+    if (!word) {
+      var hoverWord = standaloneHoverWordAtPosition(model, position);
+      word = hoverWord && hoverWord.word ? String(hoverWord.word) : '';
+    }
+    var value = word ? standaloneHoverInlineCode(word) + '  \\n' : '';
+    value += details.join(' · ');
+    var preferredRange = semantic && semantic.range ? semantic.range : (lexical && lexical.range);
+    return {
+      contents: [{ value: value, isTrusted: false }],
+      range: standaloneHoverRangeForPosition(api, model, position, preferredRange),
+    };
+  }
+
+  function canonicalStandaloneHoverMarkdown(raw) {
+    var value = typeof raw === 'string' ? raw : (raw && typeof raw.value === 'string' ? raw.value : '');
+    return String(value).replace(/\\r\\n?/g, '\\n').replace(/[ \\t]+$/gm, '').trim();
+  }
+
+  function monacoHoverFromSerialized(api, raw, model, position) {
+    if (!raw) { return null; }
+    var hovers = Array.isArray(raw) ? raw : [raw];
+    var contents = [];
+    var range = null;
+    var seenContents = Object.create(null);
+    for (var i = 0; i < hovers.length; i++) {
+      var hover = hovers[i] || {};
+      var hoverContents = Array.isArray(hover.contents) ? hover.contents : [];
+      for (var j = 0; j < hoverContents.length; j++) {
+        var canonical = canonicalStandaloneHoverMarkdown(hoverContents[j]);
+        if (!canonical || seenContents[canonical]) { continue; }
+        seenContents[canonical] = true;
+        contents.push(monacoMarkdownFromSerialized(api, hoverContents[j]));
+      }
+      if (!range && hover.range) {
+        range = monacoRangeFromSerialized(api, hover.range, state.previewBaseLine || 0);
+      }
+    }
+    if (contents.length === 0) { return null; }
+    // Monaco's hover runtime rejects otherwise-valid results whose range is
+    // undefined. VS Code Hover.range is optional, so use the lexical word (or
+    // the cursor itself) whenever the host provider omitted/misplaced it.
+    var result = {
+      contents: contents,
+      range: standaloneHoverRangeForPosition(api, model, position, range),
+    };
+    return result;
+  }
+
+  function monacoCompletionRange(api, raw, defaultRange) {
+    if (!raw) { return defaultRange; }
+    if (raw.insert || raw.inserting || raw.replace || raw.replacing) {
+      var insert = monacoRangeFromSerialized(api, raw.insert || raw.inserting, state.previewBaseLine || 0);
+      var replace = monacoRangeFromSerialized(api, raw.replace || raw.replacing, state.previewBaseLine || 0);
+      if (insert && replace) { return { insert: insert, replace: replace }; }
+    }
+    return monacoRangeFromSerialized(api, raw, state.previewBaseLine || 0) || defaultRange;
+  }
+
+  function monacoCompletionListFromSerialized(api, raw, model, position) {
+    if (!raw) { return { suggestions: [] }; }
+    var input = Array.isArray(raw) ? raw : (Array.isArray(raw.items) ? raw.items : []);
+    var word = null;
+    try { word = model.getWordUntilPosition(position); } catch (eWord) {}
+    var defaultRange = new api.Range(
+      position.lineNumber,
+      word && typeof word.startColumn === 'number' ? word.startColumn : position.column,
+      position.lineNumber,
+      word && typeof word.endColumn === 'number' ? word.endColumn : position.column
+    );
+    var suggestions = [];
+    for (var i = 0; i < input.length; i++) {
+      var item = input[i] || {};
+      var label = item.label;
+      if (label == null) { continue; }
+      var kind = api.languages.CompletionItemKind.Text;
+      try {
+        if (item.kindName && api.languages.CompletionItemKind[item.kindName] !== undefined) {
+          kind = api.languages.CompletionItemKind[item.kindName];
+        }
+      } catch (eKind) {}
+      var suggestion = {
+        label: label,
+        kind: kind,
+        insertText: typeof item.insertText === 'string'
+          ? item.insertText
+          : (typeof label === 'string' ? label : String(label.label || '')),
+        range: monacoCompletionRange(api, item.range, defaultRange),
+      };
+      if (api.languages.CompletionItemInsertTextRule) {
+        var insertTextRules = 0;
+        if (item.insertTextIsSnippet) {
+          insertTextRules |= api.languages.CompletionItemInsertTextRule.InsertAsSnippet;
+        }
+        if (item.keepWhitespace) {
+          insertTextRules |= api.languages.CompletionItemInsertTextRule.KeepWhitespace;
+        }
+        if (insertTextRules) { suggestion.insertTextRules = insertTextRules; }
+      }
+      if (typeof item.detail === 'string') { suggestion.detail = item.detail; }
+      if (item.documentation !== undefined) {
+        suggestion.documentation = monacoMarkdownFromSerialized(api, item.documentation);
+      }
+      if (typeof item.sortText === 'string') { suggestion.sortText = item.sortText; }
+      if (typeof item.filterText === 'string') { suggestion.filterText = item.filterText; }
+      if (typeof item.preselect === 'boolean') { suggestion.preselect = item.preselect; }
+      if (Array.isArray(item.commitCharacters)) { suggestion.commitCharacters = item.commitCharacters; }
+      if (Array.isArray(item.tags)) { suggestion.tags = item.tags; }
+      if (item.command && item.command.command && state.standaloneCompletionCommandId) {
+        suggestion.command = {
+          id: state.standaloneCompletionCommandId,
+          title: String(item.command.title || item.command.command),
+          arguments: [item.command],
+        };
+      }
+      if (Array.isArray(item.additionalTextEdits)) {
+        var extra = [];
+        for (var ei = 0; ei < item.additionalTextEdits.length; ei++) {
+          var edit = item.additionalTextEdits[ei];
+          var editRange = edit && monacoRangeFromSerialized(api, edit.range, state.previewBaseLine || 0);
+          if (editRange && typeof edit.newText === 'string') { extra.push({ range: editRange, text: edit.newText }); }
+        }
+        if (extra.length) { suggestion.additionalTextEdits = extra; }
+      }
+      suggestions.push(suggestion);
+    }
+    return { suggestions: suggestions, incomplete: !!raw.isIncomplete };
+  }
+
+  function monacoSignatureHelpFromSerialized(api, raw) {
+    if (!raw || !Array.isArray(raw.signatures)) { return null; }
+    return {
+      value: {
+        activeSignature: typeof raw.activeSignature === 'number' ? raw.activeSignature : 0,
+        activeParameter: typeof raw.activeParameter === 'number' ? raw.activeParameter : 0,
+        signatures: raw.signatures.map(function (signature) {
+          var convertedSignature = {
+            label: String(signature && signature.label || ''),
+            documentation: signature && signature.documentation !== undefined
+              ? monacoMarkdownFromSerialized(api, signature.documentation)
+              : undefined,
+            parameters: Array.isArray(signature && signature.parameters)
+              ? signature.parameters.map(function (parameter) {
+                  return {
+                    label: parameter.label,
+                    documentation: parameter.documentation !== undefined
+                      ? monacoMarkdownFromSerialized(api, parameter.documentation)
+                      : undefined,
+                  };
+                })
+              : [],
+          };
+          if (signature && typeof signature.activeParameter === 'number') {
+            convertedSignature.activeParameter = signature.activeParameter;
+          }
+          return convertedSignature;
+        }),
+      },
+      dispose: function () {},
+    };
+  }
+
+  function monacoLocationFromSerialized(api, raw) {
+    if (!raw) { return null; }
+    if (raw.targetUri) {
+      try {
+        var targetRange = monacoRangeFromSerialized(api, raw.targetRange, 0);
+        var targetSelectionRange = monacoRangeFromSerialized(api, raw.targetSelectionRange, 0) || targetRange;
+        if (!targetRange || !targetSelectionRange) { return null; }
+        var link = {
+          uri: api.Uri.parse(String(raw.targetUri)),
+          range: targetRange,
+          targetUri: api.Uri.parse(String(raw.targetUri)),
+          targetRange: targetRange,
+          targetSelectionRange: targetSelectionRange,
+        };
+        if (raw.originSelectionRange) {
+          link.originSelectionRange = monacoRangeFromSerialized(api, raw.originSelectionRange, state.previewBaseLine || 0);
+        }
+        return link;
+      } catch (eLocationLink) { return null; }
+    }
+    if (!raw.uri || !raw.range) { return null; }
+    try {
+      return { uri: api.Uri.parse(String(raw.uri)), range: monacoRangeFromSerialized(api, raw.range, 0) };
+    } catch (eLocation) { return null; }
+  }
+
+  function monacoLocationsFromSerialized(api, raw) {
+    var input = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+    var result = [];
+    for (var i = 0; i < input.length; i++) {
+      var location = monacoLocationFromSerialized(api, input[i]);
+      if (location && location.range) { result.push(location); }
+    }
+    return result;
+  }
+
+  function monacoDocumentHighlightsFromSerialized(api, raw) {
+    var input = Array.isArray(raw) ? raw : [];
+    var result = [];
+    for (var i = 0; i < input.length; i++) {
+      var item = input[i] || {};
+      var range = monacoRangeFromSerialized(api, item.range, state.previewBaseLine || 0);
+      if (!range) { continue; }
+      var kind = api.languages.DocumentHighlightKind.Text;
+      try {
+        if (item.kindName && api.languages.DocumentHighlightKind[item.kindName] !== undefined) {
+          kind = api.languages.DocumentHighlightKind[item.kindName];
+        }
+      } catch (eHighlightKind) {}
+      result.push({ range: range, kind: kind });
+    }
+    return result;
+  }
+
+  function monacoDocumentSymbolFromSerialized(api, raw) {
+    if (!raw) { return null; }
+    var serializedRange = raw.range || (raw.location && raw.location.range);
+    var serializedSelectionRange = raw.selectionRange || serializedRange;
+    if (!serializedRange || !serializedSelectionRange) { return null; }
+    var range = monacoRangeFromSerialized(api, serializedRange, state.previewBaseLine || 0);
+    var selectionRange = monacoRangeFromSerialized(api, serializedSelectionRange, state.previewBaseLine || 0);
+    if (!range || !selectionRange) { return null; }
+    var kind = api.languages.SymbolKind.Variable;
+    try {
+      if (raw.kindName && api.languages.SymbolKind[raw.kindName] !== undefined) {
+        kind = api.languages.SymbolKind[raw.kindName];
+      }
+    } catch (eSymbolKind) {}
+    var symbol = {
+      name: String(raw.name || ''),
+      detail: String(raw.detail || ''),
+      kind: kind,
+      tags: Array.isArray(raw.tags) ? raw.tags : [],
+      range: range,
+      selectionRange: selectionRange,
+    };
+    if (raw.containerName) { symbol.containerName = String(raw.containerName); }
+    if (Array.isArray(raw.children)) {
+      symbol.children = raw.children.map(function (child) {
+        return monacoDocumentSymbolFromSerialized(api, child);
+      }).filter(Boolean);
+    }
+    return symbol;
+  }
+
+  function monacoDocumentSymbolsFromSerialized(api, raw) {
+    return (Array.isArray(raw) ? raw : []).map(function (symbol) {
+      return monacoDocumentSymbolFromSerialized(api, symbol);
+    }).filter(Boolean);
+  }
+
+  function addStandaloneLanguageFeatureDisposable(disposable) {
+    if (disposable && typeof disposable.dispose === 'function') {
+      state.standaloneLanguageFeatureDisposers.push(disposable);
+    }
+    return disposable;
+  }
+
+  function ensureStandaloneLanguageFeatureBridge(api, languageId) {
+    if (!api || !api.languages || !languageId) { return; }
+    if (!state.standaloneLanguageFeatureLanguages.__openers) {
+      state.standaloneLanguageFeatureLanguages.__openers = true;
+      state.standaloneCompletionCommandId = 'ijss.preview.completionCommand.' + __ijFindInstanceId;
+      if (api.editor && typeof api.editor.registerCommand === 'function') {
+        addStandaloneLanguageFeatureDisposable(api.editor.registerCommand(
+          state.standaloneCompletionCommandId,
+          function (_accessor, payload) {
+            if (!payload || !payload.command) { return; }
+            sendPersistent({
+              type: 'runCommand',
+              command: String(payload.command),
+              args: Array.isArray(payload.arguments) ? payload.arguments : [],
+            });
+          }
+        ));
+      }
+      if (api.editor && typeof api.editor.registerEditorOpener === 'function') {
+        addStandaloneLanguageFeatureDisposable(api.editor.registerEditorOpener({
+          openCodeEditor: function (source, resource, selectionOrPosition) {
+            if (source !== state.monacoEditor || !resource) { return false; }
+            var line = 0;
+            var column = 0;
+            try {
+              line = Math.max(0, ((selectionOrPosition && (selectionOrPosition.startLineNumber || selectionOrPosition.lineNumber)) || 1) - 1);
+              column = Math.max(0, ((selectionOrPosition && (selectionOrPosition.startColumn || selectionOrPosition.column)) || 1) - 1);
+            } catch (eOpenPosition) {}
+            sendPersistent({ type: 'pinInSideEditor', uri: String(resource.toString()), line: line, column: column });
+            return true;
+          },
+        }));
+      }
+    }
+    if (state.standaloneLanguageFeatureLanguages[languageId]) { return; }
+    state.standaloneLanguageFeatureLanguages[languageId] = true;
+
+    // Keep lexical classification independent from the host request. Monaco
+    // streams hover-provider promises as they settle, so this synchronous row
+    // appears immediately and the VS Code semantic/documentation hover is
+    // appended when its provider completes.
+    addStandaloneLanguageFeatureDisposable(api.languages.registerHoverProvider(languageId, {
+      provideHover: function (model, position) {
+        return standaloneLexicalSemanticHover(api, model, position, languageId);
+      },
+    }));
+
+    addStandaloneLanguageFeatureDisposable(api.languages.registerHoverProvider(languageId, {
+      provideHover: function (model, position, token) {
+        if (!standalonePreviewHandlesLanguageFeature(model)) { return null; }
+        return requestStandaloneSemanticHover(model, position, token).then(function (raw) {
+          return monacoHoverFromSerialized(api, raw, model, position);
+        });
+      },
+    }));
+
+    addStandaloneLanguageFeatureDisposable(api.languages.registerCompletionItemProvider(languageId, {
+      triggerCharacters: ['.', ':', '>', '/', '@', '#', '<'],
+      provideCompletionItems: function (model, position, context, token) {
+        if (!standalonePreviewHandlesLanguageFeature(model)) { return { suggestions: [] }; }
+        return requestStandaloneLanguageFeature('completion', model, position, {
+          triggerKind: context && context.triggerKind,
+          triggerCharacter: context && context.triggerCharacter,
+          itemResolveCount: 50,
+        }, token).then(function (raw) {
+          return monacoCompletionListFromSerialized(api, raw, model, position);
+        });
+      },
+    }));
+
+    addStandaloneLanguageFeatureDisposable(api.languages.registerSignatureHelpProvider(languageId, {
+      signatureHelpTriggerCharacters: ['(', ','],
+      signatureHelpRetriggerCharacters: [','],
+      provideSignatureHelp: function (model, position, token, context) {
+        if (!standalonePreviewHandlesLanguageFeature(model)) { return null; }
+        return requestStandaloneLanguageFeature('signatureHelp', model, position, {
+          triggerKind: context && context.triggerKind,
+          triggerCharacter: context && context.triggerCharacter,
+          isRetrigger: !!(context && context.isRetrigger),
+        }, token).then(function (raw) {
+          return monacoSignatureHelpFromSerialized(api, raw);
+        });
+      },
+    }));
+
+    var locationFeatures = [
+      ['definition', 'registerDefinitionProvider'],
+      ['declaration', 'registerDeclarationProvider'],
+      ['typeDefinition', 'registerTypeDefinitionProvider'],
+      ['implementation', 'registerImplementationProvider'],
+    ];
+    for (var lfi = 0; lfi < locationFeatures.length; lfi++) {
+      (function (feature, registerName) {
+        if (typeof api.languages[registerName] !== 'function') { return; }
+        addStandaloneLanguageFeatureDisposable(api.languages[registerName](languageId, {
+          provideDefinition: function (model, position, token) {
+            if (!standalonePreviewHandlesLanguageFeature(model)) { return null; }
+            return requestStandaloneLanguageFeature(feature, model, position, {}, token).then(function (raw) {
+              return monacoLocationsFromSerialized(api, raw);
+            });
+          },
+          provideDeclaration: function (model, position, token) {
+            if (!standalonePreviewHandlesLanguageFeature(model)) { return null; }
+            return requestStandaloneLanguageFeature(feature, model, position, {}, token).then(function (raw) {
+              return monacoLocationsFromSerialized(api, raw);
+            });
+          },
+          provideTypeDefinition: function (model, position, token) {
+            if (!standalonePreviewHandlesLanguageFeature(model)) { return null; }
+            return requestStandaloneLanguageFeature(feature, model, position, {}, token).then(function (raw) {
+              return monacoLocationsFromSerialized(api, raw);
+            });
+          },
+          provideImplementation: function (model, position, token) {
+            if (!standalonePreviewHandlesLanguageFeature(model)) { return null; }
+            return requestStandaloneLanguageFeature(feature, model, position, {}, token).then(function (raw) {
+              return monacoLocationsFromSerialized(api, raw);
+            });
+          },
+        }));
+      })(locationFeatures[lfi][0], locationFeatures[lfi][1]);
+    }
+
+    if (typeof api.languages.registerReferenceProvider === 'function') {
+      addStandaloneLanguageFeatureDisposable(api.languages.registerReferenceProvider(languageId, {
+        provideReferences: function (model, position, context, token) {
+          if (!standalonePreviewHandlesLanguageFeature(model)) { return null; }
+          return requestStandaloneLanguageFeature('references', model, position, {
+            includeDeclaration: !context || context.includeDeclaration !== false,
+          }, token).then(function (raw) { return monacoLocationsFromSerialized(api, raw); });
+        },
+      }));
+    }
+
+    if (typeof api.languages.registerDocumentHighlightProvider === 'function') {
+      addStandaloneLanguageFeatureDisposable(api.languages.registerDocumentHighlightProvider(languageId, {
+        provideDocumentHighlights: function (model, position, token) {
+          if (!standalonePreviewHandlesLanguageFeature(model)) { return null; }
+          return requestStandaloneLanguageFeature('documentHighlight', model, position, {}, token).then(function (raw) {
+            return monacoDocumentHighlightsFromSerialized(api, raw);
+          });
+        },
+      }));
+    }
+
+    if (typeof api.languages.registerDocumentSymbolProvider === 'function') {
+      addStandaloneLanguageFeatureDisposable(api.languages.registerDocumentSymbolProvider(languageId, {
+        provideDocumentSymbols: function (model, token) {
+          if (!standalonePreviewHandlesLanguageFeature(model)) { return null; }
+          return requestStandaloneLanguageFeature('documentSymbol', model, null, {}, token).then(function (raw) {
+            return monacoDocumentSymbolsFromSerialized(api, raw);
+          });
+        },
+      }));
+    }
+
+    if (typeof api.languages.registerFoldingRangeProvider === 'function') {
+      addStandaloneLanguageFeatureDisposable(api.languages.registerFoldingRangeProvider(languageId, {
+        provideFoldingRanges: function (model, context, token) {
+          if (!standalonePreviewHandlesLanguageFeature(model)) { return null; }
+          return requestStandaloneLanguageFeature('foldingRange', model, null, {}, token).then(function (raw) {
+            var input = Array.isArray(raw) ? raw : [];
+            return input.map(function (range) {
+              var result = {
+                start: Math.max(1, Number(range.start || 0) - (state.previewBaseLine || 0) + 1),
+                end: Math.max(1, Number(range.end || 0) - (state.previewBaseLine || 0) + 1),
+              };
+              if ((range.kind !== undefined || range.kindName) && api.languages.FoldingRangeKind) {
+                var foldingKind = String(range.kindName || range.kind || '').toLowerCase();
+                if (foldingKind === 'comment') { result.kind = api.languages.FoldingRangeKind.Comment; }
+                else if (foldingKind === 'imports') { result.kind = api.languages.FoldingRangeKind.Imports; }
+                else if (foldingKind === 'region') { result.kind = api.languages.FoldingRangeKind.Region; }
+              }
+              return result;
+            });
+          });
+        },
+      }));
+    }
+  }
+
+  function applyStandalonePreviewDiagnostics(api, model, diagnostics) {
+    if (!api || !api.editor || typeof api.editor.setModelMarkers !== 'function' || !model) { return; }
+    if (state.previewDirty) {
+      state.standaloneDiagnosticMarkerCount = 0;
+      try { api.editor.setModelMarkers(model, 'ijss-vscode-language-service', []); } catch (eDirtyMarkers) {}
+      return;
+    }
+    var input = Array.isArray(diagnostics) ? diagnostics : [];
+    var markers = [];
+    for (var i = 0; i < input.length; i++) {
+      var diagnostic = input[i] || {};
+      var range = diagnostic.range;
+      if (!range || !range.start || !range.end) { continue; }
+      var severity = api.MarkerSeverity.Info;
+      try {
+        if (diagnostic.severityName && api.MarkerSeverity[diagnostic.severityName] !== undefined) {
+          severity = api.MarkerSeverity[diagnostic.severityName];
+        }
+      } catch (eSeverity) {}
+      var marker = {
+        severity: severity,
+        message: String(diagnostic.message || ''),
+        startLineNumber: Math.max(1, diagnostic.range.start.line - (state.previewBaseLine || 0) + 1),
+        startColumn: Math.max(1, diagnostic.range.start.character + 1),
+        endLineNumber: Math.max(1, diagnostic.range.end.line - (state.previewBaseLine || 0) + 1),
+        endColumn: Math.max(1, diagnostic.range.end.character + 1),
+      };
+      if (diagnostic.source) { marker.source = String(diagnostic.source); }
+      if (diagnostic.code !== undefined) {
+        if (diagnostic.code && typeof diagnostic.code === 'object' && diagnostic.code.value !== undefined) {
+          marker.code = { value: String(diagnostic.code.value) };
+          if (diagnostic.code.target) {
+            try { marker.code.target = api.Uri.parse(String(diagnostic.code.target)); } catch (eDiagnosticTarget) {}
+          }
+        } else {
+          marker.code = String(diagnostic.code);
+        }
+      }
+      if (Array.isArray(diagnostic.tags)) { marker.tags = diagnostic.tags; }
+      if (Array.isArray(diagnostic.relatedInformation)) {
+        var related = [];
+        for (var ri = 0; ri < diagnostic.relatedInformation.length; ri++) {
+          var info = diagnostic.relatedInformation[ri] || {};
+          var location = info.location || {};
+          var relatedRange = monacoRangeFromSerialized(api, location.range, 0);
+          if (!location.uri || !relatedRange) { continue; }
+          try {
+            related.push({
+              resource: api.Uri.parse(String(location.uri)),
+              message: String(info.message || ''),
+              startLineNumber: relatedRange.startLineNumber,
+              startColumn: relatedRange.startColumn,
+              endLineNumber: relatedRange.endLineNumber,
+              endColumn: relatedRange.endColumn,
+            });
+          } catch (eRelatedDiagnostic) {}
+        }
+        if (related.length) { marker.relatedInformation = related; }
+      }
+      markers.push(marker);
+    }
+    state.standaloneDiagnosticMarkerCount = markers.length;
+    try { api.editor.setModelMarkers(model, 'ijss-vscode-language-service', markers); } catch (eMarkers) {}
+  }
+
+  function clearStandaloneSemanticHoverSnapshot() {
+    state.standaloneSemanticHoverModel = null;
+    state.standaloneSemanticHoverModelVersion = 0;
+    state.standaloneSemanticHoverByLine = {};
+  }
+
+  function clearStandaloneLexicalHoverCache() {
+    state.standaloneLexicalHoverLineCache = null;
+  }
+
+  function cacheStandaloneSemanticHoverSnapshot(api, model, modelVersion, tokenTypes, tokenModifiers, data) {
+    var byLine = {};
+    var documentLine = 0;
+    var documentStart = 0;
+    var baseLine = state.previewBaseLine || 0;
+    var modelLineCount = 0;
+    try { modelLineCount = model && model.getLineCount ? model.getLineCount() : 0; } catch (eSemanticLineCount) {}
+    for (var i = 0; i + 4 < data.length; i += 5) {
+      var deltaLine = data[i];
+      var deltaStart = data[i + 1];
+      var length = data[i + 2];
+      var tokenTypeIndex = data[i + 3];
+      var modifierBits = data[i + 4] >>> 0;
+      if (deltaLine > 0) {
+        documentLine += deltaLine;
+        documentStart = deltaStart;
+      } else {
+        documentStart += deltaStart;
+      }
+      if (!length || tokenTypeIndex >= tokenTypes.length) { continue; }
+      var modelLine = documentLine - baseLine + 1;
+      if (modelLine < 1 || (modelLineCount && modelLine > modelLineCount)) { continue; }
+      var modifiers = [];
+      for (var mi = 0; mi < tokenModifiers.length && mi < 32; mi++) {
+        if (((modifierBits >>> mi) & 1) === 1) { modifiers.push(tokenModifiers[mi]); }
+      }
+      var startColumn = documentStart + 1;
+      var endColumn = startColumn + length;
+      var maxColumn = 0;
+      try { maxColumn = model.getLineMaxColumn ? model.getLineMaxColumn(modelLine) : 0; } catch (eSemanticMaxColumn) {}
+      if (maxColumn && (startColumn < 1 || startColumn >= maxColumn)) { continue; }
+      if (maxColumn) { endColumn = Math.min(maxColumn, endColumn); }
+      if (endColumn <= startColumn) { continue; }
+      var token = {
+        type: tokenTypes[tokenTypeIndex],
+        modifiers: modifiers,
+        startColumn: startColumn,
+        endColumn: endColumn,
+        range: new api.Range(modelLine, startColumn, modelLine, endColumn),
+      };
+      var key = String(modelLine);
+      if (!byLine[key]) { byLine[key] = []; }
+      byLine[key].push(token);
+    }
+    state.standaloneSemanticHoverModel = model;
+    state.standaloneSemanticHoverModelVersion = modelVersion;
+    state.standaloneSemanticHoverByLine = byLine;
+  }
+
+  function refreshStandaloneSemanticTokens(api, model, languageId) {
+    state.standaloneSemanticTokenCount = 0;
+    clearStandaloneSemanticHoverSnapshot();
+    var modelVersion = 0;
+    try { modelVersion = model && model.getVersionId ? model.getVersionId() : 0; } catch (eSemanticVersion) {}
+    requestStandaloneLanguageFeature('semanticTokens', model, null, {
+      modelVersion: modelVersion,
+      fullFile: state.previewFullFile !== false,
+      dirty: !!state.previewDirty,
+    }, null).then(function (raw) {
+      if (!standalonePreviewHandlesLanguageFeature(model) || state.previewDirty || state.previewFullFile === false) { return; }
+      try {
+        if (model.getVersionId && model.getVersionId() !== modelVersion) { return; }
+      } catch (eSemanticStale) { return; }
+      if (state.standaloneSemanticTokensDisposable) {
+        try { state.standaloneSemanticTokensDisposable.dispose(); } catch (eDisposeSemanticProvider) {}
+        state.standaloneSemanticTokensDisposable = null;
+      }
+      if (!raw || !raw.legend || !Array.isArray(raw.legend.tokenTypes) ||
+          !Array.isArray(raw.legend.tokenModifiers) || !Array.isArray(raw.data) ||
+          raw.data.length === 0 || raw.data.length % 5 !== 0 ||
+          raw.data.length > 1000000) {
+        return;
+      }
+      var tokenTypes = raw.legend.tokenTypes.map(function (value) { return String(value); });
+      var tokenModifiers = raw.legend.tokenModifiers.map(function (value) { return String(value); });
+      var data = new Uint32Array(raw.data.length);
+      for (var i = 0; i < raw.data.length; i++) {
+        var value = raw.data[i];
+        if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 ||
+            value > 4294967295 || Math.floor(value) !== value) {
+          return;
+        }
+        if (i % 5 === 3 && value >= tokenTypes.length) { return; }
+        data[i] = value;
+      }
+      cacheStandaloneSemanticHoverSnapshot(api, model, modelVersion, tokenTypes, tokenModifiers, data);
+      var providerModel = model;
+      var providerVersion = modelVersion;
+      try {
+        state.standaloneSemanticTokensDisposable =
+          api.languages.registerDocumentSemanticTokensProvider(languageId, {
+            getLegend: function () {
+              return { tokenTypes: tokenTypes, tokenModifiers: tokenModifiers };
+            },
+            provideDocumentSemanticTokens: function (candidate) {
+              if (candidate !== providerModel || !standalonePreviewHandlesLanguageFeature(candidate) || state.previewDirty) {
+                return null;
+              }
+              try {
+                if (candidate.getVersionId && candidate.getVersionId() !== providerVersion) { return null; }
+              } catch (eProviderVersion) { return null; }
+              return { data: new Uint32Array(data) };
+            },
+            releaseDocumentSemanticTokens: function () {},
+          });
+        state.standaloneSemanticTokenCount = data.length / 5;
+      } catch (eRegisterSemanticProvider) {
+        state.standaloneSemanticTokensDisposable = null;
+        state.standaloneSemanticTokenCount = 0;
+      }
+    });
+  }
+
+  var PREVIEW_NATIVE_RECOVERY_RETRY_DELAYS_MS = [0, 50, 150, 300, 600, 1200];
+  var PREVIEW_STANDALONE_NATIVE_PROMOTION_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000];
+
+  function cancelNativePreviewRecovery(clearSnapshot) {
+    try {
+      if (state.previewNativeRecoveryTimer) {
+        clearTimeout(state.previewNativeRecoveryTimer);
+      }
+    } catch (eClearNativeRecovery) {}
+    state.previewNativeRecoveryTimer = null;
+    state.previewNativeRecoveryAttempt = 0;
+    state.previewNativeRecoveryKey = '';
+    if (clearSnapshot !== false) {
+      state.previewNativeRecoverySnapshot = null;
+    }
+  }
+
+  function cancelStandaloneNativePromotion() {
+    try {
+      if (state.previewNativePromotionTimer) {
+        clearTimeout(state.previewNativePromotionTimer);
+      }
+    } catch (eClearNativePromotion) {}
+    state.previewNativePromotionTimer = null;
+    state.previewNativePromotionAttempt = 0;
+    state.previewNativePromotionKey = '';
+  }
+
+  function commitNativePreview() {
+    state.previewNativeCommitted = true;
+    state.previewMode = 'monaco';
+    state.previewEngine = 'native';
+    cancelStandaloneNativePromotion();
+    cancelNativePreviewRecovery(true);
+  }
+
+  function captureNativePreviewRecoverySnapshot(editor, msg) {
+    if (!editor || !msg) { return; }
+    var snapshot = {
+      key: previewKeyForMessage(msg),
+      viewState: null,
+      scrollTop: null,
+      scrollLeft: null,
+      position: null,
+      selection: null,
+    };
+    try { snapshot.viewState = editor.saveViewState && editor.saveViewState(); } catch (eSaveNativeRecovery) {}
+    try { snapshot.scrollTop = editor.getScrollTop && editor.getScrollTop(); } catch (eScrollTopNativeRecovery) {}
+    try { snapshot.scrollLeft = editor.getScrollLeft && editor.getScrollLeft(); } catch (eScrollLeftNativeRecovery) {}
+    try { snapshot.position = editor.getPosition && editor.getPosition(); } catch (ePositionNativeRecovery) {}
+    try { snapshot.selection = editor.getSelection && editor.getSelection(); } catch (eSelectionNativeRecovery) {}
+    state.previewNativeRecoverySnapshot = snapshot;
+    // A pointerdown normally does not detach the editor. Avoid retaining a
+    // stale pre-focus viewport forever, while keeping it long enough for the
+    // asynchronous Workbench takeover MutationObserver to run.
+    setTimeout(function () {
+      if (state.previewNativeRecoverySnapshot === snapshot && state.previewMonacoEditor === editor) {
+        state.previewNativeRecoverySnapshot = null;
+      }
+    }, 1500);
+  }
+
+  function restoreNativePreviewRecoverySnapshot(editor, msg, trigger) {
+    if (trigger !== 'heal' && trigger !== 'native-recovery') { return false; }
+    var snapshot = state.previewNativeRecoverySnapshot;
+    if (!snapshot || !msg || snapshot.key !== previewKeyForMessage(msg)) { return false; }
+    var restored = false;
+    if (snapshot.viewState) {
+      try {
+        if (editor.restoreViewState) {
+          editor.restoreViewState(snapshot.viewState);
+          restored = true;
+        }
+      } catch (eRestoreNativeRecovery) {}
+    }
+    function applyExplicitNativeRecoveryViewport() {
+      try {
+        if (snapshot.selection && editor.setSelection) { editor.setSelection(snapshot.selection); }
+        else if (snapshot.position && editor.setPosition) { editor.setPosition(snapshot.position); }
+      } catch (eRestoreNativePosition) {}
+      try {
+        if (typeof snapshot.scrollTop === 'number' && editor.setScrollTop) {
+          editor.setScrollTop(snapshot.scrollTop);
+          restored = true;
+        }
+      } catch (eRestoreNativeScrollTop) {}
+      try {
+        if (typeof snapshot.scrollLeft === 'number' && editor.setScrollLeft) {
+          editor.setScrollLeft(snapshot.scrollLeft);
+        }
+      } catch (eRestoreNativeScrollLeft) {}
+    }
+    // restoreViewState can be accepted before the new widget has completed
+    // its first layout but then be overwritten by that layout. Apply the
+    // explicit viewport now and over the next two paints as well.
+    applyExplicitNativeRecoveryViewport();
+    try {
+      requestAnimationFrame(function () {
+        if (state.previewMonacoEditor !== editor) { return; }
+        applyExplicitNativeRecoveryViewport();
+        requestAnimationFrame(function () {
+          if (state.previewMonacoEditor === editor) { applyExplicitNativeRecoveryViewport(); }
+        });
+      });
+    } catch (eScheduleNativeViewportRestore) {}
+    state.previewNativeRecoverySnapshot = null;
+    return restored || typeof snapshot.scrollTop === 'number';
+  }
+
+  function restoreStandaloneAfterFailedNativePromotion(msg, key, attempt, reason) {
+    if (__ijFindDisposed || state.previewNativeCommitted || !msg) { return false; }
+    var bundled = findBundledMonacoSync();
+    if (!bundled) { return false; }
+    var standaloneHealthy = state.previewEngine === 'standalone' && standaloneMonacoEditorIsHealthy();
+    if (!standaloneHealthy) {
+      try {
+        if (state.previewMonacoEditor || state.previewMonacoHost) {
+          disposePreviewMonacoEditor();
+        }
+      } catch (eDisposeFailedPromotionNative) {}
+      state.previewNativePromotionAttempt = attempt;
+      state.previewNativePromotionKey = key;
+      try {
+        renderPreviewMonaco(bundled.api, msg);
+      } catch (eRestoreBundledPromotion) {
+        send({
+          type: 'log',
+          msg: 'bundled preview restore after native promotion failure threw: ' +
+            String(eRestoreBundledPromotion && eRestoreBundledPromotion.message || eRestoreBundledPromotion).slice(0, 160),
+        });
+        return false;
+      }
+      standaloneHealthy = state.previewEngine === 'standalone' && standaloneMonacoEditorIsHealthy();
+    }
+    if (!standaloneHealthy || !state.monacoEditor) { return false; }
+    // renderPreviewMonaco reveals the search match as part of its normal cold
+    // mount. Put the exact pre-promotion viewport back after that layout.
+    restoreNativePreviewRecoverySnapshot(state.monacoEditor, msg, 'native-recovery');
+    try {
+      if (state.previewNativePromotionTimer) {
+        clearTimeout(state.previewNativePromotionTimer);
+      }
+    } catch (eClearRestoredPromotionTimer) {}
+    state.previewNativePromotionTimer = null;
+    state.previewNativePromotionAttempt = attempt;
+    state.previewNativePromotionKey = key;
+    send({
+      type: 'log',
+      msg: 'bundled preview restored after failed native promotion: ' + String(reason || ''),
+    });
+    scheduleStandaloneNativePromotion(msg, 'promotion-failure-retry');
+    return true;
+  }
+
+  function scheduleStandaloneNativePromotion(msg, reason) {
+    if (__ijFindDisposed || state.previewNativeCommitted || !msg) { return; }
+    var key = previewKeyForMessage(msg);
+    if (!key) { return; }
+    if (state.previewNativePromotionKey && state.previewNativePromotionKey !== key) {
+      cancelStandaloneNativePromotion();
+    }
+    state.previewNativePromotionKey = key;
+    if (state.previewNativePromotionTimer || state.previewDirty) { return; }
+    var attempt = state.previewNativePromotionAttempt || 0;
+    if (attempt >= PREVIEW_STANDALONE_NATIVE_PROMOTION_DELAYS_MS.length) {
+      send({
+        type: 'log',
+        msg: 'bundled preview passive native promotion exhausted: ' + String(reason || ''),
+      });
+      return;
+    }
+    var delay = PREVIEW_STANDALONE_NATIVE_PROMOTION_DELAYS_MS[attempt];
+    state.previewNativePromotionAttempt = attempt + 1;
+    state.previewNativePromotionTimer = setTimeout(function () {
+      state.previewNativePromotionTimer = null;
+      var latest = state.lastPreviewMsg;
+      if (
+        __ijFindDisposed ||
+        state.previewNativeCommitted ||
+        !panel.classList.contains('visible') ||
+        !panel.isConnected ||
+        !latest ||
+        previewKeyForMessage(latest) !== key ||
+        state.previewNativePromotionKey !== key ||
+        state.previewEngine !== 'standalone' ||
+        !state.monacoEditor ||
+        !standaloneMonacoEditorIsHealthy()
+      ) {
+        cancelStandaloneNativePromotion();
+        return;
+      }
+      // The native model is hydrated from the last extension-host snapshot.
+      // Replacing a dirty bundled model here would silently discard local
+      // edits, so save/discard must make it clean before polling resumes.
+      if (state.previewDirty) {
+        cancelStandaloneNativePromotion();
+        return;
+      }
+      if (window.__ijFindDisableMonacoProbes) {
+        cancelStandaloneNativePromotion();
+        return;
+      }
+      var monacoStatus = 'not-ready';
+      var factory = null;
+      try { monacoStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status'; }
+      catch (ePromotionStatus) {}
+      try { factory = getMonacoFactorySingleton(); } catch (ePromotionFactory) {}
+      if (monacoStatus !== 'ready' || !factory || !factory.ctor) {
+        try {
+          if (typeof window.__ijFindCaptureFromDom === 'function') {
+            window.__ijFindCaptureFromDom();
+          }
+        } catch (ePromotionDomCapture) {}
+        try {
+          if (typeof window.__ijFindTestCreateWidget === 'function') {
+            window.__ijFindTestCreateWidget();
+          }
+        } catch (ePromotionWidgetCapture) {}
+        try { monacoStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : monacoStatus; }
+        catch (ePromotionStatusAfterCapture) {}
+        try { factory = getMonacoFactorySingleton(); } catch (ePromotionFactoryAfterCapture) {}
+      }
+      if (monacoStatus === 'ready' && factory && factory.ctor) {
+        var standaloneEditor = state.monacoEditor;
+        var promotionAttempt = state.previewNativePromotionAttempt || 0;
+        try { captureNativePreviewRecoverySnapshot(standaloneEditor, latest); }
+        catch (ePromotionSnapshot) {}
+        try {
+          renderPreviewMonacoReal(latest, 'native-recovery');
+          if (state.previewNativeCommitted && state.previewEngine === 'native') {
+            send({ type: 'log', msg: 'bundled preview passively promoted to native' });
+            return;
+          }
+          if (restoreStandaloneAfterFailedNativePromotion(
+            latest,
+            key,
+            promotionAttempt,
+            'native-render-not-committed'
+          )) {
+            return;
+          }
+        } catch (ePromotionRender) {
+          send({
+            type: 'log',
+            msg: 'bundled preview passive native promotion threw: ' +
+              String(ePromotionRender && ePromotionRender.message || ePromotionRender).slice(0, 160),
+          });
+          if (restoreStandaloneAfterFailedNativePromotion(
+            latest,
+            key,
+            promotionAttempt,
+            'native-render-threw'
+          )) {
+            return;
+          }
+        }
+      }
+      if (!state.previewNativeCommitted && state.previewEngine === 'standalone') {
+        scheduleStandaloneNativePromotion(latest, reason || 'passive-retry');
+      }
+    }, delay);
+  }
+
+  function scheduleNativePreviewRecovery(msg, reason) {
+    if (!state.previewNativeCommitted || !msg) { return; }
+    var key = previewKeyForMessage(msg);
+    if (state.previewNativeRecoveryKey && state.previewNativeRecoveryKey !== key) {
+      try {
+        if (state.previewNativeRecoveryTimer) { clearTimeout(state.previewNativeRecoveryTimer); }
+      } catch (eClearChangedNativeRecovery) {}
+      state.previewNativeRecoveryTimer = null;
+      state.previewNativeRecoveryAttempt = 0;
+    }
+    state.previewNativeRecoveryKey = key;
+    if (state.previewNativeRecoveryTimer) { return; }
+    var attempt = state.previewNativeRecoveryAttempt || 0;
+    if (attempt >= PREVIEW_NATIVE_RECOVERY_RETRY_DELAYS_MS.length) {
+      send({ type: 'log', msg: 'native preview recovery exhausted without bundled downgrade: ' + String(reason || '') });
+      return;
+    }
+    var delay = PREVIEW_NATIVE_RECOVERY_RETRY_DELAYS_MS[attempt];
+    state.previewNativeRecoveryAttempt = attempt + 1;
+    state.previewNativeRecoveryTimer = setTimeout(function () {
+      state.previewNativeRecoveryTimer = null;
+      if (!state.previewNativeCommitted || !panel.classList.contains('visible') || !panel.isConnected) { return; }
+      var latest = state.lastPreviewMsg;
+      if (!latest || previewKeyForMessage(latest) !== key || previewMessageIsStale(latest)) { return; }
+      try {
+        var factory = getMonacoFactorySingleton();
+        if (!factory || !factory.ctor) {
+          try { if (typeof window.__ijFindCaptureFromDom === 'function') { window.__ijFindCaptureFromDom(); } } catch (eNativeDomCapture) {}
+          try { if (typeof window.__ijFindTestCreateWidget === 'function') { window.__ijFindTestCreateWidget(); } } catch (eNativePromote) {}
+        }
+        renderPreviewMonacoReal(latest, 'native-recovery');
+        if (!state.previewMonacoEditor) {
+          scheduleNativePreviewRecovery(latest, reason || 'retry-no-editor');
+        }
+      } catch (eNativeRecovery) {
+        send({ type: 'log', msg: 'native preview recovery retry threw: ' + (eNativeRecovery && eNativeRecovery.message) });
+        scheduleNativePreviewRecovery(latest, reason || 'retry-threw');
+      }
+    }, delay);
+  }
+
+  function renderPreviewMonacoStatus(msg, message, isError) {
+    try {
+      if (state.previewNativeCommitted) {
+        send({ type: 'log', msg: 'blocked native preview downgrade to status: ' + String(message || '') });
+        scheduleNativePreviewRecovery(msg || state.lastPreviewMsg, 'status-fallback-blocked');
+        return;
+      }
+      ensureFullPanelStructure('preview-monaco-status');
+      if (state.stolenEditor) { restoreStolenEditor(); }
+      if (state.previewMonacoEditor) { disposePreviewMonacoEditor(); }
+      if (state.monacoEditor) { disposeStandalonePreviewMonacoEditor(); }
+      state.previewMode = isError ? 'monaco-error' : 'monaco-loading';
+      state.previewEngine = '';
+      state.standaloneMonacoLoadingUri = String(msg && msg.uri || state.previewUri || '');
+      $previewBody.classList.remove('ij-find-editor-mounted');
+      clearChildren($previewBody);
+      var children = [];
+      if (!isError) {
+        children.push(el('span', { className: 'ij-find-spinner', attrs: { 'aria-hidden': 'true' } }));
+      }
+      children.push(el('span', {
+        text: message || (isError ? 'Monaco preview is unavailable.' : 'Loading Monaco preview…'),
+      }));
+      $previewBody.appendChild(el('div', {
+        className: 'ij-find-preview-monaco-status' + (isError ? ' error' : ''),
+        attrs: { role: isError ? 'alert' : 'status', 'aria-live': 'polite' },
+        children: children,
+      }));
+      syncPreviewSaveButton();
+    } catch (eStatus) {
+      send({ type: 'log', msg: 'Monaco preview status render threw: ' + (eStatus && eStatus.message) });
+    }
+  }
+
+  function renderStandaloneMonacoWhenReady(reason) {
+    try {
+      if (state.previewNativeCommitted) {
+        return 'skip:native-committed';
+      }
+      var bundled = findBundledMonacoSync();
+      if (!bundled) { return 'skip:no-bundled-monaco'; }
+      monacoState.tried = true;
+      monacoState.api = bundled.api;
+      monacoState.source = bundled.source;
+      state.standaloneMonacoRequestAt = 0;
+      var msg = state.lastPreviewMsg;
+      if (!msg) { return 'ready:no-preview'; }
+      if (!panel.classList.contains('visible') || !panel.isConnected) { return 'ready:hidden'; }
+      if (previewMessageIsStale(msg)) { return 'skip:stale-preview'; }
+      if (state.standaloneMonacoLoadingUri && state.previewUri !== state.standaloneMonacoLoadingUri) {
+        return 'skip:uri-changed';
+      }
+      if (state.previewMode === 'monaco' && state.previewMonacoEditor) {
+        return 'ready:already-monaco';
+      }
+      if (state.previewMode === 'monaco' && standaloneMonacoEditorIsHealthy()) {
+        return 'ready:already-monaco';
+      }
+      if (state.monacoEditor || state.monacoHost) {
+        try { disposeStandalonePreviewMonacoEditor(); } catch (eDisposeUnhealthyStandalone) {}
+      }
+      renderPreviewMonaco(bundled.api, msg);
+      if (!standaloneMonacoEditorIsHealthy()) {
+        throw new Error('standalone Monaco did not mount a visible model');
+      }
+      send({ type: 'log', msg: 'bundled Monaco preview ready: ' + String(reason || '') });
+      return 'rendered';
+    } catch (eReady) {
+      renderPreviewMonacoStatus(state.lastPreviewMsg, 'Monaco preview could not be created.', true);
+      return 'err:' + String(eReady && eReady.message || eReady).slice(0, 160);
+    }
+  }
+
+  function renderStandaloneMonacoFailure(message) {
+    var msg = state.lastPreviewMsg;
+    if (state.previewNativeCommitted) { return 'skip:native-committed'; }
+    if (!panel.classList.contains('visible') || !panel.isConnected) { return 'skip:hidden'; }
+    if (findBundledMonacoSync() || (state.previewMode === 'monaco' && (state.previewMonacoEditor || state.monacoEditor))) {
+      return 'skip:already-ready';
+    }
+    if (!msg || (state.previewMode !== 'monaco-loading' && state.previewMode !== 'monaco-error')) {
+      return 'skip:no-loading-preview';
+    }
+    if (state.standaloneMonacoLoadingUri && state.previewUri !== state.standaloneMonacoLoadingUri) {
+      return 'skip:uri-changed';
+    }
+    renderPreviewMonacoStatus(msg, 'Monaco preview unavailable: ' + String(message || 'bundle load failed').slice(0, 180), true);
+    return 'rendered-error';
+  }
+
+  // A renderer can host more than one detached search panel. Broadcast bundle
+  // readiness through the instance registry so the most recently installed
+  // closure cannot strand another panel in its loading state.
+  window.__ijFindStandaloneMonacoReady = function (reason) {
+    var reports = [];
+    var registry = searchInstanceRegistry();
+    for (var id in registry) {
+      if (!Object.prototype.hasOwnProperty.call(registry, id)) { continue; }
+      var inst = registry[id];
+      if (!inst || typeof inst.onStandaloneMonacoReady !== 'function') { continue; }
+      try { reports.push(id + ':' + inst.onStandaloneMonacoReady(reason)); }
+      catch (eInstanceReady) { reports.push(id + ':err'); }
+    }
+    return reports.join('|') || 'ready:no-instances';
+  };
+  window.__ijFindStandaloneMonacoFailed = function (message) {
+    var reports = [];
+    var registry = searchInstanceRegistry();
+    for (var id in registry) {
+      if (!Object.prototype.hasOwnProperty.call(registry, id)) { continue; }
+      var inst = registry[id];
+      if (!inst || typeof inst.onStandaloneMonacoFailed !== 'function') { continue; }
+      try { reports.push(id + ':' + inst.onStandaloneMonacoFailed(message)); }
+      catch (eInstanceFailed) { reports.push(id + ':err'); }
+    }
+    return reports.join('|') || 'failed:no-instances';
+  };
 
   function renderPreview(msg) {
     if (previewMessageIsStale(msg)) {
@@ -5993,6 +7720,9 @@ export function getRendererPatchScript(
       return;
     }
     var incomingPreviewKey = previewKeyForMessage(msg);
+    if (state.previewNativePromotionKey && state.previewNativePromotionKey !== incomingPreviewKey) {
+      cancelStandaloneNativePromotion();
+    }
     if (state.previewDirty) {
       var currentPreviewKey = state.previewRenderedKey || state.lastPreviewKey;
       if (incomingPreviewKey && incomingPreviewKey !== currentPreviewKey) {
@@ -6019,10 +7749,6 @@ export function getRendererPatchScript(
     if (msg && typeof msg.previewSeq === 'number' && msg.previewSeq > state.activePreviewSeq) {
       state.activePreviewSeq = msg.previewSeq;
     }
-    if (state.previewRecoveryTimer) {
-      clearTimeout(state.previewRecoveryTimer);
-      state.previewRecoveryTimer = null;
-    }
     state.lastPreviewMsg = msg;
     $previewPath.textContent = msg.relPath || msg.uri;
     state.previewUri = msg.uri;
@@ -6034,6 +7760,23 @@ export function getRendererPatchScript(
     state.previewRenderedKey = previewKeyForMessage(msg);
     setPreviewCleanSnapshot(msg.uri, previewMessageText(msg));
     syncPreviewSaveButton();
+    // Engine choice is intentionally asymmetric. Passive native capture may
+    // upgrade a preview that started on bundled Monaco, but after native has
+    // painted successfully it owns this renderer for the rest of its life.
+    // Do not re-run engine selection from a transient capture-status result:
+    // that was the native -> bundled -> native churn seen during hover.
+    if (state.previewNativeCommitted) {
+      try {
+        var committedTrigger = state.previewNativeRecoverySnapshot && !state.previewMonacoEditor
+          ? 'native-recovery'
+          : 'native-committed-message';
+        renderPreviewMonacoReal(msg, committedTrigger);
+      } catch (eNativeCommittedRender) {
+        send({ type: 'log', msg: 'committed native preview render threw without downgrade: ' + (eNativeCommittedRender && eNativeCommittedRender.message) });
+        scheduleNativePreviewRecovery(msg, 'committed-message-threw');
+      }
+      return;
+    }
     var m = window.__ijFindDisableMonacoProbes ? null : getMonacoFactorySingleton();
     var monacoStatus = 'disabled';
     if (!window.__ijFindDisableMonacoProbes) {
@@ -6042,7 +7785,7 @@ export function getRendererPatchScript(
       try { m = getMonacoFactorySingleton(); } catch (eRefreshMonaco) {}
       // Cold-path warmup: when capture isn't ready yet but the workbench
       // already has a real Monaco editor mounted, try a synchronous DOM scan
-      // + TEST widget promotion before falling back to renderPreviewDOM.
+      // + TEST widget promotion before requesting the bundled Monaco editor.
       // Without this, the first preview after a cold extension start spends
       // ~700-1500ms in DOM mode while the extension's capture diagnostic
       // schedules force-open; that wasted hop is exactly the pattern that
@@ -6065,9 +7808,20 @@ export function getRendererPatchScript(
       try { renderPreviewMonacoReal(msg, 'message'); return; }
       catch (e) { send({ type: 'log', msg: 'renderPreviewMonacoReal threw: ' + (e && e.message) }); }
     }
-    send({ type: 'log', msg: 'renderPreview: DOM fallback' });
-    renderPreviewDOM(msg);
-    scheduleDomPreviewRecovery(msg);
+    var standalone = findMonacoSync();
+    if (standalone) {
+      try {
+        renderPreviewMonaco(standalone.api, msg);
+        return;
+      } catch (eStandalone) {
+        send({ type: 'log', msg: 'renderPreviewMonaco threw: ' + (eStandalone && eStandalone.message) });
+      }
+    }
+    // A code-shaped DOM approximation is intentionally not used here. Keep
+    // the overlay responsive, show a short loading state, and ask the extension
+    // host to inject the bundled Monaco implementation into this renderer.
+    renderPreviewMonacoStatus(msg, 'Loading Monaco preview…', false);
+    requestStandaloneMonacoForPreview(msg);
   }
 
   // B-path warmup retry scheduling. Stores a single in-flight timer +
@@ -6203,7 +7957,7 @@ export function getRendererPatchScript(
   // are best-effort — Monaco internals shift across versions.
   function gatherEmbedEditorIntellisenseSnapshot(editor) {
     var out = {
-      enablePreviewLanguageFeatures: !!__ijFindEnablePreviewLanguageFeatures,
+      enablePreviewLanguageFeatures: !!window.__ijFindEnablePreviewLanguageFeatures,
       hasEditor: !!editor,
       isSimpleWidget: null,
       modelScheme: '',
@@ -6291,8 +8045,12 @@ export function getRendererPatchScript(
 
   function renderPreviewMonacoReal(msg, trigger) {
     var renderT0 = perfNow();
+    var nativeCommittedAtEntry = !!state.previewNativeCommitted;
     if (state.stolenEditor) { restoreStolenEditor(); }
-    var fullText = (msg.lines || []).map(function (l) { return l.text; }).join('\\n');
+    // Upgrade from the extension-owned standalone editor to the captured
+    // VS Code editor only after disposing the former editor and its model.
+    if (state.monacoEditor) { disposeStandalonePreviewMonacoEditor(); }
+    var fullText = (msg.lines || []).map(function (l) { return l.text; }).join(previewMessageEol(msg));
     var lang = msg.languageId || 'plaintext';
     var renderSig = previewRenderSignatureFor(msg, fullText);
     var canReuse = !!(state.previewMonacoEditor && state.previewMonacoHost && state.previewMonacoHost.parentElement === $previewBody);
@@ -6383,7 +8141,7 @@ export function getRendererPatchScript(
         var inlayT0 = perfNow();
         renderPreviewMonacoCallGraphInlays(state.previewMonacoEditor, msg);
         var inlayMs = Math.round(perfNow() - inlayT0);
-        state.previewMode = 'monaco';
+        commitNativePreview();
         syncPreviewSaveButton();
         state.lastRenderedPreviewUri = msg.uri;
         state.lastRenderedPreviewFocusLine = msgFocusLine;
@@ -6425,6 +8183,9 @@ export function getRendererPatchScript(
     var hadPriorEditor = !!state.previewMonacoEditor;
     var priorEditorDisposed = false;
     if (hadPriorEditor) {
+      if (nativeCommittedAtEntry && !state.previewNativeRecoverySnapshot) {
+        captureNativePreviewRecoverySnapshot(state.previewMonacoEditor, msg);
+      }
       try {
         disposePreviewMonacoEditor();
         priorEditorDisposed = true;
@@ -6457,17 +8218,60 @@ export function getRendererPatchScript(
         totalMs: Math.round(perfNow() - renderT0),
         createMs: createMs,
       });
-      renderPreviewDOM(msg);
-      scheduleDomPreviewRecovery(msg);
+      if (nativeCommittedAtEntry || state.previewNativeCommitted) {
+        state.previewMode = 'monaco';
+        state.previewEngine = 'native';
+        send({ type: 'log', msg: 'blocked bundled Monaco fallback after committed native create failure' });
+        scheduleNativePreviewRecovery(msg, 'native-create-failed');
+        return;
+      }
+      var bundled = findBundledMonacoSync();
+      if (bundled) {
+        try {
+          renderPreviewMonaco(bundled.api, msg);
+          return;
+        } catch (eBundledFallback) {
+          send({ type: 'log', msg: 'bundled Monaco fallback after native create failure threw: ' + (eBundledFallback && eBundledFallback.message) });
+        }
+      }
+      renderPreviewMonacoStatus(msg, 'Loading Monaco preview…', false);
+      requestStandaloneMonacoForPreview(msg);
       return;
     }
     state.previewMonacoEditor = editor;
     state.previewMonacoHost = host;
     state.previewMode = 'monaco';
+    state.previewEngine = 'native';
     var setNewT0 = perfNow();
     var setOk = setPreviewContent(editor, fullText, lang, msg.uri, state.previewFullFile);
     var setNewMs = Math.round(perfNow() - setNewT0);
     send({ type: 'log', msg: 'monacoReal setPreviewContent=' + setOk });
+    if (!setOk) {
+      try { disposePreviewMonacoEditor(); } catch (eDisposeContentlessNative) {}
+      if (nativeCommittedAtEntry || state.previewNativeCommitted) {
+        state.previewMode = 'monaco';
+        state.previewEngine = 'native';
+        send({ type: 'log', msg: 'blocked bundled Monaco fallback after committed native content failure' });
+        scheduleNativePreviewRecovery(msg, 'native-content-failed');
+        return;
+      }
+      var bundledAfterContentFailure = findBundledMonacoSync();
+      if (bundledAfterContentFailure) {
+        try {
+          renderPreviewMonaco(bundledAfterContentFailure.api, msg);
+          return;
+        } catch (eBundledContentFallback) {
+          send({
+            type: 'log',
+            msg: 'bundled Monaco fallback after native content failure threw: ' +
+              String(eBundledContentFallback && eBundledContentFallback.message || eBundledContentFallback).slice(0, 160),
+          });
+        }
+      }
+      renderPreviewMonacoStatus(msg, 'Loading Monaco preview…', false);
+      requestStandaloneMonacoForPreview(msg);
+      return;
+    }
     wirePreviewMonacoEditor(editor);
     var layoutNewT0 = perfNow();
     try {
@@ -6481,13 +8285,17 @@ export function getRendererPatchScript(
     var decoNewT0 = perfNow();
     applyPreviewMatchDecorations(editor, msg);
     var decoNewMs = Math.round(perfNow() - decoNewT0);
-    try { revealMatchImmediate(editor, msg); } catch (e) {}
-    placeCursorAtMatch(editor, msg);
+    var restoredNativeRecoveryView = restoreNativePreviewRecoverySnapshot(editor, msg, trigger);
+    if (!restoredNativeRecoveryView) {
+      try { revealMatchImmediate(editor, msg); } catch (e) {}
+      placeCursorAtMatch(editor, msg);
+    }
     var inlayNewT0 = perfNow();
     renderPreviewMonacoCallGraphInlays(editor, msg);
     var inlayNewMs = Math.round(perfNow() - inlayNewT0);
     state.lastRenderedPreviewUri = msg.uri;
     state.lastRenderedPreviewFocusLine = msgFocusLine;
+    commitNativePreview();
     scheduleSettledPreviewHydrate();
     state.lastFullyRenderedSig = renderSig;
     var postCreateMonacoHovers = 0;
@@ -6520,7 +8328,7 @@ export function getRendererPatchScript(
     } catch (e) {}
   }
 
-  function savePreviewMonacoModel() {
+  function savePreviewMonacoModel(continuation) {
     try {
       if (state.previewFullFile === false) {
         send({ type: 'log', msg: 'preview save skipped: partial preview' });
@@ -6540,12 +8348,147 @@ export function getRendererPatchScript(
         return;
       }
       var content = model.getValue ? model.getValue() : '';
-      send({ type: 'log', msg: 'preview save requested uri=' + state.previewUri + ' bytes=' + content.length });
-      send({ type: 'saveFile', uri: state.previewUri, content: content });
-      setPreviewCleanSnapshot(state.previewUri, content);
+      var requestId = ++state.previewSaveRequestId;
+      var expectedContent = state.previewCleanUri === state.previewUri
+        ? state.previewCleanContent
+        : null;
+      var latestPendingId = -1;
+      var existingPending = state.previewSavePending || {};
+      for (var pendingId in existingPending) {
+        if (!Object.prototype.hasOwnProperty.call(existingPending, pendingId)) { continue; }
+        var pendingCandidate = existingPending[pendingId];
+        var numericPendingId = Number(pendingId);
+        if (pendingCandidate && pendingCandidate.uri === state.previewUri &&
+            typeof pendingCandidate.content === 'string' && numericPendingId > latestPendingId) {
+          latestPendingId = numericPendingId;
+          expectedContent = pendingCandidate.content;
+        }
+      }
+      var payload = {
+        type: 'saveFile',
+        uri: state.previewUri,
+        content: content,
+        requestId: requestId,
+        expectedContentHash: expectedContent === null ? undefined : previewContentHash(expectedContent),
+      };
+      var payloadBytes = 0;
+      try {
+        var payloadJson = JSON.stringify(payload);
+        payloadBytes = typeof TextEncoder === 'function'
+          ? new TextEncoder().encode(payloadJson).length
+          : payloadJson.length * 3;
+      } catch (ePayloadBytes) {
+        payloadBytes = content.length * 3;
+      }
+      var pending = {
+        uri: state.previewUri,
+        content: content,
+        model: model,
+        standalone: ed === state.monacoEditor,
+        continuation: typeof continuation === 'function' ? continuation : null,
+        timer: null,
+      };
+      pending.timer = setTimeout(function () {
+        if (state.previewSavePending[requestId] !== pending) { return; }
+        delete state.previewSavePending[requestId];
+        send({ type: 'log', msg: 'preview save acknowledgement timed out uri=' + pending.uri });
+        syncPreviewSaveButton();
+      }, 30000);
+      state.previewSavePending[requestId] = pending;
+      send({ type: 'log', msg: 'preview save requested uri=' + state.previewUri + ' bytes=' + payloadBytes });
+      // The local bridge caps request bodies at 20 MiB. Leave headroom for
+      // renderer metadata and JSON escaping; an oversized save remains dirty
+      // and gets an explicit host-side error/acknowledgement.
+      if (payloadBytes > 18 * 1024 * 1024) {
+        send({
+          type: 'saveFileTooLarge',
+          uri: state.previewUri,
+          requestId: requestId,
+          bytes: payloadBytes,
+        });
+      } else {
+        send(payload);
+      }
     } catch (eSavePreview) {
       send({ type: 'log', msg: 'preview save threw: ' + (eSavePreview && eSavePreview.message) });
     }
+  }
+
+  function resolvePreviewSaveResult(msg) {
+    var requestId = msg && typeof msg.requestId === 'number' ? msg.requestId : -1;
+    var pending = state.previewSavePending && state.previewSavePending[requestId];
+    if (!pending) { return; }
+    delete state.previewSavePending[requestId];
+    if (pending.timer) {
+      try { clearTimeout(pending.timer); } catch (eClearSaveTimer) {}
+    }
+    var savedContent = typeof msg.savedContent === 'string' ? msg.savedContent : pending.content;
+    if (!msg.ok || msg.uri !== pending.uri ||
+        (typeof msg.documentHash === 'string' && msg.documentHash !== previewContentHash(savedContent))) {
+      send({
+        type: 'log',
+        msg: 'preview save failed uri=' + pending.uri + ' error=' + String(msg.error || 'unknown error'),
+      });
+      syncPreviewSaveButton();
+      return;
+    }
+    if (pending.standalone) {
+      try {
+        var sharedValue = pending.model && pending.model.getValue ? pending.model.getValue() : null;
+        if (sharedValue === pending.content && savedContent !== pending.content && pending.model.setValue) {
+          state.previewSuppressDirty = true;
+          try { pending.model.setValue(savedContent); }
+          finally { state.previewSuppressDirty = false; }
+        }
+      } catch (eAdoptFormattedStandaloneSave) {
+        state.previewSuppressDirty = false;
+      }
+      markStandalonePreviewModelClean(pending.model, savedContent);
+      syncStandaloneSharedModelCleanState(pending.model, savedContent);
+    } else {
+      try {
+        var editor = getPreviewSaveEditor();
+        var current = editor && editor.getModel && editor.getModel();
+        if (current === pending.model && state.previewUri === pending.uri) {
+          if (current.getValue && current.getValue() === pending.content &&
+              savedContent !== pending.content && current.setValue) {
+            state.previewSuppressDirty = true;
+            try { current.setValue(savedContent); }
+            finally { state.previewSuppressDirty = false; }
+          }
+          state.previewCleanUri = pending.uri;
+          state.previewCleanContent = savedContent;
+          state.previewSuppressDirty = false;
+          updatePreviewDirtyFromModel(current);
+        }
+      } catch (eResolveNativeSave) {}
+    }
+    if (typeof pending.continuation === 'function') {
+      try {
+        var activeEditor = getPreviewSaveEditor();
+        var activeModel = activeEditor && activeEditor.getModel && activeEditor.getModel();
+        if (activeModel === pending.model && state.previewUri === pending.uri && !state.previewDirty) {
+          pending.continuation();
+        }
+      } catch (eContinueAfterSave) {
+        send({ type: 'log', msg: 'preview save continuation failed: ' + (eContinueAfterSave && eContinueAfterSave.message) });
+      }
+    }
+    try {
+      var refreshedEditor = getPreviewSaveEditor();
+      var refreshedModel = refreshedEditor && refreshedEditor.getModel && refreshedEditor.getModel();
+      if (pending.standalone && refreshedModel === pending.model && state.previewUri === pending.uri && !state.previewDirty) {
+        var refreshedBundled = findBundledMonacoSync();
+        if (refreshedBundled) {
+          applyStandalonePreviewDiagnostics(refreshedBundled.api, refreshedModel, msg.diagnostics);
+          refreshStandaloneSemanticTokens(
+            refreshedBundled.api,
+            refreshedModel,
+            refreshedModel.getLanguageId ? refreshedModel.getLanguageId() : (state.previewLanguageId || 'plaintext')
+          );
+        }
+      }
+    } catch (eRefreshAfterSave) {}
   }
 
   function registerPreviewSaveKeybinding(editor) {
@@ -6559,7 +8502,7 @@ export function getRendererPatchScript(
     state.previewMonacoKeydownListener = null;
     try {
       if (typeof editor.addCommand === 'function') {
-        editor.addCommand(2048 | 49, savePreviewMonacoModel);
+        editor.addCommand(2048 | 49, function () { savePreviewMonacoModel(); });
         send({ type: 'log', msg: 'preview save command registered' });
       }
     } catch (eAddCommand) {
@@ -6636,6 +8579,14 @@ export function getRendererPatchScript(
           }
           state.previewMonacoHealPending = false;
           return;
+        }
+        // A native self-heal is still a native render. Preserve the complete
+        // Monaco view state before forgetting the detached widget so the
+        // replacement keeps scroll, cursor, and selection instead of revealing
+        // the search match again.
+        var stableRecoverySnapshot = state.previewNativeRecoverySnapshot;
+        if (!stableRecoverySnapshot || stableRecoverySnapshot.key !== previewKeyForMessage(lastMsg)) {
+          captureNativePreviewRecoverySnapshot(editor, lastMsg);
         }
         // Forget the broken editor instance so renderPreviewMonacoReal
         // recreates a fresh widget instead of trying to reuse the orphaned
@@ -6878,21 +8829,13 @@ export function getRendererPatchScript(
     wirePreviewIntellisenseProbes(editor);
   }
 
-  // Live signal for #47: when the user lingers >= 350ms over a token
-  // in the preview, do TWO things:
-  //   1. Emit a hover-linger trace with the embed editor's diagnostic
-  //      snapshot so the next captain log shows the editor state.
-  //   2. Ask the extension host (via requestIntellisenseProbe) to run
-  //      vscode.executeHoverProvider + executeCompletionItemProvider
-  //      against the SAME position — giving us automatic ground-truth
-  //      without the human needing to invoke a command. Output appears
-  //      as "[diag-auto] preview-intellisense ..." in the log.
-  //
-  // Renderer-side dedupe per (uri, line, col, 3s) so a single position
-  // doesn't generate dozens of probes when multiple listeners fire.
-  var __ijFindIntellisenseProbeRecent = Object.create(null);
+  // Optional hover-linger diagnostics. This only records renderer state when
+  // explicit performance diagnostics are enabled. It must never invoke hover
+  // or completion providers: Monaco already does that for the real gesture,
+  // and the old auto-probe duplicated language-server analysis on every hover.
   function wirePreviewIntellisenseProbes(editor) {
     try {
+      if (!__ijFindEnablePerfDiagnostics) { return; }
       if (!editor || typeof editor.onMouseMove !== 'function') { return; }
       // wirePreviewMonacoEditor runs on every render (both create and
       // reuse paths). Without this guard each render adds another
@@ -6930,10 +8873,6 @@ export function getRendererPatchScript(
                 }
               }
             } catch (eHoverDom) {}
-            // Convert Monaco's 1-based lineNumber/column to extension
-            // host's 0-based line/character.
-            var line0 = Math.max(0, (pos.lineNumber || 1) - 1);
-            var col0 = Math.max(0, (pos.column || 1) - 1);
             trace('preview/intellisense/hover-linger', {
               line: pos.lineNumber,
               column: pos.column,
@@ -6941,25 +8880,6 @@ export function getRendererPatchScript(
               hoverWidgetClasses: widgetClasses,
               snapshot: snapshot,
             });
-            // Auto ground-truth probe (host-side dedupe handles bursts).
-            try {
-              var uriStr = snapshot && snapshot.modelScheme === 'file' && state.previewUri ? state.previewUri : '';
-              if (uriStr) {
-                var probeKey = uriStr + '|' + line0 + '|' + col0;
-                var nowTs = Date.now();
-                var prev = __ijFindIntellisenseProbeRecent[probeKey] || 0;
-                if (nowTs - prev > 3000) {
-                  __ijFindIntellisenseProbeRecent[probeKey] = nowTs;
-                  send({
-                    type: 'requestIntellisenseProbe',
-                    uri: uriStr,
-                    line: line0,
-                    column: col0,
-                    source: 'hover-linger',
-                  });
-                }
-              }
-            } catch (eProbeReq) {}
           } catch (eFire) {}
         }, 350);
       });
@@ -7019,10 +8939,10 @@ export function getRendererPatchScript(
         inlays.push(byLine[lineKey][li]);
       }
     }
-    send({ type: 'log', msg: 'preview monaco inlays render start uri=' + (msg && msg.uri || state.previewUri || '') + ' previewSeq=' + (msg && typeof msg.previewSeq === 'number' ? msg.previewSeq : 'none') + ' count=' + inlays.length + ' hasEditor=' + (!!editor) + ' hasHost=' + (!!state.previewMonacoHost) });
-    if (!editor || inlays.length === 0 || !state.previewMonacoHost) { return; }
-    var host = state.previewMonacoHost;
-    if (!host.parentElement) { return; }
+    var host = state.previewMonacoHost || state.monacoEditorHost || state.monacoHost;
+    send({ type: 'log', msg: 'preview monaco inlays render start uri=' + (msg && msg.uri || state.previewUri || '') + ' previewSeq=' + (msg && typeof msg.previewSeq === 'number' ? msg.previewSeq : 'none') + ' count=' + inlays.length + ' hasEditor=' + (!!editor) + ' hasHost=' + (!!host) });
+    if (!editor || inlays.length === 0 || !host) { return; }
+    if (!host.isConnected) { return; }
     try {
       var hostPosition = window.getComputedStyle ? window.getComputedStyle(host).position : '';
       if (!hostPosition || hostPosition === 'static') { host.style.position = 'relative'; }
@@ -7094,6 +9014,15 @@ export function getRendererPatchScript(
         });
         node.style.top = Math.round(top + Math.max(0, (height - 18) / 2)) + 'px';
         node.style.left = Math.round(left) + 'px';
+        // Events crossing a ShadowRoot are retargeted to its outer host before
+        // they reach $previewBody. Handle our metadata inlay at the node so the
+        // direct-symbol command remains synchronous and sees the real target.
+        try {
+          node.addEventListener('pointerdown', activateDomPreviewCallGraphInlay, true);
+          node.addEventListener('mousedown', activateDomPreviewCallGraphInlay, true);
+          node.addEventListener('click', activateDomPreviewCallGraphInlay, true);
+          node.addEventListener('keydown', activateDomPreviewCallGraphInlay, true);
+        } catch (eInlayListener) {}
         layer.appendChild(node);
         rendered++;
       }
@@ -7168,8 +9097,9 @@ export function getRendererPatchScript(
   // Every sub-range belonging to the SAME source match gets the same
   // currentFindMatch class so a multi-line match looks uniformly
   // highlighted top-to-bottom, not "first line strong + rest faint".
-  function applyPreviewMatchDecorations(editor, msg) {
+  function applyPreviewMatchDecorations(editor, msg, decorationStateKey) {
     try {
+      var stateKey = decorationStateKey || 'previewMonacoMatchDecos';
       var model = editor.getModel && editor.getModel();
       var maxColFor = function (ln) {
         try { return model ? model.getLineMaxColumn(ln) : 1073741823; }
@@ -7234,16 +9164,19 @@ export function getRendererPatchScript(
           decos.push({ range: sub[si], options: opts });
         }
       });
-      if (state.previewMonacoMatchDecos) {
-        state.previewMonacoMatchDecos = editor.deltaDecorations(state.previewMonacoMatchDecos, []);
+      if (state[stateKey]) {
+        state[stateKey] = editor.deltaDecorations(state[stateKey], []);
       }
       if (decos.length > 0) {
-        state.previewMonacoMatchDecos = editor.deltaDecorations([], decos);
+        state[stateKey] = editor.deltaDecorations([], decos);
       }
     } catch (e) { send({ type: 'log', msg: 'monacoReal decorate threw: ' + (e && e.message) }); }
   }
 
   function disposePreviewMonacoEditor() {
+    if (state.monacoEditor) {
+      try { disposeStandalonePreviewMonacoEditor(); } catch (eStandaloneDispose) {}
+    }
     clearPreviewMonacoCallGraphInlays();
     teardownPreviewMonacoHealObserver();
     teardownPreviewMonacoDiagnostics();
@@ -7578,7 +9511,10 @@ export function getRendererPatchScript(
     try {
       var el = target && target.nodeType === 3 ? target.parentElement : target;
       if (!el || !el.closest || el.closest('.ij-find-detached')) { return false; }
-      return !!el.closest('.ij-find-preview-body .monaco-editor');
+      // document.activeElement is retargeted to the ShadowRoot host when the
+      // standalone preview has focus, so recognise both the editor itself and
+      // its isolated outer host.
+      return !!el.closest('.ij-find-preview-body .monaco-editor, .ij-find-preview-body .ij-find-monaco-host');
     } catch (ePreviewTarget) {
       return false;
     }
@@ -8849,24 +10785,312 @@ export function getRendererPatchScript(
   }
 
 
+  function retainStandalonePreviewModel(model) {
+    if (!model) { return; }
+    try {
+      var refs = window.__ijFindStandaloneModelRefs;
+      if (!refs || typeof refs.get !== 'function' || typeof refs.set !== 'function') {
+        refs = new Map();
+        window.__ijFindStandaloneModelRefs = refs;
+      }
+      refs.set(model, (refs.get(model) || 0) + 1);
+    } catch (eRetainModel) {}
+  }
+
+  function standalonePreviewModelRefCount(model) {
+    if (!model) { return 0; }
+    try {
+      var refs = window.__ijFindStandaloneModelRefs;
+      return refs && typeof refs.get === 'function' ? (refs.get(model) || 0) : 0;
+    } catch (eModelRefCount) {
+      return 0;
+    }
+  }
+
+  function standalonePreviewModelMeta(model) {
+    if (!model) { return null; }
+    try {
+      var metadata = window.__ijFindStandaloneModelMetadata;
+      if (!metadata || typeof metadata.get !== 'function' || typeof metadata.set !== 'function') {
+        metadata = new WeakMap();
+        window.__ijFindStandaloneModelMetadata = metadata;
+      }
+      return { store: metadata, value: metadata.get(model) || null };
+    } catch (eModelMetadata) {
+      return null;
+    }
+  }
+
+  function markStandalonePreviewModelClean(model, content) {
+    var metadata = standalonePreviewModelMeta(model);
+    if (!metadata) { return; }
+    try { metadata.store.set(model, { cleanContent: String(content || '') }); } catch (eMarkModelClean) {}
+  }
+
+  function standalonePreviewModelIsDirty(model) {
+    var metadata = standalonePreviewModelMeta(model);
+    if (!metadata || !metadata.value || typeof metadata.value.cleanContent !== 'string') { return false; }
+    try { return !!(model && model.getValue && model.getValue() !== metadata.value.cleanContent); }
+    catch (eSharedModelDirty) { return true; }
+  }
+
+  function syncStandaloneSharedModelDirtyState(model) {
+    try {
+      var registry = searchInstanceRegistry();
+      for (var id in registry) {
+        if (!Object.prototype.hasOwnProperty.call(registry, id)) { continue; }
+        var instance = registry[id];
+        if (instance && typeof instance.syncPreviewDirtyForModel === 'function') {
+          try { instance.syncPreviewDirtyForModel(model); } catch (eSyncInstanceDirty) {}
+        }
+      }
+    } catch (eSyncSharedDirty) {}
+  }
+
+  function syncStandaloneSharedModelCleanState(model, content) {
+    try {
+      var registry = searchInstanceRegistry();
+      for (var id in registry) {
+        if (!Object.prototype.hasOwnProperty.call(registry, id)) { continue; }
+        var instance = registry[id];
+        if (instance && typeof instance.adoptPreviewCleanContentForModel === 'function') {
+          try { instance.adoptPreviewCleanContentForModel(model, content); } catch (eAdoptInstanceClean) {}
+        }
+      }
+    } catch (eSyncSharedClean) {}
+  }
+
+  function releaseStandalonePreviewModel(model) {
+    if (!model) { return; }
+    var shouldDispose = true;
+    try {
+      var refs = window.__ijFindStandaloneModelRefs;
+      if (refs && typeof refs.get === 'function') {
+        var count = refs.get(model) || 0;
+        if (count > 1) {
+          refs.set(model, count - 1);
+          shouldDispose = false;
+        } else {
+          try { refs.delete(model); } catch (eDeleteModelRef) {}
+        }
+      }
+    } catch (eReleaseModelRef) {}
+    if (shouldDispose && model && typeof model.dispose === 'function') {
+      try { model.dispose(); } catch (eDisposeOwnedModel) {}
+    }
+  }
+
+  function disposeStandalonePreviewMonacoEditor() {
+    cancelStandaloneNativePromotion();
+    cancelStandaloneLanguageFeatureRequests();
+    clearStandaloneSemanticHoverSnapshot();
+    clearStandaloneLexicalHoverCache();
+    if (state.standaloneSemanticTokensDisposable) {
+      try { state.standaloneSemanticTokensDisposable.dispose(); } catch (eSemanticTokensDispose) {}
+      state.standaloneSemanticTokensDisposable = null;
+    }
+    state.standaloneSemanticTokenCount = 0;
+    state.standaloneDiagnosticMarkerCount = 0;
+    var languageFeatureDisposers = state.standaloneLanguageFeatureDisposers || [];
+    state.standaloneLanguageFeatureDisposers = [];
+    state.standaloneLanguageFeatureLanguages = {};
+    state.standaloneCompletionCommandId = '';
+    for (var lfd = languageFeatureDisposers.length - 1; lfd >= 0; lfd--) {
+      try { languageFeatureDisposers[lfd].dispose(); } catch (eLanguageFeatureDispose) {}
+    }
+    clearPreviewMonacoCallGraphInlays();
+    var editor = state.monacoEditor;
+    try {
+      if (state.monacoChangeListener && state.monacoChangeListener.dispose) {
+        state.monacoChangeListener.dispose();
+      }
+    } catch (eChange) {}
+    state.monacoChangeListener = null;
+    if (state.previewMonacoSaveEditor === editor) {
+      try {
+        if (state.previewMonacoKeydownListener && state.previewMonacoKeydownListener.dispose) {
+          state.previewMonacoKeydownListener.dispose();
+        }
+      } catch (eKeydown) {}
+      state.previewMonacoKeydownListener = null;
+      state.previewMonacoSaveEditor = null;
+    }
+    var model = null;
+    try { model = editor && editor.getModel && editor.getModel(); } catch (eModel) {}
+    if (editor) {
+      try { editor.dispose(); } catch (eEditor) {}
+    }
+    releaseStandalonePreviewModel(state.standaloneOwnedModel || model);
+    state.standaloneOwnedModel = null;
+    if (state.monacoHost && state.monacoHost.parentElement) {
+      try { state.monacoHost.parentElement.removeChild(state.monacoHost); } catch (eHost) {}
+    }
+    state.monacoEditor = null;
+    state.monacoHost = null;
+    state.monacoEditorHost = null;
+    state.monacoShadowRoot = null;
+    try {
+      if (state.standaloneMonacoThemeObserver) { state.standaloneMonacoThemeObserver.disconnect(); }
+    } catch (eThemeObserverDispose) {}
+    state.standaloneMonacoThemeObserver = null;
+    state.standaloneMonacoTheme = '';
+    state.monacoMatchDecos = null;
+    $previewBody.classList.remove('ij-find-editor-mounted');
+    syncPreviewSaveButton();
+  }
+
+  function standaloneMonacoThemeForDocument() {
+    try {
+      var classes = ((document.documentElement && document.documentElement.className) || '') + ' ' +
+        ((document.body && document.body.className) || '');
+      var workbench = document.querySelector('.monaco-workbench');
+      if (workbench) { classes += ' ' + String(workbench.className || ''); }
+      var themeKind = (document.documentElement && document.documentElement.getAttribute('data-vscode-theme-kind')) ||
+        (document.body && document.body.getAttribute('data-vscode-theme-kind')) || '';
+      classes += ' ' + String(themeKind || '');
+      if (/(^|\\s)hc-black(\\s|$)/.test(classes)) { return 'hc-black'; }
+      if (/(^|\\s)hc-light(\\s|$)/.test(classes)) { return 'hc-light'; }
+      if (/(^|\\s)(?:vs-dark|dark)(\\s|$)/.test(classes)) { return 'vs-dark'; }
+    } catch (eTheme) {}
+    return 'vs';
+  }
+
+  function syncStandaloneMonacoTheme(api) {
+    try {
+      var nextTheme = standaloneMonacoThemeForDocument();
+      if (state.monacoHost) {
+        state.monacoHost.style.colorScheme = nextTheme === 'vs-dark' || nextTheme === 'hc-black' ? 'dark' : 'light';
+      }
+      if (state.standaloneMonacoTheme !== nextTheme && api && api.editor &&
+          typeof api.editor.setTheme === 'function') {
+        api.editor.setTheme(nextTheme);
+      }
+      state.standaloneMonacoTheme = nextTheme;
+      return nextTheme;
+    } catch (eSyncStandaloneTheme) {
+      return state.standaloneMonacoTheme || 'vs';
+    }
+  }
+
+  function observeStandaloneMonacoTheme(api) {
+    try {
+      if (state.standaloneMonacoThemeObserver) { state.standaloneMonacoThemeObserver.disconnect(); }
+      var observer = new MutationObserver(function () {
+        if (!state.monacoEditor || !state.monacoHost || !state.monacoHost.isConnected) { return; }
+        syncStandaloneMonacoTheme(api);
+      });
+      var workbench = document.querySelector('.monaco-workbench');
+      if (workbench) { observer.observe(workbench, { attributes: true, attributeFilter: ['class', 'data-vscode-theme-kind'] }); }
+      if (document.documentElement) { observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'data-vscode-theme-kind'] }); }
+      if (document.body) { observer.observe(document.body, { attributes: true, attributeFilter: ['class', 'data-vscode-theme-kind'] }); }
+      state.standaloneMonacoThemeObserver = observer;
+    } catch (eObserveStandaloneTheme) {}
+  }
+
+  function standaloneMonacoOverlayCss() {
+    return [
+      ':host { display:block; position:relative; width:100%; height:100%; min-width:0; min-height:0; overflow:hidden; --vscode-sash-size:4px; --vscode-sash-hover-size:4px; }',
+      '.ij-find-monaco-shadow-host { position:absolute; inset:0; width:100%; height:100%; min-width:0; min-height:0; overflow:hidden; }',
+      '.monaco-editor .selected-text { background-color:var(--vscode-editor-selectionBackground, rgba(38,79,120,0.75)) !important; }',
+      '.monaco-editor .minimap { z-index:20 !important; }',
+      '.monaco-editor .minimap .minimap-slider { opacity:1 !important; z-index:30 !important; pointer-events:auto !important; }',
+      '.monaco-editor .minimap-slider .minimap-slider-horizontal { background:var(--vscode-minimapSlider-background, var(--vscode-scrollbarSlider-background, rgba(121,121,121,0.45))) !important; }',
+      '.monaco-editor .minimap-slider:hover .minimap-slider-horizontal, .monaco-editor .minimap:hover .minimap-slider-horizontal { background:var(--vscode-minimapSlider-hoverBackground, var(--vscode-scrollbarSlider-hoverBackground, rgba(100,100,100,0.75))) !important; }',
+      '.monaco-editor .minimap-slider.active .minimap-slider-horizontal { background:var(--vscode-minimapSlider-activeBackground, var(--vscode-scrollbarSlider-activeBackground, rgba(191,191,191,0.65))) !important; }',
+      '.ij-find-preview-monaco-inlay-layer { position:absolute; inset:0; pointer-events:none; z-index:20; overflow:hidden; }',
+      '.ij-find-preview-monaco-inlay-layer .ij-find-preview-inlay { position:absolute; display:inline-flex; align-items:center; margin-left:0; padding:0 4px; height:18px; line-height:18px; border-radius:3px; color:var(--vscode-editorInlayHint-foreground, var(--vscode-descriptionForeground, #9d9d9d)); background:var(--vscode-editorInlayHint-background, transparent); pointer-events:auto; cursor:pointer; user-select:none; white-space:nowrap; }',
+      '.ij-find-preview-monaco-inlay-layer .ij-find-preview-inlay:hover { color:var(--vscode-editorLink-activeForeground, var(--vscode-textLink-activeForeground, #4daafc)); background:var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08)); }'
+    ].join('\\n');
+  }
+
+  function layoutStandaloneMonacoEditor(editor) {
+    try {
+      var surface = state.monacoEditorHost;
+      var rect = surface && surface.getBoundingClientRect ? surface.getBoundingClientRect() : null;
+      if ((!rect || rect.width <= 0 || rect.height <= 0) && state.monacoHost) {
+        rect = state.monacoHost.getBoundingClientRect();
+      }
+      if (editor && rect && rect.width > 0 && rect.height > 0 && typeof editor.layout === 'function') {
+        editor.layout({ width: Math.max(1, Math.floor(rect.width)), height: Math.max(1, Math.floor(rect.height)) });
+        // Make preview readiness deterministic: model/layout changes normally
+        // paint on a later animation frame, while our success check must reject
+        // an editor whose real view rows failed to render.
+        try { if (typeof editor.render === 'function') { editor.render(true); } } catch (eRenderStandalone) {}
+        return Math.floor(rect.width) + 'x' + Math.floor(rect.height);
+      }
+    } catch (eLayoutStandalone) {}
+    return '0x0';
+  }
+
+  function standaloneMonacoEditorIsHealthy() {
+    try {
+      var editor = state.monacoEditor;
+      var outer = state.monacoHost;
+      var surface = state.monacoEditorHost;
+      var model = editor && editor.getModel && editor.getModel();
+      var dom = editor && editor.getDomNode && editor.getDomNode();
+      var rect = surface && surface.getBoundingClientRect && surface.getBoundingClientRect();
+      var renderedRows = dom && dom.querySelectorAll ? dom.querySelectorAll('.view-line').length : 0;
+      return !!(editor && model && outer && outer.parentElement === $previewBody &&
+        surface && surface.isConnected && dom && surface.contains(dom) &&
+        rect && rect.width > 0 && rect.height > 0 && renderedRows > 0);
+    } catch (eHealthyStandalone) {
+      return false;
+    }
+  }
+
   function ensureMonacoEditor(api) {
-    if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
+    if (state.previewNativeCommitted) {
+      throw new Error('blocked bundled Monaco creation after native preview commitment');
+    }
+    if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody &&
+        state.monacoEditorHost && state.monacoEditorHost.isConnected) {
+      syncStandaloneMonacoTheme(api);
       send({ type: 'log', msg: 'reusing existing monaco editor' });
       return state.monacoEditor;
+    }
+    if (state.monacoEditor || state.monacoHost) {
+      try { disposeStandalonePreviewMonacoEditor(); } catch (eStaleStandaloneDispose) {}
+    }
+    if (state.previewMonacoEditor) {
+      try { disposePreviewMonacoEditor(); } catch (eNativeDispose) {}
     }
     clearChildren($previewBody);
     // Neutralise inherited typography / padding / overflow so Monaco's own
     // geometry is in charge of this container.
     $previewBody.classList.add('ij-find-editor-mounted');
     var host = el('div', { className: 'ij-find-monaco-host' });
+    host.style.cssText = 'display:block;position:relative;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;';
     $previewBody.appendChild(host);
+    var cssText = '';
+    try { cssText = String(globalThis.__ijFindMonacoCssText || ''); } catch (eReadMonacoCss) {}
+    if (cssText.length < 1000 || !host.attachShadow) {
+      try { host.remove(); } catch (eRemoveCsslessHost) {}
+      $previewBody.classList.remove('ij-find-editor-mounted');
+      throw new Error(cssText.length < 1000 ? 'bundled Monaco CSS is unavailable' : 'Shadow DOM is unavailable');
+    }
+    var shadowRoot = host.attachShadow({ mode: 'open' });
+    var style = document.createElement('style');
+    style.setAttribute('data-ijss-monaco-base', 'true');
+    style.textContent = cssText + '\\n' + standaloneMonacoOverlayCss();
+    shadowRoot.appendChild(style);
+    var editorHost = document.createElement('div');
+    editorHost.className = 'ij-find-monaco-shadow-host';
+    shadowRoot.appendChild(editorHost);
     var hostRect = host.getBoundingClientRect();
     send({ type: 'log', msg: 'monaco host created rect=' + Math.round(hostRect.width) + 'x' + Math.round(hostRect.height) + ' parentRect=' + Math.round($previewBody.getBoundingClientRect().width) + 'x' + Math.round($previewBody.getBoundingClientRect().height) });
     state.monacoHost = host;
+    state.monacoEditorHost = editorHost;
+    state.monacoShadowRoot = shadowRoot;
     var editor;
     try {
-      editor = api.editor.create(host, {
+      var standaloneTheme = standaloneMonacoThemeForDocument();
+      host.style.colorScheme = standaloneTheme === 'vs-dark' || standaloneTheme === 'hc-black' ? 'dark' : 'light';
+      editor = api.editor.create(editorHost, {
+        model: null,
         automaticLayout: true,
+        theme: standaloneTheme,
+        ariaLabel: 'Search result preview',
         readOnly: false,
         minimap: previewMinimapOptions(),
         scrollBeyondLastLine: false,
@@ -8878,19 +11102,27 @@ export function getRendererPatchScript(
         fontSize: 12,
         renderLineHighlight: 'all',
         occurrencesHighlight: true,
-        fixedOverflowWidgets: true,
-        overflowWidgetsDomNode: getOrCreatePreviewOverflowHost(),
         hover: previewHoverOptions(),
         inlayHints: previewInlayHintsOptions(),
         overviewRulerLanes: 3,
         hideCursorInOverviewRuler: false,
       });
+      layoutStandaloneMonacoEditor(editor);
       send({ type: 'log', msg: 'monaco.editor.create OK editorType=' + typeof editor + ' hasGetModel=' + (editor && typeof editor.getModel === 'function') });
     } catch (e) {
       send({ type: 'log', msg: 'monaco.editor.create THREW: ' + (e && e.message) });
+      try { if (editor && editor.dispose) { editor.dispose(); } } catch (eDisposeFailedEditor) {}
+      try { host.remove(); } catch (eRemoveFailedHost) {}
+      state.monacoEditor = null;
+      state.monacoHost = null;
+      state.monacoEditorHost = null;
+      state.monacoShadowRoot = null;
+      $previewBody.classList.remove('ij-find-editor-mounted');
       throw e;
     }
     state.monacoEditor = editor;
+    state.standaloneMonacoTheme = standaloneMonacoThemeForDocument();
+    observeStandaloneMonacoTheme(api);
     try {
       editor.addCommand(api.KeyMod.CtrlCmd | api.KeyCode.KeyS, function () {
         savePreviewMonacoModel();
@@ -8903,99 +11135,239 @@ export function getRendererPatchScript(
   }
 
   function renderPreviewMonaco(api, msg) {
-    state.previewMode = 'monaco';
+    if (state.previewNativeCommitted) {
+      throw new Error('blocked native preview downgrade to bundled Monaco');
+    }
+    var priorStandaloneInit = false;
+    try { priorStandaloneInit = window.__ijFindStandaloneMonacoInitializing === true; } catch (eReadInit) {}
+    try { window.__ijFindStandaloneMonacoInitializing = true; } catch (eSetInit) {}
+    try {
+      var result = renderPreviewMonacoImpl(api, msg);
+      if (!standaloneMonacoEditorIsHealthy()) {
+        throw new Error('standalone Monaco did not render visible code rows');
+      }
+      return result;
+    }
+    finally {
+      try { window.__ijFindStandaloneMonacoInitializing = priorStandaloneInit; } catch (eRestoreInit) {}
+    }
+  }
+
+  function standaloneMonacoLanguageIdForPreview(api, requestedLanguageId, uri, content) {
+    var requested = String(requestedLanguageId || 'plaintext');
+    try {
+      if (!api || !api.languages || typeof api.languages.getLanguages !== 'function') { return requested; }
+      var languages = api.languages.getLanguages() || [];
+      for (var i = 0; i < languages.length; i++) {
+        if (languages[i] && languages[i].id === requested) { return requested; }
+      }
+      var normalizedRequested = requested.toLowerCase().replace(/[^a-z0-9]+/g, '');
+      for (var ai = 0; ai < languages.length; ai++) {
+        var aliases = Array.isArray(languages[ai] && languages[ai].aliases) ? languages[ai].aliases : [];
+        for (var aj = 0; aj < aliases.length; aj++) {
+          if (String(aliases[aj] || '').toLowerCase().replace(/[^a-z0-9]+/g, '') === normalizedRequested) {
+            return String(languages[ai].id || requested);
+          }
+        }
+      }
+      var standardAliases = {
+        javascriptreact: 'javascript',
+        typescriptreact: 'typescript',
+        shellscript: 'shell',
+      };
+      if (standardAliases[requested]) {
+        for (var sai = 0; sai < languages.length; sai++) {
+          if (languages[sai] && languages[sai].id === standardAliases[requested]) {
+            return standardAliases[requested];
+          }
+        }
+      }
+      var parsed = api.Uri.parse(String(uri || ''));
+      var path = String(parsed.path || '').toLowerCase();
+      var slash = path.lastIndexOf('/');
+      var filename = slash >= 0 ? path.slice(slash + 1) : path;
+      var bestId = '';
+      var bestMatchLength = -1;
+      for (var li = 0; li < languages.length; li++) {
+        var language = languages[li] || {};
+        var extensions = Array.isArray(language.extensions) ? language.extensions : [];
+        for (var ei = 0; ei < extensions.length; ei++) {
+          var extension = String(extensions[ei] || '').toLowerCase();
+          if (extension && path.slice(-extension.length) === extension && extension.length > bestMatchLength) {
+            bestId = String(language.id || '');
+            bestMatchLength = extension.length;
+          }
+        }
+        var filenames = Array.isArray(language.filenames) ? language.filenames : [];
+        for (var fi = 0; fi < filenames.length; fi++) {
+          var registeredFilename = String(filenames[fi] || '').toLowerCase();
+          if (registeredFilename && filename === registeredFilename && registeredFilename.length > bestMatchLength) {
+            bestId = String(language.id || '');
+            bestMatchLength = registeredFilename.length;
+          }
+        }
+        if (bestMatchLength < 0 && language.firstLine && content) {
+          try {
+            var firstLine = String(content).split(/\\r?\\n/, 1)[0] || '';
+            if (new RegExp(String(language.firstLine)).test(firstLine)) {
+              bestId = String(language.id || '');
+              bestMatchLength = 0;
+            }
+          } catch (eFirstLineLanguage) {}
+        }
+      }
+      if (!bestId && requested && requested !== 'plaintext' && api.languages && typeof api.languages.register === 'function') {
+        try { api.languages.register({ id: requested }); } catch (eRegisterRequestedLanguage) {}
+      }
+      return bestId || requested;
+    } catch (eResolveStandaloneLanguage) {
+      return requested;
+    }
+  }
+
+  function renderPreviewMonacoImpl(api, msg) {
+    state.standaloneMonacoLoadingUri = '';
     var editor = ensureMonacoEditor(api);
-    var fullText = msg.lines.map(function (l) { return l.text; }).join('\\n');
-    var fileUri;
-    try { fileUri = api.Uri.parse(msg.uri); }
-    catch (e) { send({ type: 'log', msg: 'Uri.parse threw: ' + (e && e.message) + ' uri=' + msg.uri }); return; }
+    var fullText = msg.lines.map(function (l) { return l.text; }).join(previewMessageEol(msg));
+    var standaloneLanguageId = standaloneMonacoLanguageIdForPreview(
+      api,
+      msg.languageId || 'plaintext',
+      msg.uri,
+      fullText
+    );
+    var fileUri = null;
+    try { fileUri = api.Uri.parse(String(msg.uri || '')); }
+    catch (eParseStandaloneUri) {
+      send({ type: 'log', msg: 'standalone Uri.parse threw: ' + (eParseStandaloneUri && eParseStandaloneUri.message) });
+      throw eParseStandaloneUri;
+    }
+    var previousModel = null;
+    try { previousModel = editor.getModel && editor.getModel(); }
+    catch (ePreviousModel) { send({ type: 'log', msg: 'standalone getModel threw: ' + (ePreviousModel && ePreviousModel.message) }); }
     var model = null;
+    var preservedSharedDirtyModel = false;
     try { model = api.editor.getModel(fileUri); }
-    catch (e) { send({ type: 'log', msg: 'getModel threw: ' + (e && e.message) }); }
+    catch (eGetResourceModel) { send({ type: 'log', msg: 'standalone getModel(uri) threw: ' + (eGetResourceModel && eGetResourceModel.message) }); }
     if (model) {
-      send({ type: 'log', msg: 'reused existing model lang=' + (model.getLanguageId ? model.getLanguageId() : '?') + ' lines=' + model.getLineCount() });
+      try {
+        var sameOwnedModel = state.standaloneOwnedModel === model;
+        preservedSharedDirtyModel = standalonePreviewModelIsDirty(model) || (sameOwnedModel && state.previewDirty);
+        if (preservedSharedDirtyModel) {
+          var sharedMetadata = standalonePreviewModelMeta(model);
+          if (sharedMetadata && sharedMetadata.value && typeof sharedMetadata.value.cleanContent === 'string') {
+            // The model's original clean base, not a newer disk payload that
+            // we intentionally declined to apply, is the optimistic save
+            // precondition for every owner of these unsaved edits.
+            state.previewCleanUri = String(msg.uri || '');
+            state.previewCleanContent = sharedMetadata.value.cleanContent;
+          }
+        }
+        if (!preservedSharedDirtyModel && model.getValue && model.getValue() !== fullText && model.setValue) {
+          state.previewSuppressDirty = true;
+          model.setValue(fullText);
+          state.previewSuppressDirty = false;
+          markStandalonePreviewModelClean(model, fullText);
+          syncStandaloneSharedModelCleanState(model, fullText);
+        }
+        if (!preservedSharedDirtyModel) { markStandalonePreviewModelClean(model, fullText); }
+      } catch (eSetValue) {
+        state.previewSuppressDirty = false;
+        send({ type: 'log', msg: 'standalone setValue threw: ' + (eSetValue && eSetValue.message) });
+      }
+      send({ type: 'log', msg: 'reused standalone resource model uri=' + String(model.uri || '') + ' lang=' + (model.getLanguageId ? model.getLanguageId() : '?') + ' lines=' + model.getLineCount() });
     } else {
       try {
-        model = api.editor.createModel(fullText, msg.languageId || 'plaintext', fileUri);
-        send({ type: 'log', msg: 'createModel OK lang=' + (msg.languageId || 'plaintext') });
+        model = api.editor.createModel(fullText, standaloneLanguageId, fileUri);
+        markStandalonePreviewModelClean(model, fullText);
+        send({ type: 'log', msg: 'standalone createModel OK uri=' + String(fileUri) + ' lang=' + standaloneLanguageId });
       }
       catch (e) {
-        send({ type: 'log', msg: 'createModel(uri) threw: ' + (e && e.message) + ' — trying anonymous' });
-        try {
-          model = api.editor.createModel(fullText, msg.languageId || 'plaintext');
-          send({ type: 'log', msg: 'createModel anonymous OK' });
-        }
-        catch (e2) {
-          send({ type: 'log', msg: 'createModel anonymous THREW: ' + (e2 && e2.message) });
-          return;
-        }
+        send({ type: 'log', msg: 'standalone createModel THREW: ' + (e && e.message) });
+        throw e;
       }
     }
-    if (msg.languageId && model.getLanguageId && model.getLanguageId() !== msg.languageId) {
-      try { api.editor.setModelLanguage(model, msg.languageId); } catch (e) {}
+    if (!preservedSharedDirtyModel && model && typeof model.setEOL === 'function' &&
+        api.editor && api.editor.EndOfLineSequence) {
+      try {
+        model.setEOL(msg.eol === '\\r\\n'
+          ? api.editor.EndOfLineSequence.CRLF
+          : api.editor.EndOfLineSequence.LF);
+        fullText = model.getValue ? model.getValue() : fullText;
+        markStandalonePreviewModelClean(model, fullText);
+        syncStandaloneSharedModelCleanState(model, fullText);
+      } catch (eSetStandaloneEol) {}
+    }
+    if (model.getLanguageId && model.getLanguageId() !== standaloneLanguageId) {
+      try { api.editor.setModelLanguage(model, standaloneLanguageId); } catch (e) {}
+    }
+    if (state.standaloneOwnedModel !== model) {
+      retainStandalonePreviewModel(model);
+    }
+    if (previousModel && previousModel !== model) {
+      cancelStandaloneLanguageFeatureRequests();
+      clearStandaloneSemanticHoverSnapshot();
+      clearStandaloneLexicalHoverCache();
     }
     try {
       editor.setModel(model);
       send({ type: 'log', msg: 'editor.setModel OK; readOnly=' + (editor.getOption ? editor.getOption(api.editor.EditorOption ? api.editor.EditorOption.readOnly : 81) : '?') });
     } catch (e) {
+      if (state.standaloneOwnedModel !== model) { releaseStandalonePreviewModel(model); }
       send({ type: 'log', msg: 'setModel threw: ' + (e && e.message) });
-      return;
+      throw e;
     }
+    if (state.standaloneOwnedModel && state.standaloneOwnedModel !== model) {
+      releaseStandalonePreviewModel(state.standaloneOwnedModel);
+    } else if (!state.standaloneOwnedModel && previousModel && previousModel !== model) {
+      releaseStandalonePreviewModel(previousModel);
+    }
+    state.standaloneOwnedModel = model;
+    claimStandaloneLanguageFeatureModel(model);
+    try {
+      if (!model || !model.getValue || (!preservedSharedDirtyModel && model.getValue() !== fullText)) {
+        throw new Error('standalone Monaco model content mismatch');
+      }
+    } catch (eVerifyModel) {
+      send({ type: 'log', msg: 'standalone model verification failed: ' + (eVerifyModel && eVerifyModel.message) });
+      throw eVerifyModel;
+    }
+    var standaloneLayout = layoutStandaloneMonacoEditor(editor);
+    send({ type: 'log', msg: 'standalone Monaco layout=' + standaloneLayout });
+    requestAnimationFrame(function () {
+      if (state.monacoEditor !== editor) { return; }
+      layoutStandaloneMonacoEditor(editor);
+      requestAnimationFrame(function () {
+        if (state.monacoEditor === editor) { layoutStandaloneMonacoEditor(editor); }
+      });
+    });
 
     attachPreviewDirtyListener(editor);
+    updatePreviewDirtyFromModel(model);
+    registerPreviewSaveKeybinding(editor);
+    renderPreviewMonacoCallGraphInlays(editor, msg);
+    ensureStandaloneTextMateGrammar(api, standaloneLanguageId);
+    if (window.__ijFindEnablePreviewLanguageFeatures) {
+      ensureStandaloneLanguageFeatureBridge(api, standaloneLanguageId);
+      applyStandalonePreviewDiagnostics(api, model, msg.diagnostics);
+      refreshStandaloneSemanticTokens(api, model, standaloneLanguageId);
+    }
+    state.previewMode = 'monaco';
+    state.previewEngine = 'standalone';
+    state.lastRenderedPreviewUri = msg.uri;
+    state.lastRenderedPreviewFocusLine = typeof msg.focusLine === 'number' ? msg.focusLine : -1;
+    syncPreviewSaveButton();
     send({ type: 'log', msg: 'change listener attached' });
 
     // Reveal focus line and place caret at first match.
-    var focusLine = msg.focusLine + 1; // monaco is 1-indexed
+    var focusLine = previewModelLineForFileLine(msg.focusLine);
     var col = (msg.ranges && msg.ranges[0]) ? msg.ranges[0].start + 1 : 1;
     try {
       editor.revealLineInCenter(focusLine, 0);
       editor.setPosition({ lineNumber: focusLine, column: col });
     } catch (e) {}
-    // Briefly highlight the search match using Monaco decorations.
-    // For multi-line matches (endLine/endCol present), we extend the range
-    // across lines so every line of the match is visibly highlighted —
-    // previously only the match's starting line got the findMatch style.
-    try {
-      var focusText = '';
-      try {
-        for (var fl = 0; fl < (msg.lines || []).length; fl++) {
-          if (msg.lines[fl] && msg.lines[fl].lineNumber === msg.focusLine) {
-            focusText = String(msg.lines[fl].text || '');
-            break;
-          }
-        }
-      } catch (eFocusText) {}
-      var ranges = sanitizeRangesForText(focusText, msg.ranges || []).map(function (r) {
-        return new api.Range(focusLine, r.start + 1, focusLine, r.end + 1);
-      });
-      if (state.monacoMatchDecos) { state.monacoMatchDecos = editor.deltaDecorations(state.monacoMatchDecos, []); }
-      if (ranges.length === 0) {
-        ranges = [new api.Range(focusLine, 1, focusLine, model.getLineMaxColumn(focusLine))];
-      }
-      state.monacoMatchDecos = editor.deltaDecorations([], ranges.map(function (range, idx) {
-        return {
-          range: range,
-          options: {
-            inlineClassName: idx === 0 && msg.ranges && msg.ranges.length > 0 ? 'findMatch currentFindMatch' : 'findMatch',
-            className: 'rangeHighlight',
-            isWholeLine: !(msg.ranges && msg.ranges.length > 0),
-            minimap: previewMinimapMatchOptions(idx === 0),
-          },
-        };
-      }));
-    } catch (e) {}
-  }
-
-  function boundedPreviewLines(msg) {
-    var rawLines = Array.isArray(msg && msg.lines) ? msg.lines : [];
-    var out = [];
-    for (var i = 0; i < rawLines.length; i++) {
-      var line = rawLines[i] || {};
-      var text = String(line.text || '');
-      out.push({ lineNumber: line.lineNumber, text: text });
-    }
-    return { lines: out, omittedBefore: 0, omittedAfter: 0 };
+    // Share the native preview's multi-line/minimap/overview-ruler behavior.
+    applyPreviewMatchDecorations(editor, msg, 'monacoMatchDecos');
+    scheduleStandaloneNativePromotion(msg, 'bundled-render');
   }
 
   function normalizePreviewCallGraphInlay(raw) {
@@ -9042,15 +11414,6 @@ export function getRendererPatchScript(
     return byLine;
   }
 
-  function previewCallGraphInlayCountByLine(byLine) {
-    var count = 0;
-    for (var line in (byLine || {})) {
-      if (!Object.prototype.hasOwnProperty.call(byLine, line)) { continue; }
-      count += byLine[line] ? byLine[line].length : 0;
-    }
-    return count;
-  }
-
   function commandForPreviewCallGraphInlayKind(kind) {
     if (kind === 'callees') { return 'intellijStyledSearch.showCalleesForSymbol'; }
     if (kind === 'impl') { return 'intellijStyledSearch.showImplementationsForSymbol'; }
@@ -9061,145 +11424,6 @@ export function getRendererPatchScript(
     if (kind === 'callees') { return 'Find Callees'; }
     if (kind === 'impl') { return 'Find Implementations'; }
     return 'Find Usages';
-  }
-
-  function appendDomPreviewCallGraphInlays(lineEl, lineNumber, inlaysByLine) {
-    var lineInlays = inlaysByLine && inlaysByLine[String(lineNumber)];
-    if (!lineInlays || lineInlays.length === 0) { return; }
-    for (var i = 0; i < lineInlays.length; i++) {
-      var inlay = lineInlays[i];
-      var attrs = {
-        'data-ijss-callgraph-symbol-id': inlay.symbolId,
-        'data-ijss-callgraph-kind': inlay.kind,
-        'data-ijss-callgraph-label': inlay.label,
-        'data-ijss-callgraph-column': String(inlay.column),
-        'data-ijss-callgraph-count': typeof inlay.count === 'number' ? String(inlay.count) : '',
-        'role': 'button',
-        'tabindex': '0',
-        'aria-label': (inlay.label ? inlay.label + ' ' : '') + inlay.text,
-      };
-      lineEl.appendChild(el('span', {
-        className: 'ij-find-preview-inlay ijss-callgraph',
-        text: inlay.text,
-        title: inlay.label ? inlay.label : inlay.text,
-        attrs: attrs,
-      }));
-    }
-  }
-
-  function renderPreviewDOM(msg) {
-    var previewT0 = perfNow();
-    var renderedLines = 0;
-    var omittedBefore = 0;
-    var omittedAfter = 0;
-    var previewError = null;
-    startPerfWatch('preview:dom', 8000);
-    panelDiagMark('preview:dom:start', {
-      uri: msg && msg.uri ? String(msg.uri).slice(-120) : '',
-      lineCount: msg && msg.lines ? msg.lines.length : 0,
-      focusLine: msg ? msg.focusLine : undefined,
-    });
-    trace('preview:dom:start', {
-      uri: msg && msg.uri ? String(msg.uri).slice(-120) : '',
-      lineCount: msg && msg.lines ? msg.lines.length : 0,
-      focusLine: msg ? msg.focusLine : undefined,
-    });
-    try {
-      ensureFullPanelStructure('preview-dom-start');
-      if (state.stolenEditor) { restoreStolenEditor(); }
-      state.previewMode = 'dom';
-      syncPreviewSaveButton();
-      clearPreviewMonacoCallGraphInlays();
-      // If we previously hosted Monaco, detach it.
-      if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody) {
-        try { state.monacoHost.parentElement.removeChild(state.monacoHost); } catch (e) {}
-      }
-      $previewBody.classList.remove('ij-find-editor-mounted');
-      clearChildren($previewBody);
-      var bounded = boundedPreviewLines(msg);
-      omittedBefore = bounded.omittedBefore;
-      omittedAfter = bounded.omittedAfter;
-      var contentEl = el('div', { className: 'ij-find-preview-content' });
-      var focusEl = null;
-      var frag = document.createDocumentFragment();
-      var inlaysByLine = previewCallGraphInlaysByLine(msg);
-      send({ type: 'log', msg: 'preview dom inlays render uri=' + (msg && msg.uri || '') + ' previewSeq=' + (msg && typeof msg.previewSeq === 'number' ? msg.previewSeq : 'none') + ' count=' + previewCallGraphInlayCountByLine(inlaysByLine) });
-      if (bounded.omittedBefore > 0) {
-        frag.appendChild(el('div', {
-          className: 'ij-find-preview-line ij-find-preview-truncated',
-          text: '... ' + bounded.omittedBefore + ' earlier line(s) omitted',
-        }));
-      }
-      for (var i = 0; i < bounded.lines.length; i++) {
-        var line = bounded.lines[i];
-        var isFocus = (line.lineNumber === msg.focusLine);
-        var lineEl = el('div', {
-          className: 'ij-find-preview-line' + (isFocus ? ' focus' : ''),
-          attrs: { 'data-line': String(line.lineNumber) },
-        });
-        lineEl.appendChild(el('span', { className: 'ij-find-preview-lineno', text: String(line.lineNumber + 1) }));
-        var textSpan = el('span', { className: 'ij-find-preview-text' });
-        if (isFocus && msg.ranges && msg.ranges.length > 0) {
-          appendHighlightedInto(textSpan, line.text, msg.ranges);
-        } else if (!fallbackHighlight(textSpan, line.text, state.previewLanguageId)) {
-          textSpan.textContent = line.text;
-        }
-        lineEl.appendChild(textSpan);
-        appendDomPreviewCallGraphInlays(lineEl, line.lineNumber, inlaysByLine);
-        frag.appendChild(lineEl);
-        if (isFocus) { focusEl = lineEl; }
-      }
-      renderedLines = bounded.lines.length;
-      if (bounded.omittedAfter > 0) {
-        frag.appendChild(el('div', {
-          className: 'ij-find-preview-line ij-find-preview-truncated',
-          text: '... ' + bounded.omittedAfter + ' later line(s) omitted',
-        }));
-      }
-      contentEl.appendChild(frag);
-      $previewBody.appendChild(contentEl);
-      if (focusEl) {
-        setTimeout(function () {
-          try { focusEl.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) {}
-        }, 0);
-      }
-    } catch (eDomPreview) {
-      previewError = eDomPreview;
-      send({ type: 'log', msg: 'renderPreviewDOM threw: ' + (eDomPreview && eDomPreview.message) });
-      try {
-        state.previewMode = 'dom';
-        $previewBody.classList.remove('ij-find-editor-mounted');
-        clearChildren($previewBody);
-        $previewBody.appendChild(el('div', {
-          className: 'ij-find-preview-content',
-          children: [el('div', {
-            className: 'ij-find-preview-line ij-find-preview-truncated',
-            text: 'Preview fallback render failed. Select another result or reopen search.',
-          })],
-        }));
-      } catch (eDomPreviewFallback) {}
-    } finally {
-      ensureFullPanelStructure('preview-dom-end');
-      trace('preview:dom:end', {
-        renderedLines: renderedLines,
-        omittedBefore: omittedBefore,
-        omittedAfter: omittedAfter,
-        durationMs: Math.round(perfNow() - previewT0),
-        error: previewError && previewError.message ? String(previewError.message).slice(0, 160) : '',
-      });
-      panelDiagMark('preview:dom:end', {
-        renderedLines: renderedLines,
-        omittedBefore: omittedBefore,
-        omittedAfter: omittedAfter,
-        durationMs: Math.round(perfNow() - previewT0),
-        error: previewError && previewError.message ? String(previewError.message).slice(0, 160) : '',
-      });
-      reportPerfPhase('preview:dom', previewT0, {
-        renderedLines: renderedLines,
-        omittedBefore: omittedBefore,
-        omittedAfter: omittedAfter,
-      }, 10);
-    }
   }
 
   // ── Hover ────────────────────────────────────────────────────────────
@@ -9248,7 +11472,7 @@ export function getRendererPatchScript(
     var cmd = commandFromUrl(url);
     if (!cmd) { return null; }
     var enabled = isTrusted && (
-      !allowedCommands || allowedCommands.length === 0 || allowedCommands.indexOf(cmd.name) >= 0
+      !allowedCommands || allowedCommands.indexOf(cmd.name) >= 0
     );
     if (!enabled) {
       return el('span', {
@@ -9439,7 +11663,9 @@ export function getRendererPatchScript(
     var pres = container.querySelectorAll('.ij-md-pre');
     if (pres.length > 0) {
       ensureMonaco(function (api) {
-        if (!api) {
+        var bundledApi = false;
+        try { bundledApi = !!(api && api === globalThis.__ijFindMonacoApi); } catch (eBundledApi) {}
+        if (!api || bundledApi) {
           // Fallback regex tokenizer per line.
           for (var i = 0; i < pres.length; i++) {
             var pre = pres[i];
@@ -9504,7 +11730,16 @@ export function getRendererPatchScript(
       var el = target && target.nodeType === 3 ? target.parentElement : target;
       if (!el || !el.closest) { return null; }
       var inlay = el.closest('[data-ijss-callgraph-symbol-id]');
-      if (!inlay || !$previewBody.contains(inlay)) { return null; }
+      if (!inlay) { return null; }
+      var ownedByPreview = $previewBody.contains(inlay);
+      if (!ownedByPreview) {
+        try {
+          ownedByPreview = !!(state.monacoShadowRoot && inlay.getRootNode &&
+            inlay.getRootNode() === state.monacoShadowRoot &&
+            state.monacoHost && state.monacoHost.parentElement === $previewBody);
+        } catch (eShadowInlayRoot) {}
+      }
+      if (!ownedByPreview) { return null; }
       return inlay;
     } catch (eDomInlayTarget) {
       return null;
@@ -9595,8 +11830,21 @@ export function getRendererPatchScript(
   on($previewBody, 'mousedown', function () {
     var ed = state.previewMonacoEditor || state.monacoEditor;
     if (ed && typeof ed.focus === 'function') {
+      // Non-simple native widgets can be detached by Workbench as focus is
+      // claimed. Snapshot before focus while the viewport is still stable;
+      // the later MutationObserver callback is too late on affected builds.
+      if (state.previewNativeCommitted && ed === state.previewMonacoEditor && state.lastPreviewMsg) {
+        try { captureNativePreviewRecoverySnapshot(ed, state.lastPreviewMsg); } catch (eCaptureBeforeNativeFocus) {}
+      }
+      try { claimStandaloneLanguageFeatureModel(ed.getModel && ed.getModel()); } catch (eClaimFocusedPreview) {}
       try { ed.focus(); } catch (e) {}
     }
+  }, true);
+  on($previewBody, 'pointermove', function () {
+    try {
+      var ed = state.monacoEditor;
+      claimStandaloneLanguageFeatureModel(ed && ed.getModel && ed.getModel());
+    } catch (eClaimHoveredPreview) {}
   }, true);
 
   // DOM-fallback mouse-hover dispatch was removed in #32. Monaco's
@@ -9788,6 +12036,12 @@ export function getRendererPatchScript(
         reportPerfPhase('show:focusSelect', focusT0, { activeTag: document.activeElement && document.activeElement.tagName ? String(document.activeElement.tagName).toLowerCase() : '' }, 1);
         panelDiagMark('show:focusSelect', {});
       }, 0);
+      if (findBundledMonacoSync() && state.lastPreviewMsg &&
+          (state.previewMode === 'monaco-loading' || state.previewMode === 'monaco-error')) {
+        setTimeout(function () {
+          try { renderStandaloneMonacoWhenReady('show-visible'); } catch (eStandaloneShow) {}
+        }, 0);
+      }
       trace('show:end', { queryLen: typeof initialQuery === 'string' ? initialQuery.length : 0, durationMs: Math.round(perfNow() - showT0) });
       panelDiagMark('show:end', { durationMs: Math.round(perfNow() - showT0) });
       reportPerfPhase('show', showT0, {
@@ -9799,6 +12053,7 @@ export function getRendererPatchScript(
   }
 	  function hideSearchPanel() {
 	    var wasVisible = panel.classList.contains('visible');
+    cancelStandaloneNativePromotion();
     trace('hide:start', { wasVisible: !!wasVisible });
     panelDiagMark('hide:start', { wasVisible: !!wasVisible });
     stopPerfWatch('hide');
@@ -9880,6 +12135,7 @@ export function getRendererPatchScript(
     if (wasVisible) {
       send({ type: 'cancel' });
       if (!hasOtherVisibleSearchPanel) { send({ type: 'panelHidden' }); }
+      else if (__ijFindInstallAdditionalInstance) { send({ type: 'panelDisposed' }); }
     }
     if (!hasOtherVisibleSearchPanel) {
       setIntelliSenseRecursionCaptureSuspended(false, 'search-ui-hidden');
@@ -9887,12 +12143,13 @@ export function getRendererPatchScript(
     trace('hide:end', { wasVisible: !!wasVisible });
     panelDiagMark('hide:end', { wasVisible: !!wasVisible });
     stopPanelDiagnostics('hide');
-    if (window.__ijFindDisposeRendererPatchOnHide) {
+    if (__ijFindInstallAdditionalInstance || window.__ijFindDisposeRendererPatchOnHide) {
       setTimeout(function () {
         try {
-          if (typeof window.__ijFindDisposeSearchUi === 'function') {
-            disposeSearchUi('hide');
-          }
+          // Call this instance's closure directly. The legacy global points
+          // at whichever spawned panel registered most recently and can
+          // otherwise dispose the wrong sibling.
+          disposeSearchUi('hide');
         } catch (eDisposeOnHide) {}
       }, 0);
     }
@@ -9939,14 +12196,15 @@ export function getRendererPatchScript(
   // E2E suite polls to avoid racing async CDP evals.
   window.__ijFindGetPreviewMonacoStateForTests = function () {
     try {
-      var ed = state.previewMonacoEditor;
-      var host = state.previewMonacoHost;
+      var ed = state.previewMonacoEditor || state.monacoEditor;
+      var host = state.previewMonacoHost || state.monacoHost;
+      var surface = state.previewMonacoHost || state.monacoEditorHost || state.monacoHost;
       var dom = null;
       var domErr = '';
       try { dom = ed && typeof ed.getDomNode === 'function' ? ed.getDomNode() : null; }
       catch (eDomTest) { domErr = String(eDomTest && eDomTest.message || eDomTest).slice(0, 80); }
       var hostInBody = !!(host && host.parentElement === $previewBody);
-      var domInHost = !!(host && dom && dom.parentElement === host);
+      var domInHost = !!(surface && dom && surface.contains(dom));
       var viewLines = 0;
       try { if (dom && dom.querySelectorAll) { viewLines = dom.querySelectorAll('.view-line').length; } } catch (eVlTest) {}
       var modelOk = false;
@@ -9965,11 +12223,13 @@ export function getRendererPatchScript(
         hasHost: !!host,
         hostInBody: hostInBody,
         domInHost: domInHost,
+        shadowRoot: !!(state.monacoShadowRoot && state.monacoShadowRoot.host === state.monacoHost),
         viewLines: viewLines,
         modelOk: modelOk,
         disposed: disposed,
         domErr: domErr,
         previewMode: state.previewMode || null,
+        previewEngine: state.previewEngine || null,
         previewUri: state.previewUri || null,
       };
     } catch (eState) {
@@ -9979,10 +12239,10 @@ export function getRendererPatchScript(
   // Used by E2E only: gives tests direct access to the live preview editor
   // widget so they can assert on scrollTop / viewState after refresh
   // scenarios. Refresh on each call rather than caching — the editor
-  // instance is recreated on capture refresh / DOM fallback recovery.
+  // instance is recreated on capture refresh / bundled Monaco upgrade.
   Object.defineProperty(window, '__ijFindPreviewEditorForTests', {
     configurable: true,
-    get: function () { return state.previewMonacoEditor; },
+    get: function () { return state.previewMonacoEditor || state.monacoEditor; },
   });
   window.__ijFindGetSearchState = function () {
     try {
@@ -9993,15 +12253,31 @@ export function getRendererPatchScript(
         activeIndex: typeof state.activeIndex === 'number' ? state.activeIndex : -1,
         activePreviewSeq: typeof state.activePreviewSeq === 'number' ? state.activePreviewSeq : 0,
 	        previewMode: state.previewMode || null,
+	        previewEngine: state.previewEngine || null,
 	        previewUri: state.previewUri || null,
 	        previewDirty: !!state.previewDirty,
 	        previewCanSave: canSavePreviewContent(),
 	        saveButtonDisabled: !!($savePreview && $savePreview.disabled),
 	        saveButtonAriaDisabled: $savePreview ? $savePreview.getAttribute('aria-disabled') : null,
 	        saveButtonDirty: $savePreview ? $savePreview.getAttribute('data-dirty') : null,
-	        previewModelUri: state.previewMonacoEditor && state.previewMonacoEditor.getModel && state.previewMonacoEditor.getModel() && state.previewMonacoEditor.getModel().uri
-          ? String(state.previewMonacoEditor.getModel().uri.toString())
+	        previewModelUri: getPreviewSaveEditor() && getPreviewSaveEditor().getModel && getPreviewSaveEditor().getModel() && getPreviewSaveEditor().getModel().uri
+          ? String(getPreviewSaveEditor().getModel().uri.toString())
           : null,
+        standaloneSemanticTokenCount: state.standaloneSemanticTokenCount || 0,
+        standaloneDiagnosticMarkerCount: state.standaloneDiagnosticMarkerCount || 0,
+        standaloneLanguageFeatureLanguages: Object.keys(state.standaloneLanguageFeatureLanguages || {}),
+        standaloneLanguageFeaturePendingCount: Object.keys(state.standaloneLanguageFeaturePending || {}).length,
+        standaloneTextMatePendingCount: Object.keys(state.standaloneTextMatePending || {}).length,
+        standaloneTextMateLanguages: state.standaloneTextMateLanguages || {},
+        standaloneLanguageFeatureOwner: (function () {
+          try {
+            var editor = state.monacoEditor;
+            var model = editor && editor.getModel && editor.getModel();
+            var owners = window.__ijFindStandaloneLanguageFeatureOwners;
+            return owners && model && typeof owners.get === 'function' ? String(owners.get(model) || '') : '';
+          } catch (eLanguageOwnerState) { return ''; }
+        })(),
+        rendererInstanceId: __ijFindInstanceId,
         previewResourceModelCreates: state.previewResourceModelCreates || 0,
         previewIsolatedModelCreates: state.previewIsolatedModelCreates || 0,
         previewOwnedModelDisposes: state.previewOwnedModelDisposes || 0,
@@ -10094,7 +12370,7 @@ export function getRendererPatchScript(
 	  function onSearchMessage(msg) {
 	    if (__ijFindDisposed) { return 'disposed'; }
 	    if (Date.now() < (state.recoveryUntil || 0)) { return 'suppressed:recovery'; }
-	    if (!panel.classList.contains('visible') && msg && /^(results:|preview(?::inlays)?$|hover$)/.test(String(msg.type || ''))) {
+	    if (!panel.classList.contains('visible') && msg && /^(results:|preview(?::(?:inlays|languageFeature|diagnostics))?$|hover$)/.test(String(msg.type || ''))) {
 	      return 'ignored:hidden';
 	    }
 	    var msgSearchId = typeof msg.searchId === 'number' ? msg.searchId : null;
@@ -10295,18 +12571,40 @@ export function getRendererPatchScript(
         if (state.lastPreviewMsg) {
           try { state.lastPreviewMsg.callGraphInlays = Array.isArray(msg.callGraphInlays) ? msg.callGraphInlays : []; } catch (eInlayMsg) {}
         }
-        if (state.previewMode === 'monaco' && state.previewMonacoEditor) {
+        if (state.previewMode === 'monaco' && (state.previewMonacoEditor || state.monacoEditor)) {
           // #44 revert: keep rendering our absolute callgraph layer even
           // after hydrate. The native InlayHintsController does not
           // actually consult our provider for the embedded editor
           // (proven by the "native InlayHint click in embed preview" E2E),
           // so handing off would leave the user with no clickable inlays.
-          renderPreviewMonacoCallGraphInlays(state.previewMonacoEditor, msg);
-        } else if (state.previewMode === 'dom' && state.lastPreviewMsg) {
-          renderPreviewDOM(state.lastPreviewMsg);
+          renderPreviewMonacoCallGraphInlays(state.previewMonacoEditor || state.monacoEditor, msg);
         } else {
           send({ type: 'log', msg: 'preview inlays not rendered: mode=' + (state.previewMode || '') + ' hasMonaco=' + (!!state.previewMonacoEditor) + ' hasLast=' + (!!state.lastPreviewMsg) });
         }
+        break;
+      case 'preview:languageFeature':
+        resolveStandaloneLanguageFeature(msg);
+        break;
+      case 'preview:textMateGrammar':
+        resolveStandaloneTextMateMessage(msg);
+        break;
+      case 'preview:textMateGrammarInvalidated':
+        refreshStandaloneTextMateGrammarAfterInvalidation();
+        break;
+      case 'preview:diagnostics':
+        if (msg.uri !== state.previewUri || state.previewEngine !== 'standalone' || !state.monacoEditor || state.previewDirty) { break; }
+        try {
+          var bundledForDiagnostics = findBundledMonacoSync();
+          var diagnosticModel = state.monacoEditor.getModel && state.monacoEditor.getModel();
+          if (typeof msg.documentHash === 'string' && diagnosticModel && diagnosticModel.getValue &&
+              msg.documentHash !== previewContentHash(diagnosticModel.getValue())) { break; }
+          if (bundledForDiagnostics && diagnosticModel) {
+            applyStandalonePreviewDiagnostics(bundledForDiagnostics.api, diagnosticModel, msg.diagnostics);
+          }
+        } catch (eDiagnosticUpdate) {}
+        break;
+      case 'preview:saveResult':
+        resolvePreviewSaveResult(msg);
         break;
       case 'lspPressure':
         // Diagnostics-driven backpressure: when LSP is overloaded the
@@ -10367,7 +12665,10 @@ export function getRendererPatchScript(
   function findRegisteredSearchInstance(targetSrc) {
     try {
       var registry = searchInstanceRegistry();
-      if (targetSrc && registry[targetSrc]) { return registry[targetSrc]; }
+      // Host responses carry an explicit renderer source. Never reroute a
+      // late response from a disposed panel into whichever sibling happens
+      // to be active now.
+      if (targetSrc) { return registry[targetSrc] || null; }
       var activeId = window.__ijFindActiveInstanceId || '';
       if (activeId && registry[activeId] && isRegisteredSearchInstanceVisible(registry[activeId])) {
         return registry[activeId];
@@ -10403,7 +12704,28 @@ export function getRendererPatchScript(
         refreshSearch: refreshSearch,
         setScopeValue: window.__ijFindSetScopeValue,
         getPreviewDecorations: window.__ijFindGetPreviewDecorations,
+        getPreviewEditorForTests: getPreviewSaveEditor,
         getPreviewOverflowHostForTests: getOrCreatePreviewOverflowHost,
+        ownsPreviewModel: function (model) {
+          var editor = getPreviewSaveEditor();
+          return !!(editor && editor.getModel && editor.getModel() === model);
+        },
+        syncPreviewDirtyForModel: function (model) {
+          var editor = getPreviewSaveEditor();
+          var current = editor && editor.getModel && editor.getModel();
+          if (current === model) { updatePreviewDirtyFromModel(model); }
+        },
+        adoptPreviewCleanContentForModel: function (model, content) {
+          var editor = getPreviewSaveEditor();
+          var current = editor && editor.getModel && editor.getModel();
+          if (current !== model) { return; }
+          state.previewCleanUri = state.previewUri || '';
+          state.previewCleanContent = String(content || '');
+          state.previewSuppressDirty = false;
+          updatePreviewDirtyFromModel(model);
+        },
+        onStandaloneMonacoReady: renderStandaloneMonacoWhenReady,
+        onStandaloneMonacoFailed: renderStandaloneMonacoFailure,
         dispose: disposeSearchUi,
       };
       window.__ijFindActiveInstanceId = __ijFindInstanceId;
@@ -10456,6 +12778,13 @@ export function getRendererPatchScript(
         var inst = findRegisteredSearchInstance(targetSrc ? String(targetSrc) : '');
         if (inst && typeof inst.getPreviewDecorations === 'function') { return inst.getPreviewDecorations(); }
         return { editor: null, decorations: [] };
+      };
+      window.__ijFindGetPreviewEditorForTests = function (targetSrc) {
+        var inst = findRegisteredSearchInstance(targetSrc ? String(targetSrc) : '');
+        if (inst && typeof inst.getPreviewEditorForTests === 'function') {
+          return inst.getPreviewEditorForTests();
+        }
+        return null;
       };
       window.__ijFindDisposeAllSearchUi = function (reason) {
         var out = [];

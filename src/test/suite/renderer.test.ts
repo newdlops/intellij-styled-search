@@ -69,6 +69,93 @@ async function probeRendererSearchState(overlay: ExtensionTestApi['overlay']): P
   return JSON.parse(raw);
 }
 
+async function warmMonacoPreviewForRendererTest(
+  overlay: ExtensionTestApi['overlay'],
+  queryValue: string,
+): Promise<void> {
+  const raw = await overlay.evalInActiveWindowForTests(
+    `(async function(){
+      var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+        var query = node.querySelector('.ij-find-query');
+        return query && query.value === ${JSON.stringify(queryValue)};
+      });
+      if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
+      var targetSrc = root.getAttribute('data-ij-find-src') || '';
+      var oldDisable = window.__ijFindDisableMonacoProbes;
+      window.__ijFindDisableMonacoProbes = true;
+      try {
+        window.__ijFindOnMessage({
+          type: 'preview',
+          __targetSrc: targetSrc,
+          uri: 'file:///ijss-test-monaco-warmup-' + Date.now() + '.txt',
+          relPath: 'ijss-test-monaco-warmup.txt',
+          languageId: 'plaintext',
+          focusLine: 0,
+          fullFile: true,
+          lines: [{ lineNumber: 0, text: 'Monaco preview warmup' }],
+          ranges: []
+        });
+        var state = window.__ijFindGetSearchState(targetSrc);
+        var deadline = performance.now() + 8000;
+        while (performance.now() < deadline) {
+          var editor = window.__ijFindGetPreviewEditorForTests
+            ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+            : null;
+          if (state && state.previewMode === 'monaco' && editor && editor.getModel && editor.getModel()) {
+            return JSON.stringify({ mode: state.previewMode, engine: state.previewEngine });
+          }
+          await new Promise(function (resolve) { setTimeout(resolve, 20); });
+          state = window.__ijFindGetSearchState(targetSrc);
+        }
+        return JSON.stringify({ err: 'Monaco warmup timed out', state: state });
+      } finally {
+        window.__ijFindDisableMonacoProbes = oldDisable;
+      }
+    })()`,
+  );
+  const parsed = JSON.parse(raw) as { err?: string; mode?: string };
+  assert.strictEqual(parsed.err, undefined, `expected Monaco preview warmup to complete: ${raw}`);
+  assert.strictEqual(parsed.mode, 'monaco', `expected Monaco preview mode after warmup: ${raw}`);
+}
+
+async function requestHostPreviewForRendererTest(
+  overlay: ExtensionTestApi['overlay'],
+  queryValue: string,
+  uri: vscode.Uri,
+  line = 0,
+): Promise<string> {
+  const targetSrc = await overlay.evalInActiveWindowForTests(
+    `(function(){
+      var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+        var query = node.querySelector('.ij-find-query');
+        return query && query.value === ${JSON.stringify(queryValue)};
+      });
+      return root ? root.getAttribute('data-ij-find-src') || '' : '';
+    })()`,
+  );
+  assert.ok(targetSrc, `expected renderer source for ${queryValue}`);
+  const previewSeq = Number(await overlay.evalInActiveWindowForTests(
+    `(function(){
+      var state = window.__ijFindGetSearchState
+        ? window.__ijFindGetSearchState(${JSON.stringify(targetSrc)}) : {};
+      var active = state && typeof state.activePreviewSeq === 'number' ? state.activePreviewSeq : 0;
+      return String(active + 1);
+    })()`,
+  ));
+  const activeWindowId = overlay.getConnectionStateForTests().activeWindowId;
+  overlay.injectRendererEventForTests(JSON.stringify({
+    type: 'requestPreview',
+    uri: uri.toString(),
+    line,
+    contextLines: 0,
+    ranges: [{ start: 0, end: 1 }],
+    previewSeq,
+    __src: targetSrc,
+    ...(typeof activeWindowId === 'number' ? { __win: activeWindowId } : {}),
+  }));
+  return targetSrc;
+}
+
 function assertNoAddedTabs(before: Map<string, number>, label: string): void {
   const after = snapshotTabCounts();
   const added = addedTabKeys(before, after);
@@ -426,6 +513,18 @@ suite('Renderer — overlay UI probes', () => {
           if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
           var targetSrc = root.getAttribute('data-ij-find-src') || '';
           window.__ijFindActiveInstanceId = targetSrc;
+          var previewLines = [
+            { lineNumber: 0, text: 'class AlphaService:' },
+            { lineNumber: 1, text: '    def __init__(self, name: str) -> None:' },
+            { lineNumber: 2, text: '        self.name = name' },
+            { lineNumber: 3, text: '        self.counter = 0' }
+          ];
+          for (var fillerLine = 4; fillerLine < 500; fillerLine++) {
+            previewLines.push({
+              lineNumber: fillerLine,
+              text: '    # neutral preview filler ' + String(fillerLine).padStart(4, '0')
+            });
+          }
           window.__ijFindOnMessage({
             type: 'preview',
             __targetSrc: targetSrc,
@@ -434,27 +533,28 @@ suite('Renderer — overlay UI probes', () => {
             languageId: 'python',
             focusLine: 0,
             fullFile: true,
-            lines: [
-              { lineNumber: 0, text: 'class AlphaService:' },
-              { lineNumber: 1, text: '    def __init__(self, name: str) -> None:' },
-              { lineNumber: 2, text: '        self.name = name' },
-              { lineNumber: 3, text: '        self.counter = 0' }
-            ],
+            lines: previewLines,
             ranges: [{ start: 6, end: 18 }]
           });
           function probe(label) {
             var snap = window.__ijFindGetPreviewMonacoStateForTests
               ? window.__ijFindGetPreviewMonacoStateForTests()
               : null;
+            var liveEditor = window.__ijFindGetPreviewEditorForTests
+              ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+              : null;
             var body = root.querySelector('.ij-find-preview-body');
             var hostEl = body ? body.querySelector('.ij-find-monaco-preview-host') : null;
             return {
               label: label,
               previewMode: snap && snap.previewMode,
+              previewEngine: snap && snap.previewEngine,
               hostMounted: !!hostEl,
+              bundledHostMounted: !!(body && body.querySelector('.ij-find-monaco-host')),
               domInHost: !!(snap && snap.domInHost),
               viewLines: snap && typeof snap.viewLines === 'number' ? snap.viewLines : 0,
               modelOk: !!(snap && snap.modelOk),
+              scrollTop: liveEditor && liveEditor.getScrollTop ? liveEditor.getScrollTop() : -1,
             };
           }
           // 2s mount poll keeps the total eval time under the 20s mocha
@@ -471,6 +571,13 @@ suite('Renderer — overlay UI probes', () => {
           if (!mounted || !(mounted.previewMode === 'monaco' && mounted.hostMounted && mounted.domInHost && mounted.viewLines > 0 && mounted.modelOk)) {
             return JSON.stringify({ phase: 'mount-failed', mounted: mounted });
           }
+          var mountedEditor = window.__ijFindGetPreviewEditorForTests
+            ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+            : null;
+          try { mountedEditor && mountedEditor.layout && mountedEditor.layout(); } catch (eLayoutBeforeClick) {}
+          try { mountedEditor && mountedEditor.setScrollTop && mountedEditor.setScrollTop(720); } catch (eScrollBeforeClick) {}
+          await new Promise(function (resolve) { setTimeout(resolve, 80); });
+          var baselineScroll = mountedEditor && mountedEditor.getScrollTop ? mountedEditor.getScrollTop() : -1;
           var body = root.querySelector('.ij-find-preview-body');
           var host = body ? body.querySelector('.ij-find-monaco-preview-host') : null;
           var dom = host ? host.querySelector('.monaco-editor') : null;
@@ -578,6 +685,12 @@ suite('Renderer — overlay UI probes', () => {
               domInHost: !!(snap && snap.domInHost),
               viewLines: snap && typeof snap.viewLines === 'number' ? snap.viewLines : 0,
               modelOk: !!(snap && snap.modelOk),
+              previewEngine: snap && snap.previewEngine,
+              bundledHostMounted: !!(body && body.querySelector('.ij-find-monaco-host')),
+              scrollTop: window.__ijFindGetPreviewEditorForTests && window.__ijFindGetPreviewEditorForTests(targetSrc) &&
+                window.__ijFindGetPreviewEditorForTests(targetSrc).getScrollTop
+                  ? window.__ijFindGetPreviewEditorForTests(targetSrc).getScrollTop()
+                  : -1,
               disposed: !!(snap && snap.disposed),
               domErr: snap && snap.domErr || '',
             });
@@ -606,6 +719,7 @@ suite('Renderer — overlay UI probes', () => {
             afterImmediate: afterImmediate,
             afterShortWait: afterShortWait,
             afterLongWait: afterLongWait,
+            baselineScroll: baselineScroll,
             timeline: timeline,
             hostMutations: hostMutations.slice(0, 30),
             bodyMutations: bodyMutations.slice(0, 30),
@@ -622,16 +736,20 @@ suite('Renderer — overlay UI probes', () => {
       const parsed = JSON.parse(raw) as {
         phase?: string;
         err?: string;
-        mounted?: { previewMode?: string; hostMounted?: boolean; domInHost?: boolean; viewLines?: number; modelOk?: boolean };
-        afterImmediate?: { domInHost?: boolean; viewLines?: number; modelOk?: boolean };
-        afterShortWait?: { domInHost?: boolean; viewLines?: number; modelOk?: boolean };
-        afterLongWait?: { domInHost?: boolean; viewLines?: number; modelOk?: boolean };
+        baselineScroll?: number;
+        mounted?: { previewMode?: string; previewEngine?: string; hostMounted?: boolean; bundledHostMounted?: boolean; domInHost?: boolean; viewLines?: number; modelOk?: boolean; scrollTop?: number };
+        afterImmediate?: { previewEngine?: string; bundledHostMounted?: boolean; domInHost?: boolean; viewLines?: number; modelOk?: boolean; scrollTop?: number };
+        afterShortWait?: { previewEngine?: string; bundledHostMounted?: boolean; domInHost?: boolean; viewLines?: number; modelOk?: boolean; scrollTop?: number };
+        afterLongWait?: { previewEngine?: string; bundledHostMounted?: boolean; domInHost?: boolean; viewLines?: number; modelOk?: boolean; scrollTop?: number };
+        timeline?: Array<{ previewEngine?: string; bundledHostMounted?: boolean; scrollTop?: number }>;
       };
       assert.strictEqual(parsed.err, undefined, `expected preview-click probe to run: ${raw}`);
       assert.strictEqual(parsed.phase, 'measured', `expected probe to complete the mount+click sequence: ${raw}`);
       assert.strictEqual(parsed.mounted?.previewMode, 'monaco', `preview should mount in Monaco mode before click: ${raw}`);
+      assert.strictEqual(parsed.mounted?.previewEngine, 'native', `preview should establish native ownership before click: ${raw}`);
       assert.strictEqual(parsed.mounted?.domInHost, true, `editor DOM should be inside the host before click: ${raw}`);
       assert.strictEqual(parsed.mounted?.modelOk, true, `editor should have a model before click: ${raw}`);
+      assert.ok((parsed.baselineScroll ?? 0) >= 400, `click probe must establish a meaningful scroll offset: ${raw}`);
       // The actual regression assertions: after a click in the preview editor,
       // its DOM must remain inside our host and its model must stay attached.
       assert.strictEqual(
@@ -658,6 +776,18 @@ suite('Renderer — overlay UI probes', () => {
         true,
         `editor model should remain attached after the self-heal window: ${raw}`,
       );
+      for (const snapshot of [parsed.afterImmediate, parsed.afterShortWait, parsed.afterLongWait]) {
+        assert.strictEqual(snapshot?.previewEngine, 'native', `click/self-heal must never downgrade native preview: ${raw}`);
+        assert.strictEqual(snapshot?.bundledHostMounted, false, `click/self-heal must never mount bundled Monaco: ${raw}`);
+        assert.ok(
+          Math.abs((snapshot?.scrollTop ?? -1) - (parsed.baselineScroll ?? -1)) <= 32,
+          `click/self-heal must preserve the native viewport: ${raw}`,
+        );
+      }
+      assert.ok(
+        (parsed.timeline ?? []).every((snapshot) => snapshot.previewEngine === 'native' && snapshot.bundledHostMounted === false),
+        `sampled click/self-heal timeline must remain native-only: ${raw}`,
+      );
     } finally {
       await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
       try {
@@ -678,144 +808,2636 @@ suite('Renderer — overlay UI probes', () => {
     }
   });
 
-  test('DOM fallback preview auto-recovers to Monaco for the same file after capture returns', async function () {
+  test('bundled Monaco preview never falls back to DOM or opens an editor tab', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(20_000);
     const { overlay } = await getApi();
-    await overlay.show('DomFallbackRecoveryProbe', { forceLiteral: true, suppressSearch: true });
-    const anyOverlay = overlay as any;
-    let monacoReady = false;
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
+    const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
+    const tabsBefore = snapshotTabCounts();
+    const groupsBefore = snapshotTabGroupCount();
+    const visibleBefore = visibleEditorUris();
+    const openedTabsDuringProbe: string[] = [];
+    let openedGroupsDuringProbe = 0;
+    const tabChangeListener = vscode.window.tabGroups.onDidChangeTabs((event) => {
+      for (const tab of event.opened) { openedTabsDuringProbe.push(tabInputKey(tab.input)); }
+    });
+    const tabGroupChangeListener = vscode.window.tabGroups.onDidChangeTabGroups((event) => {
+      openedGroupsDuringProbe += event.opened.length;
+    });
     try {
-      await anyOverlay.ensureMonacoCapture(anyOverlay.activeWindowId, undefined, {
-        allowForceOpen: true,
-        reason: 'test-dom-preview-recovery',
-      });
-      monacoReady = await overlay.waitForMonacoReadyForTests(6_000);
-    } catch {}
-    if (!monacoReady) {
-      try {
-        const forced = await overlay.forceCaptureForTests();
-        monacoReady = /^ready/.test(forced) || await overlay.waitForMonacoReadyForTests(4_000);
-      } catch {}
-    }
-    if (!monacoReady) { this.skip(); return; }
-    try {
+      await cfg.update('disableMonacoCapture', true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+      await overlay.stopMonacoCapture('bundled Monaco no-tab test');
+      await overlay.show('BundledMonacoUpgradeCleanupProbe', { forceLiteral: true, suppressSearch: true });
+      const plantedLegacyStyle = await overlay.evalInActiveWindowForTests(
+        `(function(){
+          var stale = document.createElement('style');
+          stale.id = 'ijss-stale-standalone-theme-test';
+          stale.setAttribute('data-ijss-standalone-theme', 'true');
+          stale.textContent = '.monaco-editor{--vscode-editor-background:#fff;}';
+          document.head.appendChild(stale);
+          return String(document.head.querySelectorAll('style[data-ijss-standalone-theme="true"]').length);
+        })()`,
+      );
+      assert.ok(Number(plantedLegacyStyle) > 0, 'test should plant the legacy leaked theme sheet');
+      await overlay.forceReinject();
+      const legacyStylesAfterUpgrade = await overlay.evalInActiveWindowForTests(
+        `String(document.head.querySelectorAll('style[data-ijss-standalone-theme="true"]').length)`,
+      );
+      assert.strictEqual(legacyStylesAfterUpgrade, '0', 'patch upgrade should immediately remove legacy global theme sheets');
+      await overlay.show('BundledMonacoOnlyProbe', { forceLiteral: true, suppressSearch: true });
       const raw = await overlay.evalInActiveWindowForTests(
         `(async function(){
-          var status = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'not-ready:no-status';
-          if (status !== 'ready') { return JSON.stringify({ skipped: true, status: status }); }
           var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
             var query = node.querySelector('.ij-find-query');
-            return query && query.value === 'DomFallbackRecoveryProbe';
-          }) || document.querySelector('.ij-find-overlay.visible');
+            return query && query.value === 'BundledMonacoOnlyProbe';
+          });
           if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
           var targetSrc = root.getAttribute('data-ij-find-src') || '';
-          window.__ijFindActiveInstanceId = targetSrc;
-          var uri = 'file:///tmp/ijss-dom-preview-recovery-' + Date.now() + '.py';
-          var msg = {
+          var uri = 'file:///tmp/ijss-bundled-monaco-' + Date.now() + '.py';
+          var modes = [];
+          var domPreviewSeen = false;
+          var workbenchRoot = document.querySelector('.monaco-workbench');
+          var workbenchToken = document.querySelector('.editor-group-container .monaco-editor .view-line span');
+          var workbenchTokenColorBefore = workbenchToken ? getComputedStyle(workbenchToken).color : '';
+          var workbenchBackgroundBefore = workbenchRoot ? getComputedStyle(workbenchRoot).backgroundColor : '';
+          var workbenchForegroundBefore = workbenchRoot ? getComputedStyle(workbenchRoot).color : '';
+          var workbenchClassBefore = workbenchRoot ? String(workbenchRoot.className || '') : '';
+          var globalMonacoStylesBefore = document.head.querySelectorAll('style.monaco-colors').length;
+          var staleUri = uri + '.stale';
+          window.__ijFindOnMessage({
+            type: 'preview',
+            __targetSrc: targetSrc,
+            uri: staleUri,
+            relPath: 'ijss-stale-bundled-monaco.py',
+            languageId: 'python',
+            focusLine: 0,
+            fullFile: true,
+            lines: [{ lineNumber: 0, text: 'stale preview must never win' }],
+            ranges: []
+          });
+          window.__ijFindOnMessage({
             type: 'preview',
             __targetSrc: targetSrc,
             uri: uri,
-            relPath: 'ijss-dom-preview-recovery.py',
+            relPath: 'ijss-bundled-monaco.py',
             languageId: 'python',
             focusLine: 1,
             fullFile: true,
             lines: [
-              { lineNumber: 0, text: 'class DomFallbackRecovery:' },
+              { lineNumber: 0, text: 'class BundledMonacoPreview:' },
               { lineNumber: 1, text: '    def target(self):' },
               { lineNumber: 2, text: '        return 42' }
             ],
             ranges: [{ start: 8, end: 14 }]
-          };
-          var oldDisable = window.__ijFindDisableMonacoProbes;
-          window.__ijFindDisableMonacoProbes = true;
-          var degraded = null;
-          var degradedHost = false;
-          var degradedText = '';
-          var degradeAccepted = '';
-          var degradeDeadline = performance.now() + 500;
-          while (performance.now() < degradeDeadline) {
-            degradeAccepted = String(window.__ijFindOnMessage(msg));
-            await new Promise(function (resolve) { setTimeout(resolve, 16); });
-            degraded = window.__ijFindGetSearchState(targetSrc);
-            degradedHost = !!root.querySelector('.ij-find-monaco-preview-host .monaco-editor');
-            degradedText = (root.querySelector('.ij-find-preview-body') || root).textContent || '';
-            if (degraded && degraded.previewMode === 'dom' && degraded.previewUri === uri && degradedText.indexOf('DomFallbackRecovery') >= 0) {
-              break;
-            }
-          }
-          window.__ijFindDisableMonacoProbes = false;
-          var recoveryStarted = performance.now();
-          var recovered = null;
-          var recoveredHost = false;
-          var recoveryElapsedMs = null;
-          var deadline = performance.now() + 4000;
+          });
+          var finalState = null;
+          var outerHost = null;
+          var shadowRoot = null;
+          var editorDom = null;
+          var previewEditor = null;
+          var previewModel = null;
+          var previewRect = null;
+          var viewLines = 0;
+          var deadline = performance.now() + 8000;
           while (performance.now() < deadline) {
-            recovered = window.__ijFindGetSearchState(targetSrc);
-            recoveredHost = !!root.querySelector('.ij-find-monaco-preview-host .monaco-editor');
-            if (recovered && recovered.previewMode === 'monaco' && recovered.previewUri === uri && recoveredHost) {
-              recoveryElapsedMs = Math.round(performance.now() - recoveryStarted);
-              break;
-            }
-            await new Promise(function (resolve) { setTimeout(resolve, 16); });
+            finalState = window.__ijFindGetSearchState(targetSrc);
+            var mode = finalState && finalState.previewMode || '';
+            if (mode && modes.indexOf(mode) < 0) { modes.push(mode); }
+            if (root.querySelector('.ij-find-preview-content')) { domPreviewSeen = true; }
+            outerHost = root.querySelector('.ij-find-monaco-host');
+            shadowRoot = outerHost && outerHost.shadowRoot;
+            editorDom = shadowRoot && shadowRoot.querySelector('.monaco-editor');
+            previewEditor = window.__ijFindGetPreviewEditorForTests
+              ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+              : null;
+            previewModel = previewEditor && previewEditor.getModel ? previewEditor.getModel() : null;
+            previewRect = editorDom && editorDom.getBoundingClientRect ? editorDom.getBoundingClientRect() : null;
+            viewLines = editorDom ? editorDom.querySelectorAll('.view-line').length : 0;
+            if (mode === 'monaco' && editorDom && previewModel && viewLines > 0 &&
+                previewRect && previewRect.width > 0 && previewRect.height > 0) { break; }
+            await new Promise(function (resolve) { setTimeout(resolve, 20); });
           }
-          window.__ijFindDisableMonacoProbes = oldDisable;
+          var hoverRendered = false;
+          var hoverText = '';
+          var hoverError = '';
+          var hoverDisposable = null;
+          try {
+            var bundledApi = globalThis.__ijFindMonacoApi;
+            if (!bundledApi || !previewEditor || !shadowRoot) { throw new Error('missing bundled hover prerequisites'); }
+            hoverDisposable = bundledApi.languages.registerHoverProvider('python', {
+              provideHover: function () {
+                return {
+                  range: new bundledApi.Range(1, 1, 1, 6),
+                  contents: [{ value: '**Bundled hover**\\n\\n_safe markdown_' }]
+                };
+              }
+            });
+            previewEditor.setPosition({ lineNumber: 1, column: 2 });
+            previewEditor.focus();
+            previewEditor.trigger('ijss-test', 'editor.action.showHover', {});
+            var hoverDeadline = performance.now() + 1500;
+            while (performance.now() < hoverDeadline) {
+              var hoverNode = shadowRoot.querySelector('.monaco-hover');
+              hoverText = hoverNode ? String(hoverNode.textContent || '') : '';
+              if (hoverText.indexOf('Bundled hover') >= 0 && hoverText.indexOf('safe markdown') >= 0) {
+                hoverRendered = true;
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            }
+          } catch (eHover) {
+            hoverError = String(eHover && eHover.message || eHover);
+          } finally {
+            try { if (hoverDisposable) { hoverDisposable.dispose(); } } catch (eHoverDispose) {}
+          }
+          var themeTransitionLight = '';
+          var themeTransitionRestored = '';
+          if (workbenchRoot && workbenchRoot.classList.contains('vs-dark')) {
+            workbenchRoot.classList.remove('vs-dark');
+            workbenchRoot.classList.add('vs');
+            await new Promise(function (resolve) { setTimeout(resolve, 30); });
+            themeTransitionLight = editorDom && editorDom.classList.contains('vs') ? 'vs' : '';
+            workbenchRoot.className = workbenchClassBefore;
+            await new Promise(function (resolve) { setTimeout(resolve, 30); });
+            themeTransitionRestored = editorDom && editorDom.classList.contains('vs-dark') ? 'vs-dark' : '';
+          }
+          var workbenchTokenColorAfter = workbenchToken && workbenchToken.isConnected
+            ? getComputedStyle(workbenchToken).color
+            : '';
+          var workbenchBackgroundAfter = workbenchRoot && workbenchRoot.isConnected
+            ? getComputedStyle(workbenchRoot).backgroundColor : '';
+          var workbenchForegroundAfter = workbenchRoot && workbenchRoot.isConnected
+            ? getComputedStyle(workbenchRoot).color : '';
+          var workbenchClassAfter = workbenchRoot && workbenchRoot.isConnected
+            ? String(workbenchRoot.className || '') : '';
+          var globalMonacoStylesAfter = document.head.querySelectorAll('style.monaco-colors').length;
+          var leakedStandaloneStyles = document.head.querySelectorAll('style[data-ijss-standalone-theme="true"]').length;
+          var shadowThemeStyle = shadowRoot && shadowRoot.querySelector('style.monaco-colors');
+          var shadowBaseStyle = shadowRoot && shadowRoot.querySelector('style[data-ijss-monaco-base="true"]');
+          var trustedTypesFrame = document.querySelector('iframe[data-ijss-monaco-trusted-types="true"]');
+          var trustedTypesState = globalThis.__ijFindMonacoTrustedTypesBootstrap || null;
+          var previewTheme = editorDom && editorDom.classList.contains('vs-dark') ? 'vs-dark'
+            : (editorDom && editorDom.classList.contains('hc-black') ? 'hc-black'
+              : (editorDom && editorDom.classList.contains('hc-light') ? 'hc-light' : 'vs'));
           return JSON.stringify({
             uri: uri,
-            statusAfterCaptureReturn: window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'not-ready:no-status',
-            recoveryElapsedMs: recoveryElapsedMs,
-            degraded: {
-              mode: degraded && degraded.previewMode,
-              uri: degraded && degraded.previewUri,
-              host: degradedHost,
-              hasText: degradedText.indexOf('DomFallbackRecovery') >= 0,
-              accepted: degradeAccepted
-            },
-            recovered: {
-              mode: recovered && recovered.previewMode,
-              uri: recovered && recovered.previewUri,
-              host: recoveredHost,
-              modelUri: recovered && recovered.previewModelUri
-            }
+            mode: finalState && finalState.previewMode,
+            engine: finalState && finalState.previewEngine,
+            previewUri: finalState && finalState.previewUri,
+            modes: modes,
+            domPreviewSeen: domPreviewSeen,
+            hasHost: !!outerHost,
+            hasShadowRoot: !!shadowRoot,
+            hasEditorDom: !!editorDom,
+            hasShadowThemeStyle: !!shadowThemeStyle,
+            hasShadowBaseStyle: !!shadowBaseStyle,
+            viewLines: viewLines,
+            editorWidth: previewRect ? Math.round(previewRect.width) : 0,
+            editorHeight: previewRect ? Math.round(previewRect.height) : 0,
+            modelLineCount: previewModel && previewModel.getLineCount ? previewModel.getLineCount() : 0,
+            modelValue: previewModel && previewModel.getValue ? previewModel.getValue() : '',
+            previewTheme: previewTheme,
+            hoverRendered: hoverRendered,
+            hoverText: hoverText,
+            hoverError: hoverError,
+            themeTransitionLight: themeTransitionLight,
+            themeTransitionRestored: themeTransitionRestored,
+            hasTrustedTypesFrame: !!trustedTypesFrame,
+            trustedTypesFrameDisplay: trustedTypesFrame ? getComputedStyle(trustedTypesFrame).display : '',
+            trustedTypesBootstrapError: trustedTypesState && trustedTypesState.error || '',
+            hasDomPreview: !!root.querySelector('.ij-find-preview-content'),
+            workbenchTokenColorBefore: workbenchTokenColorBefore,
+            workbenchTokenColorAfter: workbenchTokenColorAfter,
+            workbenchBackgroundBefore: workbenchBackgroundBefore,
+            workbenchBackgroundAfter: workbenchBackgroundAfter,
+            workbenchForegroundBefore: workbenchForegroundBefore,
+            workbenchForegroundAfter: workbenchForegroundAfter,
+            workbenchClassBefore: workbenchClassBefore,
+            workbenchClassAfter: workbenchClassAfter,
+            globalMonacoStylesBefore: globalMonacoStylesBefore,
+            globalMonacoStylesAfter: globalMonacoStylesAfter,
+            leakedStandaloneStyles: leakedStandaloneStyles
           });
         })()`,
       );
       const parsed = JSON.parse(raw) as {
-        skipped?: boolean;
         err?: string;
-        status?: string;
         uri?: string;
-        statusAfterCaptureReturn?: string;
-        recoveryElapsedMs?: number | null;
-        degraded?: { mode?: string; uri?: string; host?: boolean; hasText?: boolean };
-        recovered?: { mode?: string; uri?: string; host?: boolean; modelUri?: string };
+        mode?: string;
+        engine?: string;
+        previewUri?: string;
+        modes?: string[];
+        domPreviewSeen?: boolean;
+        hasHost?: boolean;
+        hasShadowRoot?: boolean;
+        hasEditorDom?: boolean;
+        hasShadowThemeStyle?: boolean;
+        hasShadowBaseStyle?: boolean;
+        viewLines?: number;
+        editorWidth?: number;
+        editorHeight?: number;
+        modelLineCount?: number;
+        modelValue?: string;
+        previewTheme?: string;
+        hoverRendered?: boolean;
+        hoverText?: string;
+        hoverError?: string;
+        themeTransitionLight?: string;
+        themeTransitionRestored?: string;
+        hasTrustedTypesFrame?: boolean;
+        trustedTypesFrameDisplay?: string;
+        trustedTypesBootstrapError?: string;
+        hasDomPreview?: boolean;
+        workbenchTokenColorBefore?: string;
+        workbenchTokenColorAfter?: string;
+        workbenchBackgroundBefore?: string;
+        workbenchBackgroundAfter?: string;
+        workbenchForegroundBefore?: string;
+        workbenchForegroundAfter?: string;
+        workbenchClassBefore?: string;
+        workbenchClassAfter?: string;
+        globalMonacoStylesBefore?: number;
+        globalMonacoStylesAfter?: number;
+        leakedStandaloneStyles?: number;
       };
-      if (parsed.skipped) { this.skip(); return; }
-      assert.strictEqual(parsed.err, undefined, `expected DOM recovery probe to run: ${raw}`);
-      assert.strictEqual(parsed.statusAfterCaptureReturn, 'ready', `expected Monaco capture to be ready after probes are re-enabled: ${raw}`);
-      assert.strictEqual(parsed.degraded?.mode, 'dom', `preview should first degrade to DOM fallback: ${raw}`);
-      assert.strictEqual(parsed.degraded?.uri, parsed.uri, `DOM fallback should keep the same preview URI: ${raw}`);
-      assert.strictEqual(parsed.degraded?.host, false, `DOM fallback should not keep a Monaco host mounted: ${raw}`);
-      assert.strictEqual(parsed.degraded?.hasText, true, `DOM fallback should render preview contents: ${raw}`);
-      assert.strictEqual(parsed.recovered?.mode, 'monaco', `same preview should recover to Monaco mode without a second preview message: ${raw}`);
-      assert.strictEqual(parsed.recovered?.uri, parsed.uri, `recovered Monaco preview should keep the same URI: ${raw}`);
-      assert.strictEqual(parsed.recovered?.host, true, `recovered preview should mount a Monaco editor host: ${raw}`);
-      assert.ok(
-        typeof parsed.recoveryElapsedMs === 'number' && parsed.recoveryElapsedMs <= 4000,
-        `DOM fallback preview should recover to Monaco within 4000ms after capture returns: ${raw}`,
+      assert.strictEqual(parsed.err, undefined, `expected bundled Monaco probe to run: ${raw}`);
+      assert.strictEqual(parsed.mode, 'monaco', `preview must finish in Monaco mode: ${raw}`);
+      assert.strictEqual(parsed.engine, 'standalone', `native capture was disabled, so bundled Monaco must own the preview: ${raw}`);
+      assert.strictEqual(parsed.previewUri, parsed.uri, `Monaco preview should keep the requested URI: ${raw}`);
+      assert.strictEqual(parsed.hasHost, true, `bundled Monaco editor should be mounted: ${raw}`);
+      assert.strictEqual(parsed.hasShadowRoot, true, `bundled Monaco must be isolated in a ShadowRoot: ${raw}`);
+      assert.strictEqual(parsed.hasEditorDom, true, `bundled Monaco should create its editor DOM inside the ShadowRoot: ${raw}`);
+      assert.strictEqual(parsed.hasShadowBaseStyle, true, `bundled Monaco base CSS must be installed inside the ShadowRoot: ${raw}`);
+      assert.strictEqual(parsed.hasShadowThemeStyle, true, `bundled Monaco theme CSS must stay inside the ShadowRoot: ${raw}`);
+      assert.strictEqual(parsed.hasTrustedTypesFrame, true, `bundled Monaco should use an isolated Trusted Types registry: ${raw}`);
+      assert.strictEqual(parsed.trustedTypesFrameDisplay, 'none', `the Trusted Types registry frame must remain hidden: ${raw}`);
+      assert.strictEqual(parsed.trustedTypesBootstrapError, '', `isolated Trusted Types setup must succeed: ${raw}`);
+      assert.ok((parsed.viewLines ?? 0) > 0, `bundled Monaco must render visible code lines: ${raw}`);
+      assert.ok((parsed.editorWidth ?? 0) > 0, `bundled Monaco must have a non-zero width: ${raw}`);
+      assert.ok((parsed.editorHeight ?? 0) > 0, `bundled Monaco must have a non-zero height: ${raw}`);
+      assert.strictEqual(parsed.modelLineCount, 3, `bundled Monaco should attach the requested model: ${raw}`);
+      assert.strictEqual(
+        parsed.modelValue,
+        'class BundledMonacoPreview:\n    def target(self):\n        return 42',
+        `bundled Monaco should display the requested source: ${raw}`,
       );
+      assert.strictEqual(parsed.hoverError, '', `bundled Monaco hover should not throw: ${raw}`);
+      assert.strictEqual(parsed.hoverRendered, true, `bundled Monaco must render Markdown hover content under Trusted Types: ${raw}`);
+      assert.strictEqual(parsed.domPreviewSeen, false, `preview must never transit through DOM code rendering: ${raw}`);
+      assert.strictEqual(parsed.hasDomPreview, false, `DOM preview content must not remain mounted: ${raw}`);
+      assert.ok(!(parsed.modes ?? []).includes('dom'), `DOM preview mode is forbidden: ${raw}`);
+      assert.strictEqual(
+        parsed.globalMonacoStylesAfter,
+        parsed.globalMonacoStylesBefore,
+        `bundled Monaco must not add a global Monaco theme stylesheet: ${raw}`,
+      );
+      assert.strictEqual(parsed.leakedStandaloneStyles, 0, `no standalone theme stylesheet may leak into document.head: ${raw}`);
+      assert.strictEqual(parsed.workbenchClassAfter, parsed.workbenchClassBefore, `bundled Monaco must not change workbench theme classes: ${raw}`);
+      if (/\\b(?:vs-dark|hc-black)\\b/.test(parsed.workbenchClassBefore ?? '')) {
+        assert.ok(
+          parsed.previewTheme === 'vs-dark' || parsed.previewTheme === 'hc-black',
+          `a dark workbench must create a dark isolated preview: ${raw}`,
+        );
+      }
+      if (/\\bvs-dark\\b/.test(parsed.workbenchClassBefore ?? '')) {
+        assert.strictEqual(parsed.themeTransitionLight, 'vs', `isolated preview should follow a light theme transition: ${raw}`);
+        assert.strictEqual(parsed.themeTransitionRestored, 'vs-dark', `isolated preview should return to the workbench dark theme: ${raw}`);
+      }
+      if (parsed.workbenchTokenColorBefore && parsed.workbenchTokenColorAfter) {
+        assert.strictEqual(
+          parsed.workbenchTokenColorAfter,
+          parsed.workbenchTokenColorBefore,
+          `bundled Monaco must not recolor the normal workbench editor: ${raw}`,
+        );
+      }
+      if (parsed.workbenchBackgroundBefore && parsed.workbenchBackgroundAfter) {
+        assert.strictEqual(parsed.workbenchBackgroundAfter, parsed.workbenchBackgroundBefore, `workbench background must remain unchanged: ${raw}`);
+      }
+      if (parsed.workbenchForegroundBefore && parsed.workbenchForegroundAfter) {
+        assert.strictEqual(parsed.workbenchForegroundAfter, parsed.workbenchForegroundBefore, `workbench foreground must remain unchanged: ${raw}`);
+      }
+      assertNoAddedTabs(tabsBefore, 'bundled Monaco preview');
+      assert.deepStrictEqual(openedTabsDuringProbe, [], 'bundled Monaco preview must never transiently open an editor tab');
+      assert.strictEqual(openedGroupsDuringProbe, 0, 'bundled Monaco preview must never transiently create an editor group');
+      assert.strictEqual(snapshotTabGroupCount(), groupsBefore, 'bundled Monaco preview must not create an editor group');
+      assert.deepStrictEqual(visibleEditorUris(), visibleBefore, 'bundled Monaco preview must not change visible editors');
     } finally {
-      await overlay.evalInActiveWindowForTests(
-        `(function(){
-          Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
-            var query = root.querySelector('.ij-find-query');
-            if (!query || query.value !== 'DomFallbackRecoveryProbe') { return; }
-            var close = root.querySelector('.ij-find-close');
-            if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+      tabChangeListener.dispose();
+      tabGroupChangeListener.dispose();
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            var stale = document.getElementById('ijss-stale-standalone-theme-test');
+            if (stale) { stale.remove(); }
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== 'BundledMonacoOnlyProbe') { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisable, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorTransient, vscode.ConfigurationTarget.Workspace);
+      if (priorDisable !== true) { overlay.resumeMonacoCaptureForTests(); }
+    }
+  });
+
+  test('bundled Monaco preview preserves file URI, language, and Python tokenization across file switches', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(25_000);
+    const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
+    const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
+    const pythonUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py').toString();
+    const javascriptUri = vscode.Uri.joinPath(folder!.uri, 'beta.js').toString();
+    const queryValue = 'BundledModelIdentityProbe';
+
+    try {
+      await cfg.update('disableMonacoCapture', true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+      await overlay.stopMonacoCapture('bundled model identity test');
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true });
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
           });
-          return 'closed';
+          if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+          window.__ijFindDisableMonacoProbes = true;
+          try {
+            var pythonUri = ${JSON.stringify(pythonUri)};
+            var javascriptUri = ${JSON.stringify(javascriptUri)};
+            var pythonText = [
+              'class Container:',
+              '    def format(self, value: str) -> str:',
+              '        message = "ready"',
+              '        return message  # stable result'
+            ].join('\\n');
+            window.__ijFindOnMessage({
+              type: 'preview',
+              __targetSrc: targetSrc,
+              uri: pythonUri,
+              relPath: 'alpha.py',
+              languageId: 'python',
+              focusLine: 0,
+              fullFile: true,
+              lines: pythonText.split('\\n').map(function (text, lineNumber) {
+                return { lineNumber: lineNumber, text: text };
+              }),
+              ranges: [{ start: 6, end: 15 }]
+            });
+
+            var bundledApi = null;
+            var editor = null;
+            var firstModel = null;
+            var firstState = null;
+            var firstDeadline = performance.now() + 8000;
+            while (performance.now() < firstDeadline) {
+              bundledApi = globalThis.__ijFindMonacoApi || null;
+              firstState = window.__ijFindGetSearchState(targetSrc);
+              editor = window.__ijFindGetPreviewEditorForTests
+                ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+                : null;
+              firstModel = editor && editor.getModel ? editor.getModel() : null;
+              var firstUriNow = firstModel && firstModel.uri && firstModel.uri.toString
+                ? String(firstModel.uri.toString()) : '';
+              var firstLanguageNow = firstModel && firstModel.getLanguageId
+                ? String(firstModel.getLanguageId()) : '';
+              if (bundledApi && firstState && firstState.previewEngine === 'standalone' &&
+                  firstUriNow === pythonUri && firstLanguageNow === 'python') {
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            }
+            if (!bundledApi || !editor || !firstModel) {
+              return JSON.stringify({ err: 'bundled Monaco model did not mount', state: firstState });
+            }
+
+            var tokenTypes = [];
+            var tokenDeadline = performance.now() + 4000;
+            while (performance.now() < tokenDeadline) {
+              try {
+                var tokenLines = bundledApi.editor.tokenize(firstModel.getValue(), 'python') || [];
+                tokenTypes = [];
+                for (var lineIdx = 0; lineIdx < tokenLines.length; lineIdx++) {
+                  for (var tokenIdx = 0; tokenIdx < tokenLines[lineIdx].length; tokenIdx++) {
+                    var tokenType = String(tokenLines[lineIdx][tokenIdx].type || '');
+                    if (tokenType && tokenTypes.indexOf(tokenType) < 0) { tokenTypes.push(tokenType); }
+                  }
+                }
+              } catch (eTokenize) {}
+              if (tokenTypes.some(function (type) { return /keyword/i.test(type); }) &&
+                  tokenTypes.some(function (type) { return /string/i.test(type); }) &&
+                  tokenTypes.some(function (type) { return /comment/i.test(type); })) {
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 25); });
+            }
+
+            var firstUri = firstModel.uri && firstModel.uri.toString ? String(firstModel.uri.toString()) : '';
+            var firstLanguage = firstModel.getLanguageId ? String(firstModel.getLanguageId()) : '';
+            var firstRegistered = false;
+            try {
+              firstRegistered = bundledApi.editor.getModel(bundledApi.Uri.parse(pythonUri)) === firstModel;
+            } catch (eFirstRegistry) {}
+
+            var javascriptText = [
+              'export class Container {',
+              '  format(value) {',
+              '    return String(value);',
+              '  }',
+              '}'
+            ].join('\\n');
+            window.__ijFindOnMessage({
+              type: 'preview',
+              __targetSrc: targetSrc,
+              uri: javascriptUri,
+              relPath: 'beta.js',
+              languageId: 'javascript',
+              focusLine: 1,
+              fullFile: true,
+              lines: javascriptText.split('\\n').map(function (text, lineNumber) {
+                return { lineNumber: lineNumber, text: text };
+              }),
+              ranges: [{ start: 2, end: 8 }]
+            });
+
+            var secondModel = null;
+            var secondState = null;
+            var secondDeadline = performance.now() + 5000;
+            while (performance.now() < secondDeadline) {
+              secondState = window.__ijFindGetSearchState(targetSrc);
+              editor = window.__ijFindGetPreviewEditorForTests
+                ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+                : null;
+              secondModel = editor && editor.getModel ? editor.getModel() : null;
+              var secondUriNow = secondModel && secondModel.uri && secondModel.uri.toString
+                ? String(secondModel.uri.toString()) : '';
+              var secondLanguageNow = secondModel && secondModel.getLanguageId
+                ? String(secondModel.getLanguageId()) : '';
+              if (secondState && secondState.previewEngine === 'standalone' &&
+                  secondUriNow === javascriptUri && secondLanguageNow === 'javascript') {
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            }
+
+            var oldDisposed = null;
+            try {
+              oldDisposed = typeof firstModel.isDisposed === 'function' ? firstModel.isDisposed() : null;
+            } catch (eDisposed) {}
+            var oldStillRegistered = null;
+            var secondRegistered = false;
+            try {
+              oldStillRegistered = !!bundledApi.editor.getModel(bundledApi.Uri.parse(pythonUri));
+              secondRegistered = bundledApi.editor.getModel(bundledApi.Uri.parse(javascriptUri)) === secondModel;
+            } catch (eRegistry) {}
+
+            return JSON.stringify({
+              first: {
+                engine: firstState && firstState.previewEngine,
+                stateUri: firstState && firstState.previewUri,
+                modelUri: firstUri,
+                languageId: firstLanguage,
+                registered: firstRegistered,
+                tokenTypes: tokenTypes
+              },
+              second: {
+                engine: secondState && secondState.previewEngine,
+                stateUri: secondState && secondState.previewUri,
+                modelUri: secondModel && secondModel.uri && secondModel.uri.toString
+                  ? String(secondModel.uri.toString()) : '',
+                languageId: secondModel && secondModel.getLanguageId
+                  ? String(secondModel.getLanguageId()) : '',
+                registered: secondRegistered,
+                replacedModel: secondModel !== firstModel
+              },
+              oldDisposed: oldDisposed,
+              oldStillRegistered: oldStillRegistered
+            });
+          } finally {
+            window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+          }
         })()`,
       );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        first?: {
+          engine?: string;
+          stateUri?: string;
+          modelUri?: string;
+          languageId?: string;
+          registered?: boolean;
+          tokenTypes?: string[];
+        };
+        second?: {
+          engine?: string;
+          stateUri?: string;
+          modelUri?: string;
+          languageId?: string;
+          registered?: boolean;
+          replacedModel?: boolean;
+        };
+        oldDisposed?: boolean | null;
+        oldStillRegistered?: boolean | null;
+      };
+      assert.strictEqual(parsed.err, undefined, `expected bundled model identity probe to run: ${raw}`);
+      assert.strictEqual(parsed.first?.engine, 'standalone', `Python preview must use bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.first?.stateUri, pythonUri, `Python preview state must keep the source URI: ${raw}`);
+      assert.strictEqual(parsed.first?.modelUri, pythonUri, `Python model must be bound to its actual file URI: ${raw}`);
+      assert.strictEqual(parsed.first?.languageId, 'python', `Python model must retain its language id: ${raw}`);
+      assert.strictEqual(parsed.first?.registered, true, `Python model must be registered under its file URI: ${raw}`);
+      assert.ok(parsed.first?.tokenTypes?.some((type) => /keyword/i.test(type)), `Python keywords must be tokenized: ${raw}`);
+      assert.ok(parsed.first?.tokenTypes?.some((type) => /string/i.test(type)), `Python strings must be tokenized: ${raw}`);
+      assert.ok(parsed.first?.tokenTypes?.some((type) => /comment/i.test(type)), `Python comments must be tokenized: ${raw}`);
+      assert.strictEqual(parsed.second?.engine, 'standalone', `switched preview must remain on bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.second?.stateUri, javascriptUri, `switched preview state must use the new URI: ${raw}`);
+      assert.strictEqual(parsed.second?.modelUri, javascriptUri, `switched model must use the new file URI: ${raw}`);
+      assert.strictEqual(parsed.second?.languageId, 'javascript', `switched model must use the new language: ${raw}`);
+      assert.strictEqual(parsed.second?.registered, true, `switched model must be registered under its file URI: ${raw}`);
+      assert.strictEqual(parsed.second?.replacedModel, true, `switching files must replace the resource model: ${raw}`);
+      assert.strictEqual(parsed.oldDisposed, true, `the previous bundled model must be disposed after a file switch: ${raw}`);
+      assert.strictEqual(parsed.oldStillRegistered, false, `the previous URI must not retain a stale bundled model: ${raw}`);
+    } finally {
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisable, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorTransient, vscode.ConfigurationTarget.Workspace);
+      if (priorDisable !== true) { overlay.resumeMonacoCaptureForTests(); }
+    }
+  });
+
+  test('bundled Monaco preview bridges extension-host hover and completion providers', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(30_000);
+    const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
+    const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
+    const previewUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
+    const previewDocument = await vscode.workspace.openTextDocument(previewUri);
+    const sourceLines = previewDocument.getText().split(/\r?\n/);
+    const sourceEol = previewDocument.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    const queryValue = 'BundledLanguageProviderBridgeProbe';
+    const hoverMarker = `IJSS_BUNDLED_HOVER_${Date.now()}`;
+    const completionMarker = `ijssBundledCompletion${Date.now()}`;
+    let hoverInvocations = 0;
+    let completionInvocations = 0;
+    const hoverUris: string[] = [];
+    const completionUris: string[] = [];
+    const hoverDisposable = vscode.languages.registerHoverProvider(
+      { scheme: 'file', language: 'python' },
+      {
+        provideHover(document) {
+          hoverInvocations++;
+          hoverUris.push(document.uri.toString());
+          return new vscode.Hover(new vscode.MarkdownString(`**${hoverMarker}**`));
+        },
+      },
+    );
+    const completionDisposable = vscode.languages.registerCompletionItemProvider(
+      { scheme: 'file', language: 'python' },
+      {
+        provideCompletionItems(document) {
+          completionInvocations++;
+          completionUris.push(document.uri.toString());
+          const item = new vscode.CompletionItem(completionMarker, vscode.CompletionItemKind.Value);
+          item.insertText = completionMarker;
+          item.sortText = '0000_ijss_bundled_provider';
+          item.preselect = true;
+          return [item];
+        },
+      },
+    );
+
+    try {
+      await cfg.update('disableMonacoCapture', true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+      await overlay.stopMonacoCapture('bundled language provider bridge test');
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true });
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+          window.__ijFindDisableMonacoProbes = true;
+          try {
+            var previewUri = ${JSON.stringify(previewUri.toString())};
+            var sourceLines = ${JSON.stringify(sourceLines)};
+            window.__ijFindOnMessage({
+              type: 'preview',
+              __targetSrc: targetSrc,
+              uri: previewUri,
+              relPath: 'alpha.py',
+              languageId: 'python',
+              eol: ${JSON.stringify(sourceEol)},
+              focusLine: 0,
+              fullFile: true,
+              lines: sourceLines.map(function (text, lineNumber) {
+                return { lineNumber: lineNumber, text: text };
+              }),
+              ranges: [{ start: 6, end: 15 }]
+            });
+
+            var state = null;
+            var editor = null;
+            var model = null;
+            var shadowRoot = null;
+            var mountDeadline = performance.now() + 8000;
+            while (performance.now() < mountDeadline) {
+              state = window.__ijFindGetSearchState(targetSrc);
+              editor = window.__ijFindGetPreviewEditorForTests
+                ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+                : null;
+              model = editor && editor.getModel ? editor.getModel() : null;
+              var host = root.querySelector('.ij-find-monaco-host');
+              shadowRoot = host && host.shadowRoot;
+              var modelUri = model && model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+              var languageId = model && model.getLanguageId ? String(model.getLanguageId()) : '';
+              if (state && state.previewEngine === 'standalone' && modelUri === previewUri &&
+                  languageId === 'python' && shadowRoot) {
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            }
+            if (!editor || !model || !shadowRoot) {
+              return JSON.stringify({ err: 'bundled preview did not mount', state: state });
+            }
+
+            var hoverText = '';
+            var hoverError = '';
+            try {
+              editor.setPosition({ lineNumber: 1, column: 8 });
+              editor.focus();
+              editor.trigger('ijss-test', 'editor.action.showHover', {});
+              var hoverDeadline = performance.now() + 6000;
+              while (performance.now() < hoverDeadline) {
+                var hoverNodes = shadowRoot.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget');
+                hoverText = '';
+                for (var hoverIdx = 0; hoverIdx < hoverNodes.length; hoverIdx++) {
+                  hoverText += ' ' + String(hoverNodes[hoverIdx].textContent || '');
+                }
+                if (hoverText.indexOf(${JSON.stringify(hoverMarker)}) >= 0) { break; }
+                await new Promise(function (resolve) { setTimeout(resolve, 25); });
+              }
+            } catch (eHover) {
+              hoverError = String(eHover && eHover.message || eHover);
+            }
+
+            var completionText = '';
+            var completionError = '';
+            try {
+              editor.setPosition({ lineNumber: 1, column: 1 });
+              editor.focus();
+              editor.trigger('ijss-test', 'editor.action.triggerSuggest', {});
+              var completionDeadline = performance.now() + 6000;
+              while (performance.now() < completionDeadline) {
+                var suggestNodes = shadowRoot.querySelectorAll('.suggest-widget,.monaco-list-row');
+                completionText = '';
+                for (var suggestIdx = 0; suggestIdx < suggestNodes.length; suggestIdx++) {
+                  completionText += ' ' + String(suggestNodes[suggestIdx].textContent || '');
+                }
+                if (completionText.indexOf(${JSON.stringify(completionMarker)}) >= 0) { break; }
+                await new Promise(function (resolve) { setTimeout(resolve, 25); });
+              }
+            } catch (eCompletion) {
+              completionError = String(eCompletion && eCompletion.message || eCompletion);
+            }
+
+            return JSON.stringify({
+              engine: state && state.previewEngine,
+              stateUri: state && state.previewUri,
+              modelUri: model && model.uri && model.uri.toString ? String(model.uri.toString()) : '',
+              languageId: model && model.getLanguageId ? String(model.getLanguageId()) : '',
+              hoverText: hoverText,
+              hoverError: hoverError,
+              completionText: completionText,
+              completionError: completionError
+            });
+          } finally {
+            window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+          }
+        })()`,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        engine?: string;
+        stateUri?: string;
+        modelUri?: string;
+        languageId?: string;
+        hoverText?: string;
+        hoverError?: string;
+        completionText?: string;
+        completionError?: string;
+      };
+      assert.strictEqual(parsed.err, undefined, `expected bundled language provider probe to run: ${raw}`);
+      assert.strictEqual(parsed.engine, 'standalone', `language providers must be tested against bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.stateUri, previewUri.toString(), `preview state must keep the provider document URI: ${raw}`);
+      assert.strictEqual(parsed.modelUri, previewUri.toString(), `bundled model must use the provider document URI: ${raw}`);
+      assert.strictEqual(parsed.languageId, 'python', `bundled model must match the provider language selector: ${raw}`);
+      assert.strictEqual(parsed.hoverError, '', `bundled hover action should not throw: ${raw}`);
+      assert.ok((parsed.hoverText ?? '').includes(hoverMarker), `extension-host hover marker must render in bundled Monaco: ${raw}`);
+      assert.ok(hoverInvocations > 0, `bundled hover must invoke the extension-host provider: ${raw}`);
+      assert.ok(hoverUris.includes(previewUri.toString()), `hover provider must receive the preview file URI: ${JSON.stringify(hoverUris)}`);
+      assert.strictEqual(parsed.completionError, '', `bundled completion action should not throw: ${raw}`);
+      assert.ok((parsed.completionText ?? '').includes(completionMarker), `extension-host completion marker must render in bundled Monaco: ${raw}`);
+      assert.ok(completionInvocations > 0, `bundled completion must invoke the extension-host provider: ${raw}`);
+      assert.ok(
+        completionUris.includes(previewUri.toString()),
+        `completion provider must receive the preview file URI: ${JSON.stringify(completionUris)}`,
+      );
+    } finally {
+      hoverDisposable.dispose();
+      completionDisposable.dispose();
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisable, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorTransient, vscode.ConfigurationTarget.Workspace);
+      if (priorDisable !== true) { overlay.resumeMonacoCaptureForTests(); }
+    }
+  });
+
+  test('bundled Monaco hover combines lexical, semantic-token, and range-less host content', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(35_000);
+    const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
+    const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
+    const fixtureName = `hover_structure_${Date.now()}.py`;
+    const previewUri = vscode.Uri.joinPath(folder!.uri, fixtureName);
+    const fixtureSource = [
+      'class Transformer:',
+      '    def transform(self, value: int) -> str:',
+      '        return str(value)',
+      '',
+      'def invoke(transformer: Transformer) -> str:',
+      '    return transformer.transform(1)',
+      '',
+    ].join('\n');
+    const sourceLines = fixtureSource.split('\n');
+    const targetText = 'transform';
+    const targetLine = sourceLines.findIndex((line) => line.includes(`def ${targetText}(`));
+    assert.ok(targetLine >= 0, 'neutral fixture must contain the method declaration');
+    const targetStart = sourceLines[targetLine]!.indexOf(targetText);
+    assert.ok(targetStart >= 0, 'neutral fixture must expose the method identifier');
+    const hoverCharacter = targetStart + Math.min(2, targetText.length - 1);
+    const targetRange = new vscode.Range(
+      new vscode.Position(targetLine, targetStart),
+      new vscode.Position(targetLine, targetStart + targetText.length),
+    );
+    const queryValue = 'BundledLexicalSemanticHoverProbe';
+    const hostMarker = `IJSS_RANGELESS_HOST_HOVER_${Date.now()}`;
+    const semanticLegend = new vscode.SemanticTokensLegend(['method'], ['declaration']);
+    const hoverRequests: Array<{ uri: string; line: number; character: number }> = [];
+    const semanticUris: string[] = [];
+    let hoverDisposable: vscode.Disposable | undefined;
+    let semanticDisposable: vscode.Disposable | undefined;
+    let fixtureWritten = false;
+
+    try {
+      await vscode.workspace.fs.writeFile(previewUri, Buffer.from(fixtureSource, 'utf8'));
+      fixtureWritten = true;
+      const previewDocument = await vscode.workspace.openTextDocument(previewUri);
+      assert.strictEqual(previewDocument.languageId, 'python', 'neutral .py fixture must activate Python providers');
+      assert.strictEqual(previewDocument.getText(), fixtureSource, 'preview fixture text must match the host document');
+
+      const selector: vscode.DocumentSelector = [{
+        scheme: 'file',
+        language: 'python',
+        pattern: `**/${fixtureName}`,
+      }];
+      hoverDisposable = vscode.languages.registerHoverProvider(selector, {
+        provideHover(document, position) {
+          hoverRequests.push({
+            uri: document.uri.toString(),
+            line: position.line,
+            character: position.character,
+          });
+          if (document.uri.toString() !== previewUri.toString()) { return undefined; }
+          // Deliberately omit Hover.range. Bundled Monaco must anchor this
+          // host content to the same identifier as its lexical/semantic row.
+          return new vscode.Hover(new vscode.MarkdownString(`**${hostMarker}**`));
+        },
+      });
+      semanticDisposable = vscode.languages.registerDocumentSemanticTokensProvider(
+        selector,
+        {
+          provideDocumentSemanticTokens(document) {
+            semanticUris.push(document.uri.toString());
+            const builder = new vscode.SemanticTokensBuilder(semanticLegend);
+            if (document.uri.toString() === previewUri.toString()) {
+              builder.push(targetRange, 'method', ['declaration']);
+            }
+            return builder.build('ijss-lexical-semantic-hover');
+          },
+        },
+        semanticLegend,
+      );
+
+      await cfg.update('disableMonacoCapture', true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+      await overlay.stopMonacoCapture('bundled lexical/semantic hover test');
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true });
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+          window.__ijFindDisableMonacoProbes = true;
+          try {
+            var previewUri = ${JSON.stringify(previewUri.toString())};
+            var sourceLines = ${JSON.stringify(sourceLines)};
+            var targetLine = ${targetLine};
+            var targetStart = ${targetStart};
+            var targetText = ${JSON.stringify(targetText)};
+            var hoverCharacter = ${hoverCharacter};
+            window.__ijFindOnMessage({
+              type: 'preview',
+              __targetSrc: targetSrc,
+              uri: previewUri,
+              relPath: ${JSON.stringify(fixtureName)},
+              languageId: 'python',
+              eol: '\\n',
+              focusLine: targetLine,
+              fullFile: true,
+              lines: sourceLines.map(function (text, lineNumber) {
+                return { lineNumber: lineNumber, text: text };
+              }),
+              ranges: [{ start: targetStart, end: targetStart + targetText.length }]
+            });
+
+            var state = null;
+            var editor = null;
+            var model = null;
+            var shadowRoot = null;
+            var semanticDeadline = performance.now() + 12000;
+            while (performance.now() < semanticDeadline) {
+              state = window.__ijFindGetSearchState(targetSrc);
+              editor = window.__ijFindGetPreviewEditorForTests
+                ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+                : null;
+              model = editor && editor.getModel ? editor.getModel() : null;
+              var host = root.querySelector('.ij-find-monaco-host');
+              shadowRoot = host && host.shadowRoot;
+              var modelUri = model && model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+              if (state && state.previewEngine === 'standalone' && modelUri === previewUri &&
+                  state.standaloneSemanticTokenCount > 0 && shadowRoot) {
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 25); });
+            }
+            if (!state || state.previewEngine !== 'standalone' || !editor || !model || !shadowRoot ||
+                !(state.standaloneSemanticTokenCount > 0)) {
+              return JSON.stringify({
+                err: 'bundled semantic hover prerequisites did not become ready',
+                state: state,
+                hasEditor: !!editor,
+                hasModel: !!model,
+                hasShadowRoot: !!shadowRoot
+              });
+            }
+
+            var hoverText = '';
+            var hoverError = '';
+            try {
+              editor.setPosition({ lineNumber: targetLine + 1, column: hoverCharacter + 1 });
+              editor.focus();
+              editor.trigger('ijss-test', 'editor.action.showHover', {});
+              var hoverDeadline = performance.now() + 8000;
+              while (performance.now() < hoverDeadline) {
+                var hoverNodes = shadowRoot.querySelectorAll(
+                  '.monaco-hover,.monaco-editor-hover,.content-hover-widget,.hover-row'
+                );
+                hoverText = '';
+                for (var hoverIdx = 0; hoverIdx < hoverNodes.length; hoverIdx++) {
+                  hoverText += ' ' + String(hoverNodes[hoverIdx].textContent || '');
+                }
+                if (hoverText.indexOf('Lexical') >= 0 &&
+                    hoverText.indexOf('Semantic') >= 0 &&
+                    hoverText.indexOf('method') >= 0 &&
+                    hoverText.indexOf('declaration') >= 0 &&
+                    hoverText.indexOf(${JSON.stringify(hostMarker)}) >= 0) {
+                  break;
+                }
+                await new Promise(function (resolve) { setTimeout(resolve, 25); });
+              }
+            } catch (eHover) {
+              hoverError = String(eHover && eHover.message || eHover);
+            }
+
+            state = window.__ijFindGetSearchState(targetSrc);
+            return JSON.stringify({
+              engine: state && state.previewEngine,
+              stateUri: state && state.previewUri,
+              modelUri: model && model.uri && model.uri.toString ? String(model.uri.toString()) : '',
+              languageId: model && model.getLanguageId ? String(model.getLanguageId()) : '',
+              semanticTokenCount: state && state.standaloneSemanticTokenCount,
+              hoverText: hoverText,
+              hoverError: hoverError
+            });
+          } finally {
+            window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+          }
+        })()`,
+        25_000,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        engine?: string;
+        stateUri?: string;
+        modelUri?: string;
+        languageId?: string;
+        semanticTokenCount?: number;
+        hoverText?: string;
+        hoverError?: string;
+      };
+      assert.strictEqual(parsed.err, undefined, `expected combined bundled hover probe to run: ${raw}`);
+      assert.strictEqual(parsed.engine, 'standalone', `combined hover must remain on bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.stateUri, previewUri.toString(), `preview state must retain the neutral fixture URI: ${raw}`);
+      assert.strictEqual(parsed.modelUri, previewUri.toString(), `bundled model must use the neutral fixture URI: ${raw}`);
+      assert.strictEqual(parsed.languageId, 'python', `bundled model must retain Python tokenization: ${raw}`);
+      assert.ok((parsed.semanticTokenCount ?? 0) > 0, `semantic tokens must be ready before hover: ${raw}`);
+      assert.strictEqual(parsed.hoverError, '', `combined bundled hover action should not throw: ${raw}`);
+      assert.ok((parsed.hoverText ?? '').includes('Lexical'), `hover DOM must include lexical classification: ${raw}`);
+      assert.ok((parsed.hoverText ?? '').includes('Semantic'), `hover DOM must include semantic classification: ${raw}`);
+      assert.ok(/\bmethod\b/.test(parsed.hoverText ?? ''), `hover DOM must include the semantic token type: ${raw}`);
+      assert.ok(/\bdeclaration\b/.test(parsed.hoverText ?? ''), `hover DOM must include the semantic modifier: ${raw}`);
+      assert.ok((parsed.hoverText ?? '').includes(hostMarker), `hover DOM must include range-less host content: ${raw}`);
+      assert.strictEqual(hoverRequests.length, 1, `same-word hover must invoke the host provider exactly once: ${raw}`);
+      assert.ok(
+        hoverRequests.every((request) =>
+          request.uri === previewUri.toString() &&
+          request.line === targetLine &&
+          request.character === hoverCharacter),
+        `host hover requests must use the exact preview URI and identifier position: ${JSON.stringify(hoverRequests)}`,
+      );
+      assert.ok(
+        semanticUris.includes(previewUri.toString()),
+        `semantic token provider must receive the neutral fixture URI: ${JSON.stringify(semanticUris)}`,
+      );
+    } finally {
+      hoverDisposable?.dispose();
+      semanticDisposable?.dispose();
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisable, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorTransient, vscode.ConfigurationTarget.Workspace);
+      if (priorDisable !== true) { overlay.resumeMonacoCaptureForTests(); }
+      if (fixtureWritten) {
+        try { await vscode.workspace.fs.delete(previewUri, { recursive: false, useTrash: false }); } catch {}
+      }
+    }
+  });
+
+  test('bundled Monaco loads contributed TextMate multiline and injection scopes without replacing the preview', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(45_000);
+    const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const grammarExtension = vscode.extensions.getExtension('fixture.textmate-bridge-fixture');
+    assert.ok(grammarExtension, 'expected the grammar-only fixture extension to be installed');
+    assert.strictEqual(grammarExtension.isActive, false, 'discovering a contributed grammar must not activate its extension');
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
+    const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
+    const languageId = 'fixture-structured-text';
+    const rootScope = 'source.fixture-structured-text';
+    const multilineScope = 'entity.name.type.inside-block.fixture-structured-text';
+    const injectionScope = 'support.function.directive.injected.fixture-structured-text';
+    const fixtureName = `structured_${Date.now()}.fixturetext`;
+    const previewUri = vscode.Uri.joinPath(folder!.uri, fixtureName);
+    const sourceLines = Array.from({ length: 36 }, (_, index) => `declare item${index}`);
+    sourceLines.push('[[', '  Widget', ']]', '@trace');
+    for (let index = 36; index < 80; index++) { sourceLines.push(`yield item${index}`); }
+    const fixtureSource = sourceLines.join('\n');
+    const multilineLine = sourceLines.indexOf('  Widget');
+    const multilineStart = sourceLines[multilineLine]!.indexOf('Widget');
+    const injectionLine = sourceLines.indexOf('@trace');
+    const injectionStart = sourceLines[injectionLine]!.indexOf('@trace');
+    assert.ok(multilineLine > 0 && multilineStart >= 0, 'fixture must contain an identifier inside a multiline rule');
+    assert.ok(injectionLine > multilineLine && injectionStart >= 0, 'fixture must contain an injected token outside the multiline rule');
+    const queryValue = 'BundledTextMateGrammarBridgeProbe';
+    let fixtureWritten = false;
+
+    try {
+      await vscode.workspace.fs.writeFile(previewUri, Buffer.from(fixtureSource, 'utf8'));
+      fixtureWritten = true;
+      const previewDocument = await vscode.workspace.openTextDocument(previewUri);
+      assert.strictEqual(previewDocument.languageId, languageId, 'the fixture extension must assign its contributed language id');
+      assert.strictEqual(previewDocument.getText(), fixtureSource, 'the host document must contain the structural grammar fixture');
+
+      await cfg.update('disableMonacoCapture', true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+      await overlay.stopMonacoCapture('bundled TextMate grammar bridge test');
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true });
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+          window.__ijFindDisableMonacoProbes = true;
+          try {
+            var previewUri = ${JSON.stringify(previewUri.toString())};
+            var sourceLines = ${JSON.stringify(sourceLines)};
+            var languageId = ${JSON.stringify(languageId)};
+            var multilineLine = ${multilineLine};
+            var multilineStart = ${multilineStart};
+            var injectionLine = ${injectionLine};
+            var injectionStart = ${injectionStart};
+            window.__ijFindOnMessage({
+              type: 'preview',
+              __targetSrc: targetSrc,
+              uri: previewUri,
+              relPath: ${JSON.stringify(fixtureName)},
+              languageId: languageId,
+              eol: '\\n',
+              focusLine: multilineLine,
+              fullFile: true,
+              lines: sourceLines.map(function (text, lineNumber) {
+                return { lineNumber: lineNumber, text: text };
+              }),
+              ranges: [{ start: multilineStart, end: multilineStart + 'Widget'.length }]
+            });
+
+            var state = null;
+            var editor = null;
+            var model = null;
+            var shadowRoot = null;
+            var mountDeadline = performance.now() + 10000;
+            while (performance.now() < mountDeadline) {
+              state = window.__ijFindGetSearchState(targetSrc);
+              editor = window.__ijFindGetPreviewEditorForTests
+                ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+                : null;
+              model = editor && editor.getModel ? editor.getModel() : null;
+              var host = root.querySelector('.ij-find-monaco-host');
+              shadowRoot = host && host.shadowRoot;
+              var modelUri = model && model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+              var modelLanguage = model && model.getLanguageId ? String(model.getLanguageId()) : '';
+              if (state && state.previewEngine === 'standalone' && modelUri === previewUri &&
+                  modelLanguage === languageId && shadowRoot) {
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 10); });
+            }
+            if (!state || state.previewEngine !== 'standalone' || !editor || !model || !shadowRoot) {
+              return JSON.stringify({
+                err: 'bundled TextMate preview did not mount',
+                state: state,
+                hasEditor: !!editor,
+                hasModel: !!model,
+                hasShadowRoot: !!shadowRoot
+              });
+            }
+
+            var mountedEditor = editor;
+            var mountedModel = model;
+            var uriAtMount = model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+            var languageAtMount = model.getLanguageId ? String(model.getLanguageId()) : '';
+            var textMateAtMount = state.standaloneTextMateLanguages &&
+              state.standaloneTextMateLanguages[languageId];
+            var textMateStatusAtMount = textMateAtMount && textMateAtMount.status || '';
+            try { editor.setScrollTop(420); } catch (eSetScroll) {}
+            var scrollTopAtMount = editor.getScrollTop ? editor.getScrollTop() : 0;
+
+            var readyState = null;
+            var readyDeadline = performance.now() + 12000;
+            while (performance.now() < readyDeadline) {
+              state = window.__ijFindGetSearchState(targetSrc);
+              readyState = state && state.standaloneTextMateLanguages &&
+                state.standaloneTextMateLanguages[languageId];
+              if (readyState && readyState.status === 'ready') { break; }
+              await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            }
+            editor = window.__ijFindGetPreviewEditorForTests
+              ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+              : null;
+            model = editor && editor.getModel ? editor.getModel() : null;
+            if (!readyState || readyState.status !== 'ready' || !editor || !model) {
+              return JSON.stringify({
+                err: 'contributed TextMate grammar did not become ready',
+                state: state,
+                textMateState: readyState
+              });
+            }
+            var sameEditorAfterReady = editor === mountedEditor;
+            var sameModelAfterReady = model === mountedModel;
+            var scrollTopAfterReady = editor.getScrollTop ? editor.getScrollTop() : 0;
+            var uriAfterReady = model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+            var languageAfterReady = model.getLanguageId ? String(model.getLanguageId()) : '';
+
+            var textMateApi = globalThis.__ijFindTextMateApi;
+            if (!textMateApi || typeof textMateApi.getTokenAtPosition !== 'function') {
+              return JSON.stringify({ err: 'missing bundled TextMate API' });
+            }
+            var injectionToken = textMateApi.getTokenAtPosition(languageId, model, {
+              lineNumber: injectionLine + 1,
+              column: injectionStart + 2
+            });
+            // Query backwards after the later injection line so the bridge
+            // must reuse the cached multiline state, not single-line tokenize.
+            var multilineToken = textMateApi.getTokenAtPosition(languageId, model, {
+              lineNumber: multilineLine + 1,
+              column: multilineStart + 2
+            });
+
+            var raceLanguageId = 'fixture-textmate-generation-race';
+            var slash = String.fromCharCode(92);
+            function raceCatalog(generation, suffix) {
+              var scopeName = 'source.fixture-textmate-generation-' + suffix;
+              var assetId = 'fixture-generation-asset-' + suffix;
+              var scopeAssets = Object.create(null);
+              scopeAssets[scopeName] = assetId;
+              return {
+                protocolVersion: 1,
+                generation: generation,
+                fingerprint: 'fixture-generation-' + suffix,
+                languageId: raceLanguageId,
+                rootScopeName: scopeName,
+                rootAssetId: assetId,
+                scopeAssets: scopeAssets,
+                injections: {},
+                language: { aliases: [], extensions: [], filenames: [] },
+                configuration: {
+                  embeddedLanguages: {}, tokenTypes: {},
+                  balancedBracketScopes: ['*'], unbalancedBracketScopes: []
+                }
+              };
+            }
+            function raceAsset(catalog, tokenScope) {
+              var content = JSON.stringify({
+                scopeName: catalog.rootScopeName,
+                patterns: [{ match: slash + 'bRaceToken' + slash + 'b', name: tokenScope }]
+              });
+              return {
+                content: content,
+                byteLength: new TextEncoder().encode(content).byteLength,
+                pathHint: 'grammar.json'
+              };
+            }
+            var oldRaceCatalog = raceCatalog(101, 'old');
+            var newRaceCatalog = raceCatalog(102, 'new');
+            var oldRaceInstall = textMateApi.installGrammarCatalog(oldRaceCatalog, function () {
+              return new Promise(function (resolve) {
+                setTimeout(function () {
+                  resolve(raceAsset(oldRaceCatalog, 'keyword.control.generation-old'));
+                }, 120);
+              });
+            });
+            await new Promise(function (resolve) { setTimeout(resolve, 10); });
+            await textMateApi.installGrammarCatalog(newRaceCatalog, function () {
+              return Promise.resolve(raceAsset(newRaceCatalog, 'keyword.control.generation-new'));
+            });
+            await oldRaceInstall;
+            var raceStatus = textMateApi.getStatus(raceLanguageId);
+            var raceModel = globalThis.__ijFindMonacoApi.editor.createModel('RaceToken', raceLanguageId);
+            var raceToken = textMateApi.getTokenAtPosition(raceLanguageId, raceModel, {
+              lineNumber: 1, column: 2
+            });
+            try { raceModel.dispose(); } catch (eDisposeRaceModel) {}
+            textMateApi.removeGrammar(raceLanguageId);
+            var removedRaceStatus = textMateApi.getStatus(raceLanguageId);
+            var removedRaceTokenTypes = [];
+            try {
+              var removedRaceLines = globalThis.__ijFindMonacoApi.editor.tokenize('RaceToken', raceLanguageId);
+              var removedRaceTokens = removedRaceLines && removedRaceLines[0] || [];
+              removedRaceTokenTypes = removedRaceTokens.map(function (token) { return String(token.type || ''); });
+            } catch (eTokenizeRemovedRace) {}
+
+            var hoverText = '';
+            var hoverError = '';
+            try {
+              editor.setPosition({ lineNumber: multilineLine + 1, column: multilineStart + 2 });
+              editor.focus();
+              editor.trigger('ijss-test', 'editor.action.showHover', {});
+              var hoverDeadline = performance.now() + 8000;
+              while (performance.now() < hoverDeadline) {
+                var hoverNodes = shadowRoot.querySelectorAll(
+                  '.monaco-hover,.monaco-editor-hover,.content-hover-widget,.hover-row'
+                );
+                hoverText = '';
+                for (var hoverIdx = 0; hoverIdx < hoverNodes.length; hoverIdx++) {
+                  hoverText += ' ' + String(hoverNodes[hoverIdx].textContent || '');
+                }
+                if (hoverText.indexOf('TextMate') >= 0 &&
+                    hoverText.indexOf(${JSON.stringify(multilineScope)}) >= 0) {
+                  break;
+                }
+                await new Promise(function (resolve) { setTimeout(resolve, 25); });
+              }
+            } catch (eHover) {
+              hoverError = String(eHover && eHover.message || eHover);
+            }
+
+            return JSON.stringify({
+              engine: state && state.previewEngine,
+              readyStatus: readyState && readyState.status,
+              rootScopeName: readyState && readyState.rootScopeName,
+              textMateStatusAtMount: textMateStatusAtMount,
+              sameEditor: sameEditorAfterReady,
+              sameModel: sameModelAfterReady,
+              scrollTopAtMount: scrollTopAtMount,
+              scrollTopAfterReady: scrollTopAfterReady,
+              uriAtMount: uriAtMount,
+              uriAfterReady: uriAfterReady,
+              languageAtMount: languageAtMount,
+              languageAfterReady: languageAfterReady,
+              multilineScopes: multilineToken && multilineToken.scopes || [],
+              injectionScopes: injectionToken && injectionToken.scopes || [],
+              raceGeneration: raceStatus && raceStatus.generation,
+              raceRootScope: raceStatus && raceStatus.rootScopeName,
+              raceScopes: raceToken && raceToken.scopes || [],
+              removedRaceStatus: removedRaceStatus && removedRaceStatus.status,
+              removedRaceTokenTypes: removedRaceTokenTypes,
+              hoverText: hoverText,
+              hoverError: hoverError
+            });
+          } finally {
+            window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+          }
+        })()`,
+        30_000,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        engine?: string;
+        readyStatus?: string;
+        rootScopeName?: string;
+        textMateStatusAtMount?: string;
+        sameEditor?: boolean;
+        sameModel?: boolean;
+        scrollTopAtMount?: number;
+        scrollTopAfterReady?: number;
+        uriAtMount?: string;
+        uriAfterReady?: string;
+        languageAtMount?: string;
+        languageAfterReady?: string;
+        multilineScopes?: string[];
+        injectionScopes?: string[];
+        raceGeneration?: number;
+        raceRootScope?: string;
+        raceScopes?: string[];
+        removedRaceStatus?: string;
+        removedRaceTokenTypes?: string[];
+        hoverText?: string;
+        hoverError?: string;
+      };
+      assert.strictEqual(parsed.err, undefined, `expected contributed TextMate grammar probe to run: ${raw}`);
+      assert.strictEqual(parsed.engine, 'standalone', `TextMate grammar must be applied in bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.readyStatus, 'ready', `contributed TextMate grammar must reach ready state: ${raw}`);
+      assert.strictEqual(parsed.rootScopeName, rootScope, `the contributed root scope must be installed: ${raw}`);
+      assert.strictEqual(parsed.sameEditor, true, `grammar readiness must not replace the bundled editor: ${raw}`);
+      assert.strictEqual(parsed.sameModel, true, `grammar readiness must not replace the preview model: ${raw}`);
+      assert.ok((parsed.scrollTopAtMount ?? 0) > 0, `probe must establish a meaningful preview scroll offset: ${raw}`);
+      assert.ok(
+        Math.abs((parsed.scrollTopAfterReady ?? 0) - (parsed.scrollTopAtMount ?? 0)) < 1,
+        `grammar readiness must preserve preview scrollTop: ${raw}`,
+      );
+      assert.strictEqual(parsed.uriAtMount, previewUri.toString(), `mounted model must use the fixture URI: ${raw}`);
+      assert.strictEqual(parsed.uriAfterReady, previewUri.toString(), `grammar readiness must preserve the model URI: ${raw}`);
+      assert.strictEqual(parsed.languageAtMount, languageId, `mounted model must use the contributed language id: ${raw}`);
+      assert.strictEqual(parsed.languageAfterReady, languageId, `grammar readiness must preserve the model language: ${raw}`);
+      assert.ok(parsed.multilineScopes?.includes(rootScope), `multiline token must retain its root scope: ${raw}`);
+      assert.ok(parsed.multilineScopes?.includes(multilineScope), `multiline state must resolve the interior identifier scope: ${raw}`);
+      assert.ok(parsed.injectionScopes?.includes(rootScope), `injected token must retain its root scope: ${raw}`);
+      assert.ok(parsed.injectionScopes?.includes(injectionScope), `injectTo grammar must contribute its directive scope: ${raw}`);
+      assert.strictEqual(parsed.raceGeneration, 102, `late completion must not replace the newer grammar generation: ${raw}`);
+      assert.strictEqual(parsed.raceRootScope, 'source.fixture-textmate-generation-new', `newer root scope must remain installed: ${raw}`);
+      assert.ok(parsed.raceScopes?.includes('keyword.control.generation-new'), `newer generation must own lexical scopes: ${raw}`);
+      assert.ok(!parsed.raceScopes?.includes('keyword.control.generation-old'), `superseded generation scopes must be discarded: ${raw}`);
+      assert.strictEqual(parsed.removedRaceStatus, 'unavailable', `removed grammar providers must not remain globally visible: ${raw}`);
+      assert.ok(
+        !parsed.removedRaceTokenTypes?.some((type) => /keyword/i.test(type)),
+        `removed grammar token providers must fall back instead of retaining stale tokenization: ${raw}`,
+      );
+      assert.strictEqual(parsed.hoverError, '', `TextMate lexical hover should not throw: ${raw}`);
+      assert.ok((parsed.hoverText ?? '').includes('TextMate'), `hover DOM must identify TextMate lexical data: ${raw}`);
+      assert.ok((parsed.hoverText ?? '').includes(multilineScope), `hover DOM must expose the exact multiline scope: ${raw}`);
+      assert.strictEqual(grammarExtension.isActive, false, 'loading its grammar assets must not activate the fixture extension');
+    } finally {
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisable, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorTransient, vscode.ConfigurationTarget.Workspace);
+      if (priorDisable !== true) { overlay.resumeMonacoCaptureForTests(); }
+      if (fixtureWritten) {
+        try { await vscode.workspace.fs.delete(previewUri, { recursive: false, useTrash: false }); } catch {}
+      }
+    }
+  });
+
+  test('bundled Monaco preview bridges semantic tokens and diagnostics', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(30_000);
+    const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
+    const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
+    const previewUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
+    const fixtureDocument = await vscode.workspace.openTextDocument(previewUri);
+    const fixtureSource = fixtureDocument.getText();
+    const fixtureLines = fixtureSource.split('\n');
+    const tokenLine = fixtureLines.findIndex((line) => /^\s*class\s+[A-Za-z_]\w*/.test(line));
+    assert.ok(tokenLine >= 0, 'expected fixture document to contain a class declaration');
+    const declarationMatch = /\bclass\s+([A-Za-z_]\w*)/.exec(fixtureLines[tokenLine]!);
+    assert.ok(declarationMatch, 'expected fixture class declaration to contain an identifier');
+    const tokenText = declarationMatch![1];
+    const tokenStart = fixtureLines[tokenLine]!.indexOf(tokenText, declarationMatch!.index);
+    const tokenRange = new vscode.Range(
+      new vscode.Position(tokenLine, tokenStart),
+      new vscode.Position(tokenLine, tokenStart + tokenText.length),
+    );
+    const queryValue = 'BundledSemanticDiagnosticBridgeProbe';
+    const diagnosticMessage = `IJSS_BUNDLED_DIAGNOSTIC_${Date.now()}`;
+    const diagnosticSource = 'ijss-semantic-diagnostic-test';
+    const semanticLegend = new vscode.SemanticTokensLegend(['class'], ['declaration']);
+    let semanticInvocations = 0;
+    const semanticUris: string[] = [];
+    const semanticDocumentTexts: string[] = [];
+    const semanticDisposable = vscode.languages.registerDocumentSemanticTokensProvider(
+      { scheme: 'file', language: 'python' },
+      {
+        provideDocumentSemanticTokens(document) {
+          semanticInvocations++;
+          semanticUris.push(document.uri.toString());
+          semanticDocumentTexts.push(document.getText());
+          const builder = new vscode.SemanticTokensBuilder(semanticLegend);
+          builder.push(tokenRange, 'class', ['declaration']);
+          return builder.build('ijss-bundled-semantic-result');
+        },
+      },
+      semanticLegend,
+    );
+    const diagnosticCollection = vscode.languages.createDiagnosticCollection(
+      `ijss-bundled-preview-${Date.now()}`,
+    );
+    const diagnostic = new vscode.Diagnostic(
+      tokenRange,
+      diagnosticMessage,
+      vscode.DiagnosticSeverity.Warning,
+    );
+    diagnostic.source = diagnosticSource;
+    diagnostic.code = 'ijss-bundled-diagnostic';
+
+    try {
+      await cfg.update('disableMonacoCapture', true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+      await overlay.stopMonacoCapture('bundled semantic tokens and diagnostics bridge test');
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true });
+
+      const targetSrc = await overlay.evalInActiveWindowForTests(
+        `(function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          return root ? root.getAttribute('data-ij-find-src') || '' : '';
+        })()`,
+      );
+      assert.ok(targetSrc, 'expected semantic/diagnostic probe renderer source');
+      const previewSeq = Number(await overlay.evalInActiveWindowForTests(
+        `(function(){
+          var state = window.__ijFindGetSearchState
+            ? window.__ijFindGetSearchState(${JSON.stringify(targetSrc)}) : {};
+          var active = state && typeof state.activePreviewSeq === 'number' ? state.activePreviewSeq : 0;
+          return String(active + 1);
+        })()`,
+      ));
+      overlay.injectRendererEventForTests(JSON.stringify({
+        type: 'requestPreview',
+        uri: previewUri.toString(),
+        line: tokenLine,
+        contextLines: 0,
+        ranges: [{ start: tokenStart, end: tokenStart + tokenText.length }],
+        previewSeq,
+        __src: targetSrc,
+      }));
+
+      const semanticReadyRaw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var targetSrc = ${JSON.stringify(targetSrc)};
+          var previewUri = ${JSON.stringify(previewUri.toString())};
+          var state = null;
+          var editor = null;
+          var model = null;
+          var deadline = performance.now() + 12000;
+          while (performance.now() < deadline) {
+            state = window.__ijFindGetSearchState(targetSrc);
+            editor = window.__ijFindGetPreviewEditorForTests
+              ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+              : null;
+            model = editor && editor.getModel ? editor.getModel() : null;
+            var modelUri = model && model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+            if (state && state.previewEngine === 'standalone' && modelUri === previewUri &&
+                state.standaloneSemanticTokenCount > 0) {
+              break;
+            }
+            await new Promise(function (resolve) { setTimeout(resolve, 25); });
+          }
+          return JSON.stringify({
+            engine: state && state.previewEngine,
+            modelUri: model && model.uri && model.uri.toString ? String(model.uri.toString()) : '',
+            semanticTokenCount: state && state.standaloneSemanticTokenCount
+          });
+        })()`,
+        18_000,
+      );
+      const semanticReady = JSON.parse(semanticReadyRaw) as {
+        engine?: string;
+        modelUri?: string;
+        semanticTokenCount?: number;
+      };
+      assert.strictEqual(
+        semanticReady.engine,
+        'standalone',
+        `semantic bridge target must mount in bundled Monaco before diagnostics update: ${semanticReadyRaw}`,
+      );
+      assert.strictEqual(
+        semanticReady.modelUri,
+        previewUri.toString(),
+        `semantic bridge target must use the actual preview URI: ${semanticReadyRaw}`,
+      );
+      assert.ok(
+        (semanticReady.semanticTokenCount ?? 0) > 0,
+        `extension-host semantic tokens must arrive before the live diagnostic update: ${semanticReadyRaw}`,
+      );
+
+      // The semantic request above registers this source/window/URI with the
+      // extension host. Updating the collection now exercises the live
+      // preview:diagnostics route rather than only the initial preview payload.
+      diagnosticCollection.set(previewUri, [diagnostic]);
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var targetSrc = ${JSON.stringify(targetSrc)};
+          var previewUri = ${JSON.stringify(previewUri.toString())};
+          var diagnosticMessage = ${JSON.stringify(diagnosticMessage)};
+          var state = null;
+          var editor = null;
+          var model = null;
+          var bundledApi = null;
+          var markers = [];
+          var deadline = performance.now() + 12000;
+          while (performance.now() < deadline) {
+            state = window.__ijFindGetSearchState(targetSrc);
+            editor = window.__ijFindGetPreviewEditorForTests
+              ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+              : null;
+            model = editor && editor.getModel ? editor.getModel() : null;
+            bundledApi = globalThis.__ijFindMonacoApi || null;
+            markers = [];
+            if (bundledApi && model && model.uri && bundledApi.editor && bundledApi.editor.getModelMarkers) {
+              try {
+                markers = bundledApi.editor.getModelMarkers({
+                  resource: model.uri,
+                  owner: 'ijss-vscode-language-service'
+                }) || [];
+              } catch (eMarkers) {}
+            }
+            var modelUri = model && model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+            var hasExpectedMarker = markers.some(function (marker) {
+              return String(marker && marker.message || '') === diagnosticMessage;
+            });
+            if (state && state.previewEngine === 'standalone' && modelUri === previewUri &&
+                state.standaloneSemanticTokenCount > 0 &&
+                state.standaloneDiagnosticMarkerCount > 0 && hasExpectedMarker) {
+              break;
+            }
+            await new Promise(function (resolve) { setTimeout(resolve, 25); });
+          }
+          return JSON.stringify({
+            engine: state && state.previewEngine,
+            stateUri: state && state.previewUri,
+            modelUri: model && model.uri && model.uri.toString ? String(model.uri.toString()) : '',
+            languageId: model && model.getLanguageId ? String(model.getLanguageId()) : '',
+            modelValue: model && model.getValue ? model.getValue() : '',
+            semanticTokenCount: state && state.standaloneSemanticTokenCount,
+            diagnosticMarkerCount: state && state.standaloneDiagnosticMarkerCount,
+            markers: markers.map(function (marker) {
+              return {
+                message: marker.message,
+                source: marker.source,
+                startLineNumber: marker.startLineNumber,
+                startColumn: marker.startColumn,
+                endLineNumber: marker.endLineNumber,
+                endColumn: marker.endColumn
+              };
+            })
+          });
+        })()`,
+        18_000,
+      );
+      const parsed = JSON.parse(raw) as {
+        engine?: string;
+        stateUri?: string;
+        modelUri?: string;
+        languageId?: string;
+        modelValue?: string;
+        semanticTokenCount?: number;
+        diagnosticMarkerCount?: number;
+        markers?: Array<{
+          message?: string;
+          source?: string;
+          startLineNumber?: number;
+          startColumn?: number;
+          endLineNumber?: number;
+          endColumn?: number;
+        }>;
+      };
+      const expectedMarker = parsed.markers?.find((marker) => marker.message === diagnosticMessage);
+      assert.strictEqual(parsed.engine, 'standalone', `semantic tokens must be tested against bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.stateUri, previewUri.toString(), `preview state must keep the semantic document URI: ${raw}`);
+      assert.strictEqual(parsed.modelUri, previewUri.toString(), `bundled model must use the semantic document URI: ${raw}`);
+      assert.strictEqual(parsed.languageId, 'python', `bundled model must match the semantic provider selector: ${raw}`);
+      assert.strictEqual(parsed.modelValue, fixtureSource, `bundled model must contain the actual fixture document text: ${raw}`);
+      assert.ok(semanticInvocations > 0, `bundled preview must invoke the extension-host semantic token provider: ${raw}`);
+      assert.ok(
+        semanticUris.includes(previewUri.toString()),
+        `semantic token provider must receive the preview file URI: ${JSON.stringify(semanticUris)}`,
+      );
+      assert.ok(
+        semanticDocumentTexts.every((text) => text === fixtureSource),
+        'semantic token provider must receive the same text rendered by the preview model',
+      );
+      assert.ok((parsed.semanticTokenCount ?? 0) > 0, `standalone preview must install semantic tokens: ${raw}`);
+      assert.ok((parsed.diagnosticMarkerCount ?? 0) > 0, `standalone preview must install diagnostic markers: ${raw}`);
+      assert.ok(expectedMarker, `bundled Monaco marker registry must contain the expected diagnostic: ${raw}`);
+      assert.strictEqual(expectedMarker?.source, diagnosticSource, `diagnostic source must survive preview serialization: ${raw}`);
+      assert.strictEqual(expectedMarker?.startLineNumber, tokenLine + 1, `diagnostic start line must match the fixture token: ${raw}`);
+      assert.strictEqual(expectedMarker?.startColumn, tokenStart + 1, `diagnostic start column must match the fixture token: ${raw}`);
+      assert.strictEqual(expectedMarker?.endLineNumber, tokenLine + 1, `diagnostic end line must match the fixture token: ${raw}`);
+      assert.strictEqual(
+        expectedMarker?.endColumn,
+        tokenStart + tokenText.length + 1,
+        `diagnostic end column must match the fixture token: ${raw}`,
+      );
+    } finally {
+      semanticDisposable.dispose();
+      diagnosticCollection.delete(previewUri);
+      diagnosticCollection.dispose();
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisable, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorTransient, vscode.ConfigurationTarget.Workspace);
+      if (priorDisable !== true) { overlay.resumeMonacoCaptureForTests(); }
+    }
+  });
+
+  test('shared bundled preview model preserves another owner unsaved edits on discard', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(30_000);
+    const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
+    const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
+    const previewUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
+    const baselineText = (await vscode.workspace.openTextDocument(previewUri)).getText();
+    const unsavedText = `${baselineText}\n# unsaved shared preview edit ${Date.now()}`;
+    const switchUri = vscode.Uri.joinPath(folder!.uri, `shared-preview-switch-${Date.now()}.txt`).toString();
+    const firstQuery = 'BundledSharedModelOwnerA';
+    const secondQuery = 'BundledSharedModelOwnerB';
+
+    try {
+      await cfg.update('disableMonacoCapture', true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+      await overlay.stopMonacoCapture('shared bundled preview model test');
+      await overlay.show(firstQuery, { forceLiteral: true, suppressSearch: true });
+      await warmMonacoPreviewForRendererTest(overlay, firstQuery);
+      await overlay.show(secondQuery, { forceLiteral: true, suppressSearch: true, spawn: true });
+      await warmMonacoPreviewForRendererTest(overlay, secondQuery);
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          function rootFor(queryValue) {
+            return Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              return query && query.value === queryValue;
+            });
+          }
+          function deliver(src, uri, relPath, languageId, text) {
+            window.__ijFindOnMessage({
+              type: 'preview',
+              __targetSrc: src,
+              uri: uri,
+              relPath: relPath,
+              languageId: languageId,
+              focusLine: 0,
+              fullFile: true,
+              lines: text.split('\\n').map(function (lineText, lineNumber) {
+                return { lineNumber: lineNumber, text: lineText };
+              }),
+              ranges: [{ start: 0, end: Math.min(5, (text.split('\\n')[0] || '').length) }]
+            });
+          }
+          async function waitForModel(src, uri) {
+            var editor = null;
+            var model = null;
+            var state = null;
+            var deadline = performance.now() + 8000;
+            while (performance.now() < deadline) {
+              state = window.__ijFindGetSearchState(src);
+              editor = window.__ijFindGetPreviewEditorForTests(src);
+              model = editor && editor.getModel ? editor.getModel() : null;
+              var modelUri = model && model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+              if (state && state.previewEngine === 'standalone' && modelUri === uri) { break; }
+              await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            }
+            return { editor: editor, model: model, state: state };
+          }
+
+          var rootA = rootFor(${JSON.stringify(firstQuery)});
+          var rootB = rootFor(${JSON.stringify(secondQuery)});
+          var srcA = rootA ? rootA.getAttribute('data-ij-find-src') || '' : '';
+          var srcB = rootB ? rootB.getAttribute('data-ij-find-src') || '' : '';
+          var sharedUri = ${JSON.stringify(previewUri.toString())};
+          var switchUri = ${JSON.stringify(switchUri)};
+          var baselineText = ${JSON.stringify(baselineText)};
+          var unsavedText = ${JSON.stringify(unsavedText)};
+          var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+          var modelA = null;
+          window.__ijFindDisableMonacoProbes = true;
+          try {
+            if (!rootA || !rootB || !srcA || !srcB) {
+              return JSON.stringify({ err: 'missing shared-model panel roots', srcA: srcA, srcB: srcB });
+            }
+
+            deliver(srcA, sharedUri, 'alpha.py', 'python', baselineText);
+            var mountedA = await waitForModel(srcA, sharedUri);
+            modelA = mountedA.model;
+            if (!modelA) { return JSON.stringify({ err: 'owner A model did not mount', stateA: mountedA.state }); }
+            modelA.setValue(unsavedText);
+            var stateAAfterEdit = window.__ijFindGetSearchState(srcA);
+
+            deliver(srcB, sharedUri, 'alpha.py', 'python', baselineText);
+            var mountedB = await waitForModel(srcB, sharedUri);
+            var modelB = mountedB.model;
+            if (!modelB) { return JSON.stringify({ err: 'owner B model did not mount', stateB: mountedB.state }); }
+            var stateAAfterBRender = window.__ijFindGetSearchState(srcA);
+            var stateBAfterRender = window.__ijFindGetSearchState(srcB);
+            var refsBeforeDiscard = 0;
+            try {
+              refsBeforeDiscard = window.__ijFindStandaloneModelRefs &&
+                window.__ijFindStandaloneModelRefs.get(modelA) || 0;
+            } catch (eRefs) {}
+
+            deliver(srcB, switchUri, 'shared-preview-switch.txt', 'plaintext', 'replacement preview');
+            await new Promise(function (resolve) { setTimeout(resolve, 0); });
+            var discard = rootB.querySelector('.ij-find-dirty-dialog button.secondary');
+            if (discard) {
+              discard.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+            var switchedB = await waitForModel(srcB, switchUri);
+            var closeB = rootB.querySelector('.ij-find-close');
+            if (closeB) {
+              closeB.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+            await new Promise(function (resolve) { setTimeout(resolve, 10); });
+
+            var stateAAfterBClosed = window.__ijFindGetSearchState(srcA);
+            var editorAAfter = window.__ijFindGetPreviewEditorForTests(srcA);
+            var modelAAfter = editorAAfter && editorAAfter.getModel ? editorAAfter.getModel() : null;
+            var bundledApi = globalThis.__ijFindMonacoApi || null;
+            var registeredA = false;
+            try {
+              registeredA = !!(bundledApi && bundledApi.editor.getModel(bundledApi.Uri.parse(sharedUri)) === modelA);
+            } catch (eRegistered) {}
+            var disposedA = false;
+            try { disposedA = !!(modelA && modelA.isDisposed && modelA.isDisposed()); } catch (eDisposed) {}
+            return JSON.stringify({
+              engineA: mountedA.state && mountedA.state.previewEngine,
+              engineB: mountedB.state && mountedB.state.previewEngine,
+              sharedModel: modelA === modelB,
+              refsBeforeDiscard: refsBeforeDiscard,
+              stateAAfterEdit: stateAAfterEdit,
+              stateAAfterBRender: stateAAfterBRender,
+              stateBAfterRender: stateBAfterRender,
+              contentAfterBRender: modelB && modelB.getValue ? modelB.getValue() : '',
+              discardFound: !!discard,
+              bSwitched: !!(switchedB.state && switchedB.state.previewUri === switchUri),
+              bVisibleAfterClose: !!rootB.classList.contains('visible'),
+              bRegisteredAfterClose: !!(window.__ijFindInstances && window.__ijFindInstances[srcB]),
+              stateAAfterBClosed: stateAAfterBClosed,
+              contentAfterBClosed: modelAAfter && modelAAfter.getValue ? modelAAfter.getValue() : '',
+              sameModelAfterBClosed: modelAAfter === modelA,
+              registeredA: registeredA,
+              disposedA: disposedA
+            });
+          } finally {
+            try {
+              if (modelA && modelA.getValue && modelA.getValue() !== baselineText && modelA.setValue) {
+                modelA.setValue(baselineText);
+              }
+            } catch (eResetA) {}
+            try {
+              var instanceB = srcB && window.__ijFindInstances && window.__ijFindInstances[srcB];
+              if (instanceB && typeof instanceB.dispose === 'function') { instanceB.dispose('shared-model-test-cleanup'); }
+            } catch (eDisposeB) {}
+            try {
+              var closeA = rootA && rootA.querySelector('.ij-find-close');
+              if (closeA && rootA.classList.contains('visible')) {
+                closeA.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+              }
+            } catch (eCloseA) {}
+            window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+          }
+        })()`,
+        20_000,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        engineA?: string;
+        engineB?: string;
+        sharedModel?: boolean;
+        refsBeforeDiscard?: number;
+        stateAAfterEdit?: { previewDirty?: boolean };
+        stateAAfterBRender?: { previewDirty?: boolean };
+        stateBAfterRender?: { previewDirty?: boolean };
+        contentAfterBRender?: string;
+        discardFound?: boolean;
+        bSwitched?: boolean;
+        bVisibleAfterClose?: boolean;
+        bRegisteredAfterClose?: boolean;
+        stateAAfterBClosed?: { previewDirty?: boolean };
+        contentAfterBClosed?: string;
+        sameModelAfterBClosed?: boolean;
+        registeredA?: boolean;
+        disposedA?: boolean;
+      };
+      assert.strictEqual(parsed.err, undefined, `expected shared bundled model probe to run: ${raw}`);
+      assert.strictEqual(parsed.engineA, 'standalone', `owner A must use bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.engineB, 'standalone', `owner B must use bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.stateAAfterEdit?.previewDirty, true, `owner A edit must become dirty: ${raw}`);
+      assert.strictEqual(parsed.sharedModel, true, `same URI previews must share one bundled model: ${raw}`);
+      assert.ok((parsed.refsBeforeDiscard ?? 0) >= 2, `shared model must retain both preview owners: ${raw}`);
+      assert.strictEqual(parsed.contentAfterBRender, unsavedText, `owner B render must not overwrite owner A unsaved content: ${raw}`);
+      assert.strictEqual(parsed.stateAAfterBRender?.previewDirty, true, `owner A must remain dirty after owner B renders: ${raw}`);
+      assert.strictEqual(parsed.stateBAfterRender?.previewDirty, true, `owner B must observe the shared unsaved model as dirty: ${raw}`);
+      assert.strictEqual(parsed.discardFound, true, `switching dirty owner B must offer discard: ${raw}`);
+      assert.strictEqual(parsed.bSwitched, true, `discard should allow owner B to switch previews: ${raw}`);
+      assert.strictEqual(parsed.bVisibleAfterClose, false, `owner B should close after discarding its view: ${raw}`);
+      assert.strictEqual(parsed.bRegisteredAfterClose, false, `closed spawned owner B must release its renderer instance: ${raw}`);
+      assert.strictEqual(parsed.contentAfterBClosed, unsavedText, `owner B discard/close must preserve owner A unsaved content: ${raw}`);
+      assert.strictEqual(parsed.stateAAfterBClosed?.previewDirty, true, `owner A must remain dirty after owner B closes: ${raw}`);
+      assert.strictEqual(parsed.sameModelAfterBClosed, true, `owner A must retain its shared model instance: ${raw}`);
+      assert.strictEqual(parsed.registeredA, true, `owner A model must remain registered under the file URI: ${raw}`);
+      assert.strictEqual(parsed.disposedA, false, `owner B close must not dispose owner A model: ${raw}`);
+    } finally {
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || (${JSON.stringify(firstQuery)} !== query.value && ${JSON.stringify(secondQuery)} !== query.value)) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisable, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorTransient, vscode.ConfigurationTarget.Workspace);
+      if (priorDisable !== true) { overlay.resumeMonacoCaptureForTests(); }
+    }
+  });
+
+  test('bundled preview stays dirty until save acknowledgement and preserves intervening edits', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(30_000);
+    const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
+    const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
+    const previewUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
+    const baselineText = (await vscode.workspace.openTextDocument(previewUri)).getText();
+    const firstSavedText = `${baselineText}\n# first acknowledged preview edit ${Date.now()}`;
+    const formattedFirstSavedText = `${firstSavedText}\n# format-on-save output`;
+    const secondSavedText = `${firstSavedText}\n# second pending preview edit`;
+    const interveningText = `${secondSavedText}\n# edit made while save is pending`;
+    const queryValue = 'BundledSaveAcknowledgementProbe';
+
+    try {
+      await cfg.update('disableMonacoCapture', true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+      await overlay.stopMonacoCapture('bundled preview save acknowledgement test');
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true });
+      await warmMonacoPreviewForRendererTest(overlay, queryValue);
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing save acknowledgement panel' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          var previewUri = ${JSON.stringify(previewUri.toString())};
+          var baselineText = ${JSON.stringify(baselineText)};
+          var firstSavedText = ${JSON.stringify(firstSavedText)};
+          var formattedFirstSavedText = ${JSON.stringify(formattedFirstSavedText)};
+          var secondSavedText = ${JSON.stringify(secondSavedText)};
+          var interveningText = ${JSON.stringify(interveningText)};
+          var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+          var oldBridge = globalThis.irSearchEvent;
+          var sent = [];
+          var model = null;
+          window.__ijFindDisableMonacoProbes = true;
+          try {
+            window.__ijFindOnMessage({
+              type: 'preview',
+              __targetSrc: targetSrc,
+              uri: previewUri,
+              relPath: 'alpha.py',
+              languageId: 'python',
+              focusLine: 0,
+              fullFile: true,
+              lines: baselineText.split('\\n').map(function (text, lineNumber) {
+                return { lineNumber: lineNumber, text: text };
+              }),
+              ranges: [{ start: 0, end: 5 }]
+            });
+
+            var editor = null;
+            var state = null;
+            var deadline = performance.now() + 8000;
+            while (performance.now() < deadline) {
+              state = window.__ijFindGetSearchState(targetSrc);
+              editor = window.__ijFindGetPreviewEditorForTests(targetSrc);
+              model = editor && editor.getModel ? editor.getModel() : null;
+              var modelUri = model && model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+              if (state && state.previewEngine === 'standalone' && modelUri === previewUri) { break; }
+              await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            }
+            if (!model || !state || state.previewEngine !== 'standalone') {
+              return JSON.stringify({ err: 'bundled save model did not mount', state: state });
+            }
+            var saveButton = root.querySelector('.ij-find-preview-save');
+            if (!saveButton) { return JSON.stringify({ err: 'missing preview save button' }); }
+            globalThis.irSearchEvent = function (payload) {
+              try { sent.push(JSON.parse(String(payload))); } catch (eParse) {}
+            };
+            function lastSaveRequest(excludedRequestId) {
+              for (var i = sent.length - 1; i >= 0; i--) {
+                if (sent[i] && sent[i].type === 'saveFile' && sent[i].requestId !== excludedRequestId) {
+                  return sent[i];
+                }
+              }
+              return null;
+            }
+            function snapshot() {
+              var current = window.__ijFindGetSearchState(targetSrc);
+              return {
+                dirty: !!(current && current.previewDirty),
+                saveDisabled: !!(current && current.saveButtonDisabled),
+                saveButtonDirty: current && current.saveButtonDirty,
+                content: model && model.getValue ? model.getValue() : ''
+              };
+            }
+
+            model.setValue(firstSavedText);
+            var beforeFirstSave = snapshot();
+            saveButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            var firstRequest = lastSaveRequest(undefined);
+            var afterFirstRequest = snapshot();
+            if (!firstRequest) {
+              return JSON.stringify({ err: 'first save request was not sent', sent: sent, afterFirstRequest: afterFirstRequest });
+            }
+            window.__ijFindOnMessage({
+              type: 'preview:saveResult',
+              __targetSrc: targetSrc,
+              requestId: firstRequest.requestId,
+              uri: previewUri,
+              ok: true,
+              savedContent: formattedFirstSavedText
+            });
+            var afterFirstAck = snapshot();
+
+            model.setValue(secondSavedText);
+            var beforeSecondSave = snapshot();
+            saveButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            var secondRequest = lastSaveRequest(firstRequest.requestId);
+            var afterSecondRequest = snapshot();
+            if (!secondRequest) {
+              return JSON.stringify({ err: 'second save request was not sent', sent: sent, afterSecondRequest: afterSecondRequest });
+            }
+            model.setValue(interveningText);
+            var afterInterveningEdit = snapshot();
+            window.__ijFindOnMessage({
+              type: 'preview:saveResult',
+              __targetSrc: targetSrc,
+              requestId: secondRequest.requestId,
+              uri: previewUri,
+              ok: true
+            });
+            var afterSecondAck = snapshot();
+            return JSON.stringify({
+              engine: state.previewEngine,
+              beforeFirstSave: beforeFirstSave,
+              afterFirstRequest: afterFirstRequest,
+              afterFirstAck: afterFirstAck,
+              beforeSecondSave: beforeSecondSave,
+              afterSecondRequest: afterSecondRequest,
+              afterInterveningEdit: afterInterveningEdit,
+              afterSecondAck: afterSecondAck,
+              firstRequest: { uri: firstRequest.uri, content: firstRequest.content, requestId: firstRequest.requestId },
+              secondRequest: { uri: secondRequest.uri, content: secondRequest.content, requestId: secondRequest.requestId }
+            });
+          } finally {
+            globalThis.irSearchEvent = oldBridge;
+            try {
+              if (model && model.getValue && model.getValue() !== secondSavedText && model.setValue) {
+                model.setValue(secondSavedText);
+              }
+            } catch (eResetModel) {}
+            try {
+              var close = root && root.querySelector('.ij-find-close');
+              if (close && root.classList.contains('visible')) {
+                close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+              }
+            } catch (eClose) {}
+            window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+          }
+        })()`,
+        20_000,
+      );
+      type SaveSnapshot = {
+        dirty?: boolean;
+        saveDisabled?: boolean;
+        saveButtonDirty?: string | null;
+        content?: string;
+      };
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        engine?: string;
+        beforeFirstSave?: SaveSnapshot;
+        afterFirstRequest?: SaveSnapshot;
+        afterFirstAck?: SaveSnapshot;
+        beforeSecondSave?: SaveSnapshot;
+        afterSecondRequest?: SaveSnapshot;
+        afterInterveningEdit?: SaveSnapshot;
+        afterSecondAck?: SaveSnapshot;
+        firstRequest?: { uri?: string; content?: string; requestId?: number };
+        secondRequest?: { uri?: string; content?: string; requestId?: number };
+      };
+      assert.strictEqual(parsed.err, undefined, `expected bundled save acknowledgement probe to run: ${raw}`);
+      assert.strictEqual(parsed.engine, 'standalone', `save acknowledgement must be tested against bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.beforeFirstSave?.dirty, true, `first edit must mark the preview dirty: ${raw}`);
+      assert.strictEqual(parsed.firstRequest?.uri, previewUri.toString(), `first save must target the preview URI: ${raw}`);
+      assert.strictEqual(parsed.firstRequest?.content, firstSavedText, `first save must capture the current model content: ${raw}`);
+      assert.strictEqual(parsed.afterFirstRequest?.dirty, true, `sending save must not optimistically clear dirty state: ${raw}`);
+      assert.strictEqual(parsed.afterFirstRequest?.saveButtonDirty, 'true', `save button must remain dirty before acknowledgement: ${raw}`);
+      assert.strictEqual(parsed.afterFirstAck?.dirty, false, `successful save acknowledgement must mark unchanged content clean: ${raw}`);
+      assert.strictEqual(parsed.afterFirstAck?.content, formattedFirstSavedText, `save acknowledgement must adopt format-on-save output: ${raw}`);
+      assert.strictEqual(parsed.afterFirstAck?.saveDisabled, true, `clean preview must disable the save button after acknowledgement: ${raw}`);
+      assert.strictEqual(parsed.beforeSecondSave?.dirty, true, `second edit must mark the preview dirty again: ${raw}`);
+      assert.strictEqual(parsed.secondRequest?.uri, previewUri.toString(), `second save must target the preview URI: ${raw}`);
+      assert.strictEqual(parsed.secondRequest?.content, secondSavedText, `second save must snapshot content at request time: ${raw}`);
+      assert.strictEqual(parsed.afterSecondRequest?.dirty, true, `second save request must remain dirty while pending: ${raw}`);
+      assert.strictEqual(parsed.afterInterveningEdit?.content, interveningText, `edit made during save must remain in the model: ${raw}`);
+      assert.strictEqual(parsed.afterInterveningEdit?.dirty, true, `edit made during save must remain dirty: ${raw}`);
+      assert.strictEqual(parsed.afterSecondAck?.content, interveningText, `save acknowledgement must not overwrite a later edit: ${raw}`);
+      assert.strictEqual(parsed.afterSecondAck?.dirty, true, `later edit must remain dirty after acknowledgement of older content: ${raw}`);
+      assert.strictEqual(parsed.afterSecondAck?.saveDisabled, false, `later dirty edit must remain savable after acknowledgement: ${raw}`);
+      assert.strictEqual(parsed.afterSecondAck?.saveButtonDirty, 'true', `save button must expose the remaining dirty state: ${raw}`);
+    } finally {
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisable, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorTransient, vscode.ConfigurationTarget.Workspace);
+      if (priorDisable !== true) { overlay.resumeMonacoCaptureForTests(); }
+    }
+  });
+
+  test('real preview save preserves CRLF and trailing newline', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(30_000);
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected workspace folder');
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
+    const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
+    const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const fileUri = vscode.Uri.joinPath(folder!.uri, `preview-eol-integrity-${suffix}.txt`);
+    const queryValue = `BundledEolSaveProbe-${suffix}`;
+    const originalContent = 'first value\r\nsecond value\r\n';
+    const savedContent = 'First value\r\nsecond value\r\n';
+    let fileCreated = false;
+
+    try {
+      await vscode.workspace.fs.writeFile(fileUri, Buffer.from(originalContent, 'utf8'));
+      fileCreated = true;
+      const sourceDocument = await vscode.workspace.openTextDocument(fileUri);
+      assert.strictEqual(sourceDocument.eol, vscode.EndOfLine.CRLF, 'temporary source must open as CRLF');
+
+      await cfg.update('disableMonacoCapture', true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+      await overlay.stopMonacoCapture('CRLF preview save integrity test');
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true });
+      await warmMonacoPreviewForRendererTest(overlay, queryValue);
+      const targetSrc = await requestHostPreviewForRendererTest(overlay, queryValue, fileUri);
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var targetSrc = ${JSON.stringify(targetSrc)};
+          var previewUri = ${JSON.stringify(fileUri.toString())};
+          var expectedContent = ${JSON.stringify(savedContent)};
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            return (node.getAttribute('data-ij-find-src') || '') === targetSrc;
+          });
+          if (!root) { return JSON.stringify({ err: 'missing CRLF preview root' }); }
+          var editor = null;
+          var model = null;
+          var state = null;
+          var mountDeadline = performance.now() + 8000;
+          while (performance.now() < mountDeadline) {
+            state = window.__ijFindGetSearchState(targetSrc);
+            editor = window.__ijFindGetPreviewEditorForTests(targetSrc);
+            model = editor && editor.getModel ? editor.getModel() : null;
+            var modelUri = model && model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+            if (state && state.previewEngine === 'standalone' && modelUri === previewUri) { break; }
+            await new Promise(function (resolve) { setTimeout(resolve, 20); });
+          }
+          if (!editor || !model || !state || state.previewEngine !== 'standalone') {
+            return JSON.stringify({ err: 'CRLF preview model did not mount', state: state });
+          }
+
+          var priorOnMessage = window.__ijFindOnMessage;
+          var saveResult = null;
+          window.__ijFindOnMessage = function (msg) {
+            if (msg && msg.type === 'preview:saveResult' && msg.uri === previewUri) {
+              saveResult = {
+                requestId: msg.requestId,
+                ok: msg.ok,
+                error: msg.error,
+                savedContent: msg.savedContent
+              };
+            }
+            return priorOnMessage.apply(this, arguments);
+          };
+          try {
+            var bundledApi = globalThis.__ijFindMonacoApi || null;
+            var editRange = bundledApi && bundledApi.Range
+              ? new bundledApi.Range(1, 1, 1, 2)
+              : { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 2 };
+            var editApplied = editor.executeEdits('preview-eol-integrity-test', [{
+              range: editRange,
+              text: 'F',
+              forceMoveMarkers: true
+            }]);
+            var beforeSave = window.__ijFindGetSearchState(targetSrc);
+            var modelEolBeforeSave = model.getEOL ? model.getEOL() : '';
+            var saveButton = root.querySelector('.ij-find-preview-save');
+            if (!saveButton) { return JSON.stringify({ err: 'missing CRLF preview save button' }); }
+            saveButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            var afterRequest = window.__ijFindGetSearchState(targetSrc);
+            var ackDeadline = performance.now() + 12000;
+            while (performance.now() < ackDeadline) {
+              state = window.__ijFindGetSearchState(targetSrc);
+              if (saveResult && saveResult.ok === true && state && state.previewDirty === false) { break; }
+              await new Promise(function (resolve) { setTimeout(resolve, 25); });
+            }
+            return JSON.stringify({
+              engine: state && state.previewEngine,
+              editApplied: editApplied,
+              beforeSaveDirty: beforeSave && beforeSave.previewDirty,
+              afterRequestDirty: afterRequest && afterRequest.previewDirty,
+              finalDirty: state && state.previewDirty,
+              finalSaveDisabled: state && state.saveButtonDisabled,
+              modelEolBeforeSave: modelEolBeforeSave,
+              modelValue: model.getValue ? model.getValue() : '',
+              expectedContent: expectedContent,
+              saveResult: saveResult
+            });
+          } finally {
+            window.__ijFindOnMessage = priorOnMessage;
+          }
+        })()`,
+        20_000,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        engine?: string;
+        editApplied?: boolean;
+        beforeSaveDirty?: boolean;
+        afterRequestDirty?: boolean;
+        finalDirty?: boolean;
+        finalSaveDisabled?: boolean;
+        modelEolBeforeSave?: string;
+        modelValue?: string;
+        saveResult?: { requestId?: number; ok?: boolean; error?: string; savedContent?: string };
+      };
+      const diskContent = Buffer.from(await vscode.workspace.fs.readFile(fileUri)).toString('utf8');
+      assert.strictEqual(parsed.err, undefined, `expected CRLF save integrity probe to run: ${raw}`);
+      assert.strictEqual(parsed.engine, 'standalone', `CRLF save must run through bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.editApplied, true, `single-character Monaco edit must apply: ${raw}`);
+      assert.strictEqual(parsed.beforeSaveDirty, true, `single-character edit must mark the preview dirty: ${raw}`);
+      assert.strictEqual(parsed.afterRequestDirty, true, `preview must stay dirty until the real save acknowledgement: ${raw}`);
+      assert.strictEqual(parsed.saveResult?.ok, true, `real save bridge must acknowledge the CRLF save: ${raw}`);
+      assert.ok(typeof parsed.saveResult?.requestId === 'number', `save acknowledgement must carry a request id: ${raw}`);
+      assert.strictEqual(parsed.finalDirty, false, `successful save acknowledgement must clean the preview: ${raw}`);
+      assert.strictEqual(parsed.finalSaveDisabled, true, `clean saved preview must disable save: ${raw}`);
+      assert.strictEqual(parsed.modelEolBeforeSave, '\r\n', `bundled model must retain the source EOL: ${raw}`);
+      assert.strictEqual(parsed.modelValue, savedContent, `saved model must retain CRLF and trailing newline: ${raw}`);
+      assert.strictEqual(diskContent, savedContent, 'real preview save must preserve CRLF bytes and trailing newline');
+    } finally {
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisable, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorTransient, vscode.ConfigurationTarget.Workspace);
+      if (priorDisable !== true) { overlay.resumeMonacoCaptureForTests(); }
+      try { await closeTabsByUri(fileUri); } catch {}
+      if (fileCreated) {
+        try { await vscode.workspace.fs.delete(fileUri, { recursive: false, useTrash: false }); } catch {}
+      }
+    }
+  });
+
+  test('stale preview save rejects external document changes without overwriting disk', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(30_000);
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected workspace folder');
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
+    const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
+    const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const fileUri = vscode.Uri.joinPath(folder!.uri, `preview-conflict-integrity-${suffix}.txt`);
+    const queryValue = `BundledConflictSaveProbe-${suffix}`;
+    const originalContent = 'original value\n';
+    const externalContent = 'externally updated value\n';
+    const stalePreviewContent = 'stale preview value\n';
+    let fileCreated = false;
+
+    try {
+      await vscode.workspace.fs.writeFile(fileUri, Buffer.from(originalContent, 'utf8'));
+      fileCreated = true;
+      await cfg.update('disableMonacoCapture', true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+      await overlay.stopMonacoCapture('stale preview save conflict test');
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true });
+      await warmMonacoPreviewForRendererTest(overlay, queryValue);
+      const targetSrc = await requestHostPreviewForRendererTest(overlay, queryValue, fileUri);
+
+      const mountedRaw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var targetSrc = ${JSON.stringify(targetSrc)};
+          var previewUri = ${JSON.stringify(fileUri.toString())};
+          var state = null;
+          var model = null;
+          var deadline = performance.now() + 8000;
+          while (performance.now() < deadline) {
+            state = window.__ijFindGetSearchState(targetSrc);
+            var editor = window.__ijFindGetPreviewEditorForTests(targetSrc);
+            model = editor && editor.getModel ? editor.getModel() : null;
+            var modelUri = model && model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+            if (state && state.previewEngine === 'standalone' && modelUri === previewUri) { break; }
+            await new Promise(function (resolve) { setTimeout(resolve, 20); });
+          }
+          return JSON.stringify({
+            engine: state && state.previewEngine,
+            dirty: state && state.previewDirty,
+            modelValue: model && model.getValue ? model.getValue() : ''
+          });
+        })()`,
+        15_000,
+      );
+      const mounted = JSON.parse(mountedRaw) as { engine?: string; dirty?: boolean; modelValue?: string };
+      assert.strictEqual(mounted.engine, 'standalone', `stale-save source must mount in bundled Monaco: ${mountedRaw}`);
+      assert.strictEqual(mounted.dirty, false, `freshly loaded preview must start clean: ${mountedRaw}`);
+      assert.strictEqual(mounted.modelValue, originalContent, `preview must load the original disk snapshot: ${mountedRaw}`);
+
+      const hostDocument = await vscode.workspace.openTextDocument(fileUri);
+      const externalEdit = new vscode.WorkspaceEdit();
+      externalEdit.replace(
+        fileUri,
+        new vscode.Range(hostDocument.positionAt(0), hostDocument.positionAt(hostDocument.getText().length)),
+        externalContent,
+      );
+      assert.strictEqual(await vscode.workspace.applyEdit(externalEdit), true, 'external WorkspaceEdit must apply');
+      assert.strictEqual(await hostDocument.save(), true, 'externally edited document must save');
+      assert.strictEqual(
+        Buffer.from(await vscode.workspace.fs.readFile(fileUri)).toString('utf8'),
+        externalContent,
+        'external edit must reach disk before stale preview save',
+      );
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var targetSrc = ${JSON.stringify(targetSrc)};
+          var previewUri = ${JSON.stringify(fileUri.toString())};
+          var originalContent = ${JSON.stringify(originalContent)};
+          var stalePreviewContent = ${JSON.stringify(stalePreviewContent)};
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            return (node.getAttribute('data-ij-find-src') || '') === targetSrc;
+          });
+          var editor = window.__ijFindGetPreviewEditorForTests(targetSrc);
+          var model = editor && editor.getModel ? editor.getModel() : null;
+          if (!root || !model) { return JSON.stringify({ err: 'missing stale preview model' }); }
+          var modelBeforeEdit = model.getValue ? model.getValue() : '';
+          var priorOnMessage = window.__ijFindOnMessage;
+          var saveResult = null;
+          window.__ijFindOnMessage = function (msg) {
+            if (msg && msg.type === 'preview:saveResult' && msg.uri === previewUri) {
+              saveResult = { requestId: msg.requestId, ok: msg.ok, error: msg.error };
+            }
+            return priorOnMessage.apply(this, arguments);
+          };
+          try {
+            model.setValue(stalePreviewContent);
+            var beforeSave = window.__ijFindGetSearchState(targetSrc);
+            var saveButton = root.querySelector('.ij-find-preview-save');
+            if (!saveButton) { return JSON.stringify({ err: 'missing stale preview save button' }); }
+            saveButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            var afterRequest = window.__ijFindGetSearchState(targetSrc);
+            var ackDeadline = performance.now() + 12000;
+            while (performance.now() < ackDeadline && !saveResult) {
+              await new Promise(function (resolve) { setTimeout(resolve, 25); });
+            }
+            var afterAck = window.__ijFindGetSearchState(targetSrc);
+            return JSON.stringify({
+              engine: afterAck && afterAck.previewEngine,
+              modelBeforeEdit: modelBeforeEdit,
+              originalContent: originalContent,
+              beforeSaveDirty: beforeSave && beforeSave.previewDirty,
+              afterRequestDirty: afterRequest && afterRequest.previewDirty,
+              afterAckDirty: afterAck && afterAck.previewDirty,
+              afterAckSaveDisabled: afterAck && afterAck.saveButtonDisabled,
+              afterAckSaveButtonDirty: afterAck && afterAck.saveButtonDirty,
+              modelAfterAck: model.getValue ? model.getValue() : '',
+              saveResult: saveResult
+            });
+          } finally {
+            window.__ijFindOnMessage = priorOnMessage;
+            try {
+              if (model && model.getValue && model.getValue() !== originalContent && model.setValue) {
+                model.setValue(originalContent);
+              }
+            } catch (eResetModel) {}
+          }
+        })()`,
+        20_000,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        engine?: string;
+        modelBeforeEdit?: string;
+        beforeSaveDirty?: boolean;
+        afterRequestDirty?: boolean;
+        afterAckDirty?: boolean;
+        afterAckSaveDisabled?: boolean;
+        afterAckSaveButtonDirty?: string | null;
+        modelAfterAck?: string;
+        saveResult?: { requestId?: number; ok?: boolean; error?: string };
+      };
+      const diskAfterRejectedSave = Buffer.from(await vscode.workspace.fs.readFile(fileUri)).toString('utf8');
+      assert.strictEqual(parsed.err, undefined, `expected stale preview save probe to run: ${raw}`);
+      assert.strictEqual(parsed.engine, 'standalone', `stale save must run through bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.modelBeforeEdit, originalContent, `external edit must not silently rewrite the loaded preview snapshot: ${raw}`);
+      assert.strictEqual(parsed.beforeSaveDirty, true, `stale preview edit must become dirty: ${raw}`);
+      assert.strictEqual(parsed.afterRequestDirty, true, `stale save request must remain dirty while pending: ${raw}`);
+      assert.strictEqual(parsed.saveResult?.ok, false, `host must reject stale preview content with a failure acknowledgement: ${raw}`);
+      assert.ok(typeof parsed.saveResult?.requestId === 'number', `failure acknowledgement must carry the save request id: ${raw}`);
+      assert.match(parsed.saveResult?.error ?? '', /changed|reopen/i, `failure acknowledgement must explain the stale snapshot: ${raw}`);
+      assert.strictEqual(parsed.modelAfterAck, stalePreviewContent, `failed save acknowledgement must preserve the user's preview edit: ${raw}`);
+      assert.strictEqual(parsed.afterAckDirty, true, `failed stale save must leave the preview dirty: ${raw}`);
+      assert.strictEqual(parsed.afterAckSaveDisabled, false, `failed stale save must remain retryable: ${raw}`);
+      assert.strictEqual(parsed.afterAckSaveButtonDirty, 'true', `save button must retain dirty state after rejection: ${raw}`);
+      assert.strictEqual(diskAfterRejectedSave, externalContent, 'stale preview save must not overwrite the latest disk content');
+    } finally {
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisable, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorTransient, vscode.ConfigurationTarget.Workspace);
+      if (priorDisable !== true) { overlay.resumeMonacoCaptureForTests(); }
+      try { await closeTabsByUri(fileUri); } catch {}
+      if (fileCreated) {
+        try { await vscode.workspace.fs.delete(fileUri, { recursive: false, useTrash: false }); } catch {}
+      }
+    }
+  });
+
+  test('bundled Monaco definition bridge opens the provider target in the workbench', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(30_000);
+    const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
+    const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
+    const previewUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
+    const targetUri = vscode.Uri.joinPath(folder!.uri, 'beta.js');
+    const previewDocument = await vscode.workspace.openTextDocument(previewUri);
+    const sourceLines = previewDocument.getText().split(/\r?\n/);
+    const sourceEol = previewDocument.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    const targetPosition = new vscode.Position(0, 6);
+    const queryValue = 'BundledDefinitionBridgeProbe';
+    let providerInvocations = 0;
+    const providerUris: string[] = [];
+    const definitionDisposable = vscode.languages.registerDefinitionProvider(
+      { scheme: 'file', language: 'python' },
+      {
+        provideDefinition(document) {
+          providerInvocations++;
+          providerUris.push(document.uri.toString());
+          return new vscode.Location(targetUri, targetPosition);
+        },
+      },
+    );
+
+    try {
+      await closeTabsByUri(targetUri);
+      await cfg.update('disableMonacoCapture', true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+      await overlay.stopMonacoCapture('bundled definition bridge test');
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true });
+
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+          window.__ijFindDisableMonacoProbes = true;
+          try {
+            var previewUri = ${JSON.stringify(previewUri.toString())};
+            var sourceLines = ${JSON.stringify(sourceLines)};
+            window.__ijFindOnMessage({
+              type: 'preview',
+              __targetSrc: targetSrc,
+              uri: previewUri,
+              relPath: 'alpha.py',
+              languageId: 'python',
+              eol: ${JSON.stringify(sourceEol)},
+              focusLine: 0,
+              fullFile: true,
+              lines: sourceLines.map(function (text, lineNumber) {
+                return { lineNumber: lineNumber, text: text };
+              }),
+              ranges: [{ start: 6, end: 15 }]
+            });
+
+            var state = null;
+            var editor = null;
+            var model = null;
+            var mountDeadline = performance.now() + 8000;
+            while (performance.now() < mountDeadline) {
+              state = window.__ijFindGetSearchState(targetSrc);
+              editor = window.__ijFindGetPreviewEditorForTests
+                ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+                : null;
+              model = editor && editor.getModel ? editor.getModel() : null;
+              var modelUri = model && model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+              var languageId = model && model.getLanguageId ? String(model.getLanguageId()) : '';
+              if (state && state.previewEngine === 'standalone' && modelUri === previewUri &&
+                  languageId === 'python') {
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            }
+            if (!editor || !model) {
+              return JSON.stringify({ err: 'bundled preview did not mount', state: state });
+            }
+
+            var triggerError = '';
+            try {
+              editor.setPosition({ lineNumber: 1, column: 8 });
+              editor.focus();
+              editor.trigger('ijss-test', 'editor.action.revealDefinition', {});
+              await new Promise(function (resolve) { setTimeout(resolve, 1200); });
+            } catch (eDefinition) {
+              triggerError = String(eDefinition && eDefinition.message || eDefinition);
+            }
+
+            return JSON.stringify({
+              engine: state && state.previewEngine,
+              stateUri: state && state.previewUri,
+              modelUri: model && model.uri && model.uri.toString ? String(model.uri.toString()) : '',
+              languageId: model && model.getLanguageId ? String(model.getLanguageId()) : '',
+              triggerError: triggerError,
+              debugState: window.__ijFindGetSearchState(targetSrc)
+            });
+          } finally {
+            window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
+          }
+        })()`,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        engine?: string;
+        stateUri?: string;
+        modelUri?: string;
+        languageId?: string;
+        triggerError?: string;
+      };
+
+      let targetEditor: vscode.TextEditor | undefined;
+      const navigationDeadline = Date.now() + 8_000;
+      while (Date.now() < navigationDeadline) {
+        targetEditor = vscode.window.visibleTextEditors.find(
+          (editor) => editor.document.uri.toString() === targetUri.toString(),
+        );
+        if (
+          providerInvocations > 0 &&
+          targetEditor &&
+          targetEditor.selection.active.line === targetPosition.line &&
+          targetEditor.selection.active.character === targetPosition.character
+        ) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+
+      assert.strictEqual(parsed.err, undefined, `expected bundled definition bridge probe to run: ${raw}`);
+      assert.strictEqual(parsed.engine, 'standalone', `definition must be tested against bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.stateUri, previewUri.toString(), `preview state must keep the definition source URI: ${raw}`);
+      assert.strictEqual(parsed.modelUri, previewUri.toString(), `bundled model must use the definition source URI: ${raw}`);
+      assert.strictEqual(parsed.languageId, 'python', `bundled model must match the definition provider selector: ${raw}`);
+      assert.strictEqual(parsed.triggerError, '', `revealDefinition should not throw: ${raw}`);
+      assert.ok(providerInvocations > 0, `bundled definition must invoke the extension-host provider: ${raw}`);
+      assert.ok(
+        providerUris.includes(previewUri.toString()),
+        `definition provider must receive the preview file URI: ${JSON.stringify(providerUris)}`,
+      );
+      assert.ok(targetEditor, `definition opener must reveal ${targetUri.toString()} in the workbench`);
+      assert.strictEqual(
+        targetEditor?.selection.active.line,
+        targetPosition.line,
+        `definition opener must preserve the target line`,
+      );
+      assert.strictEqual(
+        targetEditor?.selection.active.character,
+        targetPosition.character,
+        `definition opener must preserve the target column`,
+      );
+    } finally {
+      definitionDisposable.dispose();
+      try { await closeTabsByUri(targetUri); } catch {}
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisable, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorTransient, vscode.ConfigurationTarget.Workspace);
+      if (priorDisable !== true) { overlay.resumeMonacoCaptureForTests(); }
     }
   });
 
@@ -1235,7 +3857,7 @@ suite('Renderer — overlay UI probes', () => {
     );
   });
 
-  test('preview force-open capture fallback is coalesced during burst navigation', async function () {
+  test('opted-in preview force-open capture fallback is coalesced during burst navigation', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(30_000);
     const { overlay } = await getApi();
@@ -1245,7 +3867,9 @@ suite('Renderer — overlay UI probes', () => {
     const previewFixture = vscode.Uri.joinPath(folder!.uri, 'beta.js');
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+    const priorAllowTransientCapture = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor');
     await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
+    await cfg.update('allowTransientPreviewCaptureEditor', true, vscode.ConfigurationTarget.Workspace);
     overlay.resumeMonacoCaptureForTests();
     try { await closeTabsByUri(previewFixture); } catch {}
     await vscode.window.showTextDocument(activeFixture, {
@@ -1364,6 +3988,7 @@ suite('Renderer — overlay UI probes', () => {
       );
     } finally {
       await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorAllowTransientCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
       try {
         await overlay.evalInActiveWindowForTests(
           `(function(){
@@ -1512,7 +4137,7 @@ suite('Renderer — overlay UI probes', () => {
           var src = ${JSON.stringify(src)};
           var state = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(src) : {};
           var active = state && typeof state.activePreviewSeq === 'number' ? state.activePreviewSeq : 0;
-          return String(Math.max(Date.now(), active + 1));
+          return String(active + 1);
         })()`,
       ));
       overlay.injectRendererEventForTests(JSON.stringify({
@@ -1523,7 +4148,6 @@ suite('Renderer — overlay UI probes', () => {
         ranges: [{ start: 6, end: 16 }],
         previewSeq,
         __src: src,
-        __seq: Date.now(),
       }));
 
       let finalState = '';
@@ -1863,7 +4487,7 @@ suite('Renderer — overlay UI probes', () => {
             var src = ${JSON.stringify(src)};
             var state = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(src) : {};
             var active = state && typeof state.activePreviewSeq === 'number' ? state.activePreviewSeq : 0;
-            return String(Math.max(Date.now(), active + 1));
+            return String(active + 1);
           })()`,
         ));
       await overlay.evalInActiveWindowForTests(
@@ -1881,7 +4505,6 @@ suite('Renderer — overlay UI probes', () => {
         ranges: [{ start: 6, end: 16 }],
         previewSeq,
         __src: src,
-        __seq: Date.now(),
       }));
 
       let maxGroupCount = groupsBefore;
@@ -1939,7 +4562,7 @@ suite('Renderer — overlay UI probes', () => {
         monacoStatus?: string;
       };
       assert.strictEqual(parsed.err, undefined, `expected preview state probe to run: ${finalState}`);
-      assert.strictEqual(parsed.previewMode, 'monaco', `preview warmup should recover from DOM fallback to Monaco using an existing editor object: ${finalState}`);
+      assert.strictEqual(parsed.previewMode, 'monaco', `preview warmup should keep Monaco active while upgrading with an existing editor object: ${finalState}`);
       assert.strictEqual(parsed.previewUri, previewFixture.toString(), `preview warmup should refresh the latest requested preview: ${finalState}`);
       assert.strictEqual(parsed.hasMonacoHost, true, `preview warmup should mount a Monaco preview host: ${finalState}`);
       assert.strictEqual(
@@ -2205,11 +4828,8 @@ suite('Renderer — overlay UI probes', () => {
         `cold preview should reach Monaco within 2500ms; ${raw} captureStats=${JSON.stringify(captureStats)}`,
       );
       // Regression assertion #1: previewMode should not transit through 'dom'.
-      // Today the renderer falls back to renderPreviewDOM because
-      // monacoStatus !== 'ready' at message-arrival time, even though a real
-      // workbench editor is already visible and the DOM-scan capture should
-      // be able to harvest its widget constructor. The user sees a plain
-      // text preview for ~700-1500ms before Monaco swaps in.
+      // Monaco may begin in bundled mode while native capture warms, but it
+      // must never transit through a code-shaped DOM approximation.
       assert.ok(
         !(parsed.modesObserved ?? []).includes('dom'),
         `cold preview should not transit through DOM fallback; modes=${JSON.stringify(parsed.modesObserved)} captureStats=${JSON.stringify(captureStats)}`,
@@ -2398,6 +5018,617 @@ suite('Renderer — overlay UI probes', () => {
     }
   });
 
+  // Engine ownership is intentionally asymmetric. Once a healthy captured
+  // VS Code editor owns a preview, a momentary capture-status miss must not
+  // tear it down and replace it with bundled Monaco. Hover/LSP work can make
+  // capture diagnostics race a same-preview refresh, and replacing the widget
+  // in that window loses the user's viewport. Bundled previews may still be
+  // promoted to native when capture later becomes ready (covered below).
+  test('native preview never downgrades to bundled Monaco during same-preview refresh', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(25_000);
+    const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const { overlay } = await getApi();
+    const captureFixture = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+    const queryValue = 'NativePreviewOwnershipProbe';
+
+    try {
+      await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
+      overlay.resumeMonacoCaptureForTests();
+      await vscode.window.showTextDocument(captureFixture, {
+        preview: false,
+        preserveFocus: false,
+        viewColumn: vscode.ViewColumn.One,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const anyOverlay = overlay as any;
+      let monacoReady = false;
+      try {
+        await anyOverlay.ensureMonacoCapture(anyOverlay.activeWindowId, captureFixture, {
+          allowForceOpen: true,
+          reason: 'test-native-preview-ownership',
+        });
+        monacoReady = await overlay.waitForMonacoReadyForTests(6_000);
+      } catch {}
+      if (!monacoReady) { this.skip(); return; }
+
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true });
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing native ownership panel' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          var uri = 'untitled:native-preview-ownership-' + Date.now() + '.py';
+          var lines = [];
+          for (var i = 0; i < 800; i++) {
+            lines.push({
+              lineNumber: i,
+              text: i === 0 ? 'class StablePreviewOwner:' : '    # neutral_filler_' + String(i).padStart(4, '0')
+            });
+          }
+          var msg = {
+            type: 'preview',
+            __targetSrc: targetSrc,
+            uri: uri,
+            relPath: 'native-preview-ownership.py',
+            languageId: 'python',
+            focusLine: 0,
+            fullFile: true,
+            lines: lines,
+            ranges: [{ start: 6, end: 24 }],
+            previewSeq: Math.max(Date.now(), 1)
+          };
+          window.__ijFindOnMessage(msg);
+
+          var deadline = performance.now() + 7000;
+          var state = null;
+          var baselineEditor = null;
+          var baselineModel = null;
+          while (performance.now() < deadline) {
+            state = window.__ijFindGetSearchState(targetSrc);
+            baselineEditor = window.__ijFindGetPreviewEditorForTests
+              ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+              : null;
+            baselineModel = baselineEditor && baselineEditor.getModel ? baselineEditor.getModel() : null;
+            var modelUri = baselineModel && baselineModel.uri && baselineModel.uri.toString
+              ? String(baselineModel.uri.toString()) : '';
+            if (state && state.previewEngine === 'native' && modelUri === uri) { break; }
+            await new Promise(function (resolve) { setTimeout(resolve, 20); });
+          }
+          if (!state || state.previewEngine !== 'native' || !baselineEditor || !baselineModel) {
+            return JSON.stringify({ err: 'native preview did not establish ownership', state: state });
+          }
+
+          for (var layoutPass = 0; layoutPass < 8; layoutPass++) {
+            try { baselineEditor.layout && baselineEditor.layout(); } catch (eLayout) {}
+            await new Promise(function (resolve) { setTimeout(resolve, 25); });
+          }
+          try { baselineEditor.setScrollTop(720); } catch (eScroll) {}
+          await new Promise(function (resolve) { setTimeout(resolve, 80); });
+          var baselineScroll = baselineEditor.getScrollTop ? baselineEditor.getScrollTop() : -1;
+
+          function snapshot(label) {
+            var currentState = window.__ijFindGetSearchState(targetSrc);
+            var currentEditor = window.__ijFindGetPreviewEditorForTests
+              ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+              : null;
+            var currentModel = currentEditor && currentEditor.getModel ? currentEditor.getModel() : null;
+            return {
+              label: label,
+              engine: currentState && currentState.previewEngine,
+              uri: currentState && currentState.previewUri,
+              editorSame: currentEditor === baselineEditor,
+              modelSame: currentModel === baselineModel,
+              modelUri: currentModel && currentModel.uri && currentModel.uri.toString
+                ? String(currentModel.uri.toString()) : '',
+              scrollTop: currentEditor && currentEditor.getScrollTop ? currentEditor.getScrollTop() : -1
+            };
+          }
+
+          var enginesObserved = [];
+          function sampleEngine() {
+            var sampled = window.__ijFindGetSearchState(targetSrc);
+            var engine = sampled && sampled.previewEngine || '';
+            if (engine && enginesObserved.indexOf(engine) < 0) { enginesObserved.push(engine); }
+          }
+          sampleEngine();
+          var sampler = setInterval(sampleEngine, 5);
+          var originalStatus = window.__ijFindMonacoStatus;
+          var originalCaptureFromDom = window.__ijFindCaptureFromDom;
+          var originalTestCreateWidget = window.__ijFindTestCreateWidget;
+          var duringTransient = null;
+          var afterRecovery = null;
+          try {
+            // Model the short capture-status gap that can coincide with a
+            // hover/intellisense-driven refresh. The already-mounted native
+            // editor remains healthy and therefore retains ownership.
+            window.__ijFindMonacoStatus = function () { return 'not-ready:test-transient-capture'; };
+            window.__ijFindCaptureFromDom = function () { return 'test-transient-capture-suppressed'; };
+            window.__ijFindTestCreateWidget = function () { return 'test-transient-widget-suppressed'; };
+            msg.previewSeq += 1;
+            window.__ijFindOnMessage(msg);
+            await new Promise(function (resolve) { setTimeout(resolve, 180); });
+            duringTransient = snapshot('during-transient-capture');
+
+            window.__ijFindMonacoStatus = originalStatus;
+            window.__ijFindCaptureFromDom = originalCaptureFromDom;
+            window.__ijFindTestCreateWidget = originalTestCreateWidget;
+            msg.previewSeq += 1;
+            window.__ijFindOnMessage(msg);
+            await new Promise(function (resolve) { setTimeout(resolve, 220); });
+            afterRecovery = snapshot('after-capture-recovery');
+          } finally {
+            clearInterval(sampler);
+            window.__ijFindMonacoStatus = originalStatus;
+            window.__ijFindCaptureFromDom = originalCaptureFromDom;
+            window.__ijFindTestCreateWidget = originalTestCreateWidget;
+          }
+
+          return JSON.stringify({
+            uri: uri,
+            baseline: snapshot('baseline-after-refreshes'),
+            baselineScroll: baselineScroll,
+            duringTransient: duringTransient,
+            afterRecovery: afterRecovery,
+            enginesObserved: enginesObserved
+          });
+        })()`,
+        15_000,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        uri?: string;
+        baselineScroll?: number;
+        enginesObserved?: string[];
+        baseline?: { engine?: string; uri?: string; editorSame?: boolean; modelSame?: boolean; modelUri?: string; scrollTop?: number };
+        duringTransient?: { engine?: string; uri?: string; editorSame?: boolean; modelSame?: boolean; modelUri?: string; scrollTop?: number };
+        afterRecovery?: { engine?: string; uri?: string; editorSame?: boolean; modelSame?: boolean; modelUri?: string; scrollTop?: number };
+      };
+      assert.strictEqual(parsed.err, undefined, `expected native ownership probe to run: ${raw}`);
+      assert.ok((parsed.baselineScroll ?? 0) >= 400, `probe must establish a meaningful scroll offset: ${raw}`);
+      assert.deepStrictEqual(parsed.enginesObserved, ['native'], `native ownership must never transit through bundled Monaco: ${raw}`);
+      for (const snapshot of [parsed.duringTransient, parsed.afterRecovery, parsed.baseline]) {
+        assert.strictEqual(snapshot?.engine, 'native', `native preview engine must remain pinned: ${raw}`);
+        assert.strictEqual(snapshot?.uri, parsed.uri, `native preview URI must remain stable: ${raw}`);
+        assert.strictEqual(snapshot?.editorSame, true, `same-preview refresh must retain the native editor object: ${raw}`);
+        assert.strictEqual(snapshot?.modelSame, true, `same-preview refresh must retain the hydrated native model: ${raw}`);
+        assert.strictEqual(snapshot?.modelUri, parsed.uri, `same-preview refresh must retain the resource model URI: ${raw}`);
+        assert.ok(
+          Math.abs((snapshot?.scrollTop ?? -1) - (parsed.baselineScroll ?? -1)) <= 32,
+          `same-preview refresh must preserve native scroll position: ${raw}`,
+        );
+      }
+    } finally {
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
+    }
+  });
+
+  test('bundled preview may upgrade to native when passive capture becomes ready', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(25_000);
+    const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const { overlay } = await getApi();
+    const captureFixture = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+    const queryValue = 'BundledToNativePromotionProbe';
+
+    try {
+      await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
+      overlay.resumeMonacoCaptureForTests();
+      const captureEditor = await vscode.window.showTextDocument(captureFixture, {
+        preview: false,
+        preserveFocus: false,
+        viewColumn: vscode.ViewColumn.One,
+      });
+      const promotionContent = captureEditor.document.getText();
+      const promotionEol = captureEditor.document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+      const promotionLines = promotionContent.split(/\r\n|\n/).map((text, lineNumber) => ({ lineNumber, text }));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const anyOverlay = overlay as any;
+      let monacoReady = false;
+      try {
+        await anyOverlay.ensureMonacoCapture(anyOverlay.activeWindowId, captureFixture, {
+          allowForceOpen: true,
+          reason: 'test-bundled-to-native-promotion',
+        });
+        monacoReady = await overlay.waitForMonacoReadyForTests(6_000);
+      } catch {}
+      if (!monacoReady) { this.skip(); return; }
+
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true, spawn: true });
+      await warmMonacoPreviewForRendererTest(overlay, queryValue);
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing promotion panel' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          var uri = ${JSON.stringify(captureFixture.toString())};
+          var expectedContent = ${JSON.stringify(promotionContent)};
+          var msg = {
+            type: 'preview',
+            __targetSrc: targetSrc,
+            uri: uri,
+            relPath: 'alpha.py',
+            languageId: 'python',
+            focusLine: 1,
+            fullFile: true,
+            eol: ${JSON.stringify(promotionEol)},
+            lines: ${JSON.stringify(promotionLines)},
+            ranges: [{ start: 8, end: 13 }],
+            previewSeq: Math.max(Date.now(), 1)
+          };
+          var originalStatus = window.__ijFindMonacoStatus;
+          var originalCaptureFromDom = window.__ijFindCaptureFromDom;
+          var originalTestCreateWidget = window.__ijFindTestCreateWidget;
+          var standaloneEditor = null;
+          var standaloneModel = null;
+          var standaloneSnapshot = null;
+          var nativeSnapshot = null;
+          var failedPromotionFallback = null;
+          var originalClassListAdd = DOMTokenList.prototype.add;
+          try {
+            window.__ijFindMonacoStatus = function () { return 'not-ready:test-before-passive-capture'; };
+            window.__ijFindCaptureFromDom = function () { return 'test-pre-promotion-capture-suppressed'; };
+            window.__ijFindTestCreateWidget = function () { return 'test-pre-promotion-widget-suppressed'; };
+            window.__ijFindOnMessage(msg);
+
+            var standaloneDeadline = performance.now() + 7000;
+            while (performance.now() < standaloneDeadline) {
+              var standaloneState = window.__ijFindGetSearchState(targetSrc);
+              standaloneEditor = window.__ijFindGetPreviewEditorForTests
+                ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+                : null;
+              standaloneModel = standaloneEditor && standaloneEditor.getModel ? standaloneEditor.getModel() : null;
+              var standaloneUri = standaloneModel && standaloneModel.uri && standaloneModel.uri.toString
+                ? String(standaloneModel.uri.toString()) : '';
+              if (standaloneState && standaloneState.previewEngine === 'standalone' && standaloneUri === uri) {
+                standaloneSnapshot = {
+                  engine: standaloneState.previewEngine,
+                  uri: standaloneState.previewUri,
+                  modelUri: standaloneUri,
+                  content: standaloneModel.getValue ? standaloneModel.getValue() : ''
+                };
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            }
+            if (!standaloneSnapshot || !standaloneEditor || !standaloneModel) {
+              return JSON.stringify({ err: 'bundled preview did not establish ownership before promotion' });
+            }
+
+            standaloneEditor.setScrollTop(160);
+            standaloneSnapshot.scrollTop = standaloneEditor.getScrollTop();
+
+            // Passive capture has become ready. The bundled preview's bounded
+            // recovery poll must promote it without requiring another preview
+            // payload from the extension host. Fail the first native host mount
+            // after bundled disposal; the recovery path must recreate bundled
+            // Monaco immediately instead of leaving a blank pane.
+            var previewBody = root.querySelector('.ij-find-preview-body');
+            var failNativeMountOnce = true;
+            DOMTokenList.prototype.add = function () {
+              if (failNativeMountOnce && previewBody && this === previewBody.classList &&
+                  arguments[0] === 'ij-find-editor-mounted') {
+                failNativeMountOnce = false;
+                throw new Error('test-native-promotion-mount-failure');
+              }
+              return originalClassListAdd.apply(this, arguments);
+            };
+            window.__ijFindMonacoStatus = originalStatus;
+            window.__ijFindCaptureFromDom = originalCaptureFromDom;
+            window.__ijFindTestCreateWidget = originalTestCreateWidget;
+
+            var nativeDeadline = performance.now() + 7000;
+            while (performance.now() < nativeDeadline) {
+              var nativeState = window.__ijFindGetSearchState(targetSrc);
+              var nativeEditor = window.__ijFindGetPreviewEditorForTests
+                ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+                : null;
+              var nativeModel = nativeEditor && nativeEditor.getModel ? nativeEditor.getModel() : null;
+              var nativeUri = nativeModel && nativeModel.uri && nativeModel.uri.toString
+                ? String(nativeModel.uri.toString()) : '';
+              if (!failedPromotionFallback && nativeState && nativeState.previewEngine === 'standalone' &&
+                  nativeEditor && nativeEditor !== standaloneEditor && nativeUri === uri) {
+                failedPromotionFallback = {
+                  engine: nativeState.previewEngine,
+                  uri: nativeState.previewUri,
+                  content: nativeModel.getValue ? nativeModel.getValue() : '',
+                  editorChanged: nativeEditor !== standaloneEditor,
+                  scrollTop: nativeEditor.getScrollTop ? nativeEditor.getScrollTop() : -1
+                };
+              }
+              if (nativeState && nativeState.previewEngine === 'native' && nativeUri === uri) {
+                nativeSnapshot = {
+                  engine: nativeState.previewEngine,
+                  uri: nativeState.previewUri,
+                  modelUri: nativeUri,
+                  content: nativeModel.getValue ? nativeModel.getValue() : '',
+                  editorChanged: nativeEditor !== standaloneEditor,
+                  modelChanged: nativeModel !== standaloneModel,
+                  scrollTop: nativeEditor.getScrollTop ? nativeEditor.getScrollTop() : -1
+                };
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            }
+          } finally {
+            window.__ijFindMonacoStatus = originalStatus;
+            window.__ijFindCaptureFromDom = originalCaptureFromDom;
+            window.__ijFindTestCreateWidget = originalTestCreateWidget;
+            DOMTokenList.prototype.add = originalClassListAdd;
+          }
+
+          return JSON.stringify({
+            uri: uri,
+            expectedContent: expectedContent,
+            standalone: standaloneSnapshot,
+            failedPromotionFallback: failedPromotionFallback,
+            native: nativeSnapshot
+          });
+        })()`,
+        18_000,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        uri?: string;
+        expectedContent?: string;
+        standalone?: { engine?: string; uri?: string; modelUri?: string; content?: string; scrollTop?: number };
+        failedPromotionFallback?: { engine?: string; uri?: string; content?: string; editorChanged?: boolean; scrollTop?: number };
+        native?: { engine?: string; uri?: string; modelUri?: string; content?: string; editorChanged?: boolean; modelChanged?: boolean; scrollTop?: number };
+      };
+      assert.strictEqual(parsed.err, undefined, `expected bundled-to-native promotion probe to run: ${raw}`);
+      assert.strictEqual(parsed.standalone?.engine, 'standalone', `preview must begin on bundled Monaco while capture is unavailable: ${raw}`);
+      assert.strictEqual(parsed.standalone?.uri, parsed.uri, `bundled preview must own the requested URI before promotion: ${raw}`);
+      assert.strictEqual(parsed.standalone?.modelUri, parsed.uri, `bundled model must use the requested resource URI: ${raw}`);
+      assert.strictEqual(parsed.standalone?.content, parsed.expectedContent, `bundled preview content must match the payload: ${raw}`);
+      assert.strictEqual(parsed.failedPromotionFallback?.engine, 'standalone', `failed native mount must restore bundled Monaco: ${raw}`);
+      assert.strictEqual(parsed.failedPromotionFallback?.uri, parsed.uri, `failed native mount fallback must retain the preview URI: ${raw}`);
+      assert.strictEqual(parsed.failedPromotionFallback?.content, parsed.expectedContent, `failed native mount fallback must retain content: ${raw}`);
+      assert.strictEqual(parsed.failedPromotionFallback?.editorChanged, true, `failed native mount must recreate the disposed bundled editor: ${raw}`);
+      assert.ok(
+        Math.abs((parsed.failedPromotionFallback?.scrollTop ?? -1) - (parsed.standalone?.scrollTop ?? -1)) <= 32,
+        `failed native mount fallback must restore the bundled viewport: ${raw}`,
+      );
+      assert.strictEqual(parsed.native?.engine, 'native', `passive capture readiness may promote bundled preview to native: ${raw}`);
+      assert.strictEqual(parsed.native?.uri, parsed.uri, `native promotion must keep the preview URI: ${raw}`);
+      assert.strictEqual(parsed.native?.modelUri, parsed.uri, `native promotion must hydrate the same resource URI: ${raw}`);
+      assert.strictEqual(parsed.native?.content, parsed.expectedContent, `native promotion must preserve preview content: ${raw}`);
+      assert.strictEqual(parsed.native?.editorChanged, true, `promotion must replace the standalone editor with the native editor: ${raw}`);
+      assert.strictEqual(parsed.native?.modelChanged, true, `promotion must replace the standalone model with the native resource model: ${raw}`);
+      assert.ok(
+        Math.abs((parsed.native?.scrollTop ?? -1) - (parsed.standalone?.scrollTop ?? -1)) <= 32,
+        `automatic promotion must preserve the bundled viewport: ${raw}`,
+      );
+    } finally {
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
+    }
+  });
+
+  test('dirty bundled preview defers passive native promotion until it is clean', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(25_000);
+    const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const { overlay } = await getApi();
+    const captureFixture = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+    const queryValue = 'DirtyBundledNativePromotionProbe';
+
+    try {
+      await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
+      overlay.resumeMonacoCaptureForTests();
+      const captureEditor = await vscode.window.showTextDocument(captureFixture, {
+        preview: false,
+        preserveFocus: false,
+        viewColumn: vscode.ViewColumn.One,
+      });
+      const cleanContent = captureEditor.document.getText();
+      const eol = captureEditor.document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+      const lines = cleanContent.split(/\r\n|\n/).map((text, lineNumber) => ({ lineNumber, text }));
+      const anyOverlay = overlay as any;
+      let monacoReady = false;
+      try {
+        await anyOverlay.ensureMonacoCapture(anyOverlay.activeWindowId, captureFixture, {
+          allowForceOpen: true,
+          reason: 'test-dirty-bundled-native-promotion',
+        });
+        monacoReady = await overlay.waitForMonacoReadyForTests(6_000);
+      } catch {}
+      if (!monacoReady) { this.skip(); return; }
+
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true, spawn: true });
+      await warmMonacoPreviewForRendererTest(overlay, queryValue);
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing dirty promotion panel' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          var uri = ${JSON.stringify(captureFixture.toString())};
+          var cleanContent = ${JSON.stringify(cleanContent)};
+          var dirtyContent = cleanContent + ${JSON.stringify(`${eol}# unsaved bundled edit`)};
+          var msg = {
+            type: 'preview',
+            __targetSrc: targetSrc,
+            uri: uri,
+            relPath: 'alpha.py',
+            languageId: 'python',
+            focusLine: 1,
+            fullFile: true,
+            eol: ${JSON.stringify(eol)},
+            lines: ${JSON.stringify(lines)},
+            ranges: [{ start: 8, end: 13 }],
+            previewSeq: Math.max(Date.now(), 1)
+          };
+          var originalStatus = window.__ijFindMonacoStatus;
+          var originalCaptureFromDom = window.__ijFindCaptureFromDom;
+          var originalTestCreateWidget = window.__ijFindTestCreateWidget;
+          var standaloneEditor = null;
+          var standaloneModel = null;
+          try {
+            window.__ijFindMonacoStatus = function () { return 'not-ready:test-dirty-before-capture'; };
+            window.__ijFindCaptureFromDom = function () { return 'test-dirty-capture-suppressed'; };
+            window.__ijFindTestCreateWidget = function () { return 'test-dirty-widget-suppressed'; };
+            window.__ijFindOnMessage(msg);
+
+            var standaloneDeadline = performance.now() + 7000;
+            while (performance.now() < standaloneDeadline) {
+              var state = window.__ijFindGetSearchState(targetSrc);
+              standaloneEditor = window.__ijFindGetPreviewEditorForTests
+                ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+                : null;
+              standaloneModel = standaloneEditor && standaloneEditor.getModel ? standaloneEditor.getModel() : null;
+              if (state && state.previewEngine === 'standalone' && standaloneModel &&
+                  String(standaloneModel.uri || '') === uri) {
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            }
+            if (!standaloneEditor || !standaloneModel) {
+              return JSON.stringify({ err: 'dirty probe did not mount bundled preview' });
+            }
+
+            standaloneModel.setValue(dirtyContent);
+            var dirtyState = window.__ijFindGetSearchState(targetSrc);
+            window.__ijFindMonacoStatus = originalStatus;
+            window.__ijFindCaptureFromDom = originalCaptureFromDom;
+            window.__ijFindTestCreateWidget = originalTestCreateWidget;
+
+            // Several clean-preview retry slots elapse here. The engine and
+            // edited model must remain untouched while the dirty guard is on.
+            await new Promise(function (resolve) { setTimeout(resolve, 1200); });
+            var blockedState = window.__ijFindGetSearchState(targetSrc);
+            var blockedEditor = window.__ijFindGetPreviewEditorForTests
+              ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+              : null;
+            var blockedModel = blockedEditor && blockedEditor.getModel ? blockedEditor.getModel() : null;
+            var blocked = {
+              dirtyInitially: !!(dirtyState && dirtyState.previewDirty),
+              engine: blockedState && blockedState.previewEngine,
+              dirty: !!(blockedState && blockedState.previewDirty),
+              editorSame: blockedEditor === standaloneEditor,
+              modelSame: blockedModel === standaloneModel,
+              content: blockedModel && blockedModel.getValue ? blockedModel.getValue() : ''
+            };
+
+            // Returning to the clean snapshot restarts the bounded promotion
+            // scheduler. No second preview message is sent.
+            standaloneModel.setValue(cleanContent);
+            var nativeSnapshot = null;
+            var nativeDeadline = performance.now() + 7000;
+            while (performance.now() < nativeDeadline) {
+              var nativeState = window.__ijFindGetSearchState(targetSrc);
+              var nativeEditor = window.__ijFindGetPreviewEditorForTests
+                ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+                : null;
+              var nativeModel = nativeEditor && nativeEditor.getModel ? nativeEditor.getModel() : null;
+              if (nativeState && nativeState.previewEngine === 'native' && nativeModel) {
+                nativeSnapshot = {
+                  engine: nativeState.previewEngine,
+                  dirty: !!nativeState.previewDirty,
+                  content: nativeModel.getValue ? nativeModel.getValue() : '',
+                  editorChanged: nativeEditor !== standaloneEditor,
+                  modelChanged: nativeModel !== standaloneModel
+                };
+                break;
+              }
+              await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            }
+            return JSON.stringify({ dirtyContent: dirtyContent, cleanContent: cleanContent, blocked: blocked, native: nativeSnapshot });
+          } finally {
+            window.__ijFindMonacoStatus = originalStatus;
+            window.__ijFindCaptureFromDom = originalCaptureFromDom;
+            window.__ijFindTestCreateWidget = originalTestCreateWidget;
+          }
+        })()`,
+        18_000,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        dirtyContent?: string;
+        cleanContent?: string;
+        blocked?: { dirtyInitially?: boolean; engine?: string; dirty?: boolean; editorSame?: boolean; modelSame?: boolean; content?: string };
+        native?: { engine?: string; dirty?: boolean; content?: string; editorChanged?: boolean; modelChanged?: boolean };
+      };
+      assert.strictEqual(parsed.err, undefined, `expected dirty promotion probe to run: ${raw}`);
+      assert.strictEqual(parsed.blocked?.dirtyInitially, true, `editing bundled Monaco must mark the preview dirty: ${raw}`);
+      assert.strictEqual(parsed.blocked?.engine, 'standalone', `dirty bundled Monaco must not be promoted: ${raw}`);
+      assert.strictEqual(parsed.blocked?.dirty, true, `dirty state must survive passive recovery polling: ${raw}`);
+      assert.strictEqual(parsed.blocked?.editorSame, true, `dirty polling must retain the bundled editor: ${raw}`);
+      assert.strictEqual(parsed.blocked?.modelSame, true, `dirty polling must retain the edited model: ${raw}`);
+      assert.strictEqual(parsed.blocked?.content, parsed.dirtyContent, `dirty polling must not discard edits: ${raw}`);
+      assert.strictEqual(parsed.native?.engine, 'native', `cleaning the model should resume passive promotion: ${raw}`);
+      assert.strictEqual(parsed.native?.dirty, false, `promoted native model should remain clean: ${raw}`);
+      assert.strictEqual(parsed.native?.content, parsed.cleanContent, `promotion after cleaning must preserve content: ${raw}`);
+      assert.strictEqual(parsed.native?.editorChanged, true, `promotion after cleaning must replace the bundled editor: ${raw}`);
+      assert.strictEqual(parsed.native?.modelChanged, true, `promotion after cleaning must replace the bundled model: ${raw}`);
+    } finally {
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
+    }
+  });
+
   // Repro for log.txt observation #3: when the renderer DOM-scan cannot
   // promote a capture (workbench editors visible but widgets=0 ctors=0,
   // common on a freshly opened workbench), the extension scheduled a
@@ -2405,7 +5636,7 @@ suite('Renderer — overlay UI probes', () => {
   // adds pure latency on a single requestPreview — Monaco doesn't mount
   // for >1 second after the click. With a visible workbench editor we can
   // run force-open immediately.
-  test('first force-open after cold preview runs without the burst debounce', async function () {
+  test('first opted-in force-open after cold preview runs without the burst debounce', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(20_000);
     const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
@@ -2417,8 +5648,10 @@ suite('Renderer — overlay UI probes', () => {
     const beta = vscode.Uri.joinPath(folder!.uri, 'beta.js');
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+    const priorAllowTransientCapture = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor');
     try {
       await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', true, vscode.ConfigurationTarget.Workspace);
       overlay.resumeMonacoCaptureForTests();
       try { await closeTabsByUri(beta); } catch {}
       await vscode.window.showTextDocument(alpha, {
@@ -2460,19 +5693,15 @@ suite('Renderer — overlay UI probes', () => {
       overlay.resetPreviewCaptureStatsForTests();
 
       const startedAt = Date.now();
-      // __seq must monotonically beat anything the renderer panel has
-      // already emitted under this src; the panel's perf traces alone push
-      // the counter past 60 before our test even runs. Use a wall-clock
-      // timestamp to stay above the natural counter without bookkeeping.
+      // Test injection intentionally omits __seq so it does not advance the
+      // real renderer source's dedup watermark and suppress later UI events.
       overlay.injectRendererEventForTests(JSON.stringify({
         type: 'requestPreview',
         uri: beta.toString(),
         line: 0,
         contextLines: 0,
         ranges: [{ start: 6, end: 14 }],
-        previewSeq: Math.max(Date.now(), 1),
         __src: src,
-        __seq: Date.now(),
       }));
 
       // Poll until force-open completes (forceOpenAttempts >= 1 and timer
@@ -2533,6 +5762,7 @@ suite('Renderer — overlay UI probes', () => {
       } catch {}
       try { await closeTabsByUri(beta); } catch {}
       await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorAllowTransientCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
       try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
     }
   });
@@ -7142,39 +10372,39 @@ suite('Renderer — overlay UI probes', () => {
     assert.ok(parsed.previewHeight > parsed.resultsHeight * 1.5, `preview pane should dominate the result list by default: ${raw}`);
   });
 
-  test('DOM fallback preview render failures keep the panel chrome and resize handle attached', async function () {
+  test('Monaco loading failures keep the panel chrome and resize handle attached', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);
     const { overlay } = await getApi();
-    await overlay.show('DomPreviewChromeFailureProbe', { forceLiteral: true, suppressSearch: true, spawn: true });
+    await overlay.show('MonacoPreviewChromeFailureProbe', { forceLiteral: true, suppressSearch: true, spawn: true });
     const raw = await overlay.evalInActiveWindowForTests(
       `(function(){
         var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
           var query = node.querySelector('.ij-find-query');
-          return query && query.value === 'DomPreviewChromeFailureProbe';
+          return query && query.value === 'MonacoPreviewChromeFailureProbe';
         });
         if (!root) { return JSON.stringify({ err: 'missing root' }); }
         var targetSrc = root.getAttribute('data-ij-find-src') || '';
         var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
+        var oldBundledMonaco = globalThis.__ijFindMonacoApi;
         window.__ijFindDisableMonacoProbes = true;
-        var badLine = { lineNumber: 0 };
-        Object.defineProperty(badLine, 'text', {
-          get: function(){ throw new Error('test preview text getter failed'); }
-        });
+        globalThis.__ijFindMonacoApi = null;
         try {
           window.__ijFindOnMessage({
             type: 'preview',
             __targetSrc: targetSrc,
-            uri: 'file:///dom-preview-chrome-failure.py',
-            relPath: 'dom-preview-chrome-failure.py',
+            uri: 'file:///monaco-preview-chrome-failure.py',
+            relPath: 'monaco-preview-chrome-failure.py',
             languageId: 'python',
             focusLine: 0,
             fullFile: true,
-            lines: [badLine],
+            lines: [{ lineNumber: 0, text: 'class MonacoPreviewFailure: pass' }],
             ranges: [{ start: 0, end: 4 }]
           });
+          if (window.__ijFindStandaloneMonacoFailed) {
+            window.__ijFindStandaloneMonacoFailed('injected test failure');
+          }
         } catch (e) {}
-        window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
         var rect = root.getBoundingClientRect();
         var header = root.querySelector('.ij-find-header');
         var toolbar = root.querySelector('.ij-find-toolbar');
@@ -7194,8 +10424,11 @@ suite('Renderer — overlay UI probes', () => {
           resizerAttached: !!resizer && resizer.parentElement === root,
           resizerBottomDelta: Math.round(rect.bottom - rr.bottom),
           resizerRightDelta: Math.round(rect.right - rr.right),
-          previewText: preview ? (preview.textContent || '') : ''
+          previewText: preview ? (preview.textContent || '') : '',
+          hasDomPreview: !!root.querySelector('.ij-find-preview-content')
         };
+        globalThis.__ijFindMonacoApi = oldBundledMonaco;
+        window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
         if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
         return JSON.stringify(out);
       })()`,
@@ -7212,10 +10445,11 @@ suite('Renderer — overlay UI probes', () => {
       resizerBottomDelta: number;
       resizerRightDelta: number;
       previewText: string;
+      hasDomPreview: boolean;
     };
-    assert.strictEqual(parsed.err, undefined, `expected DOM preview chrome probe to run: ${raw}`);
-    assert.strictEqual(parsed.shell, false, `fallback preview should restore full panel mode: ${raw}`);
-    assert.ok(parsed.headerHeight > 20, `panel header should remain visible after fallback render failure: ${raw}`);
+    assert.strictEqual(parsed.err, undefined, `expected Monaco preview chrome probe to run: ${raw}`);
+    assert.strictEqual(parsed.shell, false, `Monaco status should restore full panel mode: ${raw}`);
+    assert.ok(parsed.headerHeight > 20, `panel header should remain visible after Monaco load failure: ${raw}`);
     assert.strictEqual(parsed.toolbarAttached, true, `toolbar should remain attached: ${raw}`);
     assert.strictEqual(parsed.resultsAttached, true, `results should remain attached: ${raw}`);
     assert.strictEqual(parsed.splitterAttached, true, `splitter should remain attached: ${raw}`);
@@ -7223,7 +10457,8 @@ suite('Renderer — overlay UI probes', () => {
     assert.strictEqual(parsed.resizerAttached, true, `resize handle should remain attached: ${raw}`);
     assert.ok(Math.abs(parsed.resizerBottomDelta) <= 2, `resize handle should stay on the panel bottom edge: ${raw}`);
     assert.ok(Math.abs(parsed.resizerRightDelta) <= 2, `resize handle should stay on the panel right edge: ${raw}`);
-    assert.match(parsed.previewText, /Preview fallback render failed/, `fallback error should render inside preview body: ${raw}`);
+    assert.match(parsed.previewText, /Monaco preview unavailable/, `Monaco error should render inside preview body: ${raw}`);
+    assert.strictEqual(parsed.hasDomPreview, false, `Monaco failure must not render a DOM code preview: ${raw}`);
   });
 
   test('splitter grows results without leaving blank space below preview', async function () {
@@ -7492,11 +10727,12 @@ suite('Renderer — overlay UI probes', () => {
     );
   });
 
-  test('DOM preview call graph inlays dispatch direct symbol commands', async function () {
+  test('bundled Monaco preview call graph inlays dispatch direct symbol commands', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);
     const { overlay } = await getApi();
     await overlay.show('PreviewMetadataInlayHost', { forceLiteral: true, suppressSearch: true });
+    await warmMonacoPreviewForRendererTest(overlay, 'PreviewMetadataInlayHost');
     const raw = await overlay.evalInActiveWindowForTests(
       `(function(){
         var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
@@ -7534,11 +10770,17 @@ suite('Renderer — overlay UI probes', () => {
             count: 2
           }]
         });
-        var inlay = root.querySelector('[data-ijss-callgraph-symbol-id]');
+        var standaloneHost = root.querySelector('.ij-find-monaco-host');
+        var standaloneRoot = standaloneHost && standaloneHost.shadowRoot;
+        var inlay = (standaloneRoot && standaloneRoot.querySelector('[data-ijss-callgraph-symbol-id]')) ||
+          root.querySelector('[data-ijss-callgraph-symbol-id]');
         if (!inlay) {
           globalThis.irSearchEvent = oldBridge;
           window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
-          return JSON.stringify({ err: 'missing preview inlay', html: root.querySelector('.ij-find-preview-body')?.innerHTML || '' });
+          return JSON.stringify({
+            err: 'missing preview inlay',
+            html: standaloneRoot ? standaloneRoot.innerHTML : (root.querySelector('.ij-find-preview-body')?.innerHTML || '')
+          });
         }
         var rect = inlay.getBoundingClientRect();
         var ev = new PointerEvent('pointerdown', {
@@ -7587,6 +10829,7 @@ suite('Renderer — overlay UI probes', () => {
     this.timeout(15_000);
     const { overlay } = await getApi();
     await overlay.show('PreviewRestartPreserveHost', { forceLiteral: true, suppressSearch: true });
+    await warmMonacoPreviewForRendererTest(overlay, 'PreviewRestartPreserveHost');
     const raw = await overlay.evalInActiveWindowForTests(
       `(function(){
         var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
@@ -7612,10 +10855,14 @@ suite('Renderer — overlay UI probes', () => {
           ]
         });
         var beforeState = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(targetSrc) : {};
-        var beforeText = root.querySelector('.ij-find-preview-body')?.textContent || '';
+        var beforeEditor = window.__ijFindGetPreviewEditorForTests ? window.__ijFindGetPreviewEditorForTests(targetSrc) : null;
+        var beforeModel = beforeEditor && beforeEditor.getModel ? beforeEditor.getModel() : null;
+        var beforeText = beforeModel && beforeModel.getValue ? beforeModel.getValue() : '';
         window.__ijFindOnMessage({ type: 'results:start', __targetSrc: targetSrc, searchId: 1201 });
         var afterState = window.__ijFindGetSearchState ? window.__ijFindGetSearchState(targetSrc) : {};
-        var afterText = root.querySelector('.ij-find-preview-body')?.textContent || '';
+        var afterEditor = window.__ijFindGetPreviewEditorForTests ? window.__ijFindGetPreviewEditorForTests(targetSrc) : null;
+        var afterModel = afterEditor && afterEditor.getModel ? afterEditor.getModel() : null;
+        var afterText = afterModel && afterModel.getValue ? afterModel.getValue() : '';
         window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
         return JSON.stringify({
           before: { mode: beforeState.previewMode, uri: beforeState.previewUri, text: beforeText },
@@ -7629,8 +10876,8 @@ suite('Renderer — overlay UI probes', () => {
       after?: { mode?: string; uri?: string; text?: string };
     };
     assert.strictEqual(parsed.err, undefined, `expected restart preserve probe to run: ${raw}`);
-    assert.strictEqual(parsed.before?.mode, 'dom', `preview should render before search restart: ${raw}`);
-    assert.strictEqual(parsed.after?.mode, 'dom', `results:start should not clear preview mode: ${raw}`);
+    assert.strictEqual(parsed.before?.mode, 'monaco', `preview should render in Monaco before search restart: ${raw}`);
+    assert.strictEqual(parsed.after?.mode, 'monaco', `results:start should not clear Monaco preview mode: ${raw}`);
     assert.strictEqual(parsed.after?.uri, 'file:///preview-restart-preserve.py', `results:start should keep preview URI: ${raw}`);
     assert.ok(parsed.after?.text?.includes('PreviewRestartPreserve'), `results:start should keep preview contents: ${raw}`);
   });
@@ -7640,6 +10887,7 @@ suite('Renderer — overlay UI probes', () => {
     this.timeout(15_000);
     const { overlay } = await getApi();
     await overlay.show('PreviewAsyncInlayRefreshHost', { forceLiteral: true, suppressSearch: true });
+    await warmMonacoPreviewForRendererTest(overlay, 'PreviewAsyncInlayRefreshHost');
     const raw = await overlay.evalInActiveWindowForTests(
       `(function(){
         var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
@@ -8274,11 +11522,12 @@ suite('Renderer — overlay UI probes', () => {
       `Observed=${JSON.stringify(obs)}`);
   });
 
-  test('DOM preview inlay clicks respond within one event loop turn after fallback rendering', async function () {
+  test('bundled Monaco preview inlay clicks respond within one event loop turn', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(15_000);
     const { overlay } = await getApi();
     await overlay.show('PreviewMetadataInlayFastHost', { forceLiteral: true, suppressSearch: true });
+    await warmMonacoPreviewForRendererTest(overlay, 'PreviewMetadataInlayFastHost');
     const raw = await overlay.evalInActiveWindowForTests(
       `(function(){
         var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
@@ -8317,11 +11566,17 @@ suite('Renderer — overlay UI probes', () => {
             label: 'PreviewFastSymbol.run'
           }]
         });
-        var inlay = root.querySelector('[data-ijss-callgraph-symbol-id]');
+        var standaloneHost = root.querySelector('.ij-find-monaco-host');
+        var standaloneRoot = standaloneHost && standaloneHost.shadowRoot;
+        var inlay = (standaloneRoot && standaloneRoot.querySelector('[data-ijss-callgraph-symbol-id]')) ||
+          root.querySelector('[data-ijss-callgraph-symbol-id]');
         if (!inlay) {
           globalThis.irSearchEvent = oldBridge;
           window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
-          return JSON.stringify({ err: 'missing preview inlay', html: root.querySelector('.ij-find-preview-body')?.innerHTML || '' });
+          return JSON.stringify({
+            err: 'missing preview inlay',
+            html: standaloneRoot ? standaloneRoot.innerHTML : (root.querySelector('.ij-find-preview-body')?.innerHTML || '')
+          });
         }
         var rect = inlay.getBoundingClientRect();
         for (var i = 0; i < 4; i++) {
@@ -8985,8 +12240,9 @@ suite('Renderer — overlay UI probes', () => {
     const alphaUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py').toString();
 
     await overlay.show('PreviewResetSeed', { forceLiteral: true, suppressSearch: true });
+    await warmMonacoPreviewForRendererTest(overlay, 'PreviewResetSeed');
     const seededRaw = await overlay.evalInActiveWindowForTests(
-      `(function(){
+      `(async function(){
         var alpha = ${JSON.stringify(alphaUri)};
         var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
         window.__ijFindDisableMonacoProbes = true;
@@ -9004,14 +12260,20 @@ suite('Renderer — overlay UI probes', () => {
             ],
             ranges: [{ start: 6, end: 18 }]
           });
-          return JSON.stringify(window.__ijFindGetSearchState());
+          var state = window.__ijFindGetSearchState();
+          var deadline = performance.now() + 8000;
+          while (state && state.previewMode !== 'monaco' && performance.now() < deadline) {
+            await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            state = window.__ijFindGetSearchState();
+          }
+          return JSON.stringify(state);
         } finally {
           window.__ijFindDisableMonacoProbes = oldDisableMonacoProbes;
         }
       })()`,
     );
     const seeded = JSON.parse(seededRaw) as { previewMode: string | null; previewUri: string | null };
-    assert.strictEqual(seeded.previewMode, 'dom', `seed preview should create non-empty preview state: ${seededRaw}`);
+    assert.strictEqual(seeded.previewMode, 'monaco', `seed preview should create Monaco preview state: ${seededRaw}`);
     assert.strictEqual(seeded.previewUri, alphaUri, `seed preview should target alpha.py: ${seededRaw}`);
 
     await overlay.show('PreviewResetCleared', { forceLiteral: true, suppressSearch: true });
@@ -9196,6 +12458,7 @@ suite('Renderer — overlay UI probes', () => {
     const betaUri = vscode.Uri.joinPath(folder!.uri, 'beta.js').toString();
 
     await overlay.show('PreviewClickProbe', { forceLiteral: true, suppressSearch: true });
+    await warmMonacoPreviewForRendererTest(overlay, 'PreviewClickProbe');
     const raw = await overlay.evalInActiveWindowForTests(
       `(async function(){
         var alpha = ${JSON.stringify(alphaUri)};
@@ -9291,8 +12554,9 @@ suite('Renderer — overlay UI probes', () => {
           });
           var previewAtMs = null;
           while (performance.now() - started <= 10) {
-            var previewBody = root ? root.querySelector('.ij-find-preview-body') : document.querySelector('.ij-find-overlay.visible:not(.ij-find-detached) .ij-find-preview-body');
-            var previewText = previewBody ? previewBody.textContent || '' : '';
+            var previewEditor = window.__ijFindGetPreviewEditorForTests ? window.__ijFindGetPreviewEditorForTests(targetSrc) : null;
+            var previewModel = previewEditor && previewEditor.getModel ? previewEditor.getModel() : null;
+            var previewText = previewModel && previewModel.getValue ? previewModel.getValue() : '';
             if (previewText.indexOf(uniquePreviewText) >= 0) {
               previewAtMs = performance.now() - started;
               break;
@@ -9436,6 +12700,7 @@ suite('Renderer — overlay UI probes', () => {
     const betaUri = vscode.Uri.joinPath(folder!.uri, 'beta.js').toString();
 
     await overlay.show('PreviewStaleStress', { forceLiteral: true, suppressSearch: true });
+    await warmMonacoPreviewForRendererTest(overlay, 'PreviewStaleStress');
     const raw = await overlay.evalInActiveWindowForTests(
       `(function(){
         var alpha = ${JSON.stringify(alphaUri)};
@@ -9518,8 +12783,9 @@ suite('Renderer — overlay UI probes', () => {
             deliver(latestReq, 'latest', cycle);
             deliver(staleReq, 'stale', cycle);
             var state = window.__ijFindGetSearchState(targetSrc);
-            var body = root ? root.querySelector('.ij-find-preview-body') : null;
-            var text = body ? body.textContent || '' : '';
+            var editor = window.__ijFindGetPreviewEditorForTests ? window.__ijFindGetPreviewEditorForTests(targetSrc) : null;
+            var model = editor && editor.getModel ? editor.getModel() : null;
+            var text = model && model.getValue ? model.getValue() : '';
             if (state.previewUri !== beta ||
                 text.indexOf('latest preview cycle ' + cycle) < 0 ||
                 text.indexOf('stale preview cycle ' + cycle) >= 0) {
@@ -9575,6 +12841,7 @@ suite('Renderer — overlay UI probes', () => {
     const betaUri = vscode.Uri.joinPath(folder!.uri, 'beta.js').toString();
 
     await overlay.show('PreviewBackAndForth', { forceLiteral: true, suppressSearch: true });
+    await warmMonacoPreviewForRendererTest(overlay, 'PreviewBackAndForth');
     const raw = await overlay.evalInActiveWindowForTests(
       `(async function(){
         var alpha = ${JSON.stringify(alphaUri)};
@@ -9658,8 +12925,9 @@ suite('Renderer — overlay UI probes', () => {
             deliver(secondReq, 'latest', cycle);
             deliver(firstReq, 'older', cycle);
             var state = window.__ijFindGetSearchState(targetSrc);
-            var body = root ? root.querySelector('.ij-find-preview-body') : null;
-            var text = body ? body.textContent || '' : '';
+            var editor = window.__ijFindGetPreviewEditorForTests ? window.__ijFindGetPreviewEditorForTests(targetSrc) : null;
+            var model = editor && editor.getModel ? editor.getModel() : null;
+            var text = model && model.getValue ? model.getValue() : '';
             if (state.previewUri !== lastExpected ||
                 text.indexOf('latest newest preview cycle ' + cycle) < 0 ||
                 text.indexOf('older newest preview cycle ' + cycle) >= 0) {
@@ -9674,8 +12942,9 @@ suite('Renderer — overlay UI probes', () => {
             await new Promise(function (resolve) { setTimeout(resolve, 0); });
           }
           var finalState = window.__ijFindGetSearchState(targetSrc);
-          var finalBody = root ? root.querySelector('.ij-find-preview-body') : null;
-          var finalText = finalBody ? finalBody.textContent || '' : '';
+          var finalEditor = window.__ijFindGetPreviewEditorForTests ? window.__ijFindGetPreviewEditorForTests(targetSrc) : null;
+          var finalModel = finalEditor && finalEditor.getModel ? finalEditor.getModel() : null;
+          var finalText = finalModel && finalModel.getValue ? finalModel.getValue() : '';
           var close = root && root.querySelector('.ij-find-close');
           if (close) {
             close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));

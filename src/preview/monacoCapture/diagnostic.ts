@@ -22,14 +22,18 @@ export async function runMonacoCaptureDiagnostic(
   preferredWindowId?: number,
   options?: CaptureDiagnosticOptions,
 ): Promise<void> {
-  const allowForceOpen = options?.allowForceOpen !== false;
+  // Opening an editor is a visible workspace mutation. Require an explicit
+  // opt-in so a missing option can never create a tab by accident.
+  const allowForceOpen = options?.allowForceOpen === true;
   const forceOpenUri = options?.forceOpenUri;
   const holdForceOpenedTab = options?.holdForceOpenedTab === true;
   const reason = options?.reason || 'foreground';
+  const shouldContinue = options?.shouldContinue ?? (() => true);
   runtime.log(
     `Capture diagnostic: starting (reason=${reason}, forceOpen=${allowForceOpen ? 'yes' : 'no'}` +
     (forceOpenUri ? `, forceOpenUri=${forceOpenUri.toString()}` : '') + ')...',
   );
+  if (!shouldContinue()) { return; }
   const targetWindowId = await runtime.resolveTargetWorkbenchWindowId(preferredWindowId);
   const windowIds = targetWindowId === undefined ? [] : [targetWindowId];
   runtime.log(
@@ -146,6 +150,10 @@ export async function runMonacoCaptureDiagnostic(
       runtime.log('Existing captures did not promote to Monaco - refreshing capture buffer.');
     }
 
+    if (!shouldContinue()) {
+      await stopCaptureAll();
+      return;
+    }
     await refreshCaptureAll();
     const domCaptureSummaries: string[] = [];
     await Promise.all(windowIds.map(async (id) => {
@@ -173,10 +181,11 @@ export async function runMonacoCaptureDiagnostic(
       runtime.log('DOM/service captures did not promote to Monaco.');
     }
 
-    if (!allowForceOpen) {
+    if (!allowForceOpen || !shouldContinue()) {
       runtime.log(
-        'Capture warmup: DOM scan did not yield a ready Monaco; skipping force-open and leaving capture hooks armed for the history capture path.',
+        'Capture warmup: DOM scan did not yield a ready Monaco; skipping force-open and restoring capture hooks.',
       );
+      await stopCaptureAll();
       return;
     }
 
@@ -185,7 +194,15 @@ export async function runMonacoCaptureDiagnostic(
     }));
     runtime.log('Captures cleared - no DOM-visible widgets, forcing real editor creation via file open/close...');
 
-    const phase = await forceOpenEditorForCapture(runtime, forceOpenUri, peekAll);
+    const phase = await forceOpenEditorForCapture(runtime, forceOpenUri, peekAll, shouldContinue);
+    if (!shouldContinue()) {
+      if (phase.forceOpenedCloseTargets.length > 0) {
+        try { await vscode.window.tabGroups.close(phase.forceOpenedCloseTargets, true); }
+        catch (errClose) { runtime.log(`Capture close cancelled tab failed: ${errClose instanceof Error ? errClose.message : errClose}`); }
+      }
+      await stopCaptureAll();
+      return;
+    }
     const peeked = await peekAll('Capture peek after clear+force');
     const bestWin = pickBestWindowAfterForceOpen(peeked, preferredWindowId);
     if (bestWin.id !== null && bestWin.score > 0) {
@@ -197,7 +214,7 @@ export async function runMonacoCaptureDiagnostic(
 
     if (phase.forceOpenedCloseTargets.length > 0) {
       const tClose0 = Date.now();
-      if (holdForceOpenedTab) {
+      if (holdForceOpenedTab && shouldContinue()) {
         runtime.holdPreviewCaptureTabs(phase.forceOpenedCloseTargets);
         runtime.log(
           `Capture diagnostic: holding ${phase.forceOpenedCloseTargets.length} introduced tab(s) until preview render completes.`,

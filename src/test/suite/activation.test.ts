@@ -1001,13 +1001,14 @@ suite('Activation', () => {
     }
   });
 
-  test('preview requests use a 20ms Monaco warmup budget and refresh when ready', async function () {
+  test('preview requests render immediately and defer native warmup until bundled Monaco starts', async function () {
     this.timeout(5_000);
     const { overlay } = await getApi();
     const anyOverlay = overlay as any;
     const originalActiveWindowId = anyOverlay.activeWindowId;
     const originalIsMonacoCaptureEnabled = anyOverlay.isMonacoCaptureEnabled.bind(anyOverlay);
     const originalEnsureMonacoCapture = anyOverlay.ensureMonacoCapture.bind(anyOverlay);
+    const originalInjectStandaloneMonacoBundle = anyOverlay.injectStandaloneMonacoBundle.bind(anyOverlay);
     const originalIsMonacoReadyInWindow = anyOverlay.isMonacoReadyInWindow.bind(anyOverlay);
     const originalSendPreview = anyOverlay.sendPreview.bind(anyOverlay);
     const originalReleasePreviewCaptureTabsSoon = anyOverlay.releasePreviewCaptureTabsSoon.bind(anyOverlay);
@@ -1030,6 +1031,7 @@ suite('Activation', () => {
       captureCalls.push(args);
       return warmupPromise;
     };
+    anyOverlay.injectStandaloneMonacoBundle = async () => {};
     anyOverlay.isMonacoReadyInWindow = async () => true;
     anyOverlay.sendPreview = async (...args: unknown[]) => {
       sends.push({ at: Date.now(), args });
@@ -1052,6 +1054,8 @@ suite('Activation', () => {
       const targetSends = () => sends.filter((send) => send.args[0] === previewUri);
       await new Promise((resolve) => setTimeout(resolve, 50));
       assert.strictEqual(targetSends().length, 1, 'preview should render once when Monaco warmup exceeds the budget');
+      assert.strictEqual(captureCalls.length, 0, 'native capture should wait until the bundled Monaco path gets the first turn');
+      await new Promise((resolve) => setTimeout(resolve, 160));
       assert.strictEqual(captureCalls.length, 1, 'preview should attempt Monaco warmup once');
       assert.strictEqual(captureCalls[0]?.[1], undefined, 'preview warmup should not pass a force-open URI');
       assert.strictEqual(
@@ -1076,6 +1080,7 @@ suite('Activation', () => {
       anyOverlay.activeWindowId = originalActiveWindowId;
       anyOverlay.isMonacoCaptureEnabled = originalIsMonacoCaptureEnabled;
       anyOverlay.ensureMonacoCapture = originalEnsureMonacoCapture;
+      anyOverlay.injectStandaloneMonacoBundle = originalInjectStandaloneMonacoBundle;
       anyOverlay.isMonacoReadyInWindow = originalIsMonacoReadyInWindow;
       anyOverlay.sendPreview = originalSendPreview;
       anyOverlay.releasePreviewCaptureTabsSoon = originalReleasePreviewCaptureTabsSoon;
@@ -1085,7 +1090,285 @@ suite('Activation', () => {
     }
   });
 
-  test('preview force-open cooldown trails the latest request instead of dropping it', async function () {
+  test('preview warmup requests bundled Monaco without scheduling a transient editor', async function () {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalActiveWindowId = anyOverlay.activeWindowId;
+    const originalPreviewRequestSeq = anyOverlay.previewRequestSeq;
+    const originalPreviewWarmupPromise = anyOverlay.previewWarmupPromise;
+    const originalIsMonacoCaptureEnabled = anyOverlay.isMonacoCaptureEnabled.bind(anyOverlay);
+    const originalShouldAllowTransientPreviewCaptureEditor = anyOverlay.shouldAllowTransientPreviewCaptureEditor.bind(anyOverlay);
+    const originalEnsureMonacoCapture = anyOverlay.ensureMonacoCapture.bind(anyOverlay);
+    const originalIsMonacoReadyInWindow = anyOverlay.isMonacoReadyInWindow.bind(anyOverlay);
+    const originalSchedulePreviewForceOpen = anyOverlay.schedulePreviewForceOpen.bind(anyOverlay);
+    const originalInjectStandaloneMonacoBundle = anyOverlay.injectStandaloneMonacoBundle.bind(anyOverlay);
+    let forceOpenSchedules = 0;
+    const standaloneWindows: number[] = [];
+    try {
+      anyOverlay.activeWindowId = 7;
+      anyOverlay.previewRequestSeq = 91;
+      anyOverlay.previewWarmupPromise = undefined;
+      anyOverlay.isMonacoCaptureEnabled = () => true;
+      anyOverlay.shouldAllowTransientPreviewCaptureEditor = () => false;
+      anyOverlay.ensureMonacoCapture = async () => {};
+      anyOverlay.isMonacoReadyInWindow = async () => false;
+      anyOverlay.schedulePreviewForceOpen = () => { forceOpenSchedules += 1; };
+      anyOverlay.injectStandaloneMonacoBundle = async (windowId: number) => { standaloneWindows.push(windowId); };
+
+      anyOverlay.startPreviewWarmup({
+        type: 'requestPreview',
+        uri: 'file:///bundled-monaco.py',
+        line: 0,
+        contextLines: 0,
+        ranges: [],
+        previewSeq: 1,
+      }, 91, {});
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      assert.deepStrictEqual(standaloneWindows, [7], 'preview should start the bundled Monaco path in its owning renderer');
+      assert.strictEqual(forceOpenSchedules, 0, 'automatic preview recovery must not schedule an editor tab by default');
+      assert.strictEqual(anyOverlay.previewForceOpenTimer, undefined, 'automatic preview recovery must not leave a force-open timer');
+    } finally {
+      anyOverlay.activeWindowId = originalActiveWindowId;
+      anyOverlay.previewRequestSeq = originalPreviewRequestSeq;
+      anyOverlay.previewWarmupPromise = originalPreviewWarmupPromise;
+      anyOverlay.isMonacoCaptureEnabled = originalIsMonacoCaptureEnabled;
+      anyOverlay.shouldAllowTransientPreviewCaptureEditor = originalShouldAllowTransientPreviewCaptureEditor;
+      anyOverlay.ensureMonacoCapture = originalEnsureMonacoCapture;
+      anyOverlay.isMonacoReadyInWindow = originalIsMonacoReadyInWindow;
+      anyOverlay.schedulePreviewForceOpen = originalSchedulePreviewForceOpen;
+      anyOverlay.injectStandaloneMonacoBundle = originalInjectStandaloneMonacoBundle;
+    }
+  });
+
+  test('preview warmup retries passive capture and refreshes the same preview when native becomes ready', async function () {
+    this.timeout(5_000);
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalActiveWindowId = anyOverlay.activeWindowId;
+    const originalPreviewRequestSeq = anyOverlay.previewRequestSeq;
+    const originalPreviewWarmupPromise = anyOverlay.previewWarmupPromise;
+    const originalIsMonacoCaptureEnabled = anyOverlay.isMonacoCaptureEnabled.bind(anyOverlay);
+    const originalShouldAllowTransientPreviewCaptureEditor = anyOverlay.shouldAllowTransientPreviewCaptureEditor.bind(anyOverlay);
+    const originalEnsureMonacoCapture = anyOverlay.ensureMonacoCapture.bind(anyOverlay);
+    const originalIsMonacoReadyInWindow = anyOverlay.isMonacoReadyInWindow.bind(anyOverlay);
+    const originalSchedulePreviewForceOpen = anyOverlay.schedulePreviewForceOpen.bind(anyOverlay);
+    const originalInjectStandaloneMonacoBundle = anyOverlay.injectStandaloneMonacoBundle.bind(anyOverlay);
+    const originalSendPreview = anyOverlay.sendPreview.bind(anyOverlay);
+    const originalReleasePreviewCaptureTabsSoon = anyOverlay.releasePreviewCaptureTabsSoon.bind(anyOverlay);
+    const originalScheduleCdpSearchIdleClose = anyOverlay.scheduleCdpSearchIdleClose.bind(anyOverlay);
+    let passiveAttempts = 0;
+    let refreshes = 0;
+    let forceOpenSchedules = 0;
+    try {
+      anyOverlay.activeWindowId = 9;
+      anyOverlay.previewRequestSeq = 101;
+      anyOverlay.previewWarmupPromise = undefined;
+      anyOverlay.isMonacoCaptureEnabled = () => true;
+      anyOverlay.shouldAllowTransientPreviewCaptureEditor = () => false;
+      anyOverlay.injectStandaloneMonacoBundle = async () => {};
+      anyOverlay.ensureMonacoCapture = async (_windowId: number, _uri: unknown, options: any) => {
+        assert.strictEqual(options.allowForceOpen, false, 'automatic recovery must stay passive');
+        assert.strictEqual(options.bypassThrottle, true, 'each bounded retry must run a real passive diagnostic');
+        passiveAttempts += 1;
+      };
+      anyOverlay.isMonacoReadyInWindow = async () => passiveAttempts >= 2;
+      anyOverlay.schedulePreviewForceOpen = () => { forceOpenSchedules += 1; };
+      anyOverlay.sendPreview = async () => { refreshes += 1; return true; };
+      anyOverlay.releasePreviewCaptureTabsSoon = () => {};
+      anyOverlay.scheduleCdpSearchIdleClose = () => {};
+
+      anyOverlay.startPreviewWarmup({
+        type: 'requestPreview',
+        uri: 'file:///passive-recovery.py',
+        line: 3,
+        contextLines: 10,
+        ranges: [],
+        previewSeq: 2,
+      }, 101, {});
+      const warmup = anyOverlay.previewWarmupPromise as Promise<void>;
+      assert.ok(warmup, 'latest preview should own a warmup promise');
+      await warmup;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      assert.strictEqual(passiveAttempts, 2, 'a cold first capture must be retried');
+      assert.strictEqual(refreshes, 1, 'native readiness should refresh the current preview exactly once');
+      assert.strictEqual(forceOpenSchedules, 0, 'passive recovery must not schedule a transient editor');
+    } finally {
+      anyOverlay.previewRequestSeq += 1;
+      anyOverlay.activeWindowId = originalActiveWindowId;
+      anyOverlay.previewRequestSeq = originalPreviewRequestSeq;
+      anyOverlay.previewWarmupPromise = originalPreviewWarmupPromise;
+      anyOverlay.isMonacoCaptureEnabled = originalIsMonacoCaptureEnabled;
+      anyOverlay.shouldAllowTransientPreviewCaptureEditor = originalShouldAllowTransientPreviewCaptureEditor;
+      anyOverlay.ensureMonacoCapture = originalEnsureMonacoCapture;
+      anyOverlay.isMonacoReadyInWindow = originalIsMonacoReadyInWindow;
+      anyOverlay.schedulePreviewForceOpen = originalSchedulePreviewForceOpen;
+      anyOverlay.injectStandaloneMonacoBundle = originalInjectStandaloneMonacoBundle;
+      anyOverlay.sendPreview = originalSendPreview;
+      anyOverlay.releasePreviewCaptureTabsSoon = originalReleasePreviewCaptureTabsSoon;
+      anyOverlay.scheduleCdpSearchIdleClose = originalScheduleCdpSearchIdleClose;
+    }
+  });
+
+  test('hiding the overlay cancels a queued transient capture editor', async function () {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalPreviewRequestSeq = anyOverlay.previewRequestSeq;
+    const originalAttemptCount = anyOverlay.previewForceOpenAttemptCount;
+    const originalSuppressedCount = anyOverlay.previewForceOpenSuppressedCount;
+    const originalCooldownUntil = anyOverlay.previewForceOpenCooldownUntil;
+    const originalShouldAllowTransientPreviewCaptureEditor = anyOverlay.shouldAllowTransientPreviewCaptureEditor.bind(anyOverlay);
+    const originalIsMonacoCaptureEnabled = anyOverlay.isMonacoCaptureEnabled.bind(anyOverlay);
+    const originalRunPreviewForceOpen = anyOverlay.runPreviewForceOpen.bind(anyOverlay);
+    let forceOpenRuns = 0;
+    try {
+      if (anyOverlay.previewForceOpenTimer) {
+        clearTimeout(anyOverlay.previewForceOpenTimer);
+      }
+      anyOverlay.previewForceOpenTimer = undefined;
+      anyOverlay.pendingPreviewForceOpen = undefined;
+      anyOverlay.previewRequestSeq = 92;
+      anyOverlay.previewForceOpenAttemptCount = 0;
+      anyOverlay.previewForceOpenSuppressedCount = 0;
+      anyOverlay.previewForceOpenCooldownUntil = 0;
+      anyOverlay.shouldAllowTransientPreviewCaptureEditor = () => true;
+      anyOverlay.isMonacoCaptureEnabled = () => true;
+      anyOverlay.runPreviewForceOpen = async () => { forceOpenRuns += 1; };
+
+      anyOverlay.schedulePreviewForceOpen({
+        type: 'requestPreview',
+        uri: 'file:///cancelled-capture.py',
+        line: 0,
+        contextLines: 0,
+        ranges: [],
+        previewSeq: 1,
+      }, 92, 7);
+      assert.ok(anyOverlay.previewForceOpenTimer, 'expected a queued force-open before the overlay is hidden');
+
+      overlay.injectRendererEventForTests(JSON.stringify({ type: 'panelHidden' }));
+      await new Promise((resolve) => setTimeout(resolve, 80));
+
+      assert.strictEqual(forceOpenRuns, 0, 'panelHidden must prevent a delayed editor from opening');
+      assert.strictEqual(anyOverlay.previewForceOpenTimer, undefined);
+      assert.strictEqual(anyOverlay.pendingPreviewForceOpen, undefined);
+    } finally {
+      if (anyOverlay.previewForceOpenTimer) {
+        clearTimeout(anyOverlay.previewForceOpenTimer);
+      }
+      anyOverlay.previewForceOpenTimer = undefined;
+      anyOverlay.pendingPreviewForceOpen = undefined;
+      anyOverlay.previewRequestSeq = originalPreviewRequestSeq;
+      anyOverlay.previewForceOpenAttemptCount = originalAttemptCount;
+      anyOverlay.previewForceOpenSuppressedCount = originalSuppressedCount;
+      anyOverlay.previewForceOpenCooldownUntil = originalCooldownUntil;
+      anyOverlay.shouldAllowTransientPreviewCaptureEditor = originalShouldAllowTransientPreviewCaptureEditor;
+      anyOverlay.isMonacoCaptureEnabled = originalIsMonacoCaptureEnabled;
+      anyOverlay.runPreviewForceOpen = originalRunPreviewForceOpen;
+    }
+  });
+
+  test('routine logging and normal search selection do not open or pre-probe UI', async function () {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalLog = anyOverlay.log;
+    const originalRendererCommandWindowId = anyOverlay.rendererCommandWindowId;
+    const originalActiveWindowId = anyOverlay.activeWindowId;
+    const originalEnsureRendererPatchAlive = anyOverlay.ensureRendererPatchAlive.bind(anyOverlay);
+    let outputShows = 0;
+    let rendererProbes = 0;
+    try {
+      anyOverlay.log = {
+        show: () => { outputShows += 1; },
+        appendLine: () => {},
+      };
+      overlay.logCommand('silent-routine-log-test');
+      overlay.logActivation();
+      assert.strictEqual(outputShows, 0, 'routine logs must not reveal the Output panel');
+
+      anyOverlay.rendererCommandWindowId = undefined;
+      anyOverlay.activeWindowId = 42;
+      anyOverlay.ensureRendererPatchAlive = async () => { rendererProbes += 1; };
+      const context = await overlay.getSearchSelectionShowContext();
+      assert.deepStrictEqual(context, {});
+      assert.strictEqual(rendererProbes, 0, 'normal workbench search must not wait on a stale renderer window probe');
+    } finally {
+      anyOverlay.log = originalLog;
+      anyOverlay.rendererCommandWindowId = originalRendererCommandWindowId;
+      anyOverlay.activeWindowId = originalActiveWindowId;
+      anyOverlay.ensureRendererPatchAlive = originalEnsureRendererPatchAlive;
+    }
+  });
+
+  test('standalone Monaco requests target their renderer without stealing the active window', async function () {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalActiveWindowId = anyOverlay.activeWindowId;
+    const originalActiveRendererSrc = anyOverlay.activeRendererSrc;
+    const originalRendererRecoveryUntil = anyOverlay.rendererRecoveryUntil;
+    const originalInjectStandaloneMonacoBundle = anyOverlay.injectStandaloneMonacoBundle.bind(anyOverlay);
+    const calls: Array<{ windowId: number; verifyRenderer: boolean }> = [];
+    try {
+      anyOverlay.activeWindowId = 1;
+      anyOverlay.activeRendererSrc = 'active-renderer';
+      anyOverlay.rendererRecoveryUntil = 0;
+      anyOverlay.injectStandaloneMonacoBundle = async (windowId: number, verifyRenderer: boolean) => {
+        calls.push({ windowId, verifyRenderer });
+      };
+
+      overlay.injectRendererEventForTests(JSON.stringify({
+        type: 'requestStandaloneMonaco',
+        __win: 2,
+        __src: 'background-renderer',
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      assert.deepStrictEqual(calls, [{ windowId: 2, verifyRenderer: true }]);
+      assert.strictEqual(anyOverlay.activeWindowId, 1, 'background bundle loading must not replace the active search window');
+      assert.strictEqual(anyOverlay.activeRendererSrc, 'active-renderer', 'background bundle loading must not replace active renderer routing');
+    } finally {
+      anyOverlay.activeWindowId = originalActiveWindowId;
+      anyOverlay.activeRendererSrc = originalActiveRendererSrc;
+      anyOverlay.rendererRecoveryUntil = originalRendererRecoveryUntil;
+      anyOverlay.injectStandaloneMonacoBundle = originalInjectStandaloneMonacoBundle;
+    }
+  });
+
+  test('retained renderer reconnect uses a small readiness probe instead of resending installers', async function () {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalLocalBridgeServer = anyOverlay.localBridgeServer;
+    const originalLocalBridgePort = anyOverlay.localBridgePort;
+    const originalActiveWindowId = anyOverlay.activeWindowId;
+    const originalSend = anyOverlay.send.bind(anyOverlay);
+    let expression = '';
+    try {
+      anyOverlay.localBridgeServer = {};
+      anyOverlay.localBridgePort = 43123;
+      anyOverlay.activeWindowId = 7;
+      anyOverlay.send = async (_method: string, params: { expression?: string }) => {
+        expression = params.expression ?? '';
+        return { result: { value: 'ok:7:already patched:retained' } };
+      };
+
+      const report = await anyOverlay.probeRetainedRendererPatch({});
+      assert.strictEqual(report, 'ok:7:already patched:retained');
+      assert.ok(expression.length < 12_000, `retained readiness probe should stay small; bytes=${expression.length}`);
+      assert.ok(!expression.includes('ij-find patch installed'), 'retained readiness probe must not embed the full renderer installer');
+      assert.ok(!expression.includes('__ijFindAdditionalPatchInstaller=function'), 'retained readiness probe must not embed the additional installer');
+      assert.ok(
+        expression.includes('__ijFindConsoleBridgeTargets') && expression.includes('43123'),
+        'retained readiness must reject a console listener that targets a stale extension-host endpoint',
+      );
+    } finally {
+      anyOverlay.localBridgeServer = originalLocalBridgeServer;
+      anyOverlay.localBridgePort = originalLocalBridgePort;
+      anyOverlay.activeWindowId = originalActiveWindowId;
+      anyOverlay.send = originalSend;
+    }
+  });
+
+  test('opted-in preview force-open cooldown trails the latest request instead of dropping it', async function () {
     this.timeout(5_000);
     const { overlay } = await getApi();
     const anyOverlay = overlay as any;
@@ -1096,6 +1379,7 @@ suite('Activation', () => {
     const originalPreviewForceOpenPromise = anyOverlay.previewForceOpenPromise;
     const originalPreviewForceOpenCooldownUntil = anyOverlay.previewForceOpenCooldownUntil;
     const originalIsMonacoCaptureEnabled = anyOverlay.isMonacoCaptureEnabled.bind(anyOverlay);
+    const originalShouldAllowTransientPreviewCaptureEditor = anyOverlay.shouldAllowTransientPreviewCaptureEditor.bind(anyOverlay);
     const originalIsMonacoReadyInWindow = anyOverlay.isMonacoReadyInWindow.bind(anyOverlay);
     const originalEnsureMonacoCapture = anyOverlay.ensureMonacoCapture.bind(anyOverlay);
     const originalRefreshLatestPreviewAfterCapture = anyOverlay.refreshLatestPreviewAfterCapture.bind(anyOverlay);
@@ -1113,6 +1397,7 @@ suite('Activation', () => {
       anyOverlay.previewForceOpenPromise = undefined;
       anyOverlay.previewForceOpenCooldownUntil = Date.now() + 80;
       anyOverlay.isMonacoCaptureEnabled = () => true;
+      anyOverlay.shouldAllowTransientPreviewCaptureEditor = () => true;
       anyOverlay.isMonacoReadyInWindow = async () => false;
       anyOverlay.ensureMonacoCapture = async (...args: unknown[]) => {
         captureCalls.push(args);
@@ -1166,6 +1451,7 @@ suite('Activation', () => {
       anyOverlay.previewForceOpenPromise = originalPreviewForceOpenPromise;
       anyOverlay.previewForceOpenCooldownUntil = originalPreviewForceOpenCooldownUntil;
       anyOverlay.isMonacoCaptureEnabled = originalIsMonacoCaptureEnabled;
+      anyOverlay.shouldAllowTransientPreviewCaptureEditor = originalShouldAllowTransientPreviewCaptureEditor;
       anyOverlay.isMonacoReadyInWindow = originalIsMonacoReadyInWindow;
       anyOverlay.ensureMonacoCapture = originalEnsureMonacoCapture;
       anyOverlay.refreshLatestPreviewAfterCapture = originalRefreshLatestPreviewAfterCapture;

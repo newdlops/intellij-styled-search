@@ -17,6 +17,7 @@ export async function forceOpenEditorForCapture(
   runtime: MonacoCaptureRuntime,
   forceOpenUri: vscode.Uri | undefined,
   peekAll: (stage: string, silent?: boolean) => Promise<Map<number, string>>,
+  shouldContinue: () => boolean = () => true,
 ): Promise<ForceOpenCapturePhase> {
   const startedAt = Date.now();
   let findFilesMs = 0;
@@ -26,15 +27,20 @@ export async function forceOpenEditorForCapture(
   let pollIters = 0;
   let pollPeekMaxMs = 0;
   const forceOpenedCloseTargets: vscode.Tab[] = [];
+  let preExistingUris = new Set<string>();
+  let captureUriStr: string | undefined;
 
   try {
+    if (!shouldContinue()) {
+      return emptyForceOpenCapturePhase(startedAt);
+    }
     const tFind0 = Date.now();
-    const preExistingUris = collectOpenTabUris();
+    preExistingUris = collectOpenTabUris();
     const fileUri = forceOpenUri ?? await findCaptureCandidateUri(preExistingUris);
     findFilesMs = Date.now() - tFind0;
 
     let captureDoc: vscode.TextDocument | undefined;
-    if (fileUri) {
+    if (fileUri && shouldContinue()) {
       const userAlreadyHadThisTab = preExistingUris.has(fileUri.toString());
       captureDoc = userAlreadyHadThisTab
         ? await vscode.workspace.openTextDocument({
@@ -42,13 +48,16 @@ export async function forceOpenEditorForCapture(
           content: '// IntelliJ Styled Search capture buffer\n',
         })
         : await vscode.workspace.openTextDocument(fileUri);
-      const captureUriStr = captureDoc.uri.toString();
+      captureUriStr = captureDoc.uri.toString();
       runtime.setLastCaptureDiagnosticOpenUri(captureUriStr);
       runtime.log(
         `Capture diagnostic: opening ${captureUriStr}` +
         (userAlreadyHadThisTab ? ` (capture-only fallback; requested ${fileUri.toString()} is already open)` : ''),
       );
 
+      if (!shouldContinue()) {
+        return emptyForceOpenCapturePhase(startedAt, { findFilesMs });
+      }
       const tShow0 = Date.now();
       await vscode.window.showTextDocument(captureDoc, {
         viewColumn: vscode.ViewColumn.Beside,
@@ -60,7 +69,9 @@ export async function forceOpenEditorForCapture(
       const tPoll0 = Date.now();
       let sawCaptures = false;
       for (let i = 0; i < 20; i++) {
+        if (!shouldContinue()) { break; }
         await new Promise((resolve) => setTimeout(resolve, 100));
+        if (!shouldContinue()) { break; }
         const tPeek0 = Date.now();
         const peeked = await peekAll('poll', true);
         const peekMs = Date.now() - tPeek0;
@@ -77,22 +88,28 @@ export async function forceOpenEditorForCapture(
       }
       pollMs = Date.now() - tPoll0;
 
-      const tCollectClose0 = Date.now();
-      for (const group of vscode.window.tabGroups.all) {
-        for (const tab of group.tabs) {
-          const input = tab.input as unknown as { uri?: vscode.Uri };
-          if (input && input.uri && typeof input.uri.toString === 'function' &&
-              input.uri.toString() === captureUriStr && !preExistingUris.has(input.uri.toString())) {
-            forceOpenedCloseTargets.push(tab);
-          }
-        }
-      }
-      closeMs = Date.now() - tCollectClose0;
     } else {
       runtime.log('Capture diagnostic: no files found to open');
     }
   } catch (err) {
     runtime.log(`Capture trigger failed: ${err instanceof Error ? err.message : err}`);
+  }
+
+  // Collect introduced tabs even when showTextDocument/polling throws or the
+  // request is cancelled midway, so the caller can always close what we added.
+  if (captureUriStr) {
+    const tCollectClose0 = Date.now();
+    for (const group of vscode.window.tabGroups.all) {
+      for (const tab of group.tabs) {
+        const input = tab.input as unknown as { uri?: vscode.Uri };
+        if (input?.uri && typeof input.uri.toString === 'function' &&
+            input.uri.toString() === captureUriStr && !preExistingUris.has(input.uri.toString()) &&
+            !forceOpenedCloseTargets.includes(tab)) {
+          forceOpenedCloseTargets.push(tab);
+        }
+      }
+    }
+    closeMs += Date.now() - tCollectClose0;
   }
 
   return {
@@ -104,6 +121,22 @@ export async function forceOpenEditorForCapture(
     pollIters,
     pollPeekMaxMs,
     forceOpenedCloseTargets,
+  };
+}
+
+function emptyForceOpenCapturePhase(
+  startedAt: number,
+  timings: Partial<Pick<ForceOpenCapturePhase, 'findFilesMs' | 'showTextDocumentMs' | 'pollMs' | 'closeMs'>> = {},
+): ForceOpenCapturePhase {
+  return {
+    startedAt,
+    findFilesMs: timings.findFilesMs ?? 0,
+    showTextDocumentMs: timings.showTextDocumentMs ?? 0,
+    pollMs: timings.pollMs ?? 0,
+    closeMs: timings.closeMs ?? 0,
+    pollIters: 0,
+    pollPeekMaxMs: 0,
+    forceOpenedCloseTargets: [],
   };
 }
 

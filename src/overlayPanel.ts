@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import * as http from 'http';
+import * as fs from 'fs';
+import * as path from 'path';
 import { execFileSync } from 'child_process';
 import WebSocket from 'ws';
 import {
@@ -20,6 +22,10 @@ import {
 import { configureRipgrepInstall, ensureRipgrepInstalled, findRipgrepPath, runRgSearch } from './rgSearch';
 import { getRendererPatchScript, RENDERER_PATCH_VERSION } from './rendererPatch';
 import { runMonacoCaptureDiagnostic, type CaptureDiagnosticOptions } from './preview/monacoCapture';
+import {
+  TextMateGrammarCatalog,
+  type PreviewTextMateGrammarCatalog,
+} from './preview/textMateGrammarCatalog';
 import { TrigramIndex, extractTrigramsLower } from './trigramIndex';
 import { compilePathScopeMatcher } from './pathScope';
 import { ZoektRuntime, type ZoektFreshnessStatus } from './zoekRuntime';
@@ -30,21 +36,50 @@ type RendererEvent =
   | { type: 'loadMore' }
   | { type: 'cancel' }
   | { type: 'panelHidden' }
+  | { type: 'panelDisposed' }
   | { type: 'trace'; phase: string; data?: unknown; light?: unknown; ir?: unknown; perf?: number }
   | { type: 'openFile'; uri: string; line: number; column: number }
   | { type: 'previewFile'; uri: string; line: number; column: number }
   | { type: 'requestPreview'; uri: string; line: number; ranges?: MatchRange[]; contextLines: number; previewSeq?: number }
+  | { type: 'requestStandaloneMonaco' }
+  | {
+      type: 'requestPreviewLanguageFeature';
+      requestId: number;
+      feature: PreviewLanguageFeature;
+      uri: string;
+      line?: number;
+      column?: number;
+      context?: Record<string, unknown>;
+    }
+  | {
+      type: 'requestPreviewTextMateGrammar';
+      requestId: number;
+      kind: 'catalog';
+      languageId: string;
+    }
+  | {
+      type: 'requestPreviewTextMateGrammar';
+      requestId: number;
+      kind: 'asset';
+      generation: number;
+      assetId: string;
+    }
   | { type: 'revealFile'; uri: string }
   | { type: 'openInSideEditor'; uri: string; line: number; column: number }
   | { type: 'pinInSideEditor'; uri: string; line: number; column: number }
   // 'requestHover' was removed in #32 along with the DIY $hoverTooltip.
   | { type: 'runCommand'; command: string; args: unknown[] }
-  | { type: 'saveFile'; uri: string; content: string }
-  // #47 ground-truth auto-probe: renderer asks the extension host to
-  // query Pylance/LSP for the exact position the user just hovered.
-  // The host runs vscode.executeHoverProvider +
-  // executeCompletionItemProvider and logs the result. No human input
-  // (line/col) — driven entirely by the user's natural mouse movement.
+  | {
+      type: 'saveFile';
+      uri: string;
+      content: string;
+      requestId?: number;
+      expectedContentHash?: string;
+    }
+  | { type: 'saveFileTooLarge'; uri: string; requestId: number; bytes: number }
+  // Compatibility event for renderer patches injected by older builds.
+  // Current renderers never emit this because automatic provider probes
+  // duplicate Monaco's real hover/completion work.
   | { type: 'requestIntellisenseProbe'; uri: string; line: number; column: number; source: string }
   | { type: 'log'; msg: string };
 
@@ -64,6 +99,35 @@ export type PreviewCallGraphInlayProvider = (
   range: vscode.Range,
 ) => Promise<PreviewCallGraphInlay[]> | PreviewCallGraphInlay[];
 // HoverContent type removed in #32 along with sendHover()/$hoverTooltip.
+
+type PreviewLanguageFeature =
+  | 'hover'
+  | 'completion'
+  | 'signatureHelp'
+  | 'definition'
+  | 'declaration'
+  | 'typeDefinition'
+  | 'implementation'
+  | 'references'
+  | 'documentHighlight'
+  | 'documentSymbol'
+  | 'foldingRange'
+  | 'semanticTokens';
+
+type SerializedPosition = { line: number; character: number };
+type SerializedRange = { start: SerializedPosition; end: SerializedPosition };
+type SerializedMarkdown = {
+  value: string;
+  isTrusted?: boolean | { enabledCommands: readonly string[] };
+  supportHtml?: boolean;
+  supportThemeIcons?: boolean;
+  baseUri?: string;
+};
+
+type RendererMessageRoute = {
+  windowId?: number;
+  rendererSrc?: string;
+};
 
 type OverlayMessage =
   | { type: 'estimatedToggle'; visible: boolean; pressed: boolean }
@@ -95,6 +159,8 @@ type OverlayMessage =
       languageId: string;
       baseLine: number;
       fullFile: boolean;
+      eol: '\n' | '\r\n';
+      diagnostics?: unknown[];
       callGraphInlays?: PreviewCallGraphInlay[];
     }
   | {
@@ -102,6 +168,53 @@ type OverlayMessage =
       uri: string;
       previewSeq?: number;
       callGraphInlays: PreviewCallGraphInlay[];
+    }
+  | {
+      type: 'preview:languageFeature';
+      requestId: number;
+      feature: PreviewLanguageFeature;
+      uri: string;
+      value?: unknown;
+      error?: string;
+      documentHash?: string;
+    }
+  | {
+      type: 'preview:textMateGrammar';
+      requestId: number;
+      kind: 'catalog';
+      value?: PreviewTextMateGrammarCatalog;
+      error?: string;
+    }
+  | { type: 'preview:textMateGrammarInvalidated' }
+  | {
+      type: 'preview:textMateGrammar';
+      requestId: number;
+      kind: 'asset';
+      generation: number;
+      assetId: string;
+      chunkIndex?: number;
+      chunkCount?: number;
+      base64?: string;
+      byteLength?: number;
+      sha256?: string;
+      pathHint?: string;
+      error?: string;
+    }
+  | {
+      type: 'preview:diagnostics';
+      uri: string;
+      diagnostics: unknown[];
+      documentHash?: string;
+    }
+  | {
+      type: 'preview:saveResult';
+      uri: string;
+      requestId: number;
+      ok: boolean;
+      error?: string;
+      diagnostics?: unknown[];
+      documentHash?: string;
+      savedContent?: string;
     }
   // 'hover' renderer message was removed in #32 (DIY hover tooltip is gone).
   ;
@@ -136,9 +249,14 @@ type PendingShow = {
 };
 
 type PreviewRequestEvent = Extract<RendererEvent, { type: 'requestPreview' }>;
+type PreviewLanguageFeatureRequestEvent = Extract<RendererEvent, { type: 'requestPreviewLanguageFeature' }>;
+type PreviewTextMateGrammarRequestEvent = Extract<RendererEvent, { type: 'requestPreviewTextMateGrammar' }>;
 type QueuedPreviewRequest = {
   evt: PreviewRequestEvent;
   seq: number;
+  route: RendererMessageRoute;
+  routeKey: string;
+  routeGeneration: number;
   resolve: () => void;
 };
 
@@ -146,6 +264,8 @@ type PendingPreviewForceOpen = {
   evt: PreviewRequestEvent;
   seq: number;
   windowId: number;
+  route: RendererMessageRoute;
+  epoch: number;
 };
 
 type PendingStaticResults = {
@@ -160,6 +280,7 @@ type PendingStaticResults = {
 type PatchScriptOptions = {
   ignoreTargetMarker?: boolean;
   additionalInstance?: boolean;
+  forceInstall?: boolean;
 };
 
 const BRIDGE_BINDING = 'irSearchMainBridge';
@@ -173,11 +294,25 @@ const PREVIEW_FORCE_OPEN_DEBOUNCE_MS = 750;
 // repeated attempts inside the same session pay the full 750ms debounce.
 const PREVIEW_FORCE_OPEN_FIRST_ATTEMPT_DEBOUNCE_MS = 30;
 const PREVIEW_FORCE_OPEN_COOLDOWN_MS = 2_000;
+// A bundled preview must not become a permanent terminal state merely
+// because the first tab-free native capture happened during a cold/workbench
+// transition. Keep the retries sparse and bounded: every attempt briefly
+// installs then restores the passive capture hooks, and none opens an editor.
+const PREVIEW_NATIVE_PASSIVE_RETRY_DELAYS_MS = [120, 450, 1_000, 2_000, 4_000, 8_000] as const;
 const LARGE_LITERAL_MULTILINE_SEARCH_CHARS = 512;
 const LARGE_LITERAL_MULTILINE_SEARCH_LINES = 16;
 const LARGE_LITERAL_MULTILINE_SEARCH_COALESCE_MS = 1_000;
 const MONACO_CAPTURE_RECOVERY_PAUSE_MS = 2500;
 const RENDERER_INLAY_WARMUP_MAX_FAILURES = 5;
+const PREVIEW_LANGUAGE_MAX_COMPLETION_ITEMS = 256;
+const PREVIEW_LANGUAGE_MAX_RESULT_ITEMS = 1_000;
+const PREVIEW_LANGUAGE_MAX_SYMBOL_NODES = 1_000;
+const PREVIEW_LANGUAGE_MAX_DIAGNOSTICS = 500;
+const PREVIEW_LANGUAGE_MAX_MARKDOWN_PARTS = 32;
+const PREVIEW_LANGUAGE_MAX_TEXT_CHARS = 16_384;
+const PREVIEW_LANGUAGE_MAX_SEMANTIC_TOKEN_INTS = 100_000;
+const PREVIEW_LANGUAGE_MAX_PAYLOAD_CHARS = 2_000_000;
+const PREVIEW_TEXT_MATE_ASSET_CHUNK_BYTES = 96 * 1024;
 
 function wrapLogWithPrefix(channel: vscode.OutputChannel, version: string): vscode.OutputChannel {
   // Every log line gets `[<ISO ts>] [v<version>]` prefixed so bug reports
@@ -272,6 +407,7 @@ function buildPreviewPayload(
   lines: PreviewLine[];
   ranges: MatchRange[] | undefined;
   fullFile: boolean;
+  eol: '\n' | '\r\n';
 } {
   const lineCount = Math.max(1, doc.lineCount);
   const normalizedLine = Number.isFinite(requestedLine) ? Math.floor(requestedLine) : 0;
@@ -287,6 +423,7 @@ function buildPreviewPayload(
     lines,
     ranges,
     fullFile: true,
+    eol: doc.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n',
   };
 }
 
@@ -301,6 +438,7 @@ export class OverlayPanel {
   private activeWindowId: number | undefined;
   private trigramIndex: TrigramIndex;
   private zoektRuntime: ZoektRuntime;
+  private readonly textMateGrammarCatalog: TextMateGrammarCatalog;
   private pendingShow: PendingShow | null = null;
   private showInFlight = false;
   private capturePromise: Promise<void> | undefined;
@@ -308,7 +446,8 @@ export class OverlayPanel {
   private backgroundCaptureTimer: ReturnType<typeof setTimeout> | undefined;
   private previewCaptureHoldTabs: vscode.Tab[] = [];
   private previewCaptureHoldTimer: ReturnType<typeof setTimeout> | undefined;
-  private pendingPreviewRequest: QueuedPreviewRequest | undefined;
+  private pendingPreviewRequests = new Map<string, QueuedPreviewRequest>();
+  private previewRequestGenerationByRoute = new Map<string, number>();
   private previewRequestTimer: ReturnType<typeof setTimeout> | undefined;
   private previewRequestSeq = 0;
   private previewPumpActive = false;
@@ -317,6 +456,9 @@ export class OverlayPanel {
   private previewForceOpenTimer: ReturnType<typeof setTimeout> | undefined;
   private previewForceOpenPromise: Promise<void> | undefined;
   private previewForceOpenCooldownUntil = 0;
+  private previewCaptureEpoch = 0;
+  private standaloneMonacoInjectionPromises = new Map<number, Promise<void>>();
+  private standaloneMonacoReadyWindows = new Set<number>();
   private previewForceOpenAttemptCount = 0;
   private previewForceOpenSuppressedCount = 0;
   private lastPreviewForceOpenUri: string | undefined;
@@ -368,6 +510,13 @@ export class OverlayPanel {
   private activeRendererSrc: string | undefined;
   private currentSearchRendererSrc: string | undefined;
   private previewCallGraphInlayProvider: PreviewCallGraphInlayProvider | undefined;
+  private previewLanguageTargets = new Map<string, {
+    rendererSrc: string;
+    windowId: number;
+    uri: string;
+    updatedAt: number;
+  }>();
+  private previewSaveChains = new Map<string, Promise<void>>();
   // Dedup map for inlay fetches: a single user-driven preview event flows
   // through both deliverLatestPreview() and refreshLatestPreviewAfterCapture()
   // which each call sendPreview() → sendPreviewCallGraphInlays(). Without
@@ -538,7 +687,10 @@ export class OverlayPanel {
   }
 
   async getSearchSelectionShowContext(): Promise<Pick<ShowOptions, 'preferredWindowId' | 'spawn'>> {
-    const windowId = this.rendererCommandWindowId ?? this.activeWindowId;
+    // Only renderer-originated commands need the preview/spawn probe. A normal
+    // workbench keybinding may still have an old activeWindowId, but probing it
+    // here performs a full renderer liveness check before show() can even start.
+    const windowId = this.rendererCommandWindowId;
     if (windowId === undefined) { return {}; }
     try {
       await this.ensureRendererPatchAlive(windowId, 'search-selection-context');
@@ -569,6 +721,13 @@ export class OverlayPanel {
     context.subscriptions.push({ dispose: () => this.trigramIndex.dispose() });
     this.zoektRuntime = new ZoektRuntime(context, this.log);
     context.subscriptions.push({ dispose: () => this.zoektRuntime.dispose() });
+    this.textMateGrammarCatalog = new TextMateGrammarCatalog();
+    context.subscriptions.push(this.textMateGrammarCatalog);
+    context.subscriptions.push(this.textMateGrammarCatalog.onDidInvalidate(() => {
+      void this.postPreviewTextMateGrammarInvalidated().catch((error) => {
+        this.log.appendLine(`TextMate grammar invalidation relay failed: ${error instanceof Error ? error.message : error}`);
+      });
+    }));
     const initialEngine = getConfiguredSearchEngine();
     if (initialEngine === 'codesearch') {
       this.startTrigramIndexInit('activation');
@@ -597,6 +756,7 @@ export class OverlayPanel {
         this.log.appendLine(`disableMonacoCapture changed: ${disabled}`);
         this.monacoCaptureDisabledLogged = false;
         if (disabled) {
+          void this.cancelPendingPreviewCapture('Monaco capture disabled');
           void this.stopMonacoCapture('setting changed').catch((err) => {
             this.log.appendLine(`stopMonacoCapture after setting change failed: ${err instanceof Error ? err.message : err}`);
           });
@@ -609,6 +769,15 @@ export class OverlayPanel {
           }
         }
       }
+      if (event.affectsConfiguration('intellijStyledSearch.allowTransientPreviewCaptureEditor') &&
+          !this.shouldAllowTransientPreviewCaptureEditor()) {
+        void this.cancelPendingPreviewCapture('transient capture editor disabled');
+      }
+    }));
+    context.subscriptions.push(vscode.languages.onDidChangeDiagnostics((event) => {
+      void this.postPreviewDiagnosticUpdates(event.uris).catch((err) => {
+        this.log.appendLine(`preview diagnostics update failed: ${err instanceof Error ? err.message : err}`);
+      });
     }));
   }
 
@@ -689,17 +858,6 @@ export class OverlayPanel {
 
   private lastCaptureAttemptAt = 0;
   private lastBackgroundCaptureAttemptAt = 0;
-  /** Optional Monaco capture after the overlay is attached. Disabled by
-   * default because it touches VSCode renderer internals on the UI thread. */
-  private scheduleLazyCapture(preferredWindowId?: number): void {
-    if (!this.isMonacoCaptureEnabled()) {
-      this.logMonacoCaptureDisabled('lazy');
-      return;
-    }
-    void this.ensureMonacoCapture(preferredWindowId).catch((err) => {
-      this.log.appendLine(`Monaco capture failed: ${err instanceof Error ? err.message : err}`);
-    });
-  }
 
   private scheduleBackgroundCaptureWarmup(reason: string, delayMs = 120): void {
     if (this.backgroundCaptureTimer) {
@@ -750,8 +908,15 @@ export class OverlayPanel {
   private async ensureMonacoCapture(
     preferredWindowId?: number,
     forceOpenUri?: vscode.Uri,
-    options: { allowForceOpen?: boolean; holdForceOpenedTab?: boolean; reason?: string; bypassThrottle?: boolean } = {},
+    options: {
+      allowForceOpen?: boolean;
+      holdForceOpenedTab?: boolean;
+      reason?: string;
+      bypassThrottle?: boolean;
+      shouldContinue?: () => boolean;
+    } = {},
   ): Promise<void> {
+    if (options.shouldContinue && !options.shouldContinue()) { return; }
     if (!this.isMonacoCaptureEnabled()) {
       this.logMonacoCaptureDisabled(this.getMonacoCaptureDisabledReason() ?? 'foreground');
       return;
@@ -771,14 +936,16 @@ export class OverlayPanel {
     }
     const now = Date.now();
     if (!forceOpenUri && !options.bypassThrottle && now - this.lastCaptureAttemptAt < 1500) { return; }
+    if (options.shouldContinue && !options.shouldContinue()) { return; }
     this.lastCaptureAttemptAt = now;
     try {
-      const allowForceOpen = options.allowForceOpen ?? !!forceOpenUri;
+      const allowForceOpen = options.allowForceOpen === true;
       this.capturePromise = this.triggerCaptureDiagnostic(preferredWindowId, {
         allowForceOpen,
         forceOpenUri,
         holdForceOpenedTab: options.holdForceOpenedTab ?? false,
         reason: options.reason ?? (forceOpenUri ? `preview:${forceOpenUri.toString()}` : 'foreground'),
+        shouldContinue: options.shouldContinue,
       });
       await this.capturePromise;
     } finally {
@@ -810,6 +977,29 @@ export class OverlayPanel {
     }, delayMs);
   }
 
+  private closeHeldPreviewCaptureTabs(reason: string): Promise<void> {
+    if (this.previewCaptureHoldTimer) {
+      clearTimeout(this.previewCaptureHoldTimer);
+      this.previewCaptureHoldTimer = undefined;
+    }
+    const tabs = this.previewCaptureHoldTabs.splice(0);
+    if (tabs.length === 0) { return Promise.resolve(); }
+    return Promise.resolve(vscode.window.tabGroups.close(tabs, true)).then(
+      () => this.log.appendLine(`Capture diagnostic: closed ${tabs.length} held preview capture tab(s) (${reason}).`),
+      (err) => this.log.appendLine(`Capture diagnostic: close held tabs failed (${reason}): ${err instanceof Error ? err.message : err}`),
+    );
+  }
+
+  private cancelPendingPreviewCapture(reason: string): Promise<void> {
+    this.previewCaptureEpoch++;
+    if (this.previewForceOpenTimer) {
+      clearTimeout(this.previewForceOpenTimer);
+      this.previewForceOpenTimer = undefined;
+    }
+    this.pendingPreviewForceOpen = undefined;
+    return this.closeHeldPreviewCaptureTabs(reason);
+  }
+
   private async isMonacoReadyInWindow(winId: number): Promise<boolean> {
     try {
       const r = await this.evalInWindow(winId,
@@ -832,6 +1022,11 @@ export class OverlayPanel {
   private isMonacoCaptureDisabledBySetting(): boolean {
     return vscode.workspace.getConfiguration('intellijStyledSearch')
       .get<boolean>('disableMonacoCapture', false);
+  }
+
+  private shouldAllowTransientPreviewCaptureEditor(): boolean {
+    return vscode.workspace.getConfiguration('intellijStyledSearch')
+      .get<boolean>('allowTransientPreviewCaptureEditor', false) === true;
   }
 
   private getMonacoCaptureDisabledReason(): string | undefined {
@@ -911,7 +1106,7 @@ export class OverlayPanel {
     if (this.monacoCaptureDisabledLogged) { return; }
     this.monacoCaptureDisabledLogged = true;
     this.log.appendLine(
-      `Monaco capture disabled (${reason}); previews use DOM fallback to avoid CDP/prototype work on the VSCode UI thread.`,
+      `Native Monaco capture disabled (${reason}); previews use bundled Monaco without editor tabs or prototype capture.`,
     );
   }
 
@@ -1155,7 +1350,6 @@ export class OverlayPanel {
             if (await hasMarker(wins[m])) { return wins[m].id; }
           }
           if (wins.length === 1) { return wins[0].id; }
-          return 0;
         }
         var focused = BW.getFocusedWindow();
         if (focused && isWorkbench(focused) && titleMatchesWorkspace(focused)) { return focused.id; }
@@ -1192,8 +1386,12 @@ export class OverlayPanel {
 
   private async isRendererPatchedInWindow(winId: number): Promise<boolean> {
     try {
+      const expectedPreviewLanguageFeatures = this.shouldEnablePreviewLanguageFeatures();
       const r = await this.evalInWindow(winId,
-        `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&window.__ijFindStatus&&window.__ijFindPatchVersion===${RENDERER_PATCH_VERSION}?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`,
+        `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&window.__ijFindStatus&&` +
+        `window.__ijFindPatchVersion===${RENDERER_PATCH_VERSION}&&` +
+        `window.__ijFindEnablePreviewLanguageFeatures===${expectedPreviewLanguageFeatures ? 'true' : 'false'}` +
+        `?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`,
       );
       return r === 'ready';
     } catch {
@@ -1529,7 +1727,12 @@ export class OverlayPanel {
 
   async forceCaptureForTests(): Promise<string> {
     const preferredWindowId = this.activeWindowId;
-    try { await this.triggerCaptureDiagnostic(preferredWindowId); }
+    try {
+      await this.triggerCaptureDiagnostic(preferredWindowId, {
+        allowForceOpen: true,
+        reason: 'force-capture-test',
+      });
+    }
     catch (err) {
       return 'capture-threw:' + (err instanceof Error ? err.message : String(err));
     }
@@ -1634,17 +1837,18 @@ export class OverlayPanel {
   }
 
   logActivation() {
-    this.log.show(true);
     this.log.appendLine(`Extension activated. Ext host pid=${process.pid}, ppid=${process.ppid}`);
   }
 
   logCommand(name: string) {
-    this.log.show(true);
     this.log.appendLine(`Command invoked: ${name}`);
   }
 
   async forceReinject(): Promise<void> {
     this.log.appendLine('Forcing reinject...');
+    // The renderer patch can deliberately reject an older Monaco bundle
+    // during upgrade. Re-verify the per-window bundle on the next preview.
+    this.standaloneMonacoReadyWindows.clear();
     if (this.ws) {
       try { await this.releaseRendererBridge('force reinject', undefined, 1500); }
       catch (err) { this.log.appendLine(`forceReinject release failed: ${err instanceof Error ? err.message : err}`); }
@@ -1653,7 +1857,7 @@ export class OverlayPanel {
       }
     }
     this.injectPromise = undefined;
-    await this.ensureInjected();
+    await this.ensureInjected({ forceInstall: true });
   }
 
   async recoverRendererUi(reason = 'manual'): Promise<string> {
@@ -2157,6 +2361,7 @@ export class OverlayPanel {
   }
 
   async show(initialQuery: string, options?: ShowOptions): Promise<void> {
+    void this.cancelPendingPreviewCapture('new overlay show');
     this.rendererRecoveryUntil = 0;
     this.cancelCdpIdleClose();
     this.cancelCdpSearchIdleClose();
@@ -2286,9 +2491,6 @@ export class OverlayPanel {
     const useDirectWindow = directWindowId !== undefined && this.shouldEnableRendererInlayClickHook();
     const targetMarker = useDirectWindow ? new vscode.Disposable(() => undefined) : this.beginTargetWindowMarker();
     try {
-      if (!useDirectWindow) {
-        await delay(150);
-      }
       const showSeq = ++this.showSeq;
       await this.ensureInjected();
       const tInjected = Date.now();
@@ -2334,13 +2536,6 @@ export class OverlayPanel {
         void this.postSearchHistoryToRenderer().catch((err) => {
           this.log.appendLine(`post search history failed: ${err instanceof Error ? err.message : err}`);
         });
-      }
-      // After the overlay is visible, kick off Monaco capture for the same
-      // renderer window that owns the preview pane. requestPreview awaits
-      // this when needed, so the first preview can mount as Monaco instead
-      // of permanently rendering the non-editable DOM fallback.
-      if (initialQuery && !options.suppressSearch) {
-        this.scheduleLazyCapture(v.fid);
       }
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.scheduleBridgeRepairAfterVisible(showSeq, initialQuery, options);
@@ -2412,7 +2607,8 @@ export class OverlayPanel {
             if (await hasMarker(ws[m])) { focused = ws[m]; break; }
           }
           if (!focused && ws.length === 1) { focused = ws[0]; }
-        } else {
+        }
+        if (!focused) {
           focused = BW.getFocusedWindow();
           var focusedUsable = focused && isWorkbench(focused) && titleMatchesWorkspace(focused);
           if (!focusedUsable) {
@@ -2550,7 +2746,6 @@ export class OverlayPanel {
     if (replay && replay.fid) {
       this.activeWindowId = replay.fid;
       this.log.appendLine(`Bridge repair replay show(win=${replay.fid}): ${replay.result}`);
-      this.scheduleLazyCapture(replay.fid);
     }
   }
 
@@ -2683,16 +2878,12 @@ export class OverlayPanel {
 
   private async disposeInternal(): Promise<void> {
     this.cancelActive();
+    await this.cancelPendingPreviewCapture('overlay disposed');
     this.zoektRuntime.cancelRunningProcesses('overlay disposed');
     if (this.backgroundCaptureTimer) {
       clearTimeout(this.backgroundCaptureTimer);
       this.backgroundCaptureTimer = undefined;
     }
-    if (this.previewCaptureHoldTimer) {
-      clearTimeout(this.previewCaptureHoldTimer);
-      this.previewCaptureHoldTimer = undefined;
-    }
-    this.previewCaptureHoldTabs = [];
     if (this.cdpIdleCloseTimer) {
       clearTimeout(this.cdpIdleCloseTimer);
       this.cdpIdleCloseTimer = undefined;
@@ -2841,6 +3032,7 @@ export class OverlayPanel {
               if (!keepConsoleBridgeForInlay) {
                 try { w.webContents.removeListener('console-message', consoleBridge); removed++; } catch (eConsoleRm) {}
                 try { global.__ijFindConsoleBridgeListeners.delete(w.id); } catch (eConsoleDel) {}
+                try { if (global.__ijFindConsoleBridgeTargets) { global.__ijFindConsoleBridgeTargets.delete(w.id); } } catch (eConsoleTargetDel) {}
               }
             }
             var bridge = global.__ijFindBridgeListeners && global.__ijFindBridgeListeners.get(w.id);
@@ -2908,6 +3100,90 @@ export class OverlayPanel {
     return this.injectPromise;
   }
 
+  /** Reconnect to an already-patched renderer without resending/parsing the
+   * nearly 1 MB main + additional installers. The console/HTTP bridge survives
+   * the extension's idle CDP close, so a small readiness probe is sufficient. */
+  private async probeRetainedRendererPatch(options: PatchScriptOptions): Promise<string | undefined> {
+    if (options.additionalInstance || options.forceInstall || !this.localBridgeServer || this.localBridgePort === undefined) {
+      return undefined;
+    }
+    const expectedDisableMonacoProbes = !this.isMonacoCaptureEnabled();
+    const expectedPreviewLanguageFeatures = this.shouldEnablePreviewLanguageFeatures();
+    const rendererReadyExpr =
+      `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&` +
+      `window.__ijFindLightStatus&&window.__ijFindPatchVersion===${RENDERER_PATCH_VERSION}` +
+      `&&window.__ijFindDisableMonacoProbes===${expectedDisableMonacoProbes ? 'true' : 'false'}` +
+      `&&window.__ijFindEnablePreviewLanguageFeatures===${expectedPreviewLanguageFeatures ? 'true' : 'false'}` +
+      `?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`;
+    const workspaceName = this.getExpectedWorkspaceName();
+    const markerText = options.ignoreTargetMarker ? '' : (this.targetWindowMarkerText || '');
+    const markerProbeExpr = this.buildTargetMarkerProbeExpression(markerText);
+    const preferredWindowId = this.activeWindowId;
+    const script = `
+      (async function () {
+        var BW = require('electron').BrowserWindow;
+        var preferredWindowId = ${preferredWindowId === undefined ? 'undefined' : JSON.stringify(preferredWindowId)};
+        var expectedWorkspace = ${JSON.stringify(workspaceName.toLowerCase())};
+        var markerText = ${JSON.stringify(markerText)};
+        var markerProbeExpr = ${JSON.stringify(markerProbeExpr)};
+        var expectedLocalBridgePort = ${JSON.stringify(this.localBridgePort)};
+        var expectedLocalBridgeToken = ${JSON.stringify(this.localBridgeToken)};
+        function isWorkbench(win) {
+          try { return !!win && /workbench\\.(?:esm\\.)?html/.test(win.webContents.getURL() || ''); }
+          catch (e) { return false; }
+        }
+        function titleMatches(win) {
+          if (!expectedWorkspace) { return true; }
+          try { return String(win.getTitle() || '').toLowerCase().indexOf(expectedWorkspace) >= 0; }
+          catch (e) { return false; }
+        }
+        async function hasMarker(win) {
+          if (!markerText) { return false; }
+          try { return await win.webContents.executeJavaScript(markerProbeExpr, true) === true; }
+          catch (e) { return false; }
+        }
+        var all = BW.getAllWindows().filter(isWorkbench);
+        var target = null;
+        if (markerText) {
+          for (var i = 0; i < all.length; i++) {
+            if (await hasMarker(all[i])) { target = all[i]; break; }
+          }
+        }
+        if (!target && typeof preferredWindowId === 'number') {
+          var preferred = BW.fromId(preferredWindowId);
+          if (isWorkbench(preferred) && titleMatches(preferred)) { target = preferred; }
+        }
+        if (!target) {
+          var focused = BW.getFocusedWindow();
+          if (isWorkbench(focused) && titleMatches(focused)) { target = focused; }
+        }
+        if (!target && all.length === 1) { target = all[0]; }
+        if (!target) { return 'missing:no-target'; }
+        var bridge = global.__ijFindConsoleBridgeListeners && global.__ijFindConsoleBridgeListeners.get(target.id);
+        var bridgeTarget = global.__ijFindConsoleBridgeTargets && global.__ijFindConsoleBridgeTargets.get(target.id);
+        var bridgeReady = !!bridge && !!bridgeTarget &&
+          bridgeTarget.port === expectedLocalBridgePort && bridgeTarget.token === expectedLocalBridgeToken;
+        if (!bridgeReady) { return 'missing:stale-console-bridge:' + target.id; }
+        var status = await target.webContents.executeJavaScript(${JSON.stringify(rendererReadyExpr)}, true);
+        return status === 'ready'
+          ? 'ok:' + target.id + ':already patched:retained'
+          : 'missing:renderer:' + target.id + ':' + status;
+      })()
+    `.trim();
+    try {
+      const response = await this.send('Runtime.evaluate', {
+        expression: script,
+        includeCommandLineAPI: true,
+        returnByValue: true,
+        awaitPromise: true,
+      }, 1500);
+      const report = String(response?.result?.value ?? '');
+      return /\bok:\d+:already patched:retained\b/.test(report) ? report : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async inject(options: PatchScriptOptions = {}): Promise<void> {
     const mainPid = this.findMainPid();
     if (!mainPid) { throw new Error('Could not locate VSCode main (Electron) process'); }
@@ -2972,6 +3248,13 @@ export class OverlayPanel {
     await this.send('Runtime.enable', {});
     await this.send('Runtime.addBinding', { name: BRIDGE_BINDING });
 
+    const retainedReport = await this.probeRetainedRendererPatch(options);
+    if (retainedReport) {
+      this.log.appendLine(`Injection: ${retainedReport}`);
+      this.markRendererInlayClickHookReady(retainedReport, 'retained-fast-path');
+      return;
+    }
+
     const report = await this.runPatchScript(undefined, options);
     this.log.appendLine(`Injection: ${report}`);
     if (!/\bok:/.test(String(report))) {
@@ -3013,17 +3296,20 @@ export class OverlayPanel {
       this.shouldEnablePreviewLanguageFeatures(),
     );
     // Readiness gate for the inject fast-path. Beyond the basic patch-version
-    // marker, also confirm that the renderer-side __ijFindDisableMonacoProbes
-    // flag matches what this inject would set (line 34/338 in rendererPatch).
+    // marker, also confirm that renderer-side runtime flags match what this
+    // inject would set. This prevents a retained closure from silently keeping
+    // the bundled provider bridge disabled after an extension/settings reload.
     // Recovery paths such as __ijFindForceStopMonacoCapture mutate that flag
     // to true while leaving the patch version intact; without re-running the
     // patch script we'd report 'ready' and never reset the flag back to its
     // intended value.
     const expectedDisableMonacoProbes = !this.isMonacoCaptureEnabled();
+    const expectedPreviewLanguageFeatures = this.shouldEnablePreviewLanguageFeatures();
     const rendererReadyExpr =
       `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&` +
       `window.__ijFindLightStatus&&window.__ijFindPatchVersion===${RENDERER_PATCH_VERSION}` +
       `&&window.__ijFindDisableMonacoProbes===${expectedDisableMonacoProbes ? 'true' : 'false'}` +
+      `&&window.__ijFindEnablePreviewLanguageFeatures===${expectedPreviewLanguageFeatures ? 'true' : 'false'}` +
       `?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`;
     const workspaceName = this.getExpectedWorkspaceName();
     const markerText = options.ignoreTargetMarker ? '' : (this.targetWindowMarkerText || '');
@@ -3041,7 +3327,7 @@ export class OverlayPanel {
         var localBridgeToken = ${JSON.stringify(localBridge.token)};
         var closeMainInspector = ${JSON.stringify(this.shouldCloseMainInspector())};
         var keepConsoleBridgeForInlay = ${JSON.stringify(this.shouldEnableRendererInlayClickHook())};
-        var forcePatchInstall = ${JSON.stringify(!!options.additionalInstance)};
+        var forcePatchInstall = ${JSON.stringify(!!(options.additionalInstance || options.forceInstall))};
         var targetWindowId = ${targetWindowId === undefined ? 'undefined' : JSON.stringify(targetWindowId)};
         var expectedWorkspaceName = ${JSON.stringify(workspaceName)};
         var expectedWorkspaceNameLower = expectedWorkspaceName.toLowerCase();
@@ -3085,7 +3371,6 @@ export class OverlayPanel {
               if (await hasMarker(all[m])) { return all[m]; }
             }
             if (all.length === 1) { return all[0]; }
-            return null;
           }
           var focused = BW.getFocusedWindow();
           if (focused && isWorkbench(focused) && titleMatchesWorkspace(focused)) { return focused; }
@@ -3104,6 +3389,7 @@ export class OverlayPanel {
         var bridgePrefix = '__IJSS_BRIDGE__';
         function installConsoleBridge(w) {
           if (!global.__ijFindConsoleBridgeListeners) { global.__ijFindConsoleBridgeListeners = new Map(); }
+          if (!global.__ijFindConsoleBridgeTargets) { global.__ijFindConsoleBridgeTargets = new Map(); }
           var prev = global.__ijFindConsoleBridgeListeners.get(w.id);
           if (prev) {
             try { w.webContents.removeListener('console-message', prev); } catch (eRmPrev) {}
@@ -3134,6 +3420,7 @@ export class OverlayPanel {
                     if (global.__ijFindConsoleBridgeListeners &&
                         global.__ijFindConsoleBridgeListeners.get(bridgeWinId) === bridge) {
                       global.__ijFindConsoleBridgeListeners.delete(bridgeWinId);
+                      if (global.__ijFindConsoleBridgeTargets) { global.__ijFindConsoleBridgeTargets.delete(bridgeWinId); }
                     }
                   } catch (eConsoleSelfDel) {}
                   try {
@@ -3157,14 +3444,61 @@ export class OverlayPanel {
             } catch (ePayload) {}
             try {
               if (typeof fetch === 'function') {
-                fetch('http://127.0.0.1:' + localBridgePort + '/ijss-bridge', {
-                  method: 'POST',
-                  headers: {
-                    'content-type': 'application/json',
-                    'x-ijss-token': localBridgeToken,
-                  },
-                  body: String(payload),
-                }).catch(function () {});
+                // console-message callbacks are ordered, but independent
+                // fetches are not. Serialize posts per BrowserWindow so the
+                // renderer's __seq order remains meaningful for stateful
+                // events such as search/cancel/save.
+                if (!global.__ijFindConsoleBridgeChains) { global.__ijFindConsoleBridgeChains = new Map(); }
+                var chains = global.__ijFindConsoleBridgeChains;
+                var previousPost = chains.get(bridgeWinId) || Promise.resolve();
+                var postPayload = String(payload);
+                var forwardThroughBinding = function () {
+                  try {
+                    if (typeof global[mainBridgeBindingName] === 'function') {
+                      global[mainBridgeBindingName](postPayload);
+                    }
+                  } catch (eBindingFallback) {}
+                };
+                var post = function () {
+                  var controller = typeof AbortController === 'function' ? new AbortController() : null;
+                  var abortTimer = controller ? setTimeout(function () {
+                    try { controller.abort(); } catch (eAbortPost) {}
+                  }, 2000) : null;
+                  var request;
+                  try {
+                    request = fetch('http://127.0.0.1:' + localBridgePort + '/ijss-bridge', {
+                      method: 'POST',
+                      headers: {
+                        'content-type': 'application/json',
+                        'x-ijss-token': localBridgeToken,
+                      },
+                      body: postPayload,
+                      signal: controller ? controller.signal : undefined,
+                    });
+                  } catch (eStartPost) {
+                    if (abortTimer) { clearTimeout(abortTimer); }
+                    forwardThroughBinding();
+                    return Promise.resolve();
+                  }
+                  return Promise.resolve(request).then(function () {
+                    if (abortTimer) { clearTimeout(abortTimer); }
+                  }, function () {
+                    if (abortTimer) { clearTimeout(abortTimer); }
+                    // The loopback endpoint belongs to the extension host and
+                    // can disappear briefly during a reload. If CDP is open,
+                    // its main-process binding is a safe ordered fallback;
+                    // duplicate delivery is removed by renderer __src/__seq.
+                    forwardThroughBinding();
+                  });
+                };
+                var nextPost = previousPost.then(post, post);
+                chains.set(bridgeWinId, nextPost);
+                var clearPost = function () {
+                  try {
+                    if (chains.get(bridgeWinId) === nextPost) { chains.delete(bridgeWinId); }
+                  } catch (eClearPostChain) {}
+                };
+                nextPost.then(clearPost, clearPost);
               }
               releaseSelfIfPanelHidden();
               return;
@@ -3174,6 +3508,10 @@ export class OverlayPanel {
           };
           w.webContents.on('console-message', bridge);
           global.__ijFindConsoleBridgeListeners.set(w.id, bridge);
+          global.__ijFindConsoleBridgeTargets.set(w.id, {
+            port: localBridgePort,
+            token: localBridgeToken,
+          });
         }
         for (var i = 0; i < wins.length; i++) {
           var w = wins[i];
@@ -3296,7 +3634,9 @@ export class OverlayPanel {
 	      this.activeWindowId !== undefined &&
 	      evt.__win !== this.activeWindowId &&
 	      evt.type !== 'log' &&
-	      evt.type !== 'trace'
+	      evt.type !== 'trace' &&
+	      evt.type !== 'requestStandaloneMonaco' &&
+	      evt.type !== 'requestPreviewLanguageFeature'
 	    ) {
 	      this.log.appendLine(`ignore renderer event from inactive win=${evt.__win} active=${this.activeWindowId} type=${(evt as any).type}`);
 	      return;
@@ -3330,6 +3670,13 @@ export class OverlayPanel {
         }
         break;
       case 'panelHidden':
+        if (evt.__src) {
+          this.previewLanguageTargets.delete(evt.__src);
+          this.previewRequestGenerationByRoute.delete(evt.__src);
+          this.pendingPreviewRequests.get(evt.__src)?.resolve();
+          this.pendingPreviewRequests.delete(evt.__src);
+        }
+        void this.cancelPendingPreviewCapture('panel hidden');
         if (!evt.__src || !this.currentSearchRendererSrc || evt.__src === this.currentSearchRendererSrc) {
           this.currentSearchSession = undefined;
           this.currentSearchRendererSrc = undefined;
@@ -3345,15 +3692,54 @@ export class OverlayPanel {
           this.scheduleCdpIdleClose(evt.__win);
         }
         break;
+      case 'panelDisposed':
+        if (evt.__src) {
+          this.previewLanguageTargets.delete(evt.__src);
+          this.previewRequestGenerationByRoute.delete(evt.__src);
+          this.pendingPreviewRequests.get(evt.__src)?.resolve();
+          this.pendingPreviewRequests.delete(evt.__src);
+          if (this.activeRendererSrc === evt.__src) { this.activeRendererSrc = undefined; }
+        }
+        break;
       case 'openFile': void this.openFile(evt.uri, evt.line, evt.column, false); break;
       case 'previewFile': void this.openFile(evt.uri, evt.line, evt.column, true); break;
       case 'requestPreview':
         if (evt.__src) { this.activeRendererSrc = evt.__src; }
         if (typeof evt.__win === 'number') { this.activeWindowId = evt.__win; }
-        void this.handlePreviewRequest(evt);
+        this.rememberPreviewLanguageTarget(evt.__src, evt.__win, evt.uri);
+        void this.handlePreviewRequest(evt, {
+          windowId: typeof evt.__win === 'number' ? evt.__win : undefined,
+          rendererSrc: evt.__src,
+        });
+        break;
+      case 'requestStandaloneMonaco':
+        if (typeof evt.__win === 'number') {
+          // A renderer only asks when its global bundle is absent, so bypass
+          // the optimistic window cache (the renderer may have reloaded while
+          // retaining the same BrowserWindow id).
+          void this.injectStandaloneMonacoBundle(evt.__win, true);
+        }
+        break;
+      case 'requestPreviewLanguageFeature':
+        // Do not let a delayed feature request from the previous model move
+        // the live diagnostics subscription back to an older URI.
+        this.rememberPreviewLanguageTarget(evt.__src, evt.__win, evt.uri, false);
+        void this.handlePreviewLanguageFeatureRequest(evt, {
+          windowId: typeof evt.__win === 'number' ? evt.__win : undefined,
+          rendererSrc: evt.__src,
+        });
+        break;
+      case 'requestPreviewTextMateGrammar':
+        void this.handlePreviewTextMateGrammarRequest(evt, {
+          windowId: typeof evt.__win === 'number' ? evt.__win : undefined,
+          rendererSrc: evt.__src,
+        });
         break;
       case 'requestIntellisenseProbe':
-        void this.runIntellisenseProbe(evt.uri, evt.line, evt.column, evt.source);
+        // Compatibility no-op for a renderer injected by an older extension
+        // build. Auto-probing executed both hover and completion providers in
+        // addition to Monaco's real hover request, which could restart costly
+        // language analysis and destabilize the preview widget.
         break;
       case 'revealFile': void this.revealFile(evt.uri); break;
       case 'openInSideEditor': void this.openInSideEditor(evt.uri, evt.line, evt.column, true, true); break;
@@ -3363,7 +3749,18 @@ export class OverlayPanel {
 	      // through VSCode's language services, so the renderer never
 	      // asks the extension host for hover content.
 	      case 'runCommand': void this.runHoverCommand(evt.command, evt.args, evt.__win); break;
-	      case 'saveFile': void this.saveFile(evt.uri, evt.content); break;
+	      case 'saveFile':
+          void this.enqueuePreviewSave(evt.uri, evt.content, evt.requestId, evt.expectedContentHash, {
+            windowId: typeof evt.__win === 'number' ? evt.__win : undefined,
+            rendererSrc: evt.__src,
+          });
+          break;
+        case 'saveFileTooLarge':
+          void this.rejectOversizedPreviewSave(evt.uri, evt.requestId, evt.bytes, {
+            windowId: typeof evt.__win === 'number' ? evt.__win : undefined,
+            rendererSrc: evt.__src,
+          });
+          break;
 	      case 'trace':
 	        this.log.appendLine(
 	          `[renderer-trace${typeof evt.__win === 'number' ? ` win=${evt.__win}` : ''}` +
@@ -3373,6 +3770,108 @@ export class OverlayPanel {
 	        break;
 	      case 'log': this.log.appendLine(`[renderer${typeof evt.__win === 'number' ? ` win=${evt.__win}` : ''}] ${evt.msg}`); break;
 	    }
+  }
+
+  private injectStandaloneMonacoBundle(windowId: number, verifyRenderer = false): Promise<void> {
+    if (!verifyRenderer && this.standaloneMonacoReadyWindows.has(windowId)) {
+      return Promise.resolve();
+    }
+    const existing = this.standaloneMonacoInjectionPromises.get(windowId);
+    if (existing) { return existing; }
+    const promise = this.injectStandaloneMonacoBundleOnce(windowId).finally(() => {
+      if (this.standaloneMonacoInjectionPromises.get(windowId) === promise) {
+        this.standaloneMonacoInjectionPromises.delete(windowId);
+      }
+    });
+    this.standaloneMonacoInjectionPromises.set(windowId, promise);
+    return promise;
+  }
+
+  private async injectStandaloneMonacoBundleOnce(windowId: number): Promise<void> {
+    const bundlePath = path.join(this.context.extensionPath, 'resources', 'monaco.bundle.js');
+    if (!fs.existsSync(bundlePath)) {
+      this.log.appendLine(`standalone Monaco injection failed: missing ${bundlePath}`);
+      await this.notifyStandaloneMonacoFailure(windowId, 'bundled editor is missing');
+      return;
+    }
+    try {
+      await this.ensureInjected({ ignoreTargetMarker: true });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.appendLine(`standalone Monaco injection failed before load: ${message}`);
+      await this.notifyStandaloneMonacoFailure(windowId, message);
+      return;
+    }
+    const script = `
+      (async function () {
+        var fs = require('fs');
+        var BW = require('electron').BrowserWindow;
+        var target = BW.fromId(${JSON.stringify(windowId)});
+        var bundlePath = ${JSON.stringify(bundlePath)};
+        function isWorkbench(win) {
+          try {
+            var url = (win && win.webContents && win.webContents.getURL && win.webContents.getURL()) || '';
+            return /workbench\\.(?:esm\\.)?html(?:\\?|#|$)/.test(url);
+          } catch (e) { return false; }
+        }
+        if (!target || !isWorkbench(target)) { return 'skip:no-workbench'; }
+        var statusExpr = "(function(){try{var nativeReady=!!(window.__ijFindMonacoStatus&&window.__ijFindMonacoStatus()==='ready');var standaloneReady=!!(globalThis.__ijFindMonacoBundleVersion===6&&typeof globalThis.__ijFindMonacoCssText==='string'&&globalThis.__ijFindMonacoCssText.length>=1000&&globalThis.__ijFindMonacoApi&&globalThis.__ijFindMonacoApi.editor&&typeof globalThis.__ijFindMonacoApi.editor.create==='function');return (nativeReady?'native-ready':'native-missing')+','+(standaloneReady?'standalone-ready-v6':'standalone-missing')}catch(e){return 'err:'+(e&&e.message)}})()";
+        var before = await target.webContents.executeJavaScript(statusExpr, true);
+        var notify = 'not-run';
+        var after = 'missing';
+        await target.webContents.executeJavaScript("(function(){globalThis.__ijFindStandaloneMonacoInitializing=true;try{if(window.__ijFindStopCapture){window.__ijFindStopCapture('standalone-monaco-load')}}catch(e){}return 'paused'})()", true);
+        try {
+          if (String(before).indexOf('standalone-ready') < 0) {
+            var code = fs.readFileSync(bundlePath, 'utf8');
+            await target.webContents.executeJavaScript(code + "\\n//# sourceURL=ijss-monaco.bundle.js", true);
+          }
+          var notifyExpr = "(function(){try{return window.__ijFindStandaloneMonacoReady?window.__ijFindStandaloneMonacoReady('bundle-ready'):'no-ready-hook'}catch(e){return 'notify-err:'+(e&&e.message)}})()";
+          notify = await target.webContents.executeJavaScript(notifyExpr, true);
+          after = await target.webContents.executeJavaScript(statusExpr, true);
+        } finally {
+          await target.webContents.executeJavaScript("(function(){globalThis.__ijFindStandaloneMonacoInitializing=false;return 'resumed'})()", true);
+        }
+        return 'win=' + target.id + ' before=' + before + ' after=' + after + ' notify=' + notify;
+      })()
+    `.trim();
+    try {
+      const resp = await this.send('Runtime.evaluate', {
+        expression: script,
+        includeCommandLineAPI: true,
+        returnByValue: true,
+        awaitPromise: true,
+      }, 15_000);
+      if (resp?.exceptionDetails) {
+        const message = `${resp.exceptionDetails.text || ''}:${resp.exceptionDetails.exception?.description || ''}`;
+        this.log.appendLine(`standalone Monaco injection failed: ${message}`);
+        await this.notifyStandaloneMonacoFailure(windowId, message);
+        return;
+      }
+      const report = String(resp?.result?.value ?? '(no result)');
+      this.log.appendLine(`standalone Monaco injection: ${report}`);
+      if (/after=[^ ]*standalone-ready/.test(report)) {
+        this.standaloneMonacoReadyWindows.add(windowId);
+      } else {
+        this.standaloneMonacoReadyWindows.delete(windowId);
+        await this.notifyStandaloneMonacoFailure(windowId, report);
+      }
+    } catch (err) {
+      this.standaloneMonacoReadyWindows.delete(windowId);
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.appendLine(`standalone Monaco injection failed: ${message}`);
+      await this.notifyStandaloneMonacoFailure(windowId, message);
+    }
+  }
+
+  private async notifyStandaloneMonacoFailure(windowId: number, message: string): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) { return; }
+    try {
+      await this.evalInWindow(
+        windowId,
+        `(function(){try{return window.__ijFindStandaloneMonacoFailed?window.__ijFindStandaloneMonacoFailed(${JSON.stringify(message.slice(0, 300))}):'no-failure-hook'}catch(e){return 'failure-hook-err:'+(e&&e.message)}})()`,
+        1000,
+      );
+    } catch {}
   }
 
   private async openInSideEditor(uriStr: string, line: number, column: number, preview: boolean, preserveFocus: boolean) {
@@ -3418,13 +3917,21 @@ export class OverlayPanel {
     }
   }
 
-  private async saveFile(uriStr: string, content: string) {
+  private async saveFile(
+    uriStr: string,
+    content: string,
+    expectedContentHash?: string,
+  ): Promise<{ ok: true; documentHash: string; actualContent: string } | { ok: false; error: string }> {
     try {
       const uri = vscode.Uri.parse(uriStr);
       // Use a WorkspaceEdit so VSCode's edit pipeline tracks the change (undo
-      // history, dirty state on any open editor, etc). Fall back to direct
-      // fs.writeFile if applyEdit fails.
+      // history, dirty state on any open editor, etc). Direct byte writes are
+      // intentionally avoided: they can desynchronize an open
+      // TextDocument and can silently change its encoding/BOM.
       const doc = await vscode.workspace.openTextDocument(uri);
+      if (expectedContentHash && stableSearchHash(doc.getText()) !== expectedContentHash) {
+        throw new Error('The file changed after this preview was loaded; reopen the preview before saving');
+      }
       const fullRange = new vscode.Range(
         doc.positionAt(0),
         doc.positionAt(doc.getText().length),
@@ -3432,19 +3939,85 @@ export class OverlayPanel {
       const edit = new vscode.WorkspaceEdit();
       edit.replace(uri, fullRange, content);
       const ok = await vscode.workspace.applyEdit(edit);
-      if (ok) {
-        const refreshed = await vscode.workspace.openTextDocument(uri);
-        await refreshed.save();
-      } else {
-        await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+      if (!ok) {
+        throw new Error('VS Code declined to apply the preview edit');
+      }
+      const refreshed = await vscode.workspace.openTextDocument(uri);
+      const saved = await refreshed.save();
+      if (!saved) {
+        throw new Error('VS Code declined to save the edited document');
       }
       vscode.window.setStatusBarMessage(
         `IJ Find: saved ${vscode.workspace.asRelativePath(uri)}`, 2000,
       );
+      const actualContent = refreshed.getText();
+      return { ok: true, documentHash: stableSearchHash(actualContent), actualContent };
     } catch (err) {
-      this.log.appendLine(`saveFile failed: ${err instanceof Error ? err.message : err}`);
-      vscode.window.showErrorMessage(`Save failed: ${err instanceof Error ? err.message : err}`);
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.appendLine(`saveFile failed: ${message}`);
+      vscode.window.showErrorMessage(`Save failed: ${message}`);
+      return { ok: false, error: message };
     }
+  }
+
+  private enqueuePreviewSave(
+    uriStr: string,
+    content: string,
+    requestId: number | undefined,
+    expectedContentHash: string | undefined,
+    route: RendererMessageRoute,
+  ): Promise<void> {
+    // WorkspaceEdit/save is asynchronous. Serialize writes to the same URI so
+    // two quick Cmd/Ctrl+S presses cannot complete in reverse order and make
+    // the renderer accept an older snapshot as the saved baseline.
+    const previous = this.previewSaveChains.get(uriStr) ?? Promise.resolve();
+    const run = async () => {
+      const result = await this.saveFile(uriStr, content, expectedContentHash);
+      if (typeof requestId === 'number') {
+        let diagnostics: unknown[] | undefined;
+        if (result.ok) {
+          try {
+            diagnostics = serializePreviewDiagnostics(vscode.languages.getDiagnostics(vscode.Uri.parse(uriStr)));
+          } catch {}
+        }
+        await this.postToRenderer({
+          type: 'preview:saveResult',
+          uri: uriStr,
+          requestId,
+          ok: result.ok,
+          ...(!result.ok ? { error: result.error } : {}),
+          ...(diagnostics ? { diagnostics } : {}),
+          ...(result.ok ? { documentHash: result.documentHash } : {}),
+          ...(result.ok && result.actualContent !== content ? { savedContent: result.actualContent } : {}),
+        }, route);
+      }
+    };
+    const next = previous.then(run, run);
+    this.previewSaveChains.set(uriStr, next);
+    void next.finally(() => {
+      if (this.previewSaveChains.get(uriStr) === next) {
+        this.previewSaveChains.delete(uriStr);
+      }
+    }).catch(() => undefined);
+    return next;
+  }
+
+  private async rejectOversizedPreviewSave(
+    uriStr: string,
+    requestId: number,
+    bytes: number,
+    route: RendererMessageRoute,
+  ): Promise<void> {
+    const message = `Preview content is too large to save through the renderer bridge (${Math.max(0, bytes)} bytes)`;
+    this.log.appendLine(`saveFile rejected: ${message} uri=${uriStr}`);
+    vscode.window.showErrorMessage(`Save failed: ${message}`);
+    await this.postToRenderer({
+      type: 'preview:saveResult',
+      uri: uriStr,
+      requestId,
+      ok: false,
+      error: message,
+    }, route);
   }
 
   private async runHoverCommand(command: string, args: unknown[], sourceWindowId?: number) {
@@ -3464,14 +4037,15 @@ export class OverlayPanel {
     }
   }
 
-  private handlePreviewRequest(evt: PreviewRequestEvent): Promise<void> {
+  private handlePreviewRequest(evt: PreviewRequestEvent, route: RendererMessageRoute = {}): Promise<void> {
     this.cancelCdpSearchIdleClose();
     const seq = ++this.previewRequestSeq;
-    if (this.pendingPreviewRequest) {
-      this.pendingPreviewRequest.resolve();
-    }
+    const routeKey = route.rendererSrc ?? (typeof route.windowId === 'number' ? `window:${route.windowId}` : 'active');
+    const routeGeneration = (this.previewRequestGenerationByRoute.get(routeKey) ?? 0) + 1;
+    this.previewRequestGenerationByRoute.set(routeKey, routeGeneration);
+    this.pendingPreviewRequests.get(routeKey)?.resolve();
     return new Promise((resolve) => {
-      this.pendingPreviewRequest = { evt, seq, resolve };
+      this.pendingPreviewRequests.set(routeKey, { evt, seq, route, routeKey, routeGeneration, resolve });
       this.schedulePreviewRequestPump();
     });
   }
@@ -3488,76 +4062,116 @@ export class OverlayPanel {
     if (this.previewPumpActive) { return; }
     this.previewPumpActive = true;
     try {
-      while (this.pendingPreviewRequest) {
-        const queued = this.pendingPreviewRequest;
-        this.pendingPreviewRequest = undefined;
+      while (this.pendingPreviewRequests.size > 0) {
+        const next = this.pendingPreviewRequests.entries().next();
+        if (next.done) { break; }
+        const [routeKey, queued] = next.value;
+        this.pendingPreviewRequests.delete(routeKey);
         await this.deliverLatestPreview(queued);
       }
     } finally {
       this.previewPumpActive = false;
-      if (this.pendingPreviewRequest) {
+      if (this.pendingPreviewRequests.size > 0) {
         this.schedulePreviewRequestPump();
       }
     }
   }
 
   private async deliverLatestPreview(queued: QueuedPreviewRequest): Promise<void> {
-    const { evt, seq } = queued;
-    const isLatest = () => seq === this.previewRequestSeq;
+    const { evt, seq, route, routeKey, routeGeneration } = queued;
+    const isLatest = () => this.previewRequestGenerationByRoute.get(routeKey) === routeGeneration;
     try {
       if (!isLatest()) { return; }
-      const sent = await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges, evt.previewSeq, isLatest);
+      const sent = await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges, evt.previewSeq, isLatest, route);
       if (sent === false || !isLatest()) { return; }
       this.releasePreviewCaptureTabsSoon('preview-delivered');
       this.scheduleCdpSearchIdleClose('preview-delivered');
-      this.startPreviewWarmup(evt, seq);
+      this.startPreviewWarmup(evt, seq, route);
     } finally {
       queued.resolve();
     }
   }
 
-  private startPreviewWarmup(evt: PreviewRequestEvent, seq: number): void {
-    if (this.activeWindowId === undefined) { return; }
+  private startPreviewWarmup(evt: PreviewRequestEvent, seq: number, route: RendererMessageRoute = {}): void {
+    const targetWindowId = route.windowId ?? this.activeWindowId;
+    if (targetWindowId === undefined) { return; }
+    const captureEpoch = this.previewCaptureEpoch;
+    const shouldContinue = () => (
+      captureEpoch === this.previewCaptureEpoch &&
+      seq === this.previewRequestSeq &&
+      this.isMonacoCaptureEnabled()
+    );
+    // The bundled editor is the guaranteed, tab-free path. Start loading it
+    // only once a preview is actually requested so opening an empty overlay
+    // stays cheap and can paint before the 3.7 MB editor bundle is evaluated.
+    const standaloneLoad = this.injectStandaloneMonacoBundle(targetWindowId);
     if (!this.isMonacoCaptureEnabled()) { return; }
-    const targetWindowId = this.activeWindowId;
-    if (!this.previewWarmupPromise) {
-      this.previewWarmupPromise = (async () => {
-        try {
+    // Give every latest preview its own recovery run. The sequence/epoch gate
+    // cancels an older run before its next attempt, while ensureMonacoCapture
+    // still serializes an attempt already in flight.
+    const warmup = (async () => {
+      try {
+        // Do not make the renderer evaluate the bundled editor and scan VS
+        // Code's private editor graph at the same time. Give the guaranteed
+        // preview path the first turn, then attempt sparse passive upgrades.
+        await Promise.race([standaloneLoad, delay(800)]);
+        for (let attempt = 0; attempt < PREVIEW_NATIVE_PASSIVE_RETRY_DELAYS_MS.length; attempt++) {
+          await delay(PREVIEW_NATIVE_PASSIVE_RETRY_DELAYS_MS[attempt]);
+          if (!shouldContinue()) { return; }
           await this.ensureMonacoCapture(targetWindowId, undefined, {
             allowForceOpen: false,
-            reason: 'preview-request',
+            bypassThrottle: true,
+            reason: attempt === 0 ? 'preview-request' : `preview-passive-retry-${attempt}`,
+            shouldContinue,
           });
-        } catch (err) {
-          this.log.appendLine(`preview Monaco capture failed: ${err instanceof Error ? err.message : err}`);
+          if (!shouldContinue() || await this.isMonacoReadyInWindow(targetWindowId)) { return; }
         }
-      })().finally(() => {
+      } catch (err) {
+        this.log.appendLine(`preview Monaco capture failed: ${err instanceof Error ? err.message : err}`);
+      }
+    })();
+    this.previewWarmupPromise = warmup;
+    void warmup.finally(() => {
+      if (this.previewWarmupPromise === warmup) {
         this.previewWarmupPromise = undefined;
-      });
-    }
-    void this.previewWarmupPromise.then(async () => {
-      if (seq !== this.previewRequestSeq) { return; }
+      }
+    }).then(async () => {
+      if (!shouldContinue()) { return; }
       if (!(await this.isMonacoReadyInWindow(targetWindowId))) {
+        if (!this.shouldAllowTransientPreviewCaptureEditor()) {
+          this.log.appendLine(
+            `preview native Monaco passive recovery exhausted; keeping bundled Monaco without opening an editor ` +
+            `(seq=${seq}, previewSeq=${typeof evt.previewSeq === 'number' ? evt.previewSeq : 'none'})`,
+          );
+          return;
+        }
         this.log.appendLine(
           `preview Monaco warmup not ready; scheduling force-open fallback ` +
           `(seq=${seq}, previewSeq=${typeof evt.previewSeq === 'number' ? evt.previewSeq : 'none'})`,
         );
-        this.schedulePreviewForceOpen(evt, seq, targetWindowId);
+        this.schedulePreviewForceOpen(evt, seq, targetWindowId, route);
         return;
       }
-      if (seq !== this.previewRequestSeq) { return; }
+      if (!shouldContinue()) { return; }
       if (typeof evt.previewSeq !== 'number') { return; }
-      const isLatest = () => seq === this.previewRequestSeq;
-      const sent = await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges, evt.previewSeq, isLatest);
+      const isLatest = shouldContinue;
+      const sent = await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges, evt.previewSeq, isLatest, route);
       if (sent === false || !isLatest()) { return; }
       this.releasePreviewCaptureTabsSoon('preview-refresh');
       this.scheduleCdpSearchIdleClose('preview-refresh');
     });
   }
 
-  private schedulePreviewForceOpen(evt: PreviewRequestEvent, seq: number, windowId: number): void {
+  private schedulePreviewForceOpen(
+    evt: PreviewRequestEvent,
+    seq: number,
+    windowId: number,
+    route: RendererMessageRoute,
+  ): void {
     if (!this.isMonacoCaptureEnabled()) { return; }
+    if (!this.shouldAllowTransientPreviewCaptureEditor()) { return; }
     if (seq !== this.previewRequestSeq) { return; }
-    this.pendingPreviewForceOpen = { evt, seq, windowId };
+    this.pendingPreviewForceOpen = { evt, seq, windowId, route, epoch: this.previewCaptureEpoch };
     if (this.previewForceOpenPromise) {
       this.previewForceOpenSuppressedCount++;
       return;
@@ -3605,13 +4219,21 @@ export class OverlayPanel {
     const queued = this.pendingPreviewForceOpen;
     this.pendingPreviewForceOpen = undefined;
     if (!queued) { return; }
-    const { evt, seq, windowId } = queued;
+    const { evt, seq, windowId, route, epoch } = queued;
+    if (!this.shouldAllowTransientPreviewCaptureEditor()) { return; }
+    if (epoch !== this.previewCaptureEpoch) { return; }
     if (seq !== this.previewRequestSeq) { return; }
+    const shouldContinue = () =>
+      epoch === this.previewCaptureEpoch &&
+      seq === this.previewRequestSeq &&
+      this.shouldAllowTransientPreviewCaptureEditor() &&
+      this.isMonacoCaptureEnabled();
     let attempted = false;
     this.previewForceOpenPromise = (async () => {
       try {
+        if (!shouldContinue()) { return; }
         if (await this.isMonacoReadyInWindow(windowId)) {
-          await this.refreshLatestPreviewAfterCapture(evt, seq, 'preview-force-open-already-ready');
+          await this.refreshLatestPreviewAfterCapture(evt, seq, route, 'preview-force-open-already-ready');
           return;
         }
         attempted = true;
@@ -3621,12 +4243,14 @@ export class OverlayPanel {
           allowForceOpen: true,
           holdForceOpenedTab: true,
           reason: 'preview-request-force-open',
+          shouldContinue,
         });
+        if (!shouldContinue()) { return; }
         const latest = this.pendingPreviewForceOpen && this.pendingPreviewForceOpen.seq === this.previewRequestSeq
           ? this.pendingPreviewForceOpen
           : queued;
         if (latest.seq === this.previewRequestSeq) {
-          await this.refreshLatestPreviewAfterCapture(latest.evt, latest.seq, 'preview-force-open-refresh');
+          await this.refreshLatestPreviewAfterCapture(latest.evt, latest.seq, latest.route, 'preview-force-open-refresh');
         }
       } catch (err) {
         this.log.appendLine(`preview Monaco force-open capture failed: ${err instanceof Error ? err.message : err}`);
@@ -3646,13 +4270,15 @@ export class OverlayPanel {
   private async refreshLatestPreviewAfterCapture(
     evt: PreviewRequestEvent,
     seq: number,
+    route: RendererMessageRoute,
     reason: string,
   ): Promise<void> {
     if (seq !== this.previewRequestSeq) { return; }
-    if (this.activeWindowId === undefined || !(await this.isMonacoReadyInWindow(this.activeWindowId))) { return; }
+    const windowId = route.windowId ?? this.activeWindowId;
+    if (windowId === undefined || !(await this.isMonacoReadyInWindow(windowId))) { return; }
     if (seq !== this.previewRequestSeq) { return; }
     const isLatest = () => seq === this.previewRequestSeq;
-    const sent = await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges, evt.previewSeq, isLatest);
+    const sent = await this.sendPreview(evt.uri, evt.line, evt.contextLines, evt.ranges, evt.previewSeq, isLatest, route);
     if (sent === false || !isLatest()) { return; }
     this.releasePreviewCaptureTabsSoon(reason);
     this.scheduleCdpSearchIdleClose(reason);
@@ -3664,6 +4290,293 @@ export class OverlayPanel {
   private lastPreviewLineForDiagnostics: number | undefined;
   getLastPreviewUriForDiagnostics(): string | undefined { return this.lastPreviewUriForDiagnostics; }
   getLastPreviewLineForDiagnostics(): number | undefined { return this.lastPreviewLineForDiagnostics; }
+
+  private rememberPreviewLanguageTarget(
+    rendererSrc: string | undefined,
+    windowId: number | undefined,
+    uri: string,
+    replaceDifferentUri = true,
+  ): void {
+    if (!rendererSrc || typeof windowId !== 'number' || !uri) { return; }
+    const existing = this.previewLanguageTargets.get(rendererSrc);
+    if (existing && existing.uri !== uri && !replaceDifferentUri) { return; }
+    this.previewLanguageTargets.set(rendererSrc, {
+      rendererSrc,
+      windowId,
+      uri,
+      updatedAt: Date.now(),
+    });
+  }
+
+  private async postPreviewDiagnosticUpdates(uris: readonly vscode.Uri[]): Promise<void> {
+    if (!this.shouldEnablePreviewLanguageFeatures() || uris.length === 0) { return; }
+    const changed = new Set(uris.map((uri) => uri.toString()));
+    const now = Date.now();
+    const pending: Promise<void>[] = [];
+    for (const [src, target] of this.previewLanguageTargets) {
+      if (now - target.updatedAt > 30 * 60_000) {
+        this.previewLanguageTargets.delete(src);
+        continue;
+      }
+      if (!changed.has(target.uri)) { continue; }
+      let uri: vscode.Uri;
+      try { uri = vscode.Uri.parse(target.uri); } catch { continue; }
+      pending.push((async () => {
+        const document = await vscode.workspace.openTextDocument(uri);
+        await this.postToRenderer({
+          type: 'preview:diagnostics',
+          uri: target.uri,
+          diagnostics: serializePreviewDiagnostics(vscode.languages.getDiagnostics(uri)),
+          documentHash: stableSearchHash(document.getText()),
+        }, {
+          windowId: target.windowId,
+          rendererSrc: target.rendererSrc,
+        });
+      })());
+    }
+    await Promise.all(pending);
+  }
+
+  private async handlePreviewLanguageFeatureRequest(
+    evt: PreviewLanguageFeatureRequestEvent,
+    route: RendererMessageRoute,
+  ): Promise<void> {
+    const response = {
+      type: 'preview:languageFeature' as const,
+      requestId: evt.requestId,
+      feature: evt.feature,
+      uri: evt.uri,
+    };
+    try {
+      if (!Number.isFinite(evt.requestId)) {
+        throw new Error('Invalid preview language feature request id');
+      }
+      const uri = vscode.Uri.parse(evt.uri);
+      // Opening the document activates matching language extensions and also
+      // lets us clamp renderer coordinates before invoking provider commands.
+      const document = await vscode.workspace.openTextDocument(uri);
+      const documentVersion = document.version;
+      const value = capPreviewLanguageValue(
+        evt.feature,
+        await this.executePreviewLanguageFeature(evt, document),
+      );
+      if (document.version !== documentVersion) {
+        throw new Error('The document changed while the language provider was running');
+      }
+      await this.postToRenderer({
+        ...response,
+        value: value ?? null,
+        documentHash: stableSearchHash(document.getText()),
+      }, route);
+    } catch (err) {
+      const message = limitPreviewLanguageText(err instanceof Error ? err.message : String(err), 2_000);
+      this.log.appendLine(
+        `preview language feature failed: feature=${evt.feature} uri=${evt.uri} error=${message}`,
+      );
+      await this.postToRenderer({ ...response, error: message }, route);
+    }
+  }
+
+  private async handlePreviewTextMateGrammarRequest(
+    evt: PreviewTextMateGrammarRequestEvent,
+    route: RendererMessageRoute,
+  ): Promise<void> {
+    if (!Number.isSafeInteger(evt.requestId) || evt.requestId < 0) {
+      return;
+    }
+    if (evt.kind === 'catalog') {
+      try {
+        const languageId = typeof evt.languageId === 'string' && evt.languageId.length <= 256
+          ? evt.languageId
+          : '';
+        const catalog = languageId
+          ? await this.textMateGrammarCatalog.getCatalog(languageId)
+          : undefined;
+        await this.postToRenderer({
+          type: 'preview:textMateGrammar',
+          requestId: evt.requestId,
+          kind: 'catalog',
+          ...(catalog ? { value: catalog } : {}),
+        }, route);
+      } catch (error) {
+        await this.postToRenderer({
+          type: 'preview:textMateGrammar',
+          requestId: evt.requestId,
+          kind: 'catalog',
+          error: limitPreviewLanguageText(error instanceof Error ? error.message : String(error), 2_000),
+        }, route);
+      }
+      return;
+    }
+
+    const generation = Number(evt.generation);
+    const assetId = typeof evt.assetId === 'string' && evt.assetId.length <= 1_000
+      ? evt.assetId
+      : '';
+    try {
+      if (!Number.isSafeInteger(generation) || generation < 1 || !assetId) {
+        throw new Error('Invalid TextMate grammar asset request.');
+      }
+      const asset = await this.textMateGrammarCatalog.getAsset(generation, assetId);
+      const chunkCount = Math.max(1, Math.ceil(asset.bytes.byteLength / PREVIEW_TEXT_MATE_ASSET_CHUNK_BYTES));
+      for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+        const start = chunkIndex * PREVIEW_TEXT_MATE_ASSET_CHUNK_BYTES;
+        const end = Math.min(asset.bytes.byteLength, start + PREVIEW_TEXT_MATE_ASSET_CHUNK_BYTES);
+        const chunk = asset.bytes.subarray(start, end);
+        await this.postToRenderer({
+          type: 'preview:textMateGrammar',
+          requestId: evt.requestId,
+          kind: 'asset',
+          generation: asset.generation,
+          assetId: asset.assetId,
+          chunkIndex,
+          chunkCount,
+          base64: Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength).toString('base64'),
+          byteLength: asset.bytes.byteLength,
+          sha256: asset.sha256,
+          pathHint: asset.pathHint,
+        }, route);
+      }
+    } catch (error) {
+      await this.postToRenderer({
+        type: 'preview:textMateGrammar',
+        requestId: evt.requestId,
+        kind: 'asset',
+        generation: Number.isSafeInteger(generation) ? generation : 0,
+        assetId,
+        error: limitPreviewLanguageText(error instanceof Error ? error.message : String(error), 2_000),
+      }, route);
+    }
+  }
+
+  private async postPreviewTextMateGrammarInvalidated(): Promise<void> {
+    const now = Date.now();
+    const pending: Promise<void>[] = [];
+    for (const [rendererSrc, target] of this.previewLanguageTargets) {
+      if (now - target.updatedAt > 30 * 60_000) {
+        this.previewLanguageTargets.delete(rendererSrc);
+        continue;
+      }
+      pending.push(this.postToRenderer({ type: 'preview:textMateGrammarInvalidated' }, {
+        windowId: target.windowId,
+        rendererSrc: target.rendererSrc,
+      }));
+    }
+    await Promise.all(pending);
+  }
+
+  private async executePreviewLanguageFeature(
+    evt: PreviewLanguageFeatureRequestEvent,
+    document: vscode.TextDocument,
+  ): Promise<unknown> {
+    const uri = document.uri;
+    if (evt.feature === 'documentSymbol') {
+      const symbols = await vscode.commands.executeCommand<Array<vscode.DocumentSymbol | vscode.SymbolInformation> | undefined>(
+        'vscode.executeDocumentSymbolProvider',
+        uri,
+      );
+      return serializePreviewDocumentSymbols(symbols ?? []);
+    }
+    if (evt.feature === 'foldingRange') {
+      const ranges = await vscode.commands.executeCommand<vscode.FoldingRange[] | undefined>(
+        'vscode.executeFoldingRangeProvider',
+        uri,
+      );
+      return (ranges ?? []).slice(0, PREVIEW_LANGUAGE_MAX_RESULT_ITEMS).map(serializePreviewFoldingRange);
+    }
+    if (evt.feature === 'semanticTokens') {
+      const [legend, tokens] = await Promise.all([
+        vscode.commands.executeCommand<vscode.SemanticTokensLegend | undefined>(
+          'vscode.provideDocumentSemanticTokensLegend',
+          uri,
+        ),
+        vscode.commands.executeCommand<vscode.SemanticTokens | undefined>(
+          'vscode.provideDocumentSemanticTokens',
+          uri,
+        ),
+      ]);
+      if (!legend || !tokens) { return null; }
+      const cappedLength = Math.min(
+        tokens.data.length - (tokens.data.length % 5),
+        PREVIEW_LANGUAGE_MAX_SEMANTIC_TOKEN_INTS,
+      );
+      return {
+        legend: {
+          tokenTypes: legend.tokenTypes.slice(0, 1_000).map((part) => limitPreviewLanguageText(part, 256)),
+          tokenModifiers: legend.tokenModifiers.slice(0, 1_000).map((part) => limitPreviewLanguageText(part, 256)),
+        },
+        data: Array.from(tokens.data.slice(0, cappedLength)),
+        resultId: tokens.resultId ? limitPreviewLanguageText(tokens.resultId, 4_096) : undefined,
+      };
+    }
+
+    const position = previewLanguagePosition(document, evt.line, evt.column);
+    const triggerCharacter = previewLanguageTriggerCharacter(evt.context);
+    switch (evt.feature) {
+      case 'hover': {
+        const hovers = await vscode.commands.executeCommand<vscode.Hover[] | undefined>(
+          'vscode.executeHoverProvider',
+          uri,
+          position,
+        );
+        return (hovers ?? []).slice(0, PREVIEW_LANGUAGE_MAX_RESULT_ITEMS).map(serializePreviewHover);
+      }
+      case 'completion': {
+        const resolveCount = previewLanguageResolveCount(evt.context);
+        const args: unknown[] = [uri, position];
+        if (triggerCharacter !== undefined || resolveCount !== undefined) { args.push(triggerCharacter); }
+        if (resolveCount !== undefined) { args.push(resolveCount); }
+        const completion = await vscode.commands.executeCommand<vscode.CompletionList | undefined>(
+          'vscode.executeCompletionItemProvider',
+          ...args,
+        );
+        return serializePreviewCompletionList(completion);
+      }
+      case 'signatureHelp': {
+        const args: unknown[] = [uri, position];
+        if (triggerCharacter !== undefined) { args.push(triggerCharacter); }
+        const signatureHelp = await vscode.commands.executeCommand<vscode.SignatureHelp | undefined>(
+          'vscode.executeSignatureHelpProvider',
+          ...args,
+        );
+        return serializePreviewSignatureHelp(signatureHelp);
+      }
+      case 'definition':
+        return serializePreviewLocations(await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink> | undefined>(
+          'vscode.executeDefinitionProvider', uri, position,
+        ));
+      case 'declaration':
+        return serializePreviewLocations(await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink> | undefined>(
+          'vscode.executeDeclarationProvider', uri, position,
+        ));
+      case 'typeDefinition':
+        return serializePreviewLocations(await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink> | undefined>(
+          'vscode.executeTypeDefinitionProvider', uri, position,
+        ));
+      case 'implementation':
+        return serializePreviewLocations(await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink> | undefined>(
+          'vscode.executeImplementationProvider', uri, position,
+        ));
+      case 'references':
+        return serializePreviewLocations(await vscode.commands.executeCommand<vscode.Location[] | undefined>(
+          'vscode.executeReferenceProvider', uri, position,
+        ));
+      case 'documentHighlight': {
+        const highlights = await vscode.commands.executeCommand<vscode.DocumentHighlight[] | undefined>(
+          'vscode.executeDocumentHighlights', uri, position,
+        );
+        return (highlights ?? []).slice(0, PREVIEW_LANGUAGE_MAX_RESULT_ITEMS).map((highlight) => ({
+          range: serializePreviewRange(highlight.range),
+          kind: highlight.kind,
+          kindName: previewLanguageEnumName(vscode.DocumentHighlightKind, highlight.kind),
+        }));
+      }
+      default: {
+        const exhaustive: never = evt.feature;
+        throw new Error(`Unsupported preview language feature: ${String(exhaustive)}`);
+      }
+    }
+  }
 
   // #47 auto-probe dedupe: don't fire executeHoverProvider /
   // executeCompletionItemProvider for the same (uri, line, col) more
@@ -3723,6 +4636,7 @@ export class OverlayPanel {
     ranges: MatchRange[] | undefined,
     previewSeq?: number,
     shouldSend: () => boolean = () => true,
+    route?: RendererMessageRoute,
   ): Promise<boolean> {
     try {
       this.lastPreviewUriForDiagnostics = uriStr;
@@ -3744,8 +4658,10 @@ export class OverlayPanel {
         languageId: doc.languageId,
         baseLine: preview.start,
         fullFile: preview.fullFile,
-      });
-      this.sendPreviewCallGraphInlays(uri, doc, preview.start, preview.end, previewSeq, shouldSend);
+        eol: preview.eol,
+        diagnostics: serializePreviewDiagnostics(vscode.languages.getDiagnostics(uri)),
+      }, route);
+      this.sendPreviewCallGraphInlays(uri, doc, preview.start, preview.end, previewSeq, shouldSend, route);
       return true;
     } catch (err) {
       this.log.appendLine(`preview fetch failed: ${err instanceof Error ? err.message : err}`);
@@ -3760,6 +4676,7 @@ export class OverlayPanel {
     end: number,
     previewSeq: number | undefined,
     shouldSend: () => boolean,
+    route?: RendererMessageRoute,
   ): void {
     const provider = this.previewCallGraphInlayProvider;
     const relPath = vscode.workspace.asRelativePath(uri, false);
@@ -3771,7 +4688,7 @@ export class OverlayPanel {
     // Dedup key: same uri + same previewSeq means same user-driven preview
     // event; the second sendPreview() (from refreshLatestPreviewAfterCapture)
     // would otherwise duplicate the provider query.
-    const dedupKey = `${uri.toString()}#${previewSeq ?? 'none'}`;
+    const dedupKey = `${route?.rendererSrc ?? 'active'}#${uri.toString()}#${previewSeq ?? 'none'}`;
     if (this.inFlightInlayFetches.has(dedupKey)) {
       this.inlayFetchSkippedDuplicatesCount++;
       this.log.appendLine(
@@ -3805,7 +4722,7 @@ export class OverlayPanel {
           uri: uri.toString(),
           previewSeq,
           callGraphInlays: provided,
-        });
+        }, route);
         const sample = provided
           .slice(0, 3)
           .map((inlay) => `${inlay.kind}:${inlay.line + 1}:${inlay.symbolId}`)
@@ -4252,15 +5169,18 @@ export class OverlayPanel {
     }
   }
 
-  private async postToRenderer(msg: OverlayMessage) {
-    await this.postMessagesToRenderer([msg]);
+  private async postToRenderer(msg: OverlayMessage, route?: RendererMessageRoute) {
+    await this.postMessagesToRenderer([msg], route);
   }
 
-  private async postMessagesToRenderer(messages: OverlayMessage[]) {
-    if (this.activeWindowId === undefined) { return; }
+  private async postMessagesToRenderer(messages: OverlayMessage[], route?: RendererMessageRoute) {
     if (messages.length === 0) { return; }
-    const windowId = this.activeWindowId;
-    const targetSrc = this.targetRendererSourceForMessages(messages);
+    const windowId = route?.windowId ?? this.activeWindowId;
+    if (windowId === undefined) { return; }
+    // An explicit route belongs to the originating renderer, even when it is
+    // a spawned/inactive panel. Avoid falling back to activeRendererSrc in
+    // that case or a late language-provider response can land in a new panel.
+    const targetSrc = route ? route.rendererSrc : this.targetRendererSourceForMessages(messages);
     const routedMessages = targetSrc
       ? messages.map((msg) => ({ ...(msg as object), __targetSrc: targetSrc }))
       : messages;
@@ -4425,6 +5345,7 @@ export class OverlayPanel {
                 });
               } catch (eConsoleRemoveEach) {}
               try { global.__ijFindConsoleBridgeListeners.clear(); } catch (eConsoleClear) {}
+              try { if (global.__ijFindConsoleBridgeTargets) { global.__ijFindConsoleBridgeTargets.clear(); } } catch (eConsoleTargetsClear) {}
             }
             if (global.__ijFindBridgeListeners) {
               try {
@@ -4644,6 +5565,393 @@ export class OverlayPanel {
     }
     return null;
   }
+}
+
+function previewLanguageJsonLength(value: unknown): number {
+  try { return JSON.stringify(value).length; }
+  catch { return Number.POSITIVE_INFINITY; }
+}
+
+function largestPreviewLanguageArrayPrefix<T>(
+  items: readonly T[],
+  buildValue: (prefix: T[]) => unknown,
+  multiple = 1,
+): T[] {
+  let low = 0;
+  let high = Math.floor(items.length / multiple);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    const count = middle * multiple;
+    if (previewLanguageJsonLength(buildValue(items.slice(0, count))) <= PREVIEW_LANGUAGE_MAX_PAYLOAD_CHARS) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return items.slice(0, low * multiple);
+}
+
+function capPreviewLanguageValue(feature: PreviewLanguageFeature, value: unknown): unknown {
+  if (previewLanguageJsonLength(value) <= PREVIEW_LANGUAGE_MAX_PAYLOAD_CHARS) { return value; }
+  if (Array.isArray(value)) {
+    return largestPreviewLanguageArrayPrefix(value, (prefix) => prefix);
+  }
+  if (!value || typeof value !== 'object') { return null; }
+  const record = value as Record<string, unknown>;
+  if (Array.isArray(record.items)) {
+    const items = largestPreviewLanguageArrayPrefix(record.items, (prefix) => ({
+      ...record,
+      items: prefix,
+      isIncomplete: true,
+    }));
+    return { ...record, items, isIncomplete: true };
+  }
+  if (Array.isArray(record.signatures)) {
+    const signatures = largestPreviewLanguageArrayPrefix(record.signatures, (prefix) => ({
+      ...record,
+      signatures: prefix,
+    }));
+    return { ...record, signatures };
+  }
+  if (feature === 'semanticTokens' && Array.isArray(record.data)) {
+    const data = largestPreviewLanguageArrayPrefix(record.data, (prefix) => ({ ...record, data: prefix }), 5);
+    return { ...record, data };
+  }
+  return null;
+}
+
+function limitPreviewLanguageText(value: string, maxChars = PREVIEW_LANGUAGE_MAX_TEXT_CHARS): string {
+  if (value.length <= maxChars) { return value; }
+  return `${value.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+function previewLanguageEnumName(enumObject: object, value: unknown): string | undefined {
+  if (typeof value !== 'number') { return undefined; }
+  const name = (enumObject as Record<number, unknown>)[value];
+  return typeof name === 'string' ? name : undefined;
+}
+
+function previewLanguagePosition(
+  document: vscode.TextDocument,
+  requestedLine: number | undefined,
+  requestedColumn: number | undefined,
+): vscode.Position {
+  const lastLine = Math.max(0, document.lineCount - 1);
+  const line = Math.min(lastLine, Math.max(0, Number.isFinite(requestedLine) ? Math.trunc(requestedLine!) : 0));
+  const lastColumn = document.lineAt(line).text.length;
+  const column = Math.min(lastColumn, Math.max(0, Number.isFinite(requestedColumn) ? Math.trunc(requestedColumn!) : 0));
+  return new vscode.Position(line, column);
+}
+
+function previewLanguageTriggerCharacter(context: Record<string, unknown> | undefined): string | undefined {
+  const value = context?.triggerCharacter;
+  if (typeof value !== 'string' || value.length === 0) { return undefined; }
+  return Array.from(value)[0];
+}
+
+function previewLanguageResolveCount(context: Record<string, unknown> | undefined): number | undefined {
+  const value = context?.itemResolveCount ?? context?.resolveCount;
+  if (typeof value !== 'number' || !Number.isFinite(value)) { return undefined; }
+  return Math.min(PREVIEW_LANGUAGE_MAX_COMPLETION_ITEMS, Math.max(0, Math.trunc(value)));
+}
+
+function serializePreviewPosition(position: vscode.Position): SerializedPosition {
+  return { line: position.line, character: position.character };
+}
+
+function serializePreviewRange(range: vscode.Range): SerializedRange {
+  return {
+    start: serializePreviewPosition(range.start),
+    end: serializePreviewPosition(range.end),
+  };
+}
+
+function serializePreviewMarkdown(value: unknown): SerializedMarkdown | undefined {
+  if (typeof value === 'string') {
+    return { value: limitPreviewLanguageText(value) };
+  }
+  if (!value || typeof value !== 'object') { return undefined; }
+  const record = value as Record<string, unknown>;
+  if (typeof record.language === 'string' && typeof record.value === 'string') {
+    const language = record.language.replace(/[\r\n`]/g, '').slice(0, 64);
+    return { value: `\`\`\`${language}\n${limitPreviewLanguageText(record.value)}\n\`\`\`` };
+  }
+  if (typeof record.value !== 'string') { return undefined; }
+  const markdown: SerializedMarkdown = { value: limitPreviewLanguageText(record.value) };
+  if (typeof record.isTrusted === 'boolean') {
+    markdown.isTrusted = record.isTrusted;
+  } else if (record.isTrusted && typeof record.isTrusted === 'object') {
+    const commands = (record.isTrusted as { enabledCommands?: unknown }).enabledCommands;
+    if (Array.isArray(commands)) {
+      markdown.isTrusted = {
+        enabledCommands: commands
+          .filter((command): command is string => typeof command === 'string')
+          .slice(0, 100)
+          .map((command) => limitPreviewLanguageText(command, 256)),
+      };
+    }
+  }
+  if (typeof record.supportHtml === 'boolean') { markdown.supportHtml = record.supportHtml; }
+  if (typeof record.supportThemeIcons === 'boolean') { markdown.supportThemeIcons = record.supportThemeIcons; }
+  const baseUri = record.baseUri as { toString?: () => string } | undefined;
+  if (baseUri && typeof baseUri.toString === 'function') {
+    markdown.baseUri = limitPreviewLanguageText(baseUri.toString(), 32_768);
+  }
+  return markdown;
+}
+
+function serializePreviewHover(hover: vscode.Hover): unknown {
+  return {
+    contents: hover.contents
+      .slice(0, PREVIEW_LANGUAGE_MAX_MARKDOWN_PARTS)
+      .map(serializePreviewMarkdown)
+      .filter((part): part is SerializedMarkdown => part !== undefined),
+    range: hover.range ? serializePreviewRange(hover.range) : undefined,
+  };
+}
+
+function serializePreviewCompletionRange(range: vscode.CompletionItem['range']): unknown {
+  if (!range) { return undefined; }
+  if ('inserting' in range && 'replacing' in range) {
+    return {
+      inserting: serializePreviewRange(range.inserting),
+      replacing: serializePreviewRange(range.replacing),
+    };
+  }
+  return serializePreviewRange(range);
+}
+
+function serializePreviewTextEdit(edit: vscode.TextEdit): unknown {
+  return {
+    range: serializePreviewRange(edit.range),
+    newText: limitPreviewLanguageText(edit.newText),
+  };
+}
+
+function serializePreviewUnknown(
+  value: unknown,
+  depth = 0,
+  seen: Set<object> = new Set<object>(),
+): unknown {
+  if (value === null || value === undefined || typeof value === 'boolean') { return value; }
+  if (typeof value === 'string') { return limitPreviewLanguageText(value, 4_096); }
+  if (typeof value === 'number') { return Number.isFinite(value) ? value : String(value); }
+  if (typeof value === 'bigint') { return value.toString(); }
+  if (typeof value !== 'object' || depth >= 5 || seen.has(value)) { return undefined; }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    const result = value
+      .slice(0, 64)
+      .map((item) => serializePreviewUnknown(item, depth + 1, seen));
+    seen.delete(value);
+    return result;
+  }
+  const candidateUri = value as { scheme?: unknown; path?: unknown; toString?: () => string };
+  if (typeof candidateUri.scheme === 'string' && typeof candidateUri.path === 'string' &&
+      typeof candidateUri.toString === 'function') {
+    seen.delete(value);
+    return limitPreviewLanguageText(candidateUri.toString(), 32_768);
+  }
+  const output: Record<string, unknown> = {};
+  for (const key of Object.keys(value).slice(0, 64)) {
+    const serialized = serializePreviewUnknown((value as Record<string, unknown>)[key], depth + 1, seen);
+    if (serialized !== undefined) { output[key] = serialized; }
+  }
+  seen.delete(value);
+  return output;
+}
+
+function serializePreviewCompletionItem(item: vscode.CompletionItem): unknown {
+  const rawTextEdit = item.textEdit;
+  const rawInsertText = item.insertText;
+  const insertTextIsSnippet = rawInsertText instanceof vscode.SnippetString;
+  const insertText = typeof rawInsertText === 'string'
+    ? rawInsertText
+    : rawInsertText instanceof vscode.SnippetString
+      ? rawInsertText.value
+      : rawTextEdit?.newText;
+  const label = typeof item.label === 'string'
+    ? limitPreviewLanguageText(item.label, 4_096)
+    : {
+        label: limitPreviewLanguageText(item.label.label, 4_096),
+        detail: item.label.detail ? limitPreviewLanguageText(item.label.detail, 4_096) : undefined,
+        description: item.label.description ? limitPreviewLanguageText(item.label.description, 4_096) : undefined,
+      };
+  return {
+    label,
+    kind: item.kind,
+    kindName: previewLanguageEnumName(vscode.CompletionItemKind, item.kind),
+    tags: item.tags?.slice(0, 16),
+    detail: item.detail ? limitPreviewLanguageText(item.detail) : undefined,
+    documentation: serializePreviewMarkdown(item.documentation),
+    sortText: item.sortText ? limitPreviewLanguageText(item.sortText, 4_096) : undefined,
+    filterText: item.filterText ? limitPreviewLanguageText(item.filterText, 4_096) : undefined,
+    preselect: item.preselect,
+    insertText: insertText === undefined ? undefined : limitPreviewLanguageText(insertText),
+    insertTextIsSnippet,
+    range: serializePreviewCompletionRange(item.range ?? rawTextEdit?.range),
+    commitCharacters: item.commitCharacters
+      ?.slice(0, 64)
+      .map((character) => limitPreviewLanguageText(character, 16)),
+    keepWhitespace: item.keepWhitespace,
+    textEdit: rawTextEdit ? serializePreviewTextEdit(rawTextEdit) : undefined,
+    additionalTextEdits: item.additionalTextEdits
+      ?.slice(0, 100)
+      .map(serializePreviewTextEdit),
+    command: item.command ? {
+      title: limitPreviewLanguageText(item.command.title, 4_096),
+      command: limitPreviewLanguageText(item.command.command, 1_024),
+      arguments: item.command.arguments?.slice(0, 64).map((argument) => serializePreviewUnknown(argument)),
+    } : undefined,
+  };
+}
+
+function serializePreviewCompletionList(completion: vscode.CompletionList | undefined): unknown {
+  if (!completion) { return { items: [], isIncomplete: false }; }
+  const items = completion.items.slice(0, PREVIEW_LANGUAGE_MAX_COMPLETION_ITEMS);
+  return {
+    items: items.map(serializePreviewCompletionItem),
+    isIncomplete: completion.isIncomplete === true || items.length < completion.items.length,
+  };
+}
+
+function serializePreviewSignatureHelp(signatureHelp: vscode.SignatureHelp | undefined): unknown {
+  if (!signatureHelp) { return undefined; }
+  return {
+    activeSignature: signatureHelp.activeSignature,
+    activeParameter: signatureHelp.activeParameter,
+    signatures: signatureHelp.signatures
+      .slice(0, PREVIEW_LANGUAGE_MAX_RESULT_ITEMS)
+      .map((signature) => ({
+        label: limitPreviewLanguageText(signature.label),
+        documentation: serializePreviewMarkdown(signature.documentation),
+        activeParameter: signature.activeParameter,
+        parameters: signature.parameters
+          .slice(0, PREVIEW_LANGUAGE_MAX_RESULT_ITEMS)
+          .map((parameter) => ({
+            label: typeof parameter.label === 'string'
+              ? limitPreviewLanguageText(parameter.label, 4_096)
+              : [parameter.label[0], parameter.label[1]],
+            documentation: serializePreviewMarkdown(parameter.documentation),
+          })),
+      })),
+  };
+}
+
+function serializePreviewLocation(location: vscode.Location | vscode.LocationLink): unknown {
+  if ('targetUri' in location) {
+    return {
+      targetUri: location.targetUri.toString(),
+      targetRange: serializePreviewRange(location.targetRange),
+      targetSelectionRange: location.targetSelectionRange
+        ? serializePreviewRange(location.targetSelectionRange)
+        : undefined,
+      originSelectionRange: location.originSelectionRange
+        ? serializePreviewRange(location.originSelectionRange)
+        : undefined,
+    };
+  }
+  return {
+    uri: location.uri.toString(),
+    range: serializePreviewRange(location.range),
+  };
+}
+
+function serializePreviewLocations(
+  locations: Array<vscode.Location | vscode.LocationLink> | undefined,
+): unknown[] {
+  return (locations ?? [])
+    .slice(0, PREVIEW_LANGUAGE_MAX_RESULT_ITEMS)
+    .map(serializePreviewLocation);
+}
+
+function serializePreviewDocumentSymbols(
+  symbols: Array<vscode.DocumentSymbol | vscode.SymbolInformation>,
+): unknown[] {
+  const budget = { remaining: PREVIEW_LANGUAGE_MAX_SYMBOL_NODES };
+  const output: unknown[] = [];
+  for (const symbol of symbols) {
+    const serialized = serializePreviewDocumentSymbol(symbol, budget, 0);
+    if (serialized !== undefined) { output.push(serialized); }
+    if (budget.remaining <= 0) { break; }
+  }
+  return output;
+}
+
+function serializePreviewDocumentSymbol(
+  symbol: vscode.DocumentSymbol | vscode.SymbolInformation,
+  budget: { remaining: number },
+  depth: number,
+): unknown | undefined {
+  if (budget.remaining <= 0 || depth >= 64) { return undefined; }
+  budget.remaining--;
+  if ('location' in symbol) {
+    return {
+      name: limitPreviewLanguageText(symbol.name, 4_096),
+      kind: symbol.kind,
+      kindName: previewLanguageEnumName(vscode.SymbolKind, symbol.kind),
+      tags: symbol.tags?.slice(0, 16),
+      containerName: limitPreviewLanguageText(symbol.containerName ?? '', 4_096),
+      location: serializePreviewLocation(symbol.location),
+    };
+  }
+  const children: unknown[] = [];
+  for (const child of symbol.children ?? []) {
+    const serialized = serializePreviewDocumentSymbol(child, budget, depth + 1);
+    if (serialized !== undefined) { children.push(serialized); }
+    if (budget.remaining <= 0) { break; }
+  }
+  return {
+    name: limitPreviewLanguageText(symbol.name, 4_096),
+    detail: limitPreviewLanguageText(symbol.detail ?? ''),
+    kind: symbol.kind,
+    kindName: previewLanguageEnumName(vscode.SymbolKind, symbol.kind),
+    tags: symbol.tags?.slice(0, 16),
+    range: serializePreviewRange(symbol.range),
+    selectionRange: serializePreviewRange(symbol.selectionRange),
+    children,
+  };
+}
+
+function serializePreviewFoldingRange(range: vscode.FoldingRange): unknown {
+  const collapsedText = (range as vscode.FoldingRange & { collapsedText?: unknown }).collapsedText;
+  return {
+    start: range.start,
+    end: range.end,
+    kind: range.kind,
+    kindName: previewLanguageEnumName(vscode.FoldingRangeKind, range.kind),
+    collapsedText: typeof collapsedText === 'string'
+      ? limitPreviewLanguageText(collapsedText, 4_096)
+      : undefined,
+  };
+}
+
+function serializePreviewDiagnosticCode(code: vscode.Diagnostic['code']): unknown {
+  if (!code || typeof code !== 'object') { return code; }
+  return {
+    value: code.value,
+    target: code.target.toString(),
+  };
+}
+
+function serializePreviewDiagnostics(diagnostics: readonly vscode.Diagnostic[]): unknown[] {
+  return diagnostics
+    .slice(0, PREVIEW_LANGUAGE_MAX_DIAGNOSTICS)
+    .map((diagnostic) => ({
+      range: serializePreviewRange(diagnostic.range),
+      message: limitPreviewLanguageText(diagnostic.message),
+      severity: diagnostic.severity,
+      severityName: previewLanguageEnumName(vscode.DiagnosticSeverity, diagnostic.severity),
+      source: diagnostic.source ? limitPreviewLanguageText(diagnostic.source, 4_096) : undefined,
+      code: serializePreviewDiagnosticCode(diagnostic.code),
+      tags: diagnostic.tags?.slice(0, 16),
+      relatedInformation: diagnostic.relatedInformation
+        ?.slice(0, 64)
+        .map((related) => ({
+          location: serializePreviewLocation(related.location),
+          message: limitPreviewLanguageText(related.message),
+        })),
+    }));
 }
 
 type SearchBenchmarkMeasurement = {

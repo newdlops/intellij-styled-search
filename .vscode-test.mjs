@@ -1,6 +1,10 @@
 import { defineConfig } from '@vscode/test-cli';
 import * as os from 'os';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
+
+const repoRoot = path.dirname(fileURLToPath(import.meta.url));
+const textMateBridgeFixture = path.join(repoRoot, 'tests', 'fixtures', 'extensions', 'textmate-bridge');
 
 const workspaceFolder = process.env.IJSS_E2E_WORKSPACE || './tests/fixtures/workspace';
 const normalizedWorkspaceFolder = workspaceFolder.replace(/\\/g, '/').replace(/\/+$/, '');
@@ -29,6 +33,7 @@ const isolatedExtensions = path.join(isolatedRoot, 'extensions');
 export default defineConfig({
   label: 'e2e',
   files: testFiles,
+  extensionDevelopmentPath: [repoRoot, textMateBridgeFixture],
   // VSCODE_TEST=1 flips overlayPanel.shouldAutoCloseCdpForTests() so the
   // 250ms show-shell-idle CDP close path stays disabled. Without this the
   // background CDP idle timer races with awaited Runtime.evaluate calls and
