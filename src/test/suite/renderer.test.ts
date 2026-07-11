@@ -1603,6 +1603,305 @@ suite('Renderer — overlay UI probes', () => {
     }
   });
 
+  test('trusted pointer hover reaches a bundled Monaco provider through its ShadowRoot', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    // The first bundled-editor mount also injects the Monaco/TextMate assets.
+    // A cold test workbench can keep the renderer busy longer than the inner
+    // 8s readiness poll even though a warm run finishes in under a second.
+    this.timeout(50_000);
+    const { workspaceHasOwnGit } = await import('../util/fixtureWorkspace');
+    if (await workspaceHasOwnGit()) { this.skip(); return; }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder, 'expected fixture workspace folder');
+    const { overlay } = await getApi();
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
+    const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
+    const previewUri = vscode.Uri.joinPath(folder.uri, 'alpha.py');
+    const previewDocument = await vscode.workspace.openTextDocument(previewUri);
+    const sourceLines = previewDocument.getText().split(/\r?\n/);
+    const sourceEol = previewDocument.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    const queryValue = 'BundledTrustedPointerHoverProbe';
+    const hoverMarker = `IJSS_TRUSTED_POINTER_HOVER_${Date.now()}`;
+    let hoverInvocations = 0;
+    const hoverPositions: Array<{ line: number; character: number }> = [];
+    const hoverDisposable = vscode.languages.registerHoverProvider(
+      { scheme: 'file', language: 'python' },
+      {
+        provideHover(document, position) {
+          hoverInvocations++;
+          hoverPositions.push({ line: position.line, character: position.character });
+          return new vscode.Hover(
+            new vscode.MarkdownString(`**${hoverMarker}**`),
+            document.getWordRangeAtPosition(position),
+          );
+        },
+      },
+    );
+
+    try {
+      await cfg.update('disableMonacoCapture', true, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+      // Configuration listeners stop capture asynchronously and may release
+      // the current CDP bridge. Let that teardown finish before creating the
+      // isolated renderer connection used by the trusted-input probe.
+      await new Promise((resolve) => setTimeout(resolve, 1_200));
+      await overlay.stopMonacoCapture('bundled trusted pointer hover test');
+      // The preceding provider-bridge probe restores passive native capture
+      // in its cleanup. Reinstall with capture disabled so this trusted-input
+      // test cannot inherit its editor, hover scheduler, or capture retry.
+      await overlay.forceReinject();
+      await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true });
+
+      const targetSrc = await overlay.evalInActiveWindowForTests(
+        `(function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return ''; }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          window.__ijFindOnMessage({
+            type: 'preview',
+            __targetSrc: targetSrc,
+            uri: ${JSON.stringify(previewUri.toString())},
+            relPath: 'alpha.py',
+            languageId: 'python',
+            eol: ${JSON.stringify(sourceEol)},
+            focusLine: 0,
+            fullFile: true,
+            lines: ${JSON.stringify(sourceLines)}.map(function (text, lineNumber) {
+              return { lineNumber: lineNumber, text: text };
+            }),
+            ranges: [{ start: 6, end: 18 }]
+          });
+          return targetSrc;
+        })()`,
+        15_000,
+      );
+      assert.ok(targetSrc, 'expected a renderer instance for the trusted pointer preview');
+
+      const coordinateRaw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
+          var targetSrc = ${JSON.stringify(targetSrc)};
+          var previewUri = ${JSON.stringify(previewUri.toString())};
+
+          var state = null;
+          var editor = null;
+          var model = null;
+          var shadowRoot = null;
+          var editorDom = null;
+          var deadline = performance.now() + 8000;
+          while (performance.now() < deadline) {
+            state = window.__ijFindGetSearchState(targetSrc);
+            editor = window.__ijFindGetPreviewEditorForTests
+              ? window.__ijFindGetPreviewEditorForTests(targetSrc)
+              : null;
+            model = editor && editor.getModel ? editor.getModel() : null;
+            var host = root.querySelector('.ij-find-monaco-host');
+            shadowRoot = host && host.shadowRoot;
+            editorDom = editor && editor.getDomNode ? editor.getDomNode() : null;
+            var modelUri = model && model.uri && model.uri.toString ? String(model.uri.toString()) : '';
+            if (state && state.previewEngine === 'standalone' && modelUri === previewUri &&
+                shadowRoot && editorDom && editorDom.querySelectorAll('.view-line').length > 0) {
+              break;
+            }
+            await new Promise(function (resolve) { setTimeout(resolve, 20); });
+          }
+          if (!state || state.previewEngine !== 'standalone' || !editor || !model || !shadowRoot || !editorDom) {
+            return JSON.stringify({ err: 'bundled preview did not mount', state: state });
+          }
+          var engineBadge = root.querySelector('.ij-find-preview-engine');
+
+          var position = { lineNumber: 1, column: 8 };
+          try { editor.revealPositionInCenter(position, 0); } catch (eReveal) {}
+          try { if (typeof editor.render === 'function') { editor.render(true); } } catch (eRender) {}
+          await Promise.race([
+            new Promise(function (resolve) { requestAnimationFrame(function () { requestAnimationFrame(resolve); }); }),
+            new Promise(function (resolve) { setTimeout(resolve, 120); })
+          ]);
+          var visible = editor.getScrolledVisiblePosition && editor.getScrolledVisiblePosition(position);
+          var rect = editorDom.getBoundingClientRect();
+          if (!visible || !(rect.width > 0) || !(rect.height > 0)) {
+            return JSON.stringify({ err: 'hover target is not visible', visible: visible, rect: {
+              x: rect.x, y: rect.y, width: rect.width, height: rect.height
+            }});
+          }
+          var x = Math.round(rect.left + visible.left + 3);
+          var y = Math.round(rect.top + visible.top + Math.max(2, visible.height / 2));
+          var innerHit = shadowRoot.elementFromPoint ? shadowRoot.elementFromPoint(x, y) : null;
+
+          var previousProbe = window.__ijFindTrustedPointerHoverProbe;
+          if (previousProbe && previousProbe.editorDom && previousProbe.listener) {
+            try { previousProbe.editorDom.removeEventListener('mousemove', previousProbe.listener, true); } catch (eOld) {}
+          }
+          if (previousProbe && previousProbe.monacoDisposable) {
+            try { previousProbe.monacoDisposable.dispose(); } catch (eOldMonaco) {}
+          }
+          var probe = {
+            targetSrc: targetSrc,
+            trustedMoves: 0,
+            monacoMoves: 0,
+            lastMonacoPosition: null,
+            editorDom: editorDom,
+            listener: null,
+            monacoDisposable: null
+          };
+          probe.listener = function (event) {
+            if (event.isTrusted) { probe.trustedMoves++; }
+          };
+          editorDom.addEventListener('mousemove', probe.listener, true);
+          if (typeof editor.onMouseMove === 'function') {
+            probe.monacoDisposable = editor.onMouseMove(function (event) {
+              probe.monacoMoves++;
+              var target = event && event.target;
+              var position = target && target.position;
+              probe.lastMonacoPosition = position ? {
+                lineNumber: position.lineNumber,
+                column: position.column
+              } : null;
+            });
+          }
+          window.__ijFindTrustedPointerHoverProbe = probe;
+          return JSON.stringify({
+            engine: state.previewEngine,
+            modelUri: model.uri && model.uri.toString ? String(model.uri.toString()) : '',
+            x: x,
+            y: y,
+            outsideX: Math.max(1, Math.round(rect.left - 12)),
+            outsideY: Math.max(1, Math.round(rect.top - 12)),
+            innerHit: !!innerHit,
+            badgeHidden: !engineBadge || !!engineBadge.hidden,
+            badgeText: String(engineBadge && engineBadge.textContent || ''),
+            badgeEngine: String(engineBadge && engineBadge.getAttribute('data-engine') || ''),
+            badgeFeatureReadiness: String(engineBadge && engineBadge.getAttribute('data-feature-readiness') || '')
+          });
+        })()`,
+        25_000,
+      );
+      const coordinates = JSON.parse(coordinateRaw) as {
+        err?: string;
+        engine?: string;
+        modelUri?: string;
+        x?: number;
+        y?: number;
+        outsideX?: number;
+        outsideY?: number;
+        innerHit?: boolean;
+        badgeHidden?: boolean;
+        badgeText?: string;
+        badgeEngine?: string;
+        badgeFeatureReadiness?: string;
+      };
+      assert.strictEqual(coordinates.err, undefined, `expected a visible bundled hover target: ${coordinateRaw}`);
+      assert.strictEqual(coordinates.engine, 'standalone', `trusted input must target bundled Monaco: ${coordinateRaw}`);
+      assert.strictEqual(coordinates.modelUri, previewUri.toString(), `trusted input must target the preview file model: ${coordinateRaw}`);
+      assert.ok(Number.isFinite(coordinates.x) && Number.isFinite(coordinates.y), `expected finite hover coordinates: ${coordinateRaw}`);
+      assert.strictEqual(coordinates.innerHit, true, `trusted input coordinate must hit an element inside the ShadowRoot: ${coordinateRaw}`);
+      assert.strictEqual(coordinates.badgeHidden, false, `the active preview engine badge must be visible: ${coordinateRaw}`);
+      assert.ok(coordinates.badgeText?.startsWith('Bundled · '), `the fallback badge must visibly identify bundled Monaco: ${coordinateRaw}`);
+      assert.strictEqual(coordinates.badgeEngine, 'bundled', `the fallback engine must be machine-readable: ${coordinateRaw}`);
+      assert.strictEqual(coordinates.badgeFeatureReadiness, 'limited', `bundled language readiness must be explicit: ${coordinateRaw}`);
+
+      const inputReport = await overlay.sendMouseMovesInActiveWindowForTests([
+        { x: coordinates.outsideX!, y: coordinates.outsideY! },
+        { x: coordinates.x! - 2, y: coordinates.y! },
+        { x: coordinates.x!, y: coordinates.y! },
+      ], 40);
+
+      const resultRaw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing overlay after mouse move' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          var marker = ${JSON.stringify(hoverMarker)};
+          var hoverText = '';
+          var deadline = performance.now() + 8000;
+          while (performance.now() < deadline) {
+            var host = root.querySelector('.ij-find-monaco-host');
+            var shadowRoot = host && host.shadowRoot;
+            var hoverNodes = shadowRoot
+              ? shadowRoot.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget')
+              : [];
+            hoverText = '';
+            for (var i = 0; i < hoverNodes.length; i++) {
+              hoverText += ' ' + String(hoverNodes[i].textContent || '');
+            }
+            if (hoverText.indexOf(marker) >= 0) { break; }
+            await new Promise(function (resolve) { setTimeout(resolve, 25); });
+          }
+          var probe = window.__ijFindTrustedPointerHoverProbe || {};
+          var state = window.__ijFindGetSearchState(targetSrc);
+          return JSON.stringify({
+            engine: state && state.previewEngine,
+            hoverText: hoverText,
+            trustedMoves: probe.trustedMoves || 0,
+            monacoMoves: probe.monacoMoves || 0,
+            lastMonacoPosition: probe.lastMonacoPosition || null
+          });
+        })()`,
+        20_000,
+      );
+      const result = JSON.parse(resultRaw) as {
+        err?: string;
+        engine?: string;
+        hoverText?: string;
+        trustedMoves?: number;
+        monacoMoves?: number;
+        lastMonacoPosition?: { lineNumber: number; column: number } | null;
+      };
+      assert.strictEqual(result.err, undefined, `trusted hover probe should remain mounted: ${resultRaw}`);
+      assert.strictEqual(result.engine, 'standalone', `native recovery must not replace the bundled hover target during this test: ${resultRaw}`);
+      assert.ok((result.trustedMoves ?? 0) > 0, `Electron mouseMove must arrive as a trusted event; input=${inputReport} result=${resultRaw}`);
+      assert.ok((result.monacoMoves ?? 0) > 0, `bundled Monaco must receive the trusted pointer movement; input=${inputReport} result=${resultRaw}`);
+      assert.deepStrictEqual(
+        result.lastMonacoPosition,
+        { lineNumber: 1, column: 8 },
+        `bundled Monaco must resolve the exact identifier position under the trusted pointer: ${resultRaw}`,
+      );
+      assert.ok(hoverInvocations > 0, `trusted pointer movement must invoke the extension-host hover provider; input=${inputReport} result=${resultRaw}`);
+      assert.ok((result.hoverText ?? '').includes(hoverMarker), `trusted pointer hover marker must render inside bundled Monaco; input=${inputReport} result=${resultRaw}`);
+      assert.ok(
+        hoverPositions.some((position) => position.line === 0 && position.character === 7),
+        `hover provider must receive the exact identifier position under the trusted pointer: ${JSON.stringify(hoverPositions)} coordinates=${coordinateRaw}`,
+      );
+    } finally {
+      hoverDisposable.dispose();
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){
+            var probe = window.__ijFindTrustedPointerHoverProbe;
+            if (probe && probe.editorDom && probe.listener) {
+              try { probe.editorDom.removeEventListener('mousemove', probe.listener, true); } catch (eListener) {}
+            }
+            if (probe && probe.monacoDisposable) {
+              try { probe.monacoDisposable.dispose(); } catch (eMonacoListener) {}
+            }
+            try { delete window.__ijFindTrustedPointerHoverProbe; } catch (eDelete) {}
+            Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function (root) {
+              var query = root.querySelector('.ij-find-query');
+              if (!query || query.value !== ${JSON.stringify(queryValue)}) { return; }
+              var close = root.querySelector('.ij-find-close');
+              if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+            });
+            return 'closed';
+          })()`,
+        );
+      } catch {}
+      await cfg.update('disableMonacoCapture', priorDisable, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorTransient, vscode.ConfigurationTarget.Workspace);
+      if (priorDisable !== true) { overlay.resumeMonacoCaptureForTests(); }
+    }
+  });
+
   test('bundled Monaco hover combines lexical, semantic-token, and range-less host content', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(35_000);
@@ -4386,7 +4685,21 @@ suite('Renderer — overlay UI probes', () => {
       assert.strictEqual(state.stoppedForSession, false, `recoverRendererUi should not stop capture for the full session: ${JSON.stringify(state)}`);
       assert.ok(state.recoveryPauseRemainingMs > 0, `recoverRendererUi should apply a short recovery pause: ${JSON.stringify(state)}`);
 
-      const deadline = Date.now() + 6000;
+      // Reopen while the pause is still active. The old implementation
+      // encoded this transient state as permanent disable in the retained
+      // renderer, cleared the factory, and never synchronized it on expiry.
+      (overlay as any).pauseMonacoCaptureForRecovery('test-show-during-pause', 5000);
+      await overlay.show('RecoveryCaptureProbeDuringPause', { forceLiteral: true, suppressSearch: true });
+      const pausedRendererPolicy = JSON.parse(await overlay.evalInActiveWindowForTests(
+        `(function(){return JSON.stringify({` +
+          `disabled:window.__ijFindDisableMonacoProbes===true,` +
+          `paused:window.__ijFindMonacoCapturePaused===true` +
+        `})})()`,
+      )) as { disabled: boolean; paused: boolean };
+      assert.strictEqual(pausedRendererPolicy.disabled, false, 'a temporary pause must not become permanent renderer disable');
+      assert.strictEqual(pausedRendererPolicy.paused, true, 'renderer should expose the temporary pause independently');
+
+      const deadline = Date.now() + 9000;
       while (Date.now() < deadline) {
         state = overlay.getMonacoCaptureStateForTests();
         if (state.enabled && state.recoveryPauseRemainingMs === 0) { break; }
@@ -4394,16 +4707,25 @@ suite('Renderer — overlay UI probes', () => {
       }
       assert.strictEqual(state.enabled, true, `Monaco capture should resume after renderer recovery pause: ${JSON.stringify(state)}`);
 
-      await overlay.show('RecoveryCaptureProbeAfterPause', { forceLiteral: true, suppressSearch: true });
-      const rendererFlag = await overlay.evalInActiveWindowForTests(
+      // No second show/preview message is allowed to repair the flag. Pause
+      // expiry itself must synchronize and wake the retained renderer.
+      let rendererFlag = '';
+      const rendererDeadline = Date.now() + 5000;
+      while (Date.now() < rendererDeadline) {
+        rendererFlag = await overlay.evalInActiveWindowForTests(
         `(function(){
           try {
-            return window.__ijFindDisableMonacoProbes === false ? 'capture-enabled' : 'capture-disabled:' + String(window.__ijFindDisableMonacoProbes);
+            return window.__ijFindDisableMonacoProbes === false && window.__ijFindMonacoCapturePaused === false
+              ? 'capture-enabled'
+              : 'capture-policy:' + String(window.__ijFindDisableMonacoProbes) + ':' + String(window.__ijFindMonacoCapturePaused);
           } catch (e) {
             return 'throw:' + (e && e.message);
           }
         })()`,
-      );
+        );
+        if (rendererFlag === 'capture-enabled') { break; }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       assert.strictEqual(rendererFlag, 'capture-enabled', `renderer patch should be re-enabled for Monaco preview probes after recovery: ${rendererFlag}`);
     } finally {
       await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
@@ -4458,7 +4780,11 @@ suite('Renderer — overlay UI probes', () => {
     const previewFixture = vscode.Uri.joinPath(folder!.uri, 'beta.js');
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     const priorDisableMonacoCapture = cfg.inspect<boolean>('disableMonacoCapture');
+    const priorAllowTransientCapture = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor');
     await cfg.update('disableMonacoCapture', false, vscode.ConfigurationTarget.Workspace);
+    await cfg.update('allowTransientPreviewCaptureEditor', false, vscode.ConfigurationTarget.Workspace);
+    overlay.resumeMonacoCaptureForTests();
+    overlay.resetPreviewCaptureStatsForTests();
     await vscode.window.showTextDocument(activeFixture, {
       preview: false,
       preserveFocus: false,
@@ -4469,7 +4795,6 @@ suite('Renderer — overlay UI probes', () => {
 
     const tabsBefore = snapshotTabCounts();
     const groupsBefore = snapshotTabGroupCount();
-    const visibleBefore = visibleNonMemoryEditorUris();
     const activeBefore = vscode.window.activeTextEditor?.document.uri.toString();
     const src = await overlay.evalInActiveWindowForTests(
       `(function(){
@@ -4490,13 +4815,34 @@ suite('Renderer — overlay UI probes', () => {
             return String(active + 1);
           })()`,
         ));
-      await overlay.evalInActiveWindowForTests(
+      const coldCaptureRaw = await overlay.evalInActiveWindowForTests(
         `(function(){
           window.__ijFindMonaco = null;
+          window.__ijFindMonacoFactory = null;
           window.__ijFindDisableMonacoProbes = false;
-          return window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status';
+          window.__ijFindMonacoCapturePaused = false;
+          // Keep the real cold capture buffer. The regression was that this
+          // buffer already contained a live instantiation service but factory
+          // reconstruction ignored its nested editor/model services.
+          var captures = window.__ijFindCaptures || {};
+          return JSON.stringify({
+            status: window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status',
+            services: (captures.services || []).length,
+            widgets: (captures.widgets || []).length,
+            ctors: (captures.widgetCtors || []).length,
+            hasFactory: !!(window.__ijFindMonacoFactory && window.__ijFindMonacoFactory.ctor)
+          });
         })()`,
       );
+      const coldCapture = JSON.parse(coldCaptureRaw) as {
+        status?: string;
+        services?: number;
+        widgets?: number;
+        ctors?: number;
+        hasFactory?: boolean;
+      };
+      assert.strictEqual(coldCapture.hasFactory, false, `test must remove the warm factory: ${coldCaptureRaw}`);
+      assert.ok((coldCapture.services ?? 0) > 0, `test requires real captured service roots: ${coldCaptureRaw}`);
       overlay.injectRendererEventForTests(JSON.stringify({
         type: 'requestPreview',
         uri: previewFixture.toString(),
@@ -4509,17 +4855,13 @@ suite('Renderer — overlay UI probes', () => {
 
       let maxGroupCount = groupsBefore;
       let maxAddedTabs: string[] = [];
-      let previewFileBecameVisible = false;
       let finalState = '';
       const started = Date.now();
-      while (Date.now() - started < 2500) {
+      while (Date.now() - started < 10_000) {
         maxGroupCount = Math.max(maxGroupCount, snapshotTabGroupCount());
         const added = addedTabKeys(tabsBefore, snapshotTabCounts());
         if (added.length > maxAddedTabs.length) {
           maxAddedTabs = added;
-        }
-        if (visibleEditorUris().includes(previewFixture.toString())) {
-          previewFileBecameVisible = true;
         }
         finalState = await overlay.evalInActiveWindowForTests(
           `(function(){
@@ -4533,7 +4875,9 @@ suite('Renderer — overlay UI probes', () => {
             var body = root.querySelector('.ij-find-preview-body');
             return JSON.stringify({
               previewMode: state && state.previewMode,
+              previewEngine: state && state.previewEngine,
               previewUri: state && state.previewUri,
+              previewModelUri: state && state.previewModelUri,
               hasMonacoHost: !!(body && body.querySelector('.ij-find-monaco-preview-host .monaco-editor')),
               monacoStatus: window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : 'no-status'
             });
@@ -4541,13 +4885,17 @@ suite('Renderer — overlay UI probes', () => {
         );
         const parsed = JSON.parse(finalState) as {
           previewMode?: string;
+          previewEngine?: string;
           previewUri?: string;
+          previewModelUri?: string;
           hasMonacoHost?: boolean;
           monacoStatus?: string;
         };
         if (
           parsed.previewMode === 'monaco' &&
+          parsed.previewEngine === 'native' &&
           parsed.previewUri === previewFixture.toString() &&
+          parsed.previewModelUri === previewFixture.toString() &&
           parsed.hasMonacoHost === true
         ) {
           break;
@@ -4557,14 +4905,24 @@ suite('Renderer — overlay UI probes', () => {
       const parsed = JSON.parse(finalState) as {
         err?: string;
         previewMode?: string;
+        previewEngine?: string;
         previewUri?: string;
+        previewModelUri?: string;
         hasMonacoHost?: boolean;
         monacoStatus?: string;
       };
       assert.strictEqual(parsed.err, undefined, `expected preview state probe to run: ${finalState}`);
       assert.strictEqual(parsed.previewMode, 'monaco', `preview warmup should keep Monaco active while upgrading with an existing editor object: ${finalState}`);
+      assert.strictEqual(parsed.previewEngine, 'native', `cold passive capture must commit the VS Code native preview: ${finalState}`);
       assert.strictEqual(parsed.previewUri, previewFixture.toString(), `preview warmup should refresh the latest requested preview: ${finalState}`);
+      assert.strictEqual(parsed.previewModelUri, previewFixture.toString(), `native preview must bind the requested resource model: ${finalState}`);
       assert.strictEqual(parsed.hasMonacoHost, true, `preview warmup should mount a Monaco preview host: ${finalState}`);
+      assert.strictEqual(parsed.monacoStatus, 'ready', `cold passive capture should install a reusable native factory: ${finalState}`);
+      assert.strictEqual(
+        overlay.getPreviewCaptureStatsForTests().forceOpenAttempts,
+        0,
+        'passive existing-editor recovery must not use the transient editor fallback',
+      );
       assert.strictEqual(
         maxGroupCount,
         groupsBefore,
@@ -4575,15 +4933,6 @@ suite('Renderer — overlay UI probes', () => {
         [],
         `existing-editor preview warmup should not open additional editor tabs; added=${JSON.stringify(maxAddedTabs)}`,
       );
-      assert.deepStrictEqual(
-        visibleNonMemoryEditorUris(),
-        visibleBefore,
-        'existing-editor preview warmup should not introduce extra visible workbench editors',
-      );
-      assert.ok(
-        !previewFileBecameVisible,
-        'existing-editor preview warmup should not transiently open the preview file in a workbench editor',
-      );
       assert.strictEqual(
         vscode.window.activeTextEditor?.document.uri.toString(),
         activeBefore,
@@ -4591,6 +4940,8 @@ suite('Renderer — overlay UI probes', () => {
       );
     } finally {
       await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      await cfg.update('allowTransientPreviewCaptureEditor', priorAllowTransientCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      overlay.resetPreviewCaptureStatsForTests();
       try { await closeTabsByUri(previewFixture); } catch {}
       try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
     }

@@ -124,7 +124,7 @@ Use the codeidx MCP mcp_health tool, then search for "UserService" with codeidx_
 | `intellijStyledSearch.excludeGlobs` | `[]` | User-controlled glob patterns excluded from full searches. |
 | `intellijStyledSearch.callGraphExcludeGlobs` | common dependency/build/cache folders | Glob patterns excluded only from call graph rebuilds; set to `[]` to include those folders intentionally. |
 | `intellijStyledSearch.disableMonacoCapture` | `false` | Disable probing VS Code's private Monaco services. The bundled Monaco preview and its VS Code language-provider bridge remain available. |
-| `intellijStyledSearch.allowTransientPreviewCaptureEditor` | `false` | Allow a temporary editor tab when passive capture cannot upgrade the bundled preview to VS Code's native editor. |
+| `intellijStyledSearch.allowTransientPreviewCaptureEditor` | `true` | Allow a short-lived background editor when passive capture cannot upgrade the bundled preview to VS Code's native editor. Disable it to guarantee Search never changes editor tabs. |
 | `intellijStyledSearch.previewLanguageFeatures` | `true` | Enable bundled TextMate/lexical hover and relay semantic hover, completions, navigation, diagnostics, and semantic tokens from VS Code language providers. |
 | `intellijStyledSearch.maxFileSize` | `1048576` | Maximum file size in bytes to search. |
 | `intellijStyledSearch.maxResults` | `2000` | Match lines to load per batch. Scrolling near the bottom loads the next batch. Values at or below `0` use the built-in default. |

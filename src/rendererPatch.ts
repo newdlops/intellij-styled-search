@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 140;
+export const RENDERER_PATCH_VERSION = 142;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -11,6 +11,9 @@ export function getRendererPatchScript(
   // provider requests through the extension host; captured native editors
   // additionally opt into their workbench language-feature service set.
   enablePreviewLanguageFeatures = false,
+  // A renderer-recovery pause is temporary and must not be folded into the
+  // permanent disable flag (which intentionally clears the native factory).
+  monacoCapturePaused = false,
 ): string {
   const enableMonacoPreviewCaptureLiteral = enableMonacoPreviewCapture ? 'true' : 'false';
   const enablePerfDiagnosticsLiteral = enablePerfDiagnostics ? 'true' : 'false';
@@ -19,6 +22,7 @@ export function getRendererPatchScript(
   const disposeRendererPatchOnHideLiteral = disposeRendererPatchOnHide ? 'true' : 'false';
   const installAdditionalSearchInstanceLiteral = installAdditionalSearchInstance ? 'true' : 'false';
   const enablePreviewLanguageFeaturesLiteral = enablePreviewLanguageFeatures ? 'true' : 'false';
+  const monacoCapturePausedLiteral = monacoCapturePaused ? 'true' : 'false';
   return `
 (function () {
   var __ijFindPatchVersion = ${RENDERER_PATCH_VERSION};
@@ -29,6 +33,7 @@ export function getRendererPatchScript(
   var __ijFindDisposeRendererPatchOnHide = ${disposeRendererPatchOnHideLiteral};
   var __ijFindInstallAdditionalInstance = ${installAdditionalSearchInstanceLiteral};
   var __ijFindEnablePreviewLanguageFeatures = ${enablePreviewLanguageFeaturesLiteral};
+  var __ijFindMonacoCapturePaused = ${monacoCapturePausedLiteral};
   try {
     if (!__ijFindInstallAdditionalInstance && typeof window.__ijFindDisposeAllSearchUi === 'function') {
       window.__ijFindDisposeAllSearchUi('patch-upgrade');
@@ -64,7 +69,12 @@ export function getRendererPatchScript(
     } catch (eDropLegacyBundle) {}
   }
   if (!__ijFindInstallAdditionalInstance && window.__ijFindPatchVersion === __ijFindPatchVersion && window.__ijFindPatchedV100) {
+    var __ijFindWasCaptureDisabled = false;
+    var __ijFindWasCapturePaused = false;
+    try { __ijFindWasCaptureDisabled = window.__ijFindDisableMonacoProbes === true; } catch (ePriorDisabled) {}
+    try { __ijFindWasCapturePaused = window.__ijFindMonacoCapturePaused === true; } catch (ePriorPaused) {}
     try { window.__ijFindDisableMonacoProbes = !__ijFindEnableMonacoPreviewCapture; } catch (eFlag) {}
+    try { window.__ijFindMonacoCapturePaused = !!__ijFindMonacoCapturePaused; } catch (ePauseFlag) {}
     try { window.__ijFindPerfDiagnostics = !!__ijFindEnablePerfDiagnostics; } catch (ePerfFlag) {}
     try { window.__ijFindShouldSuspendIntelliSenseRecursionCapture = !!__ijFindShouldSuspendIntelliSenseRecursionCapture; } catch (eIrFlag) {}
     try { window.__ijFindEnableRendererInlayClickHook = !!__ijFindEnableRendererInlayClickHook; } catch (eInlayFlag) {}
@@ -74,10 +84,22 @@ export function getRendererPatchScript(
     // the original patch closure, otherwise a retained patch can permanently
     // skip the bundled hover/completion provider bridge until VS Code reloads.
     try { window.__ijFindEnablePreviewLanguageFeatures = !!__ijFindEnablePreviewLanguageFeatures; } catch (eLanguageFeatureFlag) {}
-  if (!__ijFindEnableMonacoPreviewCapture) {
+    if (!__ijFindEnableMonacoPreviewCapture) {
       try { if (window.__ijFindStopCapture) { window.__ijFindStopCapture('already-patched-monaco-disabled'); } } catch (eStopAlready) {}
       try { window.__ijFindMonaco = null; } catch (eMonacoAlready) {}
       try { window.__ijFindMonacoFactory = null; } catch (eMonacoFactoryAlready) {}
+    } else if (__ijFindMonacoCapturePaused) {
+      // A recovery pause only disarms the expensive prototype hooks. Keep a
+      // previously validated factory so an already-capable preview can still
+      // promote without doing any new capture work.
+      try { if (window.__ijFindStopCapture) { window.__ijFindStopCapture('already-patched-monaco-paused'); } } catch (eStopPaused) {}
+    } else if (__ijFindWasCaptureDisabled || __ijFindWasCapturePaused) {
+      try { if (window.__ijFindRefreshCapture) { window.__ijFindRefreshCapture('renderer-policy-resumed'); } } catch (eRefreshResumed) {}
+      try {
+        if (window.__ijFindResumeStandaloneNativePromotion) {
+          window.__ijFindResumeStandaloneNativePromotion('renderer-policy-resumed');
+        }
+      } catch (eResumePromotion) {}
     }
     return 'already patched:v' + __ijFindPatchVersion;
   }
@@ -96,6 +118,7 @@ export function getRendererPatchScript(
   window.__ijFindEnableRendererInlayClickHook = !!__ijFindEnableRendererInlayClickHook;
   window.__ijFindDisposeRendererPatchOnHide = !!__ijFindDisposeRendererPatchOnHide;
   window.__ijFindEnablePreviewLanguageFeatures = !!__ijFindEnablePreviewLanguageFeatures;
+  window.__ijFindMonacoCapturePaused = !!__ijFindMonacoCapturePaused;
   function isRendererDiagnosticsEnabled() {
     try { return window.__ijFindPerfDiagnostics === true || window.__ijFindRendererTrace === true; }
     catch (eDiagFlag) { return false; }
@@ -392,6 +415,7 @@ export function getRendererPatchScript(
   // VSCode renderer, not just this extension.
   try { if (window.__ijFindStopCapture) { window.__ijFindStopCapture('patch-upgrade'); } } catch (eStopOld) {}
   try { window.__ijFindDisableMonacoProbes = !__ijFindEnableMonacoPreviewCapture; } catch (eDisableFlag) {}
+  try { window.__ijFindMonacoCapturePaused = !!__ijFindMonacoCapturePaused; } catch (ePauseFlagFresh) {}
   // Keep the Monaco editor factory across additional/spawned panel installs.
   // The factory stores constructor + DI services, not a preview widget, so it
   // is safe to reuse for the lifetime of this renderer/workspace and avoids
@@ -432,6 +456,7 @@ export function getRendererPatchScript(
   }
   window.__ijFindStartCapture = function (reason) {
     if (window.__ijFindDisableMonacoProbes) { return 'capture-disabled'; }
+    if (window.__ijFindMonacoCapturePaused) { return 'capture-paused'; }
     try { if (window.__ijFindStopCapture) { window.__ijFindStopCapture(); } } catch (eStop) {}
     caps = makeCaptureState();
     window.__ijFindCaptures = caps;
@@ -443,14 +468,17 @@ export function getRendererPatchScript(
       if (!v || typeof v !== 'object') { return null; }
       try {
         if (typeof v.layout === 'function' && typeof v.getModel === 'function' && typeof v.getDomNode === 'function') {
+          var capturedWidgetCtor = passiveCaptureWidgetCtor(v);
+          if (!capturedWidgetCtor) { return null; }
           try {
-            var widgetDom = v.getDomNode();
+            var capturedGetDomNode = passiveCaptureMethod(v, 'getDomNode');
+            var widgetDom = capturedGetDomNode && capturedGetDomNode.call(v);
             if (widgetDom && widgetDom.closest && widgetDom.closest('.ij-find-overlay')) { return null; }
           } catch (eOverlayWidget) {}
           if (caps.widgets.length < 50) {
             caps.widgets.push({ v: v, src: src, key: stringifyKey(k) });
           }
-          var ctor = v.constructor;
+          var ctor = capturedWidgetCtor;
           if (ctor && caps.widgetCtors.indexOf(ctor) < 0 && caps.widgetCtors.length < 10) {
             caps.widgetCtors.push(ctor);
           }
@@ -551,6 +579,7 @@ export function getRendererPatchScript(
   };
   window.__ijFindRefreshCapture = function (reason) {
     if (window.__ijFindDisableMonacoProbes) { return 'capture-disabled'; }
+    if (window.__ijFindMonacoCapturePaused) { return 'capture-paused'; }
     try {
       if (window.__ijFindMonacoFactory && window.__ijFindMonacoFactory.ctor) {
         window.__ijFindMonaco = window.__ijFindMonacoFactory;
@@ -560,7 +589,7 @@ export function getRendererPatchScript(
     } catch (eMonaco) {}
     return window.__ijFindStartCapture(reason || 'refresh');
   };
-  if (!window.__ijFindDisableMonacoProbes) {
+  if (!window.__ijFindDisableMonacoProbes && !window.__ijFindMonacoCapturePaused) {
     window.__ijFindStartCapture('patch-load');
   } else {
     caps = makeCaptureState();
@@ -686,6 +715,295 @@ export function getRendererPatchScript(
   }
   function isModelServiceLike(v) {
     return !!(v && typeof v.createModel === 'function' && typeof v.getModel === 'function' && typeof v.getModels === 'function');
+  }
+  // Passive capture can observe an InstantiationService without observing the
+  // later Map.set/Array.push that publishes the services it already owns. Walk
+  // a small, bounded portion of that captured object graph so an existing code
+  // editor/model service can still be recovered. This deliberately follows
+  // structure rather than private field names: only own data-property values
+  // and built-in Array/Map/Set entries are traversed. Accessors are never read.
+  var PASSIVE_CAPTURE_GRAPH_MAX_DEPTH = 5;
+  var PASSIVE_CAPTURE_GRAPH_MAX_NODES = 700;
+  var PASSIVE_CAPTURE_GRAPH_MAX_PROPERTIES = 5000;
+  var PASSIVE_CAPTURE_GRAPH_MAX_COLLECTION_ENTRIES = 700;
+  var PASSIVE_CAPTURE_GRAPH_MAX_PROPERTIES_PER_OBJECT = 96;
+  var PASSIVE_CAPTURE_GRAPH_MAX_ENTRIES_PER_COLLECTION = 512;
+  var PASSIVE_CAPTURE_GRAPH_MAX_DISCOVERED_SERVICES = 80;
+
+  function passiveCaptureDataValue(value, key, maxPrototypeDepth) {
+    if (!value) { return undefined; }
+    var cursor = value;
+    var depth = 0;
+    var maxDepth = typeof maxPrototypeDepth === 'number' ? maxPrototypeDepth : 0;
+    while (cursor && depth <= maxDepth) {
+      var descriptor = null;
+      try { descriptor = Object.getOwnPropertyDescriptor(cursor, key); } catch (eDescriptor) { return undefined; }
+      if (descriptor) {
+        return Object.prototype.hasOwnProperty.call(descriptor, 'value') ? descriptor.value : undefined;
+      }
+      try { cursor = Object.getPrototypeOf(cursor); } catch (ePrototype) { return undefined; }
+      depth++;
+    }
+    return undefined;
+  }
+
+  function passiveCaptureMethod(value, key) {
+    var member = passiveCaptureDataValue(value, key, 12);
+    return typeof member === 'function' ? member : null;
+  }
+
+  function isPassiveCaptureGraphObject(value) {
+    return !!value && typeof value === 'object';
+  }
+
+  function isPassiveCaptureGraphExcluded(value) {
+    if (!isPassiveCaptureGraphObject(value)) { return true; }
+    try {
+      if (value === window || value === document || value === globalThis) { return true; }
+    } catch (eGlobal) {}
+    try {
+      if (typeof Node === 'function' && value instanceof Node) { return true; }
+    } catch (eNode) {}
+    try {
+      if (typeof Window === 'function' && value instanceof Window) { return true; }
+    } catch (eWindow) {}
+    try {
+      if (typeof Document === 'function' && value instanceof Document) { return true; }
+    } catch (eDocument) {}
+    try {
+      if (typeof ArrayBuffer === 'function' &&
+          ((typeof ArrayBuffer.isView === 'function' && ArrayBuffer.isView(value)) || value instanceof ArrayBuffer)) {
+        return true;
+      }
+    } catch (eBuffer) {}
+    try {
+      if ((typeof WeakMap === 'function' && value instanceof WeakMap) ||
+          (typeof WeakSet === 'function' && value instanceof WeakSet)) {
+        return true;
+      }
+    } catch (eWeakCollection) {}
+    return false;
+  }
+
+  function passiveCaptureServiceKind(value) {
+    if (passiveCaptureMethod(value, 'createInstance') && passiveCaptureMethod(value, 'invokeFunction')) {
+      return 'IInstantiationService';
+    }
+    if (passiveCaptureMethod(value, 'listCodeEditors') ||
+        passiveCaptureMethod(value, 'getActiveCodeEditor') ||
+        passiveCaptureMethod(value, 'getFocusedCodeEditor')) {
+      return 'ICodeEditorService';
+    }
+    if (passiveCaptureMethod(value, 'createModel') &&
+        passiveCaptureMethod(value, 'getModel') &&
+        passiveCaptureMethod(value, 'getModels')) {
+      return 'IModelService';
+    }
+    return '';
+  }
+
+  function isPassiveCaptureEditorWidget(value) {
+    return !!(passiveCaptureMethod(value, 'layout') &&
+      passiveCaptureMethod(value, 'getModel') &&
+      passiveCaptureMethod(value, 'getDomNode'));
+  }
+
+  function passiveCaptureWidgetCtor(value) {
+    var proto = null;
+    try { proto = Object.getPrototypeOf(value); } catch (ePrototype) { return null; }
+    for (var depth = 0; proto && depth < 12; depth++) {
+      var ctor = passiveCaptureDataValue(proto, 'constructor', 0);
+      if (typeof ctor === 'function' &&
+          passiveCaptureMethod(proto, 'layout') &&
+          passiveCaptureMethod(proto, 'getModel') &&
+          passiveCaptureMethod(proto, 'getDomNode')) {
+        return ctor;
+      }
+      try { proto = Object.getPrototypeOf(proto); } catch (eNextPrototype) { break; }
+    }
+    return null;
+  }
+
+  function passiveCaptureConnectedEditorDomNode(value) {
+    if (!isPassiveCaptureEditorWidget(value)) { return null; }
+    var getDomNode = passiveCaptureMethod(value, 'getDomNode');
+    var domNode = null;
+    try { domNode = getDomNode && getDomNode.call(value); } catch (eDomNode) { return null; }
+    if (!domNode) { return null; }
+    var getRootNode = passiveCaptureMethod(domNode, 'getRootNode');
+    var connected = false;
+    try { connected = !!(getRootNode && getRootNode.call(domNode, { composed: true }) === document); } catch (eRoot) {}
+    if (!connected) { return null; }
+    try {
+      var closest = passiveCaptureMethod(domNode, 'closest');
+      if (closest && closest.call(domNode, '.ij-find-overlay')) { return null; }
+    } catch (eOverlay) {}
+    return domNode;
+  }
+
+  function addPassiveCaptureService(targetCaps, value, kind, depth) {
+    if (!targetCaps || !kind || !targetCaps.services) { return false; }
+    for (var i = 0; i < targetCaps.services.length; i++) {
+      var existing = targetCaps.services[i];
+      if (existing && existing.v === value && existing.kind === kind) { return false; }
+    }
+    // Prototype capture intentionally caps the raw buffer at 40. Keep a
+    // separate bounded allowance for structurally discovered services so a
+    // full raw buffer cannot crowd out the editor/model service we need.
+    if (targetCaps.services.length >= PASSIVE_CAPTURE_GRAPH_MAX_DISCOVERED_SERVICES) { return false; }
+    targetCaps.services.push({
+      v: value,
+      src: 'bounded-graph',
+      key: 'depth-' + depth,
+      kind: kind,
+    });
+    return true;
+  }
+
+  function expandPassiveCapturedMonacoGraph(targetCaps, report) {
+    if (!targetCaps) { return null; }
+    var queue = [];
+    var seen = typeof WeakSet === 'function' ? new WeakSet() : [];
+    var nodes = 0;
+    var properties = 0;
+    var collectionEntries = 0;
+    var addedServices = 0;
+    var capped = false;
+
+    function wasSeen(value) {
+      try {
+        if (seen instanceof WeakSet) {
+          if (seen.has(value)) { return true; }
+          seen.add(value);
+          return false;
+        }
+      } catch (eWeakSeen) {}
+      for (var si = 0; si < seen.length; si++) {
+        if (seen[si] === value) { return true; }
+      }
+      seen.push(value);
+      return false;
+    }
+
+    function enqueue(value, depth) {
+      if (depth > PASSIVE_CAPTURE_GRAPH_MAX_DEPTH || isPassiveCaptureGraphExcluded(value)) { return; }
+      if (wasSeen(value)) { return; }
+      if (queue.length + nodes >= PASSIVE_CAPTURE_GRAPH_MAX_NODES) {
+        capped = true;
+        return;
+      }
+      queue.push({ value: value, depth: depth });
+    }
+
+    try {
+      for (var wi = 0; targetCaps.widgets && wi < targetCaps.widgets.length; wi++) {
+        enqueue(targetCaps.widgets[wi] && targetCaps.widgets[wi].v, 0);
+      }
+      for (var si = 0; targetCaps.services && si < targetCaps.services.length; si++) {
+        enqueue(targetCaps.services[si] && targetCaps.services[si].v, 0);
+      }
+      for (var mi = 0; targetCaps.serviceMaps && mi < targetCaps.serviceMaps.length; mi++) {
+        enqueue(targetCaps.serviceMaps[mi], 0);
+      }
+    } catch (eRoots) {}
+
+    function enqueueCollectionValues(value, depth, valuesMethod) {
+      if (collectionEntries >= PASSIVE_CAPTURE_GRAPH_MAX_COLLECTION_ENTRIES) {
+        capped = true;
+        return;
+      }
+      var iterator = null;
+      try { iterator = valuesMethod.call(value); } catch (eIterator) { return; }
+      var next = passiveCaptureMethod(iterator, 'next');
+      if (!next) { return; }
+      var localEntries = 0;
+      while (localEntries < PASSIVE_CAPTURE_GRAPH_MAX_ENTRIES_PER_COLLECTION &&
+             collectionEntries < PASSIVE_CAPTURE_GRAPH_MAX_COLLECTION_ENTRIES) {
+        var step = null;
+        try { step = next.call(iterator); } catch (eNext) { break; }
+        if (!step || passiveCaptureDataValue(step, 'done', 0) === true) { break; }
+        enqueue(passiveCaptureDataValue(step, 'value', 0), depth + 1);
+        localEntries++;
+        collectionEntries++;
+      }
+      if (localEntries >= PASSIVE_CAPTURE_GRAPH_MAX_ENTRIES_PER_COLLECTION ||
+          collectionEntries >= PASSIVE_CAPTURE_GRAPH_MAX_COLLECTION_ENTRIES) {
+        capped = true;
+      }
+    }
+
+    while (queue.length > 0 && nodes < PASSIVE_CAPTURE_GRAPH_MAX_NODES) {
+      var current = queue.shift();
+      var value = current.value;
+      var depth = current.depth;
+      nodes++;
+
+      var kind = passiveCaptureServiceKind(value);
+      if (kind && addPassiveCaptureService(targetCaps, value, kind, depth)) { addedServices++; }
+      // Do not invoke graph-discovered widget-shaped objects directly. VS
+      // Code IPC proxies can expose arbitrary method names. Widgets become
+      // trusted only when a discovered code-editor service returns them and
+      // addServiceEditorWidget validates their concrete prototype + DOM root.
+      if (depth >= PASSIVE_CAPTURE_GRAPH_MAX_DEPTH) { continue; }
+
+      if (Array.isArray(value)) {
+        var lengthDescriptor = null;
+        try { lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length'); } catch (eLength) {}
+        var length = lengthDescriptor && typeof lengthDescriptor.value === 'number' ? lengthDescriptor.value : 0;
+        var arrayLimit = Math.min(length, PASSIVE_CAPTURE_GRAPH_MAX_ENTRIES_PER_COLLECTION);
+        for (var ai = 0; ai < arrayLimit &&
+             collectionEntries < PASSIVE_CAPTURE_GRAPH_MAX_COLLECTION_ENTRIES; ai++) {
+          var itemDescriptor = null;
+          try { itemDescriptor = Object.getOwnPropertyDescriptor(value, String(ai)); } catch (eItem) {}
+          if (itemDescriptor && Object.prototype.hasOwnProperty.call(itemDescriptor, 'value')) {
+            enqueue(itemDescriptor.value, depth + 1);
+          }
+          collectionEntries++;
+        }
+        if (length > arrayLimit || collectionEntries >= PASSIVE_CAPTURE_GRAPH_MAX_COLLECTION_ENTRIES) { capped = true; }
+        continue;
+      }
+
+      var handledCollection = false;
+      try {
+        if (typeof Map === 'function' && value instanceof Map) {
+          enqueueCollectionValues(value, depth, Map.prototype.values);
+          handledCollection = true;
+        } else if (typeof Set === 'function' && value instanceof Set) {
+          enqueueCollectionValues(value, depth, Set.prototype.values);
+          handledCollection = true;
+        }
+      } catch (eCollectionBrand) {}
+      if (handledCollection) { continue; }
+
+      var names = [];
+      try { names = Object.getOwnPropertyNames(value); } catch (eNames) { continue; }
+      var objectLimit = Math.min(names.length, PASSIVE_CAPTURE_GRAPH_MAX_PROPERTIES_PER_OBJECT);
+      for (var pi = 0; pi < objectLimit && properties < PASSIVE_CAPTURE_GRAPH_MAX_PROPERTIES; pi++) {
+        var descriptor = null;
+        try { descriptor = Object.getOwnPropertyDescriptor(value, names[pi]); } catch (eProperty) {}
+        properties++;
+        if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) { continue; }
+        enqueue(descriptor.value, depth + 1);
+      }
+      if (names.length > objectLimit || properties >= PASSIVE_CAPTURE_GRAPH_MAX_PROPERTIES) { capped = true; }
+    }
+    if (nodes >= PASSIVE_CAPTURE_GRAPH_MAX_NODES) { capped = true; }
+    var result = {
+      nodes: nodes,
+      properties: properties,
+      collectionEntries: collectionEntries,
+      addedServices: addedServices,
+      capped: capped,
+    };
+    if (report) {
+      report.push('bounded graph nodes=' + nodes +
+        ' props=' + properties +
+        ' entries=' + collectionEntries +
+        ' services+=' + addedServices +
+        ' capped=' + capped);
+    }
+    return result;
   }
   function validateInstantiationService(inst) {
     if (!isInstantiationServiceLike(inst)) { return 'missing-inst'; }
@@ -1241,23 +1559,31 @@ export function getRendererPatchScript(
       }
       if (msg.fullFile === false) {
         trace('preview/hydrate/skip', { reason: 'partial-preview', targetUri: msg.uri });
+        state.previewHydrated = false;
+        setNativePreviewFeatureReadiness('limited', 'partial-preview');
         return;
       }
       var existingModel = editor.getModel && editor.getModel();
       var existingUri = existingModel && existingModel.uri ? String(existingModel.uri.toString()) : '';
       if (existingUri === msg.uri) {
         trace('preview/hydrate/skip', { reason: 'already-bound', uri: existingUri });
+        state.previewHydrated = true;
+        setNativePreviewFeatureReadiness('ready', 'already-bound');
         return;
       }
       var m = getMonacoFactorySingleton();
       if (!m || !m.modelSvc) {
         trace('preview/hydrate/skip', { reason: 'no-monaco-or-modelsvc', hasFactory: !!m });
+        state.previewHydrated = false;
+        setNativePreviewFeatureReadiness('limited', 'no-monaco-or-modelsvc');
         return;
       }
       var monacoUri = parseMonacoUri(msg.uri);
       if (!monacoUri) {
         send({ type: 'log', msg: 'lspPressure cooldown hydrate: could not construct Monaco URI for ' + msg.uri });
         trace('preview/hydrate/skip', { reason: 'parse-uri-failed', targetUri: msg.uri });
+        state.previewHydrated = false;
+        setNativePreviewFeatureReadiness('limited', 'parse-uri-failed');
         return;
       }
       var fullText = (msg.lines || []).map(function (l) { return l.text; }).join(previewMessageEol(msg));
@@ -1276,10 +1602,14 @@ export function getRendererPatchScript(
         } catch (eCreate) {
           send({ type: 'log', msg: 'lspPressure cooldown hydrate create err: ' + (eCreate && eCreate.message) });
           trace('preview/hydrate/error', { stage: 'createModel', err: String(eCreate && eCreate.message || eCreate).slice(0, 160) });
+          state.previewHydrated = false;
+          setNativePreviewFeatureReadiness('limited', 'create-model-error');
           return;
         }
         if (!resourceModel) {
           trace('preview/hydrate/skip', { reason: 'createModel-returned-null' });
+          state.previewHydrated = false;
+          setNativePreviewFeatureReadiness('limited', 'create-model-returned-null');
           return;
         }
         state.previewResourceModelCreates++;
@@ -1312,7 +1642,12 @@ export function getRendererPatchScript(
         // complaint that motivated #33 turns out to be our callgraph
         // overlay coexisting with Pylance's native parameter/type hints,
         // which is intentional — they're different information.
-        state.previewHydrated = true;
+        var boundToRequestedUri = nativePreviewModelBindsRequestedUri(editor, msg);
+        state.previewHydrated = boundToRequestedUri;
+        setNativePreviewFeatureReadiness(
+          boundToRequestedUri ? 'ready' : 'limited',
+          boundToRequestedUri ? 'hydrate-success' : 'hydrate-uri-mismatch'
+        );
         // The setModel above swapped the editor onto a fresh model, so the
         // findMatch decorations applied earlier (during
         // renderPreviewMonacoReal) have been dropped on the OLD model.
@@ -1348,10 +1683,14 @@ export function getRendererPatchScript(
       } catch (eSet) {
         send({ type: 'log', msg: 'lspPressure cooldown hydrate setModel err: ' + (eSet && eSet.message) });
         trace('preview/hydrate/error', { stage: 'setModel', err: String(eSet && eSet.message || eSet).slice(0, 160) });
+        state.previewHydrated = false;
+        setNativePreviewFeatureReadiness('limited', 'set-model-error');
       }
     } catch (eOuter) {
       send({ type: 'log', msg: 'lspPressure cooldown hydrate threw: ' + (eOuter && eOuter.message) });
       trace('preview/hydrate/error', { stage: 'outer', err: String(eOuter && eOuter.message || eOuter).slice(0, 160) });
+      state.previewHydrated = false;
+      setNativePreviewFeatureReadiness('limited', 'hydrate-outer-error');
     }
   }
 
@@ -1379,6 +1718,18 @@ export function getRendererPatchScript(
       state.lspPressureHydrateTimer = null;
     }
     var lastUri = state.lastPreviewMsg && state.lastPreviewMsg.uri ? String(state.lastPreviewMsg.uri) : '';
+    if (state.previewEngine === 'native') {
+      if (nativePreviewModelBindsRequestedUri(state.previewMonacoEditor, state.lastPreviewMsg)) {
+        state.previewHydrated = true;
+        setNativePreviewFeatureReadiness('ready', 'schedule-already-bound');
+      } else if (state.previewFullFile === false) {
+        state.previewHydrated = false;
+        setNativePreviewFeatureReadiness('limited', 'schedule-partial-preview');
+      } else {
+        state.previewHydrated = false;
+        setNativePreviewFeatureReadiness('warming', 'hydrate-scheduled');
+      }
+    }
     trace('preview/hydrate/schedule', {
       delayMs: PREVIEW_SETTLE_HYDRATE_DELAY_MS,
       replacedPriorTimer: hadPrior,
@@ -1457,26 +1808,36 @@ export function getRendererPatchScript(
   }
 
   function isEditorWidgetLike(v) {
-    try {
-      return !!(v && typeof v === 'object' &&
-        typeof v.layout === 'function' &&
-        typeof v.getModel === 'function' &&
-        typeof v.getDomNode === 'function');
-    } catch (e) { return false; }
+    return isPassiveCaptureGraphObject(v) && isPassiveCaptureEditorWidget(v);
   }
 
   function addServiceEditorWidget(capsForService, widget, src, report) {
     if (!capsForService || !isEditorWidgetLike(widget)) { return false; }
     try {
+      // RPC/service proxies can claim arbitrary method names and only fail
+      // when invoked. A real editor widget has a concrete prototype in this
+      // renderer with all three editor methods as data descriptors.
+      var widgetCtor = passiveCaptureWidgetCtor(widget);
+      if (!widgetCtor) {
+        if (report) { report.push('service editor widget skipped proxy-like via ' + src); }
+        return false;
+      }
+      // A code-editor service may retain disposed/simple widgets. Only use a
+      // live workbench widget as constructor evidence; bundled preview DOM is
+      // explicitly outside the passive-native capture set.
+      var domNode = passiveCaptureConnectedEditorDomNode(widget);
+      if (!domNode) {
+        if (report) { report.push('service editor widget skipped disconnected via ' + src); }
+        return false;
+      }
       for (var i = 0; capsForService.widgets && i < capsForService.widgets.length; i++) {
         if (capsForService.widgets[i].v === widget) { return false; }
       }
       if (capsForService.widgets.length < 50) {
-        capsForService.widgets.push({ v: widget, src: src, key: 'service' });
+        capsForService.widgets.push({ v: widget, src: src, key: 'service', connectedNative: true });
       }
-      var ctor = widget.constructor;
-      if (ctor && capsForService.widgetCtors.indexOf(ctor) < 0 && capsForService.widgetCtors.length < 20) {
-        capsForService.widgetCtors.push(ctor);
+      if (capsForService.widgetCtors.indexOf(widgetCtor) < 0 && capsForService.widgetCtors.length < 20) {
+        capsForService.widgetCtors.push(widgetCtor);
       }
       if (report) { report.push('service editor widget via ' + src); }
       return true;
@@ -1484,6 +1845,53 @@ export function getRendererPatchScript(
       if (report) { report.push('service editor widget err ' + src + ': ' + errorText(e).slice(0, 80)); }
       return false;
     }
+  }
+
+  function forEachPassiveCapturedEditor(value, visit) {
+    var visited = 0;
+    var maxEditors = 100;
+    if (!value || typeof visit !== 'function') { return visited; }
+    if (Array.isArray(value)) {
+      var lengthDescriptor = null;
+      try { lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length'); } catch (eLength) {}
+      var length = lengthDescriptor && typeof lengthDescriptor.value === 'number' ? lengthDescriptor.value : 0;
+      for (var ai = 0; ai < length && visited < maxEditors; ai++) {
+        var itemDescriptor = null;
+        try { itemDescriptor = Object.getOwnPropertyDescriptor(value, String(ai)); } catch (eItem) {}
+        if (!itemDescriptor || !Object.prototype.hasOwnProperty.call(itemDescriptor, 'value')) { continue; }
+        visit(itemDescriptor.value, visited++);
+      }
+      return visited;
+    }
+    try {
+      if (typeof Set === 'function' && value instanceof Set) {
+        var setIterator = Set.prototype.values.call(value);
+        var setNext = passiveCaptureMethod(setIterator, 'next');
+        while (setNext && visited < maxEditors) {
+          var setStep = setNext.call(setIterator);
+          if (!setStep || passiveCaptureDataValue(setStep, 'done', 0) === true) { break; }
+          visit(passiveCaptureDataValue(setStep, 'value', 0), visited++);
+        }
+        return visited;
+      }
+    } catch (eSet) {}
+    var iteratorMethod = null;
+    try {
+      if (typeof Symbol === 'function' && Symbol.iterator) {
+        iteratorMethod = passiveCaptureMethod(value, Symbol.iterator);
+      }
+    } catch (eIteratorMethod) {}
+    if (!iteratorMethod) { return visited; }
+    var iterator = null;
+    try { iterator = iteratorMethod.call(value); } catch (eIterator) { return visited; }
+    var next = passiveCaptureMethod(iterator, 'next');
+    while (next && visited < maxEditors) {
+      var step = null;
+      try { step = next.call(iterator); } catch (eNext) { break; }
+      if (!step || passiveCaptureDataValue(step, 'done', 0) === true) { break; }
+      visit(passiveCaptureDataValue(step, 'value', 0), visited++);
+    }
+    return visited;
   }
 
   function promoteCapturedEditorServiceWidgets(capsForService, report) {
@@ -1496,8 +1904,9 @@ export function getRendererPatchScript(
       codeEditorServices++;
       var svc = entry.v;
       try {
-        if (typeof svc.getActiveCodeEditor === 'function') {
-          if (addServiceEditorWidget(capsForService, svc.getActiveCodeEditor(), 'ICodeEditorService.getActiveCodeEditor', report)) {
+        var getActiveCodeEditor = passiveCaptureMethod(svc, 'getActiveCodeEditor');
+        if (getActiveCodeEditor) {
+          if (addServiceEditorWidget(capsForService, getActiveCodeEditor.call(svc), 'ICodeEditorService.getActiveCodeEditor', report)) {
             added++;
           }
         }
@@ -1505,8 +1914,9 @@ export function getRendererPatchScript(
         if (report) { report.push('getActiveCodeEditor err: ' + errorText(eActiveEditor).slice(0, 80)); }
       }
       try {
-        if (typeof svc.getFocusedCodeEditor === 'function') {
-          if (addServiceEditorWidget(capsForService, svc.getFocusedCodeEditor(), 'ICodeEditorService.getFocusedCodeEditor', report)) {
+        var getFocusedCodeEditor = passiveCaptureMethod(svc, 'getFocusedCodeEditor');
+        if (getFocusedCodeEditor) {
+          if (addServiceEditorWidget(capsForService, getFocusedCodeEditor.call(svc), 'ICodeEditorService.getFocusedCodeEditor', report)) {
             added++;
           }
         }
@@ -1514,13 +1924,14 @@ export function getRendererPatchScript(
         if (report) { report.push('getFocusedCodeEditor err: ' + errorText(eFocusedEditor).slice(0, 80)); }
       }
       try {
-        if (typeof svc.listCodeEditors === 'function') {
-          var editors = svc.listCodeEditors() || [];
-          for (var ei = 0; ei < editors.length; ei++) {
-            if (addServiceEditorWidget(capsForService, editors[ei], 'ICodeEditorService.listCodeEditors[' + ei + ']', report)) {
+        var listCodeEditors = passiveCaptureMethod(svc, 'listCodeEditors');
+        if (listCodeEditors) {
+          var editors = listCodeEditors.call(svc);
+          forEachPassiveCapturedEditor(editors, function (editor, index) {
+            if (addServiceEditorWidget(capsForService, editor, 'ICodeEditorService.listCodeEditors[' + index + ']', report)) {
               added++;
             }
-          }
+          });
         }
       } catch (eListEditors) {
         if (report) { report.push('listCodeEditors err: ' + errorText(eListEditors).slice(0, 80)); }
@@ -1542,28 +1953,44 @@ export function getRendererPatchScript(
       }
     } catch (e) {}
     var caps = window.__ijFindCaptures;
-    if (!caps || !caps.services || caps.services.length === 0) {
-      return 'no-services-captured';
+    if (!caps) { return 'no-captures'; }
+    if ((!caps.widgets || caps.widgets.length === 0) &&
+        (!caps.widgetCtors || caps.widgetCtors.length === 0) &&
+        (!caps.services || caps.services.length === 0)) {
+      return 'no-capture-candidates';
     }
     var report = [];
+    expandPassiveCapturedMonacoGraph(caps, report);
     promoteCapturedEditorServiceWidgets(caps, report);
 
     // Filter widgets to those whose getModel() actually returns a Model with
     // a uri — those are REAL editor widgets, not DI stubs / no-op proxies.
     var realWidgets = [];
-    for (var wi = 0; wi < caps.widgets.length; wi++) {
-      var cap = caps.widgets[wi];
+    var connectedServiceWidgets = [];
+    for (var cwi = 0; cwi < caps.widgets.length; cwi++) {
+      if (caps.widgets[cwi] && caps.widgets[cwi].connectedNative === true) {
+        connectedServiceWidgets.push(caps.widgets[cwi]);
+      }
+    }
+    var widgetsToValidate = connectedServiceWidgets.length > 0 ? connectedServiceWidgets : caps.widgets;
+    for (var wi = 0; wi < widgetsToValidate.length; wi++) {
+      var cap = widgetsToValidate[wi];
       var vv = cap.v;
       try {
-        var m = vv.getModel && vv.getModel();
+        // Fallback capture buffers may contain IPC proxies. Do not invoke a
+        // widget-shaped object unless it has a concrete editor prototype in
+        // this renderer.
+        if (cap.connectedNative !== true && !passiveCaptureWidgetCtor(vv)) { continue; }
+        var getModel = passiveCaptureMethod(vv, 'getModel');
+        var m = getModel && getModel.call(vv);
         var uri = m && m.uri && (m.uri.toString ? m.uri.toString() : String(m.uri));
         var tag = '';
         var connected = false;
         var inEditorGroup = false;
         try {
-          var d = vv.getDomNode && vv.getDomNode();
+          var d = passiveCaptureConnectedEditorDomNode(vv);
           if (d && d.tagName) { tag = d.tagName; }
-          connected = !!(d && d.isConnected);
+          connected = !!d;
           inEditorGroup = !!(d && d.closest && d.closest('.editor-group-container'));
         } catch (e) {}
         if (uri && uri !== '?' && connected) {
@@ -2276,6 +2703,30 @@ export function getRendererPatchScript(
     '  flex: 1 1 auto; min-width: 0;',
     '  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;',
     '}',
+	    '.ij-find-preview-engine {',
+	    '  flex: 0 0 auto; display: inline-flex; align-items: center;',
+	    '  min-height: 16px; padding: 0 5px; border: 1px solid transparent;',
+	    '  border-radius: 999px; font-size: 9px; line-height: 14px;',
+	    '  white-space: nowrap;',
+	    '}',
+	    '.ij-find-preview-engine[data-engine="native"] {',
+	    '  color: var(--vscode-testing-iconPassed, var(--vscode-descriptionForeground, #9d9d9d));',
+	    '  border-color: color-mix(in srgb, currentColor 45%, transparent);',
+	    '}',
+	    '.ij-find-preview-engine[data-engine="native"][data-feature-readiness="warming"] {',
+	    '  color: var(--vscode-editorInfo-foreground, var(--vscode-descriptionForeground, #75beff));',
+	    '  border-style: dashed;',
+	    '}',
+	    '.ij-find-preview-engine[data-engine="native"][data-feature-readiness="limited"] {',
+	    '  color: var(--vscode-editorWarning-foreground, var(--vscode-list-warningForeground, #cca700));',
+	    '}',
+	    '.ij-find-preview-engine[data-engine="bundled"] {',
+	    '  color: var(--vscode-editorWarning-foreground, var(--vscode-list-warningForeground, #cca700));',
+	    '  border-color: color-mix(in srgb, currentColor 55%, transparent);',
+	    '}',
+	    '.ij-find-preview-engine[data-recovery="recovering"] {',
+	    '  border-style: dashed;',
+	    '}',
     '.ij-find-minimap-toggle,',
     '.ij-find-preview-save {',
     '  flex: 0 0 auto;',
@@ -2666,6 +3117,16 @@ export function getRendererPatchScript(
 
   var $modifiedDot = el('span', { className: 'ij-find-modified-dot', title: 'Unsaved changes' });
   var $previewPath = el('span', { className: 'ij-find-preview-path', text: '' });
+  var $previewEngineBadge = el('span', {
+    className: 'ij-find-preview-engine',
+    text: '',
+    attrs: {
+      role: 'status',
+      'aria-live': 'polite',
+      'aria-atomic': 'true',
+      hidden: '',
+    },
+  });
   var $savePreview = el('button', {
     className: 'ij-find-preview-save',
     title: 'Save preview edits (Cmd/Ctrl+S)',
@@ -2678,7 +3139,7 @@ export function getRendererPatchScript(
     text: 'Map',
     attrs: { type: 'button', 'aria-pressed': 'true' },
   });
-  var $previewHeader = el('div', { className: 'ij-find-preview-header', children: [$modifiedDot, $previewPath, $savePreview, $minimapToggle] });
+  var $previewHeader = el('div', { className: 'ij-find-preview-header', children: [$modifiedDot, $previewPath, $previewEngineBadge, $savePreview, $minimapToggle] });
   var $previewBody = el('div', { className: 'ij-find-preview-body' });
   var $preview = el('div', { className: 'ij-find-preview', children: [$previewHeader, $previewBody] });
 
@@ -2758,6 +3219,7 @@ export function getRendererPatchScript(
     monacoHost: null,          // light-DOM host mounted in the preview body
     monacoEditorHost: null,    // actual editor container inside monacoHost's ShadowRoot
     monacoShadowRoot: null,
+    monacoShadowMouseMoveBoundary: null,
     standaloneMonacoTheme: '',
     standaloneMonacoThemeObserver: null,
     monacoChangeListener: null,
@@ -2768,6 +3230,11 @@ export function getRendererPatchScript(
     searchTicker: null,        // setInterval handle refreshing the status with live elapsed time
     previewMode: '',           // 'monaco' | 'stolen' | 'monaco-loading' | 'monaco-error'
     previewEngine: '',         // 'native' | 'standalone'
+    // Engine recovery and language-feature readiness are deliberately
+    // independent: a native widget can paint before its model is bound to the
+    // requested resource, which means native hover/completion is still warming.
+    previewEngineRecoveryState: '', // engine: 'ready' | 'recovering' | 'paused' | 'unavailable'
+    previewFeatureReadiness: '', // 'warming' | 'ready' | 'limited'
     lastPreviewMsg: null,
     // True once the settle hydrate has upgraded the preview model to a
     // file://-bound resource model. At that point VSCode's
@@ -2865,6 +3332,97 @@ export function getRendererPatchScript(
 		  matchCount: 0,
 		  recoveryUntil: 0,
 		};
+
+  function updatePreviewEngineIndicator(recoveryState, featureReadiness) {
+    if (typeof recoveryState === 'string') {
+      state.previewEngineRecoveryState = recoveryState;
+    }
+    if (typeof featureReadiness === 'string') {
+      state.previewFeatureReadiness = featureReadiness;
+    }
+    var engine = state.previewEngine === 'native'
+      ? 'native'
+      : (state.previewEngine === 'standalone' ? 'bundled' : '');
+    // A native editor is preserved across clearPreview() for reuse. Do not
+    // show an engine badge until that editor owns an active preview URI.
+    if (!engine || !state.previewUri) {
+      $previewEngineBadge.hidden = true;
+      $previewEngineBadge.textContent = '';
+      $previewEngineBadge.removeAttribute('data-engine');
+      $previewEngineBadge.removeAttribute('data-recovery');
+      $previewEngineBadge.removeAttribute('data-feature-readiness');
+      $previewEngineBadge.removeAttribute('title');
+      $previewEngineBadge.removeAttribute('aria-label');
+      try {
+        panel.removeAttribute('data-preview-engine');
+        panel.removeAttribute('data-preview-recovery');
+        panel.removeAttribute('data-preview-feature-readiness');
+      } catch (eClearPreviewEngineData) {}
+      return;
+    }
+
+    var recovery = state.previewEngineRecoveryState || 'ready';
+    var feature = state.previewFeatureReadiness || (engine === 'native' ? 'warming' : 'limited');
+    var text = engine === 'native'
+      ? (feature === 'ready' ? 'Native' : (feature === 'limited' ? 'Native \u00b7 Limited' : 'Native \u00b7 Warming'))
+      : 'Bundled \u00b7 Degraded';
+    var label = engine === 'native'
+      ? (feature === 'ready'
+        ? 'Preview engine: VS Code native Monaco. Language features: ready; the model is bound to the requested file.'
+        : (feature === 'limited'
+          ? 'Preview engine: VS Code native Monaco. Language features: limited; the model could not bind to the requested file.'
+          : 'Preview engine: VS Code native Monaco. Language features: warming while the model binds to the requested file.'))
+      : 'Preview engine: bundled Monaco fallback. Language features: limited and provided through the bundled bridge.';
+    if (recovery === 'recovering') {
+      text = engine === 'native' ? 'Native \u00b7 Recovering' : 'Bundled \u00b7 Recovering';
+      label = engine === 'native'
+        ? 'Preview engine: VS Code native Monaco. Engine recovery is running. Language feature readiness: ' + feature + '.'
+        : 'Preview engine: bundled Monaco fallback. Recovering the VS Code native preview. Language features: limited.';
+    } else if (engine === 'bundled' && recovery === 'paused') {
+      text = 'Bundled \u00b7 Paused';
+      label = 'Preview engine: bundled Monaco fallback. Native recovery is paused while the preview has unsaved changes. Language features: limited.';
+    } else if (engine === 'native' && recovery === 'unavailable') {
+      text = 'Native \u00b7 Recovery failed';
+      label = 'Preview engine: VS Code native Monaco. Automatic engine recovery was unsuccessful. Language feature readiness: ' + feature + '.';
+    }
+
+    $previewEngineBadge.hidden = false;
+    $previewEngineBadge.textContent = text;
+    $previewEngineBadge.setAttribute('data-engine', engine);
+    $previewEngineBadge.setAttribute('data-recovery', recovery);
+    $previewEngineBadge.setAttribute('data-feature-readiness', feature);
+    $previewEngineBadge.setAttribute('title', label);
+    $previewEngineBadge.setAttribute('aria-label', label);
+    try {
+      panel.setAttribute('data-preview-engine', engine);
+      panel.setAttribute('data-preview-recovery', recovery);
+      panel.setAttribute('data-preview-feature-readiness', feature);
+    } catch (eSetPreviewEngineData) {}
+  }
+
+  function nativePreviewModelBindsRequestedUri(editor, msg) {
+    if (!editor || !msg || !msg.uri || msg.fullFile === false) { return false; }
+    try {
+      var model = editor.getModel && editor.getModel();
+      return !!(model && model.uri && String(model.uri.toString()) === String(msg.uri));
+    } catch (eNativeFeatureModelUri) {
+      return false;
+    }
+  }
+
+  function setNativePreviewFeatureReadiness(readiness, reason) {
+    if (state.previewEngine !== 'native' || !state.previewUri) { return; }
+    var next = readiness === 'ready' || readiness === 'limited' ? readiness : 'warming';
+    state.previewFeatureReadiness = next;
+    updatePreviewEngineIndicator(undefined, next);
+    trace('preview/feature-readiness', {
+      engine: 'native',
+      readiness: next,
+      reason: String(reason || ''),
+      uri: state.previewUri,
+    });
+  }
+
 	  function getPreviewSaveEditor() {
 	    return state.previewMonacoEditor || state.monacoEditor;
 	  }
@@ -2902,6 +3460,7 @@ export function getRendererPatchScript(
     state.previewDirty = !!dirty;
     if (state.previewDirty) {
       try { cancelStandaloneNativePromotion(); } catch (eCancelDirtyPromotion) {}
+      if (state.previewEngine === 'standalone') { updatePreviewEngineIndicator('paused'); }
     } else if (wasDirty && state.previewEngine === 'standalone' && state.lastPreviewMsg) {
       // A bundled buffer must never be replaced while it has unsaved edits.
       // Once save/discard returns it to the clean snapshot, give the passive
@@ -4554,6 +5113,9 @@ export function getRendererPatchScript(
     state.previewEngine = state.previewNativeCommitted ? 'native' : '';
     state.lastPreviewMsg = null;
     state.previewLanguageId = '';
+    state.previewEngineRecoveryState = '';
+    state.previewFeatureReadiness = '';
+    updatePreviewEngineIndicator('', '');
     syncPreviewSaveButton();
     hideHover();
   }
@@ -7293,7 +7855,10 @@ export function getRendererPatchScript(
   }
 
   var PREVIEW_NATIVE_RECOVERY_RETRY_DELAYS_MS = [0, 50, 150, 300, 600, 1200];
-  var PREVIEW_STANDALONE_NATIVE_PROMOTION_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000];
+  // Cover the host's bounded passive capture window as well as cold CDP
+  // reconnects. The renderer remains interactive on bundled Monaco while
+  // these sparse checks run.
+  var PREVIEW_STANDALONE_NATIVE_PROMOTION_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
   function cancelNativePreviewRecovery(clearSnapshot) {
     try {
@@ -7324,6 +7889,11 @@ export function getRendererPatchScript(
     state.previewNativeCommitted = true;
     state.previewMode = 'monaco';
     state.previewEngine = 'native';
+    var featureReadiness = nativePreviewModelBindsRequestedUri(
+      state.previewMonacoEditor,
+      state.lastPreviewMsg
+    ) ? 'ready' : (state.previewFullFile === false ? 'limited' : 'warming');
+    updatePreviewEngineIndicator('ready', featureReadiness);
     cancelStandaloneNativePromotion();
     cancelNativePreviewRecovery(true);
   }
@@ -7454,16 +8024,33 @@ export function getRendererPatchScript(
       cancelStandaloneNativePromotion();
     }
     state.previewNativePromotionKey = key;
-    if (state.previewNativePromotionTimer || state.previewDirty) { return; }
+    if (state.previewDirty) {
+      updatePreviewEngineIndicator('paused');
+      return;
+    }
+    if (state.previewNativePromotionTimer) {
+      updatePreviewEngineIndicator('recovering');
+      return;
+    }
     var attempt = state.previewNativePromotionAttempt || 0;
     if (attempt >= PREVIEW_STANDALONE_NATIVE_PROMOTION_DELAYS_MS.length) {
+      if (window.__ijFindMonacoCapturePaused) {
+        // A temporary safety pause is not a failed recovery. Restart the
+        // sparse budget so expiry can wake this exact preview without a new
+        // result selection.
+        state.previewNativePromotionAttempt = 0;
+        attempt = 0;
+      } else {
+      updatePreviewEngineIndicator('unavailable');
       send({
         type: 'log',
         msg: 'bundled preview passive native promotion exhausted: ' + String(reason || ''),
       });
       return;
+      }
     }
     var delay = PREVIEW_STANDALONE_NATIVE_PROMOTION_DELAYS_MS[attempt];
+    updatePreviewEngineIndicator('recovering');
     state.previewNativePromotionAttempt = attempt + 1;
     state.previewNativePromotionTimer = setTimeout(function () {
       state.previewNativePromotionTimer = null;
@@ -7488,10 +8075,12 @@ export function getRendererPatchScript(
       // edits, so save/discard must make it clean before polling resumes.
       if (state.previewDirty) {
         cancelStandaloneNativePromotion();
+        updatePreviewEngineIndicator('paused');
         return;
       }
       if (window.__ijFindDisableMonacoProbes) {
         cancelStandaloneNativePromotion();
+        updatePreviewEngineIndicator('unavailable');
         return;
       }
       var monacoStatus = 'not-ready';
@@ -7512,7 +8101,24 @@ export function getRendererPatchScript(
         } catch (ePromotionWidgetCapture) {}
         try { monacoStatus = window.__ijFindMonacoStatus ? window.__ijFindMonacoStatus() : monacoStatus; }
         catch (ePromotionStatusAfterCapture) {}
-        try { factory = getMonacoFactorySingleton(); } catch (ePromotionFactoryAfterCapture) {}
+      try { factory = getMonacoFactorySingleton(); } catch (ePromotionFactoryAfterCapture) {}
+      }
+      if ((monacoStatus !== 'ready' || !factory || !factory.ctor) && window.__ijFindMonacoCapturePaused) {
+        updatePreviewEngineIndicator('recovering');
+        scheduleStandaloneNativePromotion(latest, 'capture-paused');
+        return;
+      }
+      if (monacoStatus !== 'ready' || !factory || !factory.ctor) {
+        // The extension host owns CDP/capture coordination. Asking it here
+        // closes the gap where this preview was mounted during a host pause or
+        // after an earlier window-global warmup was cancelled.
+        sendPersistent({
+          type: 'requestPreviewNativeRecovery',
+          uri: String(latest.uri || ''),
+          previewSeq: typeof latest.previewSeq === 'number' ? latest.previewSeq : undefined,
+          attempt: state.previewNativePromotionAttempt || 0,
+          reason: String(reason || 'renderer-promotion'),
+        });
       }
       if (monacoStatus === 'ready' && factory && factory.ctor) {
         var standaloneEditor = state.monacoEditor;
@@ -7555,8 +8161,34 @@ export function getRendererPatchScript(
     }, delay);
   }
 
+  function resumeStandaloneNativePromotion(reason) {
+    if (__ijFindDisposed || state.previewNativeCommitted) { return 'skip:native-or-disposed'; }
+    if (state.previewEngine !== 'standalone' || !state.lastPreviewMsg) { return 'skip:not-bundled'; }
+    if (state.previewDirty) {
+      updatePreviewEngineIndicator('paused');
+      return 'skip:dirty';
+    }
+    if (window.__ijFindDisableMonacoProbes) {
+      updatePreviewEngineIndicator('unavailable');
+      return 'skip:disabled';
+    }
+    try {
+      if (state.previewNativePromotionTimer) { clearTimeout(state.previewNativePromotionTimer); }
+    } catch (eClearResumePromotion) {}
+    state.previewNativePromotionTimer = null;
+    state.previewNativePromotionAttempt = 0;
+    state.previewNativePromotionKey = previewKeyForMessage(state.lastPreviewMsg);
+    scheduleStandaloneNativePromotion(state.lastPreviewMsg, reason || 'explicit-resume');
+    return window.__ijFindMonacoCapturePaused ? 'paused:scheduled' : 'scheduled';
+  }
+
   function scheduleNativePreviewRecovery(msg, reason) {
     if (!state.previewNativeCommitted || !msg) { return; }
+    var recoveryFeatureReadiness = nativePreviewModelBindsRequestedUri(
+      state.previewMonacoEditor,
+      msg
+    ) ? 'ready' : (msg.fullFile === false ? 'limited' : 'warming');
+    updatePreviewEngineIndicator('recovering', recoveryFeatureReadiness);
     var key = previewKeyForMessage(msg);
     if (state.previewNativeRecoveryKey && state.previewNativeRecoveryKey !== key) {
       try {
@@ -7569,6 +8201,7 @@ export function getRendererPatchScript(
     if (state.previewNativeRecoveryTimer) { return; }
     var attempt = state.previewNativeRecoveryAttempt || 0;
     if (attempt >= PREVIEW_NATIVE_RECOVERY_RETRY_DELAYS_MS.length) {
+      updatePreviewEngineIndicator('unavailable');
       send({ type: 'log', msg: 'native preview recovery exhausted without bundled downgrade: ' + String(reason || '') });
       return;
     }
@@ -7609,6 +8242,9 @@ export function getRendererPatchScript(
       if (state.monacoEditor) { disposeStandalonePreviewMonacoEditor(); }
       state.previewMode = isError ? 'monaco-error' : 'monaco-loading';
       state.previewEngine = '';
+      state.previewEngineRecoveryState = '';
+      state.previewFeatureReadiness = '';
+      updatePreviewEngineIndicator('', '');
       state.standaloneMonacoLoadingUri = String(msg && msg.uri || state.previewUri || '');
       $previewBody.classList.remove('ij-find-editor-mounted');
       clearChildren($previewBody);
@@ -7700,6 +8336,18 @@ export function getRendererPatchScript(
       catch (eInstanceReady) { reports.push(id + ':err'); }
     }
     return reports.join('|') || 'ready:no-instances';
+  };
+  window.__ijFindResumeStandaloneNativePromotion = function (reason) {
+    var reports = [];
+    var registry = searchInstanceRegistry();
+    for (var id in registry) {
+      if (!Object.prototype.hasOwnProperty.call(registry, id)) { continue; }
+      var inst = registry[id];
+      if (!inst || typeof inst.resumeNativePromotion !== 'function') { continue; }
+      try { reports.push(id + ':' + inst.resumeNativePromotion(reason)); }
+      catch (eInstanceResume) { reports.push(id + ':err'); }
+    }
+    return reports.join('|') || 'resume:no-instances';
   };
   window.__ijFindStandaloneMonacoFailed = function (message) {
     var reports = [];
@@ -10589,12 +11237,14 @@ export function getRendererPatchScript(
           }
         } catch (eCtor) {}
         try {
-          var inst = widget._instantiationService;
-          if (inst && typeof inst.createInstance === 'function' &&
-              typeof inst.invokeFunction === 'function' &&
-              targetCaps.services.length < 40) {
+          // Private field names move between VS Code releases. Reuse the
+          // structural own-property scanner used by widget promotion instead
+          // of betting passive recovery on one private field alone.
+          var instSvcs = [];
+          addWidgetInstantiationServices(instSvcs, widget, 'dom-capture', null);
+          for (var is = 0; is < instSvcs.length && targetCaps.services.length < 40; is++) {
             targetCaps.services.push({
-              v: inst, src: 'dom-capture', key: stringifyKey(i),
+              v: instSvcs[is].inst, src: 'dom-capture', key: stringifyKey(i),
               kind: 'IInstantiationService',
             });
           }
@@ -10880,6 +11530,29 @@ export function getRendererPatchScript(
     }
   }
 
+  function disposeStandaloneShadowMouseMoveBoundary() {
+    var boundary = state.monacoShadowMouseMoveBoundary;
+    state.monacoShadowMouseMoveBoundary = null;
+    if (!boundary || !boundary.root || !boundary.handler) { return; }
+    try { boundary.root.removeEventListener('mousemove', boundary.handler, false); }
+    catch (eRemoveShadowMouseMoveBoundary) {}
+  }
+
+  function installStandaloneShadowMouseMoveBoundary(shadowRoot) {
+    disposeStandaloneShadowMouseMoveBoundary();
+    if (!shadowRoot || typeof shadowRoot.addEventListener !== 'function') { return; }
+    // Monaco installs a document-level mousemove monitor after the pointer first
+    // enters an editor. Outside a ShadowRoot, the browser retargets that event to
+    // the shadow host, so Monaco's viewDomNode.contains(event.target) check
+    // incorrectly emits mouseleave and cancels the hover it just scheduled.
+    // Stop only the bubbled mousemove at the shadow boundary: Monaco's listeners
+    // inside the editor have already run, while a real move into the light DOM
+    // still reaches the document monitor and closes the hover normally.
+    var handler = function (event) { event.stopPropagation(); };
+    shadowRoot.addEventListener('mousemove', handler, false);
+    state.monacoShadowMouseMoveBoundary = { root: shadowRoot, handler: handler };
+  }
+
   function disposeStandalonePreviewMonacoEditor() {
     cancelStandaloneNativePromotion();
     cancelStandaloneLanguageFeatureRequests();
@@ -10906,6 +11579,7 @@ export function getRendererPatchScript(
       }
     } catch (eChange) {}
     state.monacoChangeListener = null;
+    disposeStandaloneShadowMouseMoveBoundary();
     if (state.previewMonacoSaveEditor === editor) {
       try {
         if (state.previewMonacoKeydownListener && state.previewMonacoKeydownListener.dispose) {
@@ -11070,6 +11744,7 @@ export function getRendererPatchScript(
       throw new Error(cssText.length < 1000 ? 'bundled Monaco CSS is unavailable' : 'Shadow DOM is unavailable');
     }
     var shadowRoot = host.attachShadow({ mode: 'open' });
+    installStandaloneShadowMouseMoveBoundary(shadowRoot);
     var style = document.createElement('style');
     style.setAttribute('data-ijss-monaco-base', 'true');
     style.textContent = cssText + '\\n' + standaloneMonacoOverlayCss();
@@ -11112,6 +11787,7 @@ export function getRendererPatchScript(
     } catch (e) {
       send({ type: 'log', msg: 'monaco.editor.create THREW: ' + (e && e.message) });
       try { if (editor && editor.dispose) { editor.dispose(); } } catch (eDisposeFailedEditor) {}
+      disposeStandaloneShadowMouseMoveBoundary();
       try { host.remove(); } catch (eRemoveFailedHost) {}
       state.monacoEditor = null;
       state.monacoHost = null;
@@ -11353,6 +12029,7 @@ export function getRendererPatchScript(
     }
     state.previewMode = 'monaco';
     state.previewEngine = 'standalone';
+    updatePreviewEngineIndicator('recovering', 'limited');
     state.lastRenderedPreviewUri = msg.uri;
     state.lastRenderedPreviewFocusLine = typeof msg.focusLine === 'number' ? msg.focusLine : -1;
     syncPreviewSaveButton();
@@ -12254,6 +12931,14 @@ export function getRendererPatchScript(
         activePreviewSeq: typeof state.activePreviewSeq === 'number' ? state.activePreviewSeq : 0,
 	        previewMode: state.previewMode || null,
 	        previewEngine: state.previewEngine || null,
+	        previewEngineRecoveryState: state.previewEngineRecoveryState || null,
+	        previewFeatureReadiness: state.previewFeatureReadiness || null,
+	        previewEngineBadgeText: $previewEngineBadge && !$previewEngineBadge.hidden
+	          ? String($previewEngineBadge.textContent || '')
+	          : null,
+	        previewEngineBadgeAriaLabel: $previewEngineBadge && !$previewEngineBadge.hidden
+	          ? $previewEngineBadge.getAttribute('aria-label')
+	          : null,
 	        previewUri: state.previewUri || null,
 	        previewDirty: !!state.previewDirty,
 	        previewCanSave: canSavePreviewContent(),
@@ -12726,6 +13411,7 @@ export function getRendererPatchScript(
         },
         onStandaloneMonacoReady: renderStandaloneMonacoWhenReady,
         onStandaloneMonacoFailed: renderStandaloneMonacoFailure,
+        resumeNativePromotion: resumeStandaloneNativePromotion,
         dispose: disposeSearchUi,
       };
       window.__ijFindActiveInstanceId = __ijFindInstanceId;

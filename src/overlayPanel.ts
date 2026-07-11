@@ -43,6 +43,13 @@ type RendererEvent =
   | { type: 'requestPreview'; uri: string; line: number; ranges?: MatchRange[]; contextLines: number; previewSeq?: number }
   | { type: 'requestStandaloneMonaco' }
   | {
+      type: 'requestPreviewNativeRecovery';
+      uri: string;
+      previewSeq?: number;
+      attempt?: number;
+      reason?: string;
+    }
+  | {
       type: 'requestPreviewLanguageFeature';
       requestId: number;
       feature: PreviewLanguageFeature;
@@ -249,6 +256,7 @@ type PendingShow = {
 };
 
 type PreviewRequestEvent = Extract<RendererEvent, { type: 'requestPreview' }>;
+type PreviewNativeRecoveryRequestEvent = Extract<RendererEvent, { type: 'requestPreviewNativeRecovery' }>;
 type PreviewLanguageFeatureRequestEvent = Extract<RendererEvent, { type: 'requestPreviewLanguageFeature' }>;
 type PreviewTextMateGrammarRequestEvent = Extract<RendererEvent, { type: 'requestPreviewTextMateGrammar' }>;
 type QueuedPreviewRequest = {
@@ -452,6 +460,7 @@ export class OverlayPanel {
   private previewRequestSeq = 0;
   private previewPumpActive = false;
   private previewWarmupPromise: Promise<void> | undefined;
+  private rendererPreviewRecoveryPromise: Promise<void> | undefined;
   private pendingPreviewForceOpen: PendingPreviewForceOpen | undefined;
   private previewForceOpenTimer: ReturnType<typeof setTimeout> | undefined;
   private previewForceOpenPromise: Promise<void> | undefined;
@@ -568,7 +577,7 @@ export class OverlayPanel {
     return {
       forceOpenAttempts: this.previewForceOpenAttemptCount,
       forceOpenSuppressed: this.previewForceOpenSuppressedCount,
-      forceOpenActive: !!this.previewForceOpenPromise,
+      forceOpenActive: !!this.previewForceOpenPromise || !!this.rendererPreviewRecoveryPromise,
       forceOpenTimerActive: !!this.previewForceOpenTimer,
       forceOpenCooldownUntil: this.previewForceOpenCooldownUntil,
       lastForceOpenUri: this.lastPreviewForceOpenUri,
@@ -767,6 +776,7 @@ export class OverlayPanel {
             clearTimeout(this.monacoCaptureRecoveryPauseTimer);
             this.monacoCaptureRecoveryPauseTimer = undefined;
           }
+          void this.resumeRendererMonacoCapturePolicy('capture-setting-enabled');
         }
       }
       if (event.affectsConfiguration('intellijStyledSearch.allowTransientPreviewCaptureEditor') &&
@@ -863,10 +873,6 @@ export class OverlayPanel {
     if (this.backgroundCaptureTimer) {
       clearTimeout(this.backgroundCaptureTimer);
       this.backgroundCaptureTimer = undefined;
-    }
-    if (this.monacoCaptureRecoveryPauseTimer) {
-      clearTimeout(this.monacoCaptureRecoveryPauseTimer);
-      this.monacoCaptureRecoveryPauseTimer = undefined;
     }
     this.backgroundCaptureTimer = setTimeout(() => {
       this.backgroundCaptureTimer = undefined;
@@ -1015,6 +1021,19 @@ export class OverlayPanel {
     return !this.isMonacoCaptureDisabled();
   }
 
+  /** Whether the renderer is allowed to retain/use the native capture
+   *  capability. A short renderer-recovery pause must not be represented as
+   *  a permanent disable flag: the latter clears the captured factory and is
+   *  intentionally terminal until the setting/session policy changes. */
+  private shouldEnableRendererMonacoProbes(): boolean {
+    return !this.monacoCaptureStoppedForSession && !this.isMonacoCaptureDisabledBySetting();
+  }
+
+  private isMonacoCaptureTemporarilyPaused(): boolean {
+    return this.shouldEnableRendererMonacoProbes() &&
+      this.monacoCaptureRecoveryPauseUntil > Date.now();
+  }
+
   private isMonacoCaptureDisabled(): boolean {
     return this.getMonacoCaptureDisabledReason() !== undefined;
   }
@@ -1026,7 +1045,7 @@ export class OverlayPanel {
 
   private shouldAllowTransientPreviewCaptureEditor(): boolean {
     return vscode.workspace.getConfiguration('intellijStyledSearch')
-      .get<boolean>('allowTransientPreviewCaptureEditor', false) === true;
+      .get<boolean>('allowTransientPreviewCaptureEditor', true) === true;
   }
 
   private getMonacoCaptureDisabledReason(): string | undefined {
@@ -1386,10 +1405,14 @@ export class OverlayPanel {
 
   private async isRendererPatchedInWindow(winId: number): Promise<boolean> {
     try {
+      const expectedDisableMonacoProbes = !this.shouldEnableRendererMonacoProbes();
+      const expectedCapturePaused = this.isMonacoCaptureTemporarilyPaused();
       const expectedPreviewLanguageFeatures = this.shouldEnablePreviewLanguageFeatures();
       const r = await this.evalInWindow(winId,
         `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&window.__ijFindStatus&&` +
         `window.__ijFindPatchVersion===${RENDERER_PATCH_VERSION}&&` +
+        `window.__ijFindDisableMonacoProbes===${expectedDisableMonacoProbes ? 'true' : 'false'}&&` +
+        `window.__ijFindMonacoCapturePaused===${expectedCapturePaused ? 'true' : 'false'}&&` +
         `window.__ijFindEnablePreviewLanguageFeatures===${expectedPreviewLanguageFeatures ? 'true' : 'false'}` +
         `?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`,
       );
@@ -1800,6 +1823,65 @@ export class OverlayPanel {
     return this.evalInWindow(retryWindowId, jsExpr, timeoutMs);
   }
 
+  /** @internal Send Chromium-trusted mouse movement to the active workbench.
+   *  Renderer-level tests use this instead of dispatchEvent(), whose events
+   *  are synthetic and bypass Electron/Chromium hit testing (including
+   *  ShadowRoot retargeting). Coordinates are workbench client pixels. */
+  async sendMouseMovesInActiveWindowForTests(
+    points: ReadonlyArray<{ x: number; y: number }>,
+    intervalMs = 25,
+  ): Promise<string> {
+    const normalizedPoints = points.map((point) => ({
+      x: Math.max(0, Math.round(Number(point.x) || 0)),
+      y: Math.max(0, Math.round(Number(point.y) || 0)),
+    }));
+    if (normalizedPoints.length === 0) {
+      throw new Error('sendMouseMovesInActiveWindowForTests requires at least one point');
+    }
+    const resolved = await this.resolveTargetWorkbenchWindowId(this.activeWindowId);
+    if (resolved === undefined) {
+      throw new Error('no active workbench window — call overlay.show(...) first');
+    }
+    this.activeWindowId = resolved;
+    const safeIntervalMs = Math.max(0, Math.min(250, Math.round(intervalMs) || 0));
+    const script = `
+      (async function () {
+        var BW = require('electron').BrowserWindow;
+        var w = BW.fromId(${resolved});
+        if (!w || !w.webContents) { return 'no-window:' + ${resolved}; }
+        var points = ${JSON.stringify(normalizedPoints)};
+        var intervalMs = ${safeIntervalMs};
+        var previous = null;
+        for (var i = 0; i < points.length; i++) {
+          var point = points[i];
+          w.webContents.sendInputEvent({
+            type: 'mouseMove',
+            x: point.x,
+            y: point.y,
+            movementX: previous ? point.x - previous.x : 0,
+            movementY: previous ? point.y - previous.y : 0,
+            modifiers: []
+          });
+          previous = point;
+          if (intervalMs > 0 && i + 1 < points.length) {
+            await new Promise(function (resolve) { setTimeout(resolve, intervalMs); });
+          }
+        }
+        return JSON.stringify({ sent: points.length, windowId: w.id });
+      })()
+    `.trim();
+    const response = await this.send('Runtime.evaluate', {
+      expression: script,
+      awaitPromise: true,
+      returnByValue: true,
+      includeCommandLineAPI: true,
+    });
+    if (response?.exceptionDetails) {
+      throw new Error(response.exceptionDetails.text || 'trusted mouse move evaluation failed');
+    }
+    return String(response?.result?.value ?? '');
+  }
+
   /** @internal Forcibly close the current CDP WebSocket — simulates the
    *  bridge dying mid-session (e.g. another extension detaching the
    *  webContents debugger). `ensureInjected()` on the next operation
@@ -1927,10 +2009,48 @@ export class OverlayPanel {
         this.pauseMonacoCaptureForRecovery(`${reason}:extend`, this.monacoCaptureRecoveryPauseUntil - Date.now());
         return;
       }
+      this.monacoCaptureRecoveryPauseUntil = 0;
       this.monacoCaptureDisabledLogged = false;
       this.log.appendLine(`Monaco capture recovery pause elapsed (${reason}); future previews may capture again.`);
+      void this.resumeRendererMonacoCapturePolicy(`recovery-pause-elapsed:${reason}`);
     }, delayMs);
     this.log.appendLine(`Monaco capture paused for renderer recovery (${reason}; ${delayMs}ms).`);
+  }
+
+  /** Synchronize a retained renderer after a temporary pause or policy
+   *  change. In particular this wakes bundled previews that were mounted
+   *  while capture was paused; no new preview selection is required. */
+  private async resumeRendererMonacoCapturePolicy(reason: string): Promise<void> {
+    if (!this.shouldEnableRendererMonacoProbes() || this.isMonacoCaptureTemporarilyPaused()) { return; }
+    try {
+      // Renderer recovery deliberately closes CDP, so establish the bridge
+      // before trying to resolve a BrowserWindow through it.
+      await this.ensureRendererPatchAlive(undefined, reason);
+      const targetWindowId = await this.resolveTargetWorkbenchWindowId(this.activeWindowId);
+      if (targetWindowId !== undefined && !(await this.isRendererPatchedInWindow(targetWindowId))) {
+        await this.ensureRendererPatchAlive(targetWindowId, reason);
+      }
+      if (targetWindowId !== undefined) {
+        try {
+          await this.evalInWindow(
+            targetWindowId,
+            `(function(){try{return window.__ijFindResumeStandaloneNativePromotion` +
+              `?window.__ijFindResumeStandaloneNativePromotion(${JSON.stringify(reason)})` +
+              `:'no-resume-hook'}catch(e){return 'resume-err:'+(e&&e.message)}})()`,
+          );
+        } catch (err) {
+          this.log.appendLine(
+            `Renderer native promotion resume signal failed (${reason}): ${err instanceof Error ? err.message : err}`,
+          );
+        }
+      }
+      this.scheduleBackgroundCaptureWarmup(reason, 0);
+    } catch (err) {
+      this.log.appendLine(
+        `Renderer Monaco capture policy resume failed (${reason}): ${err instanceof Error ? err.message : err}`,
+      );
+      // A later preview request will retry the same synchronization path.
+    }
   }
 
   private async ensureLocalBridgeServer(): Promise<{ port: number; token: string }> {
@@ -3107,12 +3227,14 @@ export class OverlayPanel {
     if (options.additionalInstance || options.forceInstall || !this.localBridgeServer || this.localBridgePort === undefined) {
       return undefined;
     }
-    const expectedDisableMonacoProbes = !this.isMonacoCaptureEnabled();
+    const expectedDisableMonacoProbes = !this.shouldEnableRendererMonacoProbes();
+    const expectedCapturePaused = this.isMonacoCaptureTemporarilyPaused();
     const expectedPreviewLanguageFeatures = this.shouldEnablePreviewLanguageFeatures();
     const rendererReadyExpr =
       `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&` +
       `window.__ijFindLightStatus&&window.__ijFindPatchVersion===${RENDERER_PATCH_VERSION}` +
       `&&window.__ijFindDisableMonacoProbes===${expectedDisableMonacoProbes ? 'true' : 'false'}` +
+      `&&window.__ijFindMonacoCapturePaused===${expectedCapturePaused ? 'true' : 'false'}` +
       `&&window.__ijFindEnablePreviewLanguageFeatures===${expectedPreviewLanguageFeatures ? 'true' : 'false'}` +
       `?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`;
     const workspaceName = this.getExpectedWorkspaceName();
@@ -3277,23 +3399,27 @@ export class OverlayPanel {
     // which previously corrupted any non-ASCII characters (they arrived as raw UTF-8
     // bytes through atob and broke the parser).
     const localBridge = await this.ensureLocalBridgeServer();
+    const rendererMonacoProbesEnabled = this.shouldEnableRendererMonacoProbes();
+    const rendererMonacoCapturePaused = this.isMonacoCaptureTemporarilyPaused();
     const patchExpr = getRendererPatchScript(
-      this.isMonacoCaptureEnabled(),
+      rendererMonacoProbesEnabled,
       this.isRendererPerfDiagnosticsEnabled(),
       this.shouldSuspendIntelliSenseRecursionCapture(),
       this.shouldEnableRendererInlayClickHook(),
       this.shouldDisposeRendererPatchOnHide(),
       !!options.additionalInstance,
       this.shouldEnablePreviewLanguageFeatures(),
+      rendererMonacoCapturePaused,
     );
     const additionalPatchExpr = getRendererPatchScript(
-      this.isMonacoCaptureEnabled(),
+      rendererMonacoProbesEnabled,
       this.isRendererPerfDiagnosticsEnabled(),
       this.shouldSuspendIntelliSenseRecursionCapture(),
       this.shouldEnableRendererInlayClickHook(),
       this.shouldDisposeRendererPatchOnHide(),
       true,
       this.shouldEnablePreviewLanguageFeatures(),
+      rendererMonacoCapturePaused,
     );
     // Readiness gate for the inject fast-path. Beyond the basic patch-version
     // marker, also confirm that renderer-side runtime flags match what this
@@ -3303,12 +3429,14 @@ export class OverlayPanel {
     // to true while leaving the patch version intact; without re-running the
     // patch script we'd report 'ready' and never reset the flag back to its
     // intended value.
-    const expectedDisableMonacoProbes = !this.isMonacoCaptureEnabled();
+    const expectedDisableMonacoProbes = !rendererMonacoProbesEnabled;
+    const expectedCapturePaused = rendererMonacoCapturePaused;
     const expectedPreviewLanguageFeatures = this.shouldEnablePreviewLanguageFeatures();
     const rendererReadyExpr =
       `(function(){try{return window.__ijFindShow&&window.__ijFindOnMessage&&` +
       `window.__ijFindLightStatus&&window.__ijFindPatchVersion===${RENDERER_PATCH_VERSION}` +
       `&&window.__ijFindDisableMonacoProbes===${expectedDisableMonacoProbes ? 'true' : 'false'}` +
+      `&&window.__ijFindMonacoCapturePaused===${expectedCapturePaused ? 'true' : 'false'}` +
       `&&window.__ijFindEnablePreviewLanguageFeatures===${expectedPreviewLanguageFeatures ? 'true' : 'false'}` +
       `?'ready':'missing'}catch(e){return 'err:'+(e&&e.message)}})()`;
     const workspaceName = this.getExpectedWorkspaceName();
@@ -3636,6 +3764,7 @@ export class OverlayPanel {
 	      evt.type !== 'log' &&
 	      evt.type !== 'trace' &&
 	      evt.type !== 'requestStandaloneMonaco' &&
+	      evt.type !== 'requestPreviewNativeRecovery' &&
 	      evt.type !== 'requestPreviewLanguageFeature'
 	    ) {
 	      this.log.appendLine(`ignore renderer event from inactive win=${evt.__win} active=${this.activeWindowId} type=${(evt as any).type}`);
@@ -3719,6 +3848,12 @@ export class OverlayPanel {
           // retaining the same BrowserWindow id).
           void this.injectStandaloneMonacoBundle(evt.__win, true);
         }
+        break;
+      case 'requestPreviewNativeRecovery':
+        void this.handleRendererPreviewNativeRecoveryRequest(evt, {
+          windowId: typeof evt.__win === 'number' ? evt.__win : undefined,
+          rendererSrc: evt.__src,
+        });
         break;
       case 'requestPreviewLanguageFeature':
         // Do not let a delayed feature request from the previous model move
@@ -4110,24 +4245,44 @@ export class OverlayPanel {
     // cancels an older run before its next attempt, while ensureMonacoCapture
     // still serializes an attempt already in flight.
     const warmup = (async () => {
-      try {
-        // Do not make the renderer evaluate the bundled editor and scan VS
-        // Code's private editor graph at the same time. Give the guaranteed
-        // preview path the first turn, then attempt sparse passive upgrades.
-        await Promise.race([standaloneLoad, delay(800)]);
-        for (let attempt = 0; attempt < PREVIEW_NATIVE_PASSIVE_RETRY_DELAYS_MS.length; attempt++) {
-          await delay(PREVIEW_NATIVE_PASSIVE_RETRY_DELAYS_MS[attempt]);
-          if (!shouldContinue()) { return; }
+      // Do not let bundle evaluation stop a capture that just started. Await
+      // the bounded injection operation before arming private native hooks.
+      try { await standaloneLoad; }
+      catch (err) {
+        this.log.appendLine(`preview bundled Monaco load failed before native warmup: ${err instanceof Error ? err.message : err}`);
+      }
+      const passiveAttemptLimit = this.shouldAllowTransientPreviewCaptureEditor()
+        ? Math.min(1, PREVIEW_NATIVE_PASSIVE_RETRY_DELAYS_MS.length)
+        : PREVIEW_NATIVE_PASSIVE_RETRY_DELAYS_MS.length;
+      for (let attempt = 0; attempt < passiveAttemptLimit; attempt++) {
+        const inFlightWindowCapture = attempt === 0
+          ? (this.capturePromise ?? this.backgroundCapturePromise)
+          : undefined;
+        if (inFlightWindowCapture) {
+          try { await inFlightWindowCapture; } catch {}
+          if (!shouldContinue() || await this.isMonacoReadyInWindow(targetWindowId)) { return; }
+          // The in-flight window-global diagnostic already consumed the one
+          // quick passive probe allowed before an opted-in reliable fallback.
+          if (this.shouldAllowTransientPreviewCaptureEditor()) { break; }
+        }
+        await delay(PREVIEW_NATIVE_PASSIVE_RETRY_DELAYS_MS[attempt]);
+        if (!shouldContinue()) { return; }
+        try {
           await this.ensureMonacoCapture(targetWindowId, undefined, {
             allowForceOpen: false,
             bypassThrottle: true,
             reason: attempt === 0 ? 'preview-request' : `preview-passive-retry-${attempt}`,
             shouldContinue,
           });
-          if (!shouldContinue() || await this.isMonacoReadyInWindow(targetWindowId)) { return; }
+        } catch (err) {
+          // A CDP reconnect/eval race is transient. Do not discard the rest of
+          // this preview's bounded recovery budget because one probe failed.
+          this.log.appendLine(
+            `preview Monaco passive capture attempt ${attempt + 1}/${passiveAttemptLimit} failed: ` +
+              `${err instanceof Error ? err.message : err}`,
+          );
         }
-      } catch (err) {
-        this.log.appendLine(`preview Monaco capture failed: ${err instanceof Error ? err.message : err}`);
+        if (!shouldContinue() || await this.isMonacoReadyInWindow(targetWindowId)) { return; }
       }
     })();
     this.previewWarmupPromise = warmup;
@@ -4160,6 +4315,80 @@ export class OverlayPanel {
       this.releasePreviewCaptureTabsSoon('preview-refresh');
       this.scheduleCdpSearchIdleClose('preview-refresh');
     });
+  }
+
+  private async handleRendererPreviewNativeRecoveryRequest(
+    evt: PreviewNativeRecoveryRequestEvent,
+    route: RendererMessageRoute,
+  ): Promise<void> {
+    const targetWindowId = route.windowId ?? this.activeWindowId;
+    if (targetWindowId === undefined || !evt.uri || !this.isMonacoCaptureEnabled()) { return; }
+    // A normal requestPreview already owns a window-global warmup/fallback
+    // coordinator. Renderer polling is only a recovery backstop for previews
+    // mounted while that host run was paused or cancelled.
+    if (this.previewWarmupPromise || this.previewForceOpenPromise || this.previewForceOpenTimer) { return; }
+    const initiallyTrackedTarget = route.rendererSrc
+      ? this.previewLanguageTargets.get(route.rendererSrc)
+      : undefined;
+    if (initiallyTrackedTarget &&
+        (initiallyTrackedTarget.windowId !== targetWindowId || initiallyTrackedTarget.uri !== evt.uri)) { return; }
+    const stillCurrent = () => {
+      if (!this.isMonacoCaptureEnabled()) { return false; }
+      if (!route.rendererSrc) { return true; }
+      const target = this.previewLanguageTargets.get(route.rendererSrc);
+      if (!initiallyTrackedTarget) { return true; }
+      return !!target && target.windowId === targetWindowId && target.uri === evt.uri;
+    };
+    if (this.rendererPreviewRecoveryPromise) {
+      await this.rendererPreviewRecoveryPromise;
+      return;
+    }
+    let usedForceOpen = false;
+    const recovery = (async () => {
+      try {
+        const allowForceOpen = (evt.attempt ?? 0) >= 4 &&
+          this.shouldAllowTransientPreviewCaptureEditor() &&
+          Date.now() >= this.previewForceOpenCooldownUntil;
+        let forceOpenUri: vscode.Uri | undefined;
+        if (allowForceOpen) {
+          try { forceOpenUri = vscode.Uri.parse(evt.uri); } catch {}
+        }
+        if (forceOpenUri) {
+          usedForceOpen = true;
+          this.previewForceOpenAttemptCount++;
+          this.lastPreviewForceOpenUri = evt.uri;
+        }
+        await this.ensureMonacoCapture(targetWindowId, forceOpenUri, {
+          allowForceOpen: !!forceOpenUri,
+          holdForceOpenedTab: !!forceOpenUri,
+          reason: `renderer-preview-recovery-${Math.max(0, evt.attempt ?? 0)}`,
+          shouldContinue: stillCurrent,
+        });
+        if (!stillCurrent() || !(await this.isMonacoReadyInWindow(targetWindowId))) { return; }
+        await this.evalInWindow(
+          targetWindowId,
+          `(function(){try{return window.__ijFindResumeStandaloneNativePromotion` +
+            `?window.__ijFindResumeStandaloneNativePromotion('native-capture-ready')` +
+            `:'no-resume-hook'}catch(e){return 'resume-err:'+(e&&e.message)}})()`,
+        );
+      } catch (err) {
+        this.log.appendLine(
+          `Renderer-requested native preview recovery failed: ${err instanceof Error ? err.message : err}`,
+        );
+      } finally {
+        if (usedForceOpen) {
+          this.previewForceOpenCooldownUntil = Date.now() + PREVIEW_FORCE_OPEN_COOLDOWN_MS;
+          this.releasePreviewCaptureTabsSoon('renderer-preview-recovery');
+        }
+      }
+    })();
+    const trackedRecovery = recovery.finally(() => {
+      if (this.rendererPreviewRecoveryPromise === trackedRecovery) {
+        this.rendererPreviewRecoveryPromise = undefined;
+      }
+    });
+    this.rendererPreviewRecoveryPromise = trackedRecovery;
+    await this.rendererPreviewRecoveryPromise;
   }
 
   private schedulePreviewForceOpen(

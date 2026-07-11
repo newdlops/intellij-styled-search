@@ -17,6 +17,15 @@ type CapturedWindowSummary = {
   ctors: number;
 };
 
+// A refreshed capture buffer starts empty, while the workbench editor whose
+// constructor/services we want may still be completing an asynchronous mount.
+// Keep the hooks alive for a small, fixed window instead of treating the first
+// synchronous DOM scan as the final answer. The guard polling keeps a stale
+// preview request from holding renderer-wide prototype hooks for the full
+// dwell.
+const PASSIVE_CAPTURE_DWELL_MS = 450;
+const PASSIVE_CAPTURE_GUARD_POLL_MS = 50;
+
 export async function runMonacoCaptureDiagnostic(
   runtime: MonacoCaptureRuntime,
   preferredWindowId?: number,
@@ -29,18 +38,50 @@ export async function runMonacoCaptureDiagnostic(
   const holdForceOpenedTab = options?.holdForceOpenedTab === true;
   const reason = options?.reason || 'foreground';
   const shouldContinue = options?.shouldContinue ?? (() => true);
+  let continueGuardFailureLogged = false;
+  const canContinue = (): boolean => {
+    try {
+      return shouldContinue();
+    } catch (err) {
+      if (!continueGuardFailureLogged) {
+        continueGuardFailureLogged = true;
+        runtime.log(`Capture diagnostic continuation guard failed: ${err instanceof Error ? err.message : err}`);
+      }
+      return false;
+    }
+  };
   runtime.log(
     `Capture diagnostic: starting (reason=${reason}, forceOpen=${allowForceOpen ? 'yes' : 'no'}` +
     (forceOpenUri ? `, forceOpenUri=${forceOpenUri.toString()}` : '') + ')...',
   );
-  if (!shouldContinue()) { return; }
-  const targetWindowId = await runtime.resolveTargetWorkbenchWindowId(preferredWindowId);
+  if (!canContinue()) { return; }
+  let targetWindowId: number | undefined;
+  try {
+    targetWindowId = await runtime.resolveTargetWorkbenchWindowId(preferredWindowId);
+  } catch (err) {
+    runtime.log(`Capture diagnostic target resolution failed: ${err instanceof Error ? err.message : err}`);
+    return;
+  }
   const windowIds = targetWindowId === undefined ? [] : [targetWindowId];
   runtime.log(
     `Target workbench windows: [${windowIds.join(', ')}]` +
     (preferredWindowId !== undefined ? ` preferred=${preferredWindowId}` : ''),
   );
   if (windowIds.length === 0) { return; }
+
+  const stopCaptureAll = async (): Promise<void> => {
+    await Promise.all(windowIds.map(async (id) => {
+      try {
+        const result = await runtime.evalInWindow(id, STOP_CAPTURE_EXPR);
+        runtime.log(`Capture stop win=${id}: ${result}`);
+      } catch {}
+    }));
+  };
+
+  if (!canContinue()) {
+    await stopCaptureAll();
+    return;
+  }
 
   const monacoVals = new Map<number, string>();
   await Promise.all(windowIds.map(async (id) => {
@@ -58,6 +99,7 @@ export async function runMonacoCaptureDiagnostic(
   }
   if (alreadyReadyWin !== null) {
     runtime.log(`Monaco globals already present in win=${alreadyReadyWin} - skipping capture diagnostic.`);
+    await stopCaptureAll();
     return;
   }
 
@@ -71,15 +113,6 @@ export async function runMonacoCaptureDiagnostic(
       runtime.log(`${stage}: ${[...results.entries()].map(([id, value]) => `win=${id} ${value}`).join(' | ')}`);
     }
     return results;
-  };
-
-  const stopCaptureAll = async (): Promise<void> => {
-    await Promise.all(windowIds.map(async (id) => {
-      try {
-        const result = await runtime.evalInWindow(id, STOP_CAPTURE_EXPR);
-        runtime.log(`Capture stop win=${id}: ${result}`);
-      } catch {}
-    }));
   };
 
   const refreshCaptureAll = async (): Promise<void> => {
@@ -104,13 +137,20 @@ export async function runMonacoCaptureDiagnostic(
   };
 
   const runWidgetCreateTest = async (winId: number, label: string): Promise<boolean> => {
+    if (!canContinue()) { return false; }
     try {
       const testResult = await runtime.evalInWindow(winId, TEST_WIDGET_CREATE_EXPR);
       runtime.log(`TEST widget create (win=${winId}, ${label}): ${String(testResult).slice(0, 2000)}`);
     } catch (err) {
       runtime.log(`TEST widget eval failed: ${err instanceof Error ? err.message : err}`);
     }
-    return runtime.isMonacoReadyInWindow(winId);
+    if (!canContinue()) { return false; }
+    try {
+      return await runtime.isMonacoReadyInWindow(winId);
+    } catch (err) {
+      runtime.log(`TEST widget readiness check failed (win=${winId}, ${label}): ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
   };
 
   const findBestCapturedWindow = (peeked: Map<number, string>): CapturedWindowSummary | null => {
@@ -122,7 +162,12 @@ export async function runMonacoCaptureDiagnostic(
       const widgets = widgetsMatch ? parseInt(widgetsMatch[1], 10) : 0;
       const services = servicesMatch ? parseInt(servicesMatch[1], 10) : 0;
       const ctors = ctorsMatch ? parseInt(ctorsMatch[1], 10) : 0;
-      if (services <= 0) { continue; }
+      // A live widget or its constructor is actionable evidence too. During a
+      // cold mount, the widget/constructor commonly lands in the buffer one
+      // turn before its DI services. Preserve that structural evidence so the
+      // promotion probe can inspect the selected renderer instead of treating
+      // the capture as empty solely because of arrival order.
+      if (widgets + services + ctors <= 0) { continue; }
       if (preferredWindowId !== undefined && id === preferredWindowId) {
         return { id, widgets, services, ctors };
       }
@@ -132,6 +177,35 @@ export async function runMonacoCaptureDiagnostic(
       }
     }
     return best;
+  };
+
+  const scanDomAll = async (stage: string): Promise<void> => {
+    const domCaptureSummaries: string[] = [];
+    await Promise.all(windowIds.map(async (id) => {
+      if (!canContinue()) { return; }
+      try {
+        const result = await runtime.evalInWindow(id, DOM_CAPTURE_EXPR);
+        domCaptureSummaries.push(`win=${id} ${result}`);
+      } catch (err) {
+        domCaptureSummaries.push(`win=${id} err:${err instanceof Error ? err.message : err}`);
+      }
+    }));
+    runtime.log(`${stage}: ${domCaptureSummaries.join(' | ')}`);
+  };
+
+  const waitForPassiveCaptureDwell = async (): Promise<boolean> => {
+    // An opted-in force-open diagnostic is itself the reliable fallback. It
+    // already tested existing evidence and performed an immediate DOM scan
+    // above, so do not add a 450ms idle dwell before creating the capture
+    // editor.
+    if (allowForceOpen) { return canContinue(); }
+    const deadline = Date.now() + PASSIVE_CAPTURE_DWELL_MS;
+    while (canContinue()) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) { return true; }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(PASSIVE_CAPTURE_GUARD_POLL_MS, remaining)));
+    }
+    return false;
   };
 
   try {
@@ -150,38 +224,65 @@ export async function runMonacoCaptureDiagnostic(
       runtime.log('Existing captures did not promote to Monaco - refreshing capture buffer.');
     }
 
-    if (!shouldContinue()) {
+    if (!canContinue()) {
       await stopCaptureAll();
       return;
     }
     await refreshCaptureAll();
-    const domCaptureSummaries: string[] = [];
-    await Promise.all(windowIds.map(async (id) => {
-      try {
-        const result = await runtime.evalInWindow(id, DOM_CAPTURE_EXPR);
-        domCaptureSummaries.push(`win=${id} ${result}`);
-      } catch (err) {
-        domCaptureSummaries.push(`win=${id} err:${err instanceof Error ? err.message : err}`);
-      }
-    }));
-    runtime.log(`Capture via DOM scan: ${domCaptureSummaries.join(' | ')}`);
+    if (!canContinue()) {
+      await stopCaptureAll();
+      return;
+    }
+    await scanDomAll('Capture via DOM scan');
+    if (!canContinue()) {
+      await stopCaptureAll();
+      return;
+    }
 
     const afterDomPeek = await peekAll('Capture peek after DOM scan', true);
     const domCapture = findBestCapturedWindow(afterDomPeek);
     if (domCapture) {
       runtime.log(
-        `DOM/captured services in win=${domCapture.id} ` +
+        `DOM/captured evidence in win=${domCapture.id} ` +
         `(widgets=${domCapture.widgets} services=${domCapture.services} ctors=${domCapture.ctors}) - testing before force-open.`,
       );
-      const promoted = await runWidgetCreateTest(domCapture.id, 'DOM/service path');
+      const promoted = await runWidgetCreateTest(domCapture.id, 'DOM/capture path');
       if (promoted) {
         await stopCaptureAll();
         return;
       }
-      runtime.log('DOM/service captures did not promote to Monaco.');
+      runtime.log('DOM/captured evidence did not promote to Monaco yet.');
     }
 
-    if (!allowForceOpen || !shouldContinue()) {
+    // The prototype hooks need a bounded opportunity to observe editor work
+    // scheduled just after the refresh. Rescan once at the end so an editor
+    // which became DOM-visible without flowing through a hooked collection is
+    // also considered. This remains passive: no editor or tab is opened here.
+    if (!(await waitForPassiveCaptureDwell())) {
+      await stopCaptureAll();
+      return;
+    }
+    await scanDomAll('Capture via DOM rescan after passive dwell');
+    if (!canContinue()) {
+      await stopCaptureAll();
+      return;
+    }
+    const afterDwellPeek = await peekAll('Capture peek after passive dwell', true);
+    const dwellCapture = findBestCapturedWindow(afterDwellPeek);
+    if (dwellCapture) {
+      runtime.log(
+        `Passive dwell captures in win=${dwellCapture.id} ` +
+        `(widgets=${dwellCapture.widgets} services=${dwellCapture.services} ctors=${dwellCapture.ctors}) - testing before force-open.`,
+      );
+      const promoted = await runWidgetCreateTest(dwellCapture.id, 'passive-dwell');
+      if (promoted) {
+        await stopCaptureAll();
+        return;
+      }
+      runtime.log('Passive dwell captures did not promote to Monaco.');
+    }
+
+    if (!allowForceOpen || !canContinue()) {
       runtime.log(
         'Capture warmup: DOM scan did not yield a ready Monaco; skipping force-open and restoring capture hooks.',
       );
@@ -194,8 +295,8 @@ export async function runMonacoCaptureDiagnostic(
     }));
     runtime.log('Captures cleared - no DOM-visible widgets, forcing real editor creation via file open/close...');
 
-    const phase = await forceOpenEditorForCapture(runtime, forceOpenUri, peekAll, shouldContinue);
-    if (!shouldContinue()) {
+    const phase = await forceOpenEditorForCapture(runtime, forceOpenUri, peekAll, canContinue);
+    if (!canContinue()) {
       if (phase.forceOpenedCloseTargets.length > 0) {
         try { await vscode.window.tabGroups.close(phase.forceOpenedCloseTargets, true); }
         catch (errClose) { runtime.log(`Capture close cancelled tab failed: ${errClose instanceof Error ? errClose.message : errClose}`); }
@@ -214,7 +315,7 @@ export async function runMonacoCaptureDiagnostic(
 
     if (phase.forceOpenedCloseTargets.length > 0) {
       const tClose0 = Date.now();
-      if (holdForceOpenedTab && shouldContinue()) {
+      if (holdForceOpenedTab && canContinue()) {
         runtime.holdPreviewCaptureTabs(phase.forceOpenedCloseTargets);
         runtime.log(
           `Capture diagnostic: holding ${phase.forceOpenedCloseTargets.length} introduced tab(s) until preview render completes.`,

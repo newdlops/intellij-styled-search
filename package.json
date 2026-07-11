@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.7123",
+  "version": "0.1.7126",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -308,8 +308,8 @@
         },
         "intellijStyledSearch.allowTransientPreviewCaptureEditor": {
           "type": "boolean",
-          "default": false,
-          "description": "Allow the preview to temporarily open an editor tab to upgrade from bundled Monaco to VS Code's native language-service editor. Disabled by default so opening, previewing, or closing Search never changes editor tabs."
+          "default": true,
+          "description": "Allow the preview to briefly create and close a background editor beside the current group when passive capture cannot upgrade bundled Monaco to VS Code's native language-service editor. Enabled by default for reliable automatic recovery; disable it to guarantee Search never changes editor tabs."
         },
         "intellijStyledSearch.closeMainInspectorAfterSearch": {
           "type": "boolean",
