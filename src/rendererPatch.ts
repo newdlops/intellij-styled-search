@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 142;
+export const RENDERER_PATCH_VERSION = 143;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -329,6 +329,7 @@ export function getRendererPatchScript(
     try { if (typeof state !== 'undefined' && state && state.hoverTimer) { clearTimeout(state.hoverTimer); state.hoverTimer = null; out.push('hoverTimer=cleared'); } } catch (eHoverTimer) {}
     try { if (typeof cancelStandaloneNativePromotion === 'function') { cancelStandaloneNativePromotion(); out.push('nativePromotion=cleared'); } } catch (eNativePromotion) {}
     try { if (typeof cancelStandaloneTextMateRequests === 'function') { cancelStandaloneTextMateRequests('preview disposed'); out.push('textMateRequests=cleared'); } } catch (eTextMateRequests) {}
+    try { if (typeof disposePreviewOverflowThemeObserver === 'function') { disposePreviewOverflowThemeObserver(); out.push('overflowTheme=cleared'); } } catch (eOverflowTheme) {}
     try {
       if (typeof state !== 'undefined' && state && state.previewSavePending) {
         for (var saveRequestId in state.previewSavePending) {
@@ -371,6 +372,7 @@ export function getRendererPatchScript(
         previewOverflowRoot.parentElement.removeChild(previewOverflowRoot);
         out.push('overflow=detached');
       }
+      if (typeof state !== 'undefined' && state) { state.previewOverflowRoot = null; }
     } catch (eOverflowDetach) {}
     try { setIntelliSenseRecursionCaptureSuspended(false, 'dispose:' + (reason || 'unknown')); } catch (eIrDispose) {}
     try {
@@ -628,7 +630,7 @@ export function getRendererPatchScript(
   //      outside the widgets own bounds.
   function syncPreviewOverflowTheme(root) {
     try {
-      var source = document.querySelector('.monaco-workbench') || document.body;
+      var source = document.querySelector('.monaco-workbench:not(.ij-find-preview-overflow-root)') || document.body;
       if (!source || !root || !window.getComputedStyle) { return; }
       var cs = window.getComputedStyle(source);
       for (var i = 0; i < cs.length; i++) {
@@ -641,29 +643,113 @@ export function getRendererPatchScript(
       root.style.setProperty('color', cs.getPropertyValue('--vscode-foreground') || cs.color || 'inherit');
       root.style.setProperty('font-family', cs.getPropertyValue('--vscode-font-family') || cs.fontFamily || 'inherit');
       root.style.setProperty('font-size', cs.getPropertyValue('--vscode-font-size') || cs.fontSize || 'inherit');
+      var overflowNode = root.querySelector && root.querySelector('.ij-find-preview-overflow');
+      var themeClasses = ['vs', 'vs-dark', 'hc-black', 'hc-light'];
+      for (var ti = 0; ti < themeClasses.length; ti++) {
+        var themeClass = themeClasses[ti];
+        var enabled = !!(source.classList && source.classList.contains(themeClass));
+        if (root.classList) { root.classList.toggle(themeClass, enabled); }
+        if (overflowNode && overflowNode.classList) { overflowNode.classList.toggle(themeClass, enabled); }
+      }
+      root.style.colorScheme = (root.classList.contains('vs-dark') || root.classList.contains('hc-black'))
+        ? 'dark'
+        : 'light';
     } catch (e) {}
   }
+  function disposePreviewOverflowThemeObserver() {
+    try {
+      if (state.previewOverflowThemeObserver &&
+          typeof state.previewOverflowThemeObserver.disconnect === 'function') {
+        state.previewOverflowThemeObserver.disconnect();
+      }
+    } catch (eDisposeOverflowThemeObserver) {}
+    state.previewOverflowThemeObserver = null;
+  }
+  function ensurePreviewOverflowThemeObserver() {
+    if (state.previewOverflowThemeObserver || typeof MutationObserver !== 'function') { return; }
+    try {
+      var observer = new MutationObserver(function () {
+        var root = findPreviewOverflowRootForInstance();
+        if (root) {
+          syncPreviewOverflowTheme(root);
+          syncPreviewOverflowStacking(root);
+        }
+      });
+      var workbench = document.querySelector('.monaco-workbench:not(.ij-find-preview-overflow-root)');
+      if (workbench) {
+        observer.observe(workbench, { attributes: true, attributeFilter: ['class', 'data-vscode-theme-kind'] });
+      }
+      if (document.documentElement) {
+        observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'data-vscode-theme-kind'] });
+      }
+      if (document.body) {
+        observer.observe(document.body, { attributes: true, attributeFilter: ['class', 'data-vscode-theme-kind'] });
+      }
+      // Same-kind theme changes (for example one dark theme to another) keep
+      // the workbench's vs-dark class and only rewrite contributedColorTheme
+      // rules. Observe head stylesheet content so our intentionally inlined
+      // --vscode-* values do not remain on the previous palette.
+      if (document.head) {
+        observer.observe(document.head, { childList: true, characterData: true, subtree: true });
+      }
+      state.previewOverflowThemeObserver = observer;
+    } catch (eEnsureOverflowThemeObserver) {}
+  }
+  function syncPreviewOverflowStacking(root) {
+    try {
+      if (!root) { return; }
+      var panelZ = NaN;
+      if (typeof panel !== 'undefined' && panel) {
+        var panelStyle = window.getComputedStyle ? window.getComputedStyle(panel) : null;
+        panelZ = parseInt((panelStyle && panelStyle.zIndex) || panel.style.zIndex || '', 10);
+      }
+      if (!isFinite(panelZ)) {
+        panelZ = typeof window.__ijFindPanelZSeq === 'number' ? window.__ijFindPanelZSeq : 10000;
+      }
+      root.style.setProperty('z-index', String(panelZ + 20), 'important');
+    } catch (eSyncOverflowStacking) {}
+  }
   function findPreviewOverflowRootForInstance() {
+    try {
+      var retained = typeof state !== 'undefined' && state && state.previewOverflowRoot;
+      if (retained && retained.getAttribute &&
+          retained.getAttribute('data-ij-find-src') === __ijFindInstanceId) {
+        return retained;
+      }
+    } catch (eFindRetainedOverflowRoot) {}
     try {
       var roots = document.querySelectorAll('.ij-find-preview-overflow-root');
       for (var i = 0; i < roots.length; i++) {
         if (roots[i] && roots[i].getAttribute && roots[i].getAttribute('data-ij-find-src') === __ijFindInstanceId) {
+          try {
+            if (typeof state !== 'undefined' && state) { state.previewOverflowRoot = roots[i]; }
+          } catch (eRememberOverflowRoot) {}
           return roots[i];
         }
       }
     } catch (eFindOverflowRoot) {}
     return null;
   }
+  function abandonPreviewOverflowRoot() {
+    try {
+      var root = findPreviewOverflowRootForInstance();
+      if (root && root.parentElement) { root.parentElement.removeChild(root); }
+      if (state.previewOverflowRoot === root) { state.previewOverflowRoot = null; }
+    } catch (eAbandonOverflowRoot) {}
+  }
   function getOrCreatePreviewOverflowHost() {
     var root = findPreviewOverflowRootForInstance();
     var existing = root && root.querySelector('.ij-find-preview-overflow');
     if (existing && existing.parentElement) {
+      try { state.previewOverflowRoot = root; } catch (eRememberExistingOverflowRoot) {}
       markSearchUiRoot(root);
       markSearchUiRoot(existing);
       try { root.setAttribute('data-ij-find-src', __ijFindInstanceId); } catch (eRootSrcExisting) {}
       try { existing.setAttribute('data-ij-find-src', __ijFindInstanceId); } catch (eNodeSrcExisting) {}
       if (root.parentElement !== document.body) { document.body.appendChild(root); }
       syncPreviewOverflowTheme(root);
+      syncPreviewOverflowStacking(root);
+      ensurePreviewOverflowThemeObserver();
       return existing;
     }
     root = document.createElement('div');
@@ -695,8 +781,11 @@ export function getRendererPatchScript(
       'pointer-events:none',
     ].join(';');
     root.appendChild(node);
+    try { state.previewOverflowRoot = root; } catch (eRememberNewOverflowRoot) {}
     syncPreviewOverflowTheme(root);
     document.body.appendChild(root);
+    syncPreviewOverflowStacking(root);
+    ensurePreviewOverflowThemeObserver();
     return node;
   }
 
@@ -1330,6 +1419,8 @@ export function getRendererPatchScript(
     };
   }
 
+  var PREVIEW_HOVER_HIDE_DELAY_MS = 1200;
+
   function previewHoverOptions() {
     return {
       enabled: true,
@@ -1337,7 +1428,7 @@ export function getRendererPatchScript(
       // The preview editor renders hover widgets into a body-level overflow
       // host. Give the pointer enough grace to travel from the symbol to that
       // detached hover widget instead of hiding as soon as it leaves the token.
-      hidingDelay: 1200,
+      hidingDelay: PREVIEW_HOVER_HIDE_DELAY_MS,
     };
   }
 
@@ -3041,6 +3132,19 @@ export function getRendererPatchScript(
     '.ij-find-preview-overflow .context-view * {',
     '  pointer-events: auto !important;',
     '}',
+    // Bundled Monaco 0.52 still emits the pre-verbosity-actions-inner hover
+    // markup. VS Code's newer global Monaco stylesheet covers the shared core
+    // selectors; retain these few old structural rules for the detached popup.
+    '.ij-find-preview-overflow .monaco-hover-content {',
+    '  padding-right: 2px; padding-bottom: 2px; box-sizing: border-box;',
+    '}',
+    '.ij-find-preview-overflow .monaco-hover .hover-row .verbosity-actions {',
+    '  display: flex; flex-direction: column; padding-left: 5px; padding-right: 5px;',
+    '  justify-content: end; border-right: 1px solid var(--vscode-editorHoverWidget-border);',
+    '}',
+    '.ij-find-preview-overflow .monaco-hover .hover-row .verbosity-actions .codicon { cursor: pointer; font-size: 11px; }',
+    '.ij-find-preview-overflow .monaco-hover .hover-row .verbosity-actions .codicon.enabled { color: var(--vscode-textLink-foreground); }',
+    '.ij-find-preview-overflow .monaco-hover .hover-row .verbosity-actions .codicon.disabled { opacity: 0.6; }',
   ].join('\\n');
   document.head.appendChild(style);
 
@@ -3215,6 +3319,11 @@ export function getRendererPatchScript(
     hoverReqId: 0,
     hoverTimer: null,
     lastHoverKey: '',
+    previewHoverTransitGuard: null,
+    previewHoverTransitBootstrap: null,
+    previewHoverTransitStatus: '',
+    previewOverflowRoot: null,
+    previewOverflowThemeObserver: null,
     monacoEditor: null,        // monaco.editor.IStandaloneCodeEditor
     monacoHost: null,          // light-DOM host mounted in the preview body
     monacoEditorHost: null,    // actual editor container inside monacoHost's ShadowRoot
@@ -4487,6 +4596,8 @@ export function getRendererPatchScript(
     state.minimized = true;
     try { hideHover(); } catch (eHideHoverForMinimize) {}
     if (state.hoverTimer) { clearTimeout(state.hoverTimer); state.hoverTimer = null; }
+    dismissPreviewMonacoHover(state.previewMonacoEditor || state.monacoEditor);
+    disposePreviewHoverTransitGuard(null, 'minimize');
     setPreviewOverflowHidden(true);
     panel.classList.add('ij-find-minimized');
     var compactW = Math.max(240, Math.min(320, window.innerWidth - 16));
@@ -4515,6 +4626,7 @@ export function getRendererPatchScript(
     panel.classList.remove('ij-find-minimized');
     restorePanelInlineLayout(layout);
     setPreviewOverflowHidden(false);
+    installPreviewHoverTransitGuard(state.previewMonacoEditor || state.monacoEditor);
     syncMinimizeButton();
     relayoutHostedPreviewEditorSoon();
     if (!silent) {
@@ -9239,6 +9351,17 @@ export function getRendererPatchScript(
         // Forget the broken editor instance so renderPreviewMonacoReal
         // recreates a fresh widget instead of trying to reuse the orphaned
         // one. The host element itself remains under $previewBody.
+        disposePreviewHoverTransitGuard(editor, 'native-heal');
+        var nativeHealDisposeFailed = false;
+        try { editor.dispose(); }
+        catch (eNativeHealDispose) { nativeHealDisposeFailed = true; }
+        if (nativeHealDisposeFailed) {
+          // CodeEditorWidget binds its overflow host and focus listener in the
+          // constructor. If a damaged widget cannot dispose, abandon that host
+          // with it so the replacement editor gets a clean node and the
+          // detached listener cycle can be collected together.
+          abandonPreviewOverflowRoot();
+        }
         state.previewMonacoEditor = null;
         Promise.resolve().then(function () {
           try {
@@ -9456,6 +9579,601 @@ export function getRendererPatchScript(
     snapshotPreviewMonacoState('wired');
   }
 
+  var PREVIEW_HOVER_WIDGET_SELECTOR = [
+    '.monaco-hover',
+    '.monaco-editor-hover',
+    '.content-hover-widget',
+    '.resizable-content-hover-widget',
+    '.monaco-hover-content',
+  ].join(',');
+
+  function dismissPreviewMonacoHover(editor) {
+    if (!editor || typeof editor.getContribution !== 'function') { return; }
+    var controller = null;
+    var guard = state.previewHoverTransitGuard;
+    if (guard && guard.editor === editor) { controller = guard.controller; }
+    if (!controller) {
+      var contributionIds = ['editor.contrib.contentHover', 'editor.contrib.hover'];
+      for (var ci = 0; ci < contributionIds.length; ci++) {
+        try {
+          controller = editor.getContribution(contributionIds[ci]);
+          if (controller) { break; }
+        } catch (eDismissPreviewHoverContribution) {}
+      }
+    }
+    try {
+      if (controller && typeof controller._hideWidgets === 'function') {
+        controller._hideWidgets();
+        return;
+      }
+    } catch (eDismissPreviewHoverWidgets) {}
+    try {
+      var widget = controller && (controller._contentWidget || controller._contentHoverWidget);
+      if (widget && typeof widget.hide === 'function') { widget.hide(); }
+    } catch (eDismissPreviewHoverWidget) {}
+  }
+
+  function previewHoverElementFromNode(node) {
+    try {
+      var element = node && node.nodeType === 1 ? node : (node && node.parentElement);
+      if (!element || typeof element.closest !== 'function') { return null; }
+      return element.closest(PREVIEW_HOVER_WIDGET_SELECTOR);
+    } catch (ePreviewHoverClosest) {
+      return null;
+    }
+  }
+
+  function previewHoverScopeContains(scope, node) {
+    try { return !!(scope && node && typeof scope.contains === 'function' && scope.contains(node)); }
+    catch (ePreviewHoverContains) { return false; }
+  }
+
+  function previewHoverBelongsToGuard(guard, node) {
+    var hover = previewHoverElementFromNode(node);
+    if (!hover || !guard) { return null; }
+    if (previewHoverScopeContains(guard.shadowRoot, hover) ||
+        previewHoverScopeContains(guard.overflowRoot, hover) ||
+        previewHoverScopeContains(guard.editorDom, hover)) {
+      return hover;
+    }
+    return null;
+  }
+
+  function previewHoverEventBelongsToGuard(guard, event) {
+    var direct = previewHoverBelongsToGuard(guard, event && event.target);
+    if (direct) { return direct; }
+    try {
+      var path = event && typeof event.composedPath === 'function' ? event.composedPath() : [];
+      for (var pi = 0; pi < path.length; pi++) {
+        var hover = previewHoverBelongsToGuard(guard, path[pi]);
+        if (hover) { return hover; }
+      }
+    } catch (ePreviewHoverEventPath) {}
+    return null;
+  }
+
+  function previewHoverEventPointInsideEditor(guard, event) {
+    try {
+      var surface = guard && (guard.surfaceDom || guard.editorDom);
+      if (!surface || !event) {
+        return false;
+      }
+      var clientX = typeof event.clientX === 'number' ? event.clientX :
+        (typeof event.posx === 'number' ? event.posx : event.x);
+      var clientY = typeof event.clientY === 'number' ? event.clientY :
+        (typeof event.posy === 'number' ? event.posy : event.y);
+      if (typeof clientX !== 'number' || typeof clientY !== 'number') { return false; }
+      var rect = surface.getBoundingClientRect();
+      return clientX >= rect.left && clientX <= rect.right &&
+        clientY >= rect.top && clientY <= rect.bottom;
+    } catch (ePreviewHoverPointInsideEditor) {
+      return false;
+    }
+  }
+
+  function previewHoverNodeIsVisible(node) {
+    try {
+      if (!node || !node.isConnected) { return false; }
+      if (node.classList && node.classList.contains('hidden')) { return false; }
+      var rect = node.getBoundingClientRect && node.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) { return false; }
+      var style = window.getComputedStyle && window.getComputedStyle(node);
+      return !style || (style.display !== 'none' && style.visibility !== 'hidden');
+    } catch (ePreviewHoverVisibleNode) {
+      return false;
+    }
+  }
+
+  function previewHoverControllerReportsVisible(controller) {
+    try {
+      var reported = controller && controller.isHoverVisible;
+      if (reported === true) { return true; }
+      if (typeof reported === 'function' && reported.call(controller) === true) { return true; }
+    } catch (ePreviewHoverVisibleGetter) {}
+    try {
+      var widget = controller && (controller._contentWidget || controller._contentHoverWidget);
+      if (widget && widget.isVisible === true) { return true; }
+    } catch (ePreviewHoverVisibleWidget) {}
+    return false;
+  }
+
+  function previewHoverControllerIsVisible(controller, guard) {
+    if (previewHoverControllerReportsVisible(controller)) { return true; }
+    var scopes = guard ? [guard.shadowRoot, guard.overflowRoot, guard.editorDom] : [];
+    for (var si = 0; si < scopes.length; si++) {
+      try {
+        var nodes = scopes[si] && scopes[si].querySelectorAll
+          ? scopes[si].querySelectorAll(PREVIEW_HOVER_WIDGET_SELECTOR)
+          : [];
+        for (var ni = 0; ni < nodes.length; ni++) {
+          if (previewHoverNodeIsVisible(nodes[ni])) { return true; }
+        }
+      } catch (ePreviewHoverVisibleScope) {}
+    }
+    return false;
+  }
+
+  function previewHoverEventInsideEditorDom(guard, event) {
+    try {
+      if (!guard || !guard.editorDom || !event) { return false; }
+      if (guard.editorDom.contains(event.target)) { return true; }
+      var path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+      return path.indexOf(guard.editorDom) >= 0;
+    } catch (ePreviewHoverEventInsideDom) {
+      return false;
+    }
+  }
+
+  function disposePreviewHoverTransitBootstrap(editor) {
+    var bootstrap = state.previewHoverTransitBootstrap;
+    if (!bootstrap || (editor && bootstrap.editor !== editor)) { return; }
+    state.previewHoverTransitBootstrap = null;
+    bootstrap.disposed = true;
+    if (bootstrap.timer) {
+      try { clearTimeout(bootstrap.timer); } catch (ePreviewHoverBootstrapTimer) {}
+      bootstrap.timer = null;
+    }
+    try {
+      if (bootstrap.editorMouseMoveDisposable &&
+          typeof bootstrap.editorMouseMoveDisposable.dispose === 'function') {
+        bootstrap.editorMouseMoveDisposable.dispose();
+      }
+    } catch (ePreviewHoverBootstrapEditorMove) {}
+    try {
+      if (bootstrap.editorDisposeDisposable &&
+          typeof bootstrap.editorDisposeDisposable.dispose === 'function') {
+        bootstrap.editorDisposeDisposable.dispose();
+      }
+    } catch (ePreviewHoverBootstrapEditorDispose) {}
+    try {
+      if (bootstrap.editorDom && bootstrap.handler) {
+        bootstrap.editorDom.removeEventListener('mouseenter', bootstrap.handler, true);
+        bootstrap.editorDom.removeEventListener('mousemove', bootstrap.handler, false);
+      }
+    } catch (ePreviewHoverBootstrapDomMove) {}
+  }
+
+  function disposePreviewHoverTransitGuard(editor, reason) {
+    disposePreviewHoverTransitBootstrap(editor);
+    var guard = state.previewHoverTransitGuard;
+    if (!guard || (editor && guard.editor !== editor)) { return; }
+    state.previewHoverTransitStatus = 'disposed:' + String(reason || 'unspecified');
+    state.previewHoverTransitGuard = null;
+    guard.disposed = true;
+    if (guard.timer) {
+      try { clearTimeout(guard.timer); } catch (ePreviewHoverGuardTimer) {}
+      guard.timer = null;
+    }
+    var listeners = guard.listeners || [];
+    for (var li = listeners.length - 1; li >= 0; li--) {
+      try {
+        listeners[li].target.removeEventListener(
+          listeners[li].type,
+          listeners[li].handler,
+          listeners[li].capture
+        );
+      } catch (ePreviewHoverGuardListener) {}
+    }
+    guard.listeners = [];
+    try {
+      if (guard.hoverContentsDisposable && typeof guard.hoverContentsDisposable.dispose === 'function') {
+        guard.hoverContentsDisposable.dispose();
+      }
+    } catch (ePreviewHoverContentsDispose) {}
+    guard.hoverContentsDisposable = null;
+    try {
+      var leavePatch = guard.hoverWidgetLeavePatch;
+      if (leavePatch && leavePatch.widget &&
+          leavePatch.widget._onMouseLeave === leavePatch.wrapped) {
+        leavePatch.widget._onMouseLeave = leavePatch.original;
+      }
+    } catch (ePreviewHoverWidgetLeaveRestore) {}
+    guard.hoverWidgetLeavePatch = null;
+    try {
+      if (guard.editorDisposeDisposable && typeof guard.editorDisposeDisposable.dispose === 'function') {
+        guard.editorDisposeDisposable.dispose();
+      }
+    } catch (ePreviewHoverGuardEditorDispose) {}
+    guard.editorDisposeDisposable = null;
+    if (guard.holding && guard.controller) {
+      try {
+        guard.controller.shouldKeepOpenOnEditorMouseMoveOrLeave = guard.previousKeepOpen;
+      } catch (ePreviewHoverGuardRestore) {}
+    }
+    guard.holding = false;
+  }
+
+  function schedulePreviewHoverTransitBootstrap(editor) {
+    var existing = state.previewHoverTransitBootstrap;
+    if (existing && existing.editor === editor) { return; }
+    disposePreviewHoverTransitBootstrap();
+    var editorDom = null;
+    try { editorDom = editor && editor.getDomNode && editor.getDomNode(); } catch (ePreviewHoverBootstrapDom) {}
+    var bootstrap = {
+      editor: editor,
+      editorDom: null,
+      handler: null,
+      editorMouseMoveDisposable: null,
+      editorDisposeDisposable: null,
+      timer: null,
+      disposed: false,
+    };
+    state.previewHoverTransitBootstrap = bootstrap;
+    state.previewHoverTransitStatus = 'bootstrapping';
+    function attempt() {
+      bootstrap.timer = null;
+      if (bootstrap.disposed) { return; }
+      if (state.previewMonacoEditor !== editor && state.monacoEditor !== editor) {
+        disposePreviewHoverTransitBootstrap(editor);
+        return;
+      }
+      if (installPreviewHoverTransitGuard(editor, true)) {
+        disposePreviewHoverTransitBootstrap(editor);
+      }
+    }
+    function queueAttempt() {
+      if (bootstrap.disposed || bootstrap.timer) { return; }
+      bootstrap.timer = setTimeout(attempt, 0);
+    }
+    bootstrap.handler = queueAttempt;
+    if (editorDom && typeof editorDom.addEventListener === 'function') {
+      bootstrap.editorDom = editorDom;
+      editorDom.addEventListener('mouseenter', queueAttempt, true);
+      editorDom.addEventListener('mousemove', queueAttempt, false);
+    }
+    try {
+      if (typeof editor.onMouseMove === 'function') {
+        bootstrap.editorMouseMoveDisposable = editor.onMouseMove(queueAttempt);
+      }
+    } catch (ePreviewHoverBootstrapMonacoMove) {}
+    try {
+      if (typeof editor.onDidDispose === 'function') {
+        bootstrap.editorDisposeDisposable = editor.onDidDispose(function () {
+          disposePreviewHoverTransitBootstrap(editor);
+        });
+      }
+    } catch (ePreviewHoverBootstrapDisposeWire) {}
+    queueAttempt();
+  }
+
+  function installPreviewHoverTransitGuard(editor, skipBootstrap) {
+    state.previewHoverTransitStatus = 'installing';
+    if (!editor || typeof editor.getDomNode !== 'function' || typeof editor.getContribution !== 'function') {
+      state.previewHoverTransitStatus = 'waiting-editor-api';
+      if (editor && !skipBootstrap) { schedulePreviewHoverTransitBootstrap(editor); }
+      return false;
+    }
+    var controller = null;
+    var contributionIds = ['editor.contrib.contentHover', 'editor.contrib.hover'];
+    for (var ci = 0; ci < contributionIds.length; ci++) {
+      try {
+        var candidate = editor.getContribution(contributionIds[ci]);
+        if (candidate && 'shouldKeepOpenOnEditorMouseMoveOrLeave' in candidate) {
+          controller = candidate;
+          break;
+        }
+      } catch (ePreviewHoverContribution) {}
+    }
+    if (!controller) {
+      state.previewHoverTransitStatus = 'waiting-contribution';
+      if (!skipBootstrap) { schedulePreviewHoverTransitBootstrap(editor); }
+      return false;
+    }
+    var editorDom = null;
+    try { editorDom = editor.getDomNode(); } catch (ePreviewHoverEditorDom) {}
+    if (!editorDom || typeof editorDom.addEventListener !== 'function') {
+      state.previewHoverTransitStatus = 'waiting-editor-dom';
+      if (!skipBootstrap) { schedulePreviewHoverTransitBootstrap(editor); }
+      return false;
+    }
+    var shadowRoot = state.monacoEditor === editor ? state.monacoShadowRoot : null;
+    var ownsPreviewOverflow = state.previewMonacoEditor === editor || state.monacoEditor === editor;
+    var overflowRoot = ownsPreviewOverflow ? findPreviewOverflowRootForInstance() : null;
+    var surfaceDom = state.monacoEditor === editor
+      ? (state.monacoHost || editorDom)
+      : (state.previewMonacoHost || editorDom);
+    var existing = state.previewHoverTransitGuard;
+    if (existing && existing.editor === editor && existing.controller === controller &&
+        existing.editorDom === editorDom && existing.shadowRoot === shadowRoot &&
+        existing.overflowRoot === overflowRoot && existing.surfaceDom === surfaceDom) {
+      disposePreviewHoverTransitBootstrap(editor);
+      state.previewHoverTransitStatus = 'installed';
+      return true;
+    }
+    disposePreviewHoverTransitGuard(null, 'replace');
+
+    var guard = {
+      editor: editor,
+      controller: controller,
+      editorDom: editorDom,
+      surfaceDom: surfaceDom,
+      shadowRoot: shadowRoot,
+      overflowRoot: overflowRoot,
+      previousKeepOpen: controller.shouldKeepOpenOnEditorMouseMoveOrLeave === true,
+      holding: false,
+      pointerInEditor: false,
+      pointerInHover: false,
+      timer: null,
+      listeners: [],
+      editorDisposeDisposable: null,
+      hoverContentsDisposable: null,
+      hoverWidgetLeavePatch: null,
+      lastEvent: 'installed',
+      disposed: false,
+    };
+    state.previewHoverTransitGuard = guard;
+    state.previewHoverTransitStatus = 'installed';
+    try {
+      if (typeof editor.onDidDispose === 'function') {
+        guard.editorDisposeDisposable = editor.onDidDispose(function () {
+          disposePreviewHoverTransitGuard(editor, 'editor-dispose');
+        });
+      }
+    } catch (ePreviewHoverGuardEditorDisposeWire) {}
+
+    function listen(target, type, handler, capture) {
+      if (!target || typeof target.addEventListener !== 'function') { return; }
+      target.addEventListener(type, handler, capture);
+      guard.listeners.push({ target: target, type: type, handler: handler, capture: capture });
+    }
+
+    function clearTimer() {
+      if (!guard.timer) { return; }
+      try { clearTimeout(guard.timer); } catch (ePreviewHoverTransitClear) {}
+      guard.timer = null;
+    }
+
+    function hold() {
+      if (guard.disposed) { return false; }
+      try {
+        guard.controller.shouldKeepOpenOnEditorMouseMoveOrLeave = true;
+        guard.holding = true;
+        return true;
+      } catch (ePreviewHoverTransitHold) {
+        return false;
+      }
+    }
+
+    function restore() {
+      clearTimer();
+      if (!guard.holding) { return; }
+      guard.holding = false;
+      try {
+        guard.controller.shouldKeepOpenOnEditorMouseMoveOrLeave = guard.previousKeepOpen;
+      } catch (ePreviewHoverTransitRestore) {}
+    }
+
+    function dismissAfterTransit() {
+      guard.lastEvent = 'dismiss-timer';
+      guard.timer = null;
+      if (guard.disposed) { return; }
+      if (guard.pointerInEditor || guard.pointerInHover) {
+        restore();
+        return;
+      }
+      var preserveByDefault = guard.previousKeepOpen;
+      if (guard.holding) {
+        guard.holding = false;
+        try {
+          guard.controller.shouldKeepOpenOnEditorMouseMoveOrLeave = preserveByDefault;
+        } catch (ePreviewHoverTransitRelease) {}
+      }
+      if (preserveByDefault || !previewHoverControllerIsVisible(guard.controller, guard)) { return; }
+      try {
+        if (typeof guard.controller._hideWidgets === 'function') {
+          guard.controller._hideWidgets();
+          return;
+        }
+      } catch (ePreviewHoverTransitHideWidgets) {}
+      try {
+        var widget = guard.controller._contentWidget || guard.controller._contentHoverWidget;
+        if (widget && typeof widget.hide === 'function') { widget.hide(); }
+      } catch (ePreviewHoverTransitHideWidget) {}
+    }
+
+    function armDismiss() {
+      clearTimer();
+      if (!hold()) { return; }
+      guard.timer = setTimeout(dismissAfterTransit, PREVIEW_HOVER_HIDE_DELAY_MS);
+    }
+
+    function installHoverWidgetLeavePatch() {
+      var widget = null;
+      try { widget = guard.controller && guard.controller._contentWidget; }
+      catch (ePreviewHoverWidgetRead) {}
+      if (!widget || typeof widget._onMouseLeave !== 'function') { return; }
+      var existingPatch = guard.hoverWidgetLeavePatch;
+      if (existingPatch && existingPatch.widget === widget &&
+          widget._onMouseLeave === existingPatch.wrapped) {
+        return;
+      }
+      try {
+        if (existingPatch && existingPatch.widget &&
+            existingPatch.widget._onMouseLeave === existingPatch.wrapped) {
+          existingPatch.widget._onMouseLeave = existingPatch.original;
+        }
+      } catch (ePreviewHoverPriorLeaveRestore) {}
+      var original = widget._onMouseLeave;
+      var wrapped = function (event) {
+        guard.lastEvent = 'widget-leave';
+        if (guard.disposed) { return original.call(widget, event); }
+        var browserEvent = event && event.browserEvent ? event.browserEvent : event;
+        guard.pointerInHover = false;
+        guard.pointerInEditor = previewHoverEventPointInsideEditor(guard, browserEvent || event);
+        if (guard.pointerInEditor) {
+          restore();
+          return original.call(widget, event);
+        }
+        if (previewHoverControllerIsVisible(guard.controller, guard)) {
+          armDismiss();
+          return;
+        }
+        restore();
+        return original.call(widget, event);
+      };
+      try {
+        widget._onMouseLeave = wrapped;
+        guard.hoverWidgetLeavePatch = {
+          widget: widget,
+          original: original,
+          wrapped: wrapped,
+        };
+      } catch (ePreviewHoverWidgetLeavePatch) {}
+    }
+
+    function onEditorMouseLeave(event) {
+      guard.lastEvent = 'editor-leave';
+      guard.pointerInEditor = false;
+      guard.pointerInHover = !!previewHoverBelongsToGuard(guard, event && event.relatedTarget);
+      if (!previewHoverControllerIsVisible(guard.controller, guard)) {
+        restore();
+        return;
+      }
+      if (guard.pointerInHover) {
+        hold();
+        clearTimer();
+        return;
+      }
+      armDismiss();
+    }
+
+    function onEditorMouseEnter(event) {
+      guard.lastEvent = 'editor-enter';
+      guard.pointerInEditor = previewHoverEventPointInsideEditor(guard, event);
+      guard.pointerInHover = false;
+      if (guard.pointerInEditor) {
+        restore();
+      } else if (previewHoverControllerIsVisible(guard.controller, guard)) {
+        armDismiss();
+      } else {
+        restore();
+      }
+    }
+
+    function onHoverMouseOver(event) {
+      if (!previewHoverBelongsToGuard(guard, event && event.target)) { return; }
+      guard.lastEvent = 'hover-over';
+      guard.pointerInHover = true;
+      guard.pointerInEditor = previewHoverEventPointInsideEditor(guard, event);
+      // The capture-phase editor leave has already been skipped by the time
+      // the pointer reaches the popup. Hand control back to Monaco here so
+      // Escape, scrolling, or a model change can close the widget without
+      // leaving the controller permanently frozen in keep-open mode.
+      restore();
+    }
+
+    function onHoverMouseOut(event) {
+      if (!previewHoverBelongsToGuard(guard, event && event.target)) { return; }
+      if (previewHoverBelongsToGuard(guard, event && event.relatedTarget)) { return; }
+      guard.lastEvent = 'hover-out';
+      guard.pointerInHover = false;
+      guard.pointerInEditor = previewHoverEventPointInsideEditor(guard, event);
+      if (guard.pointerInEditor) {
+        restore();
+        return;
+      }
+      if (previewHoverControllerIsVisible(guard.controller, guard)) { armDismiss(); }
+      else { restore(); }
+    }
+
+    function onDetachedHoverMouseMove(event) {
+      if (!previewHoverEventBelongsToGuard(guard, event)) { return; }
+      guard.pointerInHover = true;
+      // Native overflow widgets live outside editorDom. Monaco also watches
+      // document mousemove and may synthesize an editor leave after the popup's
+      // own event handlers run. Keep this one dispatch open through bubbling,
+      // then release in a microtask so normal Escape/model/scroll dismissal is
+      // never blocked beyond the current event.
+      hold();
+      Promise.resolve().then(function () {
+        if (!guard.disposed && guard.pointerInHover) { restore(); }
+      });
+    }
+
+    function onDocumentMouseMove(event) {
+      installHoverWidgetLeavePatch();
+      if (!guard.pointerInHover && previewHoverEventInsideEditorDom(guard, event)) {
+        guard.pointerInEditor = true;
+        restore();
+        return;
+      }
+      // Fast path: most document moves happen while no preview-hover transit is
+      // active. Lazy Monaco contributions can install after mouseenter, so a
+      // visible controller also activates recovery even when all flags are
+      // still false on the first move outside.
+      if (!guard.pointerInEditor && !guard.pointerInHover && !guard.holding &&
+          !previewHoverControllerReportsVisible(guard.controller)) {
+        return;
+      }
+      var overHover = !!previewHoverEventBelongsToGuard(guard, event);
+      var insideEditor = previewHoverEventPointInsideEditor(guard, event);
+      if (overHover) {
+        guard.pointerInHover = true;
+        guard.pointerInEditor = insideEditor;
+        return;
+      }
+      if (insideEditor) {
+        guard.pointerInEditor = true;
+        guard.pointerInHover = false;
+        restore();
+        return;
+      }
+      guard.pointerInEditor = false;
+      guard.pointerInHover = false;
+      guard.lastEvent = 'document-outside';
+      if (previewHoverControllerIsVisible(guard.controller, guard)) {
+        if (!guard.timer) { armDismiss(); }
+      }
+      else { restore(); }
+    }
+
+    // Monaco's hover option applies hidingDelay to editor-internal mousemove,
+    // but its editor mouseleave path hides synchronously. Capture the DOM leave
+    // first so both a detached native overflow widget and a Shadow DOM widget
+    // get a real transit window before Monaco observes the same leave.
+    listen(editorDom, 'mouseleave', onEditorMouseLeave, true);
+    listen(editorDom, 'mouseenter', onEditorMouseEnter, true);
+    listen(shadowRoot, 'mouseover', onHoverMouseOver, true);
+    listen(shadowRoot, 'mouseout', onHoverMouseOut, true);
+    listen(overflowRoot, 'mouseover', onHoverMouseOver, true);
+    listen(overflowRoot, 'mouseout', onHoverMouseOut, true);
+    listen(overflowRoot, 'mousemove', onDetachedHoverMouseMove, true);
+    listen(document, 'mousemove', onDocumentMouseMove, true);
+    try {
+      var hoverContentsEvent = guard.controller.onHoverContentsChanged;
+      if (typeof hoverContentsEvent !== 'function' && guard.controller._onHoverContentsChanged) {
+        hoverContentsEvent = guard.controller._onHoverContentsChanged.event;
+      }
+      if (typeof hoverContentsEvent === 'function') {
+        guard.hoverContentsDisposable = hoverContentsEvent(function () {
+          installHoverWidgetLeavePatch();
+        });
+      }
+    } catch (ePreviewHoverContentsWire) {}
+    installHoverWidgetLeavePatch();
+    return true;
+  }
+
   function wirePreviewMonacoEditor(editor) {
     registerPreviewSaveKeybinding(editor);
     syncPreviewSaveButton();
@@ -9471,6 +10189,7 @@ export function getRendererPatchScript(
     } catch (eOptions) {
       send({ type: 'log', msg: 'preview editor option refresh failed: ' + (eOptions && eOptions.message) });
     }
+    installPreviewHoverTransitGuard(editor);
     attachPreviewDirtyListener(editor);
     wirePreviewMonacoDiagnostics(editor);
     wirePreviewMonacoHealObserver(editor, state.previewMonacoHost);
@@ -9842,7 +10561,11 @@ export function getRendererPatchScript(
     state.previewMonacoKeydownListener = null;
     state.previewMonacoSaveEditor = null;
     if (state.previewMonacoEditor) {
-      try { state.previewMonacoEditor.dispose(); } catch (e) {}
+      disposePreviewHoverTransitGuard(state.previewMonacoEditor, 'native-dispose');
+      var nativeDisposeFailed = false;
+      try { state.previewMonacoEditor.dispose(); }
+      catch (e) { nativeDisposeFailed = true; }
+      if (nativeDisposeFailed) { abandonPreviewOverflowRoot(); }
     }
     if (state.previewMonacoHost && state.previewMonacoHost.parentElement) {
       try { state.previewMonacoHost.parentElement.removeChild(state.previewMonacoHost); } catch (e) {}
@@ -11573,6 +12296,7 @@ export function getRendererPatchScript(
     }
     clearPreviewMonacoCallGraphInlays();
     var editor = state.monacoEditor;
+    disposePreviewHoverTransitGuard(editor, 'standalone-dispose');
     try {
       if (state.monacoChangeListener && state.monacoChangeListener.dispose) {
         state.monacoChangeListener.dispose();
@@ -11592,7 +12316,10 @@ export function getRendererPatchScript(
     var model = null;
     try { model = editor && editor.getModel && editor.getModel(); } catch (eModel) {}
     if (editor) {
-      try { editor.dispose(); } catch (eEditor) {}
+      var standaloneDisposeFailed = false;
+      try { editor.dispose(); }
+      catch (eEditor) { standaloneDisposeFailed = true; }
+      if (standaloneDisposeFailed) { abandonPreviewOverflowRoot(); }
     }
     releaseStandalonePreviewModel(state.standaloneOwnedModel || model);
     state.standaloneOwnedModel = null;
@@ -11617,7 +12344,7 @@ export function getRendererPatchScript(
     try {
       var classes = ((document.documentElement && document.documentElement.className) || '') + ' ' +
         ((document.body && document.body.className) || '');
-      var workbench = document.querySelector('.monaco-workbench');
+      var workbench = document.querySelector('.monaco-workbench:not(.ij-find-preview-overflow-root)');
       if (workbench) { classes += ' ' + String(workbench.className || ''); }
       var themeKind = (document.documentElement && document.documentElement.getAttribute('data-vscode-theme-kind')) ||
         (document.body && document.body.getAttribute('data-vscode-theme-kind')) || '';
@@ -11639,6 +12366,8 @@ export function getRendererPatchScript(
           typeof api.editor.setTheme === 'function') {
         api.editor.setTheme(nextTheme);
       }
+      var overflowRoot = findPreviewOverflowRootForInstance();
+      if (overflowRoot) { syncPreviewOverflowTheme(overflowRoot); }
       state.standaloneMonacoTheme = nextTheme;
       return nextTheme;
     } catch (eSyncStandaloneTheme) {
@@ -11653,7 +12382,7 @@ export function getRendererPatchScript(
         if (!state.monacoEditor || !state.monacoHost || !state.monacoHost.isConnected) { return; }
         syncStandaloneMonacoTheme(api);
       });
-      var workbench = document.querySelector('.monaco-workbench');
+      var workbench = document.querySelector('.monaco-workbench:not(.ij-find-preview-overflow-root)');
       if (workbench) { observer.observe(workbench, { attributes: true, attributeFilter: ['class', 'data-vscode-theme-kind'] }); }
       if (document.documentElement) { observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'data-vscode-theme-kind'] }); }
       if (document.body) { observer.observe(document.body, { attributes: true, attributeFilter: ['class', 'data-vscode-theme-kind'] }); }
@@ -11720,6 +12449,14 @@ export function getRendererPatchScript(
     if (state.monacoEditor && state.monacoHost && state.monacoHost.parentElement === $previewBody &&
         state.monacoEditorHost && state.monacoEditorHost.isConnected) {
       syncStandaloneMonacoTheme(api);
+      try {
+        state.monacoEditor.updateOptions({
+          fixedOverflowWidgets: true,
+          overflowWidgetsDomNode: getOrCreatePreviewOverflowHost(),
+          hover: previewHoverOptions(),
+        });
+      } catch (eStandaloneHoverOptionsReuse) {}
+      installPreviewHoverTransitGuard(state.monacoEditor);
       send({ type: 'log', msg: 'reusing existing monaco editor' });
       return state.monacoEditor;
     }
@@ -11760,6 +12497,7 @@ export function getRendererPatchScript(
     var editor;
     try {
       var standaloneTheme = standaloneMonacoThemeForDocument();
+      var standaloneOverflowHost = getOrCreatePreviewOverflowHost();
       host.style.colorScheme = standaloneTheme === 'vs-dark' || standaloneTheme === 'hc-black' ? 'dark' : 'light';
       editor = api.editor.create(editorHost, {
         model: null,
@@ -11777,6 +12515,8 @@ export function getRendererPatchScript(
         fontSize: 12,
         renderLineHighlight: 'all',
         occurrencesHighlight: true,
+        fixedOverflowWidgets: true,
+        overflowWidgetsDomNode: standaloneOverflowHost,
         hover: previewHoverOptions(),
         inlayHints: previewInlayHintsOptions(),
         overviewRulerLanes: 3,
@@ -11797,6 +12537,7 @@ export function getRendererPatchScript(
       throw e;
     }
     state.monacoEditor = editor;
+    installPreviewHoverTransitGuard(editor);
     state.standaloneMonacoTheme = standaloneMonacoThemeForDocument();
     observeStandaloneMonacoTheme(api);
     try {
@@ -12603,8 +13344,12 @@ export function getRendererPatchScript(
         if (previewOverflowRoot && !shouldShell) {
           document.body.appendChild(previewOverflowRoot);
           syncPreviewOverflowTheme(previewOverflowRoot);
+          syncPreviewOverflowStacking(previewOverflowRoot);
         }
 	      } catch (e) {}
+      if (!shouldShell) {
+        installPreviewHoverTransitGuard(state.previewMonacoEditor || state.monacoEditor);
+      }
       trace('show:visible', { wasVisible: !!wasVisible });
       // Background pre-warm of the preview Monaco editor (B-path). Captain
       // log measured the first cold createPreviewEditor at ~124ms; once we
@@ -12773,11 +13518,13 @@ export function getRendererPatchScript(
     // relevant — the next show will reschedule.
     try { cancelPrewarmRetry(); } catch (eCancelWarm) {}
     trace('hide:preserved-preview-editor', { hadEditor: !!preservedEditor });
-    // Each panel instance owns its own overflow root (overflow widgets
-    // anchored to document.body, separate from the panel's subtree). When
-    // a spawned/additional panel is closed forever, its overflow root must
-    // be torn down. The main instance's overflow root will be lazily
-    // recreated by getOrCreatePreviewOverflowHost on next show.
+    dismissPreviewMonacoHover(state.previewMonacoEditor || state.monacoEditor);
+    disposePreviewHoverTransitGuard(null, 'hide');
+    // Each panel instance owns its own body-level overflow root. Detach it
+    // while hidden, but retain the exact node: Monaco captures
+    // overflowWidgetsDomNode in the editor constructor and updateOptions
+    // cannot replace it. getOrCreatePreviewOverflowHost reattaches this same
+    // root on the next render, preserving hover/suggest after hide/show.
     try {
       var previewOverflowRoot = findPreviewOverflowRootForInstance();
       if (previewOverflowRoot && previewOverflowRoot.parentElement) {
@@ -12939,6 +13686,23 @@ export function getRendererPatchScript(
 	        previewEngineBadgeAriaLabel: $previewEngineBadge && !$previewEngineBadge.hidden
 	          ? $previewEngineBadge.getAttribute('aria-label')
 	          : null,
+	        previewHoverTransit: (function () {
+	          var guard = state.previewHoverTransitGuard;
+	          var bootstrap = state.previewHoverTransitBootstrap;
+	          return {
+	            installed: !!guard,
+	            bootstrapping: !!bootstrap,
+	            holding: !!(guard && guard.holding),
+	            pointerInEditor: !!(guard && guard.pointerInEditor),
+	            pointerInHover: !!(guard && guard.pointerInHover),
+	            timerPending: !!(guard && guard.timer),
+	            leavePatched: !!(guard && guard.hoverWidgetLeavePatch),
+	            controllerKeepOpen: !!(guard && guard.controller &&
+	              guard.controller.shouldKeepOpenOnEditorMouseMoveOrLeave),
+	            lastEvent: guard ? String(guard.lastEvent || '') : '',
+	            status: state.previewHoverTransitStatus || '',
+	          };
+	        })(),
 	        previewUri: state.previewUri || null,
 	        previewDirty: !!state.previewDirty,
 	        previewCanSave: canSavePreviewContent(),

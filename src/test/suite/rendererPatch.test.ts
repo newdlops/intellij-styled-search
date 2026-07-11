@@ -63,6 +63,62 @@ suite('Renderer patch source', () => {
         script.includes('disposeStandaloneShadowMouseMoveBoundary();'),
       'the boundary listener should be removed when the bundled editor is disposed or creation fails',
     );
+    assert.ok(
+      script.includes("listen(editorDom, 'mouseleave', onEditorMouseLeave, true)") &&
+        script.includes('guard.controller.shouldKeepOpenOnEditorMouseMoveOrLeave = true') &&
+        script.includes('setTimeout(dismissAfterTransit, PREVIEW_HOVER_HIDE_DELAY_MS)'),
+      'an editor leave should keep a visible hover alive for the editor-to-widget transit window',
+    );
+    assert.ok(
+      script.includes("listen(overflowRoot, 'mouseover', onHoverMouseOver, true)") &&
+        script.includes("listen(overflowRoot, 'mousemove', onDetachedHoverMouseMove, true)") &&
+        script.includes("listen(document, 'mousemove', onDocumentMouseMove, true)") &&
+        script.includes("listen(shadowRoot, 'mouseover', onHoverMouseOver, true)") &&
+        script.includes('widget._onMouseLeave = wrapped') &&
+        script.includes('guard.hoverContentsDisposable = hoverContentsEvent(function ()') &&
+        script.includes("disposePreviewHoverTransitGuard(editor, 'standalone-dispose')"),
+      'native overflow and bundled Shadow DOM hover widgets should cancel transit dismissal and clean up with their editor',
+    );
+    assert.ok(
+      script.includes('var standaloneOverflowHost = getOrCreatePreviewOverflowHost();') &&
+        script.includes('overflowWidgetsDomNode: standaloneOverflowHost') &&
+        script.includes('var ownsPreviewOverflow = state.previewMonacoEditor === editor || state.monacoEditor === editor;'),
+      'bundled Monaco widgets should use the same unclipped body-level overflow host as captured native Monaco',
+    );
+    assert.ok(
+      script.includes("var retained = typeof state !== 'undefined' && state && state.previewOverflowRoot;") &&
+        script.includes('state.previewOverflowRoot = root;') &&
+        script.includes('document.body.appendChild(previewOverflowRoot);') &&
+        script.includes("root.style.setProperty('z-index', String(panelZ + 20), 'important');"),
+      'hide/show should reattach the constructor-bound overflow node instead of replacing it on a retained editor',
+    );
+    assert.ok(
+      script.includes("var themeClasses = ['vs', 'vs-dark', 'hc-black', 'hc-light'];") &&
+        script.includes('function ensurePreviewOverflowThemeObserver()') &&
+        script.includes('syncPreviewOverflowTheme(overflowRoot);') &&
+        script.includes("observer.observe(document.head, { childList: true, characterData: true, subtree: true });"),
+      'detached widgets should track normal, dark, and high-contrast workbench theme changes',
+    );
+    assert.ok(
+      script.includes('dismissPreviewMonacoHover(state.previewMonacoEditor || state.monacoEditor);') &&
+        script.includes("disposePreviewHoverTransitGuard(editor, 'native-heal')") &&
+        script.includes('try { editor.dispose(); }') &&
+        script.includes('if (nativeDisposeFailed) { abandonPreviewOverflowRoot(); }') &&
+        script.includes('if (standaloneDisposeFailed) { abandonPreviewOverflowRoot(); }'),
+      'hide/minimize and native self-heal should dismiss stale hover state and release the old editor',
+    );
+    assert.ok(
+      script.includes('schedulePreviewHoverTransitBootstrap(editor)') &&
+        script.includes('bootstrap.editorMouseMoveDisposable = editor.onMouseMove(queueAttempt)') &&
+        script.includes('bootstrap.editorDisposeDisposable = editor.onDidDispose(function ()'),
+      'lazy hover contributions should install on first movement and release their bootstrap on editor disposal',
+    );
+    assert.ok(
+      script.includes("disposePreviewHoverTransitGuard(editor, 'editor-dispose')") &&
+        script.includes("disposePreviewHoverTransitGuard(null, 'minimize')") &&
+        script.includes('installPreviewHoverTransitGuard(state.previewMonacoEditor || state.monacoEditor)'),
+      'editor disposal and panel minimization should release the guard, with restore wiring it again',
+    );
   });
 
   test('keeps bundled-to-native promotion bounded, dirty-safe, and recoverable', () => {

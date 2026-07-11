@@ -1454,6 +1454,13 @@ suite('Renderer — overlay UI probes', () => {
           });
           if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
           var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          function bundledWidgetNodes(shadowRoot, selector) {
+            var nodes = shadowRoot ? Array.from(shadowRoot.querySelectorAll(selector)) : [];
+            var overflowRoot = Array.from(document.querySelectorAll('.ij-find-preview-overflow-root')).find(function (node) {
+              return node.getAttribute('data-ij-find-src') === targetSrc;
+            });
+            return overflowRoot ? nodes.concat(Array.from(overflowRoot.querySelectorAll(selector))) : nodes;
+          }
           var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
           window.__ijFindDisableMonacoProbes = true;
           try {
@@ -1507,7 +1514,10 @@ suite('Renderer — overlay UI probes', () => {
               editor.trigger('ijss-test', 'editor.action.showHover', {});
               var hoverDeadline = performance.now() + 6000;
               while (performance.now() < hoverDeadline) {
-                var hoverNodes = shadowRoot.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget');
+                var hoverNodes = bundledWidgetNodes(
+                  shadowRoot,
+                  '.monaco-hover,.monaco-editor-hover,.content-hover-widget'
+                );
                 hoverText = '';
                 for (var hoverIdx = 0; hoverIdx < hoverNodes.length; hoverIdx++) {
                   hoverText += ' ' + String(hoverNodes[hoverIdx].textContent || '');
@@ -1527,7 +1537,7 @@ suite('Renderer — overlay UI probes', () => {
               editor.trigger('ijss-test', 'editor.action.triggerSuggest', {});
               var completionDeadline = performance.now() + 6000;
               while (performance.now() < completionDeadline) {
-                var suggestNodes = shadowRoot.querySelectorAll('.suggest-widget,.monaco-list-row');
+                var suggestNodes = bundledWidgetNodes(shadowRoot, '.suggest-widget,.monaco-list-row');
                 completionText = '';
                 for (var suggestIdx = 0; suggestIdx < suggestNodes.length; suggestIdx++) {
                   completionText += ' ' + String(suggestNodes[suggestIdx].textContent || '');
@@ -1824,28 +1834,92 @@ suite('Renderer — overlay UI probes', () => {
           var targetSrc = root.getAttribute('data-ij-find-src') || '';
           var marker = ${JSON.stringify(hoverMarker)};
           var hoverText = '';
+          var hoverX = null;
+          var hoverY = null;
+          var activeHoverRect = null;
           var deadline = performance.now() + 8000;
           while (performance.now() < deadline) {
             var host = root.querySelector('.ij-find-monaco-host');
             var shadowRoot = host && host.shadowRoot;
-            var hoverNodes = shadowRoot
-              ? shadowRoot.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget')
-              : [];
+            var overflowRoot = Array.from(document.querySelectorAll('.ij-find-preview-overflow-root')).find(function (node) {
+              return node.getAttribute('data-ij-find-src') === targetSrc;
+            });
+            var hoverNodes = [];
+            if (shadowRoot) {
+              hoverNodes = hoverNodes.concat(Array.from(
+                shadowRoot.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget')
+              ));
+            }
+            if (overflowRoot) {
+              hoverNodes = hoverNodes.concat(Array.from(
+                overflowRoot.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget')
+              ));
+            }
             hoverText = '';
             for (var i = 0; i < hoverNodes.length; i++) {
-              hoverText += ' ' + String(hoverNodes[i].textContent || '');
+              var hoverNode = hoverNodes[i];
+              var nodeText = String(hoverNode.textContent || '');
+              hoverText += ' ' + nodeText;
+              var hoverRect = hoverNode.getBoundingClientRect();
+              var hoverStyle = getComputedStyle(hoverNode);
+              if (nodeText.indexOf(marker) >= 0 &&
+                  hoverRect.width > 0 && hoverRect.height > 0 &&
+                  !hoverNode.classList.contains('hidden') &&
+                  hoverStyle.display !== 'none' && hoverStyle.visibility !== 'hidden') {
+                hoverX = Math.round(hoverRect.left + Math.min(hoverRect.width - 2, Math.max(2, hoverRect.width / 2)));
+                hoverY = Math.round(hoverRect.top + Math.min(hoverRect.height - 2, Math.max(2, hoverRect.height / 2)));
+                activeHoverRect = hoverRect;
+              }
             }
-            if (hoverText.indexOf(marker) >= 0) { break; }
+            if (hoverText.indexOf(marker) >= 0 && hoverX !== null && hoverY !== null) { break; }
             await new Promise(function (resolve) { setTimeout(resolve, 25); });
           }
           var probe = window.__ijFindTrustedPointerHoverProbe || {};
+          var editorRect = probe.editorDom && probe.editorDom.getBoundingClientRect
+            ? probe.editorDom.getBoundingClientRect()
+            : null;
+          var queryNode = root.querySelector('.ij-find-query');
+          var queryRect = queryNode && queryNode.getBoundingClientRect();
+          var closeNode = root.querySelector('.ij-find-close');
+          var closeRect = closeNode && closeNode.getBoundingClientRect();
+          var rootRect = root.getBoundingClientRect();
+          var dismissCandidates = [
+            queryRect ? { x: Math.round(queryRect.left + queryRect.width / 2), y: Math.round(queryRect.top + queryRect.height / 2) } : null,
+            closeRect ? { x: Math.round(closeRect.left + closeRect.width / 2), y: Math.round(closeRect.top + closeRect.height / 2) } : null,
+            { x: Math.round(rootRect.left + 12), y: Math.round(rootRect.top + 12) },
+            { x: 40, y: 80 },
+            { x: Math.max(40, window.innerWidth - 40), y: 80 },
+            { x: 40, y: Math.max(80, window.innerHeight - 40) },
+            { x: Math.max(40, window.innerWidth - 40), y: Math.max(80, window.innerHeight - 40) }
+          ];
+          var dismissPoint = { x: 40, y: 80 };
+          for (var di = 0; di < dismissCandidates.length; di++) {
+            var candidate = dismissCandidates[di];
+            if (!candidate || candidate.x < 2 || candidate.y < 2 ||
+                candidate.x >= window.innerWidth - 2 || candidate.y >= window.innerHeight - 2 ||
+                !document.elementFromPoint(candidate.x, candidate.y)) {
+              continue;
+            }
+            var inEditor = editorRect && candidate.x >= editorRect.left && candidate.x <= editorRect.right &&
+              candidate.y >= editorRect.top && candidate.y <= editorRect.bottom;
+            var inHover = activeHoverRect && candidate.x >= activeHoverRect.left && candidate.x <= activeHoverRect.right &&
+              candidate.y >= activeHoverRect.top && candidate.y <= activeHoverRect.bottom;
+            if (!inEditor && !inHover) {
+              dismissPoint = candidate;
+              break;
+            }
+          }
           var state = window.__ijFindGetSearchState(targetSrc);
           return JSON.stringify({
             engine: state && state.previewEngine,
             hoverText: hoverText,
             trustedMoves: probe.trustedMoves || 0,
             monacoMoves: probe.monacoMoves || 0,
-            lastMonacoPosition: probe.lastMonacoPosition || null
+            lastMonacoPosition: probe.lastMonacoPosition || null,
+            hoverX: hoverX,
+            hoverY: hoverY,
+            dismissX: dismissPoint.x,
+            dismissY: dismissPoint.y
           });
         })()`,
         20_000,
@@ -1857,6 +1931,10 @@ suite('Renderer — overlay UI probes', () => {
         trustedMoves?: number;
         monacoMoves?: number;
         lastMonacoPosition?: { lineNumber: number; column: number } | null;
+        hoverX?: number | null;
+        hoverY?: number | null;
+        dismissX?: number;
+        dismissY?: number;
       };
       assert.strictEqual(result.err, undefined, `trusted hover probe should remain mounted: ${resultRaw}`);
       assert.strictEqual(result.engine, 'standalone', `native recovery must not replace the bundled hover target during this test: ${resultRaw}`);
@@ -1870,9 +1948,292 @@ suite('Renderer — overlay UI probes', () => {
       assert.ok(hoverInvocations > 0, `trusted pointer movement must invoke the extension-host hover provider; input=${inputReport} result=${resultRaw}`);
       assert.ok((result.hoverText ?? '').includes(hoverMarker), `trusted pointer hover marker must render inside bundled Monaco; input=${inputReport} result=${resultRaw}`);
       assert.ok(
+        Number.isFinite(result.hoverX) && Number.isFinite(result.hoverY),
+        `the rendered hover popup must expose a trusted-input target: ${resultRaw}`,
+      );
+      assert.ok(
         hoverPositions.some((position) => position.line === 0 && position.character === 7),
         `hover provider must receive the exact identifier position under the trusted pointer: ${JSON.stringify(hoverPositions)} coordinates=${coordinateRaw}`,
       );
+
+      const leaveInputReport = await overlay.sendMouseMovesInActiveWindowForTests([
+        { x: coordinates.outsideX!, y: coordinates.outsideY! },
+      ], 0);
+      const transitRaw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing overlay after editor leave' }); }
+          await new Promise(function (resolve) { setTimeout(resolve, 150); });
+          var marker = ${JSON.stringify(hoverMarker)};
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          var host = root.querySelector('.ij-find-monaco-host');
+          var shadowRoot = host && host.shadowRoot;
+          var overflowRoot = Array.from(document.querySelectorAll('.ij-find-preview-overflow-root')).find(function (node) {
+            return node.getAttribute('data-ij-find-src') === targetSrc;
+          });
+          var hoverNodes = [];
+          if (shadowRoot) {
+            hoverNodes = hoverNodes.concat(Array.from(
+              shadowRoot.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget')
+            ));
+          }
+          if (overflowRoot) {
+            hoverNodes = hoverNodes.concat(Array.from(
+              overflowRoot.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget')
+            ));
+          }
+          var hoverText = '';
+          var hoverX = null;
+          var hoverY = null;
+          var hoverPresentation = null;
+          for (var i = 0; i < hoverNodes.length; i++) {
+            var node = hoverNodes[i];
+            var text = String(node.textContent || '');
+            var rect = node.getBoundingClientRect();
+            var style = getComputedStyle(node);
+            if (node.classList.contains('hidden') || rect.width <= 0 || rect.height <= 0 ||
+                style.display === 'none' || style.visibility === 'hidden') {
+              continue;
+            }
+            hoverText += ' ' + text;
+            if (text.indexOf(marker) >= 0) {
+              hoverX = Math.round(rect.left + Math.min(rect.width - 2, Math.max(2, rect.width / 2)));
+              hoverY = Math.round(rect.top + Math.min(rect.height - 2, Math.max(2, rect.height / 2)));
+              var presentationNode = node.closest && node.closest('.monaco-hover,.monaco-editor-hover,.content-hover-widget') || node;
+              var presentationStyle = getComputedStyle(presentationNode);
+              hoverPresentation = {
+                backgroundColor: String(presentationStyle.backgroundColor || ''),
+                color: String(presentationStyle.color || ''),
+                pointerEvents: String(presentationStyle.pointerEvents || ''),
+                position: String(presentationStyle.position || '')
+              };
+            }
+          }
+          var state = window.__ijFindGetSearchState(targetSrc);
+          var hoverHit = hoverX !== null && hoverY !== null
+            ? document.elementFromPoint(hoverX, hoverY)
+            : null;
+          return JSON.stringify({
+            hoverText: hoverText,
+            hoverX: hoverX,
+            hoverY: hoverY,
+            transit: state && state.previewHoverTransit,
+            hoverPresentation: hoverPresentation,
+            overflowZ: overflowRoot ? parseInt(getComputedStyle(overflowRoot).zIndex || '0', 10) : 0,
+            overflowVisible: overflowRoot ? getComputedStyle(overflowRoot).overflow === 'visible' : false,
+            panelZ: parseInt(getComputedStyle(root).zIndex || '0', 10),
+            hoverHit: hoverHit ? {
+              tag: String(hoverHit.tagName || ''),
+              className: String(hoverHit.className || ''),
+              inHover: !!(hoverHit.closest && hoverHit.closest('.monaco-hover,.monaco-editor-hover,.content-hover-widget'))
+            } : null
+          });
+        })()`,
+        10_000,
+      );
+      const transit = JSON.parse(transitRaw) as {
+        err?: string;
+        hoverText?: string;
+        hoverX?: number | null;
+        hoverY?: number | null;
+        transit?: { installed?: boolean; holding?: boolean; timerPending?: boolean };
+        hoverPresentation?: {
+          backgroundColor?: string;
+          color?: string;
+          pointerEvents?: string;
+          position?: string;
+        } | null;
+        overflowZ?: number;
+        overflowVisible?: boolean;
+        panelZ?: number;
+        hoverHit?: { inHover?: boolean } | null;
+      };
+      assert.strictEqual(transit.err, undefined, `hover leave probe should remain mounted: ${transitRaw}`);
+      assert.ok(
+        (transit.hoverText ?? '').includes(hoverMarker),
+        `leaving the editor must keep hover visible during the transit window; input=${leaveInputReport} result=${transitRaw}`,
+      );
+      assert.ok(
+        Number.isFinite(transit.hoverX) && Number.isFinite(transit.hoverY),
+        `the still-visible popup must expose a fresh transit target: ${transitRaw}`,
+      );
+      assert.strictEqual(transit.hoverHit?.inHover, true, `the body-level popup must remain hit-testable: ${transitRaw}`);
+      assert.ok(
+        (transit.overflowZ ?? 0) > (transit.panelZ ?? 0),
+        `the popup stacking root must stay above the focused panel: ${transitRaw}`,
+      );
+      assert.ok(
+        transit.hoverPresentation?.backgroundColor &&
+          transit.hoverPresentation.backgroundColor !== 'transparent' &&
+          transit.hoverPresentation.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
+          transit.hoverPresentation.color &&
+          transit.hoverPresentation.color !== 'transparent' &&
+          transit.hoverPresentation.pointerEvents !== 'none' &&
+          (transit.hoverPresentation.position === 'fixed' || transit.hoverPresentation.position === 'absolute') &&
+          transit.overflowVisible === true,
+        `the detached bundled hover must retain visible, interactive Monaco styling: ${transitRaw}`,
+      );
+      const transitInputReport = await overlay.sendMouseMovesInActiveWindowForTests([
+        { x: transit.hoverX!, y: transit.hoverY! },
+      ], 0);
+      const lifetimeRaw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing overlay during hover transit' }); }
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          function visibleHoverText() {
+            var host = root.querySelector('.ij-find-monaco-host');
+            var shadowRoot = host && host.shadowRoot;
+            var overflowRoot = Array.from(document.querySelectorAll('.ij-find-preview-overflow-root')).find(function (node) {
+              return node.getAttribute('data-ij-find-src') === targetSrc;
+            });
+            var hoverNodes = [];
+            if (shadowRoot) {
+              hoverNodes = hoverNodes.concat(Array.from(
+                shadowRoot.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget')
+              ));
+            }
+            if (overflowRoot) {
+              hoverNodes = hoverNodes.concat(Array.from(
+                overflowRoot.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget')
+              ));
+            }
+            var text = '';
+            for (var i = 0; i < hoverNodes.length; i++) {
+              var node = hoverNodes[i];
+              var rect = node.getBoundingClientRect();
+              var style = getComputedStyle(node);
+              if (node.classList.contains('hidden') || rect.width <= 0 || rect.height <= 0 ||
+                  style.display === 'none' || style.visibility === 'hidden') {
+                continue;
+              }
+              text += ' ' + String(node.textContent || '');
+            }
+            return text;
+          }
+          await new Promise(function (resolve) { setTimeout(resolve, 1400); });
+          var overPopup = visibleHoverText();
+          var state = window.__ijFindGetSearchState(targetSrc);
+          return JSON.stringify({
+            engine: state && state.previewEngine,
+            overPopup: overPopup,
+            transit: state && state.previewHoverTransit
+          });
+        })()`,
+        10_000,
+      );
+      const lifetime = JSON.parse(lifetimeRaw) as {
+        err?: string;
+        engine?: string;
+        overPopup?: string;
+        transit?: {
+          installed?: boolean;
+          bootstrapping?: boolean;
+          holding?: boolean;
+          pointerInHover?: boolean;
+          timerPending?: boolean;
+          status?: string;
+        };
+      };
+      assert.strictEqual(lifetime.err, undefined, `hover transit probe should remain mounted: ${lifetimeRaw}`);
+      assert.strictEqual(lifetime.engine, 'standalone', `hover transit must not switch preview engines: ${lifetimeRaw}`);
+      assert.strictEqual(lifetime.transit?.installed, true, `hover transit guard must be installed after the first trusted move: ${lifetimeRaw}`);
+      assert.ok(
+        (lifetime.overPopup ?? '').includes(hoverMarker),
+        `leaving the symbol for its popup must keep hover interactive beyond the hide delay; leave=${transitRaw} input=${transitInputReport} result=${lifetimeRaw}`,
+      );
+      assert.strictEqual(
+        lifetime.transit?.holding,
+        false,
+        `popup entry must release Monaco's temporary keep-open flag: ${lifetimeRaw}`,
+      );
+
+      const dismissInputReport = await overlay.sendMouseMovesInActiveWindowForTests([
+        { x: result.dismissX!, y: result.dismissY! },
+      ], 0);
+      const dismissedRaw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === ${JSON.stringify(queryValue)};
+          });
+          if (!root) { return JSON.stringify({ err: 'missing overlay during hover dismissal' }); }
+          var marker = ${JSON.stringify(hoverMarker)};
+          var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          function visibleHoverText() {
+            var host = root.querySelector('.ij-find-monaco-host');
+            var shadowRoot = host && host.shadowRoot;
+            var overflowRoot = Array.from(document.querySelectorAll('.ij-find-preview-overflow-root')).find(function (node) {
+              return node.getAttribute('data-ij-find-src') === targetSrc;
+            });
+            var hoverNodes = [];
+            if (shadowRoot) {
+              hoverNodes = hoverNodes.concat(Array.from(
+                shadowRoot.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget')
+              ));
+            }
+            if (overflowRoot) {
+              hoverNodes = hoverNodes.concat(Array.from(
+                overflowRoot.querySelectorAll('.monaco-hover,.monaco-editor-hover,.content-hover-widget')
+              ));
+            }
+            var text = '';
+            for (var i = 0; i < hoverNodes.length; i++) {
+              var node = hoverNodes[i];
+              var rect = node.getBoundingClientRect();
+              var style = getComputedStyle(node);
+              if (node.classList.contains('hidden') || rect.width <= 0 || rect.height <= 0 ||
+                  style.display === 'none' || style.visibility === 'hidden') {
+                continue;
+              }
+              text += ' ' + String(node.textContent || '');
+            }
+            return text;
+          }
+          var started = performance.now();
+          var text = visibleHoverText();
+          while (text.indexOf(marker) >= 0 && performance.now() - started < 2500) {
+            await new Promise(function (resolve) { setTimeout(resolve, 25); });
+            text = visibleHoverText();
+          }
+          var remainingGrace = 1350 - (performance.now() - started);
+          if (remainingGrace > 0) {
+            await new Promise(function (resolve) { setTimeout(resolve, remainingGrace); });
+          }
+          var state = window.__ijFindGetSearchState(targetSrc);
+          return JSON.stringify({
+            visibleText: visibleHoverText(),
+            transit: state && state.previewHoverTransit,
+            hit: (function () {
+              var node = document.elementFromPoint(${JSON.stringify(result.dismissX)}, ${JSON.stringify(result.dismissY)});
+              return node ? {
+                tag: String(node.tagName || ''),
+                className: String(node.className || ''),
+                text: String(node.textContent || '').slice(0, 80)
+              } : null;
+            })()
+          });
+        })()`,
+        10_000,
+      );
+      const dismissed = JSON.parse(dismissedRaw) as {
+        err?: string;
+        visibleText?: string;
+        transit?: { holding?: boolean; timerPending?: boolean };
+      };
+      assert.strictEqual(dismissed.err, undefined, `hover dismissal probe should remain mounted: ${dismissedRaw}`);
+      assert.ok(
+        !(dismissed.visibleText ?? '').includes(hoverMarker),
+        `hover must dismiss after the pointer leaves both editor and popup; input=${dismissInputReport} result=${dismissedRaw}`,
+      );
+      assert.strictEqual(dismissed.transit?.holding, false, `dismissal must release Monaco's keep-open flag: ${dismissedRaw}`);
+      assert.strictEqual(dismissed.transit?.timerPending, false, `dismissal must clear the transit timer: ${dismissedRaw}`);
     } finally {
       hoverDisposable.dispose();
       try {
@@ -1997,6 +2358,13 @@ suite('Renderer — overlay UI probes', () => {
           });
           if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
           var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          function bundledWidgetNodes(shadowRoot, selector) {
+            var nodes = shadowRoot ? Array.from(shadowRoot.querySelectorAll(selector)) : [];
+            var overflowRoot = Array.from(document.querySelectorAll('.ij-find-preview-overflow-root')).find(function (node) {
+              return node.getAttribute('data-ij-find-src') === targetSrc;
+            });
+            return overflowRoot ? nodes.concat(Array.from(overflowRoot.querySelectorAll(selector))) : nodes;
+          }
           var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
           window.__ijFindDisableMonacoProbes = true;
           try {
@@ -2060,7 +2428,8 @@ suite('Renderer — overlay UI probes', () => {
               editor.trigger('ijss-test', 'editor.action.showHover', {});
               var hoverDeadline = performance.now() + 8000;
               while (performance.now() < hoverDeadline) {
-                var hoverNodes = shadowRoot.querySelectorAll(
+                var hoverNodes = bundledWidgetNodes(
+                  shadowRoot,
                   '.monaco-hover,.monaco-editor-hover,.content-hover-widget,.hover-row'
                 );
                 hoverText = '';
@@ -2208,6 +2577,13 @@ suite('Renderer — overlay UI probes', () => {
           });
           if (!root) { return JSON.stringify({ err: 'missing overlay root' }); }
           var targetSrc = root.getAttribute('data-ij-find-src') || '';
+          function bundledWidgetNodes(shadowRoot, selector) {
+            var nodes = shadowRoot ? Array.from(shadowRoot.querySelectorAll(selector)) : [];
+            var overflowRoot = Array.from(document.querySelectorAll('.ij-find-preview-overflow-root')).find(function (node) {
+              return node.getAttribute('data-ij-find-src') === targetSrc;
+            });
+            return overflowRoot ? nodes.concat(Array.from(overflowRoot.querySelectorAll(selector))) : nodes;
+          }
           var oldDisableMonacoProbes = window.__ijFindDisableMonacoProbes;
           window.__ijFindDisableMonacoProbes = true;
           try {
@@ -2386,7 +2762,8 @@ suite('Renderer — overlay UI probes', () => {
               editor.trigger('ijss-test', 'editor.action.showHover', {});
               var hoverDeadline = performance.now() + 8000;
               while (performance.now() < hoverDeadline) {
-                var hoverNodes = shadowRoot.querySelectorAll(
+                var hoverNodes = bundledWidgetNodes(
+                  shadowRoot,
                   '.monaco-hover,.monaco-editor-hover,.content-hover-widget,.hover-row'
                 );
                 hoverText = '';
@@ -8216,16 +8593,29 @@ suite('Renderer — overlay UI probes', () => {
           });
           await new Promise(function (r) { setTimeout(r, 80); });
           var ed = window.__ijFindPreviewEditorForTests;
+          var overflowHost = ed && ed.getOverflowWidgetsDomNode ? ed.getOverflowWidgetsDomNode() : null;
+          var overflowRoot = overflowHost && overflowHost.closest
+            ? overflowHost.closest('.ij-find-preview-overflow-root')
+            : null;
+          window.__ijFindHideShowOverflowHostProbe = overflowHost;
           return JSON.stringify({
             hasEditor: !!ed,
             editorId: ed ? String(ed._id || ed.getId && ed.getId() || '') : '',
             previewMode: (ed && ed.getModel && ed.getModel()) ? 'monaco' : '?',
+            overflowHostInBody: !!(overflowRoot && overflowRoot.parentElement === document.body),
           });
         })()`,
       );
-      const firstParsed = JSON.parse(firstRender) as { err?: string; hasEditor?: boolean; editorId?: string; previewMode?: string };
+      const firstParsed = JSON.parse(firstRender) as {
+        err?: string;
+        hasEditor?: boolean;
+        editorId?: string;
+        previewMode?: string;
+        overflowHostInBody?: boolean;
+      };
       if (firstParsed.err) { this.skip(); return; }
       assert.strictEqual(firstParsed.hasEditor, true, `first render must mount the preview editor: ${firstRender}`);
+      assert.strictEqual(firstParsed.overflowHostInBody, true, `first render must bind a body-level overflow host: ${firstRender}`);
       const firstEditorId = firstParsed.editorId || '';
       // Hide the panel by simulating the close-button click. Matches what
       // the user does in captain (Escape / close icon).
@@ -8258,10 +8648,16 @@ suite('Renderer — overlay UI probes', () => {
           if (!root) { return JSON.stringify({ err: 'no overlay root post-show' }); }
           var targetSrc = root.getAttribute('data-ij-find-src') || '';
           var alpha = ${JSON.stringify(alpha.toString())};
+          var stateBeforePreview = window.__ijFindGetSearchState
+            ? window.__ijFindGetSearchState(targetSrc)
+            : null;
           // Snapshot the editor identity BEFORE issuing the preview, so we
           // can prove the preserved instance is what the next render reuses.
           var edBefore = window.__ijFindPreviewEditorForTests;
           var editorIdBefore = edBefore ? String(edBefore._id || edBefore.getId && edBefore.getId() || '') : '';
+          var overflowHostBefore = edBefore && edBefore.getOverflowWidgetsDomNode
+            ? edBefore.getOverflowWidgetsDomNode()
+            : null;
           // Probe the renderer-side preview state directly to see what's
           // null vs alive across the hide.
           var beforeState = null;
@@ -8304,6 +8700,12 @@ suite('Renderer — overlay UI probes', () => {
           await new Promise(function (r) { setTimeout(r, 80); });
           var edAfter = window.__ijFindPreviewEditorForTests;
           var editorIdAfter = edAfter ? String(edAfter._id || edAfter.getId && edAfter.getId() || '') : '';
+          var overflowHostAfter = edAfter && edAfter.getOverflowWidgetsDomNode
+            ? edAfter.getOverflowWidgetsDomNode()
+            : null;
+          var overflowRootAfter = overflowHostAfter && overflowHostAfter.closest
+            ? overflowHostAfter.closest('.ij-find-preview-overflow-root')
+            : null;
           return JSON.stringify({
             editorIdBefore: editorIdBefore,
             editorIdAfter: editorIdAfter,
@@ -8312,6 +8714,13 @@ suite('Renderer — overlay UI probes', () => {
             hostInPreviewBody: hostInPreviewBody,
             previewBodyConnected: previewBodyConnected,
             panelConnected: panelConnected,
+            overflowHostRetained: !!overflowHostAfter &&
+              window.__ijFindHideShowOverflowHostProbe === overflowHostBefore &&
+              overflowHostBefore === overflowHostAfter,
+            overflowHostInBody: !!(overflowRootAfter && overflowRootAfter.parentElement === document.body),
+            hoverGuardInstalledBeforePreview: !!(stateBeforePreview &&
+              stateBeforePreview.previewHoverTransit &&
+              stateBeforePreview.previewHoverTransit.installed),
             beforeState: beforeState,
           });
         })()`,
@@ -8325,6 +8734,9 @@ suite('Renderer — overlay UI probes', () => {
         hostInPreviewBody?: boolean;
         previewBodyConnected?: boolean;
         panelConnected?: boolean;
+        overflowHostRetained?: boolean;
+        overflowHostInBody?: boolean;
+        hoverGuardInstalledBeforePreview?: boolean;
         beforeState?: Record<string, unknown> | null;
       };
       if (secondParsed.err) { this.skip(); return; }
@@ -8337,6 +8749,21 @@ suite('Renderer — overlay UI probes', () => {
         `hostInPreviewBody=${secondParsed.hostInPreviewBody} ` +
         `previewBodyConnected=${secondParsed.previewBodyConnected} ` +
         `panelConnected=${secondParsed.panelConnected}`,
+      );
+      assert.strictEqual(
+        secondParsed.overflowHostRetained,
+        true,
+        `hide/show must reattach the editor's constructor-bound overflow host: ${secondRender}`,
+      );
+      assert.strictEqual(
+        secondParsed.overflowHostInBody,
+        true,
+        `the retained overflow host must be body-level after show: ${secondRender}`,
+      );
+      assert.strictEqual(
+        secondParsed.hoverGuardInstalledBeforePreview,
+        true,
+        `show must restore the hover transit guard before the next preview render: ${secondRender}`,
       );
       // Reuse-path sync work should be way under create-path. Captain log
       // showed create=124ms+ vs reuse=~6-9ms. Even on small fixture the
@@ -8363,6 +8790,11 @@ suite('Renderer — overlay UI probes', () => {
             });
             return 'closed';
           })()`,
+        );
+      } catch {}
+      try {
+        await overlay.evalInActiveWindowForTests(
+          `(function(){ delete window.__ijFindHideShowOverflowHostProbe; return 'cleared'; })()`,
         );
       } catch {}
       await cfg.update('disableMonacoCapture', priorDisableMonacoCapture?.workspaceValue, vscode.ConfigurationTarget.Workspace);
