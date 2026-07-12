@@ -1,6 +1,6 @@
 use crate::config::EngineConfig;
-use crate::indexer::index_directory;
-use crate::mmap_store::StoreLayout;
+use crate::indexer::{index_directory, index_directory_with_progress};
+use crate::mmap_store::{acquire_index_read_lock, StoreLayout};
 use crate::overlay::{apply_change_batch, compaction_reason, load_overlay_with_recovery};
 use crate::planner::{build_query_plan, QueryPlan};
 use crate::protocol::{
@@ -8,7 +8,7 @@ use crate::protocol::{
     RuntimeStats, SearchRequest, ShardDiagnostic,
 };
 use crate::searcher::search_workspace;
-use crate::shard::{ShardDocument, ShardReader};
+use crate::shard::{open_validated_base_shard, read_base_shard_set, ShardDocument, ShardReader};
 use crate::verifier::matches_path_filters;
 use crate::watcher::build_change_batch;
 use std::collections::BTreeSet;
@@ -19,8 +19,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub fn collect_info(workspace_root: &Path, config: &EngineConfig) -> io::Result<InfoResponse> {
     let layout = StoreLayout::for_workspace(workspace_root, config);
-    layout.ensure_dirs()?;
-    let cleaned_temp_files = layout.cleanup_stale_temp_files(30)?;
+    let _read_lock = acquire_index_read_lock(&layout)?;
+    let cleaned_temp_files = Vec::new();
     let manifest_present = layout.manifest_path.exists();
 
     let overlay = match load_overlay_with_recovery(&layout) {
@@ -44,22 +44,33 @@ pub fn collect_info(workspace_root: &Path, config: &EngineConfig) -> io::Result<
     let mut total_document_count = 0usize;
     let mut total_gram_count = 0usize;
     let mut total_shard_bytes = 0u64;
-    for shard_path in layout.list_shard_paths()? {
-        let file_name = shard_path
-            .file_name()
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_else(|| shard_path.to_string_lossy().into_owned());
-        let file_bytes = fs::metadata(&shard_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        match ShardReader::open(&shard_path) {
-            Ok(reader) => {
+    match read_base_shard_set(&layout) {
+        Ok(base_shards) => {
+            let mut validated = true;
+            let mut document_count = 0usize;
+            let mut gram_count = 0usize;
+            let mut shard_bytes = 0u64;
+            for (shard_id, shard_path) in base_shards.paths.iter().enumerate() {
+                let file_name = shard_file_name(&shard_path);
+                let file_bytes = fs::metadata(&shard_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                let reader =
+                    match open_validated_base_shard(base_shards.identity, shard_id, shard_path) {
+                        Ok(reader) => reader,
+                        Err(err) => {
+                            validated = false;
+                            warnings.push(format!("base index validation failed: {err}"));
+                            shards.push(invalid_shard_diagnostic(shard_path));
+                            continue;
+                        }
+                    };
                 let docs = reader.documents()?;
                 let header = reader.header();
                 let source_bytes = docs.iter().map(|doc| doc.byte_len).sum::<u64>();
-                total_document_count += docs.len();
-                total_gram_count += header.gram_count;
-                total_shard_bytes += file_bytes;
+                document_count += docs.len();
+                gram_count += header.gram_count;
+                shard_bytes += file_bytes;
                 shards.push(ShardDiagnostic {
                     file_name,
                     shard_id: header.shard_id,
@@ -71,18 +82,20 @@ pub fn collect_info(workspace_root: &Path, config: &EngineConfig) -> io::Result<
                     valid: true,
                 });
             }
-            Err(err) => {
-                warnings.push(format!("skipped unreadable shard {}: {}", file_name, err));
-                shards.push(ShardDiagnostic {
-                    file_name,
-                    shard_id: 0,
-                    doc_count: 0,
-                    gram_count: 0,
-                    source_bytes: 0,
-                    file_bytes,
-                    created_unix_secs: 0,
-                    valid: false,
-                });
+            if validated {
+                total_document_count = document_count;
+                total_gram_count = gram_count;
+                total_shard_bytes = shard_bytes;
+            } else {
+                for shard in &mut shards {
+                    shard.valid = false;
+                }
+            }
+        }
+        Err(err) => {
+            warnings.push(format!("base index validation failed: {err}"));
+            for shard_path in layout.list_shard_paths()? {
+                shards.push(invalid_shard_diagnostic(&shard_path));
             }
         }
     }
@@ -110,17 +123,51 @@ pub fn collect_info(workspace_root: &Path, config: &EngineConfig) -> io::Result<
     })
 }
 
+fn shard_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn invalid_shard_diagnostic(path: &Path) -> ShardDiagnostic {
+    let file_name = shard_file_name(path);
+    let file_bytes = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if let Ok(reader) = ShardReader::open(path) {
+        let header = reader.header();
+        let documents = reader.documents().unwrap_or_default();
+        return ShardDiagnostic {
+            file_name,
+            shard_id: header.shard_id,
+            doc_count: documents.len(),
+            gram_count: header.gram_count,
+            source_bytes: documents.iter().map(|doc| doc.byte_len).sum(),
+            file_bytes,
+            created_unix_secs: header.created_unix_secs,
+            valid: false,
+        };
+    }
+    ShardDiagnostic {
+        file_name,
+        shard_id: 0,
+        doc_count: 0,
+        gram_count: 0,
+        source_bytes: 0,
+        file_bytes,
+        created_unix_secs: 0,
+        valid: false,
+    }
+}
+
 pub fn diagnose_query(
     request: &SearchRequest,
     config: &EngineConfig,
 ) -> Result<DiagnoseResponse, String> {
     let workspace_root = Path::new(&request.workspace_root);
     let layout = StoreLayout::for_workspace(workspace_root, config);
-    layout.ensure_dirs().map_err(|err| err.to_string())?;
+    let _read_lock = acquire_index_read_lock(&layout).map_err(|err| err.to_string())?;
     let plan = build_query_plan(request);
-    let cleaned_temp_files = layout
-        .cleanup_stale_temp_files(30)
-        .map_err(|err| err.to_string())?;
 
     let overlay = load_overlay_with_recovery(&layout).map_err(|err| err.to_string())?;
     let latest_overlay = overlay.manifest.latest_entries();
@@ -128,13 +175,7 @@ pub fn diagnose_query(
         .values()
         .filter(|entry| !entry.tombstone)
         .count();
-    let mut warnings = overlay.warnings;
-    if !cleaned_temp_files.is_empty() {
-        warnings.push(format!(
-            "removed stale temp index files: {}",
-            cleaned_temp_files.join(", ")
-        ));
-    }
+    let warnings = overlay.warnings;
 
     let mut grams = plan
         .required_grams
@@ -150,43 +191,57 @@ pub fn diagnose_query(
     let mut overlay_candidate_count = 0usize;
     let mut fallback_reason = None;
 
-    let shard_paths = layout.list_shard_paths().map_err(|err| err.to_string())?;
-    if shard_paths.is_empty() {
-        fallback_reason = Some("no base shards found; a full scan would be required".to_string());
-    } else {
-        for shard_path in shard_paths {
-            let reader = match ShardReader::open(&shard_path) {
-                Ok(reader) => reader,
-                Err(err) => {
-                    warnings.push(format!(
-                        "skipped unreadable shard {}: {}",
-                        shard_path.to_string_lossy(),
-                        err
-                    ));
-                    continue;
+    match read_base_shard_set(&layout) {
+        Ok(base_shards) => {
+            let mut base_valid = true;
+            for (shard_id, shard_path) in base_shards.paths.iter().enumerate() {
+                let reader =
+                    match open_validated_base_shard(base_shards.identity, shard_id, shard_path) {
+                        Ok(reader) => reader,
+                        Err(err) => {
+                            fallback_reason = Some(format!(
+                            "base index validation failed; a full scan would be required: {err}"
+                        ));
+                            base_valid = false;
+                            break;
+                        }
+                    };
+                let docs = reader.documents().map_err(|err| err.to_string())?;
+                base_document_count += docs.len();
+                for gram in &mut grams {
+                    gram.doc_freq += reader
+                        .find_posting(&gram.gram)
+                        .map_err(|err| err.to_string())?
+                        .map(|posting| posting.doc_ids.len())
+                        .unwrap_or(0);
                 }
-            };
-            let docs = reader.documents().map_err(|err| err.to_string())?;
-            base_document_count += docs.len();
-            for gram in &mut grams {
-                gram.doc_freq += reader
-                    .find_posting(&gram.gram)
-                    .map_err(|err| err.to_string())?
-                    .map(|posting| posting.doc_ids.len())
-                    .unwrap_or(0);
+                let selected_ids =
+                    candidate_doc_ids(&reader, &plan).map_err(|err| err.to_string())?;
+                let selected_docs = docs_for_ids(&docs, &selected_ids);
+                base_candidate_count += selected_docs.len();
+                for doc in selected_docs {
+                    if latest_overlay.contains_key(&doc.rel_path) {
+                        continue;
+                    }
+                    if !matches_path_filters(&doc.rel_path, &plan.include, &plan.exclude) {
+                        continue;
+                    }
+                    final_candidates.insert(doc.rel_path.clone());
+                }
             }
-            let selected_ids = candidate_doc_ids(&reader, &plan).map_err(|err| err.to_string())?;
-            let selected_docs = docs_for_ids(&docs, &selected_ids);
-            base_candidate_count += selected_docs.len();
-            for doc in selected_docs {
-                if latest_overlay.contains_key(&doc.rel_path) {
-                    continue;
+            if !base_valid {
+                for gram in &mut grams {
+                    gram.doc_freq = 0;
                 }
-                if !matches_path_filters(&doc.rel_path, &plan.include, &plan.exclude) {
-                    continue;
-                }
-                final_candidates.insert(doc.rel_path.clone());
+                base_document_count = 0;
+                base_candidate_count = 0;
+                final_candidates.clear();
             }
+        }
+        Err(err) => {
+            fallback_reason = Some(format!(
+                "base index validation failed; a full scan would be required: {err}"
+            ));
         }
     }
 
@@ -237,6 +292,12 @@ pub fn benchmark_workspaces(
     config: &EngineConfig,
 ) -> Result<BenchmarkResponse, String> {
     let mut warnings = Vec::new();
+    if file_counts.len() > 1 {
+        warnings.push(
+            "peakRssBytes is a process-lifetime high-water mark; later benchmark cases include peaks from earlier cases. Run one file count per process for isolated memory measurements."
+                .to_string(),
+        );
+    }
     let mut cases = Vec::new();
     for &file_count in file_counts {
         let root = benchmark_temp_dir(file_count);
@@ -249,6 +310,19 @@ pub fn benchmark_workspaces(
         let index_start = Instant::now();
         index_directory(&root, config).map_err(|err| err.to_string())?;
         let index_ms = elapsed_ms(index_start.elapsed());
+
+        let mut reused_clean_index = false;
+        let reuse_start = Instant::now();
+        index_directory_with_progress(&root, config, &mut |progress| {
+            reused_clean_index |= progress.detail.starts_with("reused clean index from ");
+        })
+        .map_err(|err| err.to_string())?;
+        let reuse_ms = elapsed_ms(reuse_start.elapsed());
+        if !reused_clean_index {
+            return Err(format!(
+                "synthetic benchmark did not reuse the unchanged {file_count}-file index"
+            ));
+        }
 
         let layout = StoreLayout::for_workspace(&root, config);
         let mut update_samples = Vec::new();
@@ -301,6 +375,7 @@ pub fn benchmark_workspaces(
             label: format!("synthetic-{}k", file_count / 1_000),
             file_count,
             index_ms,
+            reuse_ms,
             update_p50_ms: percentile_ms(&update_samples, 50.0),
             update_p95_ms: percentile_ms(&update_samples, 95.0),
             query_p50_ms: percentile_ms(&query_samples, 50.0),
@@ -604,12 +679,66 @@ mod tests {
     }
 
     #[test]
+    fn info_and_diagnose_reject_a_mixed_base_generation() -> io::Result<()> {
+        let root = temp_dir("ops-mixed-generation");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/a.rs"), "struct SharedMarker {}\n")?;
+        fs::write(root.join("src/b.rs"), "struct OtherRecord {}\n")?;
+        let mut config = EngineConfig::default();
+        config.max_files_per_shard = 1;
+        let artifacts = index_directory(&root, &config)?;
+        assert_eq!(artifacts.shards.len(), 2);
+
+        let mixed_path = &artifacts.shards[1].path;
+        let mut bytes = fs::read(mixed_path)?;
+        let build_id = u64::from_le_bytes(bytes[80..88].try_into().unwrap());
+        bytes[80..88].copy_from_slice(&build_id.saturating_add(1).to_le_bytes());
+        fs::write(mixed_path, bytes)?;
+
+        let info = collect_info(&root, &config)?;
+        assert_eq!(info.total_document_count, 0);
+        assert!(info.shards.iter().all(|shard| !shard.valid));
+        assert!(info
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("base index validation failed")));
+
+        let diagnosis = diagnose_query(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "SharedMarker".to_string(),
+                query_terms: Vec::new(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec![],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &config,
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(diagnosis.base_document_count, 0);
+        assert!(diagnosis
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("base index validation failed")));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn benchmark_runs_small_synthetic_workspace() -> io::Result<()> {
         let response =
             benchmark_workspaces(&[20], &EngineConfig::default()).map_err(io::Error::other)?;
         assert!(response.ok);
         assert_eq!(response.cases.len(), 1);
         assert_eq!(response.cases[0].file_count, 20);
+        assert!(response.to_json().contains("\"reuseMs\":"));
         Ok(())
     }
 

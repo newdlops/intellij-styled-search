@@ -1,8 +1,9 @@
-use crate::config::SCHEMA_VERSION;
+use crate::config::{ENGINE_NAME, SCHEMA_VERSION, WORKSPACE_METADATA_HASH_VERSION};
 use crate::gram::{hash_gram_value, GramHashMap};
-use crate::mmap_store::MappedFile;
-use std::io;
-use std::path::Path;
+use crate::mmap_store::{MappedFile, StoreLayout};
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 const SHARD_MAGIC: &[u8; 8] = b"ZKSHRD01";
 const HEADER_BYTES: usize = 88;
@@ -30,6 +31,7 @@ pub struct ShardHeader {
     pub schema_version: u32,
     pub shard_id: u32,
     pub created_unix_secs: u64,
+    pub build_id: u64,
     pub doc_count: usize,
     pub gram_count: usize,
     pub doc_ids_count: usize,
@@ -74,9 +76,233 @@ pub struct ShardReader {
     header: ShardHeader,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BaseIndexIdentity {
+    pub created_unix_secs: u64,
+    pub build_id: u64,
+    pub shard_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BaseShardSet {
+    pub identity: BaseIndexIdentity,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BaseIndexManifest {
+    pub(crate) engine: String,
+    pub(crate) schema_version: u32,
+    pub(crate) workspace_metadata_hash_version: u32,
+    pub(crate) workspace_root: String,
+    pub(crate) index_root: String,
+    pub(crate) created_unix_secs: u64,
+    pub(crate) build_id: String,
+    pub(crate) fingerprint: u64,
+    pub(crate) workspace_metadata_fingerprint: u64,
+    pub(crate) config_fingerprint: u64,
+    pub(crate) shard_metadata_fingerprint: u64,
+    pub(crate) stats: BaseIndexManifestStats,
+    pub(crate) base_shards: Vec<BaseIndexManifestShard>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BaseIndexManifestStats {
+    pub(crate) visited_files: usize,
+    pub(crate) indexed_files: usize,
+    pub(crate) skipped_binary: usize,
+    pub(crate) skipped_binary_extension: usize,
+    pub(crate) skipped_too_large: usize,
+    pub(crate) decoded_utf16_files: usize,
+    pub(crate) shard_count: usize,
+    pub(crate) total_grams: usize,
+    pub(crate) total_source_bytes: u64,
+    pub(crate) total_shard_bytes: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BaseIndexManifestShard {
+    pub(crate) shard_id: u32,
+    pub(crate) file_name: String,
+    pub(crate) doc_count: usize,
+    pub(crate) gram_count: usize,
+    pub(crate) source_bytes: u64,
+    pub(crate) file_bytes: u64,
+}
+
+pub(crate) fn read_base_index_manifest(layout: &StoreLayout) -> io::Result<BaseIndexManifest> {
+    let text = fs::read_to_string(&layout.manifest_path)?;
+    let manifest: BaseIndexManifest = serde_json::from_str(&text).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid search index manifest: {err}"),
+        )
+    })?;
+    if manifest.engine != ENGINE_NAME
+        || manifest.schema_version != SCHEMA_VERSION
+        || manifest.workspace_metadata_hash_version != WORKSPACE_METADATA_HASH_VERSION
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "search index manifest has an incompatible engine or schema",
+        ));
+    }
+    if !manifest_path_matches(&manifest.workspace_root, &layout.workspace_root)
+        || !manifest_path_matches(&manifest.index_root, &layout.root)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "search index manifest belongs to a different workspace or index root",
+        ));
+    }
+    if parse_positive_decimal_u64(&manifest.build_id).is_none()
+        || manifest.created_unix_secs == 0
+        || manifest.workspace_metadata_fingerprint == 0
+        || manifest.config_fingerprint == 0
+        || manifest.shard_metadata_fingerprint == 0
+        || manifest.stats.shard_count == 0
+        || manifest.base_shards.len() != manifest.stats.shard_count
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "search index manifest has invalid generation or shard metadata",
+        ));
+    }
+
+    let mut total_docs = 0usize;
+    let mut total_grams = 0usize;
+    let mut total_source_bytes = 0u64;
+    let mut total_shard_bytes = 0u64;
+    for (shard_id, shard) in manifest.base_shards.iter().enumerate() {
+        let expected_name = layout.shard_file_name(shard_id as u32);
+        if shard.shard_id as usize != shard_id
+            || shard.file_name != expected_name
+            || shard.file_bytes < HEADER_BYTES as u64
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "search index manifest has an invalid base shard entry",
+            ));
+        }
+        total_docs = total_docs.checked_add(shard.doc_count).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "base document count overflow")
+        })?;
+        total_grams = total_grams.checked_add(shard.gram_count).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "base gram count overflow")
+        })?;
+        total_source_bytes = total_source_bytes
+            .checked_add(shard.source_bytes)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "base source byte count overflow",
+                )
+            })?;
+        total_shard_bytes = total_shard_bytes
+            .checked_add(shard.file_bytes)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "base shard byte count overflow")
+            })?;
+    }
+    if total_docs != manifest.stats.indexed_files
+        || total_grams != manifest.stats.total_grams
+        || total_source_bytes != manifest.stats.total_source_bytes
+        || total_shard_bytes != manifest.stats.total_shard_bytes
+        || manifest.stats.decoded_utf16_files > manifest.stats.indexed_files
+        || manifest.stats.indexed_files > manifest.stats.visited_files
+        || manifest.stats.skipped_binary > manifest.stats.visited_files
+        || manifest.stats.skipped_binary_extension > manifest.stats.visited_files
+        || manifest.stats.skipped_too_large > manifest.stats.visited_files
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "search index manifest aggregate statistics do not match its shards",
+        ));
+    }
+    Ok(manifest)
+}
+
+pub fn read_base_index_identity(layout: &StoreLayout) -> io::Result<BaseIndexIdentity> {
+    let manifest = read_base_index_manifest(layout)?;
+    let build_id = parse_positive_decimal_u64(&manifest.build_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "search index manifest is missing a valid build identity",
+        )
+    })?;
+    Ok(BaseIndexIdentity {
+        created_unix_secs: manifest.created_unix_secs,
+        build_id,
+        shard_count: manifest.stats.shard_count,
+    })
+}
+
+pub fn validate_base_shard_header(
+    identity: BaseIndexIdentity,
+    expected_shard_id: usize,
+    header: &ShardHeader,
+) -> io::Result<()> {
+    if header.shard_id as usize != expected_shard_id
+        || header.created_unix_secs != identity.created_unix_secs
+        || header.build_id != identity.build_id
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "base shard {expected_shard_id} does not belong to manifest build {}",
+                identity.build_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub fn read_base_shard_set(layout: &StoreLayout) -> io::Result<BaseShardSet> {
+    let identity = read_base_index_identity(layout)?;
+    let shard_paths = layout.list_shard_paths()?;
+    if shard_paths.len() != identity.shard_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "search index manifest expects {} base shards but found {}",
+                identity.shard_count,
+                shard_paths.len()
+            ),
+        ));
+    }
+
+    for (shard_id, shard_path) in shard_paths.iter().enumerate() {
+        let expected_name = layout.shard_file_name(shard_id as u32);
+        if shard_path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected base shard file name: {}", shard_path.display()),
+            ));
+        }
+    }
+    Ok(BaseShardSet {
+        identity,
+        paths: shard_paths,
+    })
+}
+
+pub fn open_validated_base_shard(
+    identity: BaseIndexIdentity,
+    shard_id: usize,
+    path: &Path,
+) -> io::Result<ShardReader> {
+    let reader = ShardReader::open(path)?;
+    validate_base_shard_header(identity, shard_id, reader.header())?;
+    Ok(reader)
+}
+
 pub fn build_shard_bytes(
     shard_id: u32,
     created_unix_secs: u64,
+    build_id: u64,
     documents: &[IndexedDocument],
 ) -> io::Result<ShardBuildResult> {
     let mut doc_records = Vec::with_capacity(documents.len());
@@ -144,6 +370,7 @@ pub fn build_shard_bytes(
         schema_version: SCHEMA_VERSION,
         shard_id,
         created_unix_secs,
+        build_id,
         doc_count: doc_records.len(),
         gram_count: posting_records.len(),
         doc_ids_count: doc_ids_blob.len(),
@@ -168,7 +395,7 @@ pub fn build_shard_bytes(
     push_u64(&mut bytes, header.doc_ids_offset);
     push_u64(&mut bytes, header.strings_offset);
     push_u64(&mut bytes, header.file_len);
-    push_u64(&mut bytes, 0);
+    push_u64(&mut bytes, header.build_id);
 
     for record in &doc_records {
         push_u32(&mut bytes, record.0);
@@ -309,7 +536,19 @@ impl ShardReader {
     }
 }
 
+pub fn read_shard_header(path: &Path) -> io::Result<ShardHeader> {
+    let mut file = fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut bytes = [0u8; HEADER_BYTES];
+    file.read_exact(&mut bytes)?;
+    parse_header_with_file_len(&bytes, file_len)
+}
+
 fn parse_header(bytes: &[u8]) -> io::Result<ShardHeader> {
+    parse_header_with_file_len(bytes, bytes.len() as u64)
+}
+
+fn parse_header_with_file_len(bytes: &[u8], actual_file_len: u64) -> io::Result<ShardHeader> {
     if bytes.len() < HEADER_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -326,6 +565,7 @@ fn parse_header(bytes: &[u8]) -> io::Result<ShardHeader> {
         schema_version: read_u32_at(bytes, 8)?,
         shard_id: read_u32_at(bytes, 12)?,
         created_unix_secs: read_u64_at(bytes, 16)?,
+        build_id: read_u64_at(bytes, 80)?,
         doc_count: read_u32_at(bytes, 24)? as usize,
         gram_count: read_u32_at(bytes, 28)? as usize,
         doc_ids_count: read_u32_at(bytes, 32)? as usize,
@@ -344,20 +584,38 @@ fn parse_header(bytes: &[u8]) -> io::Result<ShardHeader> {
             ),
         ));
     }
-    if header.file_len as usize != bytes.len() {
+    if header.file_len != actual_file_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "shard file length does not match header",
         ));
     }
-    if header.docs_offset as usize > bytes.len()
-        || header.postings_offset as usize > bytes.len()
-        || header.doc_ids_offset as usize > bytes.len()
-        || header.strings_offset as usize > bytes.len()
+    if header.docs_offset > actual_file_len
+        || header.postings_offset > actual_file_len
+        || header.doc_ids_offset > actual_file_len
+        || header.strings_offset > actual_file_len
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "shard header contains an out-of-range section offset",
+        ));
+    }
+    let expected_postings_offset = (HEADER_BYTES as u64)
+        .checked_add((header.doc_count as u64).saturating_mul(DOC_RECORD_BYTES as u64));
+    let expected_doc_ids_offset = expected_postings_offset.and_then(|offset| {
+        offset.checked_add((header.gram_count as u64).saturating_mul(POSTING_RECORD_BYTES as u64))
+    });
+    let expected_strings_offset =
+        expected_doc_ids_offset.and_then(|offset| offset.checked_add(header.doc_ids_count as u64));
+    if header.docs_offset != HEADER_BYTES as u64
+        || Some(header.postings_offset) != expected_postings_offset
+        || Some(header.doc_ids_offset) != expected_doc_ids_offset
+        || Some(header.strings_offset) != expected_strings_offset
+        || header.strings_offset > header.file_len
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shard header section layout is inconsistent with its counts",
         ));
     }
     Ok(header)
@@ -449,11 +707,37 @@ fn read_u64_at(bytes: &[u8], offset: usize) -> io::Result<u64> {
     ]))
 }
 
+fn parse_positive_decimal_u64(value: &str) -> Option<u64> {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn manifest_path_matches(value: &str, expected: &Path) -> bool {
+    let manifest_path = Path::new(value);
+    if manifest_path == expected {
+        return true;
+    }
+    match (fs::canonicalize(manifest_path), fs::canonicalize(expected)) {
+        (Ok(manifest_path), Ok(expected)) => manifest_path == expected,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_shard_bytes, IndexedDocument, ShardReader};
+    use super::{
+        build_shard_bytes, open_validated_base_shard, parse_header, read_base_shard_set,
+        IndexedDocument, ShardReader,
+    };
+    use crate::config::EngineConfig;
     use crate::gram::hash_gram_value;
-    use crate::mmap_store::write_atomically;
+    use crate::mmap_store::{write_atomically, StoreLayout};
+    use crate::protocol::json_string;
     use std::fs;
     use std::io;
     use std::path::PathBuf;
@@ -467,6 +751,7 @@ mod tests {
         let build = build_shard_bytes(
             0,
             123,
+            456,
             &[
                 IndexedDocument {
                     rel_path: "src/a.rs".to_string(),
@@ -520,7 +805,7 @@ mod tests {
                 gram_incomplete: false,
             });
         }
-        let build = build_shard_bytes(0, 1, &docs)?;
+        let build = build_shard_bytes(0, 1, 2, &docs)?;
         write_atomically(&shard_path, &build.bytes)?;
         let reader = ShardReader::open(&shard_path)?;
 
@@ -538,6 +823,44 @@ mod tests {
         assert!(reader.find_posting("aaaa")?.is_none());
         assert!(reader.find_posting("g999")?.is_none());
         assert!(reader.find_posting("zzzz")?.is_none());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn shard_header_rejects_section_offsets_inconsistent_with_counts() -> io::Result<()> {
+        let mut bytes = build_shard_bytes(0, 1, 2, &[])?.bytes;
+        bytes[48..56].copy_from_slice(&89u64.to_le_bytes());
+        let error = parse_header(&bytes).expect_err("invalid section layout must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        Ok(())
+    }
+
+    #[test]
+    fn base_shard_set_rejects_mixed_build_identities() -> io::Result<()> {
+        let root = temp_dir("base-build-identity");
+        fs::create_dir_all(&root)?;
+        let layout = StoreLayout::for_workspace(&root, &EngineConfig::default());
+        layout.ensure_dirs()?;
+        let manifest = format!(
+            "{{\"engine\":\"zoek-rs\",\"schemaVersion\":20,\"workspaceMetadataHashVersion\":3,\"workspaceRoot\":{},\"indexRoot\":{},\"createdUnixSecs\":1,\"buildId\":\"2\",\"fingerprint\":1,\"workspaceMetadataFingerprint\":1,\"configFingerprint\":1,\"shardMetadataFingerprint\":1,\"stats\":{{\"visitedFiles\":0,\"indexedFiles\":0,\"skippedBinary\":0,\"skippedBinaryExtension\":0,\"skippedTooLarge\":0,\"decodedUtf16Files\":0,\"shardCount\":1,\"totalGrams\":0,\"totalSourceBytes\":0,\"totalShardBytes\":88}},\"baseShards\":[{{\"shardId\":0,\"fileName\":\"base-shard-0000.zrs\",\"docCount\":0,\"gramCount\":0,\"sourceBytes\":0,\"fileBytes\":88}}]}}",
+            json_string(&root.to_string_lossy()),
+            json_string(&layout.root.to_string_lossy()),
+        );
+        write_atomically(&layout.manifest_path, manifest.as_bytes())?;
+
+        let matching = build_shard_bytes(0, 1, 2, &[])?.bytes;
+        write_atomically(&layout.shard_path(0), &matching)?;
+        let base_shards = read_base_shard_set(&layout)?;
+        open_validated_base_shard(base_shards.identity, 0, &base_shards.paths[0])?;
+
+        let mixed = build_shard_bytes(0, 1, 3, &[])?.bytes;
+        write_atomically(&layout.shard_path(0), &mixed)?;
+        let error = open_validated_base_shard(base_shards.identity, 0, &base_shards.paths[0])
+            .err()
+            .expect("a shard from another build must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         fs::remove_dir_all(root)?;
         Ok(())

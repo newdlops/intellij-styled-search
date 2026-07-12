@@ -80,10 +80,334 @@ const ZOEKT_PROTOCOL_VERSION = 1;
 // 20 in af9eafb (2026-05-30) without updating this constant, which left every
 // freshly-built index looking incomplete and forced the fallback path.
 const ZOEKT_SCHEMA_VERSION = 20;
+const ZOEKT_WORKSPACE_METADATA_HASH_VERSION = 3;
+const ZOEKT_SHARD_HEADER_BYTES = 88;
+const ZOEKT_SHARD_MAGIC = Buffer.from('ZKSHRD01', 'ascii');
+const MAX_U64_AS_NUMBER = Number(0xffff_ffff_ffff_ffffn);
 const ZOEKT_UPDATE_IGNORED_DIR_NAMES = new Set([
   '.zoek-rs',
   '.zoekt-rs',
 ]);
+
+type ZoektBaseShardManifest = {
+  engine?: unknown;
+  schemaVersion?: unknown;
+  workspaceMetadataHashVersion?: unknown;
+  workspaceRoot?: unknown;
+  indexRoot?: unknown;
+  createdUnixSecs?: unknown;
+  buildId?: unknown;
+  fingerprint?: unknown;
+  workspaceMetadataFingerprint?: unknown;
+  configFingerprint?: unknown;
+  shardMetadataFingerprint?: unknown;
+  stats?: unknown;
+  baseShards?: unknown;
+};
+
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isPositiveJsonInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function parsePositiveJsonU64String(value: unknown): bigint | null {
+  if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value)) {
+    return null;
+  }
+  try {
+    const parsed = BigInt(value);
+    return parsed <= 0xffff_ffff_ffff_ffffn ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function baseShardFileName(shardId: number): string {
+  return `base-shard-${String(shardId).padStart(4, '0')}.zrs`;
+}
+
+function normalizedPathIdentity(value: string): string {
+  const resolved = path.resolve(value);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+async function pathsReferToSameLocation(left: string, right: string): Promise<boolean> {
+  if (normalizedPathIdentity(left) === normalizedPathIdentity(right)) {
+    return true;
+  }
+  try {
+    const [realLeft, realRight] = await Promise.all([
+      fs.promises.realpath(left),
+      fs.promises.realpath(right),
+    ]);
+    return normalizedPathIdentity(realLeft) === normalizedPathIdentity(realRight);
+  } catch {
+    return false;
+  }
+}
+
+function isValidZoektOverlay(value: unknown): boolean {
+  const generation = isJsonRecord(value) ? value.generation : undefined;
+  if (!isJsonRecord(value) ||
+      !isNonNegativeSafeInteger(generation) ||
+      !isNonNegativeSafeInteger(value.updatedUnixSecs) ||
+      !Array.isArray(value.entries)) {
+    return false;
+  }
+  return value.entries.every((entry) =>
+    isJsonRecord(entry) &&
+    typeof entry.relPath === 'string' &&
+    isNonNegativeSafeInteger(entry.generation) &&
+    entry.generation <= generation &&
+    typeof entry.tombstone === 'boolean' &&
+    isNonNegativeSafeInteger(entry.modifiedUnixSecs) &&
+    typeof entry.contentHash === 'number' &&
+    Number.isInteger(entry.contentHash) &&
+    entry.contentHash >= 0 &&
+    entry.contentHash <= MAX_U64_AS_NUMBER &&
+    typeof entry.gramIncomplete === 'boolean' &&
+    Array.isArray(entry.grams) &&
+    entry.grams.every((gram) => typeof gram === 'string'));
+}
+
+const ZOEKT_READINESS_CACHE_TTL_MS = 2_000;
+const zoektReadinessCache = new Map<string, { signature: string; expiresAt: number }>();
+
+/**
+ * Verify that a manifest describes the complete base-shard set currently on
+ * disk. Read only the fixed-size header: readiness must remain cheap even for
+ * very large indexes.
+ */
+export async function hasValidZoektBaseShards(
+  indexRoot: string,
+  manifest: ZoektBaseShardManifest,
+  workspaceRoot: string,
+): Promise<boolean> {
+  const buildId = parsePositiveJsonU64String(manifest.buildId);
+  if (manifest.engine !== 'zoek-rs' ||
+      manifest.schemaVersion !== ZOEKT_SCHEMA_VERSION ||
+      manifest.workspaceMetadataHashVersion !== ZOEKT_WORKSPACE_METADATA_HASH_VERSION ||
+      typeof manifest.workspaceRoot !== 'string' ||
+      typeof manifest.indexRoot !== 'string' ||
+      !isPositiveJsonInteger(manifest.createdUnixSecs) ||
+      buildId === null ||
+      !isPositiveJsonInteger(manifest.fingerprint) ||
+      !isPositiveJsonInteger(manifest.workspaceMetadataFingerprint) ||
+      !isPositiveJsonInteger(manifest.configFingerprint) ||
+      !isPositiveJsonInteger(manifest.shardMetadataFingerprint) ||
+      !isJsonRecord(manifest.stats) ||
+      !Array.isArray(manifest.baseShards)) {
+    return false;
+  }
+  const [workspaceMatches, indexMatches] = await Promise.all([
+    pathsReferToSameLocation(manifest.workspaceRoot, workspaceRoot),
+    pathsReferToSameLocation(manifest.indexRoot, indexRoot),
+  ]);
+  if (!workspaceMatches || !indexMatches) {
+    return false;
+  }
+  const createdUnixSecs = manifest.createdUnixSecs;
+
+  const shardCount = manifest.stats.shardCount;
+  const visitedFiles = manifest.stats.visitedFiles;
+  const indexedFiles = manifest.stats.indexedFiles;
+  const skippedBinary = manifest.stats.skippedBinary;
+  const skippedBinaryExtension = manifest.stats.skippedBinaryExtension;
+  const skippedTooLarge = manifest.stats.skippedTooLarge;
+  const decodedUtf16Files = manifest.stats.decodedUtf16Files;
+  const totalGrams = manifest.stats.totalGrams;
+  const totalSourceBytes = manifest.stats.totalSourceBytes;
+  const totalShardBytes = manifest.stats.totalShardBytes;
+  if (!isPositiveJsonInteger(shardCount) ||
+      !isNonNegativeSafeInteger(visitedFiles) ||
+      !isNonNegativeSafeInteger(indexedFiles) ||
+      !isNonNegativeSafeInteger(skippedBinary) ||
+      !isNonNegativeSafeInteger(skippedBinaryExtension) ||
+      !isNonNegativeSafeInteger(skippedTooLarge) ||
+      !isNonNegativeSafeInteger(decodedUtf16Files) ||
+      !isNonNegativeSafeInteger(totalGrams) ||
+      !isNonNegativeSafeInteger(totalSourceBytes) ||
+      !isNonNegativeSafeInteger(totalShardBytes) ||
+      indexedFiles > visitedFiles ||
+      decodedUtf16Files > indexedFiles ||
+      skippedBinary > visitedFiles ||
+      skippedBinaryExtension > visitedFiles ||
+      skippedTooLarge > visitedFiles ||
+      manifest.baseShards.length !== shardCount) {
+    return false;
+  }
+
+  const shards: Array<{
+    shardId: number;
+    fileName: string;
+    fileBytes: number;
+    docCount: number;
+    gramCount: number;
+    sourceBytes: number;
+  }> = [];
+  for (let shardId = 0; shardId < shardCount; shardId += 1) {
+    const shard = manifest.baseShards[shardId];
+    const expectedFileName = baseShardFileName(shardId);
+    if (!isJsonRecord(shard) ||
+        shard.shardId !== shardId ||
+        shard.fileName !== expectedFileName ||
+        typeof shard.fileBytes !== 'number' ||
+        !Number.isSafeInteger(shard.fileBytes) ||
+        shard.fileBytes < ZOEKT_SHARD_HEADER_BYTES ||
+        !isNonNegativeSafeInteger(shard.docCount) ||
+        !isNonNegativeSafeInteger(shard.gramCount) ||
+        !isNonNegativeSafeInteger(shard.sourceBytes)) {
+      return false;
+    }
+    shards.push({
+      shardId,
+      fileName: expectedFileName,
+      fileBytes: shard.fileBytes,
+      docCount: shard.docCount,
+      gramCount: shard.gramCount,
+      sourceBytes: shard.sourceBytes,
+    });
+  }
+  const totalDocs = shards.reduce((sum, shard) => sum + shard.docCount, 0);
+  const shardTotalGrams = shards.reduce((sum, shard) => sum + shard.gramCount, 0);
+  const shardTotalSourceBytes = shards.reduce((sum, shard) => sum + shard.sourceBytes, 0);
+  const shardTotalBytes = shards.reduce((sum, shard) => sum + shard.fileBytes, 0);
+  if (indexedFiles !== totalDocs ||
+      totalGrams !== shardTotalGrams ||
+      totalSourceBytes !== shardTotalSourceBytes ||
+      totalShardBytes !== shardTotalBytes) {
+    return false;
+  }
+
+  try {
+    const overlayPath = path.join(indexRoot, 'hot-overlay.json');
+    const [overlayText, overlayStats, indexEntries, indexStats, lockStats] = await Promise.all([
+      fs.promises.readFile(overlayPath, 'utf8'),
+      fs.promises.stat(overlayPath),
+      fs.promises.readdir(indexRoot),
+      fs.promises.stat(indexRoot),
+      fs.promises.stat(path.join(indexRoot, 'search-index.lock')),
+    ]);
+    const overlay = JSON.parse(overlayText) as unknown;
+    if (!isValidZoektOverlay(overlay) ||
+        !overlayStats.isFile() ||
+        !indexStats.isDirectory() ||
+        !lockStats.isFile()) {
+      return false;
+    }
+    const actualShardNames = indexEntries
+      .filter((name) => name.startsWith('base-shard-') && name.endsWith('.zrs'))
+      .sort();
+    const expectedShardNames = shards.map((shard) => shard.fileName).sort();
+    if (actualShardNames.length !== expectedShardNames.length ||
+        actualShardNames.some((name, index) => name !== expectedShardNames[index])) {
+      return false;
+    }
+
+    const cacheKey = normalizedPathIdentity(indexRoot);
+    const readinessSignature = [
+      manifest.buildId,
+      manifest.createdUnixSecs,
+      manifest.shardMetadataFingerprint,
+      shardCount,
+      totalDocs,
+      totalGrams,
+      totalSourceBytes,
+      totalShardBytes,
+      shards.map((shard) => [
+        shard.shardId,
+        shard.fileBytes,
+        shard.docCount,
+        shard.gramCount,
+        shard.sourceBytes,
+      ].join(':')).join(','),
+      actualShardNames.join(','),
+      indexStats.mtimeMs,
+      indexStats.ctimeMs,
+      overlayStats.size,
+      overlayStats.mtimeMs,
+      overlayStats.ctimeMs,
+    ].join('|');
+    const cached = zoektReadinessCache.get(cacheKey);
+    if (cached?.signature === readinessSignature && cached.expiresAt > Date.now()) {
+      return true;
+    }
+
+    const validateShard = async (shard: typeof shards[number]): Promise<boolean> => {
+      const shardPath = path.join(indexRoot, shard.fileName);
+      const stats = await fs.promises.stat(shardPath);
+      if (!stats.isFile() || stats.size !== shard.fileBytes) {
+        return false;
+      }
+
+      const header = Buffer.alloc(ZOEKT_SHARD_HEADER_BYTES);
+      const handle = await fs.promises.open(shardPath, 'r');
+      let bytesRead = 0;
+      try {
+        while (bytesRead < header.length) {
+          const result = await handle.read(
+            header,
+            bytesRead,
+            header.length - bytesRead,
+            bytesRead,
+          );
+          if (result.bytesRead === 0) { break; }
+          bytesRead += result.bytesRead;
+        }
+      } finally {
+        await handle.close();
+      }
+      if (bytesRead !== ZOEKT_SHARD_HEADER_BYTES) { return false; }
+      const docIdsCount = header.readUInt32LE(32);
+      const docsOffset = header.readBigUInt64LE(40);
+      const postingsOffset = header.readBigUInt64LE(48);
+      const docIdsOffset = header.readBigUInt64LE(56);
+      const stringsOffset = header.readBigUInt64LE(64);
+      const fileBytes = BigInt(shard.fileBytes);
+      const expectedPostingsOffset = BigInt(ZOEKT_SHARD_HEADER_BYTES) +
+        (BigInt(shard.docCount) * 48n);
+      const expectedDocIdsOffset = expectedPostingsOffset + (BigInt(shard.gramCount) * 16n);
+      return header.subarray(0, ZOEKT_SHARD_MAGIC.length).equals(ZOEKT_SHARD_MAGIC) &&
+        header.readUInt32LE(8) === ZOEKT_SCHEMA_VERSION &&
+        header.readUInt32LE(12) === shard.shardId &&
+        header.readBigUInt64LE(16) === BigInt(createdUnixSecs) &&
+        header.readBigUInt64LE(80) === buildId &&
+        header.readUInt32LE(24) === shard.docCount &&
+        header.readUInt32LE(28) === shard.gramCount &&
+        docsOffset === BigInt(ZOEKT_SHARD_HEADER_BYTES) &&
+        postingsOffset === expectedPostingsOffset &&
+        docIdsOffset === expectedDocIdsOffset &&
+        stringsOffset === docIdsOffset + BigInt(docIdsCount) &&
+        stringsOffset <= fileBytes &&
+        header.readBigUInt64LE(72) === fileBytes;
+    };
+    const validationBatchSize = 16;
+    for (let offset = 0; offset < shards.length; offset += validationBatchSize) {
+      const validity = await Promise.all(
+        shards.slice(offset, offset + validationBatchSize).map(validateShard),
+      );
+      if (validity.some((valid) => !valid)) { return false; }
+    }
+    if (zoektReadinessCache.size >= 32 && !zoektReadinessCache.has(cacheKey)) {
+      const oldestKey = zoektReadinessCache.keys().next().value as string | undefined;
+      if (oldestKey !== undefined) { zoektReadinessCache.delete(oldestKey); }
+    }
+    zoektReadinessCache.set(cacheKey, {
+      signature: readinessSignature,
+      expiresAt: Date.now() + ZOEKT_READINESS_CACHE_TTL_MS,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 class ProcessCancelledError extends Error {
   constructor(message: string) {
@@ -386,11 +710,11 @@ export class ZoektRuntime implements vscode.Disposable {
       }
       return { ready: false, reason: 'zoek-rs binary unavailable; run Rebuild Search Index to build it' };
     }
-    if (await this.hasReadyIndex(workspaceRoot)) {
-      return { ready: true };
-    }
     if (this.indexPromises.has(workspaceRoot) || this.foregroundIndexPromises.has(workspaceRoot)) {
       return { ready: false, reason: 'zoek-rs index build in progress' };
+    }
+    if (await this.hasReadyIndex(workspaceRoot)) {
+      return { ready: true };
     }
     if (this.shouldIndexInBackgroundOnSearch()) {
       this.scheduleBackgroundIndex(workspaceRoot, 'search');
@@ -1449,12 +1773,8 @@ export class ZoektRuntime implements vscode.Disposable {
     }
     try {
       const manifestText = await fs.promises.readFile(manifestPath, 'utf8');
-      const manifest = JSON.parse(manifestText) as { schemaVersion?: unknown };
-      if (manifest.schemaVersion !== ZOEKT_SCHEMA_VERSION) {
-        return false;
-      }
-      const entries = await fs.promises.readdir(indexRoot);
-      return entries.some((entry) => /^base-shard-\d+\.zrs$/.test(entry));
+      const manifest = JSON.parse(manifestText) as ZoektBaseShardManifest;
+      return hasValidZoektBaseShards(indexRoot, manifest, workspaceRoot);
     } catch {
       return false;
     }

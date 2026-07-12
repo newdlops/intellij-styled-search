@@ -1,8 +1,8 @@
 use crate::config::EngineConfig;
 use crate::corpus::{decode_bytes, looks_binary_bytes};
-use crate::mmap_store::{write_atomically, StoreLayout};
+use crate::mmap_store::{acquire_index_write_lock, write_atomically, IndexWriteGuard, StoreLayout};
 use crate::protocol::json_string;
-use crate::shard::ShardReader;
+use crate::shard::{open_validated_base_shard, read_base_shard_set};
 use crate::watcher::{ChangeBatch, FileChange, FileChangeKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -11,7 +11,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OverlayEntry {
     pub rel_path: String,
     pub generation: u64,
@@ -26,7 +27,8 @@ pub struct OverlayEntry {
     pub gram_incomplete: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OverlayManifest {
     pub generation: u64,
     pub updated_unix_secs: u64,
@@ -151,7 +153,6 @@ struct JournalReplayEntry {
 }
 
 pub fn load_overlay_with_recovery(layout: &StoreLayout) -> io::Result<OverlayLoadResult> {
-    layout.ensure_dirs()?;
     let manifest_result = OverlayManifest::load(&layout.overlay_path);
     let journal = load_journal_entries(&layout.overlay_journal_path)?;
 
@@ -176,7 +177,6 @@ pub fn load_overlay_with_recovery(layout: &StoreLayout) -> io::Result<OverlayLoa
                     manifest.updated_unix_secs.max(replay.committed_unix_secs);
                 manifest.entries.push(replay.entry);
             }
-            manifest.save(&layout.overlay_path)?;
             warnings.push(
                 "overlay manifest was behind the journal; replayed newer journal entries"
                     .to_string(),
@@ -199,9 +199,8 @@ pub fn load_overlay_with_recovery(layout: &StoreLayout) -> io::Result<OverlayLoa
                     manifest.updated_unix_secs.max(replay.committed_unix_secs);
                 manifest.entries.push(replay.entry);
             }
-            manifest.save(&layout.overlay_path)?;
             warnings.push(format!(
-                "overlay manifest was unreadable ({}); rebuilt it from overlay journal",
+                "overlay manifest was unreadable ({}); recovered it from overlay journal",
                 err
             ));
             Ok(OverlayLoadResult {
@@ -213,6 +212,20 @@ pub fn load_overlay_with_recovery(layout: &StoreLayout) -> io::Result<OverlayLoa
     }
 }
 
+/// Load and persist any journal recovery while the caller owns the index write
+/// lock. Read-only callers use `load_overlay_with_recovery`, which reconstructs
+/// the same view in memory without racing a base rebuild or overlay update.
+pub fn load_overlay_with_repair(
+    layout: &StoreLayout,
+    _write_lock: &IndexWriteGuard,
+) -> io::Result<OverlayLoadResult> {
+    let result = load_overlay_with_recovery(layout)?;
+    if result.recovered {
+        result.manifest.save(&layout.overlay_path)?;
+    }
+    Ok(result)
+}
+
 pub fn apply_change_batch(
     workspace_root: &Path,
     layout: &StoreLayout,
@@ -220,7 +233,22 @@ pub fn apply_change_batch(
     batch: &ChangeBatch,
 ) -> io::Result<OverlayUpdateSummary> {
     layout.ensure_dirs()?;
-    let mut manifest = load_overlay_with_recovery(layout)?.manifest;
+    let write_lock = acquire_index_write_lock(layout)?;
+    apply_change_batch_with_write_lock(workspace_root, layout, config, batch, &write_lock)
+}
+
+/// Apply a batch while a caller-owned index write guard is held. The CLI uses
+/// this form for workspace sync so reading the base/overlay snapshot and
+/// committing the derived batch are one serialized operation.
+pub fn apply_change_batch_with_write_lock(
+    workspace_root: &Path,
+    layout: &StoreLayout,
+    config: &EngineConfig,
+    batch: &ChangeBatch,
+    _write_lock: &IndexWriteGuard,
+) -> io::Result<OverlayUpdateSummary> {
+    let _ = layout.cleanup_stale_temp_files(30)?;
+    let mut manifest = load_overlay_with_repair(layout, _write_lock)?.manifest;
     if batch.is_empty() {
         let journal_bytes = journal_size(&layout.overlay_journal_path)?;
         let latest_stats = manifest.latest_stats();
@@ -247,11 +275,16 @@ pub fn apply_change_batch(
     };
     let generation = manifest.generation.max(batch.generation.saturating_sub(1)) + 1;
     let mut entries = Vec::new();
+    let index_relative_root = layout.workspace_relative_root(workspace_root);
+    let is_excluded = |rel_path: &str| {
+        config.is_overlay_update_excluded_relative_path(rel_path)
+            || StoreLayout::relative_path_is_within_root(index_relative_root.as_deref(), rel_path)
+    };
 
     for change in &batch.changes {
         match change.kind {
             FileChangeKind::Create | FileChangeKind::Modify => {
-                if config.is_overlay_update_excluded_relative_path(&change.rel_path) {
+                if is_excluded(&change.rel_path) {
                     continue;
                 }
                 entries.push(build_entry_for_path(
@@ -263,7 +296,7 @@ pub fn apply_change_batch(
                 )?);
             }
             FileChangeKind::Delete => {
-                if config.is_overlay_update_excluded_relative_path(&change.rel_path) {
+                if is_excluded(&change.rel_path) {
                     continue;
                 }
                 entries.push(build_tombstone_entry(
@@ -273,7 +306,7 @@ pub fn apply_change_batch(
                 ));
             }
             FileChangeKind::Rename => {
-                if !config.is_overlay_update_excluded_relative_path(&change.rel_path) {
+                if !is_excluded(&change.rel_path) {
                     entries.push(build_tombstone_entry(
                         &change.rel_path,
                         generation,
@@ -281,7 +314,7 @@ pub fn apply_change_batch(
                     ));
                 }
                 if let Some(new_rel_path) = &change.new_rel_path {
-                    if config.is_overlay_update_excluded_relative_path(new_rel_path) {
+                    if is_excluded(new_rel_path) {
                         continue;
                     }
                     entries.push(build_entry_for_path(
@@ -394,13 +427,21 @@ fn base_paths_for_tombstones<'a>(
         return BTreeSet::new();
     }
 
-    let shard_paths = match layout.list_shard_paths() {
-        Ok(paths) => paths,
+    let base_shards = match read_base_shard_set(layout) {
+        Ok(shards) => shards,
+        Err(err)
+            if err.kind() == io::ErrorKind::NotFound
+                && layout
+                    .list_shard_paths()
+                    .is_ok_and(|paths| paths.is_empty()) =>
+        {
+            return BTreeSet::new()
+        }
         Err(_) => return tombstone_paths,
     };
     let mut found = BTreeSet::new();
-    for shard_path in shard_paths {
-        let reader = match ShardReader::open(&shard_path) {
+    for (shard_id, shard_path) in base_shards.paths.iter().enumerate() {
+        let reader = match open_validated_base_shard(base_shards.identity, shard_id, shard_path) {
             Ok(reader) => reader,
             Err(_) => return tombstone_paths,
         };
@@ -690,26 +731,23 @@ fn now_unix_secs() -> u64 {
 }
 
 fn parse_overlay_manifest(text: &str) -> io::Result<OverlayManifest> {
-    let generation = parse_u64_field(text, "generation").unwrap_or(0);
-    let updated_unix_secs = parse_u64_field(text, "updatedUnixSecs").unwrap_or(0);
-    let entries_body = extract_array_body(text, "entries").unwrap_or_default();
-    let mut entries = Vec::new();
-    for raw_entry in split_top_level_objects(&entries_body) {
-        entries.push(OverlayEntry {
-            rel_path: parse_string_field(raw_entry, "relPath").unwrap_or_default(),
-            generation: parse_u64_field(raw_entry, "generation").unwrap_or(0),
-            tombstone: parse_bool_field(raw_entry, "tombstone").unwrap_or(false),
-            modified_unix_secs: parse_u64_field(raw_entry, "modifiedUnixSecs").unwrap_or(0),
-            content_hash: parse_u64_field(raw_entry, "contentHash").unwrap_or(0),
-            grams: parse_string_array_field(raw_entry, "grams").unwrap_or_default(),
-            gram_incomplete: parse_bool_field(raw_entry, "gramIncomplete").unwrap_or(false),
-        });
+    let manifest: OverlayManifest = serde_json::from_str(text).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid overlay manifest: {err}"),
+        )
+    })?;
+    if manifest
+        .entries
+        .iter()
+        .any(|entry| entry.generation > manifest.generation)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "overlay entry generation exceeds the manifest generation",
+        ));
     }
-    Ok(OverlayManifest {
-        generation,
-        updated_unix_secs,
-        entries,
-    })
+    Ok(manifest)
 }
 
 fn extract_array_body(text: &str, key: &str) -> Option<String> {
@@ -745,45 +783,6 @@ fn extract_array_body(text: &str, key: &str) -> Option<String> {
         idx += 1;
     }
     None
-}
-
-fn split_top_level_objects(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = None;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (idx, ch) in text.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => {
-                if depth == 0 {
-                    start = Some(idx);
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    if let Some(begin) = start.take() {
-                        out.push(&text[begin..=idx]);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 fn parse_string_field(text: &str, key: &str) -> Option<String> {
@@ -879,10 +878,13 @@ fn decode_json_string(text: &str) -> Result<String, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_change_batch, load_overlay_with_recovery, OverlayEntry, OverlayManifest};
+    use super::{
+        apply_change_batch, load_overlay_with_recovery, load_overlay_with_repair, OverlayEntry,
+        OverlayManifest,
+    };
     use crate::config::EngineConfig;
     use crate::indexer::index_directory;
-    use crate::mmap_store::StoreLayout;
+    use crate::mmap_store::{acquire_index_write_lock, StoreLayout};
     use crate::watcher::build_change_batch;
     use std::fs;
     use std::io;
@@ -920,6 +922,19 @@ mod tests {
         let latest = parsed.latest_entries();
         assert_eq!(latest["src/a.rs"].generation, 2);
         assert!(latest["src/a.rs"].tombstone);
+    }
+
+    #[test]
+    fn rejects_incomplete_or_trailing_overlay_json() {
+        for text in [
+            "{}",
+            "{\"generation\":0,\"updatedUnixSecs\":0,\"entries\":[]} trailing",
+            "{\"generation\":0,\"updatedUnixSecs\":0}",
+        ] {
+            let err = OverlayManifest::load_json_for_test(text)
+                .expect_err("an incomplete overlay must fail closed");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]
@@ -1123,6 +1138,48 @@ mod tests {
     }
 
     #[test]
+    fn update_ignores_configured_relative_and_absolute_index_roots() -> io::Result<()> {
+        for absolute in [false, true] {
+            let root = temp_dir(if absolute {
+                "overlay-absolute-index-root"
+            } else {
+                "overlay-relative-index-root"
+            });
+            fs::create_dir_all(root.join("src"))?;
+            fs::write(root.join("src/main.rs"), "pub fn run() {}\n")?;
+            let mut config = EngineConfig::default();
+            config.index_dir_name = if absolute {
+                root.join("state/search-index")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                "state/search-index".to_string()
+            };
+            let layout = StoreLayout::for_workspace(&root, &config);
+            layout.ensure_dirs()?;
+            fs::write(layout.manifest_path.clone(), "{}")?;
+
+            let batch = build_change_batch(
+                0,
+                &[
+                    String::from("src/main.rs"),
+                    String::from("state/search-index/manifest.json"),
+                ],
+                &[],
+                &[],
+            );
+            let summary = apply_change_batch(&root, &layout, &config, &batch)?;
+            assert_eq!(summary.entries_written, 1);
+            let latest = OverlayManifest::load(&layout.overlay_path)?.latest_entries();
+            assert!(latest.contains_key("src/main.rs"));
+            assert!(!latest.contains_key("state/search-index/manifest.json"));
+
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rename_between_included_and_excluded_dirs_only_records_indexed_side() -> io::Result<()> {
         let root = temp_dir("overlay-rename-excluded");
         fs::create_dir_all(root.join("src"))?;
@@ -1177,6 +1234,13 @@ mod tests {
             recovered.manifest.latest_entries()["src/a.rs"].tombstone,
             false
         );
+        assert!(
+            !layout.overlay_path.exists(),
+            "read-only recovery must not mutate index state"
+        );
+        let write_lock = acquire_index_write_lock(&layout)?;
+        let repaired = load_overlay_with_repair(&layout, &write_lock)?;
+        assert!(repaired.recovered);
         assert!(layout.overlay_path.exists());
 
         fs::remove_dir_all(root)?;

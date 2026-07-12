@@ -54,6 +54,7 @@ function formatCaseSummary(item) {
     `${item.label}:`,
     `files=${item.fileCount}`,
     `index=${item.indexMs}ms`,
+    `reuse=${item.reuseMs}ms`,
     `update p50/p95=${item.updateP50Ms.toFixed(2)}/${item.updateP95Ms.toFixed(2)}ms`,
     `query p50/p95=${item.queryP50Ms.toFixed(2)}/${item.queryP95Ms.toFixed(2)}ms`,
   ].join(' ');
@@ -62,7 +63,18 @@ function formatCaseSummary(item) {
 function main() {
   const { cargoArgs, outDir } = parseArgs(process.argv.slice(2));
   const startedAt = new Date().toISOString();
-  const command = ['run', '-q', '-p', 'zoek-rs', '--', 'benchmark', ...cargoArgs];
+  const command = [
+    'run',
+    '-q',
+    '--release',
+    '-p',
+    'zoek-rs',
+    '--bin',
+    'zoek-rs',
+    '--',
+    'benchmark',
+    ...cargoArgs,
+  ];
   const wallStart = process.hrtime.bigint();
   const run = spawnSync('cargo', command, {
     cwd: repoRoot,

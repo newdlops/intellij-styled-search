@@ -9,18 +9,20 @@ use std::time::Instant;
 use rayon::prelude::*;
 use zoek_rs::config::EngineConfig;
 use zoek_rs::graph::{
-    audit_usage_counts, compact_graph_overlay, dump_references_tsv, dump_references_with_overlay_tsv,
-    index_graph_from_tsv, overlay_update_graph_native, query_graph, query_graph_callees,
-    query_graph_document_symbols_with_options, query_graph_implementations,
-    query_graph_symbols_with_options, rebuild_graph_native, update_graph_native, GraphSymbol,
-    GraphSymbolQueryOptions,
+    audit_usage_counts, compact_graph_overlay, dump_references_tsv,
+    dump_references_with_overlay_tsv, index_graph_from_tsv, overlay_update_graph_native,
+    query_graph, query_graph_callees, query_graph_document_symbols_with_options,
+    query_graph_implementations, query_graph_symbols_with_options, rebuild_graph_native,
+    update_graph_native, GraphSymbol, GraphSymbolQueryOptions,
 };
 use zoek_rs::indexer::{
     index_directory_with_options, index_directory_with_progress, IndexBuildOptions,
 };
-use zoek_rs::mmap_store::StoreLayout;
+use zoek_rs::mmap_store::{acquire_index_write_lock, StoreLayout};
 use zoek_rs::ops::{benchmark_workspaces, collect_info, diagnose_query};
-use zoek_rs::overlay::{apply_change_batch, load_overlay_with_recovery};
+use zoek_rs::overlay::{
+    apply_change_batch_with_write_lock, load_overlay_with_recovery, load_overlay_with_repair,
+};
 use zoek_rs::protocol::{
     BenchmarkResponse, CapabilitiesResponse, DiagnoseResponse, EngineInfo, EngineResponse,
     ErrorResponse, GraphIndexResponse, GraphQueryReference, GraphQueryResponse,
@@ -28,7 +30,7 @@ use zoek_rs::protocol::{
     InfoResponse, OverlayUpdateResponse, SearchRequest,
 };
 use zoek_rs::searcher::{search_workspace, search_workspace_streaming};
-use zoek_rs::shard::ShardReader;
+use zoek_rs::shard::{open_validated_base_shard, read_base_shard_set};
 use zoek_rs::watcher::{build_change_batch, ChangeBatch, FileChange, FileChangeKind};
 
 const SEARCH_STREAM_PREFIX: &str = "__ZOEK_SEARCH__";
@@ -206,7 +208,8 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
     let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
     let config = EngineConfig::for_workspace(&workspace_root);
     let layout = StoreLayout::for_workspace(&workspace_root, &config);
-    let current_generation = load_overlay_with_recovery(&layout)
+    let write_lock = acquire_index_write_lock(&layout).map_err(|err| err.to_string())?;
+    let current_generation = load_overlay_with_repair(&layout, &write_lock)
         .map(|result| result.manifest.generation)
         .unwrap_or(0);
 
@@ -259,8 +262,9 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
             &renamed_paths,
         )
     };
-    let summary = apply_change_batch(&workspace_root, &layout, &config, &batch)
-        .map_err(|err| err.to_string())?;
+    let summary =
+        apply_change_batch_with_write_lock(&workspace_root, &layout, &config, &batch, &write_lock)
+            .map_err(|err| err.to_string())?;
     let mut warnings = Vec::new();
     if let Some(reason) = summary.compaction_trigger_reason.clone() {
         if summary.compaction_performed {
@@ -289,7 +293,7 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{engine_capabilities, run_index, run_update};
+    use super::{engine_capabilities, metadata_identity_requires_update, run_index, run_update};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use zoek_rs::protocol::EngineResponse;
@@ -316,6 +320,15 @@ mod cli_tests {
     }
 
     #[test]
+    fn sync_treats_unknown_current_metadata_as_changed_even_for_new_paths() {
+        assert!(metadata_identity_requires_update(None, None));
+        assert!(metadata_identity_requires_update(Some(7), None));
+        assert!(metadata_identity_requires_update(None, Some(7)));
+        assert!(!metadata_identity_requires_update(Some(7), Some(7)));
+        assert!(metadata_identity_requires_update(Some(7), Some(8)));
+    }
+
+    #[test]
     fn sync_immediately_after_base_build_is_a_noop() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -330,15 +343,51 @@ mod cli_tests {
             .expect("write neutral fixture source");
         let root_arg = root.to_string_lossy().into_owned();
 
-        let indexed = run_index(&[root_arg.clone(), "--force".to_string()])
-            .expect("base build must succeed");
+        let indexed =
+            run_index(&[root_arg.clone(), "--force".to_string()]).expect("base build must succeed");
         assert!(matches!(indexed, EngineResponse::Index(response) if response.ok));
-        let updated = run_update(&[root_arg, "--sync".to_string()])
-            .expect("workspace sync must succeed");
+        let updated =
+            run_update(&[root_arg, "--sync".to_string()]).expect("workspace sync must succeed");
         assert!(matches!(
             updated,
             EngineResponse::Update(response) if response.ok && response.entries_written == 0
         ));
+
+        fs::remove_dir_all(root).expect("remove neutral fixture directory");
+    }
+
+    #[test]
+    fn sync_rejects_a_base_shard_from_another_build_without_mutating_overlay() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "zoek-rs-sync-build-identity-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("src")).expect("create neutral fixture directory");
+        fs::write(root.join("src/record.rs"), "pub fn value() -> u32 { 7 }\n")
+            .expect("write neutral fixture source");
+        let root_arg = root.to_string_lossy().into_owned();
+        run_index(&[root_arg.clone(), "--force".to_string()]).expect("base build must succeed");
+
+        let shard_path = root.join(".zoek-rs/base-shard-0000.zrs");
+        let mut bytes = fs::read(&shard_path).expect("read base shard");
+        let build_id = u64::from_le_bytes(bytes[80..88].try_into().unwrap());
+        bytes[80..88].copy_from_slice(&build_id.saturating_add(1).to_le_bytes());
+        fs::write(&shard_path, bytes).expect("write mixed-generation shard");
+        let overlay_path = root.join(".zoek-rs/hot-overlay.json");
+        let overlay_before = fs::read(&overlay_path).expect("read overlay before sync");
+
+        let error = run_update(&[root_arg, "--sync".to_string()])
+            .err()
+            .expect("sync must reject a mixed base generation");
+        assert!(error.contains("does not belong to manifest build"));
+        assert_eq!(
+            fs::read(&overlay_path).expect("read overlay after rejected sync"),
+            overlay_before
+        );
 
         fs::remove_dir_all(root).expect("remove neutral fixture directory");
     }
@@ -375,7 +424,7 @@ fn build_workspace_sync_batch(
             }
             None => {}
         }
-        if base_docs.get(&rel_path).copied() != Some(current_hash) {
+        if metadata_identity_requires_update(base_docs.get(&rel_path).copied(), current_hash) {
             changed.push(rel_path);
         }
     }
@@ -414,10 +463,15 @@ fn build_workspace_sync_batch(
     })
 }
 
+fn metadata_identity_requires_update(base_hash: Option<u64>, current_hash: Option<u64>) -> bool {
+    current_hash.is_none() || base_hash != current_hash
+}
+
 fn collect_base_doc_hashes(layout: &StoreLayout) -> io::Result<BTreeMap<String, u64>> {
     let mut out = BTreeMap::new();
-    for shard_path in layout.list_shard_paths()? {
-        let reader = ShardReader::open(&shard_path)?;
+    let base_shards = read_base_shard_set(layout)?;
+    for (shard_id, shard_path) in base_shards.paths.iter().enumerate() {
+        let reader = open_validated_base_shard(base_shards.identity, shard_id, shard_path)?;
         for doc in reader.documents()? {
             out.insert(doc.rel_path, doc.content_hash);
         }
@@ -428,7 +482,7 @@ fn collect_base_doc_hashes(layout: &StoreLayout) -> io::Result<BTreeMap<String, 
 fn collect_current_index_candidates(
     workspace_root: &Path,
     config: &EngineConfig,
-) -> io::Result<BTreeMap<String, u64>> {
+) -> io::Result<BTreeMap<String, Option<u64>>> {
     if let Some(files) = list_files_with_rg(workspace_root)? {
         return stat_current_candidates(workspace_root, config, files);
     }
@@ -506,10 +560,10 @@ fn stat_current_candidates(
     workspace_root: &Path,
     config: &EngineConfig,
     files: Vec<String>,
-) -> io::Result<BTreeMap<String, u64>> {
+) -> io::Result<BTreeMap<String, Option<u64>>> {
     let entries = files
         .into_par_iter()
-        .map(|rel_path| -> io::Result<Option<(String, u64)>> {
+        .map(|rel_path| -> io::Result<Option<(String, Option<u64>)>> {
             if rel_path.is_empty() || config.is_overlay_update_excluded_relative_path(&rel_path) {
                 return Ok(None);
             }
@@ -525,17 +579,7 @@ fn stat_current_candidates(
             if !metadata.is_file() || metadata.len() > config.max_file_size_bytes {
                 return Ok(None);
             }
-            let modified_unix_secs = metadata
-                .modified()
-                .ok()
-                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|value| value.as_secs())
-                .unwrap_or(0);
-            let hash = zoek_rs::indexer::stable_record_hash(
-                &rel_path,
-                metadata.len(),
-                modified_unix_secs,
-            );
+            let hash = zoek_rs::indexer::stable_record_hash_for_metadata(&rel_path, &metadata);
             Ok(Some((rel_path, hash)))
         })
         .collect::<io::Result<Vec<_>>>()?;
@@ -1154,7 +1198,10 @@ fn run_graph_overlay_dump(args: &[String]) -> Result<EngineResponse, String> {
     let config = EngineConfig::for_workspace(&workspace_root);
     let n = dump_references_with_overlay_tsv(&workspace_root, &config, &out)
         .map_err(|err| err.to_string())?;
-    eprintln!("graph-overlay-dump: wrote {n} merged references to {}", out.display());
+    eprintln!(
+        "graph-overlay-dump: wrote {n} merged references to {}",
+        out.display()
+    );
     std::process::exit(0);
 }
 
@@ -1248,10 +1295,10 @@ fn run_graph_audit_counts(args: &[String]) -> Result<EngineResponse, String> {
                 idx += 2;
             }
             "--dump-first-party" => {
-                dump_first_party = Some(PathBuf::from(
-                    args.get(idx + 1)
-                        .ok_or_else(|| "--dump-first-party requires a path".to_string())?,
-                ));
+                dump_first_party =
+                    Some(PathBuf::from(args.get(idx + 1).ok_or_else(|| {
+                        "--dump-first-party requires a path".to_string()
+                    })?));
                 idx += 2;
             }
             other => return Err(format!("unknown graph-audit-counts flag: {other}")),

@@ -8,11 +8,10 @@ import type { ExtensionTestApi } from '../../extension';
 import type { SearchForTestsResult } from '../../search';
 import { ensureRipgrepInstalled, findRipgrepPath } from '../../rgSearch';
 import { decodeTextBytes, hasBinaryFileExtension, looksBinaryContent } from '../../textFiles';
+import { hasValidZoektBaseShards } from '../../zoekRuntime';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 const CAPTAIN_WORKSPACE_SUFFIX = path.join('captain2', 'captain');
-// Keep in sync with crates/zoek-rs/src/config.rs SCHEMA_VERSION (and zoekRuntime.ts).
-const ZOEKT_SCHEMA_VERSION = 20;
 const SEARCH_INDEX_BUDGET_MS = 8_000;
 const SEARCH_INDEX_SEED_TIMEOUT_MS = 120_000;
 const GRAPH_INDEX_BUDGET_MS = 8_000;
@@ -700,13 +699,14 @@ let captainSearchReuseElapsedMs: number | undefined;
 
 async function hasCleanSearchIndex(root: string): Promise<boolean> {
   try {
-    const manifest = JSON.parse(await fs.promises.readFile(path.join(root, '.zoek-rs', 'manifest.json'), 'utf8')) as {
-      schemaVersion?: unknown;
-    };
-    if (manifest.schemaVersion !== ZOEKT_SCHEMA_VERSION) {
+    const indexRoot = path.join(root, '.zoek-rs');
+    const manifest = JSON.parse(
+      await fs.promises.readFile(path.join(indexRoot, 'manifest.json'), 'utf8'),
+    );
+    if (!await hasValidZoektBaseShards(indexRoot, manifest, root)) {
       return false;
     }
-    const overlay = await fs.promises.readFile(path.join(root, '.zoek-rs', 'hot-overlay.json'), 'utf8');
+    const overlay = await fs.promises.readFile(path.join(indexRoot, 'hot-overlay.json'), 'utf8');
     return overlay.includes('"entries":[]');
   } catch {
     return false;

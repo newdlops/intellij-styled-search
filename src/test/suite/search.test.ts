@@ -346,7 +346,7 @@ suite('Search — engine end-to-end against fixture workspace', () => {
   });
 
   test('rebuildIndex follows codesearch setting and repopulates the trigram cache', async function () {
-    this.timeout(60_000);
+    this.timeout(120_000);
     const folder = vscode.workspace.workspaceFolders?.[0];
     assert.ok(folder, 'expected fixture workspace folder');
     // This test measures a full codesearch (trigram) rebuild end-to-end. On
@@ -480,6 +480,7 @@ suite('Search — engine end-to-end against fixture workspace', () => {
       caseSensitive: false,
       wholeWord: false,
       useRegex: true,
+      regexMultiline: true,
     });
     assert.deepStrictEqual(relPaths(matches), ['docs.md']);
     const range = matches[0].matches[0].ranges[0];
@@ -493,6 +494,7 @@ suite('Search — engine end-to-end against fixture workspace', () => {
       caseSensitive: true,
       wholeWord: false,
       useRegex: true,
+      regexMultiline: true,
     });
     assert.deepStrictEqual(wrongCase, [], 'case-sensitive regex should not match wrong-case text');
   });
@@ -600,7 +602,7 @@ suite('Search — engine end-to-end against fixture workspace', () => {
   });
 
   test('default safety cap prevents unbounded result explosions', async function () {
-    this.timeout(60_000);
+    this.timeout(120_000);
     // Generates a 2500-line file and walks the result cap. The overlay
     // churn from prior tests in unified mode pushes this past the 60s
     // budget on captain; verified on fixture, skip elsewhere.

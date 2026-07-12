@@ -1,11 +1,11 @@
 use crate::config::EngineConfig;
 use crate::corpus::discover_text_files;
-use crate::mmap_store::StoreLayout;
+use crate::mmap_store::{acquire_index_read_lock, StoreLayout};
 use crate::overlay::load_overlay_with_recovery;
 use crate::planner::{build_query_plan, QueryMode, QueryTermPlan};
 use crate::protocol::{SearchFileResult, SearchMatch, SearchRequest, SearchResponse};
 use crate::scorer::score_file;
-use crate::shard::{ShardDocument, ShardReader};
+use crate::shard::{open_validated_base_shard, read_base_shard_set, ShardDocument, ShardReader};
 use crate::verifier::{
     build_file_result, load_current_text, matches_path_filters, verify_literal, verify_regex,
 };
@@ -81,28 +81,21 @@ where
     let workspace_root = Path::new(&request.workspace_root);
     let layout = StoreLayout::for_workspace(workspace_root, config);
     let mut warnings = Vec::new();
-    match layout.cleanup_stale_temp_files(30) {
-        Ok(removed) if !removed.is_empty() => {
-            warnings.push(format!(
-                "removed stale temp index files: {}",
-                removed.join(", ")
-            ));
-        }
-        Ok(_) => {}
-        Err(err) => warnings.push(format!("temp-file cleanup failed: {err}")),
-    }
 
-    let candidates =
-        match collect_index_candidates(workspace_root, &layout, &plan, config, &mut warnings) {
-            Ok(Some(candidates)) => candidates,
-            Ok(None) => fallback_candidates(workspace_root, request, &mut warnings)
-                .map_err(|err| err.to_string())?,
-            Err(err) => {
-                warnings.push(format!("index query fallback: {err}"));
-                fallback_candidates(workspace_root, request, &mut warnings)
-                    .map_err(|fallback| fallback.to_string())?
-            }
-        };
+    let indexed_candidates = {
+        let _read_lock = acquire_index_read_lock(&layout).map_err(|err| err.to_string())?;
+        collect_index_candidates(workspace_root, &layout, &plan, config, &mut warnings)
+    };
+    let candidates = match indexed_candidates {
+        Ok(Some(candidates)) => candidates,
+        Ok(None) => fallback_candidates(workspace_root, request, &mut warnings)
+            .map_err(|err| err.to_string())?,
+        Err(err) => {
+            warnings.push(format!("index query fallback: {err}"));
+            fallback_candidates(workspace_root, request, &mut warnings)
+                .map_err(|fallback| fallback.to_string())?
+        }
+    };
 
     let mut verified_files = Vec::new();
     let mut total_files_scanned = 0usize;
@@ -360,22 +353,22 @@ fn collect_index_candidates(
     config: &EngineConfig,
     warnings: &mut Vec<String>,
 ) -> Result<Option<BTreeMap<String, CandidateDocument>>, String> {
-    let shard_paths = layout.list_shard_paths().map_err(|err| err.to_string())?;
-    if shard_paths.is_empty() {
-        warnings.push("no base shards found; falling back to full scan".to_string());
-        return Ok(None);
-    }
-
-    let overlay = match load_overlay_with_recovery(layout) {
-        Ok(result) => {
-            warnings.extend(result.warnings);
-            result.manifest
+    let base_shards = match read_base_shard_set(layout) {
+        Ok(shards) => shards,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            warnings.push("no complete base index found; falling back to full scan".to_string());
+            return Ok(None);
         }
-        Err(err) => {
-            warnings.push(format!("overlay load failed: {err}"));
-            crate::overlay::OverlayManifest::empty()
-        }
+        Err(err) => return Err(format!("base index validation failed: {err}")),
     };
+
+    if !layout.overlay_path.is_file() {
+        return Err("overlay validation failed: hot overlay is missing".to_string());
+    }
+    let overlay = load_overlay_with_recovery(layout)
+        .map_err(|err| format!("overlay validation failed: {err}"))?;
+    warnings.extend(overlay.warnings);
+    let overlay = overlay.manifest;
     let latest_overlay = overlay.latest_entries();
     let path_regex = plan
         .path_regex
@@ -386,8 +379,9 @@ fn collect_index_candidates(
 
     let mut candidates = BTreeMap::new();
     let mut shard_order_base = 0usize;
-    for shard_path in shard_paths {
-        let reader = ShardReader::open(&shard_path).map_err(|err| err.to_string())?;
+    for (shard_id, shard_path) in base_shards.paths.into_iter().enumerate() {
+        let reader = open_validated_base_shard(base_shards.identity, shard_id, &shard_path)
+            .map_err(|err| format!("base index validation failed: {err}"))?;
         let docs = reader.documents().map_err(|err| err.to_string())?;
         let selected_ids =
             candidate_doc_ranks(&reader, &docs, plan).map_err(|err| err.to_string())?;
@@ -943,7 +937,8 @@ mod tests {
     use crate::indexer::index_directory;
     use crate::mmap_store::StoreLayout;
     use crate::overlay::{apply_change_batch, OverlayEntry, OverlayManifest};
-    use crate::protocol::SearchRequest;
+    use crate::protocol::{json_string, SearchRequest};
+    use crate::shard::{build_shard_bytes, IndexedDocument};
     use crate::watcher::build_change_batch;
     use std::fs;
     use std::io;
@@ -979,6 +974,130 @@ mod tests {
         .map_err(io::Error::other)?;
         assert_eq!(response.total_files_matched, 1);
         assert_eq!(response.files[0].rel_path, "src/a.rs");
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_base_build_identities_fall_back_to_current_workspace_text() -> io::Result<()> {
+        let root = temp_dir("mixed-base-build");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/a.rs"), "struct SharedMarker {}\n")?;
+        fs::write(root.join("src/b.rs"), "struct OtherRecord {}\n")?;
+        let mut config = EngineConfig::default();
+        config.max_files_per_shard = 1;
+        let artifacts = index_directory(&root, &config)?;
+        assert_eq!(artifacts.shards.len(), 2);
+
+        let mixed_path = &artifacts.shards[1].path;
+        let mut bytes = fs::read(mixed_path)?;
+        let build_id = u64::from_le_bytes(bytes[80..88].try_into().unwrap());
+        bytes[80..88].copy_from_slice(&build_id.saturating_add(1).to_le_bytes());
+        fs::write(mixed_path, bytes)?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "SharedMarker".to_string(),
+                query_terms: Vec::new(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec![],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &config,
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(response.total_files_matched, 1);
+        assert_eq!(response.files[0].rel_path, "src/a.rs");
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("base index validation failed")));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_overlay_state_falls_back_before_new_files_can_be_missed() -> io::Result<()> {
+        let root = temp_dir("missing-overlay-fallback");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/base.rs"), "struct BaseRecord {}\n")?;
+        let config = EngineConfig::default();
+        index_directory(&root, &config)?;
+        fs::remove_file(root.join(".zoek-rs/hot-overlay.json"))?;
+        fs::write(root.join("src/new.rs"), "struct NewlyAddedMarker {}\n")?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "NewlyAddedMarker".to_string(),
+                query_terms: Vec::new(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec![],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &config,
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(response.total_files_matched, 1);
+        assert_eq!(response.files[0].rel_path, "src/new.rs");
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("overlay validation failed")));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_overlay_state_falls_back_before_new_files_can_be_missed() -> io::Result<()> {
+        let root = temp_dir("malformed-overlay-fallback");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/base.rs"), "struct BaseRecord {}\n")?;
+        let config = EngineConfig::default();
+        index_directory(&root, &config)?;
+        fs::write(root.join(".zoek-rs/hot-overlay.json"), "{}")?;
+        fs::write(root.join("src/new.rs"), "struct NewlyAddedMarker {}\n")?;
+
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "NewlyAddedMarker".to_string(),
+                query_terms: Vec::new(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec![],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &config,
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(response.total_files_matched, 1);
+        assert_eq!(response.files[0].rel_path, "src/new.rs");
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("overlay validation failed")));
 
         fs::remove_dir_all(root)?;
         Ok(())
@@ -1681,12 +1800,48 @@ mod tests {
     fn search_order_is_not_overridden_by_file_match_count_score() -> io::Result<()> {
         let root = temp_dir("search-order-not-score");
         fs::create_dir_all(root.join("src"))?;
-        fs::write(root.join("src/a_first.rs"), "needle\n")?;
+        let low_content = "needle\n";
+        let high_content = "needle\nneedle\nneedle\nneedle\nneedle\n";
+        fs::write(root.join("src/low.rs"), low_content)?;
+        fs::write(root.join("src/high.rs"), high_content)?;
+        let documents = [("src/low.rs", low_content), ("src/high.rs", high_content)]
+            .into_iter()
+            .map(|(rel_path, content)| {
+                let (grams, overflow) = crate::gram::extract_dynamic_gram_hashes_with_overflow(
+                    rel_path,
+                    content,
+                    EngineConfig::default().max_grams_per_file,
+                );
+                IndexedDocument {
+                    rel_path: rel_path.to_string(),
+                    byte_len: content.len() as u64,
+                    modified_unix_secs: 0,
+                    content_hash: 0,
+                    grams,
+                    gram_incomplete: overflow,
+                }
+            })
+            .collect::<Vec<_>>();
+        let layout = StoreLayout::for_workspace(&root, &EngineConfig::default());
+        layout.ensure_dirs()?;
+        let shard = build_shard_bytes(0, 1, 2, &documents)?;
+        fs::write(layout.shard_path(0), &shard.bytes)?;
+        fs::write(layout.write_lock_path(), "")?;
         fs::write(
-            root.join("src/b_many.rs"),
-            "needle\nneedle\nneedle\nneedle\nneedle\n",
+            &layout.manifest_path,
+            format!(
+                "{{\"engine\":\"zoek-rs\",\"schemaVersion\":20,\"workspaceMetadataHashVersion\":3,\"workspaceRoot\":{},\"indexRoot\":{},\"createdUnixSecs\":1,\"buildId\":\"2\",\"fingerprint\":1,\"workspaceMetadataFingerprint\":1,\"configFingerprint\":1,\"shardMetadataFingerprint\":1,\"stats\":{{\"visitedFiles\":2,\"indexedFiles\":2,\"skippedBinary\":0,\"skippedBinaryExtension\":0,\"skippedTooLarge\":0,\"decodedUtf16Files\":0,\"shardCount\":1,\"totalGrams\":{},\"totalSourceBytes\":{},\"totalShardBytes\":{}}},\"baseShards\":[{{\"shardId\":0,\"fileName\":\"base-shard-0000.zrs\",\"docCount\":2,\"gramCount\":{},\"sourceBytes\":{},\"fileBytes\":{}}}]}}",
+                json_string(&root.to_string_lossy()),
+                json_string(&layout.root.to_string_lossy()),
+                shard.header.gram_count,
+                shard.source_bytes,
+                shard.bytes.len(),
+                shard.header.gram_count,
+                shard.source_bytes,
+                shard.bytes.len(),
+            ),
         )?;
-        index_directory(&root, &EngineConfig::default())?;
+        OverlayManifest::empty().save(&layout.overlay_path)?;
 
         let response = search_workspace(
             &SearchRequest {
@@ -1710,9 +1865,10 @@ mod tests {
         assert_eq!(response.total_files_matched, 2);
         assert_eq!(
             response.files.first().map(|file| file.rel_path.as_str()),
-            Some("src/a_first.rs"),
-            "file match count score must not reorder broad search results ahead of rg-like candidate order",
+            Some("src/low.rs"),
+            "file match count score must not reorder a lower document id",
         );
+        assert!(response.files[1].score > response.files[0].score);
 
         fs::remove_dir_all(root)?;
         Ok(())

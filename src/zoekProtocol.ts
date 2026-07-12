@@ -182,6 +182,7 @@ export interface ZoektBenchmarkCase {
   label: string;
   fileCount: number;
   indexMs: number;
+  reuseMs: number;
   graphIndexMs?: number;
   graphSymbolCount?: number;
   graphReferenceCount?: number;

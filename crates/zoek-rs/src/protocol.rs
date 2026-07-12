@@ -198,6 +198,7 @@ pub struct BenchmarkCase {
     pub label: String,
     pub file_count: usize,
     pub index_ms: u64,
+    pub reuse_ms: u64,
     pub update_p50_ms: u64,
     pub update_p95_ms: u64,
     pub query_p50_ms: u64,
@@ -543,10 +544,11 @@ impl OverlayUpdateResponse {
 impl BenchmarkCase {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"label\":{},\"fileCount\":{},\"indexMs\":{},\"updateP50Ms\":{},\"updateP95Ms\":{},\"queryP50Ms\":{},\"queryP95Ms\":{},\"process\":{}}}",
+            "{{\"label\":{},\"fileCount\":{},\"indexMs\":{},\"reuseMs\":{},\"updateP50Ms\":{},\"updateP95Ms\":{},\"queryP50Ms\":{},\"queryP95Ms\":{},\"process\":{}}}",
             json_string(&self.label),
             self.file_count,
             self.index_ms,
+            self.reuse_ms,
             self.update_p50_ms,
             self.update_p95_ms,
             self.query_p50_ms,

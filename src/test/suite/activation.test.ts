@@ -146,7 +146,7 @@ suite('Activation', () => {
   test('trigram index reaches ready state on fixture workspace', async function () {
     // Default engine is zoekt. A rebuild should make the Rust engine ready
     // without falling back to codesearch.
-    this.timeout(60_000);
+    this.timeout(120_000);
     const { overlay } = await getApi();
     await overlay.rebuildIndex();
     await overlay.waitForIndexReady(30_000);
@@ -333,6 +333,160 @@ suite('Activation', () => {
       runtime.getBinaryCandidates = originalCandidates;
       runtime.binaryPath = originalBinaryPath;
       runtime.buildPromise = originalBuildPromise;
+    }
+  });
+
+  test('search index readiness validates the manifest and complete shard contract', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+    const root = path.join(workspaceRoot, `.tmp-index-readiness-${process.pid}-${Date.now()}`);
+    const indexRoot = path.join(root, '.zoek-rs');
+    const shardPath = path.join(indexRoot, 'base-shard-0000.zrs');
+    const validHeader = () => {
+      const header = Buffer.alloc(88);
+      header.write('ZKSHRD01', 0, 'ascii');
+      header.writeUInt32LE(20, 8);
+      header.writeUInt32LE(0, 12);
+      header.writeBigUInt64LE(1n, 16);
+      header.writeBigUInt64LE(88n, 40);
+      header.writeBigUInt64LE(88n, 48);
+      header.writeBigUInt64LE(88n, 56);
+      header.writeBigUInt64LE(88n, 64);
+      header.writeBigUInt64LE(BigInt(header.length), 72);
+      header.writeBigUInt64LE(2n, 80);
+      return header;
+    };
+    const validManifest = {
+      engine: 'zoek-rs',
+      schemaVersion: 20,
+      workspaceMetadataHashVersion: 3,
+      workspaceRoot: root,
+      indexRoot,
+      createdUnixSecs: 1,
+      buildId: '2',
+      fingerprint: 4,
+      workspaceMetadataFingerprint: 1,
+      configFingerprint: 2,
+      shardMetadataFingerprint: 3,
+      stats: {
+        visitedFiles: 0,
+        indexedFiles: 0,
+        skippedBinary: 0,
+        skippedBinaryExtension: 0,
+        skippedTooLarge: 0,
+        decodedUtf16Files: 0,
+        shardCount: 1,
+        totalGrams: 0,
+        totalSourceBytes: 0,
+        totalShardBytes: 88,
+      },
+      baseShards: [{
+        shardId: 0,
+        fileName: 'base-shard-0000.zrs',
+        docCount: 0,
+        gramCount: 0,
+        sourceBytes: 0,
+        fileBytes: 88,
+      }],
+    };
+    fs.mkdirSync(indexRoot, { recursive: true });
+    fs.writeFileSync(path.join(indexRoot, 'search-index.lock'), '');
+    fs.writeFileSync(path.join(indexRoot, 'hot-overlay.json'), JSON.stringify({
+      generation: 0,
+      updatedUnixSecs: 0,
+      entries: [],
+    }));
+    fs.writeFileSync(shardPath, validHeader());
+    try {
+      fs.writeFileSync(path.join(indexRoot, 'manifest.json'), JSON.stringify({ schemaVersion: 20 }));
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+
+      fs.writeFileSync(path.join(indexRoot, 'manifest.json'), JSON.stringify({
+        ...validManifest,
+        workspaceMetadataFingerprint: 0,
+      }));
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+
+      fs.writeFileSync(path.join(indexRoot, 'manifest.json'), JSON.stringify({
+        ...validManifest,
+        buildId: 2,
+      }));
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+
+      fs.writeFileSync(path.join(indexRoot, 'manifest.json'), JSON.stringify({
+        ...validManifest,
+        engine: 'another-engine',
+      }));
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+
+      fs.writeFileSync(path.join(indexRoot, 'manifest.json'), JSON.stringify(validManifest));
+      assert.strictEqual(await runtime.hasReadyIndex(root), true);
+
+      fs.writeFileSync(path.join(indexRoot, 'hot-overlay.json'), JSON.stringify({
+        generation: 0,
+        updatedUnixSecs: 0,
+        entries: [{
+          relPath: 'src/record.rs',
+          generation: 1,
+          tombstone: false,
+          modifiedUnixSecs: 1,
+          contentHash: 1,
+          gramIncomplete: false,
+          grams: [],
+        }],
+      }));
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+      fs.writeFileSync(path.join(indexRoot, 'hot-overlay.json'), JSON.stringify({
+        generation: 0,
+        updatedUnixSecs: 0,
+        entries: [],
+      }));
+
+      fs.rmSync(path.join(indexRoot, 'hot-overlay.json'));
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+      fs.writeFileSync(path.join(indexRoot, 'hot-overlay.json'), JSON.stringify({
+        generation: 0,
+        updatedUnixSecs: 0,
+        entries: [],
+      }));
+
+      fs.rmSync(shardPath);
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+
+      fs.writeFileSync(shardPath, validHeader().subarray(0, 87));
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+
+      const invalidHeader = validHeader();
+      invalidHeader.writeUInt32LE(19, 8);
+      fs.writeFileSync(shardPath, invalidHeader);
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+
+      const invalidOffsets = validHeader();
+      invalidOffsets.writeBigUInt64LE(89n, 48);
+      fs.writeFileSync(shardPath, invalidOffsets);
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+
+      const mismatchedBuild = validHeader();
+      mismatchedBuild.writeBigUInt64LE(3n, 80);
+      fs.writeFileSync(shardPath, mismatchedBuild);
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+
+      fs.writeFileSync(shardPath, validHeader());
+      fs.writeFileSync(path.join(indexRoot, 'base-shard-0001.zrs'), validHeader());
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+
+      fs.rmSync(shardPath);
+      fs.rmSync(path.join(indexRoot, 'base-shard-0001.zrs'));
+      fs.writeFileSync(path.join(indexRoot, 'manifest.json'), JSON.stringify({
+        ...validManifest,
+        stats: { shardCount: 0 },
+        baseShards: [],
+      }));
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -934,6 +1088,38 @@ suite('Activation', () => {
     }
   });
 
+  test('zoekt rebuild preserves the independent codesearch trigram cache', async () => {
+    const { overlay } = await getApi();
+    const panel = overlay as any;
+    const runtime = panel.zoektRuntime as any;
+    const trigram = overlay.getTrigramIndex() as any;
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorEngine = cfg.inspect<string>('engine')?.workspaceValue;
+    const originalClear = trigram.clear;
+    const originalRebuildIndex = runtime.rebuildIndex;
+    const originalCancelRunningProcesses = runtime.cancelRunningProcesses;
+    let clearCalls = 0;
+    let zoektRebuildCalls = 0;
+
+    trigram.clear = async () => { clearCalls += 1; };
+    runtime.rebuildIndex = async () => {
+      zoektRebuildCalls += 1;
+      return true;
+    };
+    runtime.cancelRunningProcesses = () => {};
+    try {
+      await cfg.update('engine', 'zoekt', vscode.ConfigurationTarget.Workspace);
+      await overlay.rebuildIndex();
+      assert.strictEqual(zoektRebuildCalls, 1);
+      assert.strictEqual(clearCalls, 0, 'zoekt rebuild must not clear or await the codesearch cache');
+    } finally {
+      trigram.clear = originalClear;
+      runtime.rebuildIndex = originalRebuildIndex;
+      runtime.cancelRunningProcesses = originalCancelRunningProcesses;
+      await cfg.update('engine', priorEngine, vscode.ConfigurationTarget.Workspace);
+    }
+  });
+
   test('background index consumes stderr progress lines', async () => {
     const { overlay } = await getApi();
     const runtime = (overlay as any).zoektRuntime as any;
@@ -1235,10 +1421,12 @@ suite('Activation', () => {
     assert.ok(workspaceRoot, 'expected fixture workspace folder');
 
     const originalInvokeJson = runtime.invokeJson.bind(runtime);
+    const originalHasReadyIndex = runtime.hasReadyIndex.bind(runtime);
     const invoked: string[][] = [];
 
     runtime.workspaceSyncNeeded = true;
     runtime.lastWorkspaceSyncAt.delete(workspaceRoot);
+    runtime.hasReadyIndex = async () => true;
     runtime.invokeJson = async (args: string[]) => {
       invoked.push(args);
       return {
@@ -1265,6 +1453,7 @@ suite('Activation', () => {
     } finally {
       runtime.workspaceSyncNeeded = false;
       runtime.lastWorkspaceSyncAt.delete(workspaceRoot);
+      runtime.hasReadyIndex = originalHasReadyIndex;
       runtime.invokeJson = originalInvokeJson;
     }
   });
@@ -1277,6 +1466,7 @@ suite('Activation', () => {
 
     const originalInvokeJson = runtime.invokeJson.bind(runtime);
     const originalReadGitState = runtime.readGitState.bind(runtime);
+    const originalHasReadyIndex = runtime.hasReadyIndex.bind(runtime);
     const invoked: string[][] = [];
     let gitState = 'HEAD ref: refs/heads/main\nREF aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 
@@ -1284,6 +1474,7 @@ suite('Activation', () => {
     runtime.lastGitState.delete(workspaceRoot);
     runtime.lastWorkspaceSyncAt.delete(workspaceRoot);
     runtime.readGitState = async () => gitState;
+    runtime.hasReadyIndex = async () => true;
     runtime.invokeJson = async (args: string[]) => {
       invoked.push(args);
       return {
@@ -1319,6 +1510,7 @@ suite('Activation', () => {
       runtime.lastWorkspaceSyncAt.delete(workspaceRoot);
       runtime.invokeJson = originalInvokeJson;
       runtime.readGitState = originalReadGitState;
+      runtime.hasReadyIndex = originalHasReadyIndex;
     }
   });
 

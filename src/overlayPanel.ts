@@ -2252,8 +2252,9 @@ export class OverlayPanel {
               this.zoektRuntime.cancelRunningProcesses('zoekt rebuild requested', {
                 kinds: ['search', 'update', 'info', 'diagnose', 'benchmark'],
               });
-              ui.report({ message: 'clearing codesearch trigram cache' });
-              await this.trigramIndex.clear('zoekt rebuild requested');
+              this.log.appendLine(
+                'zoekt rebuild requested; preserving the independent codesearch trigram cache.',
+              );
               try {
                 let lastPercent = 0;
                 const usedZoekt = await this.zoektRuntime.rebuildIndex((message, percent) => {

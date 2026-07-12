@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 pub const ENGINE_NAME: &str = "zoek-rs";
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const WORKSPACE_METADATA_HASH_VERSION: u32 = 3;
 // Stamped into .zoek-rs/manifest.json. When you bump this you MUST also update
 // `ZOEKT_SCHEMA_VERSION` in src/zoekRuntime.ts (and src/test/suite/captainIndexGate.test.ts):
 // the TS readiness check rejects any manifest whose schemaVersion != that
