@@ -96,8 +96,11 @@ suite('Renderer patch source', () => {
       script.includes("var themeClasses = ['vs', 'vs-dark', 'hc-black', 'hc-light'];") &&
         script.includes('function ensurePreviewOverflowThemeObserver()') &&
         script.includes('syncPreviewOverflowTheme(overflowRoot);') &&
+        script.includes("mountedInsideWorkbench = !!(panel.closest && panel.closest('.monaco-workbench'));") &&
+        script.includes('if (!mountedInsideWorkbench && searchUiMountRoot === document.body) {') &&
+        script.includes('syncPreviewOverflowTheme(panel);') &&
         script.includes("observer.observe(document.head, { childList: true, characterData: true, subtree: true });"),
-      'detached widgets should track normal, dark, and high-contrast workbench theme changes',
+      'the mounted panel should inherit without a cold style scan while the body fallback retains a theme snapshot',
     );
     assert.ok(
       script.includes('dismissPreviewMonacoHover(state.previewMonacoEditor || state.monacoEditor);') &&
@@ -183,6 +186,242 @@ suite('Renderer patch source', () => {
     assert.strictEqual(context.window.__ijFindMonacoCapturePaused, false);
     assert.strictEqual(refreshes, 1, 'pause expiry should re-arm capture on a retained patch');
     assert.strictEqual(resumes, 1, 'pause expiry should wake the current bundled preview');
+  });
+
+  test('cancels active cooperating capture cheaply and restarts only after the final suspend reason clears', () => {
+    const script = getRendererPatchScript(true, false, true, true, true, false, true, false);
+    const lifecycleStart = script.indexOf('function installIntelliSenseRecursionCaptureGuard()');
+    const lifecycleEndMarker =
+      'window.__ijFindSetIntelliSenseRecursionCaptureSuspended = setIntelliSenseRecursionCaptureSuspended;';
+    const lifecycleEnd = script.indexOf(lifecycleEndMarker, lifecycleStart);
+    assert.ok(lifecycleStart >= 0 && lifecycleEnd > lifecycleStart, 'expected generated capture lifecycle helpers');
+    const lifecycleSource = script.slice(lifecycleStart, lifecycleEnd + lifecycleEndMarker.length);
+
+    const cancelBranch = lifecycleSource.indexOf("typeof window.__irCancelCapture === 'function'");
+    const stopFallback = lifecycleSource.indexOf("!cancelled && typeof window.__irStopCapture === 'function'");
+    assert.ok(
+      cancelBranch >= 0 && stopFallback > cancelBranch,
+      'suspend should feature-detect cheap cancellation before consulting the legacy stop fallback',
+    );
+    assert.ok(
+      lifecycleSource.includes(
+        "var hadCleanupFlag = Object.prototype.hasOwnProperty.call(window, '__irCleanupInProgress')",
+      ) &&
+        lifecycleSource.includes('var previousCleanupFlag = window.__irCleanupInProgress') &&
+        lifecycleSource.includes('window.__irCleanupInProgress = true') &&
+        lifecycleSource.includes('if (window.__irCleanupInProgress !== true)') &&
+        lifecycleSource.includes('window.__irCleanupInProgress = previousCleanupFlag') &&
+        lifecycleSource.includes('delete window.__irCleanupInProgress'),
+      'legacy stop should run in cleanup mode and restore both present and absent prior flag states',
+    );
+    assert.ok(
+      lifecycleSource.includes('window.__ijFindIrCaptureNeedsRestart = true') &&
+        lifecycleSource.includes('var restart = suspended ? \'\' : scheduleIntelliSenseRecursionCaptureRestart()') &&
+        lifecycleSource.includes('if (window.__ijFindIrCaptureSuspended === true)') &&
+        lifecycleSource.includes("window.__irStartCapture('ijss:resume-after-suspend')"),
+      'only cancelled work should request a restart, and the queued restart must recheck suspension state',
+    );
+
+    function installLifecycle(windowState: Record<string, any>) {
+      const queued: Array<() => void> = [];
+      vm.runInNewContext(lifecycleSource, {
+        window: windowState,
+        setTimeout(callback: () => void) {
+          queued.push(callback);
+          return queued.length;
+        },
+      });
+      const setSuspended = windowState.__ijFindSetIntelliSenseRecursionCaptureSuspended as
+        (active: boolean, reason: string) => string;
+      assert.strictEqual(typeof setSuspended, 'function');
+      return { queued, setSuspended };
+    }
+
+    const preferredEvents: string[] = [];
+    const preferredWindow: Record<string, any> = {
+      __ijFindShouldSuspendIntelliSenseRecursionCapture: true,
+      __irCaptureActive: true,
+    };
+    preferredWindow.__irStartCapture = (reason: string) => {
+      preferredEvents.push(`start:${reason}`);
+      preferredWindow.__irCaptureActive = true;
+      return 'started';
+    };
+    preferredWindow.__irCancelCapture = (reason: string) => {
+      preferredEvents.push(`cancel:${reason}`);
+      preferredWindow.__irCaptureActive = false;
+      return 'cancelled';
+    };
+    preferredWindow.__irStopCapture = (reason: string) => {
+      preferredEvents.push(`stop:${reason}`);
+      preferredWindow.__irCaptureActive = false;
+      return 'stopped';
+    };
+    const preferred = installLifecycle(preferredWindow);
+
+    preferred.setSuspended(true, 'surface-visible');
+    preferred.setSuspended(true, 'resource-transition');
+    assert.deepStrictEqual(
+      preferredEvents,
+      ['cancel:ijss:surface-visible'],
+      'an active capture should use the preferred cancel API once; an already-cancelled capture must not stop again',
+    );
+    assert.strictEqual(preferredWindow.__ijFindIrCaptureNeedsRestart, true);
+
+    preferred.setSuspended(false, 'surface-visible');
+    assert.strictEqual(preferred.queued.length, 0, 'one remaining owner must keep restart unscheduled');
+    preferred.setSuspended(false, 'resource-transition');
+    assert.strictEqual(preferred.queued.length, 1, 'the final release should queue, not synchronously run, restart');
+    assert.deepStrictEqual(preferredEvents, ['cancel:ijss:surface-visible']);
+
+    // A new owner can arrive between queueing and the timer turn. The queued
+    // callback must preserve restart intent rather than starting while any
+    // reason remains active.
+    preferred.setSuspended(true, 'late-owner');
+    preferred.queued.shift()!();
+    assert.deepStrictEqual(preferredEvents, ['cancel:ijss:surface-visible']);
+    assert.strictEqual(preferredWindow.__ijFindIrCaptureNeedsRestart, true);
+    preferred.setSuspended(false, 'late-owner');
+    assert.strictEqual(preferred.queued.length, 1);
+    preferred.queued.shift()!();
+    assert.deepStrictEqual(
+      preferredEvents,
+      ['cancel:ijss:surface-visible', 'start:ijss:resume-after-suspend'],
+      'restart should occur asynchronously once, after every suspend reason has cleared',
+    );
+
+    let cleanupValueDuringStop: unknown;
+    const fallbackWindow: Record<string, any> = {
+      __ijFindShouldSuspendIntelliSenseRecursionCapture: true,
+      __irCaptureActive: true,
+      __irCleanupInProgress: false,
+      __irStartCapture: () => 'started',
+    };
+    fallbackWindow.__irStopCapture = () => {
+      cleanupValueDuringStop = fallbackWindow.__irCleanupInProgress;
+      fallbackWindow.__irCaptureActive = false;
+      return 'stopped';
+    };
+    const fallback = installLifecycle(fallbackWindow);
+    fallback.setSuspended(true, 'compatibility-owner');
+    assert.strictEqual(cleanupValueDuringStop, true, 'legacy stop must observe cleanup mode and skip expensive finalization');
+    assert.strictEqual(
+      fallbackWindow.__irCleanupInProgress,
+      false,
+      'legacy stop must restore the exact pre-existing cleanup flag value',
+    );
+
+    let partialStops = 0;
+    const partialCancelWindow: Record<string, any> = {
+      __ijFindShouldSuspendIntelliSenseRecursionCapture: true,
+      __irCaptureActive: true,
+      __irStartCapture: () => 'started',
+      __irCancelCapture: () => 'still-active',
+      __irStopCapture: () => {
+        partialStops++;
+        partialCancelWindow.__irCaptureActive = false;
+        return 'stopped';
+      },
+    };
+    installLifecycle(partialCancelWindow).setSuspended(true, 'partial-cancel-owner');
+    assert.strictEqual(partialStops, 1, 'a cancel shim that leaves capture active must fall back to cleanup-mode stop');
+
+    let unsafeStops = 0;
+    const cleanupUnavailableWindow: Record<string, any> = {
+      __ijFindShouldSuspendIntelliSenseRecursionCapture: true,
+      __irCaptureActive: true,
+      __irStartCapture: () => 'started',
+      __irStopCapture: () => { unsafeStops++; return 'expensive-stop'; },
+    };
+    Object.defineProperty(cleanupUnavailableWindow, '__irCleanupInProgress', {
+      value: false,
+      writable: false,
+      configurable: true,
+    });
+    const cleanupUnavailable = installLifecycle(cleanupUnavailableWindow);
+    cleanupUnavailable.setSuspended(true, 'read-only-cleanup-owner');
+    cleanupUnavailable.setSuspended(false, 'read-only-cleanup-owner');
+    assert.strictEqual(unsafeStops, 0, 'legacy stop must not run unless cheap cleanup mode is observably active');
+    assert.strictEqual(cleanupUnavailable.queued.length, 0, 'an uncancelled capture must not gain restart intent');
+
+    let cleanupOwnedStarts = 0;
+    const cleanupOwnedWindow: Record<string, any> = {
+      __ijFindShouldSuspendIntelliSenseRecursionCapture: true,
+      __irCaptureActive: true,
+      __irCleanupInProgress: true,
+      __irStartCapture: () => { cleanupOwnedStarts++; return 'started'; },
+      __irStopCapture: () => {
+        cleanupOwnedWindow.__irCaptureActive = false;
+        return 'stopped-cleanup';
+      },
+    };
+    const cleanupOwned = installLifecycle(cleanupOwnedWindow);
+    cleanupOwned.setSuspended(true, 'external-cleanup-owner');
+    cleanupOwned.setSuspended(false, 'external-cleanup-owner');
+    assert.strictEqual(cleanupOwnedStarts, 0, 'capture stopped by an existing cleanup owner must not be restarted');
+    assert.strictEqual(cleanupOwned.queued.length, 0);
+
+    let staleStarts = 0;
+    const staleSessionWindow: Record<string, any> = {
+      __ijFindShouldSuspendIntelliSenseRecursionCapture: true,
+      __irCaptureActive: true,
+      __irCaptureSessionId: 1,
+    };
+    staleSessionWindow.__irStartCapture = () => { staleStarts++; return 'started'; };
+    staleSessionWindow.__irCancelCapture = () => {
+      staleSessionWindow.__irCaptureActive = false;
+      staleSessionWindow.__irCaptureSessionId = 2;
+      return 'cancelled';
+    };
+    const staleSession = installLifecycle(staleSessionWindow);
+    staleSession.setSuspended(true, 'session-owner');
+    staleSession.setSuspended(false, 'session-owner');
+    assert.strictEqual(staleSession.queued.length, 1);
+    staleSessionWindow.__irCaptureSessionId = 3;
+    staleSession.queued.shift()!();
+    assert.strictEqual(staleStarts, 0, 'a replacement session must invalidate a queued restart');
+    assert.strictEqual(staleSessionWindow.__ijFindIrCaptureNeedsRestart, false);
+
+    let throwingStarts = 0;
+    const throwingStartWindow: Record<string, any> = {
+      __ijFindShouldSuspendIntelliSenseRecursionCapture: true,
+      __irCaptureActive: true,
+    };
+    throwingStartWindow.__irStartCapture = () => {
+      throwingStarts++;
+      throw new Error('transient start failure');
+    };
+    throwingStartWindow.__irCancelCapture = () => {
+      throwingStartWindow.__irCaptureActive = false;
+      return 'cancelled';
+    };
+    const throwingStart = installLifecycle(throwingStartWindow);
+    throwingStart.setSuspended(true, 'retry-owner');
+    throwingStart.setSuspended(false, 'retry-owner');
+    throwingStart.queued.shift()!();
+    assert.strictEqual(throwingStart.queued.length, 1, 'a transient start failure should receive one bounded retry');
+    throwingStart.queued.shift()!();
+    assert.strictEqual(throwingStarts, 2);
+    assert.strictEqual(throwingStartWindow.__ijFindIrCaptureNeedsRestart, false, 'retry exhaustion must clear stale intent');
+
+    let inactiveStops = 0;
+    const inactiveWindow: Record<string, any> = {
+      __ijFindShouldSuspendIntelliSenseRecursionCapture: true,
+      __irCaptureActive: false,
+      __irStartCapture: () => 'started',
+      __irCancelCapture: () => { inactiveStops++; return 'cancelled'; },
+      __irStopCapture: () => { inactiveStops++; return 'stopped'; },
+    };
+    const inactive = installLifecycle(inactiveWindow);
+    inactive.setSuspended(true, 'idle-owner');
+    inactive.setSuspended(false, 'idle-owner');
+    assert.strictEqual(inactiveStops, 0, 'suspending an idle integration must not invent cancelled work');
+    assert.notStrictEqual(
+      inactiveWindow.__ijFindIrCaptureNeedsRestart,
+      true,
+      'only a capture that was active and actually cancelled may carry restart intent',
+    );
+    assert.strictEqual(inactive.queued.length, 0, 'an idle integration must not schedule a restart');
   });
 
   test('recovers existing native editors through a bounded structural service graph', () => {

@@ -30,6 +30,7 @@ import { TrigramIndex, extractTrigramsLower } from './trigramIndex';
 import { compilePathScopeMatcher } from './pathScope';
 import { ZoektRuntime, type ZoektFreshnessStatus } from './zoekRuntime';
 import type { ZoektInfoResponse } from './zoekProtocol';
+import { inferBundledElectronMainPid } from './electronMainProcess';
 
 type RendererEvent =
   | { type: 'search'; options: SearchOptions; recordHistory?: boolean }
@@ -248,11 +249,30 @@ export interface ShowOptions {
   statusText?: string;
   loading?: boolean;
   preservePreview?: boolean;
+  /** @internal Prevent an indefinitely repeating late no-show-fn recovery. */
+  __deferredPatchRetry?: boolean;
+  /** @internal A bridge-repair replay must not recursively schedule itself. */
+  __skipBridgeRepair?: boolean;
+  /** @internal Serialize bridge replacement inside the show pump. */
+  __forceReinjectBeforeShow?: boolean;
 }
 
 type PendingShow = {
   query: string;
   options?: ShowOptions;
+  onSettled?: (shown: boolean) => void;
+};
+
+type EvaluatedShow = {
+  fid: number;
+  result: string;
+  completionToken?: string;
+};
+
+type DeferredEvaluationStatus = {
+  status: 'missing' | 'pending' | 'fulfilled' | 'rejected';
+  value?: string;
+  error?: string;
 };
 
 type PreviewRequestEvent = Extract<RendererEvent, { type: 'requestPreview' }>;
@@ -441,7 +461,8 @@ export class OverlayPanel {
   private msgId = 1;
   private pending = new Map<number, (resp: any) => void>();
   private activeSearch: vscode.CancellationTokenSource | undefined;
-  private injectPromise: Promise<void> | undefined;
+  private injectPromise: Promise<number | undefined> | undefined;
+  private lastKnownAncestorMainPid: number | undefined;
   private log: vscode.OutputChannel;
   private activeWindowId: number | undefined;
   private trigramIndex: TrigramIndex;
@@ -449,6 +470,9 @@ export class OverlayPanel {
   private readonly textMateGrammarCatalog: TextMateGrammarCatalog;
   private pendingShow: PendingShow | null = null;
   private showInFlight = false;
+  private showPumpGeneration = 0;
+  private deferredShowSeq: number | undefined;
+  private deferredShowSettler: ((shown: boolean) => void) | undefined;
   private capturePromise: Promise<void> | undefined;
   private backgroundCapturePromise: Promise<void> | undefined;
   private backgroundCaptureTimer: ReturnType<typeof setTimeout> | undefined;
@@ -500,6 +524,7 @@ export class OverlayPanel {
   private localBridgePromise: Promise<void> | undefined;
   private readonly localBridgeToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
   private showSeq = 0;
+  private showEvaluationSeq = 0;
   private targetWindowMarkerText: string | undefined;
   private targetWindowMarkerItem: vscode.StatusBarItem | undefined;
   private disposePromise: Promise<void> | undefined;
@@ -1217,6 +1242,13 @@ export class OverlayPanel {
     }
   }
 
+  private injectedRendererWindowId(report: string): number | undefined {
+    const match = /\bok:(\d+):/.exec(String(report));
+    if (!match) { return undefined; }
+    const windowId = Number(match[1]);
+    return Number.isFinite(windowId) && windowId > 0 ? Math.floor(windowId) : undefined;
+  }
+
   private invalidateRendererInlayClickHookReady(reason: string): void {
     if (!this.rendererInlayClickHookReady) { return; }
     this.rendererInlayClickHookReady = false;
@@ -1332,6 +1364,7 @@ export class OverlayPanel {
         var expectedWorkspaceNameLower = expectedWorkspaceName.toLowerCase();
         var markerText = ${JSON.stringify(markerText)};
         var markerProbeExpr = ${JSON.stringify(markerProbeExpr)};
+        var markerDeadline = Date.now() + 1500;
         function isWorkbench(win) {
           try {
             var url = (win.webContents && win.webContents.getURL && win.webContents.getURL()) || '';
@@ -1355,8 +1388,14 @@ export class OverlayPanel {
         }
         async function hasMarker(win) {
           if (!markerText) { return false; }
+          if (Date.now() >= markerDeadline) { return false; }
           try {
-            return await win.webContents.executeJavaScript(markerProbeExpr, true) === true;
+            var probe = Promise.resolve(win.webContents.executeJavaScript(markerProbeExpr, true))
+              .then(function (value) { return value === true; }, function () { return false; });
+            return await Promise.race([
+              probe,
+              new Promise(function (resolve) { setTimeout(function () { resolve(false); }, 250); })
+            ]);
           } catch (e) { return false; }
         }
         if (typeof requestedWindowId === 'number') {
@@ -1364,13 +1403,17 @@ export class OverlayPanel {
           if (requested && isWorkbench(requested) && (!markerText || await hasMarker(requested))) { return requested.id; }
         }
         var wins = getWorkbenchWindows();
+        var focused = BW.getFocusedWindow();
+        if (markerText && focused && isWorkbench(focused) && await hasMarker(focused)) {
+          return focused.id;
+        }
         if (markerText) {
           for (var m = 0; m < wins.length; m++) {
+            if (wins[m] === focused) { continue; }
             if (await hasMarker(wins[m])) { return wins[m].id; }
           }
           if (wins.length === 1) { return wins[0].id; }
         }
-        var focused = BW.getFocusedWindow();
         if (focused && isWorkbench(focused) && titleMatchesWorkspace(focused)) { return focused.id; }
         var firstWorkbench = null;
         for (var i = 0; i < wins.length; i++) {
@@ -1951,7 +1994,8 @@ export class OverlayPanel {
     this.rendererRecoveryUntil = Date.now() + 1000;
     this.cancelActive();
     this.currentSearchSession = undefined;
-    this.pendingShow = null;
+    this.showSeq++;
+    this.cancelShowPump();
     this.cancelCdpIdleClose();
     this.cancelCdpSearchIdleClose();
     this.zoektRuntime.cancelRunningProcesses('renderer UI recovery');
@@ -2486,24 +2530,82 @@ export class OverlayPanel {
   }
 
   async show(initialQuery: string, options?: ShowOptions): Promise<void> {
+    await this.enqueueShow(initialQuery, options);
+  }
+
+  private async enqueueShow(
+    initialQuery: string,
+    options?: ShowOptions,
+    onSettled?: (shown: boolean) => void,
+  ): Promise<void> {
     void this.cancelPendingPreviewCapture('new overlay show');
     this.rendererRecoveryUntil = 0;
     this.cancelCdpIdleClose();
     this.cancelCdpSearchIdleClose();
     // Coalesce a burst of command invocations (user mashing a shortcut)
     // into one effective show; we just remember the last query.
-    this.pendingShow = { query: initialQuery, options };
+    this.pendingShow?.onSettled?.(false);
+    this.pendingShow = { query: initialQuery, options, onSettled };
     if (this.showInFlight) { return; }
     this.showInFlight = true;
+    const pumpGeneration = ++this.showPumpGeneration;
+    await this.drainPendingShows(pumpGeneration);
+  }
+
+  private showAndWaitForSettlement(initialQuery: string, options?: ShowOptions): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      void this.enqueueShow(initialQuery, options, resolve).catch((err) => {
+        this.log.appendLine(`show-and-wait failed: ${err instanceof Error ? err.message : err}`);
+        resolve(false);
+      });
+    });
+  }
+
+  private async drainPendingShows(pumpGeneration = this.showPumpGeneration): Promise<void> {
     try {
-      while (this.pendingShow !== null) {
+      while (
+        pumpGeneration === this.showPumpGeneration &&
+        this.pendingShow !== null &&
+        this.deferredShowSeq === undefined
+      ) {
         const pending = this.pendingShow;
         this.pendingShow = null;
-        await this.doShow(pending.query, pending.options);
+        // A queued request may resume after the prior deferred reconciliation
+        // scheduled its own idle close, long after show() originally enqueued
+        // this request and canceled the then-current timers.
+        this.cancelCdpIdleClose();
+        this.cancelCdpSearchIdleClose();
+        const dispatched = await this.doShow(pending.query, pending.options);
+        if (pumpGeneration !== this.showPumpGeneration) {
+          pending.onSettled?.(false);
+          return;
+        }
+        if (this.deferredShowSeq !== undefined) {
+          this.deferredShowSettler = pending.onSettled;
+        } else {
+          pending.onSettled?.(dispatched && this.pendingShow === null);
+        }
       }
     } finally {
-      this.showInFlight = false;
+      // A renderer-busy show has returned to its public caller but is still
+      // running in the workbench. Keep the pump latched so shortcut bursts only
+      // replace pendingShow; its exact completion token resumes the pump.
+      if (pumpGeneration === this.showPumpGeneration && this.deferredShowSeq === undefined) {
+        this.showInFlight = false;
+      }
     }
+  }
+
+  private cancelShowPump(): void {
+    this.showPumpGeneration++;
+    const pendingSettler = this.pendingShow?.onSettled;
+    const deferredSettler = this.deferredShowSettler;
+    this.pendingShow = null;
+    this.deferredShowSeq = undefined;
+    this.deferredShowSettler = undefined;
+    this.showInFlight = false;
+    pendingSettler?.(false);
+    deferredSettler?.(false);
   }
 
   async showStaticResults(initialQuery: string, matches: FileMatch[]): Promise<void> {
@@ -2571,13 +2673,14 @@ export class OverlayPanel {
       this.rendererCommandPendingPanelWindowId = undefined;
       this.rendererCommandPendingPanelExpiresAt = 0;
     }
-    await this.show(initialQuery, {
+    const shown = await this.showAndWaitForSettlement(initialQuery, {
       forceLiteral: true,
       suppressSearch: true,
       preferredWindowId: sourceWindowId,
       spawn: sourceWindowId !== undefined && !reusePendingPanel,
       preservePreview: reusePendingPanel,
     });
+    if (!shown) { return; }
     if (requestId !== this.staticResultsRequestSeq) { return; }
     const searchId = ++this.searchSeq;
     const totalMatches = matches.reduce((sum, match) => sum + match.matches.length, 0);
@@ -2607,21 +2710,45 @@ export class OverlayPanel {
     this.scheduleCdpSearchIdleClose('static-results-done');
   }
 
-  private async doShow(initialQuery: string, options: ShowOptions = {}): Promise<void> {
+  private async doShow(initialQuery: string, options: ShowOptions = {}): Promise<boolean> {
     const tShow = Date.now();
     this.log.appendLine(
       `doShow: initialQueryLen=${initialQuery.length} preview=${JSON.stringify(initialQuery.slice(0, 80))}`,
     );
     const directWindowId = options.preferredWindowId ?? this.rendererCommandWindowId ?? this.activeWindowId;
-    const useDirectWindow = directWindowId !== undefined && this.shouldEnableRendererInlayClickHook();
+    const useDirectWindow = !options.__forceReinjectBeforeShow &&
+      directWindowId !== undefined && this.shouldEnableRendererInlayClickHook();
     const targetMarker = useDirectWindow ? new vscode.Disposable(() => undefined) : this.beginTargetWindowMarker();
+    const showSeq = ++this.showSeq;
     try {
-      const showSeq = ++this.showSeq;
-      await this.ensureInjected();
+      if (options.__forceReinjectBeforeShow) {
+        this.log.appendLine('Bridge repair: replacing the renderer bridge inside the show pump.');
+        await this.forceReinject();
+        if (showSeq !== this.showSeq) { return false; }
+        if (this.pendingShow !== null) {
+          this.log.appendLine('Bridge repair replay superseded by a newer queued show.');
+          return false;
+        }
+      }
+      const freshlyInjectedWindowId = await this.ensureInjected();
+      if (showSeq !== this.showSeq) { return false; }
       const tInjected = Date.now();
-      let v = useDirectWindow
-        ? await this.evaluateShowInWindow(directWindowId, initialQuery, options)
+      const showWindowId = useDirectWindow ? directWindowId : freshlyInjectedWindowId;
+      let showRoute = useDirectWindow
+        ? 'direct'
+        : freshlyInjectedWindowId !== undefined
+          ? 'inject-target'
+          : 'focused-marker';
+      let v = showWindowId !== undefined
+        ? await this.evaluateShowInWindow(showWindowId, initialQuery, options)
         : await this.evaluateShowInFocusedWindow(initialQuery, options);
+      if (showSeq !== this.showSeq) { return false; }
+      if (!v && showRoute === 'inject-target') {
+        this.log.appendLine(`Show(win=${showWindowId}): injected target disappeared; resolving the focused workbench once.`);
+        v = await this.evaluateShowInFocusedWindow(initialQuery, options);
+        if (showSeq !== this.showSeq) { return false; }
+        showRoute = 'focused-marker-fallback';
+      }
       // Brand-new VSCode windows may have missed the initial patch run
       // because their renderer wasn't ready yet ("No target available" in
       // the Injection log). Detect that via `no-show-fn` and run the patch
@@ -2632,18 +2759,23 @@ export class OverlayPanel {
           const report = await this.runPatchScript(v.fid);
           this.log.appendLine(`Re-inject: ${report}`);
           this.markRendererInlayClickHookReady(report, 'reinject-show');
+          if (showSeq !== this.showSeq) { return false; }
         } catch (e) {
           this.log.appendLine(`Re-inject failed: ${e instanceof Error ? e.message : e}`);
         }
-        v = useDirectWindow
-          ? await this.evaluateShowInWindow(directWindowId, initialQuery, options)
-          : await this.evaluateShowInFocusedWindow(initialQuery, options);
+        if (showSeq !== this.showSeq) { return false; }
+        v = await this.evaluateShowInWindow(v.fid, initialQuery, options);
+        if (showSeq !== this.showSeq) { return false; }
+      }
+      if (v && (v.result === 'no-show-fn' || /^(?:err:|show-(?:err|throw):)/.test(v.result))) {
+        throw new Error(`Renderer show failed: ${v.result.slice(0, 180)}`);
       }
       if (!v || !v.fid) {
         this.log.appendLine('show() aborted: no focused VSCode window');
-        return;
+        return false;
       }
       this.activeWindowId = v.fid;
+      const showPending = /^show pending\b/.test(v.result);
       const shownRendererSrc = this.extractRendererSource(v.result);
       if (shownRendererSrc) {
         this.activeRendererSrc = shownRendererSrc;
@@ -2652,28 +2784,45 @@ export class OverlayPanel {
       this.cancelCdpIdleClose();
       const tRendered = Date.now();
       this.log.appendLine(
-        `Show(win=${v.fid}): ${v.result} [ensureInjected=${tInjected - tShow}ms showEval=${tRendered - tInjected}ms total=${tRendered - tShow}ms]`,
+        `Show(win=${v.fid} route=${showRoute}): ${v.result} ` +
+        `[ensureInjected=${tInjected - tShow}ms showEval=${tRendered - tInjected}ms total=${tRendered - tShow}ms]`,
       );
-      if (this.isRendererSafetyDiagnosticsEnabled()) {
+      if (!showPending && this.isRendererSafetyDiagnosticsEnabled()) {
         void this.probeRendererSafety('show-complete', 700);
       }
-      if (!options.suppressSearch) {
+      if (!showPending && !options.suppressSearch) {
         void this.postSearchHistoryToRenderer().catch((err) => {
           this.log.appendLine(`post search history failed: ${err instanceof Error ? err.message : err}`);
         });
       }
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.scheduleBridgeRepairAfterVisible(showSeq, initialQuery, options);
         const shellOnly = !initialQuery || !!options.suppressSearch;
-        this.scheduleCdpSearchIdleClose(shellOnly ? 'show-shell-idle' : 'show-idle', shellOnly ? 250 : 900, shellOnly);
+        if (showPending) {
+          this.deferredShowSeq = showSeq;
+          this.scheduleDeferredShowReconciliation(
+            showSeq,
+            v.fid,
+            v.completionToken ?? '',
+            initialQuery,
+            options,
+          );
+        } else {
+          if (!options.__skipBridgeRepair) {
+            this.scheduleBridgeRepairAfterVisible(showSeq, initialQuery, options);
+          }
+          this.scheduleCdpSearchIdleClose(shellOnly ? 'show-shell-idle' : 'show-idle', shellOnly ? 250 : 900, shellOnly);
+        }
       }
-      if (this.shouldAutoCloseCdpForTests()) {
+      if (!showPending && this.shouldAutoCloseCdpForTests()) {
         this.scheduleCdpIdleClose(v.fid);
       }
+      return true;
     } catch (err) {
+      if (showSeq !== this.showSeq) { return false; }
       const msg = err instanceof Error ? err.message : String(err);
       this.log.appendLine(`show() failed: ${err instanceof Error ? err.stack : msg}`);
       vscode.window.showErrorMessage(`IntelliJ Styled Search: ${msg}`);
+      return false;
     } finally {
       targetMarker.dispose();
     }
@@ -2682,95 +2831,25 @@ export class OverlayPanel {
   private async evaluateShowInFocusedWindow(
     initialQuery: string,
     options: ShowOptions,
-  ): Promise<{ fid: number; result: string } | undefined> {
-    // Single-roundtrip fast path: in one CDP message we locate this extension
-    // host's focused/matching workbench window and send __ijFindShow into it.
-    // Do not touch other windows; cross-window hide/evaluate made unrelated
-    // VS Code renderers slow when one window opened Search UI.
-    const showExpr = `(function(){ try { return window.__ijFindShow ? window.__ijFindShow(${JSON.stringify(initialQuery)}, ${JSON.stringify(options)}) : 'no-show-fn'; } catch (e) { return 'show-throw:' + (e && e.message); } })()`;
-    const workspaceName = vscode.workspace.name || vscode.workspace.workspaceFolders?.[0]?.name || '';
-    const markerText = this.targetWindowMarkerText || '';
-    const markerProbeExpr = this.buildTargetMarkerProbeExpression(markerText);
-    const script = `
-      (async function () {
-        var BW = require('electron').BrowserWindow;
-        var expectedWorkspaceName = ${JSON.stringify(workspaceName)};
-        var expectedWorkspaceNameLower = expectedWorkspaceName.toLowerCase();
-        var markerText = ${JSON.stringify(markerText)};
-        var markerProbeExpr = ${JSON.stringify(markerProbeExpr)};
-        function isWorkbench(win) {
-          try {
-            var url = (win.webContents && win.webContents.getURL && win.webContents.getURL()) || '';
-            return /workbench\\.(?:esm\\.)?html/.test(url);
-          } catch (e) { return false; }
-        }
-        function getWorkbenchWindows() {
-          var wins = BW.getAllWindows();
-          var workbenches = [];
-          for (var i = 0; i < wins.length; i++) {
-            if (isWorkbench(wins[i])) { workbenches.push(wins[i]); }
-          }
-          return workbenches;
-        }
-        function titleMatchesWorkspace(win) {
-          if (!expectedWorkspaceNameLower) { return true; }
-          try {
-            var title = (win.getTitle && win.getTitle()) || '';
-            return title.toLowerCase().indexOf(expectedWorkspaceNameLower) >= 0;
-          } catch (e) { return false; }
-        }
-        async function hasMarker(win) {
-          if (!markerText) { return false; }
-          try {
-            return await win.webContents.executeJavaScript(markerProbeExpr, true) === true;
-          } catch (e) { return false; }
-        }
-        var focused = null;
-        var ws = getWorkbenchWindows();
-        if (markerText) {
-          for (var m = 0; m < ws.length; m++) {
-            if (await hasMarker(ws[m])) { focused = ws[m]; break; }
-          }
-          if (!focused && ws.length === 1) { focused = ws[0]; }
-        }
-        if (!focused) {
-          focused = BW.getFocusedWindow();
-          var focusedUsable = focused && isWorkbench(focused) && titleMatchesWorkspace(focused);
-          if (!focusedUsable) {
-            var firstWorkbench = null;
-            var matchingWorkbench = null;
-            for (var i = 0; i < ws.length; i++) {
-              if (!isWorkbench(ws[i])) { continue; }
-              if (!firstWorkbench) { firstWorkbench = ws[i]; }
-              if (titleMatchesWorkspace(ws[i])) { matchingWorkbench = ws[i]; break; }
-            }
-            focused = matchingWorkbench || (focused && isWorkbench(focused) ? focused : firstWorkbench);
-          }
-        }
-        if (!focused) { return { fid: 0, result: 'no-focus' }; }
-        var fid = focused.id;
-        var showR;
-        try {
-          showR = await focused.webContents.executeJavaScript(${JSON.stringify(showExpr)}, true);
-          if (showR === undefined || showR === null || showR === '') { showR = 'ok'; }
-        } catch (e) { showR = 'show-err:' + (e && e.message); }
-        return { fid: fid, result: String(showR) };
-      })()
-    `.trim();
-    const resp = await this.send('Runtime.evaluate', {
-      expression: script,
-      awaitPromise: true,
-      returnByValue: true,
-      includeCommandLineAPI: true,
-    });
-    return resp?.result?.value as { fid: number; result: string } | undefined;
+  ): Promise<EvaluatedShow | undefined> {
+    // Keep target selection and renderer execution as separate bounded CDP
+    // steps. A cold or background renderer must not hold one opaque 10s
+    // Runtime.evaluate request that cannot tell routing delay from show delay.
+    const routeStartedAt = Date.now();
+    const windowId = await this.resolveTargetWorkbenchWindowId();
+    const routeElapsedMs = Date.now() - routeStartedAt;
+    if (routeElapsedMs >= 100) {
+      this.log.appendLine(`Show target resolution: win=${windowId ?? 'none'} elapsed=${routeElapsedMs}ms`);
+    }
+    if (windowId === undefined) { return undefined; }
+    return this.evaluateShowInWindow(windowId, initialQuery, options);
   }
 
   private async evaluateShowInWindow(
     windowId: number,
     initialQuery: string,
     options: ShowOptions,
-  ): Promise<{ fid: number; result: string } | undefined> {
+  ): Promise<EvaluatedShow | undefined> {
     if (options.spawn) {
       this.spawnInjectionAttempts++;
       let spawnedFast = false;
@@ -2826,9 +2905,28 @@ export class OverlayPanel {
         }
       }
     }
-    const showExpr = `(function(){ try { return window.__ijFindShow ? window.__ijFindShow(${JSON.stringify(initialQuery)}, ${JSON.stringify(options)}) : 'no-show-fn'; } catch (e) { return 'show-throw:' + (e && e.message); } })()`;
-    const result = await this.evalInWindow(windowId, showExpr);
+    const completionToken = [
+      process.pid.toString(36),
+      Date.now().toString(36),
+      (++this.showEvaluationSeq).toString(36),
+    ].join('-');
+    const showExpr = `(async function(){` +
+      `var token=${JSON.stringify(completionToken)};var value;` +
+      `try{value=window.__ijFindShow?await window.__ijFindShow(${JSON.stringify(initialQuery)},${JSON.stringify(options)}):'no-show-fn';}` +
+      `catch(e){value='show-throw:'+(e&&e.message);}` +
+      `if(value===undefined||value===null||value===''){value='ok';}` +
+      `value=String(value);` +
+      `try{window.__ijFindLastShowCompletion={token:token,result:value,completedAt:Date.now()};}catch(eRecord){}` +
+      `return value;})()`;
+    const result = await this.evalInWindow(windowId, showExpr, 10_000, 750, completionToken);
     if (/^no-window:/.test(result)) { return undefined; }
+    if (/^pending:renderer-busy:/.test(result)) {
+      return {
+        fid: windowId,
+        result: `show pending ${result.slice('pending:'.length)}`,
+        completionToken,
+      };
+    }
     return { fid: windowId, result: result || 'ok' };
   }
 
@@ -2847,6 +2945,273 @@ export class OverlayPanel {
     });
   }
 
+  private async probeDeferredEvaluation(completionToken: string): Promise<DeferredEvaluationStatus> {
+    if (!completionToken) { return { status: 'missing' }; }
+    const script = `
+      (function () {
+        try {
+          var evaluations = global.__ijFindDeferredRendererEvaluations;
+          var entry = evaluations instanceof Map ? evaluations.get(${JSON.stringify(completionToken)}) : null;
+          if (!entry) { return JSON.stringify({ status: 'missing' }); }
+          return JSON.stringify({
+            status: String(entry.status || 'missing'),
+            value: entry.value === undefined ? undefined : String(entry.value),
+            error: entry.error === undefined ? undefined : String(entry.error)
+          });
+        } catch (e) {
+          return JSON.stringify({ status: 'rejected', error: String(e && e.message || e) });
+        }
+      })()
+    `.trim();
+    const response = await this.send('Runtime.evaluate', {
+      expression: script,
+      returnByValue: true,
+      includeCommandLineAPI: true,
+    }, 1500);
+    const parsed = JSON.parse(String(response?.result?.value ?? '{"status":"missing"}')) as DeferredEvaluationStatus;
+    return parsed && /^(missing|pending|fulfilled|rejected)$/.test(parsed.status)
+      ? parsed
+      : { status: 'rejected', error: 'invalid deferred evaluation status' };
+  }
+
+  private forgetDeferredEvaluation(completionToken: string): void {
+    if (!completionToken || !this.ws || this.ws.readyState !== WebSocket.OPEN) { return; }
+    const script = `(function(){try{var m=global.__ijFindDeferredRendererEvaluations;` +
+      `return m instanceof Map?m.delete(${JSON.stringify(completionToken)}):false}catch(e){return false}})()`;
+    void this.send('Runtime.evaluate', {
+      expression: script,
+      returnByValue: true,
+      includeCommandLineAPI: true,
+    }, 500).catch(() => undefined);
+  }
+
+  private scheduleDeferredShowReconciliation(
+    showSeq: number,
+    windowId: number,
+    completionToken: string,
+    initialQuery: string,
+    options: ShowOptions,
+  ): void {
+    void this.reconcileDeferredShow(showSeq, windowId, completionToken, initialQuery, options, 0).catch((err) => {
+      this.log.appendLine(`Deferred show reconciliation failed(win=${windowId}): ${err instanceof Error ? err.message : err}`);
+      this.finishDeferredShow(showSeq);
+    });
+  }
+
+  private finishDeferredShow(showSeq: number, shown = false): void {
+    if (this.deferredShowSeq !== showSeq) { return; }
+    this.deferredShowSeq = undefined;
+    const settle = this.deferredShowSettler;
+    this.deferredShowSettler = undefined;
+    settle?.(shown && this.pendingShow === null);
+    if (this.pendingShow !== null) {
+      void this.drainPendingShows(this.showPumpGeneration).catch((err) => {
+        this.log.appendLine(`Deferred show pump failed: ${err instanceof Error ? err.message : err}`);
+      });
+      return;
+    }
+    this.showInFlight = false;
+  }
+
+  private async reconcileDeferredShow(
+    showSeq: number,
+    windowId: number,
+    completionToken: string,
+    initialQuery: string,
+    options: ShowOptions,
+    attempt: number,
+  ): Promise<void> {
+    await delay(attempt === 0 ? 500 : Math.min(2000, 500 * (attempt + 1)));
+    if (this.deferredShowSeq !== showSeq || showSeq !== this.showSeq || this.activeWindowId !== windowId) {
+      this.forgetDeferredEvaluation(completionToken);
+      this.finishDeferredShow(showSeq);
+      return;
+    }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.finishDeferredShow(showSeq);
+      return;
+    }
+    let completion: DeferredEvaluationStatus = { status: 'missing' };
+    let report = 'missing';
+    try {
+      completion = await this.probeDeferredEvaluation(completionToken);
+      report = JSON.stringify(completion);
+    } catch (err) {
+      report = `probe-err:${err instanceof Error ? err.message : err}`;
+    }
+    // A newer show may have started while the completion probe was queued.
+    // Never let an old reconciliation claim or close that newer panel.
+    if (this.deferredShowSeq !== showSeq || showSeq !== this.showSeq || this.activeWindowId !== windowId) {
+      this.forgetDeferredEvaluation(completionToken);
+      this.finishDeferredShow(showSeq);
+      return;
+    }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.finishDeferredShow(showSeq);
+      return;
+    }
+
+    if (completion.status === 'fulfilled') {
+      const result = completion.value ?? '';
+      if (result === 'no-show-fn' && !options.__deferredPatchRetry) {
+        this.forgetDeferredEvaluation(completionToken);
+        this.log.appendLine(`Deferred show(win=${windowId}): patch missing after dispatch; reinjecting before one retry.`);
+        try {
+          const reinjectReport = await this.runPatchScript(windowId);
+          this.log.appendLine(`Deferred show reinject(win=${windowId}): ${reinjectReport}`);
+          this.markRendererInlayClickHookReady(reinjectReport, 'reinject-deferred-show');
+        } catch (err) {
+          if (this.deferredShowSeq !== showSeq || showSeq !== this.showSeq || this.activeWindowId !== windowId) {
+            this.finishDeferredShow(showSeq);
+            return;
+          }
+          const outcome = `reinject failed: ${err instanceof Error ? err.message : err}`.slice(0, 180);
+          this.log.appendLine(`Deferred show ${outcome}`);
+          if (this.pendingShow === null) {
+            vscode.window.showErrorMessage(`IntelliJ Styled Search: renderer show failed: ${outcome}`);
+          }
+          this.finishDeferredShow(showSeq);
+          return;
+        }
+        if (this.deferredShowSeq !== showSeq || showSeq !== this.showSeq || this.activeWindowId !== windowId) {
+          this.finishDeferredShow(showSeq);
+          return;
+        }
+        // Preserve a newer coalesced shortcut request. Otherwise retry the
+        // exact request once through the normal pump now that the patch exists.
+        if (this.pendingShow === null) {
+          const retrySettler = this.deferredShowSettler;
+          this.deferredShowSettler = undefined;
+          this.pendingShow = {
+            query: initialQuery,
+            options: { ...options, __deferredPatchRetry: true },
+            onSettled: retrySettler,
+          };
+        }
+        this.finishDeferredShow(showSeq);
+        return;
+      }
+      if (/^show ok\b/.test(result)) {
+        const expectedRendererSrc = this.extractRendererSource(result) ?? '';
+        let visibilityReport = '';
+        try {
+          visibilityReport = await this.evalInWindow(
+            windowId,
+            `(function(){try{var expectedSrc=${JSON.stringify(expectedRendererSrc)};` +
+            `var panels=document.querySelectorAll('.ij-find-overlay.visible');var panel=null;` +
+            `for(var i=0;i<panels.length;i++){` +
+            `if(!expectedSrc||panels[i].getAttribute('data-ij-find-src')===expectedSrc){panel=panels[i];break;}}` +
+            `return JSON.stringify({visible:!!panel,src:panel&&panel.getAttribute('data-ij-find-src')||''});` +
+            `}catch(e){return JSON.stringify({visible:false,error:String(e&&e.message||e)})}})()`,
+            2_000,
+            500,
+          );
+        } catch (err) {
+          visibilityReport = `probe-err:${err instanceof Error ? err.message : err}`;
+        }
+        if (this.deferredShowSeq !== showSeq || showSeq !== this.showSeq || this.activeWindowId !== windowId) {
+          this.forgetDeferredEvaluation(completionToken);
+          this.finishDeferredShow(showSeq);
+          return;
+        }
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+          this.finishDeferredShow(showSeq);
+          return;
+        }
+        try {
+          const visibility = JSON.parse(visibilityReport) as { visible?: boolean; src?: string };
+          this.forgetDeferredEvaluation(completionToken);
+          if (!visibility.visible) {
+            // The user can close the panel before the first visibility probe.
+            // That is a completed show, not a renderer timeout.
+            this.log.appendLine(`Deferred show completed and was hidden before probe(win=${windowId}): ${result}`);
+            this.scheduleCdpIdleClose(windowId);
+            this.finishDeferredShow(showSeq);
+            return;
+          }
+          if (visibility.src) { this.activeRendererSrc = visibility.src; }
+        } catch {
+          report = `visibility:${visibilityReport}`;
+          // The completion is terminal, but a temporarily busy renderer can
+          // still delay the one post-completion DOM check. Retry without
+          // dispatching another show.
+          if (attempt < 7) {
+            return this.reconcileDeferredShow(showSeq, windowId, completionToken, initialQuery, options, attempt + 1);
+          }
+          this.forgetDeferredEvaluation(completionToken);
+          this.log.appendLine(
+            `Deferred show completed but visibility stayed unavailable(win=${windowId}): ${visibilityReport.slice(0, 180)}`,
+          );
+          this.scheduleCdpSearchIdleClose('deferred-show-visibility-unavailable', 900, true);
+          if (this.shouldAutoCloseCdpForTests()) { this.scheduleCdpIdleClose(windowId); }
+          this.finishDeferredShow(showSeq);
+          return;
+        }
+        this.log.appendLine(
+          `Deferred show settled(win=${windowId}) after probe ${attempt + 1}: ${result}.`,
+        );
+        if (this.isRendererSafetyDiagnosticsEnabled()) {
+          void this.probeRendererSafety('deferred-show-complete', 700);
+        }
+        if (!options.suppressSearch) {
+          void this.postSearchHistoryToRenderer().catch((err) => {
+            this.log.appendLine(`post search history failed: ${err instanceof Error ? err.message : err}`);
+          });
+        }
+        if (!options.__skipBridgeRepair) {
+          this.scheduleBridgeRepairAfterVisible(showSeq, initialQuery, options);
+        }
+        const shellOnly = !initialQuery || !!options.suppressSearch;
+        this.scheduleCdpSearchIdleClose(
+          shellOnly ? 'deferred-show-shell-idle' : 'deferred-show-idle',
+          shellOnly ? 250 : 900,
+          shellOnly,
+        );
+        if (this.shouldAutoCloseCdpForTests()) {
+          this.scheduleCdpIdleClose(windowId);
+        }
+        this.finishDeferredShow(showSeq, true);
+        return;
+      }
+      this.forgetDeferredEvaluation(completionToken);
+      const outcome = (result || 'empty renderer result').slice(0, 180);
+      this.log.appendLine(`Deferred show completed without success(win=${windowId}): ${outcome}`);
+      if (this.pendingShow === null) {
+        vscode.window.showErrorMessage(`IntelliJ Styled Search: renderer show failed: ${outcome}`);
+      }
+      this.scheduleCdpSearchIdleClose('deferred-show-failed', 900, true);
+      if (this.shouldAutoCloseCdpForTests()) { this.scheduleCdpIdleClose(windowId); }
+      this.finishDeferredShow(showSeq);
+      return;
+    }
+    if (completion.status === 'rejected') {
+      this.forgetDeferredEvaluation(completionToken);
+      const outcome = (completion.error || 'renderer evaluation rejected').slice(0, 180);
+      this.log.appendLine(`Deferred show rejected(win=${windowId}): ${outcome}`);
+      if (this.pendingShow === null) {
+        vscode.window.showErrorMessage(`IntelliJ Styled Search: renderer show failed: ${outcome}`);
+      }
+      this.scheduleCdpSearchIdleClose('deferred-show-rejected', 900, true);
+      if (this.shouldAutoCloseCdpForTests()) { this.scheduleCdpIdleClose(windowId); }
+      this.finishDeferredShow(showSeq);
+      return;
+    }
+    // The regression this guards exceeded the former 10-second outer CDP
+    // timeout. Keep probing long enough to observe a show that was already
+    // dispatched but sat behind a cold renderer task for slightly longer than
+    // that limit (about 17 seconds including the bounded probes).
+    if (attempt < 7) {
+      return this.reconcileDeferredShow(showSeq, windowId, completionToken, initialQuery, options, attempt + 1);
+    }
+    this.forgetDeferredEvaluation(completionToken);
+    this.log.appendLine(`Deferred show still waiting(win=${windowId}) after ${attempt + 1} probes: ${report.slice(0, 180)}`);
+    this.scheduleCdpSearchIdleClose('deferred-show-probe-exhausted', 900, true);
+    if (this.shouldAutoCloseCdpForTests()) {
+      this.scheduleCdpIdleClose(windowId);
+    }
+    this.finishDeferredShow(showSeq);
+  }
+
   private shouldAutoCloseCdpForTests(): boolean {
     return process.env.CODEX_CI === '1' || process.env.VSCODE_TEST === '1';
   }
@@ -2863,27 +3228,104 @@ export class OverlayPanel {
     await delay(900);
     if (showSeq !== this.showSeq) { return; }
     if (this.activeSearch || this.currentSearchSession) { return; }
-    this.log.appendLine('No renderer search event after show — forcing reinject and replaying visible query');
-    await this.forceReinject();
-    if (showSeq !== this.showSeq) { return; }
-    const replay = await this.evaluateShowInFocusedWindow(initialQuery, options);
-    if (showSeq !== this.showSeq) { return; }
-    if (replay && replay.fid) {
-      this.activeWindowId = replay.fid;
-      this.log.appendLine(`Bridge repair replay show(win=${replay.fid}): ${replay.result}`);
-    }
+    this.log.appendLine('No renderer search event after show — queueing a serialized bridge replacement and replay');
+    await this.enqueueShow(initialQuery, {
+      ...options,
+      __skipBridgeRepair: true,
+      __forceReinjectBeforeShow: true,
+    });
+    this.log.appendLine('Bridge repair replay dispatched through the show pump.');
   }
 
-  private async evalInWindow(winId: number, expr: string, timeoutMs = 10_000): Promise<string> {
+  private async evalInWindow(
+    winId: number,
+    expr: string,
+    timeoutMs = 10_000,
+    rendererSettleMs = 0,
+    completionToken = '',
+  ): Promise<string> {
     const script = `
       (async function () {
         var BW = require('electron').BrowserWindow;
         var w = BW.fromId(${winId});
         if (!w || !w.webContents) { return 'no-window:' + ${winId}; }
+        var rendererSettleMs = ${Math.max(0, Math.round(rendererSettleMs))};
+        var completionToken = ${JSON.stringify(completionToken)};
+        var completionMap = null;
+        function completionText(value) { return value === undefined ? '' : String(value); }
+        function updateCompletion(status, value, error) {
+          if (!completionToken || !completionMap || !completionMap.has(completionToken)) { return; }
+          completionMap.set(completionToken, {
+            status: status,
+            value: value,
+            error: error,
+            windowId: ${winId},
+            completedAt: Date.now()
+          });
+        }
         try {
-          var v = await w.webContents.executeJavaScript(${JSON.stringify(expr)}, true);
-          return v === undefined ? '' : String(v);
-        } catch (e) { return 'err:' + (e && e.message); }
+          if (completionToken) {
+            if (!(global.__ijFindDeferredRendererEvaluations instanceof Map)) {
+              global.__ijFindDeferredRendererEvaluations = new Map();
+            }
+            completionMap = global.__ijFindDeferredRendererEvaluations;
+            var now = Date.now();
+            completionMap.forEach(function (entry, token) {
+              var at = Number(entry && (entry.completedAt || entry.startedAt) || 0);
+              if (!at || now - at > 60000) { completionMap.delete(token); }
+            });
+            while (completionMap.size >= 64) {
+              var oldest = completionMap.keys().next();
+              if (oldest.done) { break; }
+              completionMap.delete(oldest.value);
+            }
+            completionMap.set(completionToken, {
+              status: 'pending',
+              windowId: ${winId},
+              startedAt: now
+            });
+          }
+          var evaluation = Promise.resolve().then(function () {
+            return w.webContents.executeJavaScript(${JSON.stringify(expr)}, true);
+          });
+          var tracked = evaluation.then(function (value) {
+            var text = completionText(value);
+            updateCompletion('fulfilled', text, '');
+            return { value: text };
+          }, function (error) {
+            var text = String(error && error.message || error);
+            updateCompletion('rejected', '', text);
+            return { error: text };
+          });
+          var outcome;
+          if (rendererSettleMs > 0) {
+            outcome = await new Promise(function (resolve) {
+              var settled = false;
+              var timer = setTimeout(function () {
+                if (settled) { return; }
+                settled = true;
+                resolve({ pending: true });
+              }, rendererSettleMs);
+              tracked.then(function (trackedOutcome) {
+                if (settled) { return; }
+                settled = true;
+                clearTimeout(timer);
+                resolve(trackedOutcome);
+              });
+            });
+            if (outcome.pending) { return 'pending:renderer-busy:' + rendererSettleMs + 'ms'; }
+          } else {
+            outcome = await tracked;
+          }
+          if (completionToken && completionMap) { completionMap.delete(completionToken); }
+          if (outcome.error) { return 'err:' + outcome.error; }
+          return outcome.value;
+        } catch (e) {
+          var message = String(e && e.message || e);
+          updateCompletion('rejected', '', message);
+          if (completionToken && completionMap) { completionMap.delete(completionToken); }
+          return 'err:' + message;
+        }
       })()
     `.trim();
     const resp = await this.send('Runtime.evaluate', {
@@ -3003,6 +3445,8 @@ export class OverlayPanel {
 
   private async disposeInternal(): Promise<void> {
     this.cancelActive();
+    this.showSeq++;
+    this.cancelShowPump();
     await this.cancelPendingPreviewCapture('overlay disposed');
     this.zoektRuntime.cancelRunningProcesses('overlay disposed');
     if (this.backgroundCaptureTimer) {
@@ -3218,9 +3662,14 @@ export class OverlayPanel {
     }
   }
 
-  private async ensureInjected(options: PatchScriptOptions = {}): Promise<void> {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) { return; }
-    if (this.injectPromise) { return this.injectPromise; }
+  private async ensureInjected(options: PatchScriptOptions = {}): Promise<number | undefined> {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) { return undefined; }
+    if (this.injectPromise) {
+      // A caller joining somebody else's injection cannot assume that the
+      // resolved renderer belongs to its own target marker.
+      await this.injectPromise;
+      return undefined;
+    }
     this.injectPromise = this.inject(options).finally(() => { this.injectPromise = undefined; });
     return this.injectPromise;
   }
@@ -3253,6 +3702,7 @@ export class OverlayPanel {
         var expectedWorkspace = ${JSON.stringify(workspaceName.toLowerCase())};
         var markerText = ${JSON.stringify(markerText)};
         var markerProbeExpr = ${JSON.stringify(markerProbeExpr)};
+        var markerDeadline = Date.now() + 1500;
         var expectedLocalBridgePort = ${JSON.stringify(this.localBridgePort)};
         var expectedLocalBridgeToken = ${JSON.stringify(this.localBridgeToken)};
         function isWorkbench(win) {
@@ -3266,22 +3716,34 @@ export class OverlayPanel {
         }
         async function hasMarker(win) {
           if (!markerText) { return false; }
-          try { return await win.webContents.executeJavaScript(markerProbeExpr, true) === true; }
+          if (Date.now() >= markerDeadline) { return false; }
+          try {
+            var probe = Promise.resolve(win.webContents.executeJavaScript(markerProbeExpr, true))
+              .then(function (value) { return value === true; }, function () { return false; });
+            return await Promise.race([
+              probe,
+              new Promise(function (resolve) { setTimeout(function () { resolve(false); }, 250); })
+            ]);
+          }
           catch (e) { return false; }
         }
         var all = BW.getAllWindows().filter(isWorkbench);
         var target = null;
-        if (markerText) {
+        var preferred = null;
+        if (typeof preferredWindowId === 'number') {
+          preferred = BW.fromId(preferredWindowId);
+          if (isWorkbench(preferred) && (!markerText || await hasMarker(preferred))) { target = preferred; }
+        }
+        var focused = BW.getFocusedWindow();
+        if (!target && markerText && isWorkbench(focused) && await hasMarker(focused)) { target = focused; }
+        if (!target && markerText) {
           for (var i = 0; i < all.length; i++) {
+            if (all[i] === preferred || all[i] === focused) { continue; }
             if (await hasMarker(all[i])) { target = all[i]; break; }
           }
         }
-        if (!target && typeof preferredWindowId === 'number') {
-          var preferred = BW.fromId(preferredWindowId);
-          if (isWorkbench(preferred) && titleMatches(preferred)) { target = preferred; }
-        }
+        if (!target && isWorkbench(preferred) && titleMatches(preferred)) { target = preferred; }
         if (!target) {
-          var focused = BW.getFocusedWindow();
           if (isWorkbench(focused) && titleMatches(focused)) { target = focused; }
         }
         if (!target && all.length === 1) { target = all[0]; }
@@ -3311,7 +3773,7 @@ export class OverlayPanel {
     }
   }
 
-  private async inject(options: PatchScriptOptions = {}): Promise<void> {
+  private async inject(options: PatchScriptOptions = {}): Promise<number | undefined> {
     const mainPid = this.findMainPid();
     if (!mainPid) { throw new Error('Could not locate VSCode main (Electron) process'); }
     const tStart = Date.now();
@@ -3379,7 +3841,7 @@ export class OverlayPanel {
     if (retainedReport) {
       this.log.appendLine(`Injection: ${retainedReport}`);
       this.markRendererInlayClickHookReady(retainedReport, 'retained-fast-path');
-      return;
+      return options.ignoreTargetMarker ? undefined : this.injectedRendererWindowId(retainedReport);
     }
 
     const report = await this.runPatchScript(undefined, options);
@@ -3393,6 +3855,7 @@ export class OverlayPanel {
     if (this.isRendererSafetyDiagnosticsEnabled()) {
       void this.probeRendererSafety('post-install', 700);
     }
+    return options.ignoreTargetMarker ? undefined : this.injectedRendererWindowId(report);
   }
 
   /** Re-run the renderer patch in every workbench window. Windows that
@@ -3466,6 +3929,7 @@ export class OverlayPanel {
         var expectedWorkspaceNameLower = expectedWorkspaceName.toLowerCase();
         var markerText = ${JSON.stringify(markerText)};
         var markerProbeExpr = ${JSON.stringify(markerProbeExpr)};
+        var markerDeadline = Date.now() + 1500;
         function isWorkbench(win) {
           try {
             var url = (win.webContents && win.webContents.getURL && win.webContents.getURL()) || '';
@@ -3489,8 +3953,14 @@ export class OverlayPanel {
         }
         async function hasMarker(win) {
           if (!markerText) { return false; }
+          if (Date.now() >= markerDeadline) { return false; }
           try {
-            return await win.webContents.executeJavaScript(markerProbeExpr, true) === true;
+            var probe = Promise.resolve(win.webContents.executeJavaScript(markerProbeExpr, true))
+              .then(function (value) { return value === true; }, function () { return false; });
+            return await Promise.race([
+              probe,
+              new Promise(function (resolve) { setTimeout(function () { resolve(false); }, 250); })
+            ]);
           } catch (e) { return false; }
         }
         async function selectTargetWindow() {
@@ -3499,13 +3969,15 @@ export class OverlayPanel {
             if (byId && isWorkbench(byId) && (!markerText || await hasMarker(byId))) { return byId; }
           }
           var all = getWorkbenchWindows();
+          var focused = BW.getFocusedWindow();
+          if (markerText && focused && isWorkbench(focused) && await hasMarker(focused)) { return focused; }
           if (markerText) {
             for (var m = 0; m < all.length; m++) {
+              if (all[m] === focused) { continue; }
               if (await hasMarker(all[m])) { return all[m]; }
             }
             if (all.length === 1) { return all[0]; }
           }
-          var focused = BW.getFocusedWindow();
           if (focused && isWorkbench(focused) && titleMatchesWorkspace(focused)) { return focused; }
           var firstWorkbench = null;
           for (var s = 0; s < all.length; s++) {
@@ -5739,15 +6211,70 @@ export class OverlayPanel {
     return patterns.some((p) => p.test(cmd));
   }
 
+  private isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      // EPERM still proves that the PID exists. This is unlikely for a VS Code
+      // parent owned by the same user, but treating it as alive is the correct
+      // process-liveness semantics.
+      return (error as NodeJS.ErrnoException | undefined)?.code === 'EPERM';
+    }
+  }
+
+  private inferBundledParentMainPid(): number | null {
+    return inferBundledElectronMainPid({
+      platform: process.platform,
+      appRoot: vscode.env.appRoot,
+      execPath: process.execPath,
+      ppid: process.ppid,
+    });
+  }
+
+  private readMainProcessSnapshot(): string {
+    return execFileSync('/bin/ps', ['-o', 'pid=,ppid=,command=', '-ax'], {
+      encoding: 'utf8',
+      maxBuffer: 8 * 1024 * 1024,
+    });
+  }
+
+  private rememberAncestorMainPid(pid: number, source: string): number {
+    this.lastKnownAncestorMainPid = pid;
+    this.log.appendLine(`findMainPid: ${source} main pid=${pid}`);
+    return pid;
+  }
+
   private findMainPid(): number | null {
+    // The Electron main process owns this local extension host. Once that
+    // relationship has been verified, the main process cannot normally be
+    // replaced while this OverlayPanel instance survives. Avoid spawning `ps`
+    // again: Electron's extension host can transiently reject all child-process
+    // spawns with EBADF while the already-discovered parent remains healthy.
+    if (this.lastKnownAncestorMainPid !== undefined) {
+      if (this.isProcessAlive(this.lastKnownAncestorMainPid)) {
+        this.log.appendLine(`findMainPid: cached ancestor main pid=${this.lastKnownAncestorMainPid}`);
+        return this.lastKnownAncestorMainPid;
+      }
+      this.log.appendLine(`findMainPid: cached ancestor pid=${this.lastKnownAncestorMainPid} is no longer alive`);
+      this.lastKnownAncestorMainPid = undefined;
+    }
+
+    // On packaged macOS desktop builds the current process is Electron's
+    // Helper (Plugin), whose direct parent is the browser/main process. This
+    // structural fast path also protects the very first overlay open from a
+    // transient `spawnSync /bin/ps EBADF`. Non-bundled hosts do not qualify
+    // and continue through the process-table discovery below.
+    const bundledParentPid = this.inferBundledParentMainPid();
+    if (bundledParentPid !== null && this.isProcessAlive(bundledParentPid)) {
+      return this.rememberAncestorMainPid(bundledParentPid, 'bundled parent');
+    }
+
     // Prefer the Electron main process in this extension host's parent chain.
     // A global "first Code.app process" match can attach CDP to another VSCode
     // window group and make the Search UI appear in the wrong workspace.
     try {
-      const out = execFileSync('/bin/ps', ['-o', 'pid=,ppid=,command=', '-ax'], {
-        encoding: 'utf8',
-        maxBuffer: 8 * 1024 * 1024,
-      });
+      const out = this.readMainProcessSnapshot();
       const lines = out.split('\n');
       const processes = new Map<number, { pid: number; ppid: number; cmd: string }>();
       for (const line of lines) {
@@ -5766,16 +6293,14 @@ export class OverlayPanel {
         const proc = processes.get(cursor);
         if (!proc) { break; }
         if (this.isVscodeMainProcessCommand(proc.cmd)) {
-          this.log.appendLine(`findMainPid: ancestor main pid=${proc.pid}`);
-          return proc.pid;
+          return this.rememberAncestorMainPid(proc.pid, 'ancestor');
         }
         cursor = proc.ppid;
       }
 
       const directParent = processes.get(process.ppid);
       if (directParent && this.isVscodeMainProcessCommand(directParent.cmd)) {
-        this.log.appendLine(`findMainPid: direct parent main pid=${directParent.pid}`);
-        return directParent.pid;
+        return this.rememberAncestorMainPid(directParent.pid, 'direct parent');
       }
 
       // When running under @vscode/test-electron, never fall back to a

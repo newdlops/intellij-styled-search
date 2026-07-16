@@ -4311,6 +4311,130 @@ suite('Renderer — overlay UI probes', () => {
     }
   });
 
+  test('suspending an active renderer capture cancels cheaply and restarts it after release', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('CaptureSuspendLifecycleProbe', { forceLiteral: true, suppressSearch: true });
+    try {
+      const raw = await overlay.evalInActiveWindowForTests(
+        `(async function(){
+          if (!window.__ijFindSetIntelliSenseRecursionCaptureSuspended) {
+            return JSON.stringify({ err: 'missing suspend setter' });
+          }
+          var oldReasons = window.__ijFindIrSuspendReasons;
+          var oldNeedsRestart = window.__ijFindIrCaptureNeedsRestart;
+          var oldRestartState = window.__ijFindIrCaptureRestartState;
+          var oldRestartGeneration = window.__ijFindIrCaptureRestartGeneration;
+          var hadRestartState = Object.prototype.hasOwnProperty.call(window, '__ijFindIrCaptureRestartState');
+          var hadRestartGeneration = Object.prototype.hasOwnProperty.call(window, '__ijFindIrCaptureRestartGeneration');
+          var oldSuspended = window.__ijFindIrCaptureSuspended;
+          var oldSuspendReason = window.__ijFindIrCaptureSuspendReason;
+          var oldActive = window.__irCaptureActive;
+          var oldStart = window.__irStartCapture;
+          var oldStop = window.__irStopCapture;
+          var oldCancel = window.__irCancelCapture;
+          var hadCancel = Object.prototype.hasOwnProperty.call(window, '__irCancelCapture');
+          var oldCleanup = window.__irCleanupInProgress;
+          var hadCleanup = Object.prototype.hasOwnProperty.call(window, '__irCleanupInProgress');
+          var result = null;
+          try {
+            window.__ijFindIrSuspendReasons = Object.create(null);
+            window.__ijFindIrCaptureNeedsRestart = false;
+            window.__ijFindIrCaptureRestartState = null;
+            window.__ijFindIrCaptureRestartGeneration = 0;
+            window.__ijFindIrCaptureSuspended = false;
+            window.__ijFindIrCaptureSuspendReason = '';
+            window.__irCaptureActive = true;
+            window.__irCancelCapture = undefined;
+            window.__irCleanupInProgress = false;
+            var stopCalls = 0;
+            var cleanupDuringStop = null;
+            var startReasons = [];
+            window.__irStopCapture = function () {
+              stopCalls++;
+              cleanupDuringStop = window.__irCleanupInProgress;
+              window.__irCaptureActive = false;
+              return cleanupDuringStop === true ? 'stopped-cleanup' : 'stopped-finalized';
+            };
+            window.__irStartCapture = function (reason) {
+              startReasons.push(String(reason || ''));
+              window.__irCaptureActive = true;
+              return 'started';
+            };
+            var suspendReport = window.__ijFindSetIntelliSenseRecursionCaptureSuspended(true, 'lifecycle-probe');
+            var cleanupAfterStop = window.__irCleanupInProgress;
+            var releaseReport = window.__ijFindSetIntelliSenseRecursionCaptureSuspended(false, 'lifecycle-probe');
+            await new Promise(function (resolve) { setTimeout(resolve, 20); });
+            result = {
+              suspendReport: suspendReport,
+              releaseReport: releaseReport,
+              stopCalls: stopCalls,
+              cleanupDuringStop: cleanupDuringStop,
+              cleanupAfterStop: cleanupAfterStop,
+              startReasons: startReasons,
+              activeAfterRelease: window.__irCaptureActive,
+              needsRestart: window.__ijFindIrCaptureNeedsRestart
+            };
+          } finally {
+            window.__ijFindIrSuspendReasons = oldReasons;
+            window.__ijFindIrCaptureNeedsRestart = oldNeedsRestart;
+            if (hadRestartState) { window.__ijFindIrCaptureRestartState = oldRestartState; }
+            else { try { delete window.__ijFindIrCaptureRestartState; } catch (eDeleteRestartState) {} }
+            if (hadRestartGeneration) { window.__ijFindIrCaptureRestartGeneration = oldRestartGeneration; }
+            else { try { delete window.__ijFindIrCaptureRestartGeneration; } catch (eDeleteRestartGeneration) {} }
+            window.__ijFindIrCaptureSuspended = oldSuspended;
+            window.__ijFindIrCaptureSuspendReason = oldSuspendReason;
+            window.__irCaptureActive = oldActive;
+            window.__irStartCapture = oldStart;
+            window.__irStopCapture = oldStop;
+            if (hadCancel) { window.__irCancelCapture = oldCancel; }
+            else { try { delete window.__irCancelCapture; } catch (eDeleteCancel) {} }
+            if (hadCleanup) { window.__irCleanupInProgress = oldCleanup; }
+            else { try { delete window.__irCleanupInProgress; } catch (eDeleteCleanup) {} }
+          }
+          return JSON.stringify(result);
+        })()`,
+      );
+      const parsed = JSON.parse(raw) as {
+        err?: string;
+        suspendReport?: string;
+        releaseReport?: string;
+        stopCalls?: number;
+        cleanupDuringStop?: boolean;
+        cleanupAfterStop?: boolean;
+        startReasons?: string[];
+        activeAfterRelease?: boolean;
+        needsRestart?: boolean;
+      };
+      assert.strictEqual(parsed.err, undefined, `expected capture suspend lifecycle probe to run: ${raw}`);
+      assert.strictEqual(parsed.stopCalls, 1, `an active capture should be stopped exactly once: ${raw}`);
+      assert.strictEqual(parsed.cleanupDuringStop, true, `legacy stop should run in cheap cleanup mode: ${raw}`);
+      assert.strictEqual(parsed.cleanupAfterStop, false, `cleanup mode must restore the integration's prior flag: ${raw}`);
+      assert.deepStrictEqual(
+        parsed.startReasons,
+        ['ijss:resume-after-suspend'],
+        `a capture cancelled for suspension should restart only after the final reason is released: ${raw}`,
+      );
+      assert.strictEqual(parsed.activeAfterRelease, true, `the replacement capture should be active after release: ${raw}`);
+      assert.strictEqual(parsed.needsRestart, false, `a successful restart should consume the pending intent: ${raw}`);
+      assert.match(parsed.suspendReport ?? '', /stopped-cleanup/, `suspend report should identify the cheap stop: ${raw}`);
+      assert.match(parsed.releaseReport ?? '', /restart=scheduled/, `release should schedule, not synchronously run, capture restart: ${raw}`);
+    } finally {
+      await overlay.evalInActiveWindowForTests(
+        `(function(){
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var query = node.querySelector('.ij-find-query');
+            return query && query.value === 'CaptureSuspendLifecycleProbe';
+          });
+          var close = root && root.querySelector('.ij-find-close');
+          if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+          return 'closed';
+        })()`,
+      );
+    }
+  });
+
   test('diagnostics pressure defers preview LSP hydration until cooldown', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(30_000);
@@ -4481,6 +4605,73 @@ suite('Renderer — overlay UI probes', () => {
       status, /disp=(flex|block)/,
       `overlay display should be visible, got: ${status}`,
     );
+  });
+
+  test('a busy renderer leaves show running without hitting the outer CDP timeout', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const { overlay } = await getApi();
+    await overlay.show('BusyRendererDispatchSetup', { forceLiteral: true, suppressSearch: true });
+    const windowId = overlay.getConnectionStateForTests().activeWindowId;
+    assert.ok(windowId !== undefined, 'expected an active renderer window');
+    await overlay.evalInActiveWindowForTests(
+      `(function(){
+        if (window.__ijFindBusyShowOriginalForTest) { return 'already-installed'; }
+        window.__ijFindBusyShowOriginalForTest = window.__ijFindShow;
+        window.__ijFindBusyShowCallsForTest = [];
+        window.__ijFindShow = function () {
+          window.__ijFindBusyShowCallsForTest.push(String(arguments[0] || ''));
+          var until = Date.now() + 1200;
+          while (Date.now() < until) {}
+          return window.__ijFindBusyShowOriginalForTest.apply(this, arguments);
+        };
+        return 'installed';
+      })()`,
+    );
+    try {
+      const started = Date.now();
+      await overlay.show(
+        'BusyRendererDispatchProbe',
+        { forceLiteral: true, suppressSearch: true },
+      );
+      const elapsedMs = Date.now() - started;
+      assert.ok(elapsedMs < 1_100, `outer CDP dispatch should settle before the 1200ms renderer task; elapsed=${elapsedMs}`);
+      await overlay.show('BusyRendererMiddleProbe', { forceLiteral: true, suppressSearch: true, preferredWindowId: windowId });
+      await overlay.show('BusyRendererLatestProbe', { forceLiteral: true, suppressSearch: true, preferredWindowId: windowId });
+      await new Promise((resolve) => setTimeout(resolve, 1900));
+      const rendererState = JSON.parse(await overlay.evalInActiveWindowForTests(
+        `(function(){var q=document.querySelector('.ij-find-overlay.visible .ij-find-query');` +
+        `return JSON.stringify({query:q?q.value:'',calls:window.__ijFindBusyShowCallsForTest||[],` +
+        `completion:window.__ijFindLastShowCompletion||null})})()`,
+      )) as { query?: string; calls?: string[]; completion?: { token?: string; result?: string } };
+      assert.strictEqual(rendererState.query, 'BusyRendererLatestProbe', 'the latest queued show should run after the pending dispatch settles');
+      assert.deepStrictEqual(
+        rendererState.calls,
+        ['BusyRendererDispatchProbe', 'BusyRendererLatestProbe'],
+        'a shortcut burst must retain only the latest renderer show while one is pending',
+      );
+      const completion = rendererState.completion;
+      assert.match(completion?.token ?? '', /^[a-z0-9]+-[a-z0-9]+-[a-z0-9]+$/);
+      assert.match(completion?.result ?? '', /^show ok\b/, 'deferred reconciliation must observe the exact late show result');
+    } finally {
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      await overlay.evalInActiveWindowForTests(
+        `(function(){
+          if (window.__ijFindBusyShowOriginalForTest) {
+            window.__ijFindShow = window.__ijFindBusyShowOriginalForTest;
+            try { delete window.__ijFindBusyShowOriginalForTest; } catch (eDelete) {}
+            try { delete window.__ijFindBusyShowCallsForTest; } catch (eDeleteCalls) {}
+          }
+          var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
+            var q = node.querySelector('.ij-find-query');
+            return q && (q.value.indexOf('BusyRenderer') === 0);
+          });
+          var close = root && root.querySelector('.ij-find-close');
+          if (close) { close.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+          return 'restored';
+        })()`,
+      );
+    }
   });
 
   test('overlay.show() preserves the user-open tab set and active editor', async function () {

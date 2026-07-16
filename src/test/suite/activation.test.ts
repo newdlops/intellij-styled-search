@@ -73,6 +73,44 @@ suite('Activation', () => {
     assert.ok(api.overlay, 'overlay was not exposed on ext.exports');
   });
 
+  test('verified main PID discovery survives a later ps spawn failure', async () => {
+    const api = await getApi();
+    const overlay = api.overlay as any;
+    const originalCachedPid = overlay.lastKnownAncestorMainPid;
+    const originalInfer = overlay.inferBundledParentMainPid;
+    const originalRead = overlay.readMainProcessSnapshot;
+    const originalIsMain = overlay.isVscodeMainProcessCommand;
+    let reads = 0;
+    try {
+      overlay.lastKnownAncestorMainPid = undefined;
+      overlay.inferBundledParentMainPid = () => null;
+      overlay.isVscodeMainProcessCommand = (command: string) => command === 'neutral-electron-main';
+      overlay.readMainProcessSnapshot = () => {
+        reads += 1;
+        if (reads > 1) {
+          const error = new Error('spawnSync /bin/ps EBADF') as NodeJS.ErrnoException;
+          error.code = 'EBADF';
+          throw error;
+        }
+        return [
+          `${process.pid} ${process.ppid} extension-host`,
+          `${process.ppid} 1 neutral-electron-main`,
+        ].join('\n');
+      };
+
+      const first = overlay.findMainPid();
+      const second = overlay.findMainPid();
+      assert.strictEqual(first, process.ppid);
+      assert.strictEqual(second, process.ppid);
+      assert.strictEqual(reads, 1, 'a live verified parent should be reused without spawning ps again');
+    } finally {
+      overlay.lastKnownAncestorMainPid = originalCachedPid;
+      overlay.inferBundledParentMainPid = originalInfer;
+      overlay.readMainProcessSnapshot = originalRead;
+      overlay.isVscodeMainProcessCommand = originalIsMain;
+    }
+  });
+
   test('e2e launch config isolates the test VS Code main inspector', () => {
     const ext = vscode.extensions.getExtension<ExtensionTestApi>(EXTENSION_ID);
     assert.ok(ext, `extension ${EXTENSION_ID} not registered`);
@@ -1956,6 +1994,319 @@ suite('Activation', () => {
     }
   });
 
+  test('a cold show reuses the renderer window selected by its own injection', async function () {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalLog = anyOverlay.log;
+    const originalWs = anyOverlay.ws;
+    const originalActiveWindowId = anyOverlay.activeWindowId;
+    const originalActiveRendererSrc = anyOverlay.activeRendererSrc;
+    const originalRendererCommandWindowId = anyOverlay.rendererCommandWindowId;
+    const originalShowSeq = anyOverlay.showSeq;
+    const originalEnsureInjected = anyOverlay.ensureInjected.bind(anyOverlay);
+    const originalEvaluateShowInWindow = anyOverlay.evaluateShowInWindow.bind(anyOverlay);
+    const originalEvaluateShowInFocusedWindow = anyOverlay.evaluateShowInFocusedWindow.bind(anyOverlay);
+    const originalBeginTargetWindowMarker = anyOverlay.beginTargetWindowMarker.bind(anyOverlay);
+    const originalCancelCdpIdleClose = anyOverlay.cancelCdpIdleClose.bind(anyOverlay);
+    const originalIsRendererSafetyDiagnosticsEnabled = anyOverlay.isRendererSafetyDiagnosticsEnabled.bind(anyOverlay);
+    const originalShouldAutoCloseCdpForTests = anyOverlay.shouldAutoCloseCdpForTests.bind(anyOverlay);
+    const directCalls: number[] = [];
+    let focusedCalls = 0;
+    try {
+      anyOverlay.log = { appendLine: () => {} };
+      anyOverlay.ws = undefined;
+      anyOverlay.activeWindowId = undefined;
+      anyOverlay.activeRendererSrc = undefined;
+      anyOverlay.rendererCommandWindowId = undefined;
+      anyOverlay.ensureInjected = async () => 8;
+      anyOverlay.evaluateShowInWindow = async (windowId: number) => {
+        directCalls.push(windowId);
+        return { fid: windowId, result: 'show ok src=cold-route-test' };
+      };
+      anyOverlay.evaluateShowInFocusedWindow = async () => {
+        focusedCalls++;
+        return { fid: 9, result: 'unexpected focused route' };
+      };
+      anyOverlay.beginTargetWindowMarker = () => ({ dispose: () => {} });
+      anyOverlay.cancelCdpIdleClose = () => {};
+      anyOverlay.isRendererSafetyDiagnosticsEnabled = () => false;
+      anyOverlay.shouldAutoCloseCdpForTests = () => false;
+
+      await anyOverlay.doShow('', { suppressSearch: true });
+
+      assert.deepStrictEqual(directCalls, [8], 'show should go straight to the window selected during injection');
+      assert.strictEqual(focusedCalls, 0, 'cold show must not repeat the cross-window marker/focus scan');
+      assert.strictEqual(anyOverlay.activeWindowId, 8);
+      assert.strictEqual(anyOverlay.activeRendererSrc, 'cold-route-test');
+    } finally {
+      anyOverlay.log = originalLog;
+      anyOverlay.ws = originalWs;
+      anyOverlay.activeWindowId = originalActiveWindowId;
+      anyOverlay.activeRendererSrc = originalActiveRendererSrc;
+      anyOverlay.rendererCommandWindowId = originalRendererCommandWindowId;
+      anyOverlay.showSeq = originalShowSeq;
+      anyOverlay.ensureInjected = originalEnsureInjected;
+      anyOverlay.evaluateShowInWindow = originalEvaluateShowInWindow;
+      anyOverlay.evaluateShowInFocusedWindow = originalEvaluateShowInFocusedWindow;
+      anyOverlay.beginTargetWindowMarker = originalBeginTargetWindowMarker;
+      anyOverlay.cancelCdpIdleClose = originalCancelCdpIdleClose;
+      anyOverlay.isRendererSafetyDiagnosticsEnabled = originalIsRendererSafetyDiagnosticsEnabled;
+      anyOverlay.shouldAutoCloseCdpForTests = originalShouldAutoCloseCdpForTests;
+    }
+  });
+
+  test('a vanished cold injection target retries the actual fallback window after reinjection', async function () {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalLog = anyOverlay.log;
+    const originalWs = anyOverlay.ws;
+    const originalActiveWindowId = anyOverlay.activeWindowId;
+    const originalActiveRendererSrc = anyOverlay.activeRendererSrc;
+    const originalRendererCommandWindowId = anyOverlay.rendererCommandWindowId;
+    const originalShowSeq = anyOverlay.showSeq;
+    const originalEnsureInjected = anyOverlay.ensureInjected.bind(anyOverlay);
+    const originalEvaluateShowInWindow = anyOverlay.evaluateShowInWindow.bind(anyOverlay);
+    const originalEvaluateShowInFocusedWindow = anyOverlay.evaluateShowInFocusedWindow.bind(anyOverlay);
+    const originalRunPatchScript = anyOverlay.runPatchScript.bind(anyOverlay);
+    const originalMarkRendererInlayClickHookReady = anyOverlay.markRendererInlayClickHookReady.bind(anyOverlay);
+    const originalBeginTargetWindowMarker = anyOverlay.beginTargetWindowMarker.bind(anyOverlay);
+    const originalCancelCdpIdleClose = anyOverlay.cancelCdpIdleClose.bind(anyOverlay);
+    const originalIsRendererSafetyDiagnosticsEnabled = anyOverlay.isRendererSafetyDiagnosticsEnabled.bind(anyOverlay);
+    const originalShouldAutoCloseCdpForTests = anyOverlay.shouldAutoCloseCdpForTests.bind(anyOverlay);
+    const directCalls: number[] = [];
+    const reinjected: number[] = [];
+    try {
+      anyOverlay.log = { appendLine: () => {} };
+      anyOverlay.ws = undefined;
+      anyOverlay.activeWindowId = undefined;
+      anyOverlay.activeRendererSrc = undefined;
+      anyOverlay.rendererCommandWindowId = undefined;
+      anyOverlay.ensureInjected = async () => 8;
+      anyOverlay.evaluateShowInWindow = async (windowId: number) => {
+        directCalls.push(windowId);
+        return windowId === 8
+          ? undefined
+          : { fid: windowId, result: 'show ok src=fallback-route-test' };
+      };
+      anyOverlay.evaluateShowInFocusedWindow = async () => ({ fid: 9, result: 'no-show-fn' });
+      anyOverlay.runPatchScript = async (windowId: number) => {
+        reinjected.push(windowId);
+        return `ok:${windowId}:ij-find patch installed`;
+      };
+      anyOverlay.markRendererInlayClickHookReady = () => {};
+      anyOverlay.beginTargetWindowMarker = () => ({ dispose: () => {} });
+      anyOverlay.cancelCdpIdleClose = () => {};
+      anyOverlay.isRendererSafetyDiagnosticsEnabled = () => false;
+      anyOverlay.shouldAutoCloseCdpForTests = () => false;
+
+      await anyOverlay.doShow('', { suppressSearch: true });
+
+      assert.deepStrictEqual(directCalls, [8, 9], 'the post-reinject show must use the fallback window, not the vanished target');
+      assert.deepStrictEqual(reinjected, [9]);
+      assert.strictEqual(anyOverlay.activeWindowId, 9);
+    } finally {
+      anyOverlay.log = originalLog;
+      anyOverlay.ws = originalWs;
+      anyOverlay.activeWindowId = originalActiveWindowId;
+      anyOverlay.activeRendererSrc = originalActiveRendererSrc;
+      anyOverlay.rendererCommandWindowId = originalRendererCommandWindowId;
+      anyOverlay.showSeq = originalShowSeq;
+      anyOverlay.ensureInjected = originalEnsureInjected;
+      anyOverlay.evaluateShowInWindow = originalEvaluateShowInWindow;
+      anyOverlay.evaluateShowInFocusedWindow = originalEvaluateShowInFocusedWindow;
+      anyOverlay.runPatchScript = originalRunPatchScript;
+      anyOverlay.markRendererInlayClickHookReady = originalMarkRendererInlayClickHookReady;
+      anyOverlay.beginTargetWindowMarker = originalBeginTargetWindowMarker;
+      anyOverlay.cancelCdpIdleClose = originalCancelCdpIdleClose;
+      anyOverlay.isRendererSafetyDiagnosticsEnabled = originalIsRendererSafetyDiagnosticsEnabled;
+      anyOverlay.shouldAutoCloseCdpForTests = originalShouldAutoCloseCdpForTests;
+    }
+  });
+
+  test('renderer-busy show dispatch returns pending before the outer CDP timeout', async function () {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalEvalInWindow = anyOverlay.evalInWindow.bind(anyOverlay);
+    const calls: Array<{ windowId: number; expression: string; timeoutMs: number; rendererSettleMs: number }> = [];
+    try {
+      anyOverlay.evalInWindow = async (
+        windowId: number,
+        expression: string,
+        timeoutMs: number,
+        rendererSettleMs: number,
+      ) => {
+        calls.push({ windowId, expression, timeoutMs, rendererSettleMs });
+        return `pending:renderer-busy:${rendererSettleMs}ms`;
+      };
+
+      const result = await anyOverlay.evaluateShowInWindow(8, '', {});
+
+      assert.strictEqual(calls.length, 1);
+      assert.deepStrictEqual(
+        { windowId: calls[0].windowId, timeoutMs: calls[0].timeoutMs, rendererSettleMs: calls[0].rendererSettleMs },
+        { windowId: 8, timeoutMs: 10_000, rendererSettleMs: 750 },
+      );
+      assert.strictEqual(result?.fid, 8);
+      assert.strictEqual(result?.result, 'show pending renderer-busy:750ms');
+      assert.match(result?.completionToken ?? '', /^[a-z0-9]+-[a-z0-9]+-[a-z0-9]+$/);
+      assert.ok(calls[0].expression.includes('__ijFindLastShowCompletion'));
+      assert.ok(calls[0].expression.includes(JSON.stringify(result?.completionToken)));
+    } finally {
+      anyOverlay.evalInWindow = originalEvalInWindow;
+    }
+  });
+
+  test('a pending renderer evaluation is tracked by token in the main process', async function () {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalSend = anyOverlay.send.bind(anyOverlay);
+    let sentExpression = '';
+    try {
+      anyOverlay.send = async (_method: string, params: { expression?: string }) => {
+        sentExpression = params.expression ?? '';
+        return { result: { value: 'pending:renderer-busy:750ms' } };
+      };
+
+      const result = await anyOverlay.evalInWindow(8, 'window.__probe()', 10_000, 750, 'completion-token');
+
+      assert.strictEqual(result, 'pending:renderer-busy:750ms');
+      assert.ok(sentExpression.includes('global.__ijFindDeferredRendererEvaluations = new Map()'));
+      assert.ok(sentExpression.includes('completionMap.set(completionToken, {'));
+      assert.ok(sentExpression.includes("status: 'pending'"));
+      assert.ok(sentExpression.includes("updateCompletion('fulfilled', text, '')"));
+      assert.ok(sentExpression.includes("updateCompletion('rejected', '', text)"));
+      assert.ok(sentExpression.includes('while (completionMap.size >= 64)'));
+      assert.ok(sentExpression.includes("var completionToken = \"completion-token\";"));
+    } finally {
+      anyOverlay.send = originalSend;
+    }
+  });
+
+  test('a pending renderer show coalesces shortcut bursts to the latest request', async function () {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalPendingShow = anyOverlay.pendingShow;
+    const originalShowInFlight = anyOverlay.showInFlight;
+    const originalShowPumpGeneration = anyOverlay.showPumpGeneration;
+    const originalDeferredShowSeq = anyOverlay.deferredShowSeq;
+    const originalRendererRecoveryUntil = anyOverlay.rendererRecoveryUntil;
+    const originalDoShow = anyOverlay.doShow.bind(anyOverlay);
+    const originalCancelPendingPreviewCapture = anyOverlay.cancelPendingPreviewCapture.bind(anyOverlay);
+    const originalCancelCdpIdleClose = anyOverlay.cancelCdpIdleClose.bind(anyOverlay);
+    const originalCancelCdpSearchIdleClose = anyOverlay.cancelCdpSearchIdleClose.bind(anyOverlay);
+    const dispatches: Array<{ query: string; preferredWindowId?: number }> = [];
+    let latestDispatched!: () => void;
+    const latestDispatch = new Promise<void>((resolve) => { latestDispatched = resolve; });
+    try {
+      anyOverlay.pendingShow = null;
+      anyOverlay.showInFlight = false;
+      anyOverlay.showPumpGeneration = 0;
+      anyOverlay.deferredShowSeq = undefined;
+      anyOverlay.cancelPendingPreviewCapture = async () => {};
+      anyOverlay.cancelCdpIdleClose = () => {};
+      anyOverlay.cancelCdpSearchIdleClose = () => {};
+      anyOverlay.doShow = async (query: string, options: { preferredWindowId?: number }) => {
+        dispatches.push({ query, preferredWindowId: options?.preferredWindowId });
+        if (query === 'pending-a') {
+          anyOverlay.deferredShowSeq = 41;
+        } else if (query === 'latest-c') {
+          latestDispatched();
+        }
+      };
+
+      await overlay.show('pending-a', { preferredWindowId: 1 });
+      assert.strictEqual(anyOverlay.showInFlight, true, 'the pump must stay latched after the public pending return');
+      await overlay.show('middle-b', { preferredWindowId: 2 });
+      await overlay.show('latest-c', { preferredWindowId: 3 });
+      assert.deepStrictEqual(dispatches, [{ query: 'pending-a', preferredWindowId: 1 }]);
+      assert.strictEqual(anyOverlay.pendingShow?.query, 'latest-c');
+
+      anyOverlay.finishDeferredShow(40);
+      assert.deepStrictEqual(dispatches, [{ query: 'pending-a', preferredWindowId: 1 }], 'a stale token must not resume the pump');
+      anyOverlay.finishDeferredShow(41);
+      await latestDispatch;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      assert.deepStrictEqual(dispatches, [
+        { query: 'pending-a', preferredWindowId: 1 },
+        { query: 'latest-c', preferredWindowId: 3 },
+      ]);
+      assert.strictEqual(anyOverlay.pendingShow, null);
+      assert.strictEqual(anyOverlay.deferredShowSeq, undefined);
+      assert.strictEqual(anyOverlay.showInFlight, false);
+    } finally {
+      anyOverlay.pendingShow = originalPendingShow;
+      anyOverlay.showInFlight = originalShowInFlight;
+      anyOverlay.showPumpGeneration = originalShowPumpGeneration;
+      anyOverlay.deferredShowSeq = originalDeferredShowSeq;
+      anyOverlay.rendererRecoveryUntil = originalRendererRecoveryUntil;
+      anyOverlay.doShow = originalDoShow;
+      anyOverlay.cancelPendingPreviewCapture = originalCancelPendingPreviewCapture;
+      anyOverlay.cancelCdpIdleClose = originalCancelCdpIdleClose;
+      anyOverlay.cancelCdpSearchIdleClose = originalCancelCdpSearchIdleClose;
+    }
+  });
+
+  test('show-and-wait resolves only from its deferred terminal state and cancels cleanly', async function () {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalPendingShow = anyOverlay.pendingShow;
+    const originalShowInFlight = anyOverlay.showInFlight;
+    const originalShowPumpGeneration = anyOverlay.showPumpGeneration;
+    const originalDeferredShowSeq = anyOverlay.deferredShowSeq;
+    const originalDeferredShowSettler = anyOverlay.deferredShowSettler;
+    const originalDoShow = anyOverlay.doShow.bind(anyOverlay);
+    const originalCancelPendingPreviewCapture = anyOverlay.cancelPendingPreviewCapture.bind(anyOverlay);
+    const originalCancelCdpIdleClose = anyOverlay.cancelCdpIdleClose.bind(anyOverlay);
+    const originalCancelCdpSearchIdleClose = anyOverlay.cancelCdpSearchIdleClose.bind(anyOverlay);
+    let dispatchSeq = 60;
+    let dispatchStarted!: () => void;
+    let started = new Promise<void>((resolve) => { dispatchStarted = resolve; });
+    try {
+      anyOverlay.pendingShow = null;
+      anyOverlay.showInFlight = false;
+      anyOverlay.showPumpGeneration = 0;
+      anyOverlay.deferredShowSeq = undefined;
+      anyOverlay.deferredShowSettler = undefined;
+      anyOverlay.cancelPendingPreviewCapture = async () => {};
+      anyOverlay.cancelCdpIdleClose = () => {};
+      anyOverlay.cancelCdpSearchIdleClose = () => {};
+      anyOverlay.doShow = async () => {
+        anyOverlay.deferredShowSeq = dispatchSeq;
+        dispatchStarted();
+        return true;
+      };
+
+      const settled = anyOverlay.showAndWaitForSettlement('static-pending', { suppressSearch: true }) as Promise<boolean>;
+      await started;
+      let resolved = false;
+      void settled.then(() => { resolved = true; });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.strictEqual(resolved, false, 'dispatch return must not masquerade as renderer settlement');
+      anyOverlay.finishDeferredShow(60, true);
+      assert.strictEqual(await settled, true);
+
+      dispatchSeq = 61;
+      started = new Promise<void>((resolve) => { dispatchStarted = resolve; });
+      const cancelled = anyOverlay.showAndWaitForSettlement('static-cancelled', { suppressSearch: true }) as Promise<boolean>;
+      await started;
+      anyOverlay.cancelShowPump();
+      assert.strictEqual(await cancelled, false, 'recovery/dispose cancellation must release a static-results waiter');
+      assert.strictEqual(anyOverlay.showInFlight, false);
+      assert.strictEqual(anyOverlay.deferredShowSettler, undefined);
+    } finally {
+      anyOverlay.pendingShow = originalPendingShow;
+      anyOverlay.showInFlight = originalShowInFlight;
+      anyOverlay.showPumpGeneration = originalShowPumpGeneration;
+      anyOverlay.deferredShowSeq = originalDeferredShowSeq;
+      anyOverlay.deferredShowSettler = originalDeferredShowSettler;
+      anyOverlay.doShow = originalDoShow;
+      anyOverlay.cancelPendingPreviewCapture = originalCancelPendingPreviewCapture;
+      anyOverlay.cancelCdpIdleClose = originalCancelCdpIdleClose;
+      anyOverlay.cancelCdpSearchIdleClose = originalCancelCdpSearchIdleClose;
+    }
+  });
+
   test('standalone Monaco requests target their renderer without stealing the active window', async function () {
     const { overlay } = await getApi();
     const anyOverlay = overlay as any;
@@ -2015,6 +2366,13 @@ suite('Activation', () => {
       assert.ok(
         expression.includes('__ijFindConsoleBridgeTargets') && expression.includes('43123'),
         'retained readiness must reject a console listener that targets a stale extension-host endpoint',
+      );
+      assert.ok(
+        expression.includes('Promise.race') &&
+          expression.includes('resolve(false); }, 250') &&
+          expression.includes('var markerDeadline = Date.now() + 1500;') &&
+          expression.includes('if (Date.now() >= markerDeadline) { return false; }'),
+        'busy renderer marker probes need both per-window and whole-scan bounds',
       );
     } finally {
       anyOverlay.localBridgeServer = originalLocalBridgeServer;

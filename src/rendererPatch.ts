@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 143;
+export const RENDERER_PATCH_VERSION = 145;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -165,6 +165,170 @@ export function getRendererPatchScript(
       return out;
     } catch (eListIr) { return []; }
   }
+  // Suspending a cooperating capture must be a cheap cancellation operation.
+  // Some renderer integrations expose only a legacy stop function whose
+  // normal path finalizes a large captured object graph synchronously. Calling
+  // that path from __ijFindShow blocks the workbench main thread long enough
+  // for the outer CDP Runtime.evaluate request to time out. Prefer an explicit
+  // cancel API when available; otherwise use the integration's cleanup mode,
+  // restoring the prior flag exactly after the hooks have been removed.
+  function clearIntelliSenseRecursionCaptureRestart(expectedState) {
+    try {
+      if (expectedState && window.__ijFindIrCaptureRestartState !== expectedState) { return; }
+      window.__ijFindIrCaptureRestartState = null;
+      window.__ijFindIrCaptureNeedsRestart = false;
+    } catch (eClearRestart) {}
+  }
+  function rememberIntelliSenseRecursionCaptureRestart(startFn, sessionId, integrationPatchVersion) {
+    try {
+      var generation = (typeof window.__ijFindIrCaptureRestartGeneration === 'number'
+        ? window.__ijFindIrCaptureRestartGeneration
+        : 0) + 1;
+      window.__ijFindIrCaptureRestartGeneration = generation;
+      window.__ijFindIrCaptureRestartState = {
+        generation: generation,
+        scheduled: false,
+        attempts: 0,
+        startFn: startFn,
+        sessionId: sessionId,
+        integrationPatchVersion: integrationPatchVersion,
+        searchPatchVersion: window.__ijFindPatchVersion,
+      };
+      window.__ijFindIrCaptureNeedsRestart = true;
+    } catch (eRememberRestart) {}
+  }
+  function cancelIntelliSenseRecursionCaptureForSuspend(reason) {
+    try {
+      if (!window.__irCaptureActive) { return ''; }
+      var cleanupAlreadyOwned = window.__irCleanupInProgress === true;
+      var cancelled = false;
+      var report = '';
+      if (typeof window.__irCancelCapture === 'function') {
+        try {
+          report = 'cancel=' + String(window.__irCancelCapture('ijss:' + String(reason || 'unknown')));
+          cancelled = window.__irCaptureActive !== true;
+        } catch (eCancelIr) {
+          // Older/partial integrations can leave a throwing cancel shim. The
+          // cleanup-mode stop below is the compatibility fallback.
+        }
+      }
+      if (!cancelled && typeof window.__irStopCapture === 'function') {
+        var hadCleanupFlag = Object.prototype.hasOwnProperty.call(window, '__irCleanupInProgress');
+        var previousCleanupFlag = window.__irCleanupInProgress;
+        try {
+          window.__irCleanupInProgress = true;
+          // A read-only or accessor-backed integration flag can reject the
+          // assignment without throwing in this non-strict renderer script.
+          // Never risk the legacy stop's expensive finalization unless the
+          // integration confirms that cleanup mode is actually active.
+          if (window.__irCleanupInProgress !== true) {
+            report = 'cancel=cleanup-unavailable';
+          } else {
+            report = 'cancel=' + String(window.__irStopCapture('ijss:' + String(reason || 'unknown')));
+            cancelled = window.__irCaptureActive !== true;
+          }
+        } catch (eStopIr) {
+          report = 'cancel-err:' + String(eStopIr && eStopIr.message || eStopIr).slice(0, 120);
+          cancelled = false;
+        } finally {
+          try {
+            if (hadCleanupFlag) {
+              window.__irCleanupInProgress = previousCleanupFlag;
+            } else {
+              delete window.__irCleanupInProgress;
+            }
+          } catch (eRestoreCleanupFlag) {
+            try { window.__irCleanupInProgress = previousCleanupFlag; } catch (eRestoreCleanupFallback) {}
+          }
+        }
+      }
+      var restartStart = window.__irStartCapture;
+      if (cancelled && !cleanupAlreadyOwned && typeof restartStart === 'function') {
+        // Snapshot after cancellation. A cooperating cancel API may advance
+        // its session token specifically to invalidate stale stop timers.
+        rememberIntelliSenseRecursionCaptureRestart(
+          restartStart,
+          window.__irCaptureSessionId,
+          window.__irPatchVersion
+        );
+      }
+      if (!report) { report = 'cancel=no-stop'; }
+      return report;
+    } catch (eCancelCapture) {
+      return 'cancel-err:' + String(eCancelCapture && eCancelCapture.message || eCancelCapture).slice(0, 120);
+    }
+  }
+  function retryIntelliSenseRecursionCaptureRestart(restartState) {
+    try {
+      if (window.__ijFindIrCaptureRestartState !== restartState) { return; }
+      // One bounded retry handles a transient integration start failure while
+      // preventing a broken foreign hook from creating an endless timer loop.
+      if ((restartState.attempts || 0) >= 2) {
+        clearIntelliSenseRecursionCaptureRestart(restartState);
+        return;
+      }
+      window.__ijFindIrCaptureNeedsRestart = true;
+      scheduleIntelliSenseRecursionCaptureRestart();
+    } catch (eRetryRestart) {
+      clearIntelliSenseRecursionCaptureRestart(restartState);
+    }
+  }
+  function scheduleIntelliSenseRecursionCaptureRestart() {
+    try {
+      var restartState = window.__ijFindIrCaptureRestartState;
+      if (window.__ijFindIrCaptureNeedsRestart !== true || !restartState) { return ''; }
+      if (restartState.scheduled === true) { return ' restart=pending'; }
+      restartState.scheduled = true;
+      var restartGeneration = restartState.generation;
+      setTimeout(function () {
+        try {
+          var currentState = window.__ijFindIrCaptureRestartState;
+          if (currentState !== restartState || currentState.generation !== restartGeneration) { return; }
+          currentState.scheduled = false;
+          // A new suspend reason may have arrived after this restart was
+          // queued. Preserve the intent and let the final release retry it.
+          if (window.__ijFindIrCaptureSuspended === true) {
+            window.__ijFindIrCaptureNeedsRestart = true;
+            return;
+          }
+          // Another owner or a reloaded integration may already have replaced
+          // the cancelled session. Never resurrect a stale capture intent.
+          if (window.__irCaptureActive === true) {
+            clearIntelliSenseRecursionCaptureRestart(currentState);
+            return;
+          }
+          if (window.__ijFindPatchVersion !== currentState.searchPatchVersion ||
+              window.__irStartCapture !== currentState.startFn ||
+              window.__irCaptureSessionId !== currentState.sessionId ||
+              window.__irPatchVersion !== currentState.integrationPatchVersion) {
+            clearIntelliSenseRecursionCaptureRestart(currentState);
+            return;
+          }
+          currentState.attempts = (typeof currentState.attempts === 'number' ? currentState.attempts : 0) + 1;
+          var restartResult = String(window.__irStartCapture('ijss:resume-after-suspend'));
+          if (window.__irCaptureActive === true ||
+              restartResult === 'started' ||
+              restartResult === 'already-active' ||
+              restartResult === 'skipped-valid-monaco') {
+            clearIntelliSenseRecursionCaptureRestart(currentState);
+          } else {
+            retryIntelliSenseRecursionCaptureRestart(currentState);
+          }
+        } catch (eRestartIr) {
+          retryIntelliSenseRecursionCaptureRestart(restartState);
+        }
+      }, 0);
+      return ' restart=scheduled';
+    } catch (eScheduleRestart) {
+      try {
+        if (window.__ijFindIrCaptureRestartState) {
+          window.__ijFindIrCaptureRestartState.scheduled = false;
+          window.__ijFindIrCaptureNeedsRestart = true;
+        }
+      } catch (eRememberSchedule) {}
+      return ' restart=err';
+    }
+  }
   function setIntelliSenseRecursionCaptureSuspended(active, reason) {
     try {
       if (!window.__ijFindShouldSuspendIntelliSenseRecursionCapture) { return 'disabled'; }
@@ -188,11 +352,11 @@ export function getRendererPatchScript(
       window.__ijFindIrCaptureSuspended = suspended;
       window.__ijFindIrCaptureSuspendReason = suspended ? listIrSuspendReasons().join(',') : '';
       var stopped = '';
-      if (suspended && window.__irCaptureActive && typeof window.__irStopCapture === 'function') {
-        try { stopped = String(window.__irStopCapture('ijss:' + key)); }
-        catch (eStopIr) { stopped = 'stop-err:' + String(eStopIr && eStopIr.message || eStopIr).slice(0, 120); }
+      if (suspended && window.__irCaptureActive) {
+        stopped = cancelIntelliSenseRecursionCaptureForSuspend(key);
       }
-      return 'suspend=' + suspended + ' guard=' + guard + (stopped ? ' stop=' + stopped : '');
+      var restart = suspended ? '' : scheduleIntelliSenseRecursionCaptureRestart();
+      return 'suspend=' + suspended + ' guard=' + guard + (stopped ? ' stop=' + stopped : '') + restart;
     } catch (eSuspendIr) {
       return 'suspend-err:' + String(eSuspendIr && eSuspendIr.message || eSuspendIr).slice(0, 120);
     }
@@ -13324,8 +13488,8 @@ export function getRendererPatchScript(
       panel.style.setProperty('pointer-events', 'auto', 'important');
       panel.style.setProperty('z-index', String(10000 + detachedPanelSeq), 'important');
       panel.style.setProperty('position', 'fixed', 'important');
-      var mountT0 = perfNow();
-      ensureSearchUiMounted(panel);
+	      var mountT0 = perfNow();
+	      var searchUiMountRoot = ensureSearchUiMounted(panel);
       reportPerfPhase('show:mount', mountT0, {
         shouldShell: shouldShell,
         parentTag: panel.parentElement && panel.parentElement.tagName ? String(panel.parentElement.tagName).toLowerCase() : '',
@@ -13333,9 +13497,19 @@ export function getRendererPatchScript(
       bringSearchPanelToFront(panel);
       reportPerfPhase('show:style', styleT0, { shouldShell: shouldShell }, 1);
       var themeT0 = perfNow();
-      if (!shouldShell) {
-        syncPreviewOverflowTheme(panel);
-      }
+      // The panel is mounted inside .monaco-workbench and inherits VS Code's
+      // theme custom properties directly. Copying every computed
+	      // --vscode-* property here forced a cold style/layout calculation on
+	      // the first show. Only the detached body-level overflow root needs an
+	      // explicit theme snapshot. Keep the copy as a defensive fallback when
+	      // a partially initialized workbench forces the panel onto document.body.
+	      var mountedInsideWorkbench = false;
+	      try {
+	        mountedInsideWorkbench = !!(panel.closest && panel.closest('.monaco-workbench'));
+	      } catch (eWorkbenchAncestor) {}
+	      if (!mountedInsideWorkbench && searchUiMountRoot === document.body) {
+	        syncPreviewOverflowTheme(panel);
+	      }
       // $hoverTooltip theme sync + body mount were the DIY hover bring-up
       // path; removed in #32 along with the rest of that subsystem.
       reportPerfPhase('show:themeSync', themeT0, { shouldShell: shouldShell }, 1);
