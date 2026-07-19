@@ -7,6 +7,7 @@ import {
   compilePathScopeMatcher,
   toRipgrepGlobs,
 } from './pathScope';
+import { findRipgrepPath } from './rgSearch';
 import {
   type FileMatch,
   type MatchRange,
@@ -79,8 +80,12 @@ const ZOEKT_PROTOCOL_VERSION = 1;
 // value as "incomplete" (→ codesearch fallback). The rust schema was bumped to
 // 20 in af9eafb (2026-05-30) without updating this constant, which left every
 // freshly-built index looking incomplete and forced the fallback path.
-const ZOEKT_SCHEMA_VERSION = 20;
+const ZOEKT_SCHEMA_VERSION = 22;
 const ZOEKT_WORKSPACE_METADATA_HASH_VERSION = 3;
+const ZOEKT_WORKSPACE_INDEX_SCOPE = 'workspace';
+const ZOEKT_ALL_FILES_INDEX_SCOPE = 'all';
+const ZOEKT_INCLUDE_IGNORED_ENV = 'ZOEK_INDEX_INCLUDE_IGNORED';
+const ZOEKT_RG_PATH_ENV = 'ZOEK_RG_PATH';
 const ZOEKT_SHARD_HEADER_BYTES = 88;
 const ZOEKT_SHARD_MAGIC = Buffer.from('ZKSHRD01', 'ascii');
 const MAX_U64_AS_NUMBER = Number(0xffff_ffff_ffff_ffffn);
@@ -93,6 +98,7 @@ type ZoektBaseShardManifest = {
   engine?: unknown;
   schemaVersion?: unknown;
   workspaceMetadataHashVersion?: unknown;
+  indexScope?: unknown;
   workspaceRoot?: unknown;
   indexRoot?: unknown;
   createdUnixSecs?: unknown;
@@ -189,11 +195,15 @@ export async function hasValidZoektBaseShards(
   indexRoot: string,
   manifest: ZoektBaseShardManifest,
   workspaceRoot: string,
+  expectedIndexScope?: 'workspace' | 'all',
 ): Promise<boolean> {
   const buildId = parsePositiveJsonU64String(manifest.buildId);
+  const indexScope = manifest.indexScope;
   if (manifest.engine !== 'zoek-rs' ||
       manifest.schemaVersion !== ZOEKT_SCHEMA_VERSION ||
       manifest.workspaceMetadataHashVersion !== ZOEKT_WORKSPACE_METADATA_HASH_VERSION ||
+      (indexScope !== ZOEKT_WORKSPACE_INDEX_SCOPE && indexScope !== ZOEKT_ALL_FILES_INDEX_SCOPE) ||
+      (expectedIndexScope !== undefined && indexScope !== expectedIndexScope) ||
       typeof manifest.workspaceRoot !== 'string' ||
       typeof manifest.indexRoot !== 'string' ||
       !isPositiveJsonInteger(manifest.createdUnixSecs) ||
@@ -316,6 +326,7 @@ export async function hasValidZoektBaseShards(
       manifest.buildId,
       manifest.createdUnixSecs,
       manifest.shardMetadataFingerprint,
+      indexScope,
       shardCount,
       totalDocs,
       totalGrams,
@@ -1117,6 +1128,17 @@ export class ZoektRuntime implements vscode.Disposable {
     return cfg.get<boolean>('zoektIncrementalFileUpdates', true);
   }
 
+  private shouldIncludeIgnoredFiles(): boolean {
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    return cfg.get<boolean>('zoektIncludeIgnoredFiles', false);
+  }
+
+  private configuredPersistentIndexScope(): 'workspace' | 'all' {
+    return this.shouldIncludeIgnoredFiles()
+      ? ZOEKT_ALL_FILES_INDEX_SCOPE
+      : ZOEKT_WORKSPACE_INDEX_SCOPE;
+  }
+
   private shouldWatchExternalFileDeletes(): boolean {
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     return cfg.get<boolean>('zoektWatchExternalFileDeletes', false);
@@ -1774,7 +1796,12 @@ export class ZoektRuntime implements vscode.Disposable {
     try {
       const manifestText = await fs.promises.readFile(manifestPath, 'utf8');
       const manifest = JSON.parse(manifestText) as ZoektBaseShardManifest;
-      return hasValidZoektBaseShards(indexRoot, manifest, workspaceRoot);
+      return hasValidZoektBaseShards(
+        indexRoot,
+        manifest,
+        workspaceRoot,
+        this.configuredPersistentIndexScope(),
+      );
     } catch {
       return false;
     }
@@ -2558,13 +2585,21 @@ export class ZoektRuntime implements vscode.Disposable {
     const [command, ...rest] = args;
     const kind = this.classifyChild(command, rest);
     const argv0 = this.argv0ForKind(kind);
+    const childEnv: NodeJS.ProcessEnv = {
+      ...(hooks?.env ?? process.env),
+      [ZOEKT_INCLUDE_IGNORED_ENV]: this.shouldIncludeIgnoredFiles() ? '1' : '0',
+    };
+    const ripgrepPath = findRipgrepPath();
+    if (ripgrepPath) {
+      childEnv[ZOEKT_RG_PATH_ENV] = ripgrepPath;
+    }
     return new Promise((resolve, reject) => {
       const child = spawn(command, rest, {
         cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
         detached: process.platform !== 'win32',
-        ...(hooks?.env ? { env: hooks.env } : {}),
+        env: childEnv,
         ...(argv0 ? { argv0 } : {}),
       });
       const tracked = this.trackChild(child, [path.basename(command), ...rest.slice(0, 2)].join(' '), kind);

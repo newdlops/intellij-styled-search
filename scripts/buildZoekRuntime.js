@@ -178,7 +178,7 @@ const manifest = {
   platformKey,
   rustTarget: rustTarget || null,
   protocolVersion: 1,
-  schemaVersion: 20,
+  schemaVersion: 22,
   sourceFingerprint,
   artifactId: binaryPairArtifactId(files),
   files,

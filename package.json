@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.7134",
+  "version": "0.1.7137",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -225,6 +225,11 @@
           "type": "boolean",
           "default": true,
           "description": "Keep the zoekt index updated from confirmed editor saves and VS Code delete/rename operations. Disable to stop background zoekt update processes; manual index rebuild will still refresh search results."
+        },
+        "intellijStyledSearch.zoektIncludeIgnoredFiles": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Include files excluded by workspace ignore rules in the persistent zoekt index. Disabled keeps a much smaller hot index and speeds rebuilds; enable it only when searches must routinely cover ignored build, cache, or dependency files. Changing this setting requires rebuilding the search index."
         },
         "intellijStyledSearch.zoektPrewarmOnActivation": {
           "type": "boolean",

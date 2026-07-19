@@ -37,7 +37,7 @@ function engineCapabilitiesJson(commands = REQUIRED_ENGINE_COMMANDS): string {
   return JSON.stringify({
     type: 'capabilities',
     ok: true,
-    engine: { name: 'zoek-rs', protocolVersion: 1, schemaVersion: 20 },
+    engine: { name: 'zoek-rs', protocolVersion: 1, schemaVersion: 22 },
     commands,
     features: REQUIRED_ENGINE_FEATURES,
   });
@@ -385,7 +385,7 @@ suite('Activation', () => {
     const validHeader = () => {
       const header = Buffer.alloc(88);
       header.write('ZKSHRD01', 0, 'ascii');
-      header.writeUInt32LE(20, 8);
+      header.writeUInt32LE(22, 8);
       header.writeUInt32LE(0, 12);
       header.writeBigUInt64LE(1n, 16);
       header.writeBigUInt64LE(88n, 40);
@@ -398,8 +398,9 @@ suite('Activation', () => {
     };
     const validManifest = {
       engine: 'zoek-rs',
-      schemaVersion: 20,
+      schemaVersion: 22,
       workspaceMetadataHashVersion: 3,
+      indexScope: 'workspace',
       workspaceRoot: root,
       indexRoot,
       createdUnixSecs: 1,
@@ -438,7 +439,7 @@ suite('Activation', () => {
     }));
     fs.writeFileSync(shardPath, validHeader());
     try {
-      fs.writeFileSync(path.join(indexRoot, 'manifest.json'), JSON.stringify({ schemaVersion: 20 }));
+      fs.writeFileSync(path.join(indexRoot, 'manifest.json'), JSON.stringify({ schemaVersion: 22 }));
       assert.strictEqual(await runtime.hasReadyIndex(root), false);
 
       fs.writeFileSync(path.join(indexRoot, 'manifest.json'), JSON.stringify({
@@ -456,6 +457,12 @@ suite('Activation', () => {
       fs.writeFileSync(path.join(indexRoot, 'manifest.json'), JSON.stringify({
         ...validManifest,
         engine: 'another-engine',
+      }));
+      assert.strictEqual(await runtime.hasReadyIndex(root), false);
+
+      fs.writeFileSync(path.join(indexRoot, 'manifest.json'), JSON.stringify({
+        ...validManifest,
+        indexScope: 'all',
       }));
       assert.strictEqual(await runtime.hasReadyIndex(root), false);
 
@@ -747,7 +754,7 @@ suite('Activation', () => {
       formatVersion: 2,
       platformKey,
       protocolVersion: 1,
-      schemaVersion: 20,
+      schemaVersion: 22,
       sourceFingerprint,
       artifactId: binaryPairArtifactId(files),
       files,
@@ -908,7 +915,7 @@ suite('Activation', () => {
       }
       return {
         stdout: args[1] === '--capabilities'
-          ? '{"type":"capabilities","ok":true,"engine":{"name":"zoek-rs","protocolVersion":1,"schemaVersion":20},"commands":["index"],"features":["force-index-rebuild"]}'
+          ? '{"type":"capabilities","ok":true,"engine":{"name":"zoek-rs","protocolVersion":1,"schemaVersion":22},"commands":["index"],"features":["force-index-rebuild"]}'
           : engineCapabilitiesJson(),
         stderr: '',
         code: 0,
@@ -1040,7 +1047,7 @@ suite('Activation', () => {
     runtime.invokeText = async (args: string[]) => ({
       stdout: args[0] === staleBinary
         ? '{"type":"capabilities","ok":true,"engine":{"name":"zoek-rs","protocolVersion":1,"schemaVersion":19},"commands":["index"],"features":["force-index-rebuild"]}'
-        : '{"type":"capabilities","ok":true,"engine":{"name":"zoek-rs","protocolVersion":1,"schemaVersion":20},"commands":["index"],"features":["force-index-rebuild"]}',
+        : '{"type":"capabilities","ok":true,"engine":{"name":"zoek-rs","protocolVersion":1,"schemaVersion":22},"commands":["index"],"features":["force-index-rebuild"]}',
       stderr: '',
       code: 0,
       signal: null,
