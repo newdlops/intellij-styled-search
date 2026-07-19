@@ -6,6 +6,17 @@ resolver = "2"
 lto = "thin"
 codegen-units = 1
 
+# Runtime fallback builds launched by the development extension still need
+# optimized indexing code, but release LTO plus one codegen unit turns every
+# graph.rs edit into a long pre-index wait. Published artifacts continue to use
+# `release`; this profile trades a little cross-unit optimization for reusable
+# incremental code generation during local extension work.
+[profile.runtime]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"

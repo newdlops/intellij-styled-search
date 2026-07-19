@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.7137",
+  "version": "0.1.7138",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -239,26 +239,26 @@
         "intellijStyledSearch.zoektBuildBinaryInBackgroundOnSearch": {
           "type": "boolean",
           "default": false,
-          "description": "When zoekt is selected but the binary is missing, schedule a delayed background build after a search. Disabled by default; use Rebuild Search Index to start this work explicitly."
+          "description": "When zoekt is selected but the binary is missing, schedule a background build after a search. Disabled by default; use Rebuild Search Index to start this work explicitly."
         },
         "intellijStyledSearch.zoektIndexInBackgroundOnSearch": {
           "type": "boolean",
           "default": false,
-          "description": "When zoekt is selected but the index is missing, schedule delayed background indexing after a search. Disabled by default; searches show a rebuild recommendation and use fallback until Rebuild Search Index is run."
+          "description": "When zoekt is selected but the index is missing, schedule background indexing after a search. Disabled by default; searches show a rebuild recommendation and use fallback until Rebuild Search Index is run."
         },
         "intellijStyledSearch.zoektBackgroundBuildDelayMs": {
           "type": "number",
-          "default": 30000,
+          "default": 0,
           "minimum": 0,
           "maximum": 300000,
-          "description": "Delay before an opt-in background zoekt binary build starts."
+          "description": "Delay before an opt-in background zoekt binary build starts. The default starts on the next event-loop turn."
         },
         "intellijStyledSearch.zoektBackgroundIndexDelayMs": {
           "type": "number",
-          "default": 30000,
+          "default": 0,
           "minimum": 0,
           "maximum": 300000,
-          "description": "Delay before an opt-in background zoekt index build starts."
+          "description": "Delay before an opt-in background zoekt index build starts. The default starts on the next event-loop turn."
         },
         "intellijStyledSearch.zoektWatchExternalFileDeletes": {
           "type": "boolean",

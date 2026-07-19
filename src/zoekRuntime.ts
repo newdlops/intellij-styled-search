@@ -67,8 +67,10 @@ type PaginatedSearchResult = {
 const DEFAULT_UPDATE_DEBOUNCE_MS = 5_000;
 const DEFAULT_UPDATE_COOLDOWN_MS = 5_000;
 const DEFAULT_UPDATE_LOG_MIN_INTERVAL_MS = 10_000;
-const DEFAULT_BACKGROUND_BUILD_DELAY_MS = 30_000;
-const DEFAULT_BACKGROUND_INDEX_DELAY_MS = 30_000;
+// The opt-in switches already protect users from unexpected background work.
+// Once enabled, an additional fixed delay only makes the runtime look stalled.
+const DEFAULT_BACKGROUND_BUILD_DELAY_MS = 0;
+const DEFAULT_BACKGROUND_INDEX_DELAY_MS = 0;
 const UPDATE_RETRY_WHILE_INDEXING_MS = 1_000;
 const AUTO_BASE_REFRESH_MIN_INTERVAL_MS = 60_000;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
@@ -652,6 +654,7 @@ export class ZoektRuntime implements vscode.Disposable {
   async rebuildIndex(report?: (message: string, percent?: number) => void): Promise<boolean> {
     const workspaceRoot = this.getWorkspaceRootPath();
     if (!workspaceRoot) { return false; }
+    report?.('zoek-rs: preparing indexer runtime');
     this.cancelScheduledBackgroundPreparation();
     const existing = this.foregroundIndexPromises.get(workspaceRoot);
     if (existing) {
@@ -1706,6 +1709,7 @@ export class ZoektRuntime implements vscode.Disposable {
       return existing;
     }
     const promise = (async () => {
+      this.emitIndexProgress(workspaceRoot, 'zoek-rs: preparing indexer runtime');
       const binary = await this.resolveBinary(true);
       if (!binary) { return false; }
       this.log.appendLine(`zoek-rs background index start (${reason})`);
@@ -2031,12 +2035,20 @@ export class ZoektRuntime implements vscode.Disposable {
   }
 
   private getSharedCargoTargetDir(): string {
+    // Cargo already fingerprints source inputs and serializes writers inside a
+    // target directory. Keeping our source hash in this path forced a cold
+    // dependency rebuild after every Rust edit; only the published binary cache
+    // needs source-fingerprinted isolation.
+    if (this.context.extensionMode !== vscode.ExtensionMode.Production) {
+      // Share the checkout's normal Cargo cache in development/test modes;
+      // those workflows have usually compiled the same crate already.
+      return path.join(this.extensionRoot, 'target');
+    }
     return path.join(
       this.context.globalStorageUri.fsPath,
       'zoek-rs',
       'cargo-target',
       this.getBinaryPlatformKey(),
-      this.getRustSourceFingerprint(),
     );
   }
 
@@ -2386,8 +2398,12 @@ export class ZoektRuntime implements vscode.Disposable {
     const buildPromise = (async () => {
       const buildSourceFingerprint = this.getRustSourceFingerprint();
       const cargoTargetDir = this.getSharedCargoTargetDir();
+      const developmentRuntimeBuild = this.context.extensionMode !== vscode.ExtensionMode.Production;
+      const cargoProfileArgs = developmentRuntimeBuild
+        ? ['--profile', 'runtime']
+        : ['--release'];
       this.log.appendLine(
-        `zoek-rs build: cargo build -q --release -p zoek-rs --bins target=${cargoTargetDir}`,
+        `zoek-rs build: cargo build -q ${cargoProfileArgs.join(' ')} -p zoek-rs --bins target=${cargoTargetDir}`,
       );
       try {
         await fs.promises.mkdir(cargoTargetDir, { recursive: true });
@@ -2396,7 +2412,7 @@ export class ZoektRuntime implements vscode.Disposable {
             'cargo',
             'build',
             '-q',
-            '--release',
+            ...cargoProfileArgs,
             '-p',
             'zoek-rs',
             '--bins',
@@ -2408,6 +2424,9 @@ export class ZoektRuntime implements vscode.Disposable {
             env: {
               ...process.env,
               CARGO_TARGET_DIR: cargoTargetDir,
+              ...(developmentRuntimeBuild
+                ? { CARGO_INCREMENTAL: '1' }
+                : {}),
             },
           },
         );
