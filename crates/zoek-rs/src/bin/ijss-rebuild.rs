@@ -103,7 +103,7 @@ mod tests {
         let response = run(vec!["--capabilities".to_string()]).expect("capabilities response");
         let json = response.to_json();
         assert!(json.contains("\"protocolVersion\":1"));
-        assert!(json.contains("\"schemaVersion\":20"));
+        assert!(json.contains("\"schemaVersion\":22"));
         assert!(json.contains("\"commands\":[\"index\"]"));
         assert!(json.contains("\"features\":[\"force-index-rebuild\"]"));
     }

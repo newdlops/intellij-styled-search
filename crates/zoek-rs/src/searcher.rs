@@ -361,6 +361,14 @@ fn collect_index_candidates(
         }
         Err(err) => return Err(format!("base index validation failed: {err}")),
     };
+    if base_shards.index_scope != config.persistent_index_scope() {
+        warnings.push(format!(
+            "base index scope is {}, but current scope is {}; falling back to full scan",
+            base_shards.index_scope,
+            config.persistent_index_scope()
+        ));
+        return Ok(None);
+    }
 
     if !layout.overlay_path.is_file() {
         return Err("overlay validation failed: hot overlay is missing".to_string());
@@ -933,7 +941,7 @@ fn exact_path_from_regex(pattern: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{exact_path_from_regex, search_workspace};
-    use crate::config::EngineConfig;
+    use crate::config::{ripgrep_executable, EngineConfig};
     use crate::indexer::index_directory;
     use crate::mmap_store::StoreLayout;
     use crate::overlay::{apply_change_batch, OverlayEntry, OverlayManifest};
@@ -943,6 +951,7 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -974,6 +983,58 @@ mod tests {
         .map_err(io::Error::other)?;
         assert_eq!(response.total_files_matched, 1);
         assert_eq!(response.files[0].rel_path, "src/a.rs");
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn changed_index_scope_falls_back_before_ignored_files_can_be_missed() -> io::Result<()> {
+        let root = temp_dir("scope-mismatch-fallback");
+        fs::create_dir_all(root.join("source"))?;
+        fs::create_dir_all(root.join("artifacts"))?;
+        fs::write(root.join(".ignore"), "artifacts/\n")?;
+        fs::write(root.join("source/unit.rs"), "pub fn active() {}\n")?;
+        fs::write(
+            root.join("artifacts/unit.rs"),
+            "pub const CACHED_MARKER: &str = \"scope_fallback_marker\";\n",
+        )?;
+        if !Command::new(ripgrep_executable())
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            fs::remove_dir_all(root)?;
+            return Ok(());
+        }
+
+        index_directory(&root, &EngineConfig::default())?;
+        let mut all_files_config = EngineConfig::default();
+        all_files_config.include_ignored_files = true;
+        let response = search_workspace(
+            &SearchRequest {
+                workspace_root: root.to_string_lossy().into_owned(),
+                query: "scope_fallback_marker".to_string(),
+                query_terms: Vec::new(),
+                case_sensitive: true,
+                whole_word: false,
+                use_regex: false,
+                regex_multiline: true,
+                include: vec![],
+                exclude: vec![],
+                path_regex: None,
+                limit: 10,
+                offset: 0,
+            },
+            &all_files_config,
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(response.total_files_matched, 1);
+        assert_eq!(response.files[0].rel_path, "artifacts/unit.rs");
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("base index scope is workspace")));
 
         fs::remove_dir_all(root)?;
         Ok(())
@@ -1830,7 +1891,7 @@ mod tests {
         fs::write(
             &layout.manifest_path,
             format!(
-                "{{\"engine\":\"zoek-rs\",\"schemaVersion\":20,\"workspaceMetadataHashVersion\":3,\"workspaceRoot\":{},\"indexRoot\":{},\"createdUnixSecs\":1,\"buildId\":\"2\",\"fingerprint\":1,\"workspaceMetadataFingerprint\":1,\"configFingerprint\":1,\"shardMetadataFingerprint\":1,\"stats\":{{\"visitedFiles\":2,\"indexedFiles\":2,\"skippedBinary\":0,\"skippedBinaryExtension\":0,\"skippedTooLarge\":0,\"decodedUtf16Files\":0,\"shardCount\":1,\"totalGrams\":{},\"totalSourceBytes\":{},\"totalShardBytes\":{}}},\"baseShards\":[{{\"shardId\":0,\"fileName\":\"base-shard-0000.zrs\",\"docCount\":2,\"gramCount\":{},\"sourceBytes\":{},\"fileBytes\":{}}}]}}",
+                "{{\"engine\":\"zoek-rs\",\"schemaVersion\":22,\"workspaceMetadataHashVersion\":3,\"indexScope\":\"workspace\",\"workspaceRoot\":{},\"indexRoot\":{},\"createdUnixSecs\":1,\"buildId\":\"2\",\"fingerprint\":1,\"workspaceMetadataFingerprint\":1,\"configFingerprint\":1,\"shardMetadataFingerprint\":1,\"stats\":{{\"visitedFiles\":2,\"indexedFiles\":2,\"skippedBinary\":0,\"skippedBinaryExtension\":0,\"skippedTooLarge\":0,\"decodedUtf16Files\":0,\"shardCount\":1,\"totalGrams\":{},\"totalSourceBytes\":{},\"totalShardBytes\":{}}},\"baseShards\":[{{\"shardId\":0,\"fileName\":\"base-shard-0000.zrs\",\"docCount\":2,\"gramCount\":{},\"sourceBytes\":{},\"fileBytes\":{}}}]}}",
                 json_string(&root.to_string_lossy()),
                 json_string(&layout.root.to_string_lossy()),
                 shard.header.gram_count,

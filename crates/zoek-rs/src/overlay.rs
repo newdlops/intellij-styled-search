@@ -1,6 +1,7 @@
 use crate::config::EngineConfig;
 use crate::corpus::{decode_bytes, looks_binary_bytes};
 use crate::mmap_store::{acquire_index_write_lock, write_atomically, IndexWriteGuard, StoreLayout};
+use crate::path_scope::workspace_scope_paths;
 use crate::protocol::json_string;
 use crate::shard::{open_validated_base_shard, read_base_shard_set};
 use crate::watcher::{ChangeBatch, FileChange, FileChangeKind};
@@ -280,6 +281,26 @@ pub fn apply_change_batch_with_write_lock(
         config.is_overlay_update_excluded_relative_path(rel_path)
             || StoreLayout::relative_path_is_within_root(index_relative_root.as_deref(), rel_path)
     };
+    let live_paths = batch
+        .changes
+        .iter()
+        .filter_map(|change| match change.kind {
+            FileChangeKind::Create | FileChangeKind::Modify => Some(change.rel_path.clone()),
+            FileChangeKind::Rename => change.new_rel_path.clone(),
+            FileChangeKind::Delete => None,
+        })
+        .filter(|rel_path| !is_excluded(rel_path))
+        .collect::<Vec<_>>();
+    let scoped_live_paths = if config.include_ignored_files {
+        None
+    } else {
+        workspace_scope_paths(workspace_root, &live_paths)?
+    };
+    let is_live_path_in_scope = |rel_path: &str| {
+        scoped_live_paths
+            .as_ref()
+            .is_none_or(|paths| paths.contains(rel_path))
+    };
 
     for change in &batch.changes {
         match change.kind {
@@ -287,13 +308,15 @@ pub fn apply_change_batch_with_write_lock(
                 if is_excluded(&change.rel_path) {
                     continue;
                 }
-                entries.push(build_entry_for_path(
-                    workspace_root,
-                    &change.rel_path,
-                    generation,
-                    committed_unix_secs,
-                    config,
-                )?);
+                if is_live_path_in_scope(&change.rel_path) {
+                    entries.push(build_entry_for_path(
+                        workspace_root,
+                        &change.rel_path,
+                        generation,
+                        committed_unix_secs,
+                        config,
+                    )?);
+                }
             }
             FileChangeKind::Delete => {
                 if is_excluded(&change.rel_path) {
@@ -317,13 +340,15 @@ pub fn apply_change_batch_with_write_lock(
                     if is_excluded(new_rel_path) {
                         continue;
                     }
-                    entries.push(build_entry_for_path(
-                        workspace_root,
-                        new_rel_path,
-                        generation,
-                        committed_unix_secs,
-                        config,
-                    )?);
+                    if is_live_path_in_scope(new_rel_path) {
+                        entries.push(build_entry_for_path(
+                            workspace_root,
+                            new_rel_path,
+                            generation,
+                            committed_unix_secs,
+                            config,
+                        )?);
+                    }
                 }
             }
         }
@@ -882,13 +907,14 @@ mod tests {
         apply_change_batch, load_overlay_with_recovery, load_overlay_with_repair, OverlayEntry,
         OverlayManifest,
     };
-    use crate::config::EngineConfig;
+    use crate::config::{ripgrep_executable, EngineConfig};
     use crate::indexer::index_directory;
     use crate::mmap_store::{acquire_index_write_lock, StoreLayout};
     use crate::watcher::build_change_batch;
     use std::fs;
     use std::io;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1093,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn update_ignores_internal_index_dirs_but_allows_git_node_modules_and_target() -> io::Result<()>
+    fn all_files_scope_ignores_internal_index_dirs_but_allows_other_hidden_paths() -> io::Result<()>
     {
         let root = temp_dir("overlay-update-ignored-dirs");
         fs::create_dir_all(root.join(".git"))?;
@@ -1108,7 +1134,8 @@ mod tests {
         fs::write(root.join("target/debug/build.log"), "compiled\n")?;
         fs::write(root.join(".zoek-rs/overlay-journal.jsonl"), "{}\n")?;
 
-        let config = EngineConfig::default();
+        let mut config = EngineConfig::default();
+        config.include_ignored_files = true;
         let layout = StoreLayout::for_workspace(&root, &config);
         let batch = build_change_batch(
             0,
@@ -1132,6 +1159,47 @@ mod tests {
         assert!(!latest["node_modules/pkg/index.js"].tombstone);
         assert!(!latest["target/debug/build.log"].tombstone);
         assert!(!latest.contains_key(".zoek-rs/overlay-journal.jsonl"));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_scope_skips_ignored_incremental_paths() -> io::Result<()> {
+        let root = temp_dir("overlay-workspace-scope");
+        fs::create_dir_all(root.join("source"))?;
+        fs::create_dir_all(root.join("artifacts"))?;
+        fs::create_dir_all(root.join(".git"))?;
+        fs::write(root.join(".ignore"), "artifacts/\n")?;
+        fs::write(root.join("source/unit.rs"), "pub fn active() {}\n")?;
+        fs::write(root.join("artifacts/unit.rs"), "pub fn cached() {}\n")?;
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
+        if !Command::new(ripgrep_executable())
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            fs::remove_dir_all(root)?;
+            return Ok(());
+        }
+
+        let config = EngineConfig::default();
+        let layout = StoreLayout::for_workspace(&root, &config);
+        let batch = build_change_batch(
+            0,
+            &[
+                String::from("source/unit.rs"),
+                String::from("artifacts/unit.rs"),
+                String::from(".git/HEAD"),
+            ],
+            &[],
+            &[],
+        );
+        let summary = apply_change_batch(&root, &layout, &config, &batch)?;
+        let latest = OverlayManifest::load(&layout.overlay_path)?.latest_entries();
+        assert_eq!(summary.entries_written, 1);
+        assert!(latest.contains_key("source/unit.rs"));
+        assert!(!latest.contains_key(".git/HEAD"));
 
         fs::remove_dir_all(root)?;
         Ok(())

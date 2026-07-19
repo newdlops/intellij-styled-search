@@ -7,7 +7,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use rayon::prelude::*;
-use zoek_rs::config::EngineConfig;
+use zoek_rs::config::{ripgrep_executable, EngineConfig};
 use zoek_rs::graph::{
     audit_usage_counts, compact_graph_overlay, dump_references_tsv,
     dump_references_with_overlay_tsv, index_graph_from_tsv, overlay_update_graph_native,
@@ -23,6 +23,7 @@ use zoek_rs::ops::{benchmark_workspaces, collect_info, diagnose_query};
 use zoek_rs::overlay::{
     apply_change_batch_with_write_lock, load_overlay_with_recovery, load_overlay_with_repair,
 };
+use zoek_rs::path_scope::{append_file_listing_args, controls_workspace_scope};
 use zoek_rs::protocol::{
     BenchmarkResponse, CapabilitiesResponse, DiagnoseResponse, EngineInfo, EngineResponse,
     ErrorResponse, GraphIndexResponse, GraphQueryReference, GraphQueryResponse,
@@ -251,6 +252,20 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
         }
     }
 
+    if !config.include_ignored_files
+        && changed_paths
+            .iter()
+            .chain(deleted_paths.iter())
+            .chain(
+                renamed_paths
+                    .iter()
+                    .flat_map(|(old_path, new_path)| [old_path, new_path]),
+            )
+            .any(|path| controls_workspace_scope(path))
+    {
+        sync_workspace = true;
+    }
+
     let batch = if sync_workspace {
         build_workspace_sync_batch(&workspace_root, &layout, &config, current_generation)
             .map_err(|err| err.to_string())?
@@ -295,14 +310,16 @@ fn run_update(args: &[String]) -> Result<EngineResponse, String> {
 mod cli_tests {
     use super::{engine_capabilities, metadata_identity_requires_update, run_index, run_update};
     use std::fs;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use zoek_rs::config::ripgrep_executable;
     use zoek_rs::protocol::EngineResponse;
 
     #[test]
     fn capabilities_advertise_search_graph_and_force_contracts() {
         let json = engine_capabilities().to_json();
         assert!(json.contains("\"protocolVersion\":1"));
-        assert!(json.contains("\"schemaVersion\":20"));
+        assert!(json.contains("\"schemaVersion\":22"));
         assert!(json.contains("\"graph-rebuild\""));
         assert!(json.contains("\"force-index-rebuild\""));
         assert!(json.contains("\"search-exclude-globs\""));
@@ -351,6 +368,47 @@ mod cli_tests {
         assert!(matches!(
             updated,
             EngineResponse::Update(response) if response.ok && response.entries_written == 0
+        ));
+
+        fs::remove_dir_all(root).expect("remove neutral fixture directory");
+    }
+
+    #[test]
+    fn ignore_rule_change_reconciles_newly_visible_existing_files() {
+        if !Command::new(ripgrep_executable())
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "zoek-rs-ignore-reconcile-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("source")).expect("create source directory");
+        fs::create_dir_all(root.join("artifacts")).expect("create artifact directory");
+        fs::write(root.join(".ignore"), "artifacts/\n").expect("write ignore rule");
+        fs::write(root.join("source/unit.rs"), "pub fn active() {}\n")
+            .expect("write visible source");
+        fs::write(
+            root.join("artifacts/unit.rs"),
+            "pub fn newly_visible() {}\n",
+        )
+        .expect("write ignored source");
+        let root_arg = root.to_string_lossy().into_owned();
+
+        run_index(&[root_arg.clone(), "--force".to_string()]).expect("base build must succeed");
+        fs::write(root.join(".ignore"), "").expect("remove ignore rule");
+        let updated = run_update(&[root_arg, ".ignore".to_string()])
+            .expect("ignore rule update must succeed");
+        assert!(matches!(
+            updated,
+            EngineResponse::Update(response) if response.ok && response.entries_written == 2
         ));
 
         fs::remove_dir_all(root).expect("remove neutral fixture directory");
@@ -483,7 +541,7 @@ fn collect_current_index_candidates(
     workspace_root: &Path,
     config: &EngineConfig,
 ) -> io::Result<BTreeMap<String, Option<u64>>> {
-    if let Some(files) = list_files_with_rg(workspace_root)? {
+    if let Some(files) = list_files_with_rg(workspace_root, config)? {
         return stat_current_candidates(workspace_root, config, files);
     }
     let mut files = Vec::new();
@@ -491,27 +549,20 @@ fn collect_current_index_candidates(
     stat_current_candidates(workspace_root, config, files)
 }
 
-fn list_files_with_rg(workspace_root: &Path) -> io::Result<Option<Vec<String>>> {
-    let output = match Command::new("rg")
-        .current_dir(workspace_root)
-        .args([
-            "--files",
-            "--hidden",
-            "--no-ignore",
-            "--no-ignore-parent",
-            "--glob",
-            "!.zoek-rs/**",
-            "--glob",
-            "!.zoekt-rs/**",
-            ".",
-        ])
-        .output()
-    {
+fn list_files_with_rg(
+    workspace_root: &Path,
+    config: &EngineConfig,
+) -> io::Result<Option<Vec<String>>> {
+    let mut command = Command::new(ripgrep_executable());
+    command.current_dir(workspace_root);
+    append_file_listing_args(&mut command, config);
+    command.args(["--glob", "!.zoek-rs/**", "--glob", "!.zoekt-rs/**", "."]);
+    let output = match command.output() {
         Ok(output) => output,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Ok(None),
     };
-    if !output.status.success() {
+    if !output.status.success() && output.status.code() != Some(1) {
         return Ok(None);
     }
     let stdout = match String::from_utf8(output.stdout) {
@@ -521,7 +572,7 @@ fn list_files_with_rg(workspace_root: &Path) -> io::Result<Option<Vec<String>>> 
     Ok(Some(
         stdout
             .lines()
-            .map(|line| normalize_sync_rel_path(line.trim()))
+            .map(normalize_sync_rel_path)
             .filter(|line| !line.is_empty())
             .collect(),
     ))

@@ -1,4 +1,7 @@
-use crate::config::{ENGINE_NAME, SCHEMA_VERSION, WORKSPACE_METADATA_HASH_VERSION};
+use crate::config::{
+    ALL_FILES_INDEX_SCOPE, ENGINE_NAME, SCHEMA_VERSION, WORKSPACE_INDEX_SCOPE,
+    WORKSPACE_METADATA_HASH_VERSION,
+};
 use crate::gram::{hash_gram_value, GramHashMap};
 use crate::mmap_store::{MappedFile, StoreLayout};
 use std::fs;
@@ -86,6 +89,7 @@ pub struct BaseIndexIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaseShardSet {
     pub identity: BaseIndexIdentity,
+    pub index_scope: String,
     pub paths: Vec<PathBuf>,
 }
 
@@ -95,6 +99,7 @@ pub(crate) struct BaseIndexManifest {
     pub(crate) engine: String,
     pub(crate) schema_version: u32,
     pub(crate) workspace_metadata_hash_version: u32,
+    pub(crate) index_scope: String,
     pub(crate) workspace_root: String,
     pub(crate) index_root: String,
     pub(crate) created_unix_secs: u64,
@@ -144,6 +149,10 @@ pub(crate) fn read_base_index_manifest(layout: &StoreLayout) -> io::Result<BaseI
     if manifest.engine != ENGINE_NAME
         || manifest.schema_version != SCHEMA_VERSION
         || manifest.workspace_metadata_hash_version != WORKSPACE_METADATA_HASH_VERSION
+        || !matches!(
+            manifest.index_scope.as_str(),
+            WORKSPACE_INDEX_SCOPE | ALL_FILES_INDEX_SCOPE
+        )
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -261,7 +270,18 @@ pub fn validate_base_shard_header(
 }
 
 pub fn read_base_shard_set(layout: &StoreLayout) -> io::Result<BaseShardSet> {
-    let identity = read_base_index_identity(layout)?;
+    let manifest = read_base_index_manifest(layout)?;
+    let build_id = parse_positive_decimal_u64(&manifest.build_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "search index manifest is missing a valid build identity",
+        )
+    })?;
+    let identity = BaseIndexIdentity {
+        created_unix_secs: manifest.created_unix_secs,
+        build_id,
+        shard_count: manifest.stats.shard_count,
+    };
     let shard_paths = layout.list_shard_paths()?;
     if shard_paths.len() != identity.shard_count {
         return Err(io::Error::new(
@@ -285,6 +305,7 @@ pub fn read_base_shard_set(layout: &StoreLayout) -> io::Result<BaseShardSet> {
     }
     Ok(BaseShardSet {
         identity,
+        index_scope: manifest.index_scope,
         paths: shard_paths,
     })
 }
@@ -844,7 +865,7 @@ mod tests {
         let layout = StoreLayout::for_workspace(&root, &EngineConfig::default());
         layout.ensure_dirs()?;
         let manifest = format!(
-            "{{\"engine\":\"zoek-rs\",\"schemaVersion\":20,\"workspaceMetadataHashVersion\":3,\"workspaceRoot\":{},\"indexRoot\":{},\"createdUnixSecs\":1,\"buildId\":\"2\",\"fingerprint\":1,\"workspaceMetadataFingerprint\":1,\"configFingerprint\":1,\"shardMetadataFingerprint\":1,\"stats\":{{\"visitedFiles\":0,\"indexedFiles\":0,\"skippedBinary\":0,\"skippedBinaryExtension\":0,\"skippedTooLarge\":0,\"decodedUtf16Files\":0,\"shardCount\":1,\"totalGrams\":0,\"totalSourceBytes\":0,\"totalShardBytes\":88}},\"baseShards\":[{{\"shardId\":0,\"fileName\":\"base-shard-0000.zrs\",\"docCount\":0,\"gramCount\":0,\"sourceBytes\":0,\"fileBytes\":88}}]}}",
+            "{{\"engine\":\"zoek-rs\",\"schemaVersion\":22,\"workspaceMetadataHashVersion\":3,\"indexScope\":\"workspace\",\"workspaceRoot\":{},\"indexRoot\":{},\"createdUnixSecs\":1,\"buildId\":\"2\",\"fingerprint\":1,\"workspaceMetadataFingerprint\":1,\"configFingerprint\":1,\"shardMetadataFingerprint\":1,\"stats\":{{\"visitedFiles\":0,\"indexedFiles\":0,\"skippedBinary\":0,\"skippedBinaryExtension\":0,\"skippedTooLarge\":0,\"decodedUtf16Files\":0,\"shardCount\":1,\"totalGrams\":0,\"totalSourceBytes\":0,\"totalShardBytes\":88}},\"baseShards\":[{{\"shardId\":0,\"fileName\":\"base-shard-0000.zrs\",\"docCount\":0,\"gramCount\":0,\"sourceBytes\":0,\"fileBytes\":88}}]}}",
             json_string(&root.to_string_lossy()),
             json_string(&layout.root.to_string_lossy()),
         );

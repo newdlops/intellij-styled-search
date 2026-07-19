@@ -1,7 +1,10 @@
-use crate::config::{EngineConfig, ENGINE_NAME, SCHEMA_VERSION, WORKSPACE_METADATA_HASH_VERSION};
+use crate::config::{
+    ripgrep_executable, EngineConfig, ENGINE_NAME, SCHEMA_VERSION, WORKSPACE_METADATA_HASH_VERSION,
+};
 use crate::corpus::{decode_bytes_owned, CorpusStats, ReadTextBytesOutcome, TextEncoding};
 use crate::mmap_store::{acquire_index_write_lock, write_atomically, StoreLayout};
 use crate::overlay::OverlayManifest;
+use crate::path_scope::append_file_listing_args;
 use crate::protocol::json_string;
 use crate::shard::{
     build_shard_bytes, read_base_index_manifest, read_shard_header, IndexedDocument,
@@ -284,6 +287,7 @@ where
             workspace_metadata_fingerprint,
             config_fingerprint,
             shard_metadata_fingerprint,
+            config.persistent_index_scope(),
             &layout.overlay_journal_path,
             &corpus_stats,
             &shard_artifacts,
@@ -925,39 +929,32 @@ fn collect_index_file_records_with_rg<F>(
 where
     F: FnMut(IndexProgress),
 {
-    let output = match Command::new("rg")
-        .current_dir(workspace_root)
-        .args([
-            "--files",
-            "--hidden",
-            "--no-ignore",
-            "--no-ignore-parent",
-            "--glob",
-            "!.zoek-rs/**",
-            "--glob",
-            "!.zoekt-rs/**",
-            ".",
-        ])
-        .output()
-    {
+    let mut command = Command::new(ripgrep_executable());
+    command.current_dir(workspace_root);
+    append_file_listing_args(&mut command, config);
+    command.args(["--glob", "!.zoek-rs/**", "--glob", "!.zoekt-rs/**", "."]);
+    let output = match command.output() {
         Ok(output) => output,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Ok(None),
     };
-    if !output.status.success() {
+    if !output.status.success() && output.status.code() != Some(1) {
         return Ok(None);
     }
     let stdout = match String::from_utf8(output.stdout) {
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
-    let total_enumerated = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .count();
+    let total_enumerated = stdout.lines().filter(|line| !line.is_empty()).count();
     if total_enumerated == 0 {
-        return Ok(None);
+        progress(IndexProgress {
+            phase: "scan",
+            current: 0,
+            total: 1,
+            percent: 10,
+            detail: "scanned 0 files; 0 candidates".to_string(),
+        });
+        return Ok(Some((Vec::new(), CorpusStats::default())));
     }
 
     progress(IndexProgress {
@@ -980,7 +977,6 @@ where
     const RG_STAT_CHUNK_FILES: usize = 16 * 1024;
     let mut lines = stdout
         .lines()
-        .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| line.strip_prefix("./").unwrap_or(line).replace('\\', "/"));
     let mut records = Vec::new();
@@ -1946,6 +1942,7 @@ fn fingerprint_base_config(config: &EngineConfig) -> u64 {
     hasher.write_u64(config.shard_target_bytes);
     hasher.write_u64(config.max_files_per_shard as u64);
     hasher.write_u64(config.max_grams_per_file as u64);
+    hasher.write_u64(u64::from(config.include_ignored_files));
     hasher.write_u64(u64::from(config.include_generated));
     hasher.write_u64(u64::from(config.include_migrations));
     for values in [
@@ -2078,6 +2075,7 @@ fn build_manifest_json(
     workspace_metadata_fingerprint: u64,
     config_fingerprint: u64,
     shard_metadata_fingerprint: u64,
+    index_scope: &str,
     overlay_journal_path: &Path,
     corpus_stats: &crate::corpus::CorpusStats,
     shards: &[ShardArtifact],
@@ -2101,10 +2099,11 @@ fn build_manifest_json(
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"engine\":{},\"schemaVersion\":{},\"workspaceMetadataHashVersion\":{},\"workspaceRoot\":{},\"indexRoot\":{},\"createdUnixSecs\":{},\"buildId\":{},\"fingerprint\":{},\"workspaceMetadataFingerprint\":{},\"configFingerprint\":{},\"shardMetadataFingerprint\":{},\"stats\":{{\"visitedFiles\":{},\"indexedFiles\":{},\"skippedBinary\":{},\"skippedBinaryExtension\":{},\"skippedTooLarge\":{},\"decodedUtf16Files\":{},\"shardCount\":{},\"totalGrams\":{},\"totalSourceBytes\":{},\"totalShardBytes\":{}}},\"baseShards\":[{}],\"overlay\":{},\"overlayJournal\":{},\"compactionSuggested\":false}}",
+        "{{\"engine\":{},\"schemaVersion\":{},\"workspaceMetadataHashVersion\":{},\"indexScope\":{},\"workspaceRoot\":{},\"indexRoot\":{},\"createdUnixSecs\":{},\"buildId\":{},\"fingerprint\":{},\"workspaceMetadataFingerprint\":{},\"configFingerprint\":{},\"shardMetadataFingerprint\":{},\"stats\":{{\"visitedFiles\":{},\"indexedFiles\":{},\"skippedBinary\":{},\"skippedBinaryExtension\":{},\"skippedTooLarge\":{},\"decodedUtf16Files\":{},\"shardCount\":{},\"totalGrams\":{},\"totalSourceBytes\":{},\"totalShardBytes\":{}}},\"baseShards\":[{}],\"overlay\":{},\"overlayJournal\":{},\"compactionSuggested\":false}}",
         json_string(ENGINE_NAME),
         SCHEMA_VERSION,
         WORKSPACE_METADATA_HASH_VERSION,
+        json_string(index_scope),
         json_string(&workspace_root.to_string_lossy()),
         json_string(&index_root.to_string_lossy()),
         created_unix_secs,
@@ -2149,7 +2148,7 @@ mod tests {
         index_directory_with_options, metadata_fingerprint_parts, next_index_build_id,
         validate_content_snapshots, ContentSnapshot, IndexBuildOptions, IndexFileRecord,
     };
-    use crate::config::EngineConfig;
+    use crate::config::{ripgrep_executable, EngineConfig};
     use crate::mmap_store::{acquire_index_read_lock, StoreLayout};
     use crate::overlay::OverlayManifest;
     use crate::protocol::json_string;
@@ -2157,6 +2156,7 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -2174,7 +2174,8 @@ mod tests {
         let artifacts = index_directory(&root.join("."), &config)?;
         assert_eq!(artifacts.summary.shard_count, 3);
         let manifest = fs::read_to_string(root.join(".zoek-rs/manifest.json"))?;
-        assert!(manifest.contains("\"schemaVersion\":20"));
+        assert!(manifest.contains("\"schemaVersion\":22"));
+        assert!(manifest.contains("\"indexScope\":\"workspace\""));
         assert!(manifest.contains("\"workspaceMetadataHashVersion\":3"));
         assert!(manifest.contains("\"buildId\":\""));
         assert!(manifest.contains("\"workspaceMetadataFingerprint\":"));
@@ -2232,6 +2233,49 @@ mod tests {
         )?;
         assert!(!reported_clean_reuse(&repair_details));
         assert!(fs::read_to_string(&manifest_path)?.contains("\"indexedFiles\":0"));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_scope_respects_ignore_rules_and_all_scope_is_explicit() -> io::Result<()> {
+        let root = temp_dir("workspace-scope");
+        fs::create_dir_all(root.join("source"))?;
+        fs::create_dir_all(root.join("artifacts"))?;
+        fs::create_dir_all(root.join(".git"))?;
+        fs::write(root.join(".ignore"), "artifacts/\n")?;
+        fs::write(root.join("source/unit.rs"), "pub fn active() {}\n")?;
+        fs::write(root.join("artifacts/unit.rs"), "pub fn cached() {}\n")?;
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
+        if !Command::new(ripgrep_executable())
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            fs::remove_dir_all(root)?;
+            return Ok(());
+        }
+
+        let workspace_config = EngineConfig::default();
+        let workspace_artifacts = index_directory(&root, &workspace_config)?;
+        let workspace_paths = document_paths(&workspace_artifacts)?;
+        assert!(workspace_paths.contains(&String::from("source/unit.rs")));
+        assert!(!workspace_paths.contains(&String::from("artifacts/unit.rs")));
+        assert!(!workspace_paths.contains(&String::from(".git/HEAD")));
+
+        let mut all_files_config = EngineConfig::default();
+        all_files_config.include_ignored_files = true;
+        let all_files_artifacts = index_directory_with_options(
+            &root,
+            &all_files_config,
+            IndexBuildOptions { force: true },
+            &mut |_| {},
+        )?;
+        assert!(document_paths(&all_files_artifacts)?.contains(&String::from("artifacts/unit.rs")));
+        assert!(document_paths(&all_files_artifacts)?.contains(&String::from(".git/HEAD")));
+        assert!(fs::read_to_string(root.join(".zoek-rs/manifest.json"))?
+            .contains("\"indexScope\":\"all\""));
 
         fs::remove_dir_all(root)?;
         Ok(())

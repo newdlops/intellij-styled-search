@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,7 +11,11 @@ pub const WORKSPACE_METADATA_HASH_VERSION: u32 = 3;
 // the TS readiness check rejects any manifest whose schemaVersion != that
 // constant as "incomplete" and silently drops search to the codesearch
 // fallback. (Skew here on 2026-05-30 left search in permanent fallback.)
-pub const SCHEMA_VERSION: u32 = 20;
+pub const SCHEMA_VERSION: u32 = 22;
+pub const WORKSPACE_INDEX_SCOPE: &str = "workspace";
+pub const ALL_FILES_INDEX_SCOPE: &str = "all";
+pub const INCLUDE_IGNORED_FILES_ENV: &str = "ZOEK_INDEX_INCLUDE_IGNORED";
+pub const RIPGREP_PATH_ENV: &str = "ZOEK_RG_PATH";
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -23,6 +28,10 @@ pub struct EngineConfig {
     pub overlay_compaction_journal_bytes_threshold: u64,
     pub excluded_dir_names: Vec<String>,
     pub exclude_patterns: Vec<String>,
+    /// Include files excluded by workspace ignore files in the persistent
+    /// index. The default keeps a small, high-value hot index; callers can
+    /// opt back into the legacy all-files corpus when they need it.
+    pub include_ignored_files: bool,
     pub include_generated: bool,
     pub include_migrations: bool,
     pub binary_file_extensions: Vec<String>,
@@ -49,6 +58,7 @@ impl Default for EngineConfig {
             overlay_compaction_journal_bytes_threshold: 2 * 1024 * 1024,
             excluded_dir_names: Vec::new(),
             exclude_patterns: Vec::new(),
+            include_ignored_files: false,
             include_generated: true,
             include_migrations: true,
             binary_file_extensions: vec![
@@ -132,7 +142,17 @@ impl EngineConfig {
     pub fn for_workspace(workspace_root: &Path) -> Self {
         let mut config = Self::default();
         config.apply_project_config(workspace_root);
+        config.apply_environment_config();
         config
+    }
+
+    fn apply_environment_config(&mut self) {
+        let Ok(value) = env::var(INCLUDE_IGNORED_FILES_ENV) else {
+            return;
+        };
+        if let Some(include_ignored_files) = parse_bool_value(&value) {
+            self.include_ignored_files = include_ignored_files;
+        }
     }
 
     fn apply_project_config(&mut self, workspace_root: &Path) {
@@ -172,6 +192,14 @@ impl EngineConfig {
 
     pub fn index_root(&self, workspace_root: &Path) -> PathBuf {
         workspace_root.join(&self.index_dir_name)
+    }
+
+    pub fn persistent_index_scope(&self) -> &'static str {
+        if self.include_ignored_files {
+            ALL_FILES_INDEX_SCOPE
+        } else {
+            WORKSPACE_INDEX_SCOPE
+        }
     }
 
     pub fn is_excluded_dir_name(&self, name: &str) -> bool {
@@ -253,6 +281,12 @@ impl EngineConfig {
     }
 }
 
+pub fn ripgrep_executable() -> std::ffi::OsString {
+    env::var_os(RIPGREP_PATH_ENV)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "rg".into())
+}
+
 fn normalize_relative_path(value: &str) -> String {
     value
         .replace('\\', "/")
@@ -275,6 +309,14 @@ fn parse_json_bool(text: &str, key: &str) -> Option<bool> {
         Some(false)
     } else {
         None
+    }
+}
+
+fn parse_bool_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
