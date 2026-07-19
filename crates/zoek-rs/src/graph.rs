@@ -269,19 +269,11 @@ const BOUND_MAY: u8 = 0b0001;
 const BOUND_MUST: u8 = 0b0010;
 const _BOUND_OBSERVED: u8 = 0b0100;
 const MAX_EAGER_IMPLEMENTATION_SYMBOLS: usize = 50_000;
+// Bounds only the eagerly duplicated `(candidate site × same-key symbol)` rows.
+// Every candidate is still persisted once in GRAPH_TOKEN_SHAPE_SHARD_PREFIX and
+// is materialized lazily by query_graph, so exceeding this performance guard can
+// no longer turn into a false negative.
 const MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY: usize = 512;
-/// A2 Stage B: the persisted token-shape tally stores up to this many candidate
-/// sites per key — one MORE than the fanout limit. The full-rebuild phase F gate
-/// rejects any key whose TRUE likely-site count `N` satisfies `N * symbol_count
-/// > MAX_…FANOUT…` (and `symbol_count >= 1`, so any `N > 512` is rejected
-/// outright). The incremental consumer only has the persisted `candidates.len()`
-/// to gate on; capping the store at 512 would make a key with `N > 512` look
-/// like exactly 512 (`fanout = 512` for a sole symbol → wrongly emits). Storing
-/// one extra (513) lets the consumer's identical `candidates.len() * symbol_count
-/// <= 512` gate reject every over-limit key (513 > 512) while still emitting for
-/// keys whose true `N == 512`. Keys with `N > 513` never emit either way, so the
-/// further excess is irrelevant.
-const TOKEN_SHAPE_TALLY_STORE_CAP_PER_KEY: usize = MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY + 1; // A2 Stage B store cap (= fanout limit + 1)
 const RETURN_TYPE_FACT_PREFIX: &str = "__ijss_return_of__:";
 const DJANGO_MODEL_MANAGER_FACT_PREFIX: &str = "__ijss_django_model_manager_of__:";
 
@@ -495,6 +487,11 @@ const EDGE_KIND_CONSTRUCT: u8 = 2;
 const ACCESS_KIND_OTHER: u8 = 255;
 const ACCESS_KIND_BARE: u8 = 0;
 const ACCESS_KIND_MEMBER: u8 = 1;
+// `TokenShapeCandidate` is a persisted compact record, so retain its binary
+// layout and use the unused high bit to distinguish declaration occurrences.
+// The low bits remain the ordinary ACCESS_KIND_* value.
+const TOKEN_SHAPE_CANDIDATE_DEFINITION: u8 = 1 << 7;
+const TOKEN_SHAPE_CANDIDATE_ACCESS_MASK: u8 = !TOKEN_SHAPE_CANDIDATE_DEFINITION;
 
 #[inline]
 fn compute_edge_kind_id(s: &str) -> u8 {
@@ -981,6 +978,16 @@ struct TokenShapeCandidate {
     access_kind_id: u8,
 }
 
+impl TokenShapeCandidate {
+    fn access_kind_id(self) -> u8 {
+        self.access_kind_id & TOKEN_SHAPE_CANDIDATE_ACCESS_MASK
+    }
+
+    fn is_definition(self) -> bool {
+        self.access_kind_id & TOKEN_SHAPE_CANDIDATE_DEFINITION != 0
+    }
+}
+
 /// A2: deterministically shard a token-shape `(lang_hash, scope_hash, name_hash)`
 /// key so an incremental delta loads only the shards holding the affected keys.
 fn token_shape_shard_for_key(key: (u64, u64, u64)) -> usize {
@@ -1000,8 +1007,9 @@ fn token_shape_shard_for_key(key: (u64, u64, u64)) -> usize {
 /// or it selects a different (same-sized) subset. (A `source_ref_id` sort — a
 /// hash order — caused ~555K extra/missing token-shape churn; even a
 /// `(file_id,line,col)` sort diverges because `build_file_graph` does not emit a
-/// file's sites in strict position order.) Capped at the fanout limit + 1 (keys
-/// above the limit never emit, so the excess is never read). Sharded by key.
+/// file's sites in strict position order.) Every site is retained once per key:
+/// high-fanout keys are served lazily at query time instead of being discarded
+/// or eagerly multiplied by every same-key symbol. Sharded by key.
 /// Returns total bytes written (for sizing; not added to the manifest summary).
 fn write_token_shape_tally_shards(
     workspace_root: &Path,
@@ -1014,12 +1022,10 @@ fn write_token_shape_tally_shards(
         (0..GRAPH_SHARD_COUNT).map(|_| HashMap::default()).collect();
     let mut ingest = |map: &HashMap<(u64, u64, u64), Vec<u32>>| {
         for (key, idxs) in map {
-            // Preserve the build/push order (== phase F consumption order); only
-            // cap. Store one MORE than the fanout limit so the incremental
-            // consumer's `candidates.len()`-based gate can tell an over-limit key
-            // (513) from one at exactly the limit (512).
-            let mut idxs: Vec<u32> = idxs.clone();
-            idxs.truncate(TOKEN_SHAPE_TALLY_STORE_CAP_PER_KEY);
+            // Preserve the build/push order (== phase F consumption order).
+            // Do not truncate: this sidecar is the lossless, one-copy fallback
+            // used when eager reference multiplication exceeds the fanout guard.
+            let idxs: Vec<u32> = idxs.clone();
             let candidates: Vec<TokenShapeCandidate> = idxs
                 .iter()
                 .map(|&i| {
@@ -1033,7 +1039,12 @@ fn write_token_shape_tally_shards(
                         end_line: c.end_line,
                         end_column: c.end_column,
                         edge_kind_id: c.edge_kind_id,
-                        access_kind_id: c.access_kind_id,
+                        access_kind_id: c.access_kind_id
+                            | if c.flags & SITE_FLAG_IS_DEFINITION != 0 {
+                                TOKEN_SHAPE_CANDIDATE_DEFINITION
+                            } else {
+                                0
+                            },
                     }
                 })
                 .collect();
@@ -1116,7 +1127,8 @@ fn write_token_shape_tally_candidates(
 /// `*_likely_sites` maps), so each map's `Vec` holds only its access kind's
 /// candidates — kept in BUILD order (NOT sorted by `source_ref_id`; phase F
 /// consumes `*_likely_sites` in that order and its per-symbol `break` truncates
-/// there, so the persisted order must match) and capped on disk.
+/// there, so the persisted order must match). The list is lossless because it is
+/// also the query-time fallback for high-fanout keys.
 #[allow(clippy::type_complexity)]
 fn load_token_shape_tally(
     workspace_root: &Path,
@@ -1149,15 +1161,108 @@ fn load_token_shape_tally(
             })?;
         for (key, candidates) in entries {
             for c in candidates {
-                if c.access_kind_id == ACCESS_KIND_MEMBER {
+                if c.access_kind_id() == ACCESS_KIND_MEMBER {
                     member.entry(key).or_default().push(c);
-                } else if c.access_kind_id == ACCESS_KIND_BARE {
+                } else if c.access_kind_id() == ACCESS_KIND_BARE {
                     bare.entry(key).or_default().push(c);
                 }
             }
         }
     }
     Ok((bare, member))
+}
+
+/// Append the conservative occurrence set for the requested symbols from the
+/// lossless token-shape sidecar. Candidates are stored once per
+/// `(language, source-root, access-shape, name)` key and bound to a concrete
+/// target only here, avoiding an eager `sites × same-name symbols` explosion.
+/// Stronger semantic/import/type references win during the caller's occurrence
+/// dedupe; these rows exist to guarantee that an unresolved candidate is never
+/// silently absent from Find Usages.
+fn append_lazy_token_shape_references(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &[GraphSymbol],
+    file_table: &FileTable,
+    references: &mut Vec<GraphReference>,
+) -> io::Result<()> {
+    if symbols.is_empty() {
+        return Ok(());
+    }
+    let shards: HashSet<usize> = symbols
+        .iter()
+        .map(|symbol| {
+            let key = (
+                stable_hash(&symbol.language),
+                stable_hash(source_scope_key(&symbol.rel_path)),
+                symbol.name_hash,
+            );
+            token_shape_shard_for_key(key)
+        })
+        .collect();
+    let (bare, member) = load_token_shape_tally(workspace_root, config, Some(&shards))?;
+
+    for symbol in symbols {
+        let key = (
+            stable_hash(&symbol.language),
+            stable_hash(source_scope_key(&symbol.rel_path)),
+            symbol.name_hash,
+        );
+        let member_symbol = uses_member_token_shape_for_likely_count(symbol);
+        let primary = if member_symbol {
+            member.get(&key)
+        } else {
+            bare.get(&key)
+        };
+        let declaration_fallback = member_symbol.then(|| bare.get(&key)).flatten();
+        references.reserve(
+            primary.map(Vec::len).unwrap_or(0)
+                + declaration_fallback.map(Vec::len).unwrap_or(0),
+        );
+        let candidates = primary
+            .into_iter()
+            .flatten()
+            .chain(
+                declaration_fallback
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| candidate.is_definition()),
+            );
+        for candidate in candidates {
+            let rel_path = file_table.get_path(candidate.file_id).unwrap_or("");
+            // Find-usages excludes the requested declaration itself. Other
+            // declaration occurrences remain conservative candidates: in
+            // structural type systems an interface member, class member and
+            // contextually typed object property may denote the same member.
+            if rel_path == symbol.rel_path
+                && candidate.start_line == symbol.start_line
+                && candidate.start_column == symbol.start_column
+            {
+                continue;
+            }
+            let edge_kind =
+                edge_kind_str_from_id(candidate.edge_kind_id).unwrap_or("usage");
+            references.push(GraphReference {
+                source_ref_id: format!("ref:{:016x}", candidate.source_ref_id).into(),
+                target_symbol_id: Some(symbol.id.as_str().into()),
+                edge_kind: edge_kind.into(),
+                name: symbol.name.as_str().into(),
+                raw_text: symbol.name.as_str().into(),
+                uri: Box::from(""),
+                rel_path: rel_path.into(),
+                start_line: candidate.start_line,
+                start_column: candidate.start_column,
+                end_line: candidate.end_line,
+                end_column: candidate.end_column,
+                enclosing_symbol_id: enclosing_id_to_string(candidate.enclosing_id)
+                    .map(Into::into),
+                bound_mask: BOUND_MAY,
+                confidence: "possible".into(),
+                provenance: "token-shape".into(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// A2 Stage B: rebuild the GLOBAL token-shape references from the persisted
@@ -1167,9 +1272,11 @@ fn load_token_shape_tally(
 /// usage_must.max(usage_baseline)`; emit only when `reference_count <
 /// usage_likely` and `fanout <= MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY`),
 /// but sourced from the self-contained tally instead of `ref_sites`:
-/// `usage_baseline = candidates.len()`, and each emitted `GraphReference` is
-/// built from the `TokenShapeCandidate` exactly as `materialize_light_ref`
-/// builds a token-shape light. `reference_counts` is the per-target EXACT count
+/// `usage_baseline = non_definition_candidates.len()`, and each emitted
+/// `GraphReference` is built from the `TokenShapeCandidate` exactly as
+/// `materialize_light_ref` builds a token-shape light. Declaration candidates
+/// remain persisted for conservative query-time resolution but do not count as
+/// usages. `reference_counts` is the per-target EXACT count
 /// (== full rebuild's `light_target_count_by_id_u64`) that gates how many
 /// token-shape refs pad each symbol up to `usage_likely`. The candidate order
 /// is the persisted build order (= phase F's `*_likely_sites` consumption
@@ -1252,26 +1359,35 @@ fn emit_token_shape_refs_from_tally(
                     bare_symbol_count.get(&key).copied().unwrap_or(0),
                 )
             };
-        // usage_baseline == number of likely sites for the key (build side does
-        // one +1 per candidate site). `call_baseline` (build side's
+        // usage_baseline == number of non-definition likely sites for the key
+        // (build side does one +1 per usage candidate). `call_baseline` (build side's
         // `*_call_likely`) only feeds `count.calls_in_likely`, which does not
         // gate emission, so it is intentionally not recomputed here — emission is
         // gated solely by `reference_count < usage_likely` + the fanout limit,
         // exactly as in `apply_token_shape_likely_count_baseline`.
-        let usage_baseline = candidates.map(|c| c.len()).unwrap_or(0);
+        let usage_baseline = candidates
+            .map(|candidates| {
+                candidates
+                    .iter()
+                    .filter(|candidate| !candidate.is_definition())
+                    .count()
+            })
+            .unwrap_or(0);
         let usage_must = counts.get(&*symbol.id).map(|c| c.usage_must).unwrap_or(0);
         let usage_likely = usage_must.max(usage_baseline);
         let mut reference_count = reference_counts.get(&symbol.id_u64).copied().unwrap_or(0);
         if reference_count < usage_likely {
             if let Some(candidates) = candidates {
-                // Identical fanout gate: `candidates.len()` is the persisted
-                // likely-site count (stored up to 513 so an over-limit key
-                // still trips `> 512` here, matching the uncapped build side).
-                let fanout = candidates.len().saturating_mul(symbol_count_for_key);
+                // Declaration candidates are query-time-only; the eager fanout
+                // gate and count baseline cover actual usage occurrences.
+                let fanout = usage_baseline.saturating_mul(symbol_count_for_key);
                 if fanout <= MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY {
                     for c in candidates {
                         if reference_count >= usage_likely {
                             break;
+                        }
+                        if c.is_definition() {
+                            continue;
                         }
                         let edge_kind = edge_kind_str_from_id(c.edge_kind_id).unwrap_or("usage");
                         let site_partial = site_partial_hash_u64(c.source_ref_id, edge_kind);
@@ -4140,17 +4256,16 @@ pub fn update_graph_native(
         }
     }
     // Add candidates from the re-parsed changed/new files' sites. Mirrors
-    // phase_c: non-definition bare/member sites only; key = (lang_hash,
-    // scope_hash, name_hash) with scope = top-level dir. file_id comes from the
+    // phase_c: every bare/member occurrence is persisted once, including
+    // declarations used by the lazy structural fallback; only non-definitions
+    // contribute to eager usage counts. Key = (lang_hash, scope_hash,
+    // name_hash) with scope = top-level dir. file_id comes from the
     // augmented file_table, which assigns brand-new files the same appended ids
     // `write_store` will persist (#4a) — so their candidates are added (not
     // skipped) with an id the next update can resolve.
     let mut bare_added: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>> = HashMap::default();
     let mut member_added: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>> = HashMap::default();
     for site in &ref_sites {
-        if site.is_definition {
-            continue;
-        }
         if !exclude_paths.contains(&*site.rel_path) {
             continue;
         }
@@ -4175,7 +4290,12 @@ pub fn update_graph_native(
             end_line: site.end_line,
             end_column: site.end_column,
             edge_kind_id: site.edge_kind_id,
-            access_kind_id: access,
+            access_kind_id: access
+                | if site.is_definition {
+                    TOKEN_SHAPE_CANDIDATE_DEFINITION
+                } else {
+                    0
+                },
         };
         if access == ACCESS_KIND_MEMBER {
             member_added.entry(key).or_default().push(cand);
@@ -4193,7 +4313,7 @@ pub fn update_graph_native(
             map.entry(key).or_default().append(&mut cands);
         }
     }
-    // Re-order+cap only the touched keys so their candidate order/membership
+    // Re-order only the touched keys so their candidate order/membership
     // matches a full rebuild's persisted form: global build order is ascending
     // `ref_sites` index, i.e. files in rel_path order (discovery sorts by
     // `rel_path.cmp`, ~graph.rs:2031) with each file's sites contiguous in
@@ -4205,8 +4325,9 @@ pub fn update_graph_native(
     // because incremental `file_id`s are append-ordered (a new file gets the
     // next id, not its rel_path rank — #4a), so a `file_id` sort would misplace
     // new files vs the full rebuild; it is also robust to non-canonical `file_id`
-    // under parse spill (#1). Then cap at the fanout limit + 1. A key emptied by
-    // the delta is dropped so it cannot pad a stale baseline.
+    // under parse spill (#1). A key emptied by the delta is dropped so it cannot
+    // pad a stale baseline. Candidates are not truncated: query-time fallback
+    // requires the complete occurrence set.
     for (map, touched) in [
         (&mut bare_tally, &bare_touched),
         (&mut member_tally, &member_touched),
@@ -4223,7 +4344,6 @@ pub fn update_graph_native(
                         .unwrap_or("")
                         .cmp(augmented_file_table.get_path(b.file_id).unwrap_or(""))
                 });
-                cands.truncate(TOKEN_SHAPE_TALLY_STORE_CAP_PER_KEY);
             }
         }
     }
@@ -4256,7 +4376,7 @@ pub fn update_graph_native(
         compact_syms.push(compact_sym_from_graph(s, u32::MAX));
     }
     let _t = std::time::Instant::now();
-    let (mut token_shape_refs, recompute_set) = emit_token_shape_refs_from_tally(
+    let (token_shape_refs, recompute_set) = emit_token_shape_refs_from_tally(
         &compact_syms,
         &bare_tally,
         &member_tally,
@@ -5657,6 +5777,24 @@ pub fn query_graph(
             .as_deref()
             .is_some_and(|t| t.eq_ignore_ascii_case(symbol_id))
     });
+    let mut requested_ids = HashSet::default();
+    requested_ids.insert(symbol_id.to_string());
+    let mut target_symbols =
+        read_symbols_for_symbol_ids_indexed(workspace_root, config, &requested_ids)?;
+    merge_overlay_symbols(
+        workspace_root,
+        config,
+        built_at_unix_ms,
+        &mut target_symbols,
+        |symbol| symbol.id.eq_ignore_ascii_case(symbol_id),
+    );
+    append_lazy_token_shape_references(
+        workspace_root,
+        config,
+        &target_symbols,
+        &file_table,
+        &mut references,
+    )?;
     references = dedupe_graph_references_by_source_occurrence(references);
     references.sort_by(|left, right| {
         left.rel_path
@@ -6143,8 +6281,9 @@ fn extract_brace_symbol_defs(
     let mut package_name = None;
     let mut depth = 0i32;
     let mut type_stack: Vec<(i32, String)> = Vec::new();
+    let mut sanitize_state = BraceSanitizeState::default();
     for (line_idx, line) in entry.text.lines().enumerate() {
-        let sanitized = sanitize_code_line(line, language);
+        let sanitized = sanitize_brace_code_line(line, language, &mut sanitize_state);
         let trimmed = sanitized.trim_start();
         if trimmed.is_empty() {
             depth += brace_delta(&sanitized);
@@ -6180,10 +6319,17 @@ fn extract_brace_symbol_defs(
                 implements_names: implements,
             });
             type_stack.push((depth + 1, qualified_name));
-        } else if let Some(name) = brace_function_from_line(trimmed) {
+        } else if let Some(function) = brace_function_from_line(
+            trimmed,
+            language,
+            type_stack
+                .last()
+                .is_some_and(|(type_depth, _)| depth == *type_depth),
+        ) {
+            let name = function.name;
             let column = find_column(line, &name);
             let container_name = type_stack.last().map(|(_, value)| value.clone());
-            let kind = if container_name.is_some() {
+            let kind = if container_name.is_some() || function.member_like {
                 "method"
             } else {
                 "function"
@@ -6729,8 +6875,9 @@ fn extract_ts_type_facts(
     // start_column) max, same id), validated by the a2 gate.
     let ts_line_count = entry.text.lines().count() as u32;
     let enclosing_by_line = precompute_enclosing_per_line(symbols, ts_line_count);
+    let mut sanitize_state = BraceSanitizeState::default();
     for (line_idx, line) in entry.text.lines().enumerate() {
-        let sanitized = sanitize_code_line(line, language);
+        let sanitized = sanitize_brace_code_line(line, language, &mut sanitize_state);
         let trimmed = sanitized.trim_start();
         if trimmed.is_empty() {
             continue;
@@ -7861,11 +8008,17 @@ fn extract_ref_sites(
     let arc_member: Arc<str> = Arc::from("member");
     let arc_bare: Arc<str> = Arc::from("bare");
     let mut python_multiline_string_quote = None;
+    let mut brace_sanitize_state = BraceSanitizeState::default();
     let line_count = entry.text.lines().count().max(1) as u32;
     let line_enclosing_cache = precompute_enclosing_per_line(symbols, line_count);
     for (line_idx, line) in entry.text.lines().enumerate() {
         let sanitized =
-            sanitize_ref_site_code_line(line, language, &mut python_multiline_string_quote);
+            sanitize_ref_site_code_line(
+                line,
+                language,
+                &mut python_multiline_string_quote,
+                &mut brace_sanitize_state,
+            );
         let is_import_context = is_import_context_line(sanitized.trim_start(), language);
         // B6 stage-3: enclosing is line-constant; parse the "sym:HEX16" id to
         // its u64 once per line (0 = none) instead of cloning the String per
@@ -7887,7 +8040,13 @@ fn extract_ref_sites(
                 "usage"
             };
             let receiver_name = member_receiver_name(&sanitized, start);
-            let access_kind = if receiver_name.is_some() || has_member_access_dot(&sanitized, start)
+            let structural_member_key = matches!(language, "typescript" | "javascript")
+                && javascript_property_key_position(&sanitized, start)
+                && (javascript_method_declaration_tail(&sanitized, end)
+                    || (!is_definition && followed_by_property_colon(&sanitized, end)));
+            let access_kind = if receiver_name.is_some()
+                || has_member_access_dot(&sanitized, start)
+                || structural_member_key
             {
                 "member"
             } else {
@@ -10944,9 +11103,6 @@ fn phase_c_process_chunk(
                 *member_call_may.entry(name_hash).or_default() += 1;
             }
         }
-        if is_definition {
-            continue;
-        }
         if !have_file || rel_path_hash != cached_rel_path_hash {
             have_file = true;
             cached_rel_path_hash = rel_path_hash;
@@ -10966,19 +11122,23 @@ fn phase_c_process_chunk(
         }
         let scope_name = (cached_lang_hash, cached_scope_hash, name_hash);
         if access_kind_id == ACCESS_KIND_BARE {
-            *bare_usage_likely.entry(scope_name).or_default() += 1;
             bare_likely_sites.entry(scope_name).or_default().push(i as u32);
-            if is_call_or_construct {
-                *bare_call_likely.entry(scope_name).or_default() += 1;
+            if !is_definition {
+                *bare_usage_likely.entry(scope_name).or_default() += 1;
+                if is_call_or_construct {
+                    *bare_call_likely.entry(scope_name).or_default() += 1;
+                }
             }
         } else if access_kind_id == ACCESS_KIND_MEMBER {
-            *member_usage_likely.entry(scope_name).or_default() += 1;
             member_likely_sites
                 .entry(scope_name)
                 .or_default()
                 .push(i as u32);
-            if is_call_or_construct {
-                *member_call_likely.entry(scope_name).or_default() += 1;
+            if !is_definition {
+                *member_usage_likely.entry(scope_name).or_default() += 1;
+                if is_call_or_construct {
+                    *member_call_likely.entry(scope_name).or_default() += 1;
+                }
             }
         }
     }
@@ -11201,38 +11361,32 @@ fn apply_token_shape_likely_count_baseline(
                 .get(&symbol.id)
                 .copied()
                 .unwrap_or_default();
-            // Honest count: the token-shape "likely" baseline only contributes
-            // QUERYABLE references when the per-key fanout is within the limit —
-            // the emission gate below (`fanout <= MAX_…FANOUT…`) emits ZERO
-            // token-shape refs once it is exceeded. The baseline must follow the
-            // same gate here, otherwise `usage_likely` promises usages the index
-            // never stores: the inline usage hint shows 1000+ while Find Usages /
-            // the inlay click return nothing (graph-query finds no rows). This
-            // changes counts ONLY for over-limit keys; the emitted reference set
-            // (the full-vs-incremental byte-identical invariant) is untouched,
-            // since the inner `fanout` gate already blocks emission there.
-            let token_shape_emittable = match baseline_sites {
-                Some(sites) => {
-                    sites.len().saturating_mul(symbol_count_for_key)
-                        <= MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY
-                }
-                None => false,
-            };
-            let effective_usage_baseline = if token_shape_emittable { usage_baseline } else { 0 };
-            let effective_call_baseline = if token_shape_emittable { call_baseline } else { 0 };
-            count.usage_likely = count.usage_must.max(effective_usage_baseline);
-            count.calls_in_likely = count.calls_in_must.max(effective_call_baseline);
+            // The baseline remains queryable even when eager row multiplication
+            // exceeds the guard below: every candidate is persisted once in the
+            // token-shape sidecar and query_graph materializes it lazily. Never
+            // zero this count merely because eager duplication was skipped.
+            count.usage_likely = count.usage_must.max(usage_baseline);
+            count.calls_in_likely = count.calls_in_must.max(call_baseline);
             let mut reference_count = reference_counts_ref
                 .get(&symbol.id_u64)
                 .copied()
                 .unwrap_or(0);
             if reference_count < count.usage_likely {
                 if let Some(sites) = baseline_sites {
-                    let fanout = sites.len().saturating_mul(symbol_count_for_key);
+                    let fanout = usage_baseline.saturating_mul(symbol_count_for_key);
                     if fanout <= MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY {
                         for &site_idx in sites {
                             if reference_count >= count.usage_likely {
                                 break;
+                            }
+                            let is_definition = match prebuilt_site_cols {
+                                Some(sc) => {
+                                    sc[site_idx as usize].flags & SITE_FLAG_IS_DEFINITION != 0
+                                }
+                                None => ref_sites[site_idx as usize].is_definition,
+                            };
+                            if is_definition {
+                                continue;
                             }
                             // B5: phase C stored the global ref_sites index.
                             // B6 stage-5d: the `site_partial` is precomputed in
@@ -11266,15 +11420,10 @@ fn apply_token_shape_likely_count_baseline(
                     }
                 }
             }
-            // ② usage_likely := the target's TOTAL emitted-reference count, so the
-            // inline "N usages" hint equals exactly what graph-query / the panel
-            // returns (undercount=0 AND overcount=0 by construction). `reference_count`
-            // began at the phase-E emitted tally (`reference_counts_ref`, which
-            // already counts exact + unique-name + member refs) and the token-shape
-            // loop above incremented it per emit, so it now == this target's emitted
-            // total. overcount==0 means this is always >= the prior scoped baseline,
-            // so usage_likely never decreases.
-            count.usage_likely = reference_count;
+            // Eager references and the lazy candidate baseline are two storage
+            // representations of the same query result. Keep the larger count;
+            // document-symbol queries later compute the exact deduped union.
+            count.usage_likely = reference_count.max(count.usage_likely);
             // Downstream consumers `counts.get(id).unwrap_or_default()`, so skip
             // emitting default entries — saves String clone per zero-usage symbol.
             if count != GraphCount::default() {
@@ -16852,17 +17001,18 @@ fn apply_deduped_usage_counts_for_symbols(
     }
     let symbol_ids: HashSet<String> = symbols
         .iter()
-        .filter(|symbol| symbol.usage_count.unwrap_or(0) > 0)
         .map(|symbol| symbol.id.clone())
         .collect();
     if symbol_ids.is_empty() {
         return Ok(());
     }
-    let counts = deduped_reference_counts_for_symbol_ids_indexed(workspace_root, config, &symbol_ids)?;
+    let counts = deduped_reference_counts_for_symbol_ids_indexed(
+        workspace_root,
+        config,
+        &symbol_ids,
+        symbols,
+    )?;
     for symbol in symbols {
-        if symbol.usage_count.unwrap_or(0) == 0 {
-            continue;
-        }
         let key = symbol.id.to_ascii_lowercase();
         symbol.usage_count = Some(counts.get(&key).copied().unwrap_or(0));
     }
@@ -16873,6 +17023,7 @@ fn deduped_reference_counts_for_symbol_ids_indexed(
     workspace_root: &Path,
     config: &EngineConfig,
     symbol_ids: &HashSet<String>,
+    symbols: &[GraphSymbol],
 ) -> io::Result<HashMap<String, usize>> {
     if symbol_ids.is_empty() || !graph_index_available(workspace_root, config) {
         return Ok(HashMap::new());
@@ -16922,6 +17073,13 @@ fn deduped_reference_counts_for_symbol_ids_indexed(
             .map(|target| ids_lower.contains(&target.to_ascii_lowercase()))
             .unwrap_or(false)
     });
+    append_lazy_token_shape_references(
+        workspace_root,
+        config,
+        symbols,
+        &file_table,
+        &mut references,
+    )?;
     let mut counts: HashMap<String, usize> = HashMap::default();
     for reference in dedupe_graph_references_by_source_occurrence(references) {
         if let Some(target) = reference.target_symbol_id.as_deref() {
@@ -17180,18 +17338,70 @@ fn brace_type_from_line(trimmed: &str) -> Option<(String, String, Vec<String>, V
     None
 }
 
-fn brace_function_from_line(trimmed: &str) -> Option<String> {
-    if let Some(rest) = find_keyword_tail(trimmed, "function") {
-        return leading_identifier(rest);
+struct BraceFunctionDef {
+    name: String,
+    member_like: bool,
+}
+
+fn strip_trailing_generic_parameter_list(value: &str) -> &str {
+    let trimmed = value.trim_end();
+    if !trimmed.ends_with('>') {
+        return trimmed;
+    }
+    let mut depth = 0u32;
+    for (idx, ch) in trimmed.char_indices().rev() {
+        match ch {
+            '>' => depth += 1,
+            '<' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return trimmed[..idx].trim_end();
+                }
+            }
+            _ => {}
+        }
+    }
+    trimmed
+}
+
+/// Recognize a declaration signature, not merely an identifier followed by
+/// `(`. The old implementation treated statement calls such as `run()` and
+/// `await run()` as fresh definitions. Besides polluting the symbol table, those
+/// false definitions made an otherwise unique same-file binding ambiguous and
+/// prevented every real call from resolving.
+fn brace_function_from_line(
+    trimmed: &str,
+    language: &str,
+    at_type_body: bool,
+) -> Option<BraceFunctionDef> {
+    // Languages with an explicit declaration keyword are unambiguous even when
+    // the parameter list continues on following physical lines.
+    for keyword in ["function", "fn", "func", "fun"] {
+        if let Some(rest) = find_keyword_tail(trimmed, keyword) {
+            let name = leading_identifier(rest)?;
+            return Some(BraceFunctionDef {
+                name,
+                member_like: at_type_body,
+            });
+        }
     }
     let open = trimmed.find('(')?;
-    let before = trimmed[..open].trim_end();
+    let before = strip_trailing_generic_parameter_list(&trimmed[..open]);
+    let before = before
+        .strip_suffix('?')
+        .map(str::trim_end)
+        .unwrap_or(before);
     let before_start = before.trim_start();
     if before.is_empty()
         || before.contains('=')
         || before.contains('.')
+        || before.contains(':')
+        || before.contains(',')
         || before_start.starts_with("return ")
         || before_start.starts_with("throw ")
+        || before_start.starts_with("await ")
+        || before_start.starts_with("yield ")
+        || before_start.starts_with("new ")
         || before.ends_with("if")
         || before.ends_with("for")
         || before.ends_with("while")
@@ -17201,11 +17411,74 @@ fn brace_function_from_line(trimmed: &str) -> Option<String> {
         return None;
     }
     let name = trailing_identifier(before)?;
-    if is_keyword(&name, "typescript") {
-        None
-    } else {
-        Some(name)
+    // `trailing_identifier` intentionally skips punctuation/text while serving
+    // other parsers. A declaration name, however, must be the actual suffix
+    // immediately before its parameter list (or generic parameters stripped
+    // above). Requiring that suffix both rejects JSX/text such as
+    // `<Title>description (required)` and makes the byte subtraction below
+    // UTF-8-boundary safe.
+    if !before.ends_with(&name) {
+        return None;
     }
+    if is_keyword(&name, language) {
+        return None;
+    }
+
+    // A generic method signature may be multiline, but only while positioned
+    // directly in a type body. A call inside a method is one brace level deeper
+    // and therefore cannot take this path.
+    let close = matching_close_paren(trimmed, open);
+    if close.is_none() {
+        return at_type_body.then_some(BraceFunctionDef {
+            name,
+            member_like: true,
+        });
+    }
+
+    let tail = trimmed[close.unwrap() + 1..].trim_start();
+    let prefix = before[..before.len().saturating_sub(name.len())].trim();
+    let ts_js = matches!(language, "typescript" | "javascript");
+    let method_prefix = prefix.is_empty()
+        || prefix.split_whitespace().all(|part| {
+            matches!(
+                part,
+                "abstract"
+                    | "async"
+                    | "declare"
+                    | "get"
+                    | "override"
+                    | "private"
+                    | "protected"
+                    | "public"
+                    | "readonly"
+                    | "set"
+                    | "static"
+            )
+        });
+    let starts_body = tail.starts_with('{');
+    let typed_or_abstract_tail = tail.starts_with(':')
+        || tail.starts_with("throws ")
+        || tail.starts_with("where ")
+        || tail.starts_with("->")
+        || tail == ";";
+
+    let declaration = if ts_js {
+        // In JS/TS, a declaration without the `function` keyword is method
+        // shorthand. Its prefix is limited to language modifiers; expression
+        // prefixes such as `await`, `return`, or a property label are rejected
+        // above. Object-literal methods are member-like even without a class.
+        method_prefix && (starts_body || (at_type_body && typed_or_abstract_tail))
+    } else {
+        // C-family declarations normally carry a return type/modifier prefix;
+        // constructors are the prefix-less exception and only exist directly in
+        // a type body. A body-opening tail is also declaration-shaped (and is not
+        // valid syntax for an ordinary call expression).
+        starts_body || (typed_or_abstract_tail && (at_type_body || !prefix.is_empty()))
+    };
+    declaration.then_some(BraceFunctionDef {
+        name,
+        member_like: at_type_body || ts_js,
+    })
 }
 
 fn brace_assignment_name(trimmed: &str) -> Option<String> {
@@ -17539,7 +17812,377 @@ fn leading_qualified_identifier(value: &str) -> Option<String> {
     }
 }
 
+struct BraceSanitizeState {
+    templates: Vec<BraceTemplateState>,
+    in_block_comment: bool,
+    javascript_expression_can_start: bool,
+    javascript_control_parens: Vec<bool>,
+    javascript_pending_control_paren: bool,
+}
+
+impl Default for BraceSanitizeState {
+    fn default() -> Self {
+        Self {
+            templates: Vec::new(),
+            in_block_comment: false,
+            // At a file/statement boundary a JavaScript regular-expression
+            // literal may begin an expression.
+            javascript_expression_can_start: true,
+            javascript_control_parens: Vec::new(),
+            javascript_pending_control_paren: false,
+        }
+    }
+}
+
+struct BraceTemplateState {
+    in_expression: bool,
+    expression_brace_depth: u32,
+    interpolates: bool,
+}
+
+fn javascript_regex_literal_len(value: &str) -> Option<usize> {
+    if !value.starts_with('/') || value.starts_with("//") || value.starts_with("/*") {
+        return None;
+    }
+    let mut idx = 1usize;
+    let mut in_character_class = false;
+    while idx < value.len() {
+        let ch = value[idx..].chars().next()?;
+        if ch == '\\' {
+            idx += ch.len_utf8();
+            if idx < value.len() {
+                idx += value[idx..].chars().next()?.len_utf8();
+            }
+            continue;
+        }
+        if ch == '[' {
+            in_character_class = true;
+        } else if ch == ']' {
+            in_character_class = false;
+        } else if ch == '/' && !in_character_class {
+            idx += 1;
+            while idx < value.len() {
+                let flag = value.as_bytes()[idx];
+                if matches!(flag, b'd' | b'g' | b'i' | b'm' | b's' | b'u' | b'v' | b'y') {
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            return Some(idx);
+        }
+        idx += ch.len_utf8();
+    }
+    None
+}
+
+fn update_javascript_context_for_identifier(state: &mut BraceSanitizeState, name: &str) {
+    let control = matches!(name, "catch" | "for" | "if" | "switch" | "while" | "with");
+    state.javascript_pending_control_paren = control;
+    state.javascript_expression_can_start = control
+        || matches!(
+            name,
+            "await"
+                | "case"
+                | "delete"
+                | "do"
+                | "else"
+                | "instanceof"
+                | "in"
+                | "new"
+                | "of"
+                | "return"
+                | "throw"
+                | "typeof"
+                | "void"
+                | "yield"
+        );
+}
+
+fn update_javascript_context_for_punctuation(
+    state: &mut BraceSanitizeState,
+    ch: char,
+) {
+    match ch {
+        '(' => {
+            state
+                .javascript_control_parens
+                .push(state.javascript_pending_control_paren);
+            state.javascript_pending_control_paren = false;
+            state.javascript_expression_can_start = true;
+        }
+        ')' => {
+            state.javascript_expression_can_start =
+                state.javascript_control_parens.pop().unwrap_or(false);
+            state.javascript_pending_control_paren = false;
+        }
+        ']' | '}' | '.' => {
+            state.javascript_expression_can_start = false;
+            state.javascript_pending_control_paren = false;
+        }
+        '[' | '{' | ',' | ';' | ':' | '?' | '=' | '!' | '~' | '*' | '%' | '&' | '|'
+        | '^' | '<' | '>' | '+' | '-' | '/' => {
+            state.javascript_expression_can_start = true;
+            state.javascript_pending_control_paren = false;
+        }
+        _ if !ch.is_whitespace() => {
+            state.javascript_expression_can_start = false;
+            state.javascript_pending_control_paren = false;
+        }
+        _ => {}
+    }
+}
+
+fn update_javascript_plain_line_context(line: &str, state: &mut BraceSanitizeState) {
+    let mut idx = 0usize;
+    while idx < line.len() {
+        let rest = &line[idx..];
+        let ch = rest.chars().next().unwrap_or(' ');
+        if is_ident_start(ch) {
+            let mut end = idx + ch.len_utf8();
+            while end < line.len() {
+                let next = line[end..].chars().next().unwrap_or(' ');
+                if !is_ident_continue(next) {
+                    break;
+                }
+                end += next.len_utf8();
+            }
+            update_javascript_context_for_identifier(state, &line[idx..end]);
+            idx = end;
+            continue;
+        }
+        if rest.starts_with("++") || rest.starts_with("--") {
+            state.javascript_expression_can_start = false;
+            state.javascript_pending_control_paren = false;
+            idx += 2;
+            continue;
+        }
+        update_javascript_context_for_punctuation(state, ch);
+        idx += ch.len_utf8();
+    }
+}
+
+/// Stateful lexer-level sanitizer for brace languages. It blanks literal text
+/// while preserving byte offsets, but keeps executable `${ ... }` template
+/// expressions visible to symbol/reference extraction. Template and block-
+/// comment state is carried across physical lines so braces contained in raw
+/// multiline text cannot corrupt the surrounding class scope.
+fn sanitize_brace_code_line<'a>(
+    line: &'a str,
+    language: &str,
+    state: &mut BraceSanitizeState,
+) -> Cow<'a, str> {
+    let supports_template_expressions = matches!(language, "typescript" | "javascript");
+    if state.templates.is_empty()
+        && !state.in_block_comment
+        && !line
+            .as_bytes()
+            .iter()
+            .any(|&b| matches!(b, b'\'' | b'"' | b'`' | b'/'))
+    {
+        if supports_template_expressions {
+            update_javascript_plain_line_context(line, state);
+        }
+        return Cow::Borrowed(line);
+    }
+
+    let mut out = String::with_capacity(line.len());
+    let mut idx = 0usize;
+    let mut quote: Option<char> = None;
+    while idx < line.len() {
+        let rest = &line[idx..];
+        let ch = rest.chars().next().unwrap_or(' ');
+
+        if state.in_block_comment {
+            if rest.starts_with("*/") {
+                push_ascii_spaces(&mut out, 2);
+                idx += 2;
+                state.in_block_comment = false;
+            } else {
+                push_ascii_spaces(&mut out, ch.len_utf8());
+                idx += ch.len_utf8();
+            }
+            continue;
+        }
+
+        let in_template_text = state
+            .templates
+            .last()
+            .is_some_and(|template| !template.in_expression);
+        if in_template_text {
+            let interpolates = state
+                .templates
+                .last()
+                .is_some_and(|template| template.interpolates);
+            if ch == '`' {
+                push_ascii_spaces(&mut out, 1);
+                idx += 1;
+                state.templates.pop();
+                if supports_template_expressions {
+                    state.javascript_expression_can_start = false;
+                    state.javascript_pending_control_paren = false;
+                }
+                continue;
+            }
+            if interpolates && rest.starts_with("${") {
+                push_ascii_spaces(&mut out, 2);
+                idx += 2;
+                if let Some(template) = state.templates.last_mut() {
+                    template.in_expression = true;
+                    template.expression_brace_depth = 0;
+                }
+                state.javascript_expression_can_start = true;
+                state.javascript_pending_control_paren = false;
+                continue;
+            }
+            if interpolates && ch == '\\' {
+                push_ascii_spaces(&mut out, 1);
+                idx += 1;
+                if idx < line.len() {
+                    let escaped = line[idx..].chars().next().unwrap_or(' ');
+                    push_ascii_spaces(&mut out, escaped.len_utf8());
+                    idx += escaped.len_utf8();
+                }
+                continue;
+            }
+            push_ascii_spaces(&mut out, ch.len_utf8());
+            idx += ch.len_utf8();
+            continue;
+        }
+
+        if let Some(active) = quote {
+            push_ascii_spaces(&mut out, ch.len_utf8());
+            idx += ch.len_utf8();
+            if ch == '\\' {
+                if idx < line.len() {
+                    let escaped = line[idx..].chars().next().unwrap_or(' ');
+                    push_ascii_spaces(&mut out, escaped.len_utf8());
+                    idx += escaped.len_utf8();
+                }
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+
+        if rest.starts_with("/*") {
+            push_ascii_spaces(&mut out, 2);
+            idx += 2;
+            state.in_block_comment = true;
+            continue;
+        }
+        if rest.starts_with("//") {
+            push_ascii_spaces(&mut out, line.len() - idx);
+            break;
+        }
+        if supports_template_expressions
+            && ch == '/'
+            && state.javascript_expression_can_start
+        {
+            if let Some(regex_len) = javascript_regex_literal_len(rest) {
+                push_ascii_spaces(&mut out, regex_len);
+                idx += regex_len;
+                state.javascript_expression_can_start = false;
+                state.javascript_pending_control_paren = false;
+                continue;
+            }
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            push_ascii_spaces(&mut out, ch.len_utf8());
+            idx += ch.len_utf8();
+            if supports_template_expressions {
+                state.javascript_expression_can_start = false;
+                state.javascript_pending_control_paren = false;
+            }
+            continue;
+        }
+        if ch == '`' {
+            state.templates.push(BraceTemplateState {
+                in_expression: false,
+                expression_brace_depth: 0,
+                interpolates: supports_template_expressions,
+            });
+            push_ascii_spaces(&mut out, 1);
+            idx += 1;
+            if supports_template_expressions {
+                state.javascript_expression_can_start = false;
+                state.javascript_pending_control_paren = false;
+            }
+            continue;
+        }
+
+        if supports_template_expressions && is_ident_start(ch) {
+            let mut end = idx + ch.len_utf8();
+            while end < line.len() {
+                let next = line[end..].chars().next().unwrap_or(' ');
+                if !is_ident_continue(next) {
+                    break;
+                }
+                end += next.len_utf8();
+            }
+            out.push_str(&line[idx..end]);
+            update_javascript_context_for_identifier(state, &line[idx..end]);
+            idx = end;
+            continue;
+        }
+
+        if supports_template_expressions && (rest.starts_with("++") || rest.starts_with("--")) {
+            out.push_str(&rest[..2]);
+            idx += 2;
+            state.javascript_expression_can_start = false;
+            state.javascript_pending_control_paren = false;
+            continue;
+        }
+
+        let in_template_expression = state
+            .templates
+            .last()
+            .is_some_and(|template| template.in_expression);
+        if in_template_expression && ch == '{' {
+            if let Some(template) = state.templates.last_mut() {
+                template.expression_brace_depth += 1;
+            }
+            out.push(ch);
+            idx += ch.len_utf8();
+            update_javascript_context_for_punctuation(state, ch);
+            continue;
+        }
+        if in_template_expression && ch == '}' {
+            let closes_expression = state
+                .templates
+                .last()
+                .is_some_and(|template| template.expression_brace_depth == 0);
+            if closes_expression {
+                if let Some(template) = state.templates.last_mut() {
+                    template.in_expression = false;
+                }
+                push_ascii_spaces(&mut out, 1);
+            } else {
+                if let Some(template) = state.templates.last_mut() {
+                    template.expression_brace_depth -= 1;
+                }
+                out.push(ch);
+                update_javascript_context_for_punctuation(state, ch);
+            }
+            idx += ch.len_utf8();
+            continue;
+        }
+
+        out.push(ch);
+        idx += ch.len_utf8();
+        if supports_template_expressions {
+            update_javascript_context_for_punctuation(state, ch);
+        }
+    }
+    Cow::Owned(out)
+}
+
 fn sanitize_code_line<'a>(line: &'a str, language: &str) -> Cow<'a, str> {
+    if language != "python" {
+        let mut state = BraceSanitizeState::default();
+        return sanitize_brace_code_line(line, language, &mut state);
+    }
     // P2 (parse alloc reduction): the sanitizer rebuilds the line char-by-char
     // only to blank out string/comment spans. A line with no quote/comment
     // trigger sanitizes to itself, so borrow it instead of allocating a copy —
@@ -17597,11 +18240,12 @@ fn sanitize_ref_site_code_line<'a>(
     line: &'a str,
     language: &str,
     python_multiline_string_quote: &mut Option<char>,
+    brace_state: &mut BraceSanitizeState,
 ) -> Cow<'a, str> {
     if language == "python" {
         sanitize_python_ref_site_code_line(line, python_multiline_string_quote)
     } else {
-        sanitize_code_line(line, language)
+        sanitize_brace_code_line(line, language, brace_state)
     }
 }
 
@@ -17892,6 +18536,82 @@ fn is_keyword(name: &str, language: &str) -> bool {
 
 fn next_nonspace_char(line: &str, idx: usize) -> Option<char> {
     line[idx..].chars().find(|ch| !ch.is_whitespace())
+}
+
+/// True when an identifier occupies a JavaScript/TypeScript property-key slot:
+/// at the start of a member list, after a member separator, or after only
+/// declaration modifiers. This excludes expression operands such as the value
+/// between `?` and `:` in a ternary.
+fn javascript_property_key_position(line: &str, start: usize) -> bool {
+    let prefix = line[..start].trim_end();
+    let segment = prefix
+        .rfind(|ch| matches!(ch, '{' | '[' | ',' | ';'))
+        .map(|idx| prefix[idx + 1..].trim())
+        .unwrap_or(prefix);
+    let segment = segment.trim_start_matches('*').trim();
+    segment.is_empty()
+        || segment.split_whitespace().all(|part| {
+            matches!(
+                part,
+                "abstract"
+                    | "async"
+                    | "declare"
+                    | "get"
+                    | "override"
+                    | "private"
+                    | "protected"
+                    | "public"
+                    | "readonly"
+                    | "set"
+                    | "static"
+            )
+        })
+}
+
+fn javascript_method_declaration_tail(line: &str, end: usize) -> bool {
+    let mut tail = line[end..].trim_start();
+    if let Some(optional) = tail.strip_prefix('?') {
+        tail = optional.trim_start();
+    }
+    if tail.starts_with('<') {
+        let mut depth = 0u32;
+        let mut generic_end = None;
+        for (idx, ch) in tail.char_indices() {
+            match ch {
+                '<' => depth += 1,
+                '>' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        generic_end = Some(idx + ch.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(generic_end) = generic_end else {
+            return false;
+        };
+        tail = tail[generic_end..].trim_start();
+    }
+    if !tail.starts_with('(') {
+        return false;
+    }
+    let Some(close) = matching_close_paren(tail, 0) else {
+        return false;
+    };
+    let after = tail[close + 1..].trim_start();
+    after.starts_with('{') || after.starts_with(':')
+}
+
+/// A property key participates in member lookup even though it has no receiver
+/// dot (`{ render: implementation }`, `{ render?: Handler }`). Restrict this to
+/// the immediate `:` / optional-property `?:` shape so ternary expressions and
+/// ordinary bare identifiers retain their existing access class.
+fn followed_by_property_colon(line: &str, idx: usize) -> bool {
+    let tail = line[idx..].trim_start();
+    let tail = tail.strip_prefix('?').map(str::trim_start).unwrap_or(tail);
+    tail.starts_with(':')
 }
 
 fn member_receiver_name(line: &str, member_start: usize) -> Option<String> {
@@ -18825,6 +19545,250 @@ mod tests {
     }
 
     #[test]
+    fn brace_call_expressions_do_not_create_duplicate_definitions() {
+        let entry = test_entry(
+            "pkg/module.ts",
+            r#"
+export function calculate(value: number): number {
+  return value + 1;
+}
+
+class Processor {
+  execute(): number {
+    calculate(1);
+    this.execute();
+    return calculate(2);
+  }
+}
+
+async function consume(): Promise<void> {
+  await calculate(3);
+  callback(calculate(4));
+}
+
+const handlers = {
+  handle() {
+    calculate(5);
+  },
+};
+"#,
+        );
+        let graph = build_file_graph(&entry);
+
+        assert_eq!(
+            graph
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.name == "calculate")
+                .count(),
+            1,
+            "ordinary calls must not be extracted as repeated function definitions"
+        );
+        assert!(graph.symbols.iter().all(|symbol| symbol.name != "callback"));
+        assert!(graph
+            .symbols
+            .iter()
+            .any(|symbol| symbol.qualified_name == "Processor.execute" && symbol.kind == "method"));
+        assert!(graph
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "handle" && symbol.kind == "method"));
+        let calculate_id = symbol_id(&graph.symbols, "calculate");
+        let result = resolve_ref_sites(
+            &graph.symbols,
+            &graph.ref_sites,
+            &graph.import_facts,
+            &graph.type_facts,
+            &graph.function_return_facts,
+            &graph.hierarchy_facts,
+        );
+        assert_eq!(
+            result
+                .references
+                .iter()
+                .filter(|reference| {
+                    reference.target_symbol_id.as_deref() == Some(calculate_id)
+                })
+                .count(),
+            5,
+            "calls at statement starts must retain bare-function resolution"
+        );
+    }
+
+    #[test]
+    fn tsx_text_before_parentheses_is_not_a_function_declaration() {
+        let entry = test_entry(
+            "pkg/view.tsx",
+            r#"
+export function render() {
+  const view = <Panel>설명 (필수)</Panel>;
+  return view;
+}
+"#,
+        );
+        let graph = build_file_graph(&entry);
+        assert!(graph
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "render" && symbol.kind == "function"));
+        assert!(graph
+            .symbols
+            .iter()
+            .all(|symbol| symbol.name != "Panel" && symbol.name != "설명"));
+    }
+
+    #[test]
+    fn typescript_template_expressions_are_code_but_template_text_is_not() {
+        let entry = test_entry(
+            "pkg/template.ts",
+            r#"
+const TOKEN = "value";
+
+class Container {
+  compose(): string {
+    const text = `
+      rawCall()
+      class Phantom {
+      ${TOKEN}
+      ${format(TOKEN)}
+    `;
+    return text;
+  }
+
+  after(): string {
+    return TOKEN;
+  }
+}
+"#,
+        );
+        let (symbols, result) = resolve_test_entries(&[entry]);
+
+        assert!(symbols.iter().all(|symbol| symbol.name != "rawCall"));
+        assert!(symbols.iter().all(|symbol| symbol.name != "Phantom"));
+        assert!(symbols
+            .iter()
+            .any(|symbol| symbol.qualified_name == "Container.after" && symbol.kind == "method"));
+
+        let token_id = symbol_id(&symbols, "TOKEN");
+        let token_refs: Vec<_> = result
+            .references
+            .iter()
+            .filter(|reference| reference.target_symbol_id.as_deref() == Some(token_id))
+            .collect();
+        assert_eq!(
+            token_refs.len(),
+            3,
+            "identifiers inside template expressions must remain queryable usages"
+        );
+    }
+
+    #[test]
+    fn typescript_generic_method_names_are_extracted_before_type_parameters() {
+        let entry = test_entry(
+            "pkg/generic.ts",
+            r#"
+interface Transformer {
+  transform<Value>(value: Value): Value;
+}
+
+class IdentityTransformer implements Transformer {
+  transform<Value>(value: Value): Value {
+    return value;
+  }
+}
+
+export function apply<Value>(transformer: Transformer, value: Value): Value {
+  return transformer.transform(value);
+}
+"#,
+        );
+        let graph = build_file_graph(&entry);
+
+        assert!(graph.symbols.iter().any(|symbol| {
+            symbol.qualified_name == "Transformer.transform" && symbol.kind == "method"
+        }));
+        assert!(graph.symbols.iter().any(|symbol| {
+            symbol.qualified_name == "IdentityTransformer.transform" && symbol.kind == "method"
+        }));
+        assert!(graph
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "apply" && symbol.kind == "function"));
+        assert!(graph.symbols.iter().all(|symbol| symbol.name != "Value"));
+    }
+
+    #[test]
+    fn typescript_regex_literals_do_not_corrupt_template_or_following_code() {
+        let entry = test_entry(
+            "pkg/regex-template.ts",
+            r#"
+const TOKEN = "value";
+
+function decode(value: string): string {
+  return value;
+}
+
+const quotient = numerator / denominator;
+const rendered = `${TOKEN.replace(/'/g, "")}`;
+
+function after(): string {
+  return decode(TOKEN);
+}
+"#,
+        );
+        let graph = build_file_graph(&entry);
+
+        assert!(graph
+            .ref_sites
+            .iter()
+            .any(|site| site.name == "denominator"));
+        assert!(graph
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "after" && symbol.kind == "function"));
+        let token_id = symbol_id(&graph.symbols, "TOKEN");
+        let result = resolve_ref_sites(
+            &graph.symbols,
+            &graph.ref_sites,
+            &graph.import_facts,
+            &graph.type_facts,
+            &graph.function_return_facts,
+            &graph.hierarchy_facts,
+        );
+        let locations: HashSet<_> = result
+            .references
+            .iter()
+            .filter(|reference| reference.target_symbol_id.as_deref() == Some(token_id))
+            .map(|reference| (reference.start_line, reference.start_column))
+            .collect();
+        assert_eq!(locations.len(), 2);
+    }
+
+    #[test]
+    fn typescript_ternary_consequents_remain_bare_usages() {
+        let entry = test_entry(
+            "pkg/conditional.ts",
+            r#"
+const LIMIT = 10;
+
+export function choose(enabled: boolean): number | undefined {
+  return enabled ? LIMIT : undefined;
+}
+"#,
+        );
+        let (symbols, result) = resolve_test_entries(&[entry]);
+        let limit_id = symbol_id(&symbols, "LIMIT");
+        let locations: HashSet<_> = result
+            .references
+            .iter()
+            .filter(|reference| reference.target_symbol_id.as_deref() == Some(limit_id))
+            .map(|reference| (reference.start_line, reference.start_column))
+            .collect();
+        assert_eq!(locations.len(), 1);
+        assert!(locations.contains(&(4, 19)));
+    }
+
+    #[test]
     fn net_bracket_depth_ignores_strings_and_comments() {
         assert_eq!(net_bracket_depth("class Foo(Base):"), 0);
         assert_eq!(net_bracket_depth("class Foo(  # type: ignore[x]"), 1);
@@ -19434,6 +20398,131 @@ def use_collection(first, second):
         assert!(refs
             .iter()
             .all(|reference| &*reference.provenance == "token-shape"));
+    }
+
+    #[test]
+    fn high_fanout_token_shape_candidates_remain_queryable_without_eager_multiplication() {
+        let ws = unique_temp_workspace("zoek-token-shape-lazy-query");
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(ws.join("pkg")).expect("create fixture directory");
+        let provider_path = ws.join("pkg/provider.ts");
+        fs::write(
+            &provider_path,
+            "export class FirstProvider {\n\
+               collect() {}\n\
+             }\n",
+        )
+        .expect("write provider");
+        let mut consumer = String::from("export function use(source: unknown) {\n");
+        for _ in 0..600 {
+            consumer.push_str("  source.collect();\n");
+        }
+        consumer.push_str("}\n");
+        fs::write(ws.join("pkg/consumer.ts"), consumer).expect("write consumer");
+
+        let config = EngineConfig::default();
+        let mut noop = |_progress: GraphRebuildProgress| {};
+        rebuild_graph_native(&ws, unix_millis_now(), &config, 0, &mut noop)
+            .expect("rebuild graph");
+        let symbols = query_graph_document_symbols(
+            &ws,
+            &file_uri(&provider_path),
+            None,
+            None,
+            20,
+            &config,
+        )
+        .expect("query provider symbols")
+        .expect("graph index");
+        let first = symbols
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "FirstProvider.collect")
+            .expect("first method");
+        assert_eq!(
+            first.usage_count,
+            Some(600),
+            "the inline count must include the lossless lazy candidate set"
+        );
+
+        let usages = query_graph(&ws, &first.id, 700, &config)
+            .expect("query usages")
+            .expect("graph index");
+        assert_eq!(usages.total_references, 600);
+        assert_eq!(usages.references.len(), 600);
+        assert!(usages
+            .references
+            .iter()
+            .all(|reference| reference.confidence.as_ref() == "possible"));
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn member_query_keeps_related_declarations_and_contextual_property_keys() {
+        let ws = unique_temp_workspace("zoek-structural-member-declarations");
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(ws.join("pkg")).expect("create fixture directory");
+        let provider_path = ws.join("pkg/provider.ts");
+        fs::write(
+            &provider_path,
+            "export interface Contract {\n\
+               execute(value: string): void;\n\
+             }\n\
+             class Adapter implements Contract {\n\
+               execute(value: string): void {}\n\
+             }\n\
+             const contract: Contract = {\n\
+               execute: (_value) => {},\n\
+             };\n\
+             const fallback = contract ?? { execute() {} };\n\
+             export function invoke(): void {\n\
+               contract.execute('value');\n\
+             }\n",
+        )
+        .expect("write provider");
+
+        let config = EngineConfig::default();
+        let mut noop = |_progress: GraphRebuildProgress| {};
+        rebuild_graph_native(&ws, unix_millis_now(), &config, 0, &mut noop)
+            .expect("rebuild graph");
+        let symbols = query_graph_document_symbols(
+            &ws,
+            &file_uri(&provider_path),
+            None,
+            None,
+            20,
+            &config,
+        )
+        .expect("query provider symbols")
+        .expect("graph index");
+        let target = symbols
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "Contract.execute")
+            .expect("interface method");
+        let usages = query_graph(&ws, &target.id, 20, &config)
+            .expect("query usages")
+            .expect("graph index");
+        let locations: HashSet<_> = usages
+            .references
+            .iter()
+            .map(|reference| (reference.start_line, reference.start_column))
+            .collect();
+        assert!(
+            locations.contains(&(4, 0)),
+            "implementation declaration; got {locations:?}"
+        );
+        assert!(
+            locations.contains(&(7, 0)),
+            "contextual property key; got {locations:?}"
+        );
+        assert!(
+            locations.contains(&(9, 31)),
+            "inline object method; got {locations:?}"
+        );
+        assert!(locations.contains(&(11, 9)), "member call; got {locations:?}");
+        assert!(!locations.contains(&(1, 0)), "target declaration itself");
+        let _ = fs::remove_dir_all(&ws);
     }
 
     #[test]
