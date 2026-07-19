@@ -777,13 +777,14 @@ const DEFAULT_CALL_GRAPH_MAX_CALLSITES = 0;
 const DEFAULT_CALL_GRAPH_MAX_REFERENCE_CANDIDATES = 0;
 const DEFAULT_CALL_GRAPH_MEMORY_BUDGET_MB = 8_192;
 const CALL_GRAPH_SOURCE_GLOB = '**/*.{py,java,kt,kts,ts,tsx,js,jsx,mjs,cjs}';
-// v15: paired with rust GRAPH_VERSION 6->7 (position-independent symbol ids in
-// crates/zoek-rs/src/graph.rs `stable_symbol_id`). The id scheme is on-disk-
-// incompatible with v6 — a v6 index served to the v7 binary would mix old/new
-// target ids — so this bump discards the v6 cache and forces a one-time reindex.
+// v16: paired with rust GRAPH_VERSION 7->8. v8 persists the number of concrete
+// targets for each token-shape key so unresolved occurrences are attached only
+// when that structural key identifies one target or one complete inheritance
+// family. The new sidecar is required for query-time lazy references, so this
+// bump forces a one-time reindex.
 // MUST move together with the GRAPH_VERSION bump + the rebuilt binary.
-const CALL_GRAPH_CACHE_VERSION = 15;
-const RUST_NATIVE_GRAPH_MANIFEST_VERSION = 7;
+const CALL_GRAPH_CACHE_VERSION = 16;
+const RUST_NATIVE_GRAPH_MANIFEST_VERSION = 8;
 const RUST_NATIVE_GRAPH_REBUILD_WARNING = 'rust-native graph rebuild stores the primary graph in zoek-rs binary index; JS snapshot arrays are intentionally not materialized';
 const CALL_GRAPH_EXTERNAL_INCREMENTAL_DEBOUNCE_MS = 1_500;
 const CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS = 75;
@@ -5061,10 +5062,11 @@ export class CallGraphService implements vscode.Disposable {
     excludeGlobs: string[];
     parseConcurrency: number;
     configSignature: string;
+    binaryPromise?: Promise<string | undefined>;
     token?: vscode.CancellationToken;
     report?: (progress: CallGraphRebuildProgress) => void;
   }): Promise<CallGraphSnapshot> {
-    const binary = await this.resolveRustGraphBinary(true);
+    const binary = await (input.binaryPromise ?? this.resolveRustGraphBinary(true));
     if (!binary) {
       throw new Error('zoek-rs binary is unavailable for rust-native call graph rebuild');
     }
@@ -5224,10 +5226,40 @@ export class CallGraphService implements vscode.Disposable {
     if (!folder) {
       throw new Error('No workspace folder is open.');
     }
+    const workspaceRoot = folder.uri.fsPath;
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const maxFileSize = getConfiguredCallGraphMaxFileSize(cfg);
+    const parseConcurrency = getConfiguredCallGraphConcurrency(cfg);
+    const backend = getConfiguredCallGraphBackend(cfg);
+    const configSignature = getCallGraphConfigSignature(cfg);
+    // Runtime preparation can include a release build. Start it immediately and
+    // overlap it with cache restore/cleanup instead of putting both waits in
+    // series before the first indexing progress event.
+    const binaryPromise = backend === 'rust-native'
+      ? (() => {
+        report?.({
+          stage: 'discovering',
+          message: 'preparing rust graph runtime',
+          current: 0,
+          total: 0,
+          parsedFiles: 0,
+          skippedFiles: 0,
+          warningCount: 0,
+          elapsedMs: 0,
+          concurrency: parseConcurrency,
+          maxConcurrency: parseConcurrency,
+        });
+        const preparation = this.resolveRustGraphBinary(true);
+        // The restore gate can stay pending longer than runtime preparation.
+        // Mark an early rejection handled here; the original promise is still
+        // awaited below and preserves the rebuild error for its caller.
+        void preparation.catch(() => undefined);
+        return preparation;
+      })()
+      : undefined;
     if (this.restorePromise) {
       await this.restorePromise;
     }
-    const workspaceRoot = folder.uri.fsPath;
     this.cancelRustGraphProcesses('call graph rebuild started', {
       kinds: ['graph-query', 'graph-symbol-query', 'graph-index'],
     });
@@ -5236,11 +5268,6 @@ export class CallGraphService implements vscode.Disposable {
     if (options.force) {
       await this.clearForForceRebuild(workspaceRoot);
     }
-    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-    const maxFileSize = getConfiguredCallGraphMaxFileSize(cfg);
-    const parseConcurrency = getConfiguredCallGraphConcurrency(cfg);
-    const backend = getConfiguredCallGraphBackend(cfg);
-    const configSignature = getCallGraphConfigSignature(cfg);
     if (backend === 'javascript') {
       return this.rebuildInWorkerProcess({
         workspaceRoot,
@@ -5263,6 +5290,7 @@ export class CallGraphService implements vscode.Disposable {
       excludeGlobs: getConfiguredCallGraphExcludeGlobs(cfg),
       parseConcurrency,
       configSignature,
+      binaryPromise,
       token,
       report,
     });
