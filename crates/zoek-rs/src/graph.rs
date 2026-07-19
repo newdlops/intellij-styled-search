@@ -211,13 +211,13 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// v7: position-INDEPENDENT symbol ids (see `stable_symbol_id`) — a symbol's id no
-// longer encodes its line/column, so a body edit keeps every symbol id stable and
-// the overlay update can skip re-resolving importers whose target ids did not
-// change. The id scheme is on-disk-incompatible with v6 (every symbol/target id
-// differs), so the bump forces a one-time reindex (paired with the TS
-// CALL_GRAPH_CACHE_VERSION bump).
-const GRAPH_VERSION: u32 = 7;
+// v8: token-shape sidecars include concrete-target cardinality so lazy
+// unresolved candidates are attached only to structurally unique targets (or
+// one complete ancestor/implementation family). The new sidecar is required at
+// query time; raw MAY candidates remain conservative without being multiplied
+// into every symbol's visible usage list. This forces a one-time reindex (paired
+// with the TS cache bump).
+const GRAPH_VERSION: u32 = 8;
 const GRAPH_FILE_NAME: &str = "callgraph-relations.tsv";
 const GRAPH_SYMBOL_FILE_NAME: &str = "callgraph-symbols.tsv";
 const GRAPH_COUNT_FILE_NAME: &str = "callgraph-counts.tsv";
@@ -260,6 +260,8 @@ const GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX: &str = "callgraph-hierarchy-fa
 // token-shape byte-identical to a full rebuild. Sharded by the (lang,scope,name)
 // key hash so a delta loads only the affected keys' shards.
 const GRAPH_TOKEN_SHAPE_SHARD_PREFIX: &str = "callgraph-token-shape-by-key";
+const GRAPH_TOKEN_SHAPE_TARGET_COUNT_SHARD_PREFIX: &str =
+    "callgraph-token-shape-target-count-by-key";
 const GRAPH_FILE_TABLE_NAME: &str = "callgraph-file-table.bin";
 const GRAPH_SHARD_COUNT: usize = 128;
 // Per-source-file EXACT-scoped outgoing-target tally (overlay count deltas).
@@ -269,10 +271,9 @@ const BOUND_MAY: u8 = 0b0001;
 const BOUND_MUST: u8 = 0b0010;
 const _BOUND_OBSERVED: u8 = 0b0100;
 const MAX_EAGER_IMPLEMENTATION_SYMBOLS: usize = 50_000;
-// Bounds only the eagerly duplicated `(candidate site × same-key symbol)` rows.
-// Every candidate is still persisted once in GRAPH_TOKEN_SHAPE_SHARD_PREFIX and
-// is materialized lazily by query_graph, so exceeding this performance guard can
-// no longer turn into a false negative.
+// Bounds eager rows for an assignable token-shape key. Every candidate is still
+// persisted once and can be materialized lazily when a query proves a unique
+// target or a complete ancestor/implementation family.
 const MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY: usize = 512;
 const RETURN_TYPE_FACT_PREFIX: &str = "__ijss_return_of__:";
 const DJANGO_MODEL_MANAGER_FACT_PREFIX: &str = "__ijss_django_model_manager_of__:";
@@ -978,6 +979,19 @@ struct TokenShapeCandidate {
     access_kind_id: u8,
 }
 
+/// Number of concrete declarations eligible for each access shape under a
+/// `(language, source-root, name)` token-shape key. An unresolved occurrence
+/// can be attributed to a concrete symbol only when the corresponding count is
+/// normally exactly one. Larger counts remain part of the conservative MAY
+/// envelope; query-time hierarchy evidence may additionally recognize one
+/// complete ancestor/implementation family without duplicating into unrelated
+/// same-name symbols.
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+struct TokenShapeTargetCount {
+    bare: u32,
+    member: u32,
+}
+
 impl TokenShapeCandidate {
     fn access_kind_id(self) -> u8 {
         self.access_kind_id & TOKEN_SHAPE_CANDIDATE_ACCESS_MASK
@@ -1008,8 +1022,8 @@ fn token_shape_shard_for_key(key: (u64, u64, u64)) -> usize {
 /// hash order — caused ~555K extra/missing token-shape churn; even a
 /// `(file_id,line,col)` sort diverges because `build_file_graph` does not emit a
 /// file's sites in strict position order.) Every site is retained once per key:
-/// high-fanout keys are served lazily at query time instead of being discarded
-/// or eagerly multiplied by every same-key symbol. Sharded by key.
+/// assignable high-fanout keys are served lazily at query time instead of being
+/// discarded or eagerly multiplied by every same-key symbol. Sharded by key.
 /// Returns total bytes written (for sizing; not added to the manifest summary).
 fn write_token_shape_tally_shards(
     workspace_root: &Path,
@@ -1115,6 +1129,87 @@ fn write_token_shape_tally_candidates(
     Ok(total)
 }
 
+/// Persist the target cardinality used by both eager count construction and
+/// query-time lazy token-shape materialization. This is deliberately separate
+/// from the candidate tally: incremental updates maintain candidate lists by
+/// touched key, while cardinality is rebuilt from the current compact symbols.
+fn write_token_shape_target_count_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    bare: &AHashMap<(u64, u64, u64), usize>,
+    member: &AHashMap<(u64, u64, u64), usize>,
+) -> io::Result<u64> {
+    let mut shards: Vec<HashMap<(u64, u64, u64), TokenShapeTargetCount>> =
+        (0..GRAPH_SHARD_COUNT).map(|_| HashMap::default()).collect();
+    for (key, count) in bare {
+        shards[token_shape_shard_for_key(*key)]
+            .entry(*key)
+            .or_default()
+            .bare = u32::try_from(*count).unwrap_or(u32::MAX);
+    }
+    for (key, count) in member {
+        shards[token_shape_shard_for_key(*key)]
+            .entry(*key)
+            .or_default()
+            .member = u32::try_from(*count).unwrap_or(u32::MAX);
+    }
+    let mut total = 0u64;
+    for (shard_idx, map) in shards.into_iter().enumerate() {
+        let entries: Vec<((u64, u64, u64), TokenShapeTargetCount)> =
+            map.into_iter().collect();
+        let path = graph_shard_path(
+            workspace_root,
+            config,
+            GRAPH_TOKEN_SHAPE_TARGET_COUNT_SHARD_PREFIX,
+            shard_idx,
+        );
+        let bytes = bincode::serialize(&entries).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("token-shape target count ser: {e}"),
+            )
+        })?;
+        write_atomically(&path, &bytes)?;
+        total += bytes.len() as u64;
+    }
+    Ok(total)
+}
+
+fn load_token_shape_target_counts(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    only_shards: Option<&HashSet<usize>>,
+) -> io::Result<HashMap<(u64, u64, u64), TokenShapeTargetCount>> {
+    let mut out = HashMap::default();
+    for shard in 0..GRAPH_SHARD_COUNT {
+        if only_shards.is_some_and(|selected| !selected.contains(&shard)) {
+            continue;
+        }
+        let path = graph_shard_path(
+            workspace_root,
+            config,
+            GRAPH_TOKEN_SHAPE_TARGET_COUNT_SHARD_PREFIX,
+            shard,
+        );
+        if !path.exists() {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let entries: Vec<((u64, u64, u64), TokenShapeTargetCount)> =
+            bincode::deserialize(&bytes).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("token-shape target count de: {e}"),
+                )
+            })?;
+        out.extend(entries);
+    }
+    Ok(out)
+}
+
 /// A2 Stage B: load the persisted token-shape candidate tally and split each
 /// key's candidates into a `bare` and a `member` map keyed by the same
 /// `(lang_hash, scope_hash, name_hash)` triple as the build side. The split is
@@ -1172,13 +1267,69 @@ fn load_token_shape_tally(
     Ok((bare, member))
 }
 
+/// A multi-declaration member key is still a single semantic family when the
+/// queried declaration is the ancestor contract and every other eligible
+/// declaration is its method implementation. This preserves interface/base
+/// Find Usages without reopening unrelated same-name fanout.
+fn token_shape_member_family_covers_key(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbol: &GraphSymbol,
+    target_count: u32,
+) -> io::Result<bool> {
+    if target_count <= 1 || symbol.kind != "method" {
+        return Ok(target_count == 1);
+    }
+    let Some(container_id) = symbol.container_id.as_deref() else {
+        return Ok(false);
+    };
+    let container_ids: HashSet<String> = [container_id.to_string()].into_iter().collect();
+    let Some(container) = read_symbols_for_symbol_ids_indexed(
+        workspace_root,
+        config,
+        &container_ids,
+    )?
+    .into_iter()
+    .find(|candidate| candidate.id == container_id)
+    else {
+        return Ok(false);
+    };
+    let (descendant_ids, descendant_names) =
+        descendant_type_ids_and_names_indexed(workspace_root, config, &container)?;
+    if descendant_ids.is_empty() || descendant_names.is_empty() {
+        return Ok(false);
+    }
+    let target_scope = source_scope_key(&symbol.rel_path);
+    let mut related_ids: HashSet<String> = [symbol.id.clone()].into_iter().collect();
+    for candidate in read_methods_for_container_names_indexed(
+        workspace_root,
+        config,
+        &descendant_names,
+        &symbol.name,
+    )? {
+        if candidate.language == symbol.language
+            && source_scope_key(&candidate.rel_path) == target_scope
+            && candidate.name_hash == symbol.name_hash
+            && candidate
+                .container_id
+                .as_deref()
+                .is_some_and(|id| descendant_ids.contains(id))
+            && uses_member_token_shape_for_likely_count(&candidate)
+        {
+            related_ids.insert(candidate.id);
+        }
+    }
+    Ok(related_ids.len() as u64 == target_count as u64)
+}
+
 /// Append the conservative occurrence set for the requested symbols from the
 /// lossless token-shape sidecar. Candidates are stored once per
 /// `(language, source-root, access-shape, name)` key and bound to a concrete
 /// target only here, avoiding an eager `sites × same-name symbols` explosion.
 /// Stronger semantic/import/type references win during the caller's occurrence
-/// dedupe; these rows exist to guarantee that an unresolved candidate is never
-/// silently absent from Find Usages.
+/// dedupe. Raw candidates are attached only when the key has one eligible target
+/// or the queried ancestor owns the key's complete implementation family. Other
+/// multi-target keys have no structural evidence for per-symbol assignment.
 fn append_lazy_token_shape_references(
     workspace_root: &Path,
     config: &EngineConfig,
@@ -1201,6 +1352,64 @@ fn append_lazy_token_shape_references(
         })
         .collect();
     let (bare, member) = load_token_shape_tally(workspace_root, config, Some(&shards))?;
+    let mut target_counts =
+        load_token_shape_target_counts(workspace_root, config, Some(&shards))?;
+    let built_at_unix_ms =
+        read_built_at_unix_ms(&graph_manifest_path(workspace_root, config)).unwrap_or(0);
+    let overlay = crate::graph_overlay::GraphOverlay::load_valid(
+        workspace_root,
+        config,
+        built_at_unix_ms,
+    );
+    for (key, (bare_delta, member_delta)) in overlay.total_token_shape_target_deltas() {
+        if !shards.contains(&token_shape_shard_for_key(key)) {
+            continue;
+        }
+        let count = target_counts.entry(key).or_default();
+        // The overlay does not rewrite the candidate tally. Positive deltas can
+        // safely make a base key ambiguous immediately; a negative delta must
+        // not make it newly assignable while deleted/changed base candidates
+        // remain in that tally. Compaction applies the exact lower count.
+        count.bare = (count.bare as i64 + bare_delta.max(0))
+            .clamp(0, u32::MAX as i64) as u32;
+        count.member = (count.member as i64 + member_delta.max(0))
+            .clamp(0, u32::MAX as i64) as u32;
+    }
+
+    // Eager token-shape and unique-name rows were written against the base
+    // cardinality. An overlay can add or remove same-key declarations before
+    // compaction, so discard any now-ambiguous provisional rows as well as
+    // suppressing lazy ones. Import/type/lexical rows are independent of this
+    // cardinality and remain untouched.
+    let mut assignable_targets: HashSet<&str> = HashSet::default();
+    for symbol in symbols {
+        let key = (
+            stable_hash(&symbol.language),
+            stable_hash(source_scope_key(&symbol.rel_path)),
+            symbol.name_hash,
+        );
+        let count = target_counts.get(&key).copied().unwrap_or_default();
+        let assignable = if uses_member_token_shape_for_likely_count(symbol) {
+            token_shape_member_family_covers_key(
+                workspace_root,
+                config,
+                symbol,
+                count.member,
+            )?
+        } else {
+            count.bare == 1
+        };
+        if assignable {
+            assignable_targets.insert(symbol.id.as_str());
+        }
+    }
+    references.retain(|reference| {
+        !matches!(reference.provenance.as_ref(), "token-shape" | "unique-name")
+            || reference
+                .target_symbol_id
+                .as_deref()
+                .is_some_and(|target| assignable_targets.contains(target))
+    });
 
     for symbol in symbols {
         let key = (
@@ -1209,12 +1418,14 @@ fn append_lazy_token_shape_references(
             symbol.name_hash,
         );
         let member_symbol = uses_member_token_shape_for_likely_count(symbol);
-        let primary = if member_symbol {
-            member.get(&key)
-        } else {
-            bare.get(&key)
-        };
-        let declaration_fallback = member_symbol.then(|| bare.get(&key)).flatten();
+        let target_count = target_counts.get(&key).copied().unwrap_or_default();
+        let primary = assignable_targets
+            .contains(symbol.id.as_str())
+            .then(|| if member_symbol { member.get(&key) } else { bare.get(&key) })
+            .flatten();
+        let declaration_fallback = (member_symbol && target_count.bare == 1)
+            .then(|| bare.get(&key))
+            .flatten();
         references.reserve(
             primary.map(Vec::len).unwrap_or(0)
                 + declaration_fallback.map(Vec::len).unwrap_or(0),
@@ -1268,9 +1479,9 @@ fn append_lazy_token_shape_references(
 /// A2 Stage B: rebuild the GLOBAL token-shape references from the persisted
 /// candidate tally. Mirrors `apply_token_shape_likely_count_baseline`'s gate
 /// EXACTLY (per-symbol bare/member `symbol_count`; per key `usage_baseline`,
-/// `call_baseline`, `baseline_sites`, `symbol_count_for_key`; `usage_likely =
-/// usage_must.max(usage_baseline)`; emit only when `reference_count <
-/// usage_likely` and `fanout <= MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY`),
+/// `call_baseline`, `baseline_sites`, `symbol_count_for_key`; token-shape
+/// candidates contribute only when `symbol_count_for_key == 1`, then emit when
+/// `reference_count < usage_likely` and fanout is bounded),
 /// but sourced from the self-contained tally instead of `ref_sites`:
 /// `usage_baseline = non_definition_candidates.len()`, and each emitted
 /// `GraphReference` is built from the `TokenShapeCandidate` exactly as
@@ -1302,7 +1513,12 @@ fn emit_token_shape_refs_from_tally(
     // token-shape of those same targets.
     recompute_keys: &AHashSet<(u64, u64, u64)>,
     affected_targets: &AHashSet<u64>,
-) -> (Vec<GraphReference>, AHashSet<u64>) {
+) -> (
+    Vec<GraphReference>,
+    AHashSet<u64>,
+    AHashMap<(u64, u64, u64), usize>,
+    AHashMap<(u64, u64, u64), usize>,
+) {
     // Per-symbol bare/member symbol_count over the same key as the build side —
     // identical to apply_token_shape_likely_count_baseline's first pass — fused
     // with the recompute_set build (both need each symbol's key).
@@ -1359,6 +1575,9 @@ fn emit_token_shape_refs_from_tally(
                     bare_symbol_count.get(&key).copied().unwrap_or(0),
                 )
             };
+        if symbol_count_for_key != 1 {
+            continue;
+        }
         // usage_baseline == number of non-definition likely sites for the key
         // (build side does one +1 per usage candidate). `call_baseline` (build side's
         // `*_call_likely`) only feeds `count.calls_in_likely`, which does not
@@ -1433,7 +1652,12 @@ fn emit_token_shape_refs_from_tally(
             }
         }
     }
-    (out, recompute_set)
+    (
+        out,
+        recompute_set,
+        bare_symbol_count,
+        member_symbol_count,
+    )
 }
 
 /// B6 stage-4/5c: the columns the resolve worker's cold per-file cache-miss
@@ -3505,11 +3729,18 @@ where
                         &token_shape_tally.1,
                         write_cols_ref,
                     )?;
+                    let target_count_bytes = write_token_shape_target_count_shards(
+                        workspace_root,
+                        config,
+                        &token_shape_tally.2,
+                        &token_shape_tally.3,
+                    )?;
                     if std::env::var("ZOEK_RESOLVE_PROBE").is_ok() {
                         eprintln!(
-                            "[a2] token_shape_tally_write={}ms bytes={} bare_keys={} member_keys={}",
+                            "[a2] token_shape_tally_write={}ms bytes={} target_count_bytes={} bare_keys={} member_keys={}",
                             _t_ts.elapsed().as_millis(),
                             ts_bytes,
+                            target_count_bytes,
                             token_shape_tally.0.len(),
                             token_shape_tally.1.len()
                         );
@@ -3824,6 +4055,11 @@ pub fn update_graph_native(
             workspace_root,
             config,
             GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX,
+        )
+        && graph_shard_family_available(
+            workspace_root,
+            config,
+            GRAPH_TOKEN_SHAPE_TARGET_COUNT_SHARD_PREFIX,
         );
     if !sidecars_ready {
         eprintln!(
@@ -4376,7 +4612,12 @@ pub fn update_graph_native(
         compact_syms.push(compact_sym_from_graph(s, u32::MAX));
     }
     let _t = std::time::Instant::now();
-    let (token_shape_refs, recompute_set) = emit_token_shape_refs_from_tally(
+    let (
+        token_shape_refs,
+        recompute_set,
+        bare_token_shape_target_counts,
+        member_token_shape_target_counts,
+    ) = emit_token_shape_refs_from_tally(
         &compact_syms,
         &bare_tally,
         &member_tally,
@@ -4395,11 +4636,18 @@ pub fn update_graph_native(
         let _t_tw = std::time::Instant::now();
         let ts_wb =
             write_token_shape_tally_candidates(workspace_root, config, &bare_tally, &member_tally)?;
+        let target_count_wb = write_token_shape_target_count_shards(
+            workspace_root,
+            config,
+            &bare_token_shape_target_counts,
+            &member_token_shape_target_counts,
+        )?;
         if probe {
             eprintln!(
-                "[flow] token_shape_tally_writeback={}ms bytes={}",
+                "[flow] token_shape_tally_writeback={}ms bytes={} target_count_bytes={}",
                 _t_tw.elapsed().as_millis(),
-                ts_wb
+                ts_wb,
+                target_count_wb
             );
         }
     }
@@ -4665,10 +4913,11 @@ fn parse_overlay_file(
 ///
 /// What it deliberately does NOT do (the O(total) phases `update_graph_native`
 /// pays): no `partition_prior_references_streaming` (the 9s carry read), no
-/// full resolve, no token-shape tally load/emit, no `write_store` shard rewrite.
-/// Token-shape ("possible") refs and usage counts stay at their base values and
-/// are refreshed at compaction; the overlay carries the exact resolved graph
-/// (the correctness-critical part) for the edited/affected files.
+/// full resolve, no token-shape candidate-tally load/emit, no `write_store`
+/// shard rewrite. The overlay carries exact resolved edges plus per-key target
+/// cardinality deltas, so adding an otherwise ambiguous declaration suppresses
+/// stale provisional bindings immediately. Candidate rows themselves are
+/// refreshed at compaction.
 ///
 /// Falls back to `update_graph_native` (the full path, which also builds the v3
 /// sidecars the lazy resolve needs) when those sidecars are absent or there is
@@ -4709,6 +4958,11 @@ pub fn overlay_update_graph_native(
             workspace_root,
             config,
             GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX,
+        )
+        && graph_shard_family_available(
+            workspace_root,
+            config,
+            GRAPH_TOKEN_SHAPE_TARGET_COUNT_SHARD_PREFIX,
         );
     if !sidecars_ready || base_built_at == 0 {
         if probe {
@@ -4971,6 +5225,67 @@ pub fn overlay_update_graph_native(
         }
     }
 
+    // Compute each changed/deleted file's target-cardinality delta against the
+    // immutable base. Keeping this in the overlay prevents a newly introduced
+    // same-name declaration from leaving lazy token-shape queries falsely
+    // unique until compaction.
+    type TokenShapeTargetDelta =
+        std::collections::BTreeMap<(u64, u64, u64), (i32, i32)>;
+    let mut base_token_targets_by_file: HashMap<String, TokenShapeTargetDelta> =
+        HashMap::default();
+    for symbol in &prior_compact {
+        let key = (
+            symbol.lang_hash,
+            stable_hash(source_scope_key(&symbol.rel_path)),
+            symbol.name_hash,
+        );
+        let value = base_token_targets_by_file
+            .entry(symbol.rel_path.to_string())
+            .or_default()
+            .entry(key)
+            .or_insert((0, 0));
+        if symbol.is_member() {
+            value.1 += 1;
+        } else {
+            value.0 += 1;
+        }
+    }
+    let mut current_token_targets_by_file: HashMap<String, TokenShapeTargetDelta> =
+        HashMap::default();
+    for symbol in &changed_full_symbols {
+        let key = (
+            stable_hash(&symbol.language),
+            stable_hash(source_scope_key(&symbol.rel_path)),
+            symbol.name_hash,
+        );
+        let value = current_token_targets_by_file
+            .entry(symbol.rel_path.clone())
+            .or_default()
+            .entry(key)
+            .or_insert((0, 0));
+        if uses_member_token_shape_for_likely_count(symbol) {
+            value.1 += 1;
+        } else {
+            value.0 += 1;
+        }
+    }
+    let mut token_target_deltas_by_file: HashMap<String, TokenShapeTargetDelta> =
+        HashMap::default();
+    for rel in &exclude_paths {
+        let mut delta = base_token_targets_by_file.remove(rel).unwrap_or_default();
+        for value in delta.values_mut() {
+            value.0 = -value.0;
+            value.1 = -value.1;
+        }
+        for (key, value) in current_token_targets_by_file.remove(rel).unwrap_or_default() {
+            let target = delta.entry(key).or_insert((0, 0));
+            target.0 += value.0;
+            target.1 += value.1;
+        }
+        delta.retain(|_, value| *value != (0, 0));
+        token_target_deltas_by_file.insert(rel.clone(), delta);
+    }
+
     // ---- group by source file → per-file overlay entries ----
     let mut refs_by_file: HashMap<String, Vec<GraphReference>> = HashMap::default();
     for r in new_exact_refs {
@@ -5019,12 +5334,26 @@ pub fn overlay_update_graph_native(
                 refs,
                 symbols: syms_by_file.remove(rel).unwrap_or_default(),
                 contrib,
+                token_shape_target_deltas: token_target_deltas_by_file
+                    .remove(rel)
+                    .unwrap_or_default(),
             },
         );
     }
     // Deleted files: tombstone (supersede base refs + symbols, supply neither).
     for rel in &deleted_rel {
-        overlay.upsert_tombstone(rel, GraphOverlayEntryKind::Deleted);
+        overlay.upsert(
+            rel,
+            GraphOverlayEntry {
+                kind: GraphOverlayEntryKind::Deleted,
+                refs: Vec::new(),
+                symbols: Vec::new(),
+                contrib: std::collections::BTreeMap::new(),
+                token_shape_target_deltas: token_target_deltas_by_file
+                    .remove(rel)
+                    .unwrap_or_default(),
+            },
+        );
     }
     // Affected (importer) files: supersede base refs only (symbols unchanged).
     for rel in affected_paths.iter().filter(|r| !exclude_paths.contains(*r)) {
@@ -5037,6 +5366,7 @@ pub fn overlay_update_graph_native(
                 refs,
                 symbols: Vec::new(),
                 contrib,
+                token_shape_target_deltas: std::collections::BTreeMap::new(),
             },
         );
     }
@@ -8134,7 +8464,7 @@ fn resolve_ref_sites(
     }
     let light_in = std::mem::take(&mut intermediate.light_references);
     let mut light_out_f: Vec<LightRef> = Vec::new();
-    apply_token_shape_likely_count_baseline(
+    let _ = apply_token_shape_likely_count_baseline(
         symbols,
         ref_sites,
         &mut intermediate.counts,
@@ -8191,9 +8521,14 @@ fn resolve_ref_sites_for_rebuild(
     light_sender: Option<&crossbeam_channel::Sender<Vec<LightRef>>>,
 ) -> (
     ResolutionResult,
-    // A2: token-shape likely-site idx maps (bare, member), moved out after phase
-    // F so the caller — which holds `write_cols` — can persist the candidates.
-    (HashMap<(u64, u64, u64), Vec<u32>>, HashMap<(u64, u64, u64), Vec<u32>>),
+    // A2: token-shape likely-site idx maps plus the corresponding concrete
+    // target counts (bare/member), moved out after phase F for persistence.
+    (
+        HashMap<(u64, u64, u64), Vec<u32>>,
+        HashMap<(u64, u64, u64), Vec<u32>>,
+        AHashMap<(u64, u64, u64), usize>,
+        AHashMap<(u64, u64, u64), usize>,
+    ),
 ) {
     let mut intermediate = resolve_ref_sites_a_to_e(
         symbols,
@@ -8239,7 +8574,7 @@ fn resolve_ref_sites_for_rebuild(
         None
     };
     let _t_pf = std::time::Instant::now();
-    apply_token_shape_likely_count_baseline(
+    let token_shape_target_counts = apply_token_shape_likely_count_baseline(
         symbols,
         ref_sites,
         &mut intermediate.counts,
@@ -8273,6 +8608,8 @@ fn resolve_ref_sites_for_rebuild(
     let token_shape_tally = (
         std::mem::take(&mut intermediate.bare_likely_sites_by_scope_and_name),
         std::mem::take(&mut intermediate.member_likely_sites_by_scope_and_name),
+        token_shape_target_counts.0,
+        token_shape_target_counts.1,
     );
     (
         ResolutionResult {
@@ -11229,6 +11566,9 @@ fn apply_token_shape_likely_count_baseline(
     // `site_partial` from `SiteCols` instead of `ref_sites[idx]` (which is
     // dropped on the channel rebuild). `None` recomputes it from `ref_sites`.
     prebuilt_site_cols: Option<&[SiteCols]>,
+) -> (
+    AHashMap<(u64, u64, u64), usize>,
+    AHashMap<(u64, u64, u64), usize>,
 ) {
     let mut bare_symbol_count_by_scope_and_name: AHashMap<(u64, u64, u64), usize> =
         AHashMap::default();
@@ -11361,17 +11701,23 @@ fn apply_token_shape_likely_count_baseline(
                 .get(&symbol.id)
                 .copied()
                 .unwrap_or_default();
-            // The baseline remains queryable even when eager row multiplication
-            // exceeds the guard below: every candidate is persisted once in the
-            // token-shape sidecar and query_graph materializes it lazily. Never
-            // zero this count merely because eager duplication was skipped.
-            count.usage_likely = count.usage_must.max(usage_baseline);
-            count.calls_in_likely = count.calls_in_must.max(call_baseline);
+            // A raw token shape identifies a concrete target only when the
+            // language/source-root/access/name key is unique. With multiple
+            // eligible declarations the occurrence remains MAY evidence; adding
+            // it to every declaration would multiply one unknown occurrence into
+            // many false per-symbol usages.
+            if symbol_count_for_key == 1 {
+                count.usage_likely = count.usage_must.max(usage_baseline);
+                count.calls_in_likely = count.calls_in_must.max(call_baseline);
+            } else {
+                count.usage_likely = count.usage_must;
+                count.calls_in_likely = count.calls_in_must;
+            }
             let mut reference_count = reference_counts_ref
                 .get(&symbol.id_u64)
                 .copied()
                 .unwrap_or(0);
-            if reference_count < count.usage_likely {
+            if symbol_count_for_key == 1 && reference_count < count.usage_likely {
                 if let Some(sites) = baseline_sites {
                     let fanout = usage_baseline.saturating_mul(symbol_count_for_key);
                     if fanout <= MAX_TOKEN_SHAPE_REFERENCE_FANOUT_PER_KEY {
@@ -11487,6 +11833,10 @@ fn apply_token_shape_likely_count_baseline(
         light_out.append(&mut local_light_refs);
         dedup.extend(local_dedup);
     }
+    (
+        bare_symbol_count_by_scope_and_name,
+        member_symbol_count_by_scope_and_name,
+    )
 }
 
 /// A2 (incremental counts): set `usage_likely` / `calls_in_likely` from the
@@ -19516,6 +19866,115 @@ mod tests {
         let _ = fs::remove_dir_all(&ws);
     }
 
+    #[test]
+    fn overlay_target_cardinality_suppresses_stale_unique_token_shape_refs() {
+        let ws = unique_temp_workspace("zoek-overlay-token-shape-cardinality");
+        let _ = fs::remove_dir_all(&ws);
+        let config = EngineConfig::default();
+        fs::create_dir_all(ws.join("pkg")).expect("create fixture package");
+        let first_path = ws.join("pkg/first.ts");
+        fs::write(
+            &first_path,
+            "export class FirstProvider {\n  collect() {}\n}\n",
+        )
+        .expect("write first provider");
+        let mut consumer = String::from("export function use(source: unknown) {\n");
+        for _ in 0..20 {
+            consumer.push_str("  source.collect();\n");
+        }
+        consumer.push_str("}\n");
+        fs::write(ws.join("pkg/use.ts"), consumer).expect("write consumer");
+
+        let built_at = unix_millis_now();
+        let mut noop = |_progress: GraphRebuildProgress| {};
+        rebuild_graph_native(&ws, built_at, &config, 0, &mut noop)
+            .expect("full graph rebuild");
+        let first_before = query_graph_document_symbols(
+            &ws,
+            &file_uri(&first_path),
+            None,
+            None,
+            20,
+            &config,
+        )
+        .expect("query first provider")
+        .expect("graph index")
+        .symbols
+        .into_iter()
+        .find(|symbol| symbol.name == "collect")
+        .expect("first collect method");
+        assert_eq!(first_before.usage_count, Some(20));
+
+        let second_path = ws.join("pkg/second.ts");
+        fs::write(
+            &second_path,
+            "export class SecondProvider {\n  collect() {}\n}\n",
+        )
+        .expect("write second provider");
+        overlay_update_graph_native(
+            &ws,
+            std::slice::from_ref(&second_path),
+            &[],
+            built_at,
+            &config,
+            0,
+        )
+        .expect("overlay update");
+        let key = (
+            stable_hash(&first_before.language),
+            stable_hash(source_scope_key(&first_before.rel_path)),
+            first_before.name_hash,
+        );
+        let overlay = crate::graph_overlay::GraphOverlay::load_valid(&ws, &config, built_at);
+        assert!(overlay.entry_count() > 0, "test must exercise the overlay path");
+        assert_eq!(
+            overlay.total_token_shape_target_deltas().get(&key),
+            Some(&(0, 1)),
+            "the added member must increment its structural target key"
+        );
+        let mut selected = HashSet::default();
+        selected.insert(token_shape_shard_for_key(key));
+        assert_eq!(
+            load_token_shape_target_counts(&ws, &config, Some(&selected))
+                .expect("load base target counts")
+                .get(&key)
+                .map(|count| count.member),
+            Some(1),
+            "the immutable base contains the original unique member"
+        );
+
+        for path in [&first_path, &second_path] {
+            let document = query_graph_document_symbols(
+                &ws,
+                &file_uri(path),
+                None,
+                None,
+                20,
+                &config,
+            )
+            .expect("query provider after overlay")
+            .expect("graph index");
+            let method = document
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == "collect")
+                .expect("collect method after overlay");
+            assert_eq!(
+                method.usage_count,
+                Some(0),
+                "adding a same-key declaration must immediately make raw candidates ambiguous"
+            );
+            let usages = query_graph(&ws, &method.id, 100, &config)
+                .expect("query method usages")
+                .expect("graph index");
+            assert!(usages
+                .references
+                .iter()
+                .all(|reference| reference.provenance.as_ref() != "token-shape"));
+        }
+        let _ = fs::remove_dir_all(&ws);
+    }
+
     fn resolve_test_entries(entries: &[CorpusEntry]) -> (Vec<GraphSymbol>, ResolutionResult) {
         let mut symbols = Vec::new();
         let mut refs = Vec::new();
@@ -20279,8 +20738,8 @@ def use(client):
                 .get(first_shared_id)
                 .map(|count| count.usage_likely)
                 .unwrap_or(0),
-            1,
-            "ambiguous member names still receive the token-shape likely baseline"
+            0,
+            "an unresolved token must not be attributed to the first same-key declaration"
         );
         assert_eq!(
             result
@@ -20288,8 +20747,8 @@ def use(client):
                 .get(second_shared_id)
                 .map(|count| count.usage_likely)
                 .unwrap_or(0),
-            1,
-            "ambiguous member names still receive the token-shape likely baseline"
+            0,
+            "an unresolved token must not be attributed to the second same-key declaration"
         );
         assert!(
             result.references.iter().any(|reference| {
@@ -20356,7 +20815,7 @@ def use(client):
     }
 
     #[test]
-    fn token_shape_likely_baseline_materializes_bounded_possible_references() {
+    fn token_shape_likely_baseline_does_not_multiply_ambiguous_targets() {
         let provider = test_entry(
             "pkg/provider.py",
             r#"
@@ -20379,25 +20838,25 @@ def use_collection(first, second):
         );
         let (symbols, result) = resolve_test_entries(&[provider, consumer]);
         let first_id = symbol_id(&symbols, "FirstProvider.collect_items");
+        let second_id = symbol_id(&symbols, "SecondProvider.collect_items");
         let count = result.counts.get(first_id).copied().unwrap_or_default();
-        assert_eq!(count.usage_likely, 2);
+        assert_eq!(count.usage_likely, 0);
         assert_eq!(count.usage_must, 0);
         let refs: Vec<_> = result
             .references
             .iter()
-            .filter(|reference| reference.target_symbol_id.as_deref() == Some(first_id))
+            .filter(|reference| {
+                matches!(
+                    reference.target_symbol_id.as_deref(),
+                    Some(target) if target == first_id || target == second_id
+                ) && &*reference.provenance == "token-shape"
+            })
             .collect();
         assert_eq!(
             refs.len(),
-            2,
-            "bounded token-shape fallback counts should have detail references for UI panels"
+            0,
+            "unknown receivers must not duplicate the same occurrences across unrelated declarations"
         );
-        assert!(refs
-            .iter()
-            .all(|reference| &*reference.confidence == "possible"));
-        assert!(refs
-            .iter()
-            .all(|reference| &*reference.provenance == "token-shape"));
     }
 
     #[test]
@@ -20454,6 +20913,129 @@ def use_collection(first, second):
             .references
             .iter()
             .all(|reference| reference.confidence.as_ref() == "possible"));
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn high_fanout_ambiguous_token_shape_is_not_bound_to_each_declaration() {
+        let ws = unique_temp_workspace("zoek-token-shape-ambiguous-query");
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(ws.join("pkg")).expect("create fixture directory");
+        let provider_path = ws.join("pkg/provider.ts");
+        fs::write(
+            &provider_path,
+            "export class FirstProvider {\n\
+               collect() {}\n\
+             }\n\
+             export class SecondProvider {\n\
+               collect() {}\n\
+             }\n",
+        )
+        .expect("write provider");
+        let mut consumer = String::from("export function use(source: unknown) {\n");
+        for _ in 0..600 {
+            consumer.push_str("  source.collect();\n");
+        }
+        consumer.push_str("}\n");
+        fs::write(ws.join("pkg/consumer.ts"), consumer).expect("write consumer");
+
+        let config = EngineConfig::default();
+        let mut noop = |_progress: GraphRebuildProgress| {};
+        rebuild_graph_native(&ws, unix_millis_now(), &config, 0, &mut noop)
+            .expect("rebuild graph");
+        let symbols = query_graph_document_symbols(
+            &ws,
+            &file_uri(&provider_path),
+            None,
+            None,
+            20,
+            &config,
+        )
+        .expect("query provider symbols")
+        .expect("graph index");
+        let methods: Vec<_> = symbols
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == "collect")
+            .collect();
+        assert_eq!(methods.len(), 2);
+        for method in methods {
+            assert_eq!(
+                method.usage_count,
+                Some(0),
+                "same-key raw tokens are not per-declaration usages"
+            );
+            let usages = query_graph(&ws, &method.id, 700, &config)
+                .expect("query usages")
+                .expect("graph index");
+            assert!(
+                usages
+                    .references
+                    .iter()
+                    .all(|reference| reference.provenance.as_ref() != "token-shape"),
+                "lazy query must apply the same uniqueness rule as eager counts"
+            );
+        }
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn inheritance_family_requires_exact_descendant_container_ids() {
+        let ws = unique_temp_workspace("zoek-token-shape-inheritance-identity");
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(ws.join("pkg/feature")).expect("create feature directory");
+        fs::create_dir_all(ws.join("pkg/other")).expect("create other directory");
+        let contract_path = ws.join("pkg/feature/contract.ts");
+        fs::write(
+            &contract_path,
+            "export interface Contract {\n\
+               execute(value: string): void;\n\
+             }\n\
+             export class Adapter implements Contract {\n\
+               execute(_value: string): void {}\n\
+             }\n",
+        )
+        .expect("write contract fixture");
+        fs::write(
+            ws.join("pkg/other/adapter.ts"),
+            "export class Adapter {\n  execute(_value: string): void {}\n}\n",
+        )
+        .expect("write unrelated same-named container");
+        fs::write(
+            ws.join("pkg/consumer.ts"),
+            "export function invoke(value: unknown): void {\n  value.execute('input');\n}\n",
+        )
+        .expect("write consumer");
+
+        let config = EngineConfig::default();
+        let mut noop = |_progress: GraphRebuildProgress| {};
+        rebuild_graph_native(&ws, unix_millis_now(), &config, 0, &mut noop)
+            .expect("rebuild graph");
+        let symbols = query_graph_document_symbols(
+            &ws,
+            &file_uri(&contract_path),
+            None,
+            None,
+            20,
+            &config,
+        )
+        .expect("query contract symbols")
+        .expect("graph index");
+        let target = symbols
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "Contract.execute")
+            .expect("contract method");
+        let usages = query_graph(&ws, &target.id, 100, &config)
+            .expect("query contract usages")
+            .expect("graph index");
+        assert!(
+            usages
+                .references
+                .iter()
+                .all(|reference| reference.provenance.as_ref() != "token-shape"),
+            "a same-named but unrelated container must keep the key ambiguous"
+        );
         let _ = fs::remove_dir_all(&ws);
     }
 

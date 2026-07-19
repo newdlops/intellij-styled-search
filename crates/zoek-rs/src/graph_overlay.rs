@@ -81,6 +81,12 @@ pub struct GraphOverlayEntry {
     /// chained edits without re-deriving target scopes. Empty for `Deleted`.
     #[serde(default)]
     pub contrib: BTreeMap<u64, (u32, u32)>,
+    /// Signed change to the number of eligible bare/member declarations for
+    /// each `(language, source-root, name)` token-shape key. Queries apply the
+    /// aggregate to the immutable base sidecar so lazy ambiguous candidates do
+    /// not become stale between an edit and the next compaction.
+    #[serde(default)]
+    pub token_shape_target_deltas: BTreeMap<(u64, u64, u64), (i32, i32)>,
 }
 
 impl GraphOverlayEntry {
@@ -90,6 +96,7 @@ impl GraphOverlayEntry {
             refs: Vec::new(),
             symbols: Vec::new(),
             contrib: BTreeMap::new(),
+            token_shape_target_deltas: BTreeMap::new(),
         }
     }
 }
@@ -249,6 +256,23 @@ impl GraphOverlay {
         out
     }
 
+    /// Sum per-file token-shape target-cardinality deltas. Each overlay entry
+    /// is already relative to the immutable base contribution of that file, so
+    /// summing current entries is correct across chained edits.
+    pub fn total_token_shape_target_deltas(
+        &self,
+    ) -> BTreeMap<(u64, u64, u64), (i64, i64)> {
+        let mut out = BTreeMap::new();
+        for entry in self.entries.values() {
+            for (&key, &(bare, member)) in &entry.token_shape_target_deltas {
+                let value = out.entry(key).or_insert((0i64, 0i64));
+                value.0 += bare as i64;
+                value.1 += member as i64;
+            }
+        }
+        out
+    }
+
     /// The set of (changed) live source files — fed to compaction as its
     /// `changed_paths`.
     pub fn changed_paths(&self) -> Vec<String> {
@@ -352,6 +376,7 @@ mod tests {
                 refs: vec![rref("sym:1", "a.py", "import")],
                 symbols: vec![sym("sym:1", "a.py")],
                 contrib: BTreeMap::new(),
+                token_shape_target_deltas: BTreeMap::new(),
             },
         );
         overlay.upsert_tombstone("gone.py", GraphOverlayEntryKind::Deleted);
@@ -372,6 +397,7 @@ mod tests {
                 refs: vec![rref("sym:t", "changed.py", "import")],
                 symbols: vec![sym("sym:c", "changed.py")],
                 contrib: BTreeMap::new(),
+                token_shape_target_deltas: BTreeMap::new(),
             },
         );
         overlay.upsert(
@@ -381,6 +407,7 @@ mod tests {
                 refs: vec![rref("sym:c", "importer.py", "import")],
                 symbols: Vec::new(),
                 contrib: BTreeMap::new(),
+                token_shape_target_deltas: BTreeMap::new(),
             },
         );
         overlay.upsert_tombstone("deleted.py", GraphOverlayEntryKind::Deleted);
@@ -411,6 +438,7 @@ mod tests {
                 refs: vec![rref("sym:old", "a.py", "import")],
                 symbols: Vec::new(),
                 contrib: BTreeMap::new(),
+                token_shape_target_deltas: BTreeMap::new(),
             },
         );
         overlay.upsert(
@@ -423,6 +451,7 @@ mod tests {
                 ],
                 symbols: Vec::new(),
                 contrib: BTreeMap::new(),
+                token_shape_target_deltas: BTreeMap::new(),
             },
         );
         assert_eq!(overlay.entry_count(), 1);
