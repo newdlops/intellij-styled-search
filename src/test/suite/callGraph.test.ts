@@ -18,6 +18,7 @@ import {
 import { workspaceHasOwnGit } from '../util/fixtureWorkspace';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
+const CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER = '.__ijssInlay__.';
 
 async function getApi(): Promise<ExtensionTestApi> {
   const ext = vscode.extensions.getExtension<ExtensionTestApi>(EXTENSION_ID);
@@ -51,13 +52,35 @@ function inlayLabelParts(hints: vscode.InlayHint[] | undefined): Array<{ hint: v
       : []);
 }
 
+function isInlayCommandFor(part: vscode.InlayHintLabelPart, targetCommand: string): boolean {
+  const command = part.command?.command ?? '';
+  return command === targetCommand ||
+    command.startsWith(`${targetCommand}${CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER}`);
+}
+
+function inlayCommandArguments(part: vscode.InlayHintLabelPart): unknown[] {
+  const direct = part.command?.arguments;
+  if (Array.isArray(direct) && direct.length > 0) { return direct; }
+  const command = part.command?.command ?? '';
+  const markerIndex = command.indexOf(CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER);
+  if (markerIndex < 0) { return []; }
+  try {
+    const parsed = JSON.parse(decodeURIComponent(
+      command.slice(markerIndex + CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER.length),
+    ));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 function usageInlayPartForSymbol(
   hints: vscode.InlayHint[] | undefined,
   symbolLabel: string,
 ): { hint: vscode.InlayHint; part: vscode.InlayHintLabelPart } | undefined {
   return inlayLabelParts(hints).find((entry) =>
-    entry.part.command?.command === 'intellijStyledSearch.showUsagesForSymbol' &&
-    entry.part.command.arguments?.[1] === symbolLabel);
+    isInlayCommandFor(entry.part, 'intellijStyledSearch.showUsagesForSymbol') &&
+    inlayCommandArguments(entry.part)[1] === symbolLabel);
 }
 
 function usageInlayCount(entry: { part: vscode.InlayHintLabelPart } | undefined): number {
@@ -739,20 +762,33 @@ suite('Call graph', () => {
           : [])
         .filter((entry) => entry.part.command?.command?.startsWith('intellijStyledSearch.show'));
       assert.ok(
-        !commandParts.some((entry) => entry.part.command?.command === 'intellijStyledSearch.showCallersForSymbol'),
+        !commandParts.some((entry) => isInlayCommandFor(entry.part, 'intellijStyledSearch.showCallersForSymbol')),
         'expected callers to be folded into usages instead of exposed as a separate inlay part',
       );
       assert.ok(
-        !commandParts.some((entry) => entry.part.command?.command === 'intellijStyledSearch.showCalleesForSymbol'),
+        !commandParts.some((entry) => isInlayCommandFor(entry.part, 'intellijStyledSearch.showCalleesForSymbol')),
         'expected callee inlay parts to be hidden by default',
       );
       assert.ok(
-        commandParts.some((entry) => entry.part.command?.command === 'intellijStyledSearch.showUsagesForSymbol'),
+        commandParts.some((entry) => isInlayCommandFor(entry.part, 'intellijStyledSearch.showUsagesForSymbol')),
         'expected usages inlay part to expose a direct command',
       );
       const graphPyUsagePart = usageInlayPartForSymbol(inlayHints, 'GraphPy');
+      const durableUsageCommand = graphPyUsagePart?.part.command?.command ?? '';
+      assert.ok(
+        durableUsageCommand.includes(CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER),
+        `expected usage inlay to use an extension-lifetime command, got ${durableUsageCommand}`,
+      );
+      assert.ok(
+        !graphPyUsagePart?.part.command?.arguments?.length,
+        'expected durable inlay command to omit arguments so VS Code does not allocate a temporary command /N delegate',
+      );
+      assert.ok(
+        (await vscode.commands.getCommands(true)).includes(durableUsageCommand),
+        'expected durable usage command to be registered before the hint is rendered',
+      );
       assert.strictEqual(
-        graphPyUsagePart?.part.command?.arguments?.[2],
+        graphPyUsagePart ? inlayCommandArguments(graphPyUsagePart.part)[2] : undefined,
         usageInlayCount(graphPyUsagePart),
         'expected usage inlay command to carry the shown usage count as the query limit floor',
       );
@@ -775,7 +811,7 @@ suite('Call graph', () => {
       );
       assert.ok(
         commandParts
-          .filter((entry) => entry.part.command?.command !== 'intellijStyledSearch.showUsagesForSymbol')
+          .filter((entry) => !isInlayCommandFor(entry.part, 'intellijStyledSearch.showUsagesForSymbol'))
           .every((entry) => entry.part.command?.title === ''),
         'expected non-usage call graph inlay hover to keep underline affordance without command-title tooltip text',
       );
@@ -793,7 +829,7 @@ suite('Call graph', () => {
         .flatMap((hint) => Array.isArray(hint.label) ? hint.label.map((part) => ({ hint, part })) : [])
         .filter((entry) => entry.part.command?.command?.startsWith('intellijStyledSearch.show'));
       assert.ok(
-        calleeCommandParts.some((entry) => entry.part.command?.command === 'intellijStyledSearch.showCalleesForSymbol'),
+        calleeCommandParts.some((entry) => isInlayCommandFor(entry.part, 'intellijStyledSearch.showCalleesForSymbol')),
         'expected callee inlay parts to be available when explicitly enabled',
       );
       assert.ok(
@@ -801,8 +837,12 @@ suite('Call graph', () => {
           calleeInlayHints.some((hint) =>
             hint.position.line === multilineSummary.symbol.range.startLine &&
             Array.isArray(hint.label) &&
-            hint.label.some((part) => part.command?.command === 'intellijStyledSearch.showCalleesForSymbol')),
+            hint.label.some((part) => isInlayCommandFor(part, 'intellijStyledSearch.showCalleesForSymbol'))),
         'expected multiline Python method declarations to render callee inlay hints on the declaration line',
+      );
+      assert.ok(
+        (await vscode.commands.getCommands(true)).includes(durableUsageCommand),
+        'expected an earlier inlay command to remain registered after a later provider refresh',
       );
     } finally {
       await vscode.workspace.getConfiguration('intellijStyledSearch').update(
@@ -889,7 +929,7 @@ suite('Call graph', () => {
       const classUsagePart = usageInlayPartForSymbol(refreshedHints, className);
       assert.ok(
         classUsagePart,
-        `expected usage inlay for ${className} after incremental create; hints=${inlayLabelParts(refreshedHints).map((entry) => `${entry.part.value}:${entry.part.command?.arguments?.[1] ?? ''}`).join(', ')}`,
+        `expected usage inlay for ${className} after incremental create; hints=${inlayLabelParts(refreshedHints).map((entry) => `${entry.part.value}:${inlayCommandArguments(entry.part)[1] ?? ''}`).join(', ')}`,
       );
       const usageCount = usageInlayCount(classUsagePart);
       assert.ok(
@@ -1032,7 +1072,7 @@ suite('Call graph', () => {
           inlayHints.some((hint) =>
             hint.position.line === summary.symbol.range.startLine &&
             Array.isArray(hint.label) &&
-            hint.label.some((part) => part.command?.command === 'intellijStyledSearch.showUsagesForSymbol')),
+            hint.label.some((part) => isInlayCommandFor(part, 'intellijStyledSearch.showUsagesForSymbol'))),
         'expected multiline Python declarations with inline type-ignore comments to render usage inlay hints on the declaration line',
       );
     } finally {

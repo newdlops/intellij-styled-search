@@ -3,6 +3,28 @@ import * as vscode from 'vscode';
 import type { ExtensionTestApi } from '../../extension';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
+const CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER = '.__ijssInlay__.';
+
+function isInlayCommandFor(part: vscode.InlayHintLabelPart, targetCommand: string): boolean {
+  const command = part.command?.command ?? '';
+  return command === targetCommand ||
+    command.startsWith(`${targetCommand}${CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER}`);
+}
+
+function inlayCommandArguments(part: vscode.InlayHintLabelPart): unknown[] {
+  if (part.command?.arguments?.length) { return part.command.arguments; }
+  const command = part.command?.command ?? '';
+  const markerIndex = command.indexOf(CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER);
+  if (markerIndex < 0) { return []; }
+  try {
+    const parsed = JSON.parse(decodeURIComponent(
+      command.slice(markerIndex + CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER.length),
+    ));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
 
 async function getApi(): Promise<ExtensionTestApi> {
   const ext = vscode.extensions.getExtension<ExtensionTestApi>(EXTENSION_ID);
@@ -12301,8 +12323,8 @@ suite('Renderer — overlay UI probes', () => {
         const parts = Array.isArray(hint.label) ? hint.label : [];
         for (const part of parts) {
           const lp = part as vscode.InlayHintLabelPart;
-          if (!lp.command || lp.command.command !== 'intellijStyledSearch.showUsagesForSymbol') { continue; }
-          const sym = (lp.command.arguments ?? [])[0];
+          if (!isInlayCommandFor(lp, 'intellijStyledSearch.showUsagesForSymbol')) { continue; }
+          const sym = inlayCommandArguments(lp)[0];
           if (typeof sym !== 'string') { continue; }
           labelMatches.push({
             hint,
@@ -12347,8 +12369,8 @@ suite('Renderer — overlay UI probes', () => {
         const parts = Array.isArray(hint.label) ? hint.label : [];
         for (const part of parts) {
           const lp = part as vscode.InlayHintLabelPart;
-          if (!lp.command || lp.command.command !== 'intellijStyledSearch.showUsagesForSymbol') { continue; }
-          const sym = (lp.command.arguments ?? [])[0];
+          if (!isInlayCommandFor(lp, 'intellijStyledSearch.showUsagesForSymbol')) { continue; }
+          const sym = inlayCommandArguments(lp)[0];
           if (typeof sym !== 'string') { continue; }
           probeCandidates.push({
             hint,

@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 145;
+export const RENDERER_PATCH_VERSION = 146;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -11268,8 +11268,9 @@ export function getRendererPatchScript(
         // Symbol/label extraction: ask Monaco directly which inlay hint
         // is rendered at this span's center via getTargetAtClientPoint.
         // target.detail.injectedText.options.attachedData carries the
-        // InlayHintLabelPart that holds command + arguments (symbolId,
-        // qualifiedName, optional count). #50 user request.
+        // InlayHintLabelPart. Older providers expose symbol metadata as command
+        // arguments; current providers encode it in a durable command id so the
+        // command remains valid after the hint result is disposed. #50.
         var symbolId = '';
         var symbolLabel = '';
         var symbolCount = '';
@@ -11284,12 +11285,18 @@ export function getRendererPatchScript(
             var part = attached && (attached.part || attached);
             var command = part && part.command;
             var args = command && command.arguments;
+            var durablePayload = durableCallGraphInlayPayloadFromCommand(command && command.command);
             if (args && args.length >= 1 && typeof args[0] === 'string') {
               symbolId = args[0];
               symbolLabel = args.length >= 2 && typeof args[1] === 'string' ? args[1] : '';
               symbolCount = args.length >= 3 && typeof args[2] === 'number' && Number.isFinite(args[2]) && args[2] >= 0
                 ? String(Math.floor(args[2]))
                 : '';
+              symbolHits++;
+            } else if (durablePayload) {
+              symbolId = durablePayload.symbolId;
+              symbolLabel = durablePayload.label;
+              symbolCount = typeof durablePayload.count === 'number' ? String(durablePayload.count) : '';
               symbolHits++;
             }
           }
@@ -11474,9 +11481,9 @@ export function getRendererPatchScript(
   // InlayHintLabelPart reference on the injected-text option's attachedData.
   // When the user clicks an inlay span, getTargetAtClientPoint gives us a
   // target whose detail.injectedText.options.attachedData IS that label
-  // part — with command + arguments intact. Extracting it directly avoids
-  // re-deriving line/column and querying providers; we just dispatch the
-  // exact command Monaco's hover popup would.
+  // part — with its exact command identity intact (and arguments on legacy
+  // hints). Extracting it directly avoids re-deriving line/column and querying
+  // providers; we just dispatch the exact command Monaco's hover popup would.
   function extractInlayHintLabelPartFromClick(widget, event) {
     try {
       if (!widget || typeof widget.getTargetAtClientPoint !== 'function') { return null; }
@@ -11831,7 +11838,8 @@ export function getRendererPatchScript(
           // No URI available — let the lower fallbacks run.
         }
         // #48 user-suggested fast-fast-path: Monaco already attached the
-        // exact InlayHintLabelPart (with command + symbolId arguments) to
+        // exact InlayHintLabelPart (with a durable symbol command, or legacy
+        // command arguments) to
         // the mouse target's injectedText. Read it directly and dispatch
         // — no line/col reconstruction, no provider re-query, no nearby
         // fallback. This is the same path the inlay's hover-popup
@@ -13000,6 +13008,35 @@ export function getRendererPatchScript(
     if (kind === 'callees') { return 'intellijStyledSearch.showCalleesForSymbol'; }
     if (kind === 'impl') { return 'intellijStyledSearch.showImplementationsForSymbol'; }
     return 'intellijStyledSearch.showUsagesForSymbol';
+  }
+
+  var CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER = '.__ijssInlay__.';
+
+  function durableCallGraphInlayPayloadFromCommand(commandId) {
+    if (typeof commandId !== 'string') { return null; }
+    var markerIndex = commandId.indexOf(CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER);
+    if (markerIndex <= 0) { return null; }
+    var targetCommand = commandId.slice(0, markerIndex);
+    if (targetCommand !== 'intellijStyledSearch.showUsagesForSymbol' &&
+        targetCommand !== 'intellijStyledSearch.showImplementationsForSymbol' &&
+        targetCommand !== 'intellijStyledSearch.showCalleesForSymbol') {
+      return null;
+    }
+    try {
+      var encoded = commandId.slice(markerIndex + CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER.length);
+      var parsed = JSON.parse(decodeURIComponent(encoded));
+      if (!Array.isArray(parsed) || typeof parsed[0] !== 'string') { return null; }
+      return {
+        targetCommand: targetCommand,
+        symbolId: parsed[0],
+        label: typeof parsed[1] === 'string' ? parsed[1] : '',
+        count: typeof parsed[2] === 'number' && Number.isFinite(parsed[2]) && parsed[2] >= 0
+          ? Math.floor(parsed[2])
+          : undefined,
+      };
+    } catch (eDecodeDurableInlayCommand) {
+      return null;
+    }
   }
 
   function titleForCallGraphInlayKind(kind) {

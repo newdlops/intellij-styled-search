@@ -43,6 +43,7 @@ const CALL_GRAPH_USAGE_SEARCH_INCLUDE_PATTERNS = [
   '**/*.cjs',
 ];
 const CALL_GRAPH_IMPL_INLAY_LARGE_COUNT_THRESHOLD = 50;
+const CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER = '.__ijssInlay__.';
 
 let activeOverlay: OverlayPanel | undefined;
 
@@ -148,6 +149,57 @@ class CallGraphInlayRegistry {
   }
 }
 
+/**
+ * VS Code rewrites extension commands that carry arguments into temporary
+ * `command /N` delegates owned by the individual InlayHint result. A hover or
+ * renderer node can outlive that result, leaving a perfectly visible inlay
+ * whose delegate has already been removed. Keep a no-argument command for the
+ * lifetime of the extension instead; its encoded payload also makes each
+ * symbol/relation/count tuple deterministic across provider refreshes.
+ */
+class CallGraphDurableInlayCommandRegistry implements vscode.Disposable {
+  private readonly registrations = new Map<string, vscode.Disposable>();
+
+  createCommand(
+    title: string,
+    targetCommand: string,
+    symbolId: string,
+    symbolLabel: string,
+    count?: number,
+  ): vscode.Command {
+    const normalizedCount = normalizeExpectedUsageCount(count);
+    const targetArgs: unknown[] = [symbolId, symbolLabel];
+    if (normalizedCount !== undefined) {
+      targetArgs.push(normalizedCount);
+    }
+    const commandId = `${targetCommand}${CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER}` +
+      encodeURIComponent(JSON.stringify(targetArgs));
+    if (!this.registrations.has(commandId)) {
+      const capturedArgs = [...targetArgs];
+      this.registrations.set(
+        commandId,
+        vscode.commands.registerCommand(commandId, () =>
+          vscode.commands.executeCommand(targetCommand, ...capturedArgs)),
+      );
+    }
+    // Deliberately omit `arguments`: any argument array makes VS Code allocate
+    // the short-lived CommandsConverter delegate this registry is avoiding.
+    return { title, command: commandId };
+  }
+
+  dispose(): void {
+    for (const registration of this.registrations.values()) {
+      registration.dispose();
+    }
+    this.registrations.clear();
+  }
+}
+
+function isCallGraphInlayCommandForTarget(command: string, targetCommand: string): boolean {
+  return command === targetCommand ||
+    command.startsWith(`${targetCommand}${CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER}`);
+}
+
 function normalizeCallGraphInlayKind(kind: string): CallGraphInlayKind {
   if (kind === 'impl' || kind === 'implementations') { return 'impl'; }
   if (kind === 'callees') { return 'callees'; }
@@ -172,12 +224,14 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
     (allowBuild) => overlay.resolveZoekEngineBinaryForGraph(allowBuild),
   );
   const callGraphInlayRegistry = new CallGraphInlayRegistry();
+  const callGraphDurableInlayCommands = new CallGraphDurableInlayCommandRegistry();
   overlay.setPreviewCallGraphInlayProvider((uri, document, range) =>
     buildPreviewCallGraphInlays(callGraph, callGraphLog, uri, document, range));
   const mcpServer = new CallGraphMcpServer(callGraph, callGraphLog, overlay);
   context.subscriptions.push(
     callGraph,
     mcpServer,
+    callGraphDurableInlayCommands,
     { dispose: () => overlay.setPreviewCallGraphInlayProvider(undefined) },
   );
   if (vscode.workspace.isTrusted && vscode.workspace.workspaceFolders?.length) {
@@ -219,7 +273,12 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   context.subscriptions.push(
     vscode.languages.registerInlayHintsProvider(
       CALL_GRAPH_DOCUMENT_SELECTOR,
-      new CallGraphInlayHintsProvider(overlay, callGraph, callGraphInlayRegistry),
+      new CallGraphInlayHintsProvider(
+        overlay,
+        callGraph,
+        callGraphInlayRegistry,
+        callGraphDurableInlayCommands,
+      ),
     ),
     vscode.languages.registerImplementationProvider(CALL_GRAPH_DOCUMENT_SELECTOR, new CallGraphImplementationProvider(callGraph)),
   );
@@ -721,10 +780,10 @@ export async function deactivate() {
 
 // #48 user-suggested fast-path: read the InlayHintLabelPart.command
 // that Monaco actually rendered on this line via the standard
-// `vscode.executeInlayHintProvider` API. That command carries the exact
-// symbolId/qualifiedName our CallGraphInlayHintsProvider attached when
-// building the hint — same one the inlay's "Execute command" hover
-// popup would invoke. Skips our registry/nearby-search entirely so the
+// `vscode.executeInlayHintProvider` API. The durable command identity encodes
+// the exact symbolId/qualifiedName our CallGraphInlayHintsProvider attached
+// when building the hint — the same command the inlay's "Execute command"
+// hover popup would invoke. Skips our registry/nearby-search entirely so the
 // click→search-result mapping is exact.
 // Returns true iff a matching label-part command was found and executed.
 async function tryDispatchInlayLabelCommandAt(
@@ -764,7 +823,7 @@ async function tryDispatchInlayLabelCommandAt(
       for (const part of labelParts) {
         const labelPart = part as vscode.InlayHintLabelPart;
         const cmd = labelPart.command;
-        if (!cmd || cmd.command !== expectedCommand) { continue; }
+        if (!cmd || !isCallGraphInlayCommandForTarget(cmd.command, expectedCommand)) { continue; }
         const partValue = (labelPart.value || '').trim().replace(/\s+/g, ' ');
         candidates.push({
           command: cmd,
@@ -2089,6 +2148,7 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
     private readonly overlay: OverlayPanel,
     private readonly callGraph: CallGraphService,
     private readonly registry: CallGraphInlayRegistry,
+    private readonly durableCommands: CallGraphDurableInlayCommandRegistry,
   ) {
     this.onDidChangeInlayHints = callGraph.onDidChangeSnapshot;
   }
@@ -2125,6 +2185,7 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
       const lineEndColumn = document.lineAt(summary.symbol.range.startLine).range.end.character;
       const hint = buildCallGraphInlayHint(
         summary,
+        this.durableCommands,
         showCalleeInlayHints,
         lineEndColumn,
       );
@@ -2193,6 +2254,7 @@ class CallGraphImplementationProvider implements vscode.ImplementationProvider {
 
 function buildCallGraphInlayHint(
   summary: CallGraphSymbolRelationSummary,
+  durableCommands: CallGraphDurableInlayCommandRegistry,
   showCalleeInlayHints = false,
   lineEndColumn = summary.symbol.range.endColumn,
 ): vscode.InlayHint | undefined {
@@ -2210,6 +2272,7 @@ function buildCallGraphInlayHint(
       summary.symbol.id,
       summary.symbol.qualifiedName,
       summary.calleeCount,
+      durableCommands,
     ));
   }
   if (shouldShowImplementationInlay(summary)) {
@@ -2221,6 +2284,7 @@ function buildCallGraphInlayHint(
       summary.symbol.id,
       summary.symbol.qualifiedName,
       summary.implementationCount,
+      durableCommands,
     ));
   }
   if (summary.usageCount > 0) {
@@ -2235,6 +2299,7 @@ function buildCallGraphInlayHint(
       summary.symbol.id,
       summary.symbol.qualifiedName,
       summary.usageCount,
+      durableCommands,
     ));
   }
   if (parts.length === 0) { return undefined; }
@@ -2293,19 +2358,11 @@ function makeInlayCommandPart(
   command: string,
   symbolId: string,
   symbolLabel: string,
-  count?: number,
+  count: number | undefined,
+  durableCommands: CallGraphDurableInlayCommandRegistry,
 ): vscode.InlayHintLabelPart {
   const part = new vscode.InlayHintLabelPart(label);
-  const args: unknown[] = [symbolId, symbolLabel];
-  const normalizedCount = normalizeExpectedUsageCount(count);
-  if (normalizedCount !== undefined) {
-    args.push(normalizedCount);
-  }
-  part.command = {
-    title,
-    command,
-    arguments: args,
-  };
+  part.command = durableCommands.createCommand(title, command, symbolId, symbolLabel, count);
   return part;
 }
 
