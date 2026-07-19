@@ -73,6 +73,24 @@ suite('Activation', () => {
     assert.ok(api.overlay, 'overlay was not exposed on ext.exports');
   });
 
+  test('opt-in background indexing has no built-in startup pause', async () => {
+    const ext = vscode.extensions.getExtension<ExtensionTestApi>(EXTENSION_ID);
+    assert.ok(ext);
+    const properties = ext.packageJSON?.contributes?.configuration?.properties ?? {};
+    assert.strictEqual(
+      properties['intellijStyledSearch.zoektBackgroundBuildDelayMs']?.default,
+      0,
+    );
+    assert.strictEqual(
+      properties['intellijStyledSearch.zoektBackgroundIndexDelayMs']?.default,
+      0,
+    );
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    assert.strictEqual(runtime.getConfiguredBackgroundBuildDelayMs(), 0);
+    assert.strictEqual(runtime.getConfiguredBackgroundIndexDelayMs(), 0);
+  });
+
   test('verified main PID discovery survives a later ps spawn failure', async () => {
     const api = await getApi();
     const overlay = api.overlay as any;
@@ -710,10 +728,15 @@ suite('Activation', () => {
     try {
       const candidates = runtime.getBinaryCandidatesFor('engine') as string[];
       assert.strictEqual(candidates[0], path.join(cacheDir, `zoek-rs${exeSuffix}`));
-      assert.strictEqual(
-        runtime.getSharedCargoTargetDir(),
-        path.join(runtime.context.globalStorageUri.fsPath, 'zoek-rs', 'cargo-target', platformKey, fingerprint),
-      );
+      const cargoTargetDir = runtime.getSharedCargoTargetDir();
+      if (runtime.context.extensionMode === vscode.ExtensionMode.Production) {
+        assert.strictEqual(
+          cargoTargetDir,
+          path.join(runtime.context.globalStorageUri.fsPath, 'zoek-rs', 'cargo-target', platformKey),
+        );
+      } else {
+        assert.strictEqual(cargoTargetDir, path.join(runtime.extensionRoot, 'target'));
+      }
       assert.strictEqual(
         candidates[1],
         path.join(runtime.extensionRoot, 'resources', 'bin', platformKey, `zoek-rs${exeSuffix}`),
@@ -730,6 +753,26 @@ suite('Activation', () => {
         recursive: true,
         force: true,
       });
+    }
+  });
+
+  test('Cargo compilation cache survives Rust source fingerprint changes', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const originalFingerprint = runtime.getRustSourceFingerprint;
+    let fingerprint = 'source-a';
+    runtime.getRustSourceFingerprint = () => fingerprint;
+    try {
+      const first = runtime.getSharedCargoTargetDir();
+      fingerprint = 'source-b';
+      const second = runtime.getSharedCargoTargetDir();
+      assert.strictEqual(second, first, 'Cargo should reuse compiled dependencies across source edits');
+      assert.ok(
+        !first.includes('source-a') && !first.includes('source-b'),
+        'source fingerprints belong to the published binary cache, not Cargo target storage',
+      );
+    } finally {
+      runtime.getRustSourceFingerprint = originalFingerprint;
     }
   });
 
@@ -936,6 +979,14 @@ suite('Activation', () => {
       assert.ok(rebuildPath);
       assert.strictEqual(path.dirname(enginePath), path.dirname(rebuildPath));
       assert.strictEqual(cargoEnv?.CARGO_TARGET_DIR, cargoTargetDir);
+      if (runtime.context.extensionMode !== vscode.ExtensionMode.Production) {
+        assert.strictEqual(cargoEnv?.CARGO_INCREMENTAL, '1');
+        assert.ok(cargoArgs?.includes('--profile'));
+        assert.ok(cargoArgs?.includes('runtime'));
+        assert.ok(!cargoArgs?.includes('--release'));
+      } else {
+        assert.ok(cargoArgs?.includes('--release'));
+      }
       assert.ok(cargoArgs?.includes('--message-format=json-render-diagnostics'));
       assert.ok(cargoArgs?.includes('--bins'));
       assert.strictEqual(fs.readFileSync(enginePath, 'utf8'), 'engine');
@@ -1089,6 +1140,58 @@ suite('Activation', () => {
     }
   });
 
+  test('call graph prepares the Rust runtime while cache restore is still pending', async () => {
+    const { callGraph } = await getApi();
+    const service = callGraph as any;
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const priorBackend = cfg.inspect<string>('callGraphBackend')?.workspaceValue;
+    await cfg.update('callGraphBackend', 'rust-native', vscode.ConfigurationTarget.Workspace);
+    const originalRestorePromise = service.restorePromise;
+    const originalResolver = service.resolveRustGraphBinary;
+    const originalRebuild = service.rebuildInRustGraphProcess;
+    const originalCancel = service.cancelRustGraphProcesses;
+    let releaseRestore!: () => void;
+    let releaseBinary!: () => void;
+    const restoreGate = new Promise<void>((resolve) => { releaseRestore = resolve; });
+    const binaryGate = new Promise<void>((resolve) => { releaseBinary = resolve; });
+    let resolverStarted = false;
+    let nativeRebuildStarted = false;
+    const messages: string[] = [];
+    service.restorePromise = restoreGate;
+    service.resolveRustGraphBinary = () => {
+      resolverStarted = true;
+      return binaryGate.then(() => '/tmp/zoek-rs');
+    };
+    service.cancelRustGraphProcesses = () => {};
+    service.rebuildInRustGraphProcess = async (input: { binaryPromise?: Promise<string | undefined> }) => {
+      nativeRebuildStarted = true;
+      assert.ok(input.binaryPromise, 'doRebuild should pass the already-started runtime promise');
+      assert.strictEqual(await input.binaryPromise, '/tmp/zoek-rs');
+      return {};
+    };
+    try {
+      const rebuilding = service.doRebuild((progress: { message: string }) => {
+        messages.push(progress.message);
+      });
+      assert.strictEqual(resolverStarted, true, 'runtime resolution should start synchronously');
+      assert.strictEqual(nativeRebuildStarted, false, 'cache restore should still gate index mutation');
+      assert.strictEqual(messages[0], 'preparing rust graph runtime');
+      releaseRestore();
+      await Promise.resolve();
+      assert.strictEqual(nativeRebuildStarted, true);
+      releaseBinary();
+      await rebuilding;
+    } finally {
+      releaseRestore();
+      releaseBinary();
+      service.restorePromise = originalRestorePromise;
+      service.resolveRustGraphBinary = originalResolver;
+      service.rebuildInRustGraphProcess = originalRebuild;
+      service.cancelRustGraphProcesses = originalCancel;
+      await cfg.update('callGraphBackend', priorBackend, vscode.ConfigurationTarget.Workspace);
+    }
+  });
+
   test('rebuildIndex starts a dedicated rebuild after cancelling background index', async () => {
     const { overlay } = await getApi();
     const runtime = (overlay as any).zoektRuntime as any;
@@ -1100,6 +1203,7 @@ suite('Activation', () => {
     const originalInvokeJson = runtime.invokeJson.bind(runtime);
     const pending = Promise.resolve(false);
     const cancellations: Array<{ reason: string; kinds?: string[] }> = [];
+    const progressMessages: string[] = [];
     let invokedArgs: string[] | undefined;
 
     runtime.indexPromises.set(workspaceRoot, pending);
@@ -1119,8 +1223,9 @@ suite('Activation', () => {
       };
     };
     try {
-      const result = await runtime.rebuildIndex();
+      const result = await runtime.rebuildIndex((message: string) => progressMessages.push(message));
       assert.strictEqual(result, true);
+      assert.strictEqual(progressMessages[0], 'zoek-rs: preparing indexer runtime');
       assert.deepStrictEqual(cancellations, [
         { reason: 'explicit rebuild requested', kinds: ['index'] },
       ]);
