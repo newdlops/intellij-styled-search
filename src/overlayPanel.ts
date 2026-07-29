@@ -19,7 +19,7 @@ import {
   type SearchForTestsResult,
   type SearchEngine,
 } from './search';
-import { configureRipgrepInstall, ensureRipgrepInstalled, findRipgrepPath, runRgSearch } from './rgSearch';
+import { configureRipgrepInstall, findRipgrepPath, runRgSearch } from './rgSearch';
 import { getRendererPatchScript, RENDERER_PATCH_VERSION } from './rendererPatch';
 import { runMonacoCaptureDiagnostic, type CaptureDiagnosticOptions } from './preview/monacoCapture';
 import {
@@ -750,7 +750,6 @@ export class OverlayPanel {
     context.subscriptions.push(rawLog);
     context.subscriptions.push({ dispose: () => { void this.dispose(); } });
     configureRipgrepInstall(context);
-    void ensureRipgrepInstalled((msg) => this.log.appendLine(msg));
     this.trigramIndex = new TrigramIndex(context.globalStorageUri, this.log);
     context.subscriptions.push({ dispose: () => this.trigramIndex.dispose() });
     this.zoektRuntime = new ZoektRuntime(context, this.log);
@@ -1156,6 +1155,7 @@ export class OverlayPanel {
 
   scheduleRendererInlayClickHookWarmup(reason = 'inlay-hints', delayMs = 700, bypassThrottle = false): void {
     if (!this.shouldEnableRendererInlayClickHook()) { return; }
+    if (!vscode.window.state.focused) { return; }
     if (this.activeWindowId !== undefined && this.isRendererInlayClickHookReadyFor(this.activeWindowId)) { return; }
     const now = Date.now();
     if (!bypassThrottle && now - this.lastRendererInlayClickWarmupAt < 5000) { return; }
@@ -1167,6 +1167,7 @@ export class OverlayPanel {
   }
 
   private runRendererInlayClickHookWarmup(reason: string): void {
+    if (!vscode.window.state.focused) { return; }
     if (this.showInFlight || this.pendingShow) {
       this.scheduleRendererInlayClickHookWarmup(reason, 1000, true);
       return;
