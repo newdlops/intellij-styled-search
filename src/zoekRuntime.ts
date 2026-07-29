@@ -72,6 +72,9 @@ const DEFAULT_UPDATE_LOG_MIN_INTERVAL_MS = 10_000;
 const DEFAULT_BACKGROUND_BUILD_DELAY_MS = 0;
 const DEFAULT_BACKGROUND_INDEX_DELAY_MS = 0;
 const UPDATE_RETRY_WHILE_INDEXING_MS = 1_000;
+// A suspended window must retain enough detail for a small incremental update,
+// but a large event burst is cheaper and bounded as one workspace sync.
+const SUSPENDED_UPDATE_PATH_LIMIT = 200;
 const AUTO_BASE_REFRESH_MIN_INTERVAL_MS = 60_000;
 const PROCESS_KILL_TIMEOUT_MS = 1_500;
 const ZOEKT_PROGRESS_PREFIX = '__ZOEK_PROGRESS__';
@@ -515,6 +518,7 @@ export class ZoektRuntime implements vscode.Disposable {
   private lastUpdateLogAt = 0;
   private suppressedUpdateLogCount = 0;
   private backgroundBuildTimer: ReturnType<typeof setTimeout> | undefined;
+  private windowFocusedForTests: boolean | undefined;
   private readonly backgroundIndexTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private excludeMatcherCache: {
     key: string;
@@ -563,6 +567,7 @@ export class ZoektRuntime implements vscode.Disposable {
           this.queueRename(file.oldUri, file.newUri);
         }
       }),
+      vscode.window.onDidChangeWindowState((state) => this.handleWindowStateChange(state.focused)),
     );
   }
 
@@ -1236,6 +1241,11 @@ export class ZoektRuntime implements vscode.Disposable {
     }
   }
 
+  /** @internal Deterministic lifecycle seam for foreground scheduling tests. */
+  setWindowFocusedForTests(focused: boolean | undefined): void {
+    this.windowFocusedForTests = focused;
+  }
+
   /** @internal Tests use this to decide whether to skip a full rebuild. */
   async hasReadyIndexForTests(): Promise<boolean> {
     const workspaceRoot = this.getWorkspaceRootPath();
@@ -1281,6 +1291,7 @@ export class ZoektRuntime implements vscode.Disposable {
     if (!relPath) { return; }
     this.pendingDeleted.delete(relPath);
     this.pendingChanged.add(relPath);
+    this.boundSuspendedPendingUpdates();
     this.logQueuedUpdate(reason);
     this.scheduleFlush();
   }
@@ -1292,6 +1303,7 @@ export class ZoektRuntime implements vscode.Disposable {
     if (!relPath) { return; }
     this.pendingChanged.delete(relPath);
     this.pendingDeleted.add(relPath);
+    this.boundSuspendedPendingUpdates();
     this.logQueuedUpdate(reason);
     this.scheduleFlush();
   }
@@ -1306,6 +1318,7 @@ export class ZoektRuntime implements vscode.Disposable {
       if (!newRelPath) { return; }
       this.pendingDeleted.delete(newRelPath);
       this.pendingChanged.add(newRelPath);
+      this.boundSuspendedPendingUpdates();
       this.logQueuedUpdate('rename-create');
       this.scheduleFlush();
       return;
@@ -1313,6 +1326,7 @@ export class ZoektRuntime implements vscode.Disposable {
     if (!newRelPath) {
       this.pendingChanged.delete(oldRelPath);
       this.pendingDeleted.add(oldRelPath);
+      this.boundSuspendedPendingUpdates();
       this.logQueuedUpdate('rename-delete');
       this.scheduleFlush();
       return;
@@ -1322,14 +1336,33 @@ export class ZoektRuntime implements vscode.Disposable {
     this.pendingDeleted.delete(oldRelPath);
     this.pendingDeleted.delete(newRelPath);
     this.pendingRenames.push({ oldRelPath, newRelPath });
+    this.boundSuspendedPendingUpdates();
     this.logQueuedUpdate('rename');
     this.scheduleFlush();
   }
 
   private hasPendingUpdates(): boolean {
-    return this.pendingChanged.size > 0 ||
+    return this.workspaceSyncNeeded ||
+      this.pendingChanged.size > 0 ||
       this.pendingDeleted.size > 0 ||
       this.pendingRenames.length > 0;
+  }
+
+  private isWindowFocused(): boolean {
+    return this.windowFocusedForTests ?? vscode.window.state.focused;
+  }
+
+  private handleWindowStateChange(focused: boolean): void {
+    if (!focused) {
+      if (this.flushTimer) {
+        clearTimeout(this.flushTimer);
+        this.flushTimer = undefined;
+      }
+      return;
+    }
+    if (this.hasPendingUpdates()) {
+      this.scheduleFlush();
+    }
   }
 
   private logQueuedUpdate(reason: string): void {
@@ -1341,6 +1374,7 @@ export class ZoektRuntime implements vscode.Disposable {
   private scheduleFlush(delayMs = this.getConfiguredUpdateDebounceMs()): void {
     if (this.disposed) { return; }
     if (this.updatePauseDepth > 0) { return; }
+    if (!this.isWindowFocused()) { return; }
     const cooldownMs = this.getConfiguredUpdateCooldownMs();
     if (cooldownMs > 0 && this.lastUpdateFinishedAt > 0) {
       const remainingCooldownMs = cooldownMs - (Date.now() - this.lastUpdateFinishedAt);
@@ -1353,7 +1387,7 @@ export class ZoektRuntime implements vscode.Disposable {
     }
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
-      void this.flushPendingUpdates();
+      void this.flushPendingUpdates(true);
     }, delayMs);
   }
 
@@ -1373,12 +1407,13 @@ export class ZoektRuntime implements vscode.Disposable {
     }
   }
 
-  private async flushPendingUpdates(): Promise<void> {
+  private async flushPendingUpdates(automatic = false): Promise<void> {
     if (this.disposed) {
       this.clearPending();
       return;
     }
     if (
+      !this.workspaceSyncNeeded &&
       this.pendingChanged.size === 0 &&
       this.pendingDeleted.size === 0 &&
       this.pendingRenames.length === 0
@@ -1388,6 +1423,10 @@ export class ZoektRuntime implements vscode.Disposable {
     if (this.updatePauseDepth > 0) {
       return;
     }
+    // A blur can race an already-fired debounce timer. Keep the queue intact;
+    // focus will arm exactly one replacement timer, while explicit drains pass
+    // automatic=false and remain fresh in every window.
+    if (automatic && !this.isWindowFocused()) { return; }
     if (!this.shouldRunIncrementalFileUpdates()) {
       this.clearPending();
       return;
@@ -1410,6 +1449,17 @@ export class ZoektRuntime implements vscode.Disposable {
       this.clearPending();
       return;
     }
+    if (automatic && !this.isWindowFocused()) { return; }
+    if (this.workspaceSyncNeeded) {
+      await this.syncWorkspaceIndexIfNeeded(workspaceRoot, binary, automatic ? 'foreground catch-up' : 'explicit drain', automatic);
+    }
+    if (
+      this.pendingChanged.size === 0 &&
+      this.pendingDeleted.size === 0 &&
+      this.pendingRenames.length === 0
+    ) {
+      return;
+    }
     const indexBusy = this.indexPromises.has(workspaceRoot) || this.foregroundIndexPromises.has(workspaceRoot);
     const ready = !indexBusy && await this.hasReadyIndex(workspaceRoot);
     if (indexBusy || !ready) {
@@ -1421,6 +1471,7 @@ export class ZoektRuntime implements vscode.Disposable {
       this.log.appendLine('zoek-rs update skipped: index is not ready; run Rebuild Search Index to refresh saved changes');
       return;
     }
+    if (automatic && !this.isWindowFocused()) { return; }
 
     const changed = Array.from(this.pendingChanged);
     const deleted = Array.from(this.pendingDeleted);
@@ -1468,10 +1519,19 @@ export class ZoektRuntime implements vscode.Disposable {
     }
   }
 
+  private boundSuspendedPendingUpdates(): void {
+    if (this.isWindowFocused()) { return; }
+    const pendingCount = this.pendingChanged.size + this.pendingDeleted.size + this.pendingRenames.length;
+    if (pendingCount <= SUSPENDED_UPDATE_PATH_LIMIT) { return; }
+    this.clearPending();
+    this.workspaceSyncNeeded = true;
+  }
+
   private async syncWorkspaceIndexIfNeeded(
     workspaceRoot: string,
     binary: string,
     reason: string,
+    automatic = false,
   ): Promise<void> {
     if (this.disposed || !this.shouldRunIncrementalFileUpdates()) { return; }
     if (this.getConfiguredEngine() !== 'zoekt') { return; }
@@ -1484,6 +1544,7 @@ export class ZoektRuntime implements vscode.Disposable {
       return;
     }
     if (!await this.hasReadyIndex(workspaceRoot)) { return; }
+    if (automatic && !this.isWindowFocused()) { return; }
 
     const previousHead = previousGitState ? this.gitHeadFromState(previousGitState) : undefined;
     const currentHead = gitState ? this.gitHeadFromState(gitState) : undefined;

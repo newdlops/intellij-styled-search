@@ -1470,6 +1470,88 @@ suite('Activation', () => {
     }
   });
 
+  test('unfocused automatic zoekt updates stay bounded and explicit drains bypass the foreground gate', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot, 'expected fixture workspace folder');
+
+    const originalResolveBinary = runtime.resolveBinary.bind(runtime);
+    const originalHasReadyIndex = runtime.hasReadyIndex.bind(runtime);
+    const originalInvokeJson = runtime.invokeJson.bind(runtime);
+    const originalScheduleFlush = runtime.scheduleFlush.bind(runtime);
+    const invoked: string[][] = [];
+    let scheduled = 0;
+    runtime.resolveBinary = async () => '/tmp/zoek-rs';
+    runtime.hasReadyIndex = async () => true;
+    runtime.invokeJson = async (args: string[]) => {
+      invoked.push(args);
+      return { type: 'update', ok: true, generation: 1, entriesWritten: 0, liveEntries: 0, tombstones: 0, overlayTotalEntries: 0, latestVisibleEntries: 0, journalBytes: 0, compactionSuggested: false, warnings: [] };
+    };
+    runtime.scheduleFlush = () => { scheduled++; };
+    try {
+      runtime.setWindowFocusedForTests(false);
+      runtime.pendingChanged.add('queued.ts');
+      await runtime.flushPendingUpdates(true);
+      assert.deepStrictEqual(invoked, [], 'automatic drain must not launch while unfocused');
+      assert.strictEqual(runtime.pendingChanged.has('queued.ts'), true, 'blur retains pending work');
+
+      for (let i = 0; i <= 200; i++) { runtime.pendingChanged.add(`burst-${i}.ts`); }
+      runtime.boundSuspendedPendingUpdates();
+      assert.strictEqual(runtime.workspaceSyncNeeded, true, 'large suspended burst collapses to workspace sync');
+      assert.strictEqual(runtime.pendingChanged.size, 0, 'bounded suspended state drops individual paths');
+
+      runtime.setWindowFocusedForTests(true);
+      runtime.handleWindowStateChange(true);
+      assert.strictEqual(scheduled, 1, 'refocus arms one catch-up flush');
+
+      runtime.workspaceSyncNeeded = false;
+      runtime.pendingChanged.add('explicit.ts');
+      await runtime.flushPendingUpdates(false);
+      assert.deepStrictEqual(invoked[0], ['/tmp/zoek-rs', 'update', workspaceRoot, 'explicit.ts']);
+    } finally {
+      runtime.pendingChanged.clear();
+      runtime.workspaceSyncNeeded = false;
+      runtime.setWindowFocusedForTests(undefined);
+      runtime.resolveBinary = originalResolveBinary;
+      runtime.hasReadyIndex = originalHasReadyIndex;
+      runtime.invokeJson = originalInvokeJson;
+      runtime.scheduleFlush = originalScheduleFlush;
+    }
+  });
+
+  test('unfocused automatic call graph refresh retains a bounded catch-up while explicit refresh bypasses', async () => {
+    const { callGraph } = await getApi();
+    const service = callGraph as any;
+    const originalProcessChangedFiles = service.processChangedFiles.bind(service);
+    let launches = 0;
+    service.processChangedFiles = async () => { launches++; };
+    try {
+      service.setWindowFocusedForTests(false);
+      service.pendingChangedUris.add(vscode.Uri.file('/tmp/foreground-gate.ts').toString());
+      await service.kickIncrementalRefresh(true);
+      assert.strictEqual(launches, 0, 'automatic graph refresh must not launch while unfocused');
+      assert.strictEqual(service.pendingChangedUris.size, 1, 'automatic graph refresh retains pending URI');
+
+      for (let i = 0; i < 200; i++) {
+        service.pendingChangedUris.add(vscode.Uri.file(`/tmp/foreground-gate-${i}.ts`).toString());
+      }
+      service.boundSuspendedIncrementalBacklog();
+      assert.strictEqual(service.pendingFullRefresh, true, 'suspended graph burst uses one full-refresh marker');
+      assert.strictEqual(service.pendingChangedUris.size, 0, 'suspended graph burst does not retain unbounded URIs');
+
+      service.pendingFullRefresh = false;
+      service.pendingChangedUris.add(vscode.Uri.file('/tmp/explicit-foreground-gate.ts').toString());
+      await service.kickIncrementalRefresh(false);
+      assert.strictEqual(launches, 1, 'explicit graph refresh bypasses the foreground gate');
+    } finally {
+      service.pendingChangedUris.clear();
+      service.pendingFullRefresh = false;
+      service.setWindowFocusedForTests(undefined);
+      service.processChangedFiles = originalProcessChangedFiles;
+    }
+  });
+
   test('rename crossing ignored zoekt dirs queues only the indexed side', async () => {
     const { overlay } = await getApi();
     const runtime = (overlay as any).zoektRuntime as any;
