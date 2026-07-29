@@ -3,6 +3,8 @@
     "module": "commonjs",
     "target": "ES2020",
     "outDir": "out",
+    "incremental": true,
+    "tsBuildInfoFile": "out/test/tsconfig.tsbuildinfo",
     "lib": ["ES2020"],
     "sourceMap": true,
     "rootDir": "src",

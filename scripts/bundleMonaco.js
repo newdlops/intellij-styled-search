@@ -4,6 +4,7 @@
 // inject it into the VSCode renderer via CDP Runtime.evaluate so the preview
 // pane can instantiate a real Monaco editor without colliding with VS Code.
 const esbuild = require('esbuild');
+const cache = require('./buildCache');
 const fs = require('fs');
 const path = require('path');
 
@@ -13,7 +14,24 @@ const outDir = path.join(root, 'resources');
 const outFile = path.join(outDir, 'monaco.bundle.js');
 const cssFile = path.join(outDir, 'monaco.bundle.css');
 const noticesFile = path.join(outDir, 'monaco.third-party-notices.txt');
+const monacoPackageDir = path.dirname(require.resolve('monaco-editor/package.json'));
+const textMatePackageDir = path.dirname(require.resolve('vscode-textmate/package.json'));
+const onigurumaPackageDir = path.dirname(require.resolve('vscode-oniguruma/package.json'));
+const licenseFiles = [
+  path.join(monacoPackageDir, 'LICENSE'), path.join(monacoPackageDir, 'ThirdPartyNotices.txt'),
+  path.join(textMatePackageDir, 'LICENSE.md'), path.join(onigurumaPackageDir, 'LICENSE.txt'),
+  path.join(onigurumaPackageDir, 'NOTICES.txt'),
+];
+const cacheOptions = {
+  stage: 'monaco',
+  config: { format: 'iife', minify: true, target: 'chrome120', postprocess: 'trusted-types-css-notices-v1' },
+  tools: { node: process.version, esbuild: esbuild.version },
+  outputs: [outFile, noticesFile],
+};
 
+if (cache.valid(cacheOptions)) {
+  console.log(`[bundleMonaco] cache hit ${outFile}`);
+} else {
 if (!fs.existsSync(outDir)) {
   fs.mkdirSync(outDir, { recursive: true });
 }
@@ -27,6 +45,7 @@ const result = esbuild.buildSync({
   target: 'chrome120',
   platform: 'browser',
   legalComments: 'none',
+  metafile: true,
   loader: {
     '.ttf': 'dataurl',
     '.wasm': 'binary',
@@ -157,12 +176,9 @@ fs.unlinkSync(cssFile);
 
 // node_modules is excluded from the VSIX, so copy Monaco's license and
 // upstream third-party notices next to the generated bundle that we ship.
-const monacoPackageDir = path.dirname(require.resolve('monaco-editor/package.json'));
 const monacoLicense = fs.readFileSync(path.join(monacoPackageDir, 'LICENSE'), 'utf8');
 const monacoNotices = fs.readFileSync(path.join(monacoPackageDir, 'ThirdPartyNotices.txt'), 'utf8');
-const textMatePackageDir = path.dirname(require.resolve('vscode-textmate/package.json'));
 const textMateLicense = fs.readFileSync(path.join(textMatePackageDir, 'LICENSE.md'), 'utf8');
-const onigurumaPackageDir = path.dirname(require.resolve('vscode-oniguruma/package.json'));
 const onigurumaLicense = fs.readFileSync(path.join(onigurumaPackageDir, 'LICENSE.txt'), 'utf8');
 const onigurumaNotices = fs.readFileSync(path.join(onigurumaPackageDir, 'NOTICES.txt'), 'utf8');
 fs.writeFileSync(
@@ -182,4 +198,9 @@ console.log(
 );
 if (result.warnings && result.warnings.length) {
   console.warn(`[bundleMonaco] ${result.warnings.length} warnings`);
+}
+cache.write({
+  ...cacheOptions,
+  inputs: [...Object.keys(result.metafile.inputs).map((file) => path.resolve(root, file)), __filename, entry, path.join(root, 'package-lock.json'), ...licenseFiles],
+});
 }
