@@ -19,6 +19,7 @@ import {
   type CallGraphUsageConfidenceCounts,
 } from './callGraph';
 import { CallGraphMcpServer } from './mcpServer';
+import { DurableCommandOwnershipRegistry } from './internal/callGraphInlayCommandOwnership';
 
 const CALL_GRAPH_DOCUMENT_SELECTOR: vscode.DocumentSelector = [
   { scheme: 'file', language: 'python' },
@@ -158,9 +159,10 @@ class CallGraphInlayRegistry {
  * symbol/relation/count tuple deterministic across provider refreshes.
  */
 class CallGraphDurableInlayCommandRegistry implements vscode.Disposable {
-  private readonly registrations = new Map<string, vscode.Disposable>();
+  private readonly ownership = new DurableCommandOwnershipRegistry();
 
   createCommand(
+    owner: vscode.Uri,
     title: string,
     targetCommand: string,
     symbolId: string,
@@ -174,24 +176,22 @@ class CallGraphDurableInlayCommandRegistry implements vscode.Disposable {
     }
     const commandId = `${targetCommand}${CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER}` +
       encodeURIComponent(JSON.stringify(targetArgs));
-    if (!this.registrations.has(commandId)) {
+    this.ownership.retain(owner.toString(), commandId, () => {
       const capturedArgs = [...targetArgs];
-      this.registrations.set(
-        commandId,
-        vscode.commands.registerCommand(commandId, () =>
-          vscode.commands.executeCommand(targetCommand, ...capturedArgs)),
-      );
-    }
+      return vscode.commands.registerCommand(commandId, () =>
+        vscode.commands.executeCommand(targetCommand, ...capturedArgs));
+    });
     // Deliberately omit `arguments`: any argument array makes VS Code allocate
     // the short-lived CommandsConverter delegate this registry is avoiding.
     return { title, command: commandId };
   }
 
+  releaseDocument(uri: vscode.Uri): void {
+    this.ownership.releaseOwner(uri.toString());
+  }
+
   dispose(): void {
-    for (const registration of this.registrations.values()) {
-      registration.dispose();
-    }
-    this.registrations.clear();
+    this.ownership.dispose();
   }
 }
 
@@ -265,6 +265,7 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
     }),
     vscode.workspace.onDidCloseTextDocument((document) => {
       callGraphInlayRegistry.clearDocument(document.uri);
+      callGraphDurableInlayCommands.releaseDocument(document.uri);
     }),
     callGraph.onDidChangeSnapshot(() => {
       callGraphInlayRegistry.clearAll();
@@ -2160,6 +2161,13 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
   ): Promise<vscode.InlayHint[]> {
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     if (token.isCancellationRequested) { return []; }
+    // Provider calls are automatic work. Do not hydrate persisted summaries in
+    // every background VS Code window; focus will fire the graph change event
+    // and VS Code will request fresh hints then.
+    if (!vscode.window.state.focused) {
+      this.registry.replaceRange(document.uri, range, []);
+      return [];
+    }
     if (!cfg.get<boolean>('callGraphInlayHints', true)) {
       this.registry.replaceRange(document.uri, range, []);
       return [];
@@ -2185,6 +2193,7 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
       const lineEndColumn = document.lineAt(summary.symbol.range.startLine).range.end.character;
       const hint = buildCallGraphInlayHint(
         summary,
+        document.uri,
         this.durableCommands,
         showCalleeInlayHints,
         lineEndColumn,
@@ -2254,6 +2263,7 @@ class CallGraphImplementationProvider implements vscode.ImplementationProvider {
 
 function buildCallGraphInlayHint(
   summary: CallGraphSymbolRelationSummary,
+  owner: vscode.Uri,
   durableCommands: CallGraphDurableInlayCommandRegistry,
   showCalleeInlayHints = false,
   lineEndColumn = summary.symbol.range.endColumn,
@@ -2272,6 +2282,7 @@ function buildCallGraphInlayHint(
       summary.symbol.id,
       summary.symbol.qualifiedName,
       summary.calleeCount,
+      owner,
       durableCommands,
     ));
   }
@@ -2284,6 +2295,7 @@ function buildCallGraphInlayHint(
       summary.symbol.id,
       summary.symbol.qualifiedName,
       summary.implementationCount,
+      owner,
       durableCommands,
     ));
   }
@@ -2299,6 +2311,7 @@ function buildCallGraphInlayHint(
       summary.symbol.id,
       summary.symbol.qualifiedName,
       summary.usageCount,
+      owner,
       durableCommands,
     ));
   }
@@ -2359,10 +2372,11 @@ function makeInlayCommandPart(
   symbolId: string,
   symbolLabel: string,
   count: number | undefined,
+  owner: vscode.Uri,
   durableCommands: CallGraphDurableInlayCommandRegistry,
 ): vscode.InlayHintLabelPart {
   const part = new vscode.InlayHintLabelPart(label);
-  part.command = durableCommands.createCommand(title, command, symbolId, symbolLabel, count);
+  part.command = durableCommands.createCommand(owner, title, command, symbolId, symbolLabel, count);
   return part;
 }
 
