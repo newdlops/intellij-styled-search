@@ -7,6 +7,8 @@ import * as v8 from 'v8';
 import { pathToFileURL } from 'url';
 import { gzip, gunzip } from 'zlib';
 import * as vscode from 'vscode';
+import { AsyncWeightedLruCache } from './internal/asyncWeightedLruCache';
+import { DocumentSummaryRetentionStore, type DocumentSummaryLoadTicket } from './internal/documentSummaryRetention';
 import { compilePathScopeMatcher } from './pathScope';
 import { decodeTextBytes, hasBinaryFileExtension, looksBinaryContent } from './textFiles';
 
@@ -811,6 +813,8 @@ const CALL_GRAPH_DOCUMENT_SUMMARY_BUCKETS = 256;
 const MODULE_IMPORT_TARGET = '*module*';
 const RUST_GRAPH_QUERY_TIMEOUT_MS = 30_000;
 const RUST_GRAPH_DOCUMENT_SYMBOL_QUERY_TIMEOUT_MS = 3_000;
+const RUST_SYMBOL_QUERY_CACHE_MAX_ENTRIES = 64;
+const RUST_SYMBOL_QUERY_CACHE_MAX_SYMBOLS = 2_000;
 const RUST_GRAPH_PROCESS_KILL_TIMEOUT_MS = 2_000;
 const USAGE_SOURCE_REFINEMENT_TIMEOUT_MS = 1_500;
 const USAGE_SOURCE_REFINEMENT_MAX_URIS = 8;
@@ -873,6 +877,7 @@ export class CallGraphService implements vscode.Disposable {
   private relationSummaryCache: { snapshot: CallGraphSnapshot; index: RelationSummaryIndex } | undefined;
   private readonly fileRecordsByUri = new Map<string, CallGraphFileRecord>();
   private readonly pendingChangedUris = new Set<string>();
+  private pendingFullRefresh = false;
   private readonly watcher: vscode.FileSystemWatcher | undefined;
   private restorePromise: Promise<void> | undefined;
   private snapshotRestorePromise: Promise<void> | undefined;
@@ -889,20 +894,35 @@ export class CallGraphService implements vscode.Disposable {
   private cacheConfigSignature: string | undefined;
   private cacheManifest: CallGraphCacheManifest | undefined;
   private cacheRecordsLoaded = false;
-  private readonly symbolRelationBucketsByIndex = new Map<number, Map<string, CallGraphSymbolRelationRecord>>();
-  private readonly symbolRelationLoadedBuckets = new Set<number>();
-  private readonly symbolRelationBucketPromises = new Map<number, Promise<void>>();
-  private readonly documentSummaryBucketsByIndex = new Map<number, Map<string, CallGraphDocumentSummaryRecord>>();
+  private readonly symbolRelationBuckets = new AsyncWeightedLruCache<number, Map<string, CallGraphSymbolRelationRecord>>({
+    maxEntries: 16,
+    maxWeight: 50_000,
+    weight: (records) => [...records.values()].reduce((total, record) => total + record.usages.length, 0),
+  });
+  private readonly documentSummaryRetention = new DocumentSummaryRetentionStore<CallGraphDocumentSummaryRecord>(
+    (record) => record.symbols.length,
+  );
   private readonly documentSummaryLoadedBuckets = new Set<number>();
-  private readonly documentSummaryBucketPromises = new Map<number, Promise<void>>();
-  private readonly rustSymbolQueryCache = new Map<string, { builtAtUnixMs: number; symbols: CallGraphSymbol[] }>();
-  private readonly rustDocumentSummaryPromises = new Map<string, Promise<boolean>>();
+  private readonly documentSummaryBucketPromises = new Map<string, Promise<void>>();
+  private readonly documentSummaryDiskLoadPromises = new Map<string, { ticket: DocumentSummaryLoadTicket; promise: Promise<void> }>();
+  private readonly rustSymbolQueryCache = new Map<string, { symbols: CallGraphSymbol[]; weight: number }>();
+  private readonly rustSymbolQueryFlights = new Map<string, Promise<CallGraphSymbol[] | undefined>>();
+  private rustSymbolQueryCacheWeight = 0;
+  private rustSymbolQueryGeneration = 0;
+  private rustSymbolQueryForTests: ((
+    workspaceRoot: string,
+    query: string,
+    limit: number,
+    options: { includeImplementationCounts: boolean; includeUsageCounts: boolean; timeoutMs?: number },
+  ) => Promise<CallGraphSymbol[] | undefined>) | undefined;
+  private readonly rustDocumentSummaryPromises = new Map<string, { ticket: DocumentSummaryLoadTicket; promise: Promise<boolean> }>();
   private readonly rustNativeDocumentSummaryUris = new Set<string>();
   private readonly rustNativeDirtySummaryUris = new Set<string>();
   private readonly rustGraphChildren = new Map<number, RustGraphTrackedChild>();
   private documentSummaryMigrationPromise: Promise<boolean> | undefined;
   private readonly documentSummaryFilePromises = new Map<string, Promise<boolean>>();
   private nextRustGraphChildId = 1;
+  private windowFocusedForTests: boolean | undefined;
 
   readonly onDidChangeSnapshot = this.onDidChangeSnapshotEmitter.event;
 
@@ -945,6 +965,8 @@ export class CallGraphService implements vscode.Disposable {
       vscode.workspace.onDidSaveTextDocument((document) => {
         this.scheduleIncrementalRefreshIfSupported(document.uri, 'saved', CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS);
       }),
+      vscode.workspace.onDidCloseTextDocument((document) => this.releaseDocumentSummaryOwner(document.uri.toString())),
+      vscode.window.onDidChangeWindowState((state) => this.handleWindowStateChange(state.focused)),
     );
     context.subscriptions.push(
       ...disposables,
@@ -954,6 +976,7 @@ export class CallGraphService implements vscode.Disposable {
 
   dispose(): void {
     this.disposed = true;
+    this.invalidateRustSymbolQueryCache();
     if (this.incrementalTimer) {
       clearTimeout(this.incrementalTimer);
       this.incrementalTimer = undefined;
@@ -1045,7 +1068,7 @@ export class CallGraphService implements vscode.Disposable {
     }
     if (uri) {
       const bucket = documentSummaryBucketForUri(uri.toString());
-      await this.ensureDocumentSummaryBucketLoaded(folder.uri.fsPath, bucket, chunks);
+      await this.ensureDocumentSummaryBucketLoaded(folder.uri.fsPath, bucket, chunks, uri.toString());
       return true;
     }
     await Promise.all(
@@ -1092,24 +1115,58 @@ export class CallGraphService implements vscode.Disposable {
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
     if (!folder || !manifest?.builtAtUnixMs) { return cached; }
-    const symbols = await this.queryRustGraphSymbolIndex(
+    const normalizedQuery = query.trim();
+    const normalizedLimit = Math.max(1, Math.floor(limit));
+    const effectiveOptions = {
+      includeImplementationCounts: options.includeImplementationCounts ?? false,
+      includeUsageCounts: options.includeUsageCounts ?? true,
+      ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    };
+    const generation = this.rustSymbolQueryGeneration;
+    const key = rustSymbolQueryCacheKey(
       folder.uri.fsPath,
-      { query: query.trim(), limit },
       manifest.builtAtUnixMs,
-      {
-        includeImplementationCounts: options.includeImplementationCounts ?? false,
-        includeUsageCounts: options.includeUsageCounts,
-        timeoutMs: options.timeoutMs,
-      },
+      generation,
+      normalizedQuery,
+      normalizedLimit,
+      effectiveOptions,
     );
+    const cachedSymbols = this.getRustSymbolQueryCacheEntry(key);
+    if (cachedSymbols) {
+      return cachedSymbols.length === 0 && cached.length > 0 ? cached : cachedSymbols;
+    }
+    let flight = this.rustSymbolQueryFlights.get(key);
+    if (!flight) {
+      flight = (async () => {
+        const symbols = this.rustSymbolQueryForTests
+          ? await this.rustSymbolQueryForTests(folder.uri.fsPath, normalizedQuery, normalizedLimit, effectiveOptions)
+          : await this.queryRustGraphSymbolIndex(
+            folder.uri.fsPath,
+            { query: normalizedQuery, limit: normalizedLimit },
+            manifest.builtAtUnixMs,
+            effectiveOptions,
+          );
+        if (!symbols) { return undefined; }
+        if (
+          this.rustSymbolQueryGeneration === generation &&
+          this.cacheManifest?.builtAtUnixMs === manifest.builtAtUnixMs
+        ) {
+          this.putRustSymbolQueryCacheEntry(key, symbols);
+        }
+        return cloneCallGraphSymbols(symbols);
+      })();
+      this.rustSymbolQueryFlights.set(key, flight);
+      void flight.finally(() => {
+        if (this.rustSymbolQueryFlights.get(key) === flight) {
+          this.rustSymbolQueryFlights.delete(key);
+        }
+      }).catch(() => undefined);
+    }
+    const symbols = await flight;
     if (!symbols) { return cached; }
     if (this.cacheManifest?.builtAtUnixMs !== manifest.builtAtUnixMs) { return cached; }
     if (symbols.length === 0 && cached.length > 0) { return cached; }
-    this.rustSymbolQueryCache.set(rustSymbolQueryCacheKey(query, limit), {
-      builtAtUnixMs: manifest.builtAtUnixMs,
-      symbols,
-    });
-    return symbols;
+    return cloneCallGraphSymbols(symbols);
   }
 
   async findUsagesResolved(symbolOrQuery: string, limit = 500): Promise<CallGraphReference[]> {
@@ -1434,8 +1491,8 @@ export class CallGraphService implements vscode.Disposable {
       let baseUsages: CallGraphReference[] = [];
       if (manifest.symbolRelations.length > 0) {
         const bucket = symbolRelationBucketForSymbolId(symbolId);
-        await this.ensureSymbolRelationBucketLoaded(folder.uri.fsPath, bucket, manifest.symbolRelations);
-        const record = this.getCachedSymbolRelationRecord(symbolId);
+        const records = await this.ensureSymbolRelationBucketLoaded(folder.uri.fsPath, bucket, manifest.symbolRelations);
+        const record = records.get(symbolId);
         baseUsages = record?.usages ?? [];
       }
       const overrides = await this.loadRecordOverrides(folder.uri.fsPath, manifest);
@@ -2115,8 +2172,7 @@ export class CallGraphService implements vscode.Disposable {
       return this.getSymbolRelationSummariesForDocument(uri, range, limit);
     }
     const uriString = uri.toString();
-    const bucket = documentSummaryBucketForUri(uriString);
-    const record = this.documentSummaryBucketsByIndex.get(bucket)?.get(uriString);
+    const record = this.getCachedDocumentSummaryRecord(uriString);
     if (!record) { return []; }
     return record.symbols
       .filter((summary) => !range || range.contains(new vscode.Position(summary.symbol.range.startLine, summary.symbol.range.startColumn)))
@@ -2166,19 +2222,28 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   private getCachedDocumentSymbols(uriString: string): CallGraphSymbol[] {
-    const bucket = documentSummaryBucketForUri(uriString);
-    const record = this.documentSummaryBucketsByIndex.get(bucket)?.get(uriString);
+    const record = this.getCachedDocumentSummaryRecord(uriString);
     return record?.symbols.map((summary) => summary.symbol) ?? [];
   }
 
   private async getDocumentSymbolsFromLocalParse(uri: vscode.Uri, reason: string): Promise<CallGraphSymbol[]> {
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
-    const parsed = await parseSourceFileRecord(
-      uri,
-      getConfiguredCallGraphMaxFileSize(cfg),
-      getConfiguredCallGraphParseLimits(cfg),
-    );
-    if (!parsed.record) { return []; }
+    const ticket = this.documentSummaryRetention.beginLoad(uri.toString());
+    let parsed: Awaited<ReturnType<typeof parseSourceFileRecord>>;
+    try {
+      parsed = await parseSourceFileRecord(
+        uri,
+        getConfiguredCallGraphMaxFileSize(cfg),
+        getConfiguredCallGraphParseLimits(cfg),
+      );
+    } catch (err) {
+      this.documentSummaryRetention.discard(ticket);
+      throw err;
+    }
+    if (!parsed.record) {
+      this.documentSummaryRetention.discard(ticket);
+      return [];
+    }
     const symbols = parsed.record.parsed.symbols
       .filter((symbol) => isCallableSymbol(symbol) || isTypeSymbol(symbol) || isReferenceableSymbol(symbol))
       .map(stripMutableSymbol);
@@ -2193,7 +2258,7 @@ export class CallGraphService implements vscode.Disposable {
         usageCount: 0,
       })),
     };
-    this.putDocumentSummaryRecord(record);
+    if (!this.putDocumentSummaryRecord(record, 'cache', ticket)) { return []; }
     this.log.appendLine(
       `call graph local document summary parsed: reason=${reason} file=${record.relPath} symbols=${record.symbols.length}`,
     );
@@ -2202,19 +2267,25 @@ export class CallGraphService implements vscode.Disposable {
 
   private resolveCachedRustSymbols(query: string, limit: number): CallGraphSymbol[] {
     const normalized = query.trim();
+    const folder = vscode.workspace.workspaceFolders?.[0];
     const manifestBuiltAt = this.cacheManifest?.builtAtUnixMs;
-    const cached = this.rustSymbolQueryCache.get(rustSymbolQueryCacheKey(normalized, limit));
-    if (cached && cached.builtAtUnixMs === manifestBuiltAt && cached.symbols.length > 0) {
-      return cached.symbols.slice(0, limit);
+    if (folder && manifestBuiltAt) {
+      const cached = this.getRustSymbolQueryCacheEntry(rustSymbolQueryCacheKey(
+        folder.uri.fsPath,
+        manifestBuiltAt,
+        this.rustSymbolQueryGeneration,
+        normalized,
+        Math.max(1, Math.floor(limit)),
+        { includeImplementationCounts: false, includeUsageCounts: true },
+      ));
+      if (cached && cached.length > 0) { return cached.slice(0, limit); }
     }
     const lower = normalized.toLowerCase();
     const symbols: CallGraphSymbol[] = [];
-    for (const bucket of this.documentSummaryBucketsByIndex.values()) {
-      for (const record of bucket.values()) {
-        for (const summary of record.symbols) {
-          if (scoreSymbolMatch(summary.symbol, normalized, lower) > 0) {
-            symbols.push(summary.symbol);
-          }
+    for (const record of this.documentSummaryRetention.values()) {
+      for (const summary of record.symbols) {
+        if (scoreSymbolMatch(summary.symbol, normalized, lower) > 0) {
+          symbols.push(summary.symbol);
         }
       }
     }
@@ -2309,6 +2380,39 @@ export class CallGraphService implements vscode.Disposable {
     await this.refreshChangedFiles(uris, 'test');
   }
 
+  /** @internal Deterministic lifecycle seam for foreground scheduling tests. */
+  setWindowFocusedForTests(focused: boolean | undefined): void {
+    this.windowFocusedForTests = focused;
+  }
+
+  /** @internal Focused seam for deterministic Rust symbol-query cache tests. */
+  setRustSymbolQueryForTests(
+    query: ((
+      workspaceRoot: string,
+      query: string,
+      limit: number,
+      options: { includeImplementationCounts: boolean; includeUsageCounts: boolean; timeoutMs?: number },
+    ) => Promise<CallGraphSymbol[] | undefined>) | undefined,
+  ): void {
+    this.rustSymbolQueryForTests = query;
+    this.invalidateRustSymbolQueryCache();
+  }
+
+  /** @internal Focused seam for deterministic Rust symbol-query cache tests. */
+  getRustSymbolQueryCacheStatsForTests(): { entries: number; retainedSymbols: number; generation: number; inFlight: number } {
+    return {
+      entries: this.rustSymbolQueryCache.size,
+      retainedSymbols: this.rustSymbolQueryCacheWeight,
+      generation: this.rustSymbolQueryGeneration,
+      inFlight: this.rustSymbolQueryFlights.size,
+    };
+  }
+
+  /** @internal Focused seam for deterministic Rust symbol-query cache tests. */
+  invalidateRustSymbolQueryCacheForTests(): void {
+    this.invalidateRustSymbolQueryCache();
+  }
+
   async reloadPersistedSnapshotForTests(): Promise<void> {
     this.snapshot = undefined;
     this.indexCache = undefined;
@@ -2361,15 +2465,23 @@ export class CallGraphService implements vscode.Disposable {
       return true;
     }
     const existing = this.rustDocumentSummaryPromises.get(uriString);
-    if (existing) { return existing; }
-    const promise = this.doEnsureRustNativeDocumentSummary(uri, options.timeoutMs).finally(() => {
-      this.rustDocumentSummaryPromises.delete(uriString);
+    if (existing) { return existing.promise; }
+    const ticket = this.documentSummaryRetention.beginLoad(uriString);
+    const promise = this.doEnsureRustNativeDocumentSummary(uri, ticket, options.timeoutMs).finally(() => {
+      this.documentSummaryRetention.discard(ticket);
+      if (this.rustDocumentSummaryPromises.get(uriString)?.ticket === ticket) {
+        this.rustDocumentSummaryPromises.delete(uriString);
+      }
     });
-    this.rustDocumentSummaryPromises.set(uriString, promise);
+    this.rustDocumentSummaryPromises.set(uriString, { ticket, promise });
     return promise;
   }
 
-  private async doEnsureRustNativeDocumentSummary(uri: vscode.Uri, timeoutMs?: number): Promise<boolean> {
+  private async doEnsureRustNativeDocumentSummary(
+    uri: vscode.Uri,
+    ticket: DocumentSummaryLoadTicket,
+    timeoutMs?: number,
+  ): Promise<boolean> {
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
     if (!folder || !manifest?.builtAtUnixMs) { return false; }
@@ -2396,7 +2508,7 @@ export class CallGraphService implements vscode.Disposable {
         usageCount: Math.max(0, Math.floor(symbol.usageCount ?? 0)),
       })),
     };
-    this.putDocumentSummaryRecord(record, 'rust-native');
+    if (!this.putDocumentSummaryRecord(record, 'rust-native', ticket)) { return false; }
     this.rustNativeDirtySummaryUris.delete(uriString);
     this.log.appendLine(
       `call graph rust-native document summary loaded: file=${record.relPath} ` +
@@ -2412,6 +2524,7 @@ export class CallGraphService implements vscode.Disposable {
   ): void {
     if (this.disposed || isCallGraphExcludedUri(uri)) { return; }
     this.pendingChangedUris.add(uri.toString());
+    this.boundSuspendedIncrementalBacklog();
     if (!this.incrementalReason || reason === 'saved' || this.incrementalReason.startsWith('external-')) {
       this.incrementalReason = reason;
     }
@@ -2431,6 +2544,7 @@ export class CallGraphService implements vscode.Disposable {
       clearTimeout(this.compactionTimer);
       this.compactionTimer = undefined;
     }
+    if (!this.isWindowFocused()) { return; }
     const flushAt = Date.now() + delayMs;
     if (this.incrementalTimer && this.incrementalFlushAt > 0 && this.incrementalFlushAt <= flushAt) {
       return;
@@ -2442,7 +2556,7 @@ export class CallGraphService implements vscode.Disposable {
     this.incrementalTimer = setTimeout(() => {
       this.incrementalTimer = undefined;
       this.incrementalFlushAt = 0;
-      void this.kickIncrementalRefresh()
+      void this.kickIncrementalRefresh(true)
         .catch((err) => this.log.appendLine(`call graph incremental update failed: ${err instanceof Error ? err.message : err}`));
     }, delayMs);
   }
@@ -2463,7 +2577,7 @@ export class CallGraphService implements vscode.Disposable {
     if (reason && (!this.incrementalReason || reason === 'saved' || this.incrementalReason.startsWith('external-'))) {
       this.incrementalReason = reason;
     }
-    await this.kickIncrementalRefresh();
+    await this.kickIncrementalRefresh(false);
   }
 
   // Single-flight gate: at most ONE incremental drain runs at a time. Changes
@@ -2472,21 +2586,22 @@ export class CallGraphService implements vscode.Disposable {
   // concurrent graph-update processes. The overlay file and sidecars are shared,
   // and an incremental can still fall back to the full path when old sidecars are
   // missing. Serializing + coalescing bounds it to a single process.
-  private kickIncrementalRefresh(): Promise<void> {
+  private kickIncrementalRefresh(automatic: boolean): Promise<void> {
     if (this.incrementalPromise) { return this.incrementalPromise; }
-    this.incrementalPromise = this.drainIncrementalRefresh().finally(() => {
+    this.incrementalPromise = this.drainIncrementalRefresh(automatic).finally(() => {
       this.incrementalPromise = undefined;
     });
     return this.incrementalPromise;
   }
 
-  private async drainIncrementalRefresh(): Promise<void> {
+  private async drainIncrementalRefresh(automatic: boolean): Promise<void> {
     if (this.rebuildPromise) { await this.rebuildPromise; }
     if (this.restorePromise) { await this.restorePromise; }
     // Never overlay-update while a compaction is folding the overlay into the base.
     if (this.compactionPromise) { await this.compactionPromise; }
     let iterations = 0;
-    while (!this.disposed && this.pendingChangedUris.size > 0) {
+    while (!this.disposed && (this.pendingFullRefresh || this.pendingChangedUris.size > 0)) {
+      if (automatic && !this.isWindowFocused()) { return; }
       if (++iterations > CALL_GRAPH_INCREMENTAL_MAX_DRAIN_ITERATIONS) {
         // Continuous editing: release the loop (and any open update process) and
         // let the next debounce flush resume, so a never-ending edit stream
@@ -2498,6 +2613,8 @@ export class CallGraphService implements vscode.Disposable {
         this.armIncrementalFlush(CALL_GRAPH_EXTERNAL_INCREMENTAL_DEBOUNCE_MS);
         return;
       }
+      const fullRefresh = this.pendingFullRefresh;
+      this.pendingFullRefresh = false;
       const uriStrings = Array.from(this.pendingChangedUris);
       this.pendingChangedUris.clear();
       const reason = this.incrementalReason || 'changed';
@@ -2505,10 +2622,10 @@ export class CallGraphService implements vscode.Disposable {
       // A very large coalesced batch (branch switch, mass edit, generated code)
       // is cheaper AND memory-bounded as ONE full rebuild than as a giant
       // incremental that assembles a huge delta against the full prior graph.
-      if (uriStrings.length >= CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD) {
+      if (fullRefresh || uriStrings.length >= CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD) {
         this.log.appendLine(
-          `call graph incremental: ${uriStrings.length} files changed ` +
-          `(>= ${CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD}); running one full rebuild instead`,
+          `call graph incremental: ${fullRefresh ? 'suspended backlog' : `${uriStrings.length} files changed`} ` +
+          `(${fullRefresh ? 'bounded full-refresh marker' : `>= ${CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD}`}); running one full rebuild instead`,
         );
         try {
           await this.rebuild();
@@ -2536,9 +2653,10 @@ export class CallGraphService implements vscode.Disposable {
   // has been quiet for CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS.
   private armCompactionTimer(): void {
     if (this.disposed || this.compactionTimer) { return; }
+    if (!this.isWindowFocused()) { return; }
     this.compactionTimer = setTimeout(() => {
       this.compactionTimer = undefined;
-      void this.kickCompaction()
+      void this.kickCompaction(true)
         .catch((err) => this.log.appendLine(`call graph overlay compaction failed: ${err instanceof Error ? err.message : err}`));
     }, CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS);
   }
@@ -2546,8 +2664,9 @@ export class CallGraphService implements vscode.Disposable {
   // Single-flight compaction. Defers if an update/rebuild/restore is in flight or
   // edits are pending (re-arms so it retries once idle), so compaction never
   // overlaps an overlay-update.
-  private kickCompaction(): Promise<void> {
+  private kickCompaction(automatic = false): Promise<void> {
     if (this.disposed || !this.overlayDirty) { return Promise.resolve(); }
+    if (automatic && !this.isWindowFocused()) { return Promise.resolve(); }
     if (this.compactionPromise) { return this.compactionPromise; }
     if (
       this.incrementalPromise ||
@@ -2558,10 +2677,41 @@ export class CallGraphService implements vscode.Disposable {
       this.armCompactionTimer();
       return Promise.resolve();
     }
-    this.compactionPromise = this.compactRustNativeGraphOverlay().finally(() => {
+    this.compactionPromise = this.compactRustNativeGraphOverlay(automatic).finally(() => {
       this.compactionPromise = undefined;
     });
     return this.compactionPromise;
+  }
+
+  private boundSuspendedIncrementalBacklog(): void {
+    if (this.isWindowFocused() || this.pendingChangedUris.size < CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD) { return; }
+    this.pendingChangedUris.clear();
+    this.pendingFullRefresh = true;
+  }
+
+  private isWindowFocused(): boolean {
+    return this.windowFocusedForTests ?? vscode.window.state.focused;
+  }
+
+  private handleWindowStateChange(focused: boolean): void {
+    if (!focused) {
+      if (this.incrementalTimer) {
+        clearTimeout(this.incrementalTimer);
+        this.incrementalTimer = undefined;
+        this.incrementalFlushAt = 0;
+      }
+      if (this.compactionTimer) {
+        clearTimeout(this.compactionTimer);
+        this.compactionTimer = undefined;
+      }
+      return;
+    }
+    if (this.pendingChangedUris.size > 0 || this.pendingFullRefresh) {
+      this.armIncrementalFlush(0);
+    } else if (this.overlayDirty) {
+      this.armCompactionTimer();
+    }
+    this.onDidChangeSnapshotEmitter.fire();
   }
 
   private async processChangedFiles(uris: vscode.Uri[], reason: string): Promise<void> {
@@ -2618,7 +2768,7 @@ export class CallGraphService implements vscode.Disposable {
         this.rustNativeDirtySummaryUris.delete(uriString);
       }
     }
-    this.rustSymbolQueryCache.clear();
+    this.invalidateRustSymbolQueryCache();
     for (const uri of uniqueUris) {
       if (!isSupportedSourceUri(uri) || !fs.existsSync(uri.fsPath)) { continue; }
       try {
@@ -2637,13 +2787,14 @@ export class CallGraphService implements vscode.Disposable {
   // (base+overlay merged == compacted base), so the cached manifest stays valid;
   // we only refresh derived caches so reads pick up the folded base and the
   // now-exact token-shape / usage counts the overlay left at base values.
-  private async compactRustNativeGraphOverlay(): Promise<void> {
+  private async compactRustNativeGraphOverlay(automatic = false): Promise<void> {
     const folder = vscode.workspace.workspaceFolders?.[0];
     const manifest = this.cacheManifest;
     if (this.disposed || !folder || !manifest?.builtAtUnixMs) { return; }
     if (!this.hasRustNativePrimaryGraph()) { this.overlayDirty = false; return; }
     const binary = await this.resolveRustGraphBinary(true);
     if (!binary) { return; }
+    if (automatic && !this.isWindowFocused()) { return; }
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     const args = [
       binary,
@@ -2671,7 +2822,7 @@ export class CallGraphService implements vscode.Disposable {
     }
     this.overlayDirty = false;
     this.clearDocumentSummaryCache();
-    this.rustSymbolQueryCache.clear();
+    this.invalidateRustSymbolQueryCache();
     this.onDidChangeSnapshotEmitter.fire();
     this.log.appendLine(`call graph overlay compaction done: elapsed=${Date.now() - started}ms`);
   }
@@ -3362,69 +3513,46 @@ export class CallGraphService implements vscode.Disposable {
     workspaceRoot: string,
     bucket: number,
     chunks: CallGraphSymbolRelationChunk[],
-  ): Promise<void> {
-    if (this.symbolRelationLoadedBuckets.has(bucket)) { return; }
-    const existing = this.symbolRelationBucketPromises.get(bucket);
-    if (existing) {
-      await existing;
-      return;
-    }
-    const promise = this.doLoadSymbolRelationBucket(workspaceRoot, bucket, chunks).finally(() => {
-      this.symbolRelationBucketPromises.delete(bucket);
-    });
-    this.symbolRelationBucketPromises.set(bucket, promise);
-    await promise;
-  }
-
-  private async doLoadSymbolRelationBucket(
-    workspaceRoot: string,
-    bucket: number,
-    chunks: CallGraphSymbolRelationChunk[],
-  ): Promise<void> {
-    const chunk = chunks.find((entry) => entry.bucket === bucket);
-    if (!chunk) {
-      this.symbolRelationLoadedBuckets.add(bucket);
-      return;
-    }
-    const started = Date.now();
+  ): Promise<Map<string, CallGraphSymbolRelationRecord>> {
     try {
-      const records = await this.readCacheArrayChunk<CallGraphSymbolRelationRecord>(workspaceRoot, chunk);
-      let bucketRecords = this.symbolRelationBucketsByIndex.get(bucket);
-      if (!bucketRecords) {
-        bucketRecords = new Map<string, CallGraphSymbolRelationRecord>();
-        this.symbolRelationBucketsByIndex.set(bucket, bucketRecords);
-      }
-      for (const record of records) {
-        bucketRecords.set(record.symbolId, record);
-      }
-      this.symbolRelationLoadedBuckets.add(bucket);
-      this.log.appendLine(
-        `call graph symbol relation bucket loaded: bucket=${bucket} symbols=${records.length} elapsed=${Date.now() - started}ms`,
-      );
+      return await this.symbolRelationBuckets.getOrLoad(bucket, async () => {
+        const chunk = chunks.find((entry) => entry.bucket === bucket);
+        if (!chunk) { return new Map(); }
+        const started = Date.now();
+        const records = await this.readCacheArrayChunk<CallGraphSymbolRelationRecord>(workspaceRoot, chunk);
+        const bucketRecords = new Map<string, CallGraphSymbolRelationRecord>();
+        for (const record of records) {
+          bucketRecords.set(record.symbolId, record);
+        }
+        this.log.appendLine(
+          `call graph symbol relation bucket loaded: bucket=${bucket} symbols=${records.length} elapsed=${Date.now() - started}ms`,
+        );
+        return bucketRecords;
+      });
     } catch (err) {
       this.log.appendLine(`call graph symbol relation load skipped: ${err instanceof Error ? err.message : String(err)}`);
+      return new Map();
     }
-  }
-
-  private getCachedSymbolRelationRecord(symbolId: string): CallGraphSymbolRelationRecord | undefined {
-    return this.symbolRelationBucketsByIndex.get(symbolRelationBucketForSymbolId(symbolId))?.get(symbolId);
   }
 
   private async ensureDocumentSummaryBucketLoaded(
     workspaceRoot: string,
     bucket: number,
     chunks: CallGraphDocumentSummaryChunk[],
+    uriString?: string,
   ): Promise<void> {
-    if (this.documentSummaryLoadedBuckets.has(bucket)) { return; }
-    const existing = this.documentSummaryBucketPromises.get(bucket);
+    if (!uriString && this.documentSummaryLoadedBuckets.has(bucket)) { return; }
+    const key = uriString ? `${bucket}:${uriString}` : String(bucket);
+    const existing = this.documentSummaryBucketPromises.get(key);
     if (existing) {
       await existing;
       return;
     }
-    const promise = this.doLoadDocumentSummaryBucket(workspaceRoot, bucket, chunks).finally(() => {
-      this.documentSummaryBucketPromises.delete(bucket);
+    const ticket = uriString ? this.documentSummaryRetention.beginLoad(uriString) : undefined;
+    const promise = this.doLoadDocumentSummaryBucket(workspaceRoot, bucket, chunks, uriString, ticket).finally(() => {
+      this.documentSummaryBucketPromises.delete(key);
     });
-    this.documentSummaryBucketPromises.set(bucket, promise);
+    this.documentSummaryBucketPromises.set(key, promise);
     await promise;
   }
 
@@ -3432,30 +3560,36 @@ export class CallGraphService implements vscode.Disposable {
     workspaceRoot: string,
     bucket: number,
     chunks: CallGraphDocumentSummaryChunk[],
+    uriString?: string,
+    ticket?: DocumentSummaryLoadTicket,
   ): Promise<void> {
     const chunk = chunks.find((entry) => entry.bucket === bucket);
     if (!chunk) {
+      if (ticket) { this.documentSummaryRetention.discard(ticket); }
       this.documentSummaryLoadedBuckets.add(bucket);
       return;
     }
     const started = Date.now();
     try {
       const records = await this.readCacheArrayChunk<CallGraphDocumentSummaryRecord>(workspaceRoot, chunk);
-      let bucketRecords = this.documentSummaryBucketsByIndex.get(bucket);
-      if (!bucketRecords) {
-        bucketRecords = new Map<string, CallGraphDocumentSummaryRecord>();
-        this.documentSummaryBucketsByIndex.set(bucket, bucketRecords);
-      }
+      let committed = false;
       for (const record of records) {
+        if (uriString && record.uri !== uriString) { continue; }
         if (this.rustNativeDirtySummaryUris.has(record.uri)) { continue; }
-        bucketRecords.set(record.uri, record);
+        if (ticket && record.uri === ticket.uri) {
+          committed = this.putDocumentSummaryRecord(record, 'cache', ticket) || committed;
+        } else {
+          this.putDocumentSummaryRecord(record);
+        }
         this.rustNativeDocumentSummaryUris.delete(record.uri);
       }
+      if (ticket && !committed) { this.documentSummaryRetention.discard(ticket); }
       this.documentSummaryLoadedBuckets.add(bucket);
       this.log.appendLine(
         `call graph document summary bucket loaded: bucket=${bucket} files=${records.length} elapsed=${Date.now() - started}ms`,
       );
     } catch (err) {
+      if (ticket) { this.documentSummaryRetention.discard(ticket); }
       this.log.appendLine(`call graph document summary load skipped: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -3464,16 +3598,42 @@ export class CallGraphService implements vscode.Disposable {
     workspaceRoot: string,
     chunk: CallGraphDocumentSummaryFileChunk,
   ): Promise<void> {
+    const existing = this.documentSummaryDiskLoadPromises.get(chunk.uri);
+    if (existing) {
+      await existing.promise;
+      return;
+    }
+    const ticket = this.documentSummaryRetention.beginLoad(chunk.uri);
+    const promise = this.doLoadDocumentSummaryFile(workspaceRoot, chunk, ticket).finally(() => {
+      this.documentSummaryRetention.discard(ticket);
+      if (this.documentSummaryDiskLoadPromises.get(chunk.uri)?.ticket === ticket) {
+        this.documentSummaryDiskLoadPromises.delete(chunk.uri);
+      }
+    });
+    this.documentSummaryDiskLoadPromises.set(chunk.uri, { ticket, promise });
+    await promise;
+  }
+
+  private async doLoadDocumentSummaryFile(
+    workspaceRoot: string,
+    chunk: CallGraphDocumentSummaryFileChunk,
+    ticket: DocumentSummaryLoadTicket,
+  ): Promise<void> {
     const started = Date.now();
     try {
       const records = await this.readCacheArrayChunk<CallGraphDocumentSummaryRecord>(workspaceRoot, chunk);
+      let committed = false;
       for (const record of records) {
-        this.putDocumentSummaryRecord(record);
+        if (record.uri === chunk.uri) {
+          committed = this.putDocumentSummaryRecord(record, 'cache', ticket) || committed;
+        }
       }
+      if (!committed) { this.documentSummaryRetention.discard(ticket); }
       this.log.appendLine(
         `call graph document summary file loaded: uri=${chunk.uri} records=${records.length} elapsed=${Date.now() - started}ms`,
       );
     } catch (err) {
+      this.documentSummaryRetention.discard(ticket);
       this.log.appendLine(`call graph document summary file load skipped: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -3521,14 +3681,14 @@ export class CallGraphService implements vscode.Disposable {
     }
     const chunks = manifest.documentSummaries;
     if (Array.isArray(chunks) && chunks.length > 0) {
-      await this.ensureDocumentSummaryBucketLoaded(workspaceRoot, documentSummaryBucketForUri(uriString), chunks);
+      await this.ensureDocumentSummaryBucketLoaded(workspaceRoot, documentSummaryBucketForUri(uriString), chunks, uriString);
       return this.getCachedDocumentSummaryRecord(uriString);
     }
     return undefined;
   }
 
   private getCachedDocumentSummaryRecord(uriString: string): CallGraphDocumentSummaryRecord | undefined {
-    return this.documentSummaryBucketsByIndex.get(documentSummaryBucketForUri(uriString))?.get(uriString);
+    return this.documentSummaryRetention.get(uriString);
   }
 
   private ensureDocumentSummaryFileFromSnapshot(uri: vscode.Uri, reason: string): Promise<boolean> {
@@ -3896,20 +4056,57 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   private clearSymbolRelationCache(): void {
-    this.symbolRelationBucketsByIndex.clear();
-    this.symbolRelationLoadedBuckets.clear();
-    this.symbolRelationBucketPromises.clear();
+    this.symbolRelationBuckets.clear();
   }
 
   private clearDocumentSummaryCache(): void {
-    this.documentSummaryBucketsByIndex.clear();
+    this.documentSummaryRetention.clear();
     this.documentSummaryLoadedBuckets.clear();
     this.documentSummaryBucketPromises.clear();
+    this.documentSummaryDiskLoadPromises.clear();
     this.documentSummaryFilePromises.clear();
     this.rustDocumentSummaryPromises.clear();
-    this.rustSymbolQueryCache.clear();
+    this.invalidateRustSymbolQueryCache();
     this.rustNativeDocumentSummaryUris.clear();
     this.rustNativeDirtySummaryUris.clear();
+  }
+
+  private getRustSymbolQueryCacheEntry(key: string): CallGraphSymbol[] | undefined {
+    const entry = this.rustSymbolQueryCache.get(key);
+    if (!entry) { return undefined; }
+    // Map insertion order is our LRU order; a successful read becomes newest.
+    this.rustSymbolQueryCache.delete(key);
+    this.rustSymbolQueryCache.set(key, entry);
+    return cloneCallGraphSymbols(entry.symbols);
+  }
+
+  private putRustSymbolQueryCacheEntry(key: string, symbols: CallGraphSymbol[]): void {
+    const weight = symbols.length;
+    if (weight > RUST_SYMBOL_QUERY_CACHE_MAX_SYMBOLS) { return; }
+    const existing = this.rustSymbolQueryCache.get(key);
+    if (existing) {
+      this.rustSymbolQueryCache.delete(key);
+      this.rustSymbolQueryCacheWeight -= existing.weight;
+    }
+    const entry = { symbols: cloneCallGraphSymbols(symbols), weight };
+    this.rustSymbolQueryCache.set(key, entry);
+    this.rustSymbolQueryCacheWeight += weight;
+    while (
+      this.rustSymbolQueryCache.size > RUST_SYMBOL_QUERY_CACHE_MAX_ENTRIES ||
+      this.rustSymbolQueryCacheWeight > RUST_SYMBOL_QUERY_CACHE_MAX_SYMBOLS
+    ) {
+      const oldest = this.rustSymbolQueryCache.entries().next().value as [string, { symbols: CallGraphSymbol[]; weight: number }] | undefined;
+      if (!oldest) { break; }
+      this.rustSymbolQueryCache.delete(oldest[0]);
+      this.rustSymbolQueryCacheWeight -= oldest[1].weight;
+    }
+  }
+
+  private invalidateRustSymbolQueryCache(): void {
+    this.rustSymbolQueryGeneration++;
+    this.rustSymbolQueryCache.clear();
+    this.rustSymbolQueryCacheWeight = 0;
+    this.rustSymbolQueryFlights.clear();
   }
 
   private async persistCache(
@@ -4028,7 +4225,6 @@ export class CallGraphService implements vscode.Disposable {
         this.cacheManifest = updatedManifest;
         if (this.snapshot === snapshot) {
           this.relationSummaryCache = { snapshot, index: relationIndex };
-          this.replaceDocumentSummaryCache(documentSummaryRecords);
           this.onDidChangeSnapshotEmitter.fire();
         }
         this.log.appendLine(
@@ -4765,30 +4961,36 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   private deleteDocumentSummaryRecord(uriString: string): void {
-    const bucket = documentSummaryBucketForUri(uriString);
-    this.documentSummaryBucketsByIndex.get(bucket)?.delete(uriString);
+    this.documentSummaryRetention.release(uriString);
+    this.rustNativeDocumentSummaryUris.delete(uriString);
+  }
+
+  private releaseDocumentSummaryOwner(uriString: string): void {
+    this.documentSummaryRetention.release(uriString);
+    this.rustDocumentSummaryPromises.delete(uriString);
+    this.documentSummaryDiskLoadPromises.delete(uriString);
     this.rustNativeDocumentSummaryUris.delete(uriString);
   }
 
   private putDocumentSummaryRecord(
     record: CallGraphDocumentSummaryRecord,
     source: 'cache' | 'rust-native' = 'cache',
-  ): void {
+    ticket?: DocumentSummaryLoadTicket,
+  ): boolean {
     if (source !== 'rust-native' && this.rustNativeDirtySummaryUris.has(record.uri)) {
-      return;
+      return false;
     }
-    const bucket = documentSummaryBucketForUri(record.uri);
-    let bucketRecords = this.documentSummaryBucketsByIndex.get(bucket);
-    if (!bucketRecords) {
-      bucketRecords = new Map<string, CallGraphDocumentSummaryRecord>();
-      this.documentSummaryBucketsByIndex.set(bucket, bucketRecords);
+    if (ticket) {
+      if (!this.documentSummaryRetention.commit(ticket, record)) { return false; }
+    } else {
+      this.documentSummaryRetention.put(record.uri, record);
     }
-    bucketRecords.set(record.uri, record);
     if (source === 'rust-native') {
       this.rustNativeDocumentSummaryUris.add(record.uri);
     } else {
       this.rustNativeDocumentSummaryUris.delete(record.uri);
     }
+    return true;
   }
 
   private async writeCacheArrayChunks<T>(
@@ -5263,7 +5465,7 @@ export class CallGraphService implements vscode.Disposable {
     this.cancelRustGraphProcesses('call graph rebuild started', {
       kinds: ['graph-query', 'graph-symbol-query', 'graph-index'],
     });
-    this.rustSymbolQueryCache.clear();
+    this.invalidateRustSymbolQueryCache();
     this.rustDocumentSummaryPromises.clear();
     if (options.force) {
       await this.clearForForceRebuild(workspaceRoot);
@@ -5561,8 +5763,34 @@ function normalizeCallGraphSymbolKind(value: unknown): CallGraphSymbolKind {
   return 'function';
 }
 
-function rustSymbolQueryCacheKey(query: string, limit: number): string {
-  return `${query.trim()}\n${Math.max(1, Math.floor(limit))}`;
+function rustSymbolQueryCacheKey(
+  workspaceRoot: string,
+  builtAtUnixMs: number,
+  generation: number,
+  query: string,
+  limit: number,
+  options: { includeImplementationCounts: boolean; includeUsageCounts: boolean },
+): string {
+  return JSON.stringify([
+    workspaceRoot,
+    builtAtUnixMs,
+    generation,
+    query.trim(),
+    Math.max(1, Math.floor(limit)),
+    options.includeImplementationCounts,
+    options.includeUsageCounts,
+  ]);
+}
+
+function cloneCallGraphSymbols(symbols: readonly CallGraphSymbol[]): CallGraphSymbol[] {
+  return symbols.map((symbol) => ({
+    ...symbol,
+    range: { ...symbol.range },
+    bodyRange: { ...symbol.bodyRange },
+    ...(symbol.modifiers ? { modifiers: [...symbol.modifiers] } : {}),
+    ...(symbol.extendsNames ? { extendsNames: [...symbol.extendsNames] } : {}),
+    ...(symbol.implementsNames ? { implementsNames: [...symbol.implementsNames] } : {}),
+  }));
 }
 
 function parseRustGraphRebuildProgressLine(line: string): {
