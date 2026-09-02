@@ -384,6 +384,8 @@ const LANGUAGE_GLOBS: Record<string, string[]> = {
 type UserEditDirectoryPriority = {
   active: readonly string[];
   changed: readonly string[];
+  activeFiles: readonly string[];
+  changedFiles: readonly string[];
 };
 
 type ChangedWorkspaceStatus = {
@@ -410,6 +412,8 @@ type SearchResultWithDirtyOverlay = SearchForTestsResult & {
 const EMPTY_USER_EDIT_DIRECTORY_PRIORITY: UserEditDirectoryPriority = {
   active: [],
   changed: [],
+  activeFiles: [],
+  changedFiles: [],
 };
 
 export class CallGraphMcpServer implements vscode.Disposable {
@@ -426,7 +430,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
   private readonly bundles = new Map<string, BundleRecord>();
   private readonly recentSymbols = new Map<string, CallGraphSymbol>();
   private readonly activeRequestCancellations = new Map<string, vscode.CancellationTokenSource>();
-  private editDirectoryRankCache: { at: number; changed: string[] } | undefined;
+  private editDirectoryRankCache: { at: number; changed: string[]; changedFiles: string[] } | undefined;
 
   constructor(
     private readonly callGraph: CallGraphService,
@@ -3344,18 +3348,28 @@ export class CallGraphMcpServer implements vscode.Disposable {
   }
 
   private userEditDirectoryPrefixes(limit: number): UserEditDirectoryPriority {
-    const activeDirs = this.directoryPrefixesForRelPaths(this.activeWorkspaceRelPaths(limit), limit);
+    const activeFiles = this.activeWorkspaceRelPaths(limit).map(normalizeMcpRelPath).filter(Boolean);
+    const activeDirs = this.directoryPrefixesForRelPaths(activeFiles, limit);
     const now = Date.now();
     let changedDirs: string[];
+    let changedFiles: string[];
     if (this.editDirectoryRankCache && now - this.editDirectoryRankCache.at < 2_000) {
       changedDirs = this.editDirectoryRankCache.changed;
+      changedFiles = this.editDirectoryRankCache.changedFiles;
     } else {
-      changedDirs = this.directoryPrefixesForRelPaths(this.changedWorkspaceRelPaths(limit), limit);
-      this.editDirectoryRankCache = { at: now, changed: changedDirs };
+      changedFiles = this.changedWorkspaceRelPaths(limit).map(normalizeMcpRelPath).filter(Boolean);
+      changedDirs = this.directoryPrefixesForRelPaths(changedFiles, limit);
+      this.editDirectoryRankCache = { at: now, changed: changedDirs, changedFiles };
     }
     const active = activeDirs.slice(0, limit);
     const changed = changedDirs.filter((dir) => !isInUserEditDirectory(dir, active)).slice(0, Math.max(0, limit - active.length));
-    return { active, changed };
+    const activeFileSet = new Set(activeFiles);
+    return {
+      active,
+      changed,
+      activeFiles: activeFiles.slice(0, limit),
+      changedFiles: changedFiles.filter((relPath) => !activeFileSet.has(relPath)).slice(0, limit),
+    };
   }
 
   private directoryPrefixesForRelPaths(relPaths: readonly string[], limit: number): string[] {
@@ -5290,9 +5304,9 @@ function searchResultPathPenalty(
   const normalized = normalizeMcpRelPath(relPath);
   const base = path.basename(normalized);
   let penalty = 0;
-  if (isInUserEditDirectory(normalized, userEditDirs.active)) {
+  if (userEditDirs.activeFiles.includes(normalized) || isInUserEditDirectory(normalized, userEditDirs.active)) {
     penalty -= 20_000;
-  } else if (isInUserEditDirectory(normalized, userEditDirs.changed)) {
+  } else if (userEditDirs.changedFiles.includes(normalized) || isInUserEditDirectory(normalized, userEditDirs.changed)) {
     penalty -= 4_000;
   }
   if (/(^|\/)(?:\.vscode|\.vscode-test|\.codeidx|\.lh)(?:\/|$)/.test(normalized) ||
@@ -5554,20 +5568,23 @@ function trimSearchPayloadToBudget(
   warnings: string[],
 ): Array<Record<string, unknown>> {
   const results = Array.isArray(payload.results) ? payload.results as Array<Record<string, unknown>> : [];
+  let omittedDueToMaxChars = 0;
   while (results.length > 1 && JSON.stringify(payload).length > maxChars) {
     results.pop();
+    omittedDueToMaxChars++;
     payload.truncated = true;
   }
   const window = isObject(payload.result_window) ? payload.result_window as Record<string, unknown> : undefined;
   if (window) {
     window.returned = results.length;
+    window.omitted_due_to_max_chars = omittedDueToMaxChars;
   }
   if (results.length > 0 && payload.truncated === true) {
     payload.next_cursor = cursorForOffset(offset + results.length);
   }
   if (JSON.stringify(payload).length > maxChars) {
     warnings.push('Response still exceeds max_chars with one result; increase max_chars or narrow file_globs.');
-  } else if (payload.truncated === true && results.length > 0) {
+  } else if (omittedDueToMaxChars > 0 && results.length > 0) {
     warnings.push('Response was capped by max_chars; use next_cursor to continue.');
   }
   syncSearchResultWindow(payload);
@@ -5867,10 +5884,15 @@ function stdioLauncherContent(cliPath: string): string {
     '}',
     'function dotWorkspaceArg() {',
     '  const cwd = path.resolve(process.cwd());',
-    '  if (cwd !== workspaceRoot) {',
-    '    return cwd;',
+    '  if (cwd === workspaceRoot) {',
+    '    return workspaceRoot;',
     '  }',
-    '  return workspaceRoot;',
+    '  const relativeLauncherWorkspace = path.relative(cwd, workspaceRoot);',
+    '  const cwdContainsLauncherWorkspace = relativeLauncherWorkspace &&',
+    '    !relativeLauncherWorkspace.startsWith(".." + path.sep) &&',
+    '    relativeLauncherWorkspace !== ".." &&',
+    '    !path.isAbsolute(relativeLauncherWorkspace);',
+    '  return cwdContainsLauncherWorkspace ? workspaceRoot : cwd;',
     '}',
     'function normalizeWorkspaceArg(value) {',
     '  if (value === ".") {',
@@ -6004,7 +6026,7 @@ function readMcpSearchScope(args: Record<string, unknown>): McpSearchScope {
   const userExcludeGlobs = normalizeMcpGlobPatterns(readStringArrayArg(args, 'exclude_globs'));
   const excludePolicy = readEnumArg(args, 'exclude_policy', EXCLUDE_POLICIES, 'default');
   const includeSensitive = readBoolArg(args, 'include_sensitive', false);
-  const includeDependencies = readBoolArg(args, 'include_dependencies', true);
+  const includeDependencies = readBoolArg(args, 'include_dependencies', false);
   const includeGenerated = readBoolArg(args, 'include_generated', false);
   const scopePreset = readEnumArg(args, 'scope_preset', MCP_SCOPE_PRESETS, 'all');
   const defaultExcludePatterns: string[] = [];

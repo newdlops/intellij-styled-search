@@ -212,6 +212,7 @@ export interface ExtensionTestApi {
   overlay: OverlayPanel;
   callGraph: CallGraphService;
   mcpServer: CallGraphMcpServer;
+  setCallGraphInlayHintsAllowUnfocusedForTests(allow: boolean): void;
 }
 
 export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
@@ -225,6 +226,12 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   );
   const callGraphInlayRegistry = new CallGraphInlayRegistry();
   const callGraphDurableInlayCommands = new CallGraphDurableInlayCommandRegistry();
+  const callGraphInlayHintsProvider = new CallGraphInlayHintsProvider(
+    overlay,
+    callGraph,
+    callGraphInlayRegistry,
+    callGraphDurableInlayCommands,
+  );
   overlay.setPreviewCallGraphInlayProvider((uri, document, range) =>
     buildPreviewCallGraphInlays(callGraph, callGraphLog, uri, document, range));
   const mcpServer = new CallGraphMcpServer(callGraph, callGraphLog, overlay);
@@ -274,12 +281,7 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   context.subscriptions.push(
     vscode.languages.registerInlayHintsProvider(
       CALL_GRAPH_DOCUMENT_SELECTOR,
-      new CallGraphInlayHintsProvider(
-        overlay,
-        callGraph,
-        callGraphInlayRegistry,
-        callGraphDurableInlayCommands,
-      ),
+      callGraphInlayHintsProvider,
     ),
     vscode.languages.registerImplementationProvider(CALL_GRAPH_DOCUMENT_SELECTOR, new CallGraphImplementationProvider(callGraph)),
   );
@@ -771,7 +773,14 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
     }),
   );
 
-  return { overlay, callGraph, mcpServer };
+  return {
+    overlay,
+    callGraph,
+    mcpServer,
+    setCallGraphInlayHintsAllowUnfocusedForTests: (allow: boolean) => {
+      callGraphInlayHintsProvider.setAllowUnfocusedForTests(allow);
+    },
+  };
 }
 
 export async function deactivate() {
@@ -2144,6 +2153,7 @@ function buildPreviewCallGraphInlayEntries(
 
 class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
   readonly onDidChangeInlayHints: vscode.Event<void>;
+  private allowUnfocusedForTests = false;
 
   constructor(
     private readonly overlay: OverlayPanel,
@@ -2152,6 +2162,10 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
     private readonly durableCommands: CallGraphDurableInlayCommandRegistry,
   ) {
     this.onDidChangeInlayHints = callGraph.onDidChangeSnapshot;
+  }
+
+  setAllowUnfocusedForTests(allow: boolean): void {
+    this.allowUnfocusedForTests = allow;
   }
 
   async provideInlayHints(
@@ -2164,7 +2178,7 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
     // Provider calls are automatic work. Do not hydrate persisted summaries in
     // every background VS Code window; focus will fire the graph change event
     // and VS Code will request fresh hints then.
-    if (!vscode.window.state.focused) {
+    if (!vscode.window.state.focused && !this.allowUnfocusedForTests) {
       this.registry.replaceRange(document.uri, range, []);
       return [];
     }

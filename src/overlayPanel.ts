@@ -31,6 +31,7 @@ import { compilePathScopeMatcher } from './pathScope';
 import { ZoektRuntime, type ZoektFreshnessStatus } from './zoekRuntime';
 import type { ZoektInfoResponse } from './zoekProtocol';
 import { inferBundledElectronMainPid } from './electronMainProcess';
+import { isIndexingMemoryPressureError } from './internal/indexingMemoryProtection';
 
 type RendererEvent =
   | { type: 'search'; options: SearchOptions; recordHistory?: boolean }
@@ -762,11 +763,14 @@ export class OverlayPanel {
       });
     }));
     const initialEngine = getConfiguredSearchEngine();
+    const protectedTrigramFileNames: string[] = [];
     if (initialEngine === 'codesearch') {
+      protectedTrigramFileNames.push(this.trigramIndex.protectPersistedIndex());
       this.startTrigramIndexInit('activation');
     } else {
       this.log.appendLine('zoekt selected on activation; preserving existing codesearch trigram cache.');
     }
+    this.zoektRuntime.maintainGeneratedStorage(protectedTrigramFileNames);
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('intellijStyledSearch.engine')) {
         const engine = getConfiguredSearchEngine();
@@ -1166,8 +1170,16 @@ export class OverlayPanel {
     }, delayMs);
   }
 
-  private runRendererInlayClickHookWarmup(reason: string): void {
-    if (!vscode.window.state.focused) { return; }
+  /** @internal E2E hook. OS-level focus can move to the test driver while the
+   *  workbench is still the intended target, so deterministic warmup probes
+   *  bypass only the production focus gate. */
+  runRendererInlayClickHookWarmupForTests(reason = 'test'): void {
+    if (!this.shouldEnableRendererInlayClickHook()) { return; }
+    this.runRendererInlayClickHookWarmup(reason, true);
+  }
+
+  private runRendererInlayClickHookWarmup(reason: string, allowUnfocused = false): void {
+    if (!allowUnfocused && !vscode.window.state.focused) { return; }
     if (this.showInFlight || this.pendingShow) {
       this.scheduleRendererInlayClickHookWarmup(reason, 1000, true);
       return;
@@ -2317,6 +2329,9 @@ export class OverlayPanel {
                 }
               } catch (err) {
                 this.log.appendLine(`zoek-rs rebuild failed: ${err instanceof Error ? err.message : err}`);
+                if (isIndexingMemoryPressureError(err)) {
+                  throw err;
+                }
               }
             }
           } catch (err) {
@@ -2532,6 +2547,34 @@ export class OverlayPanel {
 
   async show(initialQuery: string, options?: ShowOptions): Promise<void> {
     await this.enqueueShow(initialQuery, options);
+  }
+
+  /** @internal E2E hook for probes that must inspect the rendered panel.
+   *  The public show() intentionally returns after a busy renderer accepts a
+   *  deferred request; tests that read DOM state need the stronger settlement
+   *  boundary so one probe cannot leak a pending show into the next one. */
+  showAndWaitForTests(initialQuery: string, options?: ShowOptions): Promise<boolean> {
+    return this.showAndWaitForSettlement(initialQuery, options);
+  }
+
+  /** @internal E2E isolation barrier. A renderer-busy show is allowed to
+   *  outlive show(), but must not bleed into the next test case. */
+  async waitForShowIdleForTests(timeoutMs = 12_000): Promise<void> {
+    const deadline = Date.now() + Math.max(1, timeoutMs);
+    while (
+      this.showInFlight ||
+      this.pendingShow !== null ||
+      this.deferredShowSeq !== undefined
+    ) {
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `renderer show did not settle within ${timeoutMs}ms ` +
+          `(inFlight=${this.showInFlight}, pending=${this.pendingShow !== null}, ` +
+          `deferred=${this.deferredShowSeq !== undefined})`,
+        );
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
   }
 
   private async enqueueShow(

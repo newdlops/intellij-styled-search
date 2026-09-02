@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.7144",
+  "version": "0.1.7147",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -460,7 +460,7 @@
           "default": 8192,
           "minimum": 256,
           "maximum": 32768,
-          "description": "Approximate call graph rebuild memory budget in MB. Full rebuilds run in a separate worker process launched with this V8 max-old-space-size; the default is 8192MB and the worker can be raised up to 32768MB."
+          "description": "Call graph rebuild memory budget in MB. JavaScript rebuild workers use it as their V8 heap limit; Rust rebuilds use it to cap process address space and per-worker spill buffers. The default is 8192MB and the limit can be raised up to 32768MB."
         },
         "intellijStyledSearch.callGraphNodePath": {
           "type": "string",

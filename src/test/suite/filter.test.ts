@@ -19,6 +19,7 @@ interface SearchState {
   searching: boolean;
   filesCount: number;
   flatCount: number;
+  searchId?: number;
   inputValue: string | null;
   scopeValue?: string | null;
   rgQuery: string;
@@ -28,6 +29,7 @@ interface SearchState {
   history?: string[];
   lastBatchMatches?: number;
   lastBatchFiles?: number;
+  lastBatchMode?: string;
   err?: string;
 }
 
@@ -98,7 +100,12 @@ suite('Extension-typing filter — client-side narrowing', () => {
   setup(async function () {
     if (!cdpAvailable) { return; }
     const api = await getApi();
-    await api.overlay.show('');
+    await api.overlay.waitForShowIdleForTests();
+    assert.strictEqual(
+      await api.overlay.showAndWaitForTests(''),
+      true,
+      'renderer should accept the setup reset',
+    );
     await api.overlay.evalInActiveWindowForTests(
       `(function(){
         var q = document.querySelector('.ij-find-query');
@@ -160,7 +167,11 @@ suite('Extension-typing filter — client-side narrowing', () => {
     // First search — sets rgQuery on the renderer side. Keep the seed
     // query narrow so the test doesn't depend on scanning every common
     // `class` token in the repo and bundled VS Code test install.
-    await api.overlay.show('Beta');
+    assert.strictEqual(
+      await api.overlay.showAndWaitForTests('Beta'),
+      true,
+      'renderer should settle the first query',
+    );
     const afterFirst = await waitUntil(
       api,
       (s) => !s.searching && s.rgQuery === 'Beta',
@@ -174,7 +185,11 @@ suite('Extension-typing filter — client-side narrowing', () => {
     // renderer path, this may stay as a client-side narrowing pass or
     // become a fresh rg run. What must hold is that the renderer lands on
     // the new query and drives search state from it.
-    await api.overlay.show('BetaWidget');
+    assert.strictEqual(
+      await api.overlay.showAndWaitForTests('BetaWidget'),
+      true,
+      'renderer should settle the extension query',
+    );
     const afterExt = await waitUntil(
       api,
       (s) => s.inputValue === 'BetaWidget' && (s.filterQuery === 'BetaWidget' || s.rgQuery === 'BetaWidget'),
@@ -391,7 +406,12 @@ suite('Extension-typing filter — client-side narrowing', () => {
     );
     const scoped = await waitUntil(
       api,
-      (s) => !s.searching && s.rgQuery === 'class' && s.scopeValue === 'nested/' && s.rgScope === 'nested/',
+      (s) => !s.searching &&
+        s.rgQuery === 'class' &&
+        s.scopeValue === 'nested/' &&
+        s.rgScope === 'nested/' &&
+        (s.searchId ?? -1) > (baseline.searchId ?? -1) &&
+        s.lastBatchMode === 'initial',
       10_000,
       'scope-narrowed search to settle with scope=nested/',
     );

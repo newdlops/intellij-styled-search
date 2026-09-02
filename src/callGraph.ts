@@ -9,6 +9,12 @@ import { gzip, gunzip } from 'zlib';
 import * as vscode from 'vscode';
 import { AsyncWeightedLruCache } from './internal/asyncWeightedLruCache';
 import { DocumentSummaryRetentionStore, type DocumentSummaryLoadTicket } from './internal/documentSummaryRetention';
+import {
+  IndexingMemoryProtection,
+  type IndexingMemoryPressureError,
+  indexingMemoryProtection,
+  isIndexingMemoryPressureError,
+} from './internal/indexingMemoryProtection';
 import { compilePathScopeMatcher } from './pathScope';
 import { decodeTextBytes, hasBinaryFileExtension, looksBinaryContent } from './textFiles';
 
@@ -801,6 +807,7 @@ const CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD = 200;
 //     this many back-to-back passes the loop releases and the next debounce
 //     flush resumes the remainder.
 const CALL_GRAPH_INCREMENTAL_MAX_DRAIN_ITERATIONS = 50;
+const CALL_GRAPH_MEMORY_PRESSURE_RETRY_MS = 30_000;
 // LSM overlay: a save writes a small delta overlay (graph-overlay-update, ~<1s)
 // instead of rewriting the base. After editing goes idle for this long, fold the
 // overlay into the base (graph-compact, the heavy ~O(total) job) off the critical
@@ -864,6 +871,7 @@ type RustGraphInvokeOptions = {
   token?: vscode.CancellationToken;
   timeoutMs?: number;
   cancelError?: Error;
+  env?: NodeJS.ProcessEnv;
 };
 
 type RustGraphBinaryResolver = (allowBuild: boolean) => Promise<string | undefined>;
@@ -930,6 +938,7 @@ export class CallGraphService implements vscode.Disposable {
     private readonly context: vscode.ExtensionContext,
     private readonly log: vscode.OutputChannel,
     private readonly rustGraphBinaryResolver?: RustGraphBinaryResolver,
+    private readonly memoryProtection: IndexingMemoryProtection = indexingMemoryProtection,
   ) {
     const disposables: vscode.Disposable[] = [];
     if (this.shouldWatchExternalFileChanges()) {
@@ -2630,6 +2639,12 @@ export class CallGraphService implements vscode.Disposable {
         try {
           await this.rebuild();
         } catch (err) {
+          if (isIndexingMemoryPressureError(err)) {
+            this.pendingFullRefresh = true;
+            this.armIncrementalFlush(CALL_GRAPH_MEMORY_PRESSURE_RETRY_MS);
+            this.log.appendLine(`call graph batch full rebuild deferred: ${err.message}`);
+            return;
+          }
           this.log.appendLine(`call graph batch full rebuild failed: ${err instanceof Error ? err.message : err}`);
         }
         continue;
@@ -2638,6 +2653,13 @@ export class CallGraphService implements vscode.Disposable {
       try {
         await this.processChangedFiles(uris, reason);
       } catch (err) {
+        if (isIndexingMemoryPressureError(err)) {
+          for (const uriString of uriStrings) { this.pendingChangedUris.add(uriString); }
+          this.incrementalReason = reason;
+          this.armIncrementalFlush(CALL_GRAPH_MEMORY_PRESSURE_RETRY_MS);
+          this.log.appendLine(`call graph incremental update deferred: ${err.message}`);
+          return;
+        }
         this.log.appendLine(`call graph incremental update failed: ${err instanceof Error ? err.message : err}`);
       }
     }
@@ -2651,14 +2673,14 @@ export class CallGraphService implements vscode.Disposable {
   // Arm (or keep) the idle timer that folds the overlay into the base. A fresh
   // edit clears it (armIncrementalFlush) so compaction only fires once editing
   // has been quiet for CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS.
-  private armCompactionTimer(): void {
+  private armCompactionTimer(delayMs = CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS): void {
     if (this.disposed || this.compactionTimer) { return; }
     if (!this.isWindowFocused()) { return; }
     this.compactionTimer = setTimeout(() => {
       this.compactionTimer = undefined;
       void this.kickCompaction(true)
         .catch((err) => this.log.appendLine(`call graph overlay compaction failed: ${err instanceof Error ? err.message : err}`));
-    }, CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS);
+    }, delayMs);
   }
 
   // Single-flight compaction. Defers if an update/rebuild/restore is in flight or
@@ -2716,6 +2738,7 @@ export class CallGraphService implements vscode.Disposable {
 
   private async processChangedFiles(uris: vscode.Uri[], reason: string): Promise<void> {
     if (uris.length === 0 || this.disposed) { return; }
+    this.memoryProtection.assertCanStart('call graph incremental indexing');
     if (this.hasRustNativePrimaryGraph()) {
       await this.refreshRustNativeChangedFiles(uris, reason);
       return;
@@ -2743,6 +2766,9 @@ export class CallGraphService implements vscode.Disposable {
     try {
       updated = await this.updateRustNativeGraphIndex(folder.uri.fsPath, manifest, uniqueUris, reason);
     } catch (err) {
+      if (isIndexingMemoryPressureError(err)) {
+        throw err;
+      }
       this.log.appendLine(`call graph rust-native incremental ${reason} failed: ${err instanceof Error ? err.message : String(err)}`);
     }
     if (!updated) {
@@ -2792,7 +2818,17 @@ export class CallGraphService implements vscode.Disposable {
     const manifest = this.cacheManifest;
     if (this.disposed || !folder || !manifest?.builtAtUnixMs) { return; }
     if (!this.hasRustNativePrimaryGraph()) { this.overlayDirty = false; return; }
-    const binary = await this.resolveRustGraphBinary(true);
+    let binary: string | undefined;
+    try {
+      binary = await this.resolveRustGraphBinary(true);
+    } catch (err) {
+      if (isIndexingMemoryPressureError(err)) {
+        this.armCompactionTimer(CALL_GRAPH_MEMORY_PRESSURE_RETRY_MS);
+        this.log.appendLine(`call graph overlay compaction deferred: ${err.message}`);
+        return;
+      }
+      throw err;
+    }
     if (!binary) { return; }
     if (automatic && !this.isWindowFocused()) { return; }
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
@@ -2813,6 +2849,11 @@ export class CallGraphService implements vscode.Disposable {
     try {
       response = await this.invokeRustGraphJson(args) as RustGraphIndexResponse;
     } catch (err) {
+      if (isIndexingMemoryPressureError(err)) {
+        this.armCompactionTimer(CALL_GRAPH_MEMORY_PRESSURE_RETRY_MS);
+        this.log.appendLine(`call graph overlay compaction deferred: ${err.message}`);
+        return;
+      }
       this.log.appendLine(`call graph overlay compaction failed: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
@@ -4507,6 +4548,9 @@ export class CallGraphService implements vscode.Disposable {
         }
         return binary;
       } catch (err) {
+        if (isIndexingMemoryPressureError(err)) {
+          throw err;
+        }
         this.log.appendLine(`call graph rust graph index build skipped: ${err instanceof Error ? err.message : String(err)}`);
         return undefined;
       } finally {
@@ -4563,6 +4607,10 @@ export class CallGraphService implements vscode.Disposable {
   ): Promise<string> {
     const [command, ...rest] = args;
     const kind = this.classifyRustGraphProcess(rest);
+    const protectHostMemory = this.isMemoryIntensiveRustGraphProcess(kind);
+    if (protectHostMemory) {
+      this.memoryProtection.assertCanStart(`call graph ${kind}`);
+    }
     const timeoutMs = options.timeoutMs ?? this.defaultRustGraphTimeoutMs(kind);
     return new Promise((resolve, reject) => {
       const child = spawn(command, rest, {
@@ -4571,6 +4619,7 @@ export class CallGraphService implements vscode.Disposable {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
         detached: process.platform !== 'win32',
+        env: options.env ?? process.env,
       });
       const tracked = this.trackRustGraphChild(
         child,
@@ -4584,12 +4633,14 @@ export class CallGraphService implements vscode.Disposable {
       let forcedError: Error | undefined;
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let tokenSub: { dispose(): void } = { dispose() {} };
+      let memoryMonitor = { dispose() {} };
       const cleanup = () => {
         if (timeout) {
           clearTimeout(timeout);
           timeout = undefined;
         }
         tokenSub.dispose();
+        memoryMonitor.dispose();
         if (tracked.killTimer) {
           clearTimeout(tracked.killTimer);
           tracked.killTimer = undefined;
@@ -4608,6 +4659,11 @@ export class CallGraphService implements vscode.Disposable {
         }
         this.terminateRustGraphChild(tracked, reason);
       };
+      if (protectHostMemory) {
+        memoryMonitor = this.memoryProtection.monitor(`call graph ${kind}`, (error) => {
+          requestCancel(error.message, error);
+        });
+      }
       tokenSub = options.token?.onCancellationRequested(() => {
         requestCancel('request cancelled', options.cancelError ?? new Error('zoek-rs graph command cancelled'));
       }) ?? { dispose() {} };
@@ -4637,7 +4693,7 @@ export class CallGraphService implements vscode.Disposable {
         }
       });
       child.on('error', (err) => {
-        finish(() => reject(err));
+        finish(() => reject(forcedError ?? err));
       });
       child.on('close', (code, signal) => {
         if (options.onStderrLine && stderrLineBuffer.trim()) {
@@ -4695,6 +4751,11 @@ export class CallGraphService implements vscode.Disposable {
       case 'graph-symbol-query': return 'graph-symbol-query';
       default: return 'other';
     }
+  }
+
+  private isMemoryIntensiveRustGraphProcess(kind: RustGraphProcessKind): boolean {
+    return kind === 'build' || kind === 'graph-rebuild' || kind === 'graph-update' ||
+      kind === 'graph-overlay-update' || kind === 'graph-compact' || kind === 'graph-index';
   }
 
   private argv0ForRustGraphProcess(kind: RustGraphProcessKind): string | undefined {
@@ -5101,6 +5162,7 @@ export class CallGraphService implements vscode.Disposable {
     report?: (progress: CallGraphRebuildProgress) => void;
     token?: vscode.CancellationToken;
   }): Promise<CallGraphSnapshot> {
+    this.memoryProtection.assertCanStart('JavaScript call graph rebuild');
     const workerPath = path.join(this.context.extensionUri.fsPath, 'out', 'callGraphWorkerProcess.js');
     if (!fs.existsSync(workerPath)) {
       throw new Error(`call graph worker bundle is missing: ${workerPath}`);
@@ -5129,11 +5191,14 @@ export class CallGraphService implements vscode.Disposable {
       let stdout = '';
       let finished = false;
       let killTimer: ReturnType<typeof setTimeout> | undefined;
+      let memoryPressureError: IndexingMemoryPressureError | undefined;
+      let memoryMonitor = { dispose() {} };
       const cleanup = () => {
         if (killTimer) {
           clearTimeout(killTimer);
           killTimer = undefined;
         }
+        memoryMonitor.dispose();
         tokenSub.dispose();
       };
       const finish = (fn: () => void) => {
@@ -5149,6 +5214,10 @@ export class CallGraphService implements vscode.Disposable {
           try { child.kill('SIGKILL'); } catch {}
         }, 2_000);
       };
+      memoryMonitor = this.memoryProtection.monitor('JavaScript call graph rebuild', (error) => {
+        memoryPressureError = error;
+        terminate();
+      });
       const tokenSub = input.token?.onCancellationRequested(() => {
         terminate();
         finish(() => reject(new CallGraphRebuildCancelledError()));
@@ -5211,10 +5280,14 @@ export class CallGraphService implements vscode.Disposable {
         }
       });
       child.on('error', (err) => {
-        finish(() => reject(err));
+        finish(() => reject(memoryPressureError ?? err));
       });
       child.on('close', (code, signal) => {
         if (finished) { return; }
+        if (memoryPressureError) {
+          finish(() => reject(memoryPressureError));
+          return;
+        }
         const details = stderr.trim() || stdout.trim() || (signal ? `signal ${signal}` : `exit code ${code}`);
         finish(() => reject(new Error(`call graph worker exited before completion: ${details}`)));
       });
@@ -5263,6 +5336,7 @@ export class CallGraphService implements vscode.Disposable {
     maxFileSize: number;
     excludeGlobs: string[];
     parseConcurrency: number;
+    memoryBudgetMb: number;
     configSignature: string;
     binaryPromise?: Promise<string | undefined>;
     token?: vscode.CancellationToken;
@@ -5300,10 +5374,12 @@ export class CallGraphService implements vscode.Disposable {
     for (const glob of input.excludeGlobs) {
       args.push('--exclude', glob);
     }
+    const memoryEnv = createRustGraphMemoryEnv(input.memoryBudgetMb, input.parseConcurrency);
     this.log.appendLine(`call graph rust-native rebuild start: binary=${binary} args=${JSON.stringify(args.slice(1))}`);
     const response = await this.invokeRustGraphJson(args, {
       token: input.token,
       cancelError: new CallGraphRebuildCancelledError(),
+      env: memoryEnv,
       onStderrLine: (line) => {
         const progress = parseRustGraphRebuildProgressLine(line);
         if (!progress) {
@@ -5428,9 +5504,11 @@ export class CallGraphService implements vscode.Disposable {
     if (!folder) {
       throw new Error('No workspace folder is open.');
     }
+    this.memoryProtection.assertCanStart('call graph rebuild');
     const workspaceRoot = folder.uri.fsPath;
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     const maxFileSize = getConfiguredCallGraphMaxFileSize(cfg);
+    const buildLimits = getConfiguredCallGraphBuildLimits(cfg);
     const parseConcurrency = getConfiguredCallGraphConcurrency(cfg);
     const backend = getConfiguredCallGraphBackend(cfg);
     const configSignature = getCallGraphConfigSignature(cfg);
@@ -5475,7 +5553,7 @@ export class CallGraphService implements vscode.Disposable {
         workspaceRoot,
         excludeGlobs: getConfiguredCallGraphExcludeGlobs(cfg),
         maxFileSize,
-        buildLimits: getConfiguredCallGraphBuildLimits(cfg),
+        buildLimits,
         parseConcurrency,
         resolveOptions: getConfiguredCallGraphResolveOptions(cfg),
         parseLimits: getConfiguredCallGraphParseLimits(cfg),
@@ -5491,6 +5569,7 @@ export class CallGraphService implements vscode.Disposable {
       maxFileSize,
       excludeGlobs: getConfiguredCallGraphExcludeGlobs(cfg),
       parseConcurrency,
+      memoryBudgetMb: buildLimits.memoryBudgetMb,
       configSignature,
       binaryPromise,
       token,
@@ -10123,6 +10202,47 @@ function capCallGraphConcurrencyForMemoryBudget(concurrency: number, memoryBudge
             ? 16
             : 64;
   return Math.max(1, Math.min(concurrency, memoryCap, MAX_CALL_GRAPH_CONCURRENCY));
+}
+
+export function createRustGraphMemoryEnv(
+  memoryBudgetMb: number,
+  parseConcurrency: number,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const mib = 1024 * 1024;
+  const requestedBudgetMb = Number.isFinite(memoryBudgetMb)
+    ? Math.floor(memoryBudgetMb)
+    : DEFAULT_CALL_GRAPH_MEMORY_BUDGET_MB;
+  const requestedWorkers = Number.isFinite(parseConcurrency) ? Math.floor(parseConcurrency) : 1;
+  const budgetBytes = Math.max(256, Math.min(32_768, requestedBudgetMb)) * mib;
+  const workers = Math.max(1, Math.min(MAX_CALL_GRAPH_CONCURRENCY, requestedWorkers));
+  // Parsing owns one accumulation buffer per worker. Give those buffers at
+  // most half the process budget, leaving the other half for merge/index
+  // structures. Workers spill before reaching this share; the higher soft
+  // limit only catches a single oversized batch that leaps past the spill
+  // point between checks.
+  const spillBytes = Math.max(
+    16 * mib,
+    Math.min(256 * mib, Math.floor((budgetBytes * 0.5) / workers)),
+  );
+  const workerLimitBytes = Math.min(budgetBytes, spillBytes * 4);
+  return {
+    ...baseEnv,
+    ZOEK_MEMORY_CAP_BYTES: boundedPositiveEnvBytes(baseEnv.ZOEK_MEMORY_CAP_BYTES, budgetBytes),
+    ZOEK_PARSE_SPILL_BYTES: boundedPositiveEnvBytes(baseEnv.ZOEK_PARSE_SPILL_BYTES, spillBytes),
+    ZOEK_WORKER_MEMORY_LIMIT_BYTES: boundedPositiveEnvBytes(
+      baseEnv.ZOEK_WORKER_MEMORY_LIMIT_BYTES,
+      workerLimitBytes,
+    ),
+  };
+}
+
+function boundedPositiveEnvBytes(existing: string | undefined, upperBound: number): string {
+  const parsed = existing === undefined ? NaN : Number(existing);
+  const value = Number.isSafeInteger(parsed) && parsed > 0
+    ? Math.min(parsed, upperBound)
+    : upperBound;
+  return String(Math.max(1, Math.floor(value)));
 }
 
 function getConfiguredCallGraphResolveOptions(

@@ -9,6 +9,13 @@ import {
 } from './pathScope';
 import { findRipgrepPath } from './rgSearch';
 import {
+  IndexingMemoryProtection,
+  type IndexingMemoryPressureError,
+  indexingMemoryProtection,
+  isIndexingMemoryPressureError,
+} from './internal/indexingMemoryProtection';
+import { maintainGlobalStorage } from './internal/globalStorageMaintenance';
+import {
   type FileMatch,
   type MatchRange,
   type SearchOptions,
@@ -72,6 +79,7 @@ const DEFAULT_UPDATE_LOG_MIN_INTERVAL_MS = 10_000;
 const DEFAULT_BACKGROUND_BUILD_DELAY_MS = 0;
 const DEFAULT_BACKGROUND_INDEX_DELAY_MS = 0;
 const UPDATE_RETRY_WHILE_INDEXING_MS = 1_000;
+const MEMORY_PRESSURE_RETRY_MS = 30_000;
 // A suspended window must retain enough detail for a small incremental update,
 // but a large event burst is cheaper and bounded as one workspace sync.
 const SUSPENDED_UPDATE_PATH_LIMIT = 200;
@@ -528,6 +536,7 @@ export class ZoektRuntime implements vscode.Disposable {
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly log: vscode.OutputChannel,
+    private readonly memoryProtection: IndexingMemoryProtection = indexingMemoryProtection,
   ) {
     this.extensionRoot = context.extensionUri.fsPath;
     const watchExternalChanges = this.shouldWatchExternalFileChanges();
@@ -569,6 +578,27 @@ export class ZoektRuntime implements vscode.Disposable {
       }),
       vscode.window.onDidChangeWindowState((state) => this.handleWindowStateChange(state.focused)),
     );
+  }
+
+  maintainGeneratedStorage(protectedTrigramFileNames: readonly string[]): void {
+    void maintainGlobalStorage({
+      globalStoragePath: this.context.globalStorageUri.fsPath,
+      platformKey: this.getBinaryPlatformKey(),
+      currentRustSourceFingerprint: this.getRustSourceFingerprint(),
+      protectedTrigramFileNames,
+    }).then((report) => {
+      if (report.skippedBecauseLocked) { return; }
+      if (report.removed.length > 0) {
+        this.log.appendLine(`global storage maintenance removed ${report.removed.length} obsolete cache entries`);
+      }
+      for (const error of report.errors) {
+        this.log.appendLine(`global storage maintenance skipped an entry: ${error}`);
+      }
+    }).catch((error) => {
+      this.log.appendLine(
+        `global storage maintenance failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
   }
 
   dispose(): void {
@@ -659,6 +689,7 @@ export class ZoektRuntime implements vscode.Disposable {
   async rebuildIndex(report?: (message: string, percent?: number) => void): Promise<boolean> {
     const workspaceRoot = this.getWorkspaceRootPath();
     if (!workspaceRoot) { return false; }
+    this.memoryProtection.assertCanStart('zoek-rs search index rebuild');
     report?.('zoek-rs: preparing indexer runtime');
     this.cancelScheduledBackgroundPreparation();
     const existing = this.foregroundIndexPromises.get(workspaceRoot);
@@ -1479,6 +1510,7 @@ export class ZoektRuntime implements vscode.Disposable {
     this.clearPending();
 
     this.updateInFlight = true;
+    let memoryPressureDeferred = false;
     this.updatePromise = this.updatePromise
       .then(async () => {
         const args: string[] = [binary, 'update', workspaceRoot];
@@ -1502,6 +1534,14 @@ export class ZoektRuntime implements vscode.Disposable {
       })
       .catch((err) => {
         if (err instanceof ProcessCancelledError) { return; }
+        if (isIndexingMemoryPressureError(err)) {
+          for (const relPath of changed) { this.pendingChanged.add(relPath); }
+          for (const relPath of deleted) { this.pendingDeleted.add(relPath); }
+          this.pendingRenames.push(...renamed.map(([oldRelPath, newRelPath]) => ({ oldRelPath, newRelPath })));
+          memoryPressureDeferred = true;
+          this.log.appendLine(`zoek-rs update deferred: ${err.message}`);
+          return;
+        }
         this.log.appendLine(`zoek-rs update failed: ${err instanceof Error ? err.message : err}`);
       })
       .finally(() => {
@@ -1515,7 +1555,7 @@ export class ZoektRuntime implements vscode.Disposable {
       this.pendingDeleted.size > 0 ||
       this.pendingRenames.length > 0
     ) {
-      this.scheduleFlush();
+      this.scheduleFlush(memoryPressureDeferred ? MEMORY_PRESSURE_RETRY_MS : undefined);
     }
   }
 
@@ -1571,6 +1611,11 @@ export class ZoektRuntime implements vscode.Disposable {
       this.log.appendLine(`zoek-rs workspace sync complete: reason=${reason} elapsed=${Date.now() - started}ms`);
     } catch (err) {
       if (err instanceof ProcessCancelledError) { return; }
+      if (isIndexingMemoryPressureError(err)) {
+        this.scheduleFlush(MEMORY_PRESSURE_RETRY_MS);
+        this.log.appendLine(`zoek-rs workspace sync deferred: ${err.message}`);
+        return;
+      }
       this.log.appendLine(`zoek-rs workspace sync failed: ${err instanceof Error ? err.message : err}`);
     }
   }
@@ -1720,6 +1765,14 @@ export class ZoektRuntime implements vscode.Disposable {
     if (this.indexPromises.has(workspaceRoot) || this.foregroundIndexPromises.has(workspaceRoot)) {
       return;
     }
+    try {
+      this.memoryProtection.assertCanStart('zoek-rs search index compaction');
+    } catch (err) {
+      this.log.appendLine(
+        `zoek-rs background base refresh deferred: ${err instanceof Error ? err.message : err}`,
+      );
+      return;
+    }
     const now = Date.now();
     const lastRefresh = this.lastAutoBaseRefreshAt.get(workspaceRoot) ?? 0;
     if (now - lastRefresh < AUTO_BASE_REFRESH_MIN_INTERVAL_MS) {
@@ -1770,6 +1823,7 @@ export class ZoektRuntime implements vscode.Disposable {
       return existing;
     }
     const promise = (async () => {
+      this.memoryProtection.assertCanStart('zoek-rs background search indexing');
       this.emitIndexProgress(workspaceRoot, 'zoek-rs: preparing indexer runtime');
       const binary = await this.resolveBinary(true);
       if (!binary) { return false; }
@@ -2515,6 +2569,9 @@ export class ZoektRuntime implements vscode.Disposable {
           this.log.appendLine('zoek-rs build cancelled.');
           return;
         }
+        if (isIndexingMemoryPressureError(err)) {
+          throw err;
+        }
         this.log.appendLine(`zoek-rs build failed: ${err instanceof Error ? err.message : err}`);
         return;
       }
@@ -2664,6 +2721,10 @@ export class ZoektRuntime implements vscode.Disposable {
     }
     const [command, ...rest] = args;
     const kind = this.classifyChild(command, rest);
+    const protectHostMemory = this.isMemoryIntensiveProcessKind(kind);
+    if (protectHostMemory) {
+      this.memoryProtection.assertCanStart(`zoek-rs ${kind}`);
+    }
     const argv0 = this.argv0ForKind(kind);
     const childEnv: NodeJS.ProcessEnv = {
       ...(hooks?.env ?? process.env),
@@ -2687,9 +2748,17 @@ export class ZoektRuntime implements vscode.Disposable {
       let stderr = '';
       let stderrLineBuf = '';
       let finished = false;
+      let memoryPressureError: IndexingMemoryPressureError | undefined;
+      const memoryMonitor = protectHostMemory
+        ? this.memoryProtection.monitor(`zoek-rs ${kind}`, (error) => {
+          memoryPressureError = error;
+          this.terminateTrackedChild(tracked, error.message);
+        })
+        : { dispose() {} };
       const cleanup = () => {
         if (finished) { return; }
         finished = true;
+        memoryMonitor.dispose();
         tokenSub.dispose();
         disposeSub.dispose();
         if (tracked.killTimer) {
@@ -2727,7 +2796,7 @@ export class ZoektRuntime implements vscode.Disposable {
       });
       child.on('error', (err) => {
         cleanup();
-        reject(err);
+        reject(memoryPressureError ?? err);
       });
       child.on('close', (code, signal) => {
         cleanup();
@@ -2737,6 +2806,10 @@ export class ZoektRuntime implements vscode.Disposable {
           if (!consumed) {
             stderr += line;
           }
+        }
+        if (memoryPressureError) {
+          reject(memoryPressureError);
+          return;
         }
         resolve({
           stdout,
@@ -2783,6 +2856,10 @@ export class ZoektRuntime implements vscode.Disposable {
       case 'benchmark': return 'benchmark';
       default: return 'other';
     }
+  }
+
+  private isMemoryIntensiveProcessKind(kind: ProcessKind): boolean {
+    return kind === 'build' || kind === 'index' || kind === 'rebuild' || kind === 'update';
   }
 
   private argv0ForKind(kind: ProcessKind): string | undefined {

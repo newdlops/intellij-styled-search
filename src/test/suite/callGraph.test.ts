@@ -97,12 +97,26 @@ async function useCallGraphBackend(backend: 'rust-native' | 'javascript'): Promi
 }
 
 suite('Call graph', () => {
+  let suiteApi: ExtensionTestApi | undefined;
+
   suiteSetup(async function () {
     // Tests in this suite write fixture files at workspace root and then
     // walk the entire workspace through the call-graph indexer. On large
     // checkouts that walk fundamentally exceeds the per-test 30s budget,
     // so skip cleanly off the dedicated fixture workspace.
     if (await workspaceHasOwnGit()) { this.skip(); return; }
+    suiteApi = await getApi();
+    // VS Code's E2E window is not guaranteed to have OS focus. These tests
+    // exercise save-driven refresh and the inlay provider directly, so make
+    // those foreground gates deterministic for the lifetime of this suite.
+    suiteApi.callGraph.setWindowFocusedForTests(true);
+    suiteApi.setCallGraphInlayHintsAllowUnfocusedForTests(true);
+  });
+
+  suiteTeardown(() => {
+    suiteApi?.callGraph.setWindowFocusedForTests(undefined);
+    suiteApi?.setCallGraphInlayHintsAllowUnfocusedForTests(false);
+    suiteApi = undefined;
   });
 
   test('indexes Python and JavaScript symbols with caller/callee edges', async function () {
@@ -2278,7 +2292,9 @@ suite('Call graph', () => {
       );
       assert.ok(
         rankedPaths.includes('mcp_rank_source.test.ts') && rankedPaths.includes('migrations/0001_mcp_rank.py'),
-        `expected overfetched ranked results to keep lower-value hits after source, got ${JSON.stringify(rankedPaths)}`,
+        `expected overfetched ranked results to keep lower-value hits after source; ` +
+          `paths=${JSON.stringify(rankedPaths)} diagnostics=${JSON.stringify(rankedSearch.result?.structuredContent?.query_diagnostics)} ` +
+          `dirtyOverlay=${JSON.stringify(rankedSearch.result?.structuredContent?.dirty_overlay)}`,
       );
       const lowValueIncludedRankedSearch = await postJson(url, {
         jsonrpc: '2.0',
@@ -2300,7 +2316,11 @@ suite('Call graph', () => {
           },
         },
       });
-      assert.strictEqual(lowValueIncludedRankedSearch.result?.isError, false);
+      assert.strictEqual(
+        lowValueIncludedRankedSearch.result?.isError,
+        false,
+        `expected explicit generated/dependency full scan to succeed, got ${JSON.stringify(lowValueIncludedRankedSearch.result)}`,
+      );
       const lowValueIncludedPaths = lowValueIncludedRankedSearch.result?.structuredContent?.results?.map((item: { path?: string }) => item.path) ?? [];
       assert.strictEqual(
         lowValueIncludedPaths[0],

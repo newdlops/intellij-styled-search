@@ -8,6 +8,11 @@ import { analyze } from './codesearch/regexInfo';
 import { PostingSource, TrigramQuery, evalQuery, qAnd, qTri } from './codesearch/trigramQuery';
 import { serializeV3 } from './codesearch/binaryIndex';
 import { findWorkspaceFilesDirect } from './fileDiscovery';
+import {
+  IndexingMemoryProtection,
+  type IndexingMemoryPressureError,
+  indexingMemoryProtection,
+} from './internal/indexingMemoryProtection';
 import { decodeTextBytes, getFileExtension, hasBinaryFileExtension, looksBinaryContent } from './textFiles';
 
 // A posting list entry that hasn't been materialized into memory yet.
@@ -143,15 +148,35 @@ export class TrigramIndex {
   private rebuildPromise: Promise<void> | undefined;
   private clearPromise: Promise<void> | undefined;
   private saveTimer: NodeJS.Timeout | undefined;
+  private cacheHeartbeat: NodeJS.Timeout | undefined;
   private watcher: vscode.FileSystemWatcher | undefined;
 
   constructor(
     private readonly storageDir: vscode.Uri,
     private readonly log: vscode.OutputChannel,
+    private readonly memoryProtection: IndexingMemoryProtection = indexingMemoryProtection,
   ) {}
 
   get isReady(): boolean { return this.ready; }
   get size(): number { return this.fileMeta.size; }
+
+  get persistedIndexFileName(): string { return this.indexFileName(); }
+
+  protectPersistedIndex(): string {
+    const fileName = this.indexFileName();
+    const touch = () => {
+      try {
+        const now = new Date();
+        fs.utimesSync(vscode.Uri.joinPath(this.storageDir, fileName).fsPath, now, now);
+      } catch {}
+    };
+    touch();
+    if (!this.cacheHeartbeat) {
+      this.cacheHeartbeat = setInterval(touch, 6 * 60 * 60 * 1_000);
+      this.cacheHeartbeat.unref?.();
+    }
+    return fileName;
+  }
 
   /** Diagnose whether a specific file is in the index and which of the
    *  provided trigrams are missing from its posting lists. Used by the
@@ -204,6 +229,7 @@ export class TrigramIndex {
   }
 
   async init(): Promise<void> {
+    this.protectPersistedIndex();
     if (this.clearPromise) {
       try { await this.clearPromise; } catch {}
     }
@@ -213,6 +239,12 @@ export class TrigramIndex {
 
   private async doInit(): Promise<void> {
     try { await vscode.workspace.fs.createDirectory(this.storageDir); } catch {}
+    try {
+      this.memoryProtection.assertCanStart('codesearch index load');
+    } catch (err) {
+      this.log.appendLine(`TrigramIndex load deferred to protect host memory: ${err instanceof Error ? err.message : err}`);
+      return;
+    }
     await this.load();
     // Mark ready AS SOON AS the disk image is loaded — search can use the
     // ~accurate cached index immediately. Reconcile (mtime-based delta
@@ -223,6 +255,14 @@ export class TrigramIndex {
       this.log.appendLine(`TrigramIndex usable from disk (${this.fileMeta.size} files) — reconcile in bg`);
     }
     this.startWatcher();
+    try {
+      this.memoryProtection.assertCanStart('codesearch startup index reconciliation');
+    } catch (err) {
+      this.log.appendLine(
+        `TrigramIndex reconcile deferred to protect host memory: ${err instanceof Error ? err.message : err}`,
+      );
+      return;
+    }
     await this.reconcileWorkspace();
     this.ready = true;
     // reconcileWorkspace already called scheduleSave(5_000) if anything
@@ -343,6 +383,12 @@ export class TrigramIndex {
   }
 
   private async save(): Promise<void> {
+    try {
+      this.memoryProtection.assertCanStart('codesearch trigram index persistence');
+    } catch (err) {
+      this.log.appendLine(`TrigramIndex save deferred to protect host memory: ${err instanceof Error ? err.message : err}`);
+      return;
+    }
     const fileUri = vscode.Uri.joinPath(this.storageDir, this.indexFileName());
     // Compact all posting lists to Uint32Array (sorted). Materializes any
     // still-lazy postings by reading them from the backing fd. Yields
@@ -367,12 +413,19 @@ export class TrigramIndex {
       }
       if (Date.now() - checkpoint > 15) {
         await new Promise<void>((r) => setImmediate(r));
+        try {
+          this.memoryProtection.assertCanStart('codesearch trigram index persistence');
+        } catch (err) {
+          this.log.appendLine(`TrigramIndex save stopped to protect host memory: ${err instanceof Error ? err.message : err}`);
+          return;
+        }
         checkpoint = Date.now();
       }
     }
     try {
       const tSer = Date.now();
       await new Promise<void>((r) => setImmediate(r));
+      this.memoryProtection.assertCanStart('codesearch trigram index serialization');
       const buf = serializeV3({
         nextId: this.nextId,
         fileMeta: this.fileMeta,
@@ -447,6 +500,7 @@ export class TrigramIndex {
 
   dispose(): void {
     if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = undefined; }
+    if (this.cacheHeartbeat) { clearInterval(this.cacheHeartbeat); this.cacheHeartbeat = undefined; }
     if (this.watcher) { this.watcher.dispose(); this.watcher = undefined; }
     if (this.dirty) { void this.save(); }
     if (this.fd !== undefined) {
@@ -505,6 +559,7 @@ export class TrigramIndex {
   }
 
   private async doRebuild(progress?: ReconcileProgress): Promise<void> {
+    this.memoryProtection.assertCanStart('codesearch trigram index rebuild');
     progress?.report('waiting for initial load', 0, 0);
     if (this.clearPromise) {
       try { await this.clearPromise; } catch {}
@@ -514,6 +569,7 @@ export class TrigramIndex {
       // concurrent 100K-file scans hammering the FS.
       try { await this.initPromise; } catch {}
     }
+    this.memoryProtection.assertCanStart('codesearch trigram index rebuild');
     // Cancel any pending save so it can't clobber the fresh build.
     if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = undefined; }
     // Block reads during rebuild — callers get null candidates and fall
@@ -556,6 +612,25 @@ export class TrigramIndex {
   }
 
   private async reconcileWorkspace(progress?: ReconcileProgress): Promise<void> {
+    this.memoryProtection.assertCanStart('codesearch trigram index reconciliation');
+    let memoryPressureError: IndexingMemoryPressureError | undefined;
+    const monitor = this.memoryProtection.monitor('codesearch trigram index reconciliation', (error) => {
+      memoryPressureError = error;
+    });
+    const stopIfMemoryPressured = () => {
+      if (memoryPressureError) { throw memoryPressureError; }
+    };
+    try {
+      await this.reconcileWorkspaceProtected(progress, stopIfMemoryPressured);
+    } finally {
+      monitor.dispose();
+    }
+  }
+
+  private async reconcileWorkspaceProtected(
+    progress: ReconcileProgress | undefined,
+    stopIfMemoryPressured: () => void,
+  ): Promise<void> {
     const excludeGlobs = this.getExcludeGlobs();
     // Reset skip-reason tally for this reconcile run so the final log line
     // reflects THIS pass only, not lifetime counts.
@@ -569,6 +644,7 @@ export class TrigramIndex {
     // flap in/out of the index and force massive reindex work every run).
     // We rely on excludeGlobs + mtime delta to keep the working set sane.
     const files = await findWorkspaceFilesDirect({ excludeGlobs });
+    stopIfMemoryPressured();
     const currentUris = new Set(files.map((u) => u.toString()));
     let removed = 0;
     for (const [id, meta] of Array.from(this.fileMeta)) {
@@ -595,6 +671,7 @@ export class TrigramIndex {
       for (let w = 0; w < statLimit; w++) {
         statWorkers.push((async () => {
           while (true) {
+            stopIfMemoryPressured();
             const i = statIdx++;
             if (i >= files.length) { return; }
             const uri = files[i];
@@ -616,7 +693,10 @@ export class TrigramIndex {
           }
         })());
       }
-      await Promise.all(statWorkers);
+      const statResults = await Promise.allSettled(statWorkers);
+      stopIfMemoryPressured();
+      const rejectedStat = statResults.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+      if (rejectedStat) { throw rejectedStat.reason; }
     }
     // Pre-mark any file whose mtime changed as stale BEFORE the index-phase
     // picks it up. The old posting lists still point at this id from the
@@ -642,6 +722,7 @@ export class TrigramIndex {
     for (let w = 0; w < indexLimit; w++) {
       indexWorkers.push((async () => {
         while (true) {
+          stopIfMemoryPressured();
           const i = indexIdx++;
           if (i >= toIndex.length) { return; }
           try { await this.indexFile(toIndex[i]); } catch {}
@@ -656,7 +737,10 @@ export class TrigramIndex {
         }
       })());
     }
-    await Promise.all(indexWorkers);
+    const indexResults = await Promise.allSettled(indexWorkers);
+    stopIfMemoryPressured();
+    const rejectedIndex = indexResults.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (rejectedIndex) { throw rejectedIndex.reason; }
     progress?.report('indexing', toIndex.length, toIndex.length);
     const s = this.skipCounts;
     this.log.appendLine(

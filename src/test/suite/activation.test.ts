@@ -3,7 +3,9 @@ import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { createRustGraphMemoryEnv } from '../../callGraph';
 import type { ExtensionTestApi } from '../../extension';
+import { IndexingMemoryProtection } from '../../internal/indexingMemoryProtection';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 
@@ -91,6 +93,58 @@ suite('Activation', () => {
     assert.strictEqual(runtime.getConfiguredBackgroundIndexDelayMs(), 0);
   });
 
+  test('memory pressure blocks search, trigram, and call graph rebuilds before work starts', async () => {
+    const api = await getApi();
+    const runtime = (api.overlay as any).zoektRuntime as any;
+    const trigram = api.overlay.getTrigramIndex() as any;
+    const callGraph = api.callGraph as any;
+    const originalRuntimeProtection = runtime.memoryProtection;
+    const originalTrigramProtection = trigram.memoryProtection;
+    const originalGraphProtection = callGraph.memoryProtection;
+    const blocked = new IndexingMemoryProtection({
+      sample: () => ({
+        totalBytes: 16 * 1024 * 1024 * 1024,
+        availableBytes: 1024 * 1024 * 1024,
+        source: 'os-freemem',
+      }),
+    });
+    const trigramReady = trigram.isReady;
+    const trigramSize = trigram.size;
+    runtime.memoryProtection = blocked;
+    trigram.memoryProtection = blocked;
+    callGraph.memoryProtection = blocked;
+    try {
+      await assert.rejects(runtime.rebuildIndex(), /not started to protect the host from OOM/);
+      await assert.rejects(trigram.rebuild(), /not started to protect the host from OOM/);
+      await assert.rejects(callGraph.rebuild(), /not started to protect the host from OOM/);
+      assert.strictEqual(trigram.isReady, trigramReady);
+      assert.strictEqual(trigram.size, trigramSize);
+      assert.strictEqual(runtime.activeChildren.size, 0);
+      assert.strictEqual(callGraph.rustGraphChildren.size, 0);
+    } finally {
+      runtime.memoryProtection = originalRuntimeProtection;
+      trigram.memoryProtection = originalTrigramProtection;
+      callGraph.memoryProtection = originalGraphProtection;
+    }
+  });
+
+  test('rust graph rebuild environment enforces the configured total and per-worker budgets', () => {
+    const mib = 1024 * 1024;
+    const env = createRustGraphMemoryEnv(8_192, 64, {});
+    assert.strictEqual(env.ZOEK_MEMORY_CAP_BYTES, String(8_192 * mib));
+    assert.strictEqual(env.ZOEK_PARSE_SPILL_BYTES, String(64 * mib));
+    assert.strictEqual(env.ZOEK_WORKER_MEMORY_LIMIT_BYTES, String(256 * mib));
+
+    const tighter = createRustGraphMemoryEnv(8_192, 64, {
+      ZOEK_MEMORY_CAP_BYTES: String(4_096 * mib),
+      ZOEK_PARSE_SPILL_BYTES: String(32 * mib),
+      ZOEK_WORKER_MEMORY_LIMIT_BYTES: String(96 * mib),
+    });
+    assert.strictEqual(tighter.ZOEK_MEMORY_CAP_BYTES, String(4_096 * mib));
+    assert.strictEqual(tighter.ZOEK_PARSE_SPILL_BYTES, String(32 * mib));
+    assert.strictEqual(tighter.ZOEK_WORKER_MEMORY_LIMIT_BYTES, String(96 * mib));
+  });
+
   test('verified main PID discovery survives a later ps spawn failure', async () => {
     const api = await getApi();
     const overlay = api.overlay as any;
@@ -173,17 +227,18 @@ suite('Activation', () => {
       assert.ok(all.includes(cmd), `command ${cmd} not registered`);
     }
     const contributes = ext?.packageJSON?.contributes;
-    const visibleCommands = (contributes?.commands ?? [])
+    const contributedCommands = (contributes?.commands ?? [])
       .map((item: { command?: string }) => item.command)
-      .filter(Boolean);
-    assert.deepStrictEqual(
-      visibleCommands,
-      [
-        'intellijStyledSearch.searchInProject',
-        'intellijStyledSearch.rebuildIndex',
-      ],
-      'only Search and integrated Force Rebuild should be visible in the command palette',
+      .filter((command: string | undefined): command is string => !!command);
+    assert.ok(contributedCommands.length > 0, 'expected package manifest to contribute commands');
+    assert.strictEqual(
+      new Set(contributedCommands).size,
+      contributedCommands.length,
+      'package manifest must not contribute a command more than once',
     );
+    for (const command of contributedCommands) {
+      assert.ok(all.includes(command), `contributed command ${command} not registered`);
+    }
     const submenu = contributes?.submenus?.find((item: { id?: string }) => item.id === 'intellijStyledSearch.editorContext');
     assert.ok(submenu, 'IntelliJ Search editor context submenu not contributed');
     const submenuCommands = (contributes?.menus?.['intellijStyledSearch.editorContext'] ?? [])
@@ -194,8 +249,14 @@ suite('Activation', () => {
       [
         'intellijStyledSearch.searchInProject',
         'intellijStyledSearch.rebuildIndex',
+        'intellijStyledSearch.showIndexHealth',
+        'intellijStyledSearch.selectSearchMode',
+        'intellijStyledSearch.benchmarkAgainstRg',
+        'intellijStyledSearch.startMcpServer',
+        'intellijStyledSearch.restartMcpServer',
+        'intellijStyledSearch.stopMcpServer',
       ],
-      'editor context submenu should expose only Search and integrated Force Rebuild',
+      'editor context submenu should expose search, index diagnostics, and MCP lifecycle workflows in group order',
     );
   });
 
@@ -1314,6 +1375,10 @@ suite('Activation', () => {
     const runtime = (overlay as any).zoektRuntime as any;
     assert.strictEqual(runtime.classifyChild('/tmp/ijss-rebuild', []), 'rebuild');
     assert.strictEqual(runtime.argv0ForKind('rebuild'), 'ijss-rebuild');
+    for (const kind of ['build', 'index', 'rebuild', 'update']) {
+      assert.strictEqual(runtime.isMemoryIntensiveProcessKind(kind), true, `${kind} must be memory guarded`);
+    }
+    assert.strictEqual(runtime.isMemoryIntensiveProcessKind('search'), false);
   });
 
   test('call graph rust queries use tracked process metadata and timeouts', async () => {
@@ -1329,6 +1394,10 @@ suite('Activation', () => {
     assert.strictEqual(service.argv0ForRustGraphProcess('graph-symbol-query'), 'ijss-rust-graph-symbol-query');
     assert.strictEqual(service.defaultRustGraphTimeoutMs('graph-symbol-query'), 30_000);
     assert.strictEqual(service.defaultRustGraphTimeoutMs('graph-rebuild'), 0);
+    for (const kind of ['build', 'graph-rebuild', 'graph-update', 'graph-overlay-update', 'graph-compact', 'graph-index']) {
+      assert.strictEqual(service.isMemoryIntensiveRustGraphProcess(kind), true, `${kind} must be memory guarded`);
+    }
+    assert.strictEqual(service.isMemoryIntensiveRustGraphProcess('graph-query'), false);
   });
 
   test('call graph excludes common dependency and build output folders by default', () => {
@@ -1524,10 +1593,17 @@ suite('Activation', () => {
     const { callGraph } = await getApi();
     const service = callGraph as any;
     const originalProcessChangedFiles = service.processChangedFiles.bind(service);
+    const priorPendingChangedUris = new Set<string>(service.pendingChangedUris);
+    const priorPendingFullRefresh = service.pendingFullRefresh;
     let launches = 0;
     service.processChangedFiles = async () => { launches++; };
     try {
       service.setWindowFocusedForTests(false);
+      // The extension service is shared across the E2E process. Earlier suites
+      // legitimately leave watcher work queued, so exercise this gate from a
+      // known local state instead of asserting against unrelated pending URIs.
+      service.pendingChangedUris.clear();
+      service.pendingFullRefresh = false;
       service.pendingChangedUris.add(vscode.Uri.file('/tmp/foreground-gate.ts').toString());
       await service.kickIncrementalRefresh(true);
       assert.strictEqual(launches, 0, 'automatic graph refresh must not launch while unfocused');
@@ -1546,7 +1622,8 @@ suite('Activation', () => {
       assert.strictEqual(launches, 1, 'explicit graph refresh bypasses the foreground gate');
     } finally {
       service.pendingChangedUris.clear();
-      service.pendingFullRefresh = false;
+      for (const uri of priorPendingChangedUris) { service.pendingChangedUris.add(uri); }
+      service.pendingFullRefresh = priorPendingFullRefresh;
       service.setWindowFocusedForTests(undefined);
       service.processChangedFiles = originalProcessChangedFiles;
     }

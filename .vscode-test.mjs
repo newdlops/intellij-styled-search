@@ -1,4 +1,6 @@
 import { defineConfig } from '@vscode/test-cli';
+import { downloadAndUnzipVSCode } from '@vscode/test-electron';
+import { existsSync } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
@@ -30,6 +32,25 @@ const isolatedRoot = path.join(os.tmpdir(), 'ijss-e2e', `${process.pid}-${Date.n
 const isolatedUserData = path.join(isolatedRoot, 'user-data');
 const isolatedExtensions = path.join(isolatedRoot, 'extensions');
 
+// @vscode/test-electron currently resolves the macOS app executable as
+// Contents/MacOS/Electron. Newer stable archives name the same executable
+// Contents/MacOS/Code instead. Resolve the downloaded installation up front so
+// a clean test checkout works with either archive layout without mutating the
+// shared .vscode-test cache.
+const requestedCodeVersion = process.env.IJSS_E2E_VSCODE_VERSION || 'stable';
+const downloadedExecutable = await downloadAndUnzipVSCode(requestedCodeVersion);
+const vscodeExecutable = existsSync(downloadedExecutable)
+  ? downloadedExecutable
+  : process.platform === 'darwin'
+    ? path.join(path.dirname(downloadedExecutable), 'Code')
+    : downloadedExecutable;
+
+if (!existsSync(vscodeExecutable)) {
+  throw new Error(
+    `VS Code test executable was not found at ${downloadedExecutable} or ${vscodeExecutable}`,
+  );
+}
+
 export default defineConfig({
   label: 'e2e',
   files: testFiles,
@@ -40,6 +61,9 @@ export default defineConfig({
   // surfaces "CDP connection closed (show-shell-idle)" mid-test.
   env: {
     VSCODE_TEST: '1',
+  },
+  useInstallation: {
+    fromPath: vscodeExecutable,
   },
   // Keep the Electron main-process inspector for the test VS Code away from
   // a developer's already-running VS Code, which usually owns port 9229.

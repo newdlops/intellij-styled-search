@@ -487,6 +487,25 @@ export function getRendererPatchScript(
         window.__ijFindActiveInstanceId = nextActive;
       }
     } catch (eRegistryDispose) {}
+    try {
+      var ownedInlayListeners = window.__ijFindCallGraphInlayListeners || null;
+      if (ownedInlayListeners && ownedInlayListeners.owner === __ijFindInstanceId) {
+        removePriorCallGraphInlayListeners();
+        window.__ijFindCallGraphInlayListeners = null;
+        var survivingRegistry = window.__ijFindInstances || null;
+        if (survivingRegistry) {
+          for (var survivingId in survivingRegistry) {
+            if (!Object.prototype.hasOwnProperty.call(survivingRegistry, survivingId)) { continue; }
+            var survivingInstance = survivingRegistry[survivingId];
+            if (survivingInstance && typeof survivingInstance.installCallGraphInlayListeners === 'function') {
+              survivingInstance.installCallGraphInlayListeners();
+              out.push('inlayListeners=restored:' + survivingId);
+              break;
+            }
+          }
+        }
+      }
+    } catch (eRestoreInlayListeners) {}
     try { cancelScheduledRender(); out.push('render=cancelled'); } catch (eRender) {}
     try { if (typeof state !== 'undefined' && state && state.searchTicker) { clearInterval(state.searchTicker); state.searchTicker = null; out.push('ticker=cleared'); } } catch (eTicker) {}
     try { if (typeof state !== 'undefined' && state && state.debounce) { clearTimeout(state.debounce); state.debounce = null; out.push('debounce=cleared'); } } catch (eDebounce) {}
@@ -3509,6 +3528,7 @@ export function getRendererPatchScript(
     previewEngineRecoveryState: '', // engine: 'ready' | 'recovering' | 'paused' | 'unavailable'
     previewFeatureReadiness: '', // 'warming' | 'ready' | 'limited'
     lastPreviewMsg: null,
+    lastFullyRenderedSig: '',
     // True once the settle hydrate has upgraded the preview model to a
     // file://-bound resource model. At that point VSCode's
     // InlayHintsController starts driving inlays via our registered
@@ -5380,6 +5400,9 @@ export function getRendererPatchScript(
     }
     state.lastPreviewKey = '';
     state.previewRenderedKey = '';
+    // Clearing decorations/inlays invalidates the no-op render cache even
+    // when the next preview payload is byte-for-byte identical.
+    state.lastFullyRenderedSig = '';
     state.activePreviewSeq++;
     state.previewUri = '';
     state.previewMode = '';
@@ -8926,8 +8949,8 @@ export function getRendererPatchScript(
   // Expose for future test instrumentation (no production use).
   try { window.__ijFindGatherEmbedEditorIntellisenseSnapshot = gatherEmbedEditorIntellisenseSnapshot; } catch (eExposeIs) {}
 
-  // Cheap fingerprint of every input that affects what renderPreviewMonacoReal
-  // paints: uri, focus line, language, base line, full-file flag, content size,
+  // Fingerprint every input that affects what renderPreviewMonacoReal paints:
+  // uri, focus line, language, base line, full-file flag, content hash,
   // match ranges (decorations), and callgraph inlays. Two messages with the
   // same signature render pixel-identically, so the second is a no-op we can
   // skip. Uses content shape (not the whole text) to stay O(ranges+inlays).
@@ -8940,6 +8963,7 @@ export function getRendererPatchScript(
       typeof msg.baseLine === 'number' ? msg.baseLine : '',
       msg.fullFile === false ? '0' : '1',
       fullText ? fullText.length : 0,
+      previewContentHash(fullText || ''),
       (msg.lines && msg.lines.length) || 0,
     ];
     var rangeSig = 'r';
@@ -12086,28 +12110,33 @@ export function getRendererPatchScript(
     } catch (eDevtools) {}
   }
 
-  removePriorCallGraphInlayListeners();
-  if (__ijFindEnableRendererInlayClickHook) {
-    if (window.PointerEvent) {
-      document.addEventListener('pointerdown', handleCallGraphInlayMouseDown, true);
+  function installCallGraphInlayListeners() {
+    removePriorCallGraphInlayListeners();
+    if (__ijFindEnableRendererInlayClickHook) {
+      if (window.PointerEvent) {
+        document.addEventListener('pointerdown', handleCallGraphInlayMouseDown, true);
+      } else {
+        document.addEventListener('mousedown', handleCallGraphInlayMouseDown, true);
+      }
+      document.addEventListener('click', suppressCallGraphInlayClick, true);
+      window.__ijFindCallGraphInlayListeners = {
+        pointerdown: window.PointerEvent ? handleCallGraphInlayMouseDown : null,
+        mousedown: window.PointerEvent ? null : handleCallGraphInlayMouseDown,
+        click: suppressCallGraphInlayClick,
+        enabled: true,
+        owner: __ijFindInstanceId,
+      };
     } else {
-      document.addEventListener('mousedown', handleCallGraphInlayMouseDown, true);
+      window.__ijFindCallGraphInlayListeners = {
+        pointerdown: null,
+        mousedown: null,
+        click: null,
+        enabled: false,
+        owner: __ijFindInstanceId,
+      };
     }
-    document.addEventListener('click', suppressCallGraphInlayClick, true);
-    window.__ijFindCallGraphInlayListeners = {
-      pointerdown: window.PointerEvent ? handleCallGraphInlayMouseDown : null,
-      mousedown: window.PointerEvent ? null : handleCallGraphInlayMouseDown,
-      click: suppressCallGraphInlayClick,
-      enabled: true,
-    };
-  } else {
-    window.__ijFindCallGraphInlayListeners = {
-      pointerdown: null,
-      mousedown: null,
-      click: null,
-      enabled: false,
-    };
   }
+  installCallGraphInlayListeners();
 
   // Scan the live DOM for any existing code-editor widget the user
   // already has open and register it into caps.widgets / caps.services /
@@ -13588,7 +13617,14 @@ export function getRendererPatchScript(
         $optWord.setAttribute('aria-pressed', 'false');
         syncRegexMultilineUi();
       }
-      if (typeof initialQuery === 'string' && (suppressSearch || initialQuery !== $q.value)) {
+      // The input value can be updated before a deferred show reaches the
+      // search-state transition below. If that show is replayed, comparing
+      // only against the DOM would incorrectly treat it as a no-op and leave
+      // rgQuery/filterQuery on the previous query. Include the active search
+      // state in the idempotence check so a replay repairs that split state.
+      var activeSearchQuery = state.filterQuery || state.rgQuery || '';
+      if (typeof initialQuery === 'string' &&
+          (suppressSearch || initialQuery !== $q.value || initialQuery !== activeSearchQuery)) {
         panelDiagMark('show:setQuery', { len: initialQuery.length, suppressSearch: suppressSearch });
         var oldQ = state.rgQuery || '';
         var oldOpts = state.rgOptions;
@@ -13721,6 +13757,9 @@ export function getRendererPatchScript(
       }
     } catch (eClearMatchDecos) {}
     try { clearPreviewMonacoCallGraphInlays(); } catch (eClearInlays) {}
+    // The preserved editor no longer contains all output represented by the
+    // prior signature. Force an identical preview to repaint after reopen.
+    state.lastFullyRenderedSig = '';
     // Reset hydrate flag so the next preview's settle hydrate fires
     // properly (the preserved editor's model might still be file:// from
     // last time, but the next preview will bind a fresh model).
@@ -13829,7 +13868,7 @@ export function getRendererPatchScript(
   };
   // Test-only probes. Safe to ship — they just expose read-only state the
   // E2E suite polls to avoid racing async CDP evals.
-  window.__ijFindGetPreviewMonacoStateForTests = function () {
+  function getPreviewMonacoStateForTests() {
     try {
       var ed = state.previewMonacoEditor || state.monacoEditor;
       var host = state.previewMonacoHost || state.monacoHost;
@@ -13870,15 +13909,7 @@ export function getRendererPatchScript(
     } catch (eState) {
       return { err: String(eState && eState.message || eState).slice(0, 200) };
     }
-  };
-  // Used by E2E only: gives tests direct access to the live preview editor
-  // widget so they can assert on scrollTop / viewState after refresh
-  // scenarios. Refresh on each call rather than caching — the editor
-  // instance is recreated on capture refresh / bundled Monaco upgrade.
-  Object.defineProperty(window, '__ijFindPreviewEditorForTests', {
-    configurable: true,
-    get: function () { return state.previewMonacoEditor || state.monacoEditor; },
-  });
+  }
   window.__ijFindGetSearchState = function () {
     try {
       return {
@@ -14365,7 +14396,9 @@ export function getRendererPatchScript(
         setScopeValue: window.__ijFindSetScopeValue,
         getPreviewDecorations: window.__ijFindGetPreviewDecorations,
         getPreviewEditorForTests: getPreviewSaveEditor,
+        getPreviewMonacoStateForTests: getPreviewMonacoStateForTests,
         getPreviewOverflowHostForTests: getOrCreatePreviewOverflowHost,
+        installCallGraphInlayListeners: installCallGraphInlayListeners,
         ownsPreviewModel: function (model) {
           var editor = getPreviewSaveEditor();
           return !!(editor && editor.getModel && editor.getModel() === model);
@@ -14447,6 +14480,19 @@ export function getRendererPatchScript(
         }
         return null;
       };
+      window.__ijFindGetPreviewMonacoStateForTests = function (targetSrc) {
+        var inst = findRegisteredSearchInstance(targetSrc ? String(targetSrc) : '');
+        if (inst && typeof inst.getPreviewMonacoStateForTests === 'function') {
+          return inst.getPreviewMonacoStateForTests();
+        }
+        return { err: 'missing-instance' };
+      };
+      // Backward-compatible property used by older probes. Resolve it on
+      // every read instead of retaining the state closure of the first panel.
+      Object.defineProperty(window, '__ijFindPreviewEditorForTests', {
+        configurable: true,
+        get: function () { return window.__ijFindGetPreviewEditorForTests(); },
+      });
       window.__ijFindDisposeAllSearchUi = function (reason) {
         var out = [];
         var all = searchInstanceRegistry();
