@@ -5,6 +5,7 @@
 - Added host-memory pressure gates and cancellation for codesearch and zoek-rs indexing work.
 - Bounded generated global storage, retained active and rollback runtimes/indexes, and coordinated cleanup safely across VS Code windows.
 - Removed obsolete Cargo targets, abandoned runtime stages, and inactive trigram caches through strict generated-artifact allowlists and age gates.
+- Updated the shipped WebSocket runtime and build tooling to remove known runtime and bundler advisories.
 
 - Restored VS Code hover, completions, signature help, navigation, symbols, folding, diagnostics, and semantic tokens in the tab-free bundled Monaco preview.
 - Bound bundled preview models to their real file URIs and kept lexical syntax tokenization without loading Monaco's duplicate language workers.
