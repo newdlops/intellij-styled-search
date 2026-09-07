@@ -211,13 +211,11 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// v8: token-shape sidecars include concrete-target cardinality so lazy
-// unresolved candidates are attached only to structurally unique targets (or
-// one complete ancestor/implementation family). The new sidecar is required at
-// query time; raw MAY candidates remain conservative without being multiplied
-// into every symbol's visible usage list. This forces a one-time reindex (paired
-// with the TS cache bump).
-const GRAPH_VERSION: u32 = 8;
+// v9: member targets use declaring container IDs and qualified import bindings.
+// Outgoing tallies distinguish scoped possible usages from MUST usages so edits
+// update exact counts without promoting uncertain references. Requires a
+// one-time reindex, paired with the TS cache/manifest version bump.
+const GRAPH_VERSION: u32 = 9;
 const GRAPH_FILE_NAME: &str = "callgraph-relations.tsv";
 const GRAPH_SYMBOL_FILE_NAME: &str = "callgraph-symbols.tsv";
 const GRAPH_COUNT_FILE_NAME: &str = "callgraph-counts.tsv";
@@ -264,8 +262,9 @@ const GRAPH_TOKEN_SHAPE_TARGET_COUNT_SHARD_PREFIX: &str =
     "callgraph-token-shape-target-count-by-key";
 const GRAPH_FILE_TABLE_NAME: &str = "callgraph-file-table.bin";
 const GRAPH_SHARD_COUNT: usize = 128;
-// Per-source-file EXACT-scoped outgoing-target tally (overlay count deltas).
-const GRAPH_OUTGOING_TALLY_BY_FILE_SHARD_PREFIX: &str = "callgraph-outgoing-tally-by-file";
+// Per-source-file scoped + MUST outgoing-target tally (overlay count deltas).
+// A distinct name prevents old two-counter rows being decoded as four counters.
+const GRAPH_OUTGOING_TALLY_BY_FILE_SHARD_PREFIX: &str = "callgraph-outgoing-tally-by-file-v2";
 
 const BOUND_MAY: u8 = 0b0001;
 const BOUND_MUST: u8 = 0b0010;
@@ -4832,6 +4831,11 @@ pub fn update_graph_native(
         Some(symbol_count),
     );
     if probe { eprintln!("[flow] write_store={}ms", _t.elapsed().as_millis()); }
+    if result.is_ok() {
+        // The next overlay must subtract the newly written base contribution,
+        // including when this update was invoked directly rather than compacted.
+        build_and_write_outgoing_tally(workspace_root, config)?;
+    }
     result
 }
 
@@ -4963,6 +4967,11 @@ pub fn overlay_update_graph_native(
             workspace_root,
             config,
             GRAPH_TOKEN_SHAPE_TARGET_COUNT_SHARD_PREFIX,
+        )
+        && graph_shard_family_available(
+            workspace_root,
+            config,
+            GRAPH_OUTGOING_TALLY_BY_FILE_SHARD_PREFIX,
         );
     if !sidecars_ready || base_built_at == 0 {
         if probe {
@@ -5296,9 +5305,10 @@ pub fn overlay_update_graph_native(
         syms_by_file.entry(s.rel_path.clone()).or_default().push(s);
     }
 
-    // EXACT-scoped per-target contribution of one file's refs (for count deltas).
-    let scoped_contrib = |refs: &[GraphReference]| -> std::collections::BTreeMap<u64, (u32, u32)> {
-        let mut m: std::collections::BTreeMap<u64, (u32, u32)> = std::collections::BTreeMap::new();
+    // Keep scoped displayed counts separate from MUST counts; possible refs
+    // and cross-root imports contribute differently to these two measures.
+    let scoped_contrib = |refs: &[GraphReference]| -> std::collections::BTreeMap<u64, [u32; 4]> {
+        let mut m: std::collections::BTreeMap<u64, [u32; 4]> = std::collections::BTreeMap::new();
         for r in refs {
             let Some(t) = r
                 .target_symbol_id
@@ -5307,17 +5317,9 @@ pub fn overlay_update_graph_native(
             else {
                 continue;
             };
-            let Some(root) = scope_by_target.get(&t) else {
-                continue;
-            };
-            if source_scope_key(&r.rel_path) != &**root {
-                continue;
-            }
-            let e = m.entry(t).or_insert((0, 0));
-            e.0 += 1;
-            if matches!(r.edge_kind.as_ref(), "call" | "construct") {
-                e.1 += 1;
-            }
+            let same_scope = scope_by_target.get(&t)
+                .is_some_and(|root| source_scope_key(&r.rel_path) == &**root);
+            add_outgoing_usage_contribution(m.entry(t).or_default(), r, same_scope);
         }
         m
     };
@@ -5378,18 +5380,18 @@ pub fn overlay_update_graph_native(
     let overlay_files: HashSet<String> = overlay.entries.keys().cloned().collect();
     let base_contrib = load_outgoing_tally_for_files(workspace_root, config, &overlay_files)?;
     let current = overlay.total_contrib();
-    let mut count_deltas: std::collections::BTreeMap<u64, (i64, i64)> =
+    let mut count_deltas: std::collections::BTreeMap<u64, [i64; 4]> =
         std::collections::BTreeMap::new();
     for (&t, &n) in &current {
-        let o = base_contrib.get(&t).copied().unwrap_or((0, 0));
-        let d = (n.0 - o.0, n.1 - o.1);
-        if d != (0, 0) {
+        let o = base_contrib.get(&t).copied().unwrap_or_default();
+        let d = std::array::from_fn(|i| n[i] - o[i]);
+        if d != [0; 4] {
             count_deltas.insert(t, d);
         }
     }
     for (&t, &o) in &base_contrib {
-        if !current.contains_key(&t) && o != (0, 0) {
-            count_deltas.insert(t, (-o.0, -o.1));
+        if !current.contains_key(&t) && o != [0; 4] {
+            count_deltas.insert(t, o.map(|value| -value));
         }
     }
     overlay.count_deltas = count_deltas;
@@ -5516,11 +5518,7 @@ pub fn compact_graph_overlay(
         config,
         worker_count,
     )?;
-    // Rebuild the outgoing tally over the freshly folded base so the next overlay
-    // edit's count deltas are computed against current data.
-    if let Err(err) = build_and_write_outgoing_tally(workspace_root, config) {
-        eprintln!("[graph-compact] outgoing-tally rebuild skipped: {err}");
-    }
+    // update_graph_native also refreshes the outgoing tally for subsequent edits.
     // Base now incorporates the overlay. Clear it — unless a concurrent
     // overlay-update landed during the fold (its new entries are NOT in the new
     // base), in which case keep the overlay (idempotent re-supersession; next
@@ -6001,9 +5999,9 @@ fn graph_reference_edge_kind_rank(edge_kind: &str) -> i32 {
 /// base until compaction), then add the overlay's own matching refs. No-op when
 /// the overlay is empty or was built against a different base (`load_valid`).
 /// Apply the overlay's per-target count deltas onto a freshly-read base `counts`
-/// map (keyed by `sym:HEX16`). Bumps `usage_likely`/`calls_in_likely` so the
-/// inline "N usages" hint reflects an un-compacted edit. Exact for the
-/// exact-usage component; token-shape padding converges at the next compaction.
+/// map (keyed by `sym:HEX16`). Updates both scoped displayed counts and MUST
+/// counts so an un-compacted edit cannot leave the exact count stale.
+/// Token-shape padding converges at the next compaction.
 /// No-op when the overlay is empty / built against a different base.
 fn merge_overlay_count_deltas(
     workspace_root: &Path,
@@ -6016,11 +6014,25 @@ fn merge_overlay_count_deltas(
     if overlay.count_deltas.is_empty() {
         return;
     }
-    for (&t, &(usage_delta, calls_delta)) in &overlay.count_deltas {
+    for (&t, &[usage_delta, calls_delta, must_usage_delta, must_calls_delta]) in
+        &overlay.count_deltas
+    {
         let id = format!("sym:{:016x}", t);
         let count = counts.entry(id).or_default();
         count.usage_likely = (count.usage_likely as i64 + usage_delta).max(0) as usize;
         count.calls_in_likely = (count.calls_in_likely as i64 + calls_delta).max(0) as usize;
+        count.usage_must = (count.usage_must as i64 + must_usage_delta).max(0) as usize;
+        count.calls_in_must = (count.calls_in_must as i64 + must_calls_delta).max(0) as usize;
+        // MAY is deliberately conservative until compaction, but must remain
+        // an upper bound when edits introduce additional resolved usages.
+        count.usage_may = count
+            .usage_may
+            .max(count.usage_must)
+            .max(count.usage_likely);
+        count.calls_in_may = count
+            .calls_in_may
+            .max(count.calls_in_must)
+            .max(count.calls_in_likely);
     }
 }
 
@@ -6927,12 +6939,12 @@ fn collect_python_import_facts(
             if module_name.is_empty() || local_name.is_empty() {
                 continue;
             }
-            let imported_name = type_tail(&module_name).to_string();
             out.push(ImportFact {
                 file_id: file_id.to_string(),
                 rel_path: entry.rel_path.clone(),
                 local_name,
-                imported_name,
+                // `import module` binds a namespace, unlike `from module import name`.
+                imported_name: "*".to_string(),
                 module_candidates: python_module_candidates(&entry.rel_path, &module_name),
             });
         }
@@ -8813,13 +8825,18 @@ fn resolve_ref_sites_a_to_e<'a>(
                                 if symbol.kind_flags & KF_TYPE != 0 {
                                     types_by_name.entry(&symbol.name).or_default().push(symbol);
                                 }
-                                if let Some(container_name) = symbol.container_name.as_deref() {
+                                // Names are not container identities: unrelated files may
+                                // declare the same class (including the same nested path).
+                                if let Some(container_id) = symbol.container_id.as_deref() {
                                     members_by_container_and_name
-                                        .entry((container_name, symbol.name.as_str()))
+                                        .entry((container_id, symbol.name.as_str()))
                                         .or_default()
                                         .push(symbol);
                                     members_by_container_and_name_h
-                                        .entry((stable_hash(container_name), symbol.name_hash))
+                                        .entry((
+                                            parse_stable_symbol_id_to_u64(container_id).unwrap_or(0),
+                                            symbol.name_hash,
+                                        ))
                                         .or_default()
                                         .push(symbol);
                                 }
@@ -9557,7 +9574,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                             {
                                 return ReceiverResolutionCols {
                                     has_any: false,
-                                    self_container_hash: None,
+                                    self_container_id: None,
                                     self_type: None,
                                     type_targets: Vec::new(),
                                     import_modules: Vec::new(),
@@ -10365,17 +10382,17 @@ fn combined_member_candidates_by_key<'a>(
 
     if matches!(receiver, "self" | "cls") {
         if let Some(source) = site_enclosing_id.and_then(|id| symbols_by_id.get(id)) {
-            if let Some(container_name) = source.container_name.as_deref() {
+            if let Some(container_id) = source.container_id.as_deref() {
                 extend_members_for_container(
                     fallback,
                     members_by_container_and_name,
-                    container_name,
+                    container_id,
                     name,
                 );
                 collect_exact_members_for_container(
                     exact,
                     members_by_container_and_name,
-                    container_name,
+                    container_id,
                     name,
                     "receiver-self",
                 );
@@ -10390,8 +10407,17 @@ fn combined_member_candidates_by_key<'a>(
         }
     }
 
-    if let Some(types) = types_by_name.get(receiver) {
-        for symbol in types {
+    if types_by_name.contains_key(receiver) {
+        for symbol in resolve_type_name_targets_by_key(
+            receiver,
+            rel_path,
+            site_enclosing_id,
+            symbols_by_id,
+            types_by_name,
+            symbols_by_file_and_name,
+            import_targets,
+            import_facts_by_file_local,
+        ) {
             extend_members_for_type(
                 fallback,
                 members_by_container_and_name,
@@ -10482,6 +10508,7 @@ fn combined_member_candidates_by_key<'a>(
                 types_by_name,
                 symbols_by_file_and_name,
                 import_targets,
+                import_facts_by_file_local,
                 function_return_facts_by_file_name,
                 hierarchy_facts,
             );
@@ -10526,7 +10553,7 @@ struct TypeTarget<'a> {
 
 struct ReceiverResolution<'a> {
     has_any: bool,
-    /// For receiver="self"|"cls" where source has container_name
+    /// Identity of the declaring container for receiver="self"|"cls".
     self_container: Option<&'a str>,
     /// For receiver="self"|"cls" where source itself is a type kind
     self_type_symbol: Option<&'a GraphSymbol>,
@@ -10536,15 +10563,9 @@ struct ReceiverResolution<'a> {
     import_facts: Vec<&'a ImportFact>,
 }
 
-/// W18 / Option B step B4: the all-hash twin of `TypeTarget`. The container
-/// strings of the type symbol (qualified_name / name) are hashed once when the
-/// `ReceiverResolution` is converted (cache-miss, rare) so the per-site
-/// `expand` probe of `members_by_container_and_name_h` is pure integer keys.
+/// Compact identity-keyed twin of `TypeTarget`, cached once per receiver.
 struct TypeTargetCols {
-    qual_hash: u64,
-    name_hash: u64,
-    /// `qualified_name == name` — skip the redundant second member probe.
-    qual_eq_name: bool,
+    container_id: u64,
     provenance: &'static str,
 }
 
@@ -10555,11 +10576,9 @@ struct TypeTargetCols {
 /// `expand_receiver_for_name_cols` reads only these hashes + `site_cols`.
 struct ReceiverResolutionCols {
     has_any: bool,
-    /// receiver=self|cls with container_name → `stable_hash(container)`.
-    self_container_hash: Option<u64>,
-    /// receiver=self|cls where source is itself a type kind →
-    /// `(qualified_name hash, name hash, qualified_name == name)`.
-    self_type: Option<(u64, u64, bool)>,
+    self_container_id: Option<u64>,
+    /// receiver=self|cls where source is itself a type kind.
+    self_type: Option<u64>,
     type_targets: Vec<TypeTargetCols>,
     /// `(module_candidate hash, is_star)` pairs flattened from the import facts.
     import_modules: Vec<(u64, bool)>,
@@ -10572,21 +10591,13 @@ struct ReceiverResolutionCols {
 fn receiver_resolution_to_cols(res: &ReceiverResolution) -> ReceiverResolutionCols {
     ReceiverResolutionCols {
         has_any: res.has_any,
-        self_container_hash: res.self_container.map(stable_hash),
-        self_type: res.self_type_symbol.map(|s| {
-            (
-                stable_hash(&s.qualified_name),
-                s.name_hash,
-                s.qualified_name == s.name,
-            )
-        }),
+        self_container_id: res.self_container.and_then(parse_stable_symbol_id_to_u64),
+        self_type: res.self_type_symbol.map(|s| s.id_u64),
         type_targets: res
             .type_targets
             .iter()
             .map(|tt| TypeTargetCols {
-                qual_hash: stable_hash(&tt.sym.qualified_name),
-                name_hash: tt.sym.name_hash,
-                qual_eq_name: tt.sym.qualified_name == tt.sym.name,
+                container_id: tt.sym.id_u64,
                 provenance: tt.provenance,
             })
             .collect(),
@@ -10631,7 +10642,7 @@ fn expand_receiver_for_name_cols<'a>(
     if !res.has_any {
         return;
     }
-    if let Some(ch) = res.self_container_hash {
+    if let Some(ch) = res.self_container_id {
         // extend_and_collect_members_for_container (receiver-self): both buffers.
         if let Some(symbols) = members_by_container_and_name_h.get(&(ch, name_hash)) {
             for sym in symbols {
@@ -10639,31 +10650,17 @@ fn expand_receiver_for_name_cols<'a>(
                 exact.push(MemberExactCandidate { target: *sym, provenance: "receiver-self" });
             }
         }
-    } else if let Some((qual_hash, name_h, qual_eq_name)) = res.self_type {
+    } else if let Some(container_id) = res.self_type {
         // extend_members_for_type (self type): fallback only.
-        if let Some(symbols) = members_by_container_and_name_h.get(&(qual_hash, name_hash)) {
+        if let Some(symbols) = members_by_container_and_name_h.get(&(container_id, name_hash)) {
             fallback.extend(symbols.iter().copied());
-        }
-        if !qual_eq_name {
-            if let Some(symbols) = members_by_container_and_name_h.get(&(name_h, name_hash)) {
-                fallback.extend(symbols.iter().copied());
-            }
         }
     }
     for tt in &res.type_targets {
-        // extend_and_collect_members_for_type: both buffers, qual then (name if !=).
-        if let Some(symbols) = members_by_container_and_name_h.get(&(tt.qual_hash, name_hash)) {
+        if let Some(symbols) = members_by_container_and_name_h.get(&(tt.container_id, name_hash)) {
             for sym in symbols {
                 fallback.push(*sym);
                 exact.push(MemberExactCandidate { target: *sym, provenance: tt.provenance });
-            }
-        }
-        if !tt.qual_eq_name {
-            if let Some(symbols) = members_by_container_and_name_h.get(&(tt.name_hash, name_hash)) {
-                for sym in symbols {
-                    fallback.push(*sym);
-                    exact.push(MemberExactCandidate { target: *sym, provenance: tt.provenance });
-                }
             }
         }
     }
@@ -10748,7 +10745,7 @@ fn compute_receiver_resolution<'a>(
 
     if is_self_kind {
         if let Some(source) = site_enclosing_id.and_then(|id| symbols_by_id.get(id)) {
-            if let Some(c) = source.container_name.as_deref() {
+            if let Some(c) = source.container_id.as_deref() {
                 self_container = Some(c);
             } else if is_type_kind_sym(source) {
                 self_type_symbol = Some(source);
@@ -10756,9 +10753,18 @@ fn compute_receiver_resolution<'a>(
         }
     }
 
-    if let Some(types) = types_by_name.get(receiver) {
-        for t in types {
-            type_targets.push(TypeTarget { sym: *t, provenance: "receiver-type" });
+    if types_by_name.contains_key(receiver) {
+        for t in resolve_type_name_targets_by_key(
+            receiver,
+            rel_path,
+            site_enclosing_id,
+            symbols_by_id,
+            types_by_name,
+            symbols_by_file_and_name,
+            import_targets,
+            import_facts_by_file_local,
+        ) {
+            type_targets.push(TypeTarget { sym: t, provenance: "receiver-type" });
         }
     }
 
@@ -10787,6 +10793,7 @@ fn compute_receiver_resolution<'a>(
                 types_by_name,
                 symbols_by_file_and_name,
                 import_targets,
+                import_facts_by_file_local,
                 function_return_facts_by_file_name,
                 hierarchy_facts,
             );
@@ -10869,6 +10876,15 @@ fn expand_receiver_for_name<'a>(
                     }
                 }
             }
+            if let Some(submodule) = submodule_member_candidate(module_path, &fact.imported_name) {
+                if let Some(symbols) = symbols_by_file_and_name.get(&(submodule.as_str(), name)) {
+                    fallback.extend(symbols.iter().copied());
+                    exact.extend(symbols.iter().map(|target| MemberExactCandidate {
+                        target: *target,
+                        provenance: "import-namespace",
+                    }));
+                }
+            }
         }
     }
     if fallback.len() > 1 {
@@ -10899,6 +10915,7 @@ fn resolve_type_fact_targets_by_key<'a>(
     types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
     symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
     import_targets: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    import_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a ImportFact>>,
     function_return_facts_by_file_name: &HashMap<(&'a str, &'a str), Vec<&'a FunctionReturnFact>>,
     hierarchy_facts: &[HierarchyFact],
 ) -> Vec<&'a GraphSymbol> {
@@ -10914,6 +10931,7 @@ fn resolve_type_fact_targets_by_key<'a>(
             types_by_name,
             symbols_by_file_and_name,
             import_targets,
+            import_facts_by_file_local,
         )
         .into_iter()
         .filter(|symbol| is_django_model_type(symbol, hierarchy_facts))
@@ -10933,6 +10951,7 @@ fn resolve_type_fact_targets_by_key<'a>(
                     types_by_name,
                     symbols_by_file_and_name,
                     import_targets,
+                    import_facts_by_file_local,
                 ));
             }
         }
@@ -10953,6 +10972,7 @@ fn resolve_type_fact_targets_by_key<'a>(
                             types_by_name,
                             symbols_by_file_and_name,
                             import_targets,
+                            import_facts_by_file_local,
                         ));
                     }
                 }
@@ -10969,32 +10989,104 @@ fn resolve_type_fact_targets_by_key<'a>(
         types_by_name,
         symbols_by_file_and_name,
         import_targets,
+        import_facts_by_file_local,
     )
 }
 
 fn resolve_type_name_targets_by_key<'a>(
     type_expr: &str,
-    context_rel_path: &'a str,
+    context_rel_path: &str,
     site_enclosing_id: Option<&str>,
     symbols_by_id: &HashMap<&'a str, &'a GraphSymbol>,
     types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
     symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
     import_targets: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    import_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a ImportFact>>,
 ) -> Vec<&'a GraphSymbol> {
-    let type_name = type_tail(type_expr);
-    if type_name == "Self" {
-        if let Some(container_name) = site_enclosing_id
-            .and_then(|id| symbols_by_id.get(id))
-            .and_then(|symbol| symbol.container_name.as_deref())
-        {
-            return types_by_name
-                .get(container_name)
-                .cloned()
-                .unwrap_or_default();
-        }
-        return Vec::new();
+    if type_expr == "Self" {
+        let Some(source) = site_enclosing_id.and_then(|id| symbols_by_id.get(id)) else {
+            return Vec::new();
+        };
+        let container = if is_type_kind_sym(source) {
+            Some(*source)
+        } else {
+            source
+                .container_id
+                .as_deref()
+                .and_then(|id| symbols_by_id.get(id).copied())
+        };
+        return container
+            .filter(|symbol| is_type_kind_sym(symbol))
+            .into_iter()
+            .collect();
     }
-    if let Some(targets) = symbols_by_file_and_name.get(&(context_rel_path, type_name)) {
+    if let Some((qualifier, name)) = type_expr.rsplit_once('.') {
+        let mut out = Vec::new();
+        // Follow the namespace binding before considering its member name.
+        // A qualified name must never resolve to a same-named local/global type.
+        if let Some(facts) = import_facts_by_file_local
+            .get(&(context_rel_path, qualifier))
+            .filter(|_| !import_targets.contains_key(&(context_rel_path, qualifier)))
+        {
+            for fact in facts {
+                for module_path in &fact.module_candidates {
+                    if fact.imported_name == "*" {
+                        if let Some(targets) =
+                            symbols_by_file_and_name.get(&(module_path.as_str(), name))
+                        {
+                            out.extend(targets.iter().copied().filter(|symbol| {
+                                is_type_kind_sym(symbol) && symbol.container_id.is_none()
+                            }));
+                        }
+                    }
+                    if let Some(submodule) =
+                        submodule_member_candidate(module_path, &fact.imported_name)
+                    {
+                        if let Some(targets) =
+                            symbols_by_file_and_name.get(&(submodule.as_str(), name))
+                        {
+                            out.extend(targets.iter().copied().filter(|symbol| {
+                                is_type_kind_sym(symbol) && symbol.container_id.is_none()
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        // A qualifier can also be a locally declared or imported outer class.
+        // Recurse only through lexical/import bindings, never workspace names.
+        let bound_qualifier = qualifier.contains('.')
+            || symbols_by_file_and_name
+                .get(&(context_rel_path, qualifier))
+                .is_some_and(|targets| targets.iter().any(|symbol| is_type_kind_sym(symbol)))
+            || import_targets
+                .get(&(context_rel_path, qualifier))
+                .is_some_and(|targets| targets.iter().any(|symbol| is_type_kind_sym(symbol)));
+        if bound_qualifier {
+            for parent in resolve_type_name_targets_by_key(
+                qualifier,
+                context_rel_path,
+                site_enclosing_id,
+                symbols_by_id,
+                types_by_name,
+                symbols_by_file_and_name,
+                import_targets,
+                import_facts_by_file_local,
+            ) {
+                if let Some(targets) =
+                    symbols_by_file_and_name.get(&(parent.rel_path.as_str(), name))
+                {
+                    out.extend(targets.iter().copied().filter(|symbol| {
+                        is_type_kind_sym(symbol)
+                            && symbol.container_id.as_deref() == Some(parent.id.as_str())
+                    }));
+                }
+            }
+        }
+        sort_dedup_symbols(&mut out);
+        return out;
+    }
+    if let Some(targets) = symbols_by_file_and_name.get(&(context_rel_path, type_expr)) {
         let same_file_types: Vec<_> = targets
             .iter()
             .copied()
@@ -11004,7 +11096,7 @@ fn resolve_type_name_targets_by_key<'a>(
             return same_file_types;
         }
     }
-    if let Some(targets) = import_targets.get(&(context_rel_path, type_name)) {
+    if let Some(targets) = import_targets.get(&(context_rel_path, type_expr)) {
         let imported_types: Vec<_> = targets
             .iter()
             .copied()
@@ -11014,10 +11106,7 @@ fn resolve_type_name_targets_by_key<'a>(
             return imported_types;
         }
     }
-    types_by_name
-        .get(type_name)
-        .cloned()
-        .unwrap_or_default()
+    types_by_name.get(type_expr).cloned().unwrap_or_default()
 }
 
 fn type_fact_applies_to_site(fact: &TypeFact, site: &RefSite) -> bool {
@@ -11033,6 +11122,7 @@ fn resolve_type_fact_targets<'a>(
     types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
     symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
     import_targets: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    import_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a ImportFact>>,
     function_return_facts_by_file_name: &HashMap<(&'a str, &'a str), Vec<&'a FunctionReturnFact>>,
     hierarchy_facts: &[HierarchyFact],
 ) -> Vec<&'a GraphSymbol> {
@@ -11048,6 +11138,7 @@ fn resolve_type_fact_targets<'a>(
             types_by_name,
             symbols_by_file_and_name,
             import_targets,
+            import_facts_by_file_local,
         )
         .into_iter()
         .filter(|symbol| is_django_model_type(symbol, hierarchy_facts))
@@ -11069,6 +11160,7 @@ fn resolve_type_fact_targets<'a>(
                     types_by_name,
                     symbols_by_file_and_name,
                     import_targets,
+                    import_facts_by_file_local,
                 ));
             }
         }
@@ -11089,6 +11181,7 @@ fn resolve_type_fact_targets<'a>(
                             types_by_name,
                             symbols_by_file_and_name,
                             import_targets,
+                            import_facts_by_file_local,
                         ));
                     }
                 }
@@ -11105,6 +11198,7 @@ fn resolve_type_fact_targets<'a>(
         types_by_name,
         symbols_by_file_and_name,
         import_targets,
+        import_facts_by_file_local,
     )
 }
 
@@ -11116,44 +11210,18 @@ fn resolve_type_name_targets<'a>(
     types_by_name: &HashMap<&'a str, Vec<&'a GraphSymbol>>,
     symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
     import_targets: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
+    import_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a ImportFact>>,
 ) -> Vec<&'a GraphSymbol> {
-    let type_name = type_tail(type_expr);
-    if type_name == "Self" {
-        // B6 stage-3: rebuild the enclosing id string from the stored u64 (cold).
-        let site_enclosing = enclosing_id_to_string(site.enclosing_id);
-        if let Some(container_name) = site_enclosing
-            .as_deref()
-            .and_then(|id| symbols_by_id.get(id))
-            .and_then(|symbol| symbol.container_name.as_deref())
-        {
-            return types_by_name
-                .get(container_name)
-                .cloned()
-                .unwrap_or_default();
-        }
-        return Vec::new();
-    }
-    if let Some(targets) = symbols_by_file_and_name.get(&(context_rel_path, type_name)) {
-        let same_file_types: Vec<_> = targets
-            .iter()
-            .copied()
-            .filter(|symbol| is_type_kind_sym(symbol))
-            .collect();
-        if !same_file_types.is_empty() {
-            return same_file_types;
-        }
-    }
-    if let Some(targets) = import_targets.get(&(context_rel_path, type_name)) {
-        let imported_types: Vec<_> = targets
-            .iter()
-            .copied()
-            .filter(|symbol| is_type_kind_sym(symbol))
-            .collect();
-        if !imported_types.is_empty() {
-            return imported_types;
-        }
-    }
-    types_by_name.get(type_name).cloned().unwrap_or_default()
+    resolve_type_name_targets_by_key(
+        type_expr,
+        context_rel_path,
+        enclosing_id_to_string(site.enclosing_id).as_deref(),
+        symbols_by_id,
+        types_by_name,
+        symbols_by_file_and_name,
+        import_targets,
+        import_facts_by_file_local,
+    )
 }
 
 fn is_django_model_type(symbol: &GraphSymbol, hierarchy_facts: &[HierarchyFact]) -> bool {
@@ -11203,12 +11271,12 @@ fn extend_members_for_type<'a>(
     type_symbol: &'a GraphSymbol,
     member_name: &str,
 ) {
-    let qual = type_symbol.qualified_name.as_str();
-    let name = type_symbol.name.as_str();
-    extend_members_for_container(out, members_by_container_and_name, qual, member_name);
-    if qual != name {
-        extend_members_for_container(out, members_by_container_and_name, name, member_name);
-    }
+    extend_members_for_container(
+        out,
+        members_by_container_and_name,
+        &type_symbol.id,
+        member_name,
+    );
 }
 
 fn collect_exact_members_for_type<'a>(
@@ -11221,14 +11289,7 @@ fn collect_exact_members_for_type<'a>(
     collect_exact_members_for_container(
         out,
         members_by_container_and_name,
-        type_symbol.qualified_name.as_str(),
-        member_name,
-        provenance,
-    );
-    collect_exact_members_for_container(
-        out,
-        members_by_container_and_name,
-        type_symbol.name.as_str(),
+        type_symbol.id.as_str(),
         member_name,
         provenance,
     );
@@ -11237,10 +11298,10 @@ fn collect_exact_members_for_type<'a>(
 fn extend_members_for_container<'a>(
     out: &mut Vec<&'a GraphSymbol>,
     members_by_container_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
-    container_name: &str,
+    container_id: &str,
     member_name: &str,
 ) {
-    if let Some(symbols) = members_by_container_and_name.get(&(container_name, member_name)) {
+    if let Some(symbols) = members_by_container_and_name.get(&(container_id, member_name)) {
         out.extend(symbols.iter().copied());
     }
 }
@@ -11248,11 +11309,11 @@ fn extend_members_for_container<'a>(
 fn collect_exact_members_for_container<'a>(
     out: &mut Vec<MemberExactCandidate<'a>>,
     members_by_container_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
-    container_name: &str,
+    container_id: &str,
     member_name: &str,
     provenance: &'static str,
 ) {
-    if let Some(symbols) = members_by_container_and_name.get(&(container_name, member_name)) {
+    if let Some(symbols) = members_by_container_and_name.get(&(container_id, member_name)) {
         out.extend(symbols.iter().map(|target| MemberExactCandidate {
             target: *target,
             provenance,
@@ -11268,14 +11329,17 @@ fn extend_and_collect_members_for_container<'a>(
     fallback: &mut Vec<&'a GraphSymbol>,
     exact: &mut Vec<MemberExactCandidate<'a>>,
     members_by_container_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
-    container_name: &str,
+    container_id: &str,
     member_name: &str,
     provenance: &'static str,
 ) {
-    if let Some(symbols) = members_by_container_and_name.get(&(container_name, member_name)) {
+    if let Some(symbols) = members_by_container_and_name.get(&(container_id, member_name)) {
         for sym in symbols {
             fallback.push(*sym);
-            exact.push(MemberExactCandidate { target: *sym, provenance });
+            exact.push(MemberExactCandidate {
+                target: *sym,
+                provenance,
+            });
         }
     }
 }
@@ -11288,28 +11352,14 @@ fn extend_and_collect_members_for_type<'a>(
     member_name: &str,
     provenance: &'static str,
 ) {
-    let qual = type_symbol.qualified_name.as_str();
-    let name = type_symbol.name.as_str();
     extend_and_collect_members_for_container(
         fallback,
         exact,
         members_by_container_and_name,
-        qual,
+        type_symbol.id.as_str(),
         member_name,
         provenance,
     );
-    // Phase 3 optimization: top-level symbols have qualified_name == name;
-    // the second lookup would return the same Vec. Skip when equal.
-    if qual != name {
-        extend_and_collect_members_for_container(
-            fallback,
-            exact,
-            members_by_container_and_name,
-            name,
-            member_name,
-            provenance,
-        );
-    }
 }
 
 // Phase 3 optimization: dedup `&GraphSymbol` by pointer instead of by id
@@ -11985,11 +12035,28 @@ fn source_scope_key(rel_path: &str) -> &str {
     rel_path.split('/').next().unwrap_or(rel_path)
 }
 
-/// Build the per-source-file EXACT-scoped outgoing-target tally and write it
+/// Accumulate the same four counters for immutable base and edited files.
+fn add_outgoing_usage_contribution(
+    counts: &mut [u32; 4],
+    reference: &GraphReference,
+    same_scope: bool,
+) {
+    let is_call = matches!(reference.edge_kind.as_ref(), "call" | "construct");
+    let is_must = reference.bound_mask & BOUND_MUST != 0;
+    for (count, include) in counts.iter_mut().zip([
+        same_scope,
+        same_scope && is_call,
+        is_must,
+        is_must && is_call,
+    ]) {
+        *count = count.saturating_add(u32::from(include));
+    }
+}
+
+/// Build the per-source-file scoped and MUST outgoing-target tally and write it
 /// sharded by source rel_path. For each source file F it records, per target T,
-/// how many of F's EXACT (non-token-shape) references to T are scoped to T
-/// (source root == target root) — i.e. F's contribution to `usage_likely(T)`'s
-/// exact component, split into usage + call counts.
+/// non-token-shape usages/calls scoped to T, plus MUST usages/calls across
+/// all roots. Keeping separate counters prevents possible refs becoming exact.
 ///
 /// The overlay edit path reads only the affected files' rows (O(edit)) to get
 /// each superseded file's PRIOR contribution, so it can compute an exact count
@@ -12022,7 +12089,7 @@ fn build_and_write_outgoing_tally(workspace_root: &Path, config: &EngineConfig) 
     drop(compact);
     // Accumulate per (source rel_path → target → (usage, calls)) by streaming the
     // by-target reference shards one at a time (never holds the full ref set).
-    let mut tally: HashMap<String, AHashMap<u64, (u32, u32)>> = HashMap::default();
+    let mut tally: HashMap<String, AHashMap<u64, [u32; 4]>> = HashMap::default();
     for shard in 0..GRAPH_SHARD_COUNT {
         let path = graph_shard_path(
             workspace_root,
@@ -12044,25 +12111,19 @@ fn build_and_write_outgoing_tally(workspace_root: &Path, config: &EngineConfig) 
             else {
                 continue;
             };
-            let Some(root) = scope_by_target.get(&t) else {
-                continue;
-            };
-            if source_scope_key(&r.rel_path) != &**root {
-                continue;
-            }
+            let same_scope = scope_by_target
+                .get(&t)
+                .is_some_and(|root| source_scope_key(&r.rel_path) == &**root);
             let entry = tally
                 .entry(r.rel_path.to_string())
                 .or_default()
                 .entry(t)
                 .or_default();
-            entry.0 = entry.0.saturating_add(1);
-            if matches!(r.edge_kind.as_ref(), "call" | "construct") {
-                entry.1 = entry.1.saturating_add(1);
-            }
+            add_outgoing_usage_contribution(entry, r, same_scope);
         }
     }
     // Write sharded by source rel_path. Per record: u32 path_len, path bytes,
-    // u32 n_targets, then n × (u64 target, u32 usage, u32 calls).
+    // u32 n_targets, then n × (u64 target, four u32 contribution counts).
     let mut shard_bufs: Vec<Vec<u8>> = vec![Vec::new(); GRAPH_SHARD_COUNT];
     for (rel_path, targets) in &tally {
         let buf = &mut shard_bufs[shard_index_for_key(rel_path)];
@@ -12070,10 +12131,11 @@ fn build_and_write_outgoing_tally(workspace_root: &Path, config: &EngineConfig) 
         buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
         buf.extend_from_slice(pb);
         buf.extend_from_slice(&(targets.len() as u32).to_le_bytes());
-        for (t, (usage, calls)) in targets {
+        for (t, contribution) in targets {
             buf.extend_from_slice(&t.to_le_bytes());
-            buf.extend_from_slice(&usage.to_le_bytes());
-            buf.extend_from_slice(&calls.to_le_bytes());
+            for count in contribution {
+                buf.extend_from_slice(&count.to_le_bytes());
+            }
         }
     }
     for (shard, buf) in shard_bufs.iter().enumerate() {
@@ -12088,15 +12150,15 @@ fn build_and_write_outgoing_tally(workspace_root: &Path, config: &EngineConfig) 
     Ok(())
 }
 
-/// Sum the prior EXACT-scoped outgoing contribution of the given source files,
-/// per target id_u64: (usage, calls). Reads only the tally shards holding those
+/// Sum the prior scoped and MUST outgoing contributions of the given source files,
+/// per target id_u64: [scoped usages, scoped calls, MUST usages, MUST calls]. Reads only the tally shards holding those
 /// files (O(edit)). Returns an empty map when the tally sidecar is absent.
 fn load_outgoing_tally_for_files(
     workspace_root: &Path,
     config: &EngineConfig,
     files: &HashSet<String>,
-) -> io::Result<AHashMap<u64, (i64, i64)>> {
-    let mut out: AHashMap<u64, (i64, i64)> = AHashMap::default();
+) -> io::Result<AHashMap<u64, [i64; 4]>> {
+    let mut out: AHashMap<u64, [i64; 4]> = AHashMap::default();
     if files.is_empty() {
         return Ok(out);
     }
@@ -12128,18 +12190,19 @@ fn load_outgoing_tally_for_files(
             cur += 4;
             let include = files.contains(rel);
             for _ in 0..n {
-                if cur + 16 > bytes.len() {
+                if cur + 24 > bytes.len() {
                     break;
                 }
                 if include {
                     let t = u64::from_le_bytes(bytes[cur..cur + 8].try_into().unwrap());
-                    let usage = u32::from_le_bytes(bytes[cur + 8..cur + 12].try_into().unwrap());
-                    let calls = u32::from_le_bytes(bytes[cur + 12..cur + 16].try_into().unwrap());
-                    let e = out.entry(t).or_default();
-                    e.0 += usage as i64;
-                    e.1 += calls as i64;
+                    let contribution = out.entry(t).or_default();
+                    for (i, value) in contribution.iter_mut().enumerate() {
+                        let offset = cur + 8 + i * 4;
+                        *value += u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+                            as i64;
+                    }
                 }
-                cur += 16;
+                cur += 24;
             }
         }
     }
@@ -20001,6 +20064,364 @@ mod tests {
             .find(|symbol| symbol.qualified_name == qualified_name)
             .map(|symbol| symbol.id.as_str())
             .unwrap_or_else(|| panic!("missing symbol {qualified_name}"))
+    }
+
+    #[test]
+    fn imported_types_keep_member_usages_in_their_declaring_container() {
+        for (extension, provider, consumer) in [
+            (
+                "py",
+                "class Worker:\n    def run(self):\n        pass\n",
+                "from .first import Worker as Selected\n\ndef consume(worker: Selected):\n    worker.run()\n    worker.run()\n",
+            ),
+            (
+                "ts",
+                "export class Worker {\n  run() {}\n}\n",
+                "import { Worker as Selected } from './first';\nfunction consume(worker: Selected) {\n  worker.run();\n  worker.run();\n}\n",
+            ),
+        ] {
+            let first_path = format!("pkg/first.{extension}");
+            let second_path = format!("pkg/second.{extension}");
+            let (symbols, result) = resolve_test_entries(&[
+                test_entry(&first_path, provider),
+                test_entry(&second_path, provider),
+                test_entry(&format!("pkg/consumer.{extension}"), consumer),
+            ]);
+            for (path, expected) in [(&first_path, 2), (&second_path, 0)] {
+                let target = symbols
+                    .iter()
+                    .find(|symbol| symbol.rel_path == *path && symbol.qualified_name == "Worker.run")
+                    .expect("member declaration");
+                let count = result.counts.get(&target.id).copied().unwrap_or_default();
+                assert_eq!(count.usage_must, expected, "{path}: exact usages");
+                assert_eq!(count.usage_likely, expected, "{path}: displayed usages");
+                assert_eq!(
+                    result.references.iter().filter(|reference| {
+                        reference.target_symbol_id.as_deref() == Some(target.id.as_str())
+                            && reference.confidence.as_ref() == "exact"
+                    }).count(),
+                    expected,
+                    "{path}: exact reference locations"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_type_facts_respect_module_qualification() {
+        for (extension, provider, consumer) in [
+            (
+                "py",
+                "class Worker:\n    def run(self):\n        pass\n",
+                "from . import first as api\n\nclass Worker:\n    def run(self):\n        pass\n\ndef consume(worker: api.Worker):\n    worker.run()\n",
+            ),
+            (
+                "ts",
+                "export class Worker {\n  run() {}\n}\n",
+                "import * as api from './first';\nclass Worker {\n  run() {}\n}\nfunction consume(worker: api.Worker) {\n  worker.run();\n}\nfunction construct() {\n  const worker = new api.Worker();\n  worker.run();\n}\n",
+            ),
+        ] {
+            let expected = if extension == "ts" { 2 } else { 1 };
+            let first_path = format!("pkg/first.{extension}");
+            let (symbols, result) = resolve_test_entries(&[
+                test_entry(&first_path, provider),
+                test_entry(&format!("pkg/second.{extension}"), provider),
+                test_entry(&format!("pkg/consumer.{extension}"), consumer),
+            ]);
+            for target in symbols.iter().filter(|symbol| symbol.qualified_name == "Worker.run") {
+                let count = result.counts.get(&target.id).copied().unwrap_or_default();
+                let expected = if target.rel_path == first_path { expected } else { 0 };
+                assert_eq!(count.usage_must, expected, "{}: qualified exact usages", target.rel_path);
+                assert_eq!(count.usage_likely, expected, "{}: qualified displayed usages", target.rel_path);
+            }
+        }
+    }
+
+    #[test]
+    fn python_self_and_nested_types_use_container_identity() {
+        let provider = "class Outer:\n    class Worker:\n        def run(self):\n            pass\n\n        def repeat(self, peer: Self):\n            self.run()\n            peer.run()\n\n        @classmethod\n        def invoke(cls):\n            cls.run(None)\n";
+        let (symbols, result) = resolve_test_entries(&[
+            test_entry("pkg/first.py", provider),
+            test_entry("pkg/second.py", provider),
+            test_entry("pkg/consumer.py", "from .first import Outer as Selected\n\nclass Worker:\n    def run(self):\n        pass\n\ndef consume(worker: Selected.Worker):\n    worker.run()\n"),
+        ]);
+        for target in symbols.iter().filter(|symbol| symbol.name == "run") {
+            let expected = match target.rel_path.as_str() {
+                "pkg/first.py" => 4,
+                "pkg/second.py" => 3,
+                _ => 0,
+            };
+            let count = result.counts.get(&target.id).copied().unwrap_or_default();
+            assert_eq!(
+                count.usage_must, expected,
+                "{}: nested/self exact usages",
+                target.rel_path
+            );
+            assert_eq!(
+                count.usage_likely, expected,
+                "{}: nested/self displayed usages",
+                target.rel_path
+            );
+        }
+    }
+
+    #[test]
+    fn named_type_receivers_prefer_the_imported_declaration() {
+        let (symbols, result) = resolve_test_entries(&[
+            test_entry(
+                "pkg/first.py",
+                "class Worker:\n    @staticmethod\n    def run():\n        pass\n",
+            ),
+            test_entry(
+                "pkg/second.py",
+                "class Worker:\n    @staticmethod\n    def run():\n        pass\n",
+            ),
+            test_entry(
+                "pkg/consumer.py",
+                "from .first import Worker\n\ndef consume():\n    Worker.run()\n",
+            ),
+        ]);
+        for target in symbols.iter().filter(|symbol| symbol.name == "run") {
+            let expected = usize::from(target.rel_path == "pkg/first.py");
+            let count = result.counts.get(&target.id).copied().unwrap_or_default();
+            assert_eq!(
+                count.usage_must, expected,
+                "{}: imported receiver exact usages",
+                target.rel_path
+            );
+            assert_eq!(
+                count.usage_likely, expected,
+                "{}: imported receiver displayed usages",
+                target.rel_path
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_qualified_types_do_not_borrow_an_unrelated_type() {
+        let (symbols, result) = resolve_test_entries(&[
+            test_entry(
+                "pkg/provider.py",
+                "class Worker:\n    def run(self):\n        pass\n",
+            ),
+            test_entry(
+                "pkg/consumer.py",
+                "import unavailable as api\n\ndef consume(worker: api.Worker):\n    worker.run()\n",
+            ),
+        ]);
+        let run_id = symbol_id(&symbols, "Worker.run");
+        let count = result.counts.get(run_id).copied().unwrap_or_default();
+        assert_eq!(
+            count.usage_must, 0,
+            "an unresolved namespace cannot prove a target"
+        );
+        assert!(
+            count.usage_may >= 1,
+            "keep the unresolved occurrence as a conservative candidate"
+        );
+        assert!(!result.references.iter().any(|reference| {
+            reference.target_symbol_id.as_deref() == Some(run_id)
+                && reference.confidence.as_ref() == "exact"
+        }));
+    }
+
+    #[test]
+    fn qualified_types_require_a_namespace_or_outer_type_binding() {
+        let provider = test_entry(
+            "pkg/provider.py",
+            "class Worker:\n    def run(self):\n        pass\n\ndef factory():\n    pass\n",
+        );
+        for (import_line, expected) in [
+            ("import pkg.provider as api", 1),
+            ("from pkg.provider import factory as api", 0),
+            ("from pkg.provider import missing as api", 0),
+        ] {
+            let consumer = test_entry(
+                "pkg/consumer.py",
+                &format!("{import_line}\n\ndef consume(worker: api.Worker):\n    worker.run()\n"),
+            );
+            let (symbols, result) = resolve_test_entries(&[provider.clone(), consumer]);
+            let run_id = symbol_id(&symbols, "Worker.run");
+            let count = result.counts.get(run_id).copied().unwrap_or_default();
+            assert_eq!(
+                count.usage_must, expected,
+                "{import_line}: only namespace imports expose module types"
+            );
+        }
+    }
+
+    #[test]
+    fn qualified_member_usages_survive_rebuild_overlay_and_incremental_updates() {
+        let ws = unique_temp_workspace("zoek-qualified-member-usages");
+        let config = EngineConfig::default();
+        fs::create_dir_all(ws.join("pkg")).expect("create fixture package");
+        let provider = "class Worker:\n    def run(self):\n        pass\n";
+        for module in ["first", "second"] {
+            fs::write(ws.join(format!("pkg/{module}.py")), provider).expect("write provider");
+        }
+        let consumer_path = ws.join("pkg/consumer.py");
+        let consumer = |module: &str, calls: usize| {
+            format!(
+                "from . import {module} as api\n\ndef consume(worker: api.Worker):\n{}",
+                "    worker.run()\n".repeat(calls),
+            )
+        };
+        let assert_usages = |module: &str, expected_count: usize| {
+            let symbols = query_graph_symbols(&ws, "Worker.run", 100, &config)
+                .expect("query symbols")
+                .expect("graph index");
+            assert_eq!(symbols.symbols.len(), 2, "two unrelated declarations");
+            for target in &symbols.symbols {
+                let expected = if target.rel_path == format!("pkg/{module}.py") {
+                    expected_count
+                } else {
+                    0
+                };
+                assert_eq!(
+                    target.usage_count,
+                    Some(expected),
+                    "{}: persisted display count",
+                    target.rel_path
+                );
+                assert_eq!(
+                    target.usage_must_count,
+                    Some(expected),
+                    "{}: persisted exact count",
+                    target.rel_path
+                );
+                let usages = query_graph(&ws, &target.id, 100, &config)
+                    .expect("query usages")
+                    .expect("graph index");
+                assert_eq!(
+                    usages.references.len(),
+                    expected,
+                    "{}: persisted locations",
+                    target.rel_path
+                );
+                assert!(usages.references.iter().all(|reference| {
+                    reference.rel_path.as_ref() == "pkg/consumer.py"
+                        && reference.raw_text.as_ref() == "run"
+                        && reference.confidence.as_ref() == "exact"
+                }));
+            }
+        };
+        fs::write(&consumer_path, consumer("first", 1)).expect("write consumer");
+        let built_at = unix_millis_now();
+        let mut noop = |_progress: GraphRebuildProgress| {};
+        rebuild_graph_native(&ws, built_at, &config, 0, &mut noop).expect("rebuild");
+        assert_usages("first", 1);
+
+        fs::write(&consumer_path, consumer("second", 2)).expect("change namespace binding");
+        overlay_update_graph_native(
+            &ws,
+            std::slice::from_ref(&consumer_path),
+            &[],
+            built_at,
+            &config,
+            0,
+        )
+        .expect("overlay update");
+        assert!(
+            crate::graph_overlay::GraphOverlay::load_valid(&ws, &config, built_at).entry_count()
+                > 0
+        );
+        assert_usages("second", 2);
+
+        fs::write(&consumer_path, consumer("first", 3)).expect("change binding again");
+        update_graph_native(
+            &ws,
+            std::slice::from_ref(&consumer_path),
+            &[],
+            built_at + 1,
+            &config,
+            0,
+        )
+        .expect("incremental update");
+        assert_usages("first", 3);
+        fs::write(&consumer_path, consumer("second", 4)).expect("edit after incremental update");
+        overlay_update_graph_native(
+            &ws,
+            std::slice::from_ref(&consumer_path),
+            &[],
+            built_at + 1,
+            &config,
+            0,
+        )
+        .expect("overlay against updated base");
+        assert_usages("second", 4);
+        compact_graph_overlay(&ws, built_at + 1, &config, 0).expect("compact overlay");
+        assert_usages("second", 4);
+        fs::write(&consumer_path, consumer("first", 3)).expect("edit before fresh rebuild");
+        rebuild_graph_native(&ws, built_at + 2, &config, 0, &mut noop).expect("fresh rebuild");
+        assert_usages("first", 3);
+        fs::remove_dir_all(&ws).expect("remove fixture workspace");
+    }
+
+    #[test]
+    fn overlay_usage_counts_keep_possible_and_exact_references_separate() {
+        let ws = unique_temp_workspace("zoek-overlay-usage-confidence");
+        let config = EngineConfig::default();
+        fs::create_dir_all(ws.join("pkg")).expect("create package");
+        fs::write(
+            ws.join("pkg/provider.py"),
+            "class Worker:\n    def run(self):\n        pass\n",
+        )
+        .expect("write provider");
+        let consumer_path = ws.join("pkg/consumer.py");
+        let consumer = |typed: bool, calls: usize| {
+            let annotation = if typed { ": api.Worker" } else { "" };
+            format!(
+                "from . import provider as api\n\ndef consume(worker{annotation}):\n{}",
+                "    worker.run()\n".repeat(calls)
+            )
+        };
+        fs::write(&consumer_path, consumer(false, 1)).expect("write consumer");
+        let built_at = unix_millis_now();
+        rebuild_graph_native(&ws, built_at, &config, 0, &mut |_| {}).expect("rebuild");
+        for (typed, calls) in [(false, 2), (true, 2), (false, 1)] {
+            fs::write(&consumer_path, consumer(typed, calls)).expect("edit receiver type");
+            overlay_update_graph_native(
+                &ws,
+                std::slice::from_ref(&consumer_path),
+                &[],
+                built_at,
+                &config,
+                0,
+            )
+            .expect("overlay update");
+            let symbols = query_graph_symbols(&ws, "Worker.run", 10, &config)
+                .expect("query symbol")
+                .expect("graph index");
+            let target = &symbols.symbols[0];
+            assert_eq!(
+                target.usage_count,
+                Some(calls),
+                "displayed usage count after edit"
+            );
+            assert_eq!(
+                target.usage_must_count,
+                Some(if typed { calls } else { 0 }),
+                "MUST counts require type evidence"
+            );
+            assert!(target.usage_may_count.unwrap_or(0) >= calls);
+            let usages = query_graph(&ws, &target.id, 10, &config)
+                .expect("query usages")
+                .expect("graph index");
+            assert_eq!(
+                usages.references.len(),
+                calls,
+                "reference locations after edit"
+            );
+            assert_eq!(
+                usages
+                    .references
+                    .iter()
+                    .filter(|reference| reference.bound_mask & BOUND_MUST != 0)
+                    .count(),
+                if typed { calls } else { 0 }
+            );
+        }
+        fs::remove_dir_all(&ws).expect("remove fixture workspace");
     }
 
     #[test]

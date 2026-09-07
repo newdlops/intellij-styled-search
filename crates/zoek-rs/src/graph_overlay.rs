@@ -74,13 +74,14 @@ pub struct GraphOverlayEntry {
     pub refs: Vec<GraphReference>,
     /// Symbols *defined in this file*. Populated for `Changed` only.
     pub symbols: Vec<GraphSymbol>,
-    /// This file's EXACT-scoped contribution to each target's count, computed at
-    /// edit time (target id_u64 → (usage, calls)). Mirrors the base
-    /// `callgraph-outgoing-tally-by-file` rows so the overlay can recompute
+    /// This file's non-token-shape contribution to each target's count, computed
+    /// at edit time: [scoped usages, scoped calls, MUST usages, MUST calls].
+    /// MUST counts include cross-root references and exclude possible edges.
+    /// Mirrors the base `callgraph-outgoing-tally-by-file-v2` rows to recompute
     /// per-target count deltas (current contribution − base contribution) across
     /// chained edits without re-deriving target scopes. Empty for `Deleted`.
     #[serde(default)]
-    pub contrib: BTreeMap<u64, (u32, u32)>,
+    pub contrib: BTreeMap<u64, [u32; 4]>,
     /// Signed change to the number of eligible bare/member declarations for
     /// each `(language, source-root, name)` token-shape key. Queries apply the
     /// aggregate to the immutable base sidecar so lazy ambiguous candidates do
@@ -114,14 +115,15 @@ pub struct GraphOverlay {
     /// Keyed by source `rel_path`.
     pub entries: BTreeMap<String, GraphOverlayEntry>,
     /// Per-target signed count deltas to apply on top of the base `counts-by-id`
-    /// at query time, keyed by target `id_u64`: (usage_likely_delta,
-    /// calls_in_likely_delta). Computed at edit time from the EXACT-scoped
+    /// at query time, keyed by target `id_u64`: [usage_likely_delta,
+    /// calls_in_likely_delta, usage_must_delta, calls_in_must_delta].
+    /// Computed at edit time from the non-token-shape
     /// outgoing tally (new re-resolved contribution − superseded files' prior
     /// contribution). Exact for the exact-usage component; the token-shape
-    /// padding of `usage_likely` converges at the next compaction. Empty when the
-    /// base tally sidecar is absent (graceful degrade → base counts).
+    /// padding of `usage_likely` converges at the next compaction. An absent base
+    /// tally sends edits through the full update path instead.
     #[serde(default)]
-    pub count_deltas: BTreeMap<u64, (i64, i64)>,
+    pub count_deltas: BTreeMap<u64, [i64; 4]>,
 }
 
 impl GraphOverlay {
@@ -242,15 +244,15 @@ impl GraphOverlay {
         self.entries.values().flat_map(|e| e.symbols.iter())
     }
 
-    /// Sum every entry's EXACT-scoped per-target contribution (target id_u64 →
-    /// (usage, calls)). The caller subtracts the base tally to get `count_deltas`.
-    pub fn total_contrib(&self) -> BTreeMap<u64, (i64, i64)> {
-        let mut out: BTreeMap<u64, (i64, i64)> = BTreeMap::new();
+    /// Sum each entry's contribution. Subtract the base tally for `count_deltas`.
+    pub fn total_contrib(&self) -> BTreeMap<u64, [i64; 4]> {
+        let mut out: BTreeMap<u64, [i64; 4]> = BTreeMap::new();
         for e in self.entries.values() {
-            for (&t, &(usage, calls)) in &e.contrib {
-                let v = out.entry(t).or_insert((0, 0));
-                v.0 += usage as i64;
-                v.1 += calls as i64;
+            for (&t, contribution) in &e.contrib {
+                let total = out.entry(t).or_default();
+                for (value, count) in total.iter_mut().zip(contribution) {
+                    *value += *count as i64;
+                }
             }
         }
         out

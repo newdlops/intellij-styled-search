@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.7149 - 2026-09-07
+
+- Resolved member usages by declaring class ID so unrelated classes with the same name no longer lose exact references or share inferred member targets.
+- Followed import aliases and module-qualified receiver types in Python and TypeScript, including nested classes and Python `Self` annotations.
+- Updated exact usage counts after edits without promoting possible references, and refreshed the base contribution tally after incremental updates and compaction.
+- Added regression coverage for ambiguous declarations, unresolved namespaces, count/reference consistency, and successive index updates. Graph cache v17 / native graph v9 requires one reindex to replace older inferred links and count tallies.
+
 ## 0.1.7148 - 2026-09-07
 
 - Bounded the codesearch disk-posting read cache to 16 MiB and 4,096 entries while preserving search results after eviction.

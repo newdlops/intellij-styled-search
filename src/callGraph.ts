@@ -785,14 +785,13 @@ const DEFAULT_CALL_GRAPH_MAX_CALLSITES = 0;
 const DEFAULT_CALL_GRAPH_MAX_REFERENCE_CANDIDATES = 0;
 const DEFAULT_CALL_GRAPH_MEMORY_BUDGET_MB = 8_192;
 const CALL_GRAPH_SOURCE_GLOB = '**/*.{py,java,kt,kts,ts,tsx,js,jsx,mjs,cjs}';
-// v16: paired with rust GRAPH_VERSION 7->8. v8 persists the number of concrete
-// targets for each token-shape key so unresolved occurrences are attached only
-// when that structural key identifies one target or one complete inheritance
-// family. The new sidecar is required for query-time lazy references, so this
-// bump forces a one-time reindex.
+// v17 / native v9: resolve members by declaring container ID and qualified
+// types by their import bindings. Reindex once so persisted counts/references
+// cannot retain links between unrelated classes with the same name, and the
+// overlay tally distinguishes possible usages from MUST usages after edits.
 // MUST move together with the GRAPH_VERSION bump + the rebuilt binary.
-const CALL_GRAPH_CACHE_VERSION = 16;
-const RUST_NATIVE_GRAPH_MANIFEST_VERSION = 8;
+const CALL_GRAPH_CACHE_VERSION = 17;
+const RUST_NATIVE_GRAPH_MANIFEST_VERSION = 9;
 const RUST_NATIVE_GRAPH_REBUILD_WARNING = 'rust-native graph rebuild stores the primary graph in zoek-rs binary index; JS snapshot arrays are intentionally not materialized';
 const CALL_GRAPH_EXTERNAL_INCREMENTAL_DEBOUNCE_MS = 1_500;
 const CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS = 75;
