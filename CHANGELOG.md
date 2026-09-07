@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.7148 - 2026-09-07
+
+- Bounded the codesearch disk-posting read cache to 16 MiB and 4,096 entries while preserving search results after eviction.
+- Used posting-size metadata to evaluate selective search terms first and avoid unnecessary disk reads after an empty intersection.
+- Kept unchanged trigram postings compact during file updates and removed the file-sized temporary array from trigram extraction.
+- Added regression coverage for Unicode compatibility, cache eviction, incremental updates, persistence, and query semantics, plus an isolated resource benchmark.
+
 ## 0.1.7147 - 2026-09-02
 
 - Added host-memory pressure gates and cancellation for codesearch and zoek-rs indexing work.

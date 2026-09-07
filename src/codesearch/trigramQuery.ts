@@ -105,6 +105,9 @@ export interface PostingSource {
   /** Posting list of fileIds containing the trigram, or null if the
    *  trigram was never indexed (treat as "any file could contain it"). */
   get(tri: string): Posting | null;
+  /** Optional cardinality metadata; must not materialize the posting.
+   *  Missing metadata is unconstrained and only affects evaluation order. */
+  size?(tri: string): number | undefined;
   /** All fileIds known to the index — used when a subtree is `any`. */
   allFiles(): ReadonlySet<number>;
 }
@@ -146,6 +149,16 @@ function unionSorted(a: Uint32Array, b: Uint32Array): Uint32Array {
   return out.subarray(0, k);
 }
 
+function estimatedSize(q: TrigramQuery, src: PostingSource): number {
+  switch (q.kind) {
+    case 'any': return Infinity;
+    case 'all': return 0;
+    case 'tri': return src.size?.(q.value) ?? Infinity;
+    case 'and': return q.children.reduce((size, child) => Math.min(size, estimatedSize(child, src)), Infinity);
+    case 'or': return q.children.reduce((size, child) => size + estimatedSize(child, src), 0);
+  }
+}
+
 /** Evaluate query against the index. Returns the candidate fileId array
  *  (sorted ascending). `null` means "index can't constrain" (every file is
  *  a candidate — caller should fall back to full scan). Empty array means
@@ -161,20 +174,15 @@ export function evalQuery(q: TrigramQuery, src: PostingSource): Uint32Array | nu
       return s ? toSortedArray(s) : null;
     }
     case 'and': {
-      // Evaluate all children, sort by cardinality (smallest first) so the
-      // working set shrinks fast and short-circuits to empty early.
-      const evaluated: Array<{ size: number; value: Uint32Array | null }> = [];
-      for (const c of q.children) {
-        const r = evalQuery(c, src);
-        if (r && r.length === 0) { return new Uint32Array(0); }
-        evaluated.push({ size: r ? r.length : Number.MAX_SAFE_INTEGER, value: r });
-      }
-      evaluated.sort((a, b) => a.size - b.size);
+      // Order by the on-disk metadata before reading. Hold only the running
+      // intersection and current child, and stop loading when it is empty.
+      const ordered = q.children.map((query) => ({ query, size: estimatedSize(query, src) }));
+      ordered.sort((a, b) => a.size - b.size);
       let acc: Uint32Array | null = null;
-      for (const e of evaluated) {
-        if (e.value === null) { continue; }
-        if (acc === null) { acc = e.value; continue; }
-        acc = intersectSorted(acc, e.value);
+      for (const child of ordered) {
+        const value = evalQuery(child.query, src);
+        if (value === null) { continue; }
+        acc = acc === null ? value : intersectSorted(acc, value);
         if (acc.length === 0) { return acc; }
       }
       return acc;

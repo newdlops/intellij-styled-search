@@ -139,6 +139,8 @@ Zoekt indexes are kept fresh with incremental updates for VS Code create/save/de
 
 Search and call graph indexing check host-wide available memory before starting. While an isolated index process runs, sustained memory pressure is sampled and the process is stopped before it can exhaust the machine. Background full builds are deferred to a later trigger, while pending compactions and incremental batches retain their work and retry after pressure subsides; manual rebuilds report the available/required memory totals.
 
+The codesearch trigram engine retains at most 16 MiB or 4,096 entries of clean disk-backed posting data. Evicted postings are read again when needed. Queries use posting sizes from the index metadata to intersect selective terms first and stop reading after the candidate set becomes empty. Reindexing keeps unchanged postings compact, and trigram extraction uses a three-character window. The read-cache limit does not cap mutable build data, query results, or the temporary full index image used during persistence.
+
 The tab-free bundled preview is the guaranteed path. It uses real file URIs, lazily reads the installed extensions' `contributes.languages`/`contributes.grammars` assets without activating those extensions, and relays VS Code language providers without opening an editor tab. TextMate grammar failures or safety-budget overruns fall back to Monaco's bundled tokenizer. When passive renderer capture is available, the preview may upgrade to VS Code's native editor services. Workspace language requests use the saved VS Code document snapshot, so a bundled preview pauses them while it has unsaved edits and resumes them after a successful save instead of showing stale ranges. If the overlay or preview fails to mount after a VS Code update, run `IntelliJ Search: Reinject Renderer Patch (Recovery)`.
 
 ## Development
@@ -148,9 +150,12 @@ npm install
 npm run compile
 npm test
 npm run bench:zoekt -- --files 10000,50000,100000
+npm run bench:trigram
 ```
 
 `npm run bench:zoekt` saves a timestamped artifact plus `latest.json` under `artifacts/benchmarks/zoekt/`. The artifact includes the raw benchmark response, wall-clock runtime, git commit, Rust toolchain versions, and host metadata so repeated runs stay comparable.
+
+`npm run bench:trigram` runs isolated synthetic extraction, selective-query, repeated-query, and unchanged-update workloads without accessing a workspace index. It reports elapsed time, posting reads, and retained heap/array-buffer memory after GC. Use `-- --output=/tmp/trigram.json` to save the report, or `-- --module=/path/to/earlier-bundle.cjs` to compare an earlier build on the same host. These are codesearch measurements, not end-to-end Rust engine timings.
 
 ## Deployment
 

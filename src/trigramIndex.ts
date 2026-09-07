@@ -7,6 +7,8 @@ import { parseRegex } from './codesearch/regexAst';
 import { analyze } from './codesearch/regexInfo';
 import { PostingSource, TrigramQuery, evalQuery, qAnd, qTri } from './codesearch/trigramQuery';
 import { serializeV3 } from './codesearch/binaryIndex';
+import { extractTrigramsLower } from './codesearch/trigrams';
+export { extractTrigramsLower } from './codesearch/trigrams';
 import { findWorkspaceFilesDirect } from './fileDiscovery';
 import {
   IndexingMemoryProtection,
@@ -117,6 +119,12 @@ export class TrigramIndex {
   //   Uint32Array   — materialized, sorted ascending
   //   Set<number>   — being mutated by indexFile; save() compacts back
   private tris = new Map<string, Posting>();
+  // Clean disk-backed postings can be discarded at any time. Keep their
+  // offsets in tris so repeated queries cannot gradually retain the full index.
+  private readonly postingCache = new Map<string, Uint32Array>();
+  private readonly postingCacheMaxBytes = 16 * 1024 * 1024;
+  private readonly postingCacheMaxEntries = 4096;
+  private postingCacheBytes = 0;
   private fileMeta = new Map<number, FileMeta>();
   private uriToId = new Map<string, number>();
   // File ids whose disk content may disagree with the trigrams we have for
@@ -300,6 +308,7 @@ export class TrigramIndex {
       this.fileMeta.set(id, { uri, mtime, size });
       this.uriToId.set(uri, id);
     }
+    this.clearPostingCache();
     this.tris = new Map();
     if (result.kind === 'v3') {
       // Lazy mode: keep postings on disk, store only TOC refs. We open our
@@ -353,10 +362,15 @@ export class TrigramIndex {
     );
   }
 
-  /** Read a posting from the backing fd into a fresh Uint32Array and cache
-   *  it in the tris map (replacing the LazyPosting ref). Returns null if
-   *  the fd is closed or the read fails. */
+  /** Read a posting without replacing its disk reference. Oversized values
+   *  are usable by the caller but are not retained in the bounded read cache. */
   private materializeLazy(tri: string, ref: LazyPosting): Uint32Array | null {
+    const cached = this.postingCache.get(tri);
+    if (cached) {
+      this.postingCache.delete(tri);
+      this.postingCache.set(tri, cached);
+      return cached;
+    }
     if (this.fd === undefined) { return null; }
     const bytes = ref.length * 4;
     const buf = Buffer.alloc(bytes);
@@ -368,8 +382,34 @@ export class TrigramIndex {
     }
     if (read < bytes) { return null; }
     const posting = new Uint32Array(buf.buffer, buf.byteOffset, ref.length);
-    this.tris.set(tri, posting);
+    if (bytes <= this.postingCacheMaxBytes) {
+      while (this.postingCache.size >= this.postingCacheMaxEntries ||
+        this.postingCacheBytes + bytes > this.postingCacheMaxBytes) {
+        const oldest = this.postingCache.keys().next().value as string | undefined;
+        if (oldest === undefined) { break; }
+        this.dropCachedPosting(oldest);
+      }
+      this.postingCache.set(tri, posting);
+      this.postingCacheBytes += bytes;
+    }
     return posting;
+  }
+
+  private dropCachedPosting(tri: string): void {
+    const cached = this.postingCache.get(tri);
+    if (!cached) { return; }
+    this.postingCacheBytes -= cached.byteLength;
+    this.postingCache.delete(tri);
+  }
+
+  private clearPostingCache(): void {
+    this.postingCache.clear();
+    this.postingCacheBytes = 0;
+  }
+
+  private postingSize(tri: string): number | undefined {
+    const posting = this.tris.get(tri);
+    return posting instanceof Set ? posting.size : posting?.length;
   }
 
   /** Normalize a posting to its materialized form (Uint32Array | Set). */
@@ -401,7 +441,14 @@ export class TrigramIndex {
         compactTris.set(tri, posting);
       } else if ((posting as LazyPosting).kind === 'lazy') {
         const loaded = this.materializeLazy(tri, posting as LazyPosting);
-        if (loaded) { compactTris.set(tri, loaded); materialized++; }
+        if (loaded) {
+          compactTris.set(tri, loaded);
+          // Keep save's existing in-memory snapshot available while the
+          // backing descriptor is closed for the asynchronous write below.
+          this.tris.set(tri, loaded);
+          this.dropCachedPosting(tri);
+          materialized++;
+        }
       } else {
         const set = posting as Set<number>;
         const arr = new Uint32Array(set.size);
@@ -469,6 +516,7 @@ export class TrigramIndex {
     //                [fileMetaEnd 4][tocEnd 4][reserved 4]
     if (buf.length < 32) { return; }
     const tocEnd = buf.readUInt32LE(24);
+    this.clearPostingCache();
     this.postingsStart = tocEnd;
     // Walk compactTris in insertion order (same as serialize traverses the
     // map) to reconstruct postOffsets without re-parsing the TOC.
@@ -507,6 +555,7 @@ export class TrigramIndex {
       try { fs.closeSync(this.fd); } catch {}
       this.fd = undefined;
     }
+    this.clearPostingCache();
   }
 
   /** Wipe the in-memory index + disk cache and rebuild from scratch.
@@ -544,6 +593,7 @@ export class TrigramIndex {
       try { fs.closeSync(this.fd); } catch {}
       this.fd = undefined;
     }
+    this.clearPostingCache();
     this.tris.clear();
     this.fileMeta.clear();
     this.uriToId.clear();
@@ -579,6 +629,7 @@ export class TrigramIndex {
       try { fs.closeSync(this.fd); } catch {}
       this.fd = undefined;
     }
+    this.clearPostingCache();
     this.tris.clear();
     this.fileMeta.clear();
     this.uriToId.clear();
@@ -766,30 +817,19 @@ export class TrigramIndex {
     if (id !== undefined) { this.removeFileId(id); }
   }
 
-  /** Get the posting for `tri` as a mutable Set, converting the Uint32Array
-   *  / LazyPosting form on first write. Caller can then call .add/.delete
-   *  directly. Lazy postings get materialized via fd read. */
-  private mutablePosting(tri: string): Set<number> {
+  /** Promote to a mutable posting only when the file ID is actually new.
+   *  Unchanged trigrams on save can continue using compact disk-backed data. */
+  private addToPosting(tri: string, id: number): void {
     const existing = this.tris.get(tri);
-    if (existing instanceof Set) { return existing; }
-    if (existing instanceof Uint32Array) {
-      const s = new Set<number>();
-      for (let i = 0; i < existing.length; i++) { s.add(existing[i]); }
-      this.tris.set(tri, s);
-      return s;
+    if (existing instanceof Set) { existing.add(id); return; }
+    const resolved = this.resolvePosting(tri);
+    if (resolved instanceof Uint32Array && u32ArrayContains(resolved, id)) {
+      return;
     }
-    if (existing && (existing as LazyPosting).kind === 'lazy') {
-      const resolved = this.materializeLazy(tri, existing as LazyPosting);
-      if (resolved) {
-        const s = new Set<number>();
-        for (let i = 0; i < resolved.length; i++) { s.add(resolved[i]); }
-        this.tris.set(tri, s);
-        return s;
-      }
-    }
-    const fresh = new Set<number>();
+    const fresh = new Set<number>(resolved ?? []);
+    fresh.add(id);
+    this.dropCachedPosting(tri);
     this.tris.set(tri, fresh);
-    return fresh;
   }
 
   private removeFileId(id: number): void {
@@ -864,7 +904,7 @@ export class TrigramIndex {
       const uniq = extractTrigramsLower(text);
       this.fileMeta.set(id, { uri: uriStr, mtime: stat.mtime, size: stat.size });
       for (const tri of uniq) {
-        this.mutablePosting(tri).add(id);
+        this.addToPosting(tri, id);
       }
     } finally {
       if (preexistingId !== undefined) { this.stale.delete(preexistingId); }
@@ -973,6 +1013,7 @@ export class TrigramIndex {
     const tq: TrigramQuery = info.match;
     const source: PostingSource = {
       get: (tri: string) => this.resolvePosting(tri),
+      size: (tri: string) => this.postingSize(tri),
       allFiles: () => {
         const all = new Set<number>();
         for (const id of this.fileMeta.keys()) { all.add(id); }
@@ -1018,6 +1059,7 @@ export class TrigramIndex {
     const tq = qAnd(qList);
     const source: PostingSource = {
       get: (tri: string) => this.resolvePosting(tri),
+      size: (tri: string) => this.postingSize(tri),
       allFiles: () => {
         const all = new Set<number>();
         for (const id of this.fileMeta.keys()) { all.add(id); }
@@ -1041,29 +1083,4 @@ function escapeRegexSource(s: string): string {
 
 function getExt(fsPath: string): string {
   return getFileExtension(fsPath);
-}
-
-export function extractTrigramsLower(text: string): Set<string> {
-  // Lowercase in place via charCode for speed; this is an approximation that
-  // handles ASCII well and remains serviceable for BMP Unicode.
-  const out = new Set<string>();
-  const len = text.length;
-  if (len < 3) { return out; }
-  // Build a rolling lowercase view. For ASCII [A-Z] we shift by 32; for
-  // everything else we fall back to String#toLowerCase per character.
-  const buf: string[] = new Array(len);
-  for (let i = 0; i < len; i++) {
-    const c = text.charCodeAt(i);
-    if (c >= 0x41 && c <= 0x5a) {
-      buf[i] = String.fromCharCode(c + 32);
-    } else if (c < 0x80) {
-      buf[i] = text[i];
-    } else {
-      buf[i] = text[i].toLowerCase();
-    }
-  }
-  for (let i = 0; i <= len - 3; i++) {
-    out.add(buf[i] + buf[i + 1] + buf[i + 2]);
-  }
-  return out;
 }
