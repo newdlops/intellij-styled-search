@@ -808,11 +808,22 @@ const CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD = 200;
 const CALL_GRAPH_INCREMENTAL_MAX_DRAIN_ITERATIONS = 50;
 const CALL_GRAPH_MEMORY_PRESSURE_RETRY_MS = 30_000;
 // LSM overlay: a save writes a small delta overlay (graph-overlay-update, ~<1s)
-// instead of rewriting the base. After editing goes idle for this long, fold the
+// instead of rewriting the base. After editing goes idle for at least this long, fold the
 // overlay into the base (graph-compact, the heavy ~O(total) job) off the critical
 // path — this keeps the overlay small (queries merge base+overlay) and refreshes
 // the base-only artifacts (token-shape, usage counts) the overlay leaves stale.
 const CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS = 12_000;
+// Compaction costs about as much as a rebuild, so the idle wait before the next
+// one scales with the last measured compaction: at most ~1/20 of wall time goes
+// to compaction (a 3s fold waits a minute, a 14s fold about five), capped so
+// token-shape references and likely counts still converge within minutes.
+const CALL_GRAPH_OVERLAY_COMPACTION_COST_MULTIPLIER = 20;
+const CALL_GRAPH_OVERLAY_COMPACTION_MAX_IDLE_MS = 10 * 60_000;
+// An overlay this large folds after the base idle wait whatever it costs,
+// like the search index's size-based overlay compaction.
+const CALL_GRAPH_OVERLAY_COMPACTION_MAX_FILES = 64;
+const CALL_GRAPH_OVERLAY_COMPACTION_MAX_BYTES = 16 * 1024 * 1024;
+const CALL_GRAPH_LAST_COMPACTION_MS_STATE_KEY = 'intellijStyledSearch.callGraph.lastOverlayCompactionMs';
 const CALL_GRAPH_CACHE_SNAPSHOT_ITEMS_PER_CHUNK = 50_000;
 const CALL_GRAPH_SYMBOL_RELATION_BUCKETS = 256;
 const CALL_GRAPH_DOCUMENT_SUMMARY_BUCKETS = 256;
@@ -896,6 +907,11 @@ export class CallGraphService implements vscode.Disposable {
   private overlayDirty = false;
   private compactionTimer: ReturnType<typeof setTimeout> | undefined;
   private compactionPromise: Promise<void> | undefined;
+  // Files written to the overlay since the last compaction.
+  private readonly overlayChangedUris = new Set<string>();
+  // Duration of the last compaction that folded an overlay; persisted per
+  // workspace so a reload keeps pacing large workspaces. Read lazily.
+  private lastOverlayCompactionMs: number | undefined;
   private cacheWritePromise: Promise<void> = Promise.resolve();
   private rustGraphBuildPromise: Promise<string | undefined> | undefined;
   private cacheConfigSignature: string | undefined;
@@ -2671,8 +2687,8 @@ export class CallGraphService implements vscode.Disposable {
 
   // Arm (or keep) the idle timer that folds the overlay into the base. A fresh
   // edit clears it (armIncrementalFlush) so compaction only fires once editing
-  // has been quiet for CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS.
-  private armCompactionTimer(delayMs = CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS): void {
+  // has been quiet for compactionIdleDelayMs().
+  private armCompactionTimer(delayMs = this.compactionIdleDelayMs()): void {
     if (this.disposed || this.compactionTimer) { return; }
     if (!this.isWindowFocused()) { return; }
     this.compactionTimer = setTimeout(() => {
@@ -2680,6 +2696,38 @@ export class CallGraphService implements vscode.Disposable {
       void this.kickCompaction(true)
         .catch((err) => this.log.appendLine(`call graph overlay compaction failed: ${err instanceof Error ? err.message : err}`));
     }, delayMs);
+  }
+
+  private compactionIdleDelayMs(): number {
+    if (
+      this.overlayChangedUris.size >= CALL_GRAPH_OVERLAY_COMPACTION_MAX_FILES ||
+      this.overlayFileBytes() >= CALL_GRAPH_OVERLAY_COMPACTION_MAX_BYTES
+    ) {
+      return CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS;
+    }
+    if (this.lastOverlayCompactionMs === undefined) {
+      const stored = this.context.workspaceState?.get<number>(CALL_GRAPH_LAST_COMPACTION_MS_STATE_KEY);
+      this.lastOverlayCompactionMs = typeof stored === 'number' && Number.isFinite(stored) && stored > 0
+        ? stored
+        : 0;
+    }
+    return Math.min(
+      CALL_GRAPH_OVERLAY_COMPACTION_MAX_IDLE_MS,
+      Math.max(
+        CALL_GRAPH_OVERLAY_COMPACTION_IDLE_MS,
+        this.lastOverlayCompactionMs * CALL_GRAPH_OVERLAY_COMPACTION_COST_MULTIPLIER,
+      ),
+    );
+  }
+
+  private overlayFileBytes(): number {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceRoot) { return 0; }
+    try {
+      return fs.statSync(path.join(workspaceRoot, '.zoek-rs', 'callgraph-overlay.bin')).size;
+    } catch {
+      return 0;
+    }
   }
 
   // Single-flight compaction. Defers if an update/rebuild/restore is in flight or
@@ -2780,6 +2828,7 @@ export class CallGraphService implements vscode.Disposable {
     // A delta overlay was written (or a bootstrap full-update ran). Mark it so the
     // drain schedules an idle compaction to fold it into the base.
     this.overlayDirty = true;
+    for (const uri of uniqueUris) { this.overlayChangedUris.add(uri.toString()); }
     // Cross-file relation counts can change for documents that were not
     // themselves edited. Drop lazy document summaries so inlay requests for
     // already-open definition files read fresh counts from the native index.
@@ -2842,6 +2891,9 @@ export class CallGraphService implements vscode.Disposable {
       '--workers',
       String(getConfiguredCallGraphConcurrency(cfg)),
     ];
+    // A missing overlay (for example after a full rebuild) folds nothing, so its
+    // near-zero duration must not lower the measured compaction cost.
+    const overlayBytes = this.overlayFileBytes();
     const started = Date.now();
     this.log.appendLine('call graph overlay compaction start');
     let response: RustGraphIndexResponse;
@@ -2860,11 +2912,20 @@ export class CallGraphService implements vscode.Disposable {
       this.log.appendLine('call graph overlay compaction skipped: unexpected zoek-rs graph-compact response');
       return;
     }
+    const elapsedMs = Date.now() - started;
     this.overlayDirty = false;
+    this.overlayChangedUris.clear();
+    if (overlayBytes > 0) {
+      this.lastOverlayCompactionMs = elapsedMs;
+      void this.context.workspaceState?.update(CALL_GRAPH_LAST_COMPACTION_MS_STATE_KEY, elapsedMs);
+    }
     this.clearDocumentSummaryCache();
     this.invalidateRustSymbolQueryCache();
     this.onDidChangeSnapshotEmitter.fire();
-    this.log.appendLine(`call graph overlay compaction done: elapsed=${Date.now() - started}ms`);
+    this.log.appendLine(
+      `call graph overlay compaction done: elapsed=${elapsedMs}ms ` +
+      `nextIdleDelay=${this.compactionIdleDelayMs()}ms`,
+    );
   }
 
   private async updateRustNativeGraphIndex(

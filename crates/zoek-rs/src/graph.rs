@@ -247,7 +247,7 @@ const GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX: &str = "callgraph-symbols-compa
 // A2 v3 (memory floor) — S4: faithful per-file hierarchy-fact sidecar (one
 // record per extends/implements edge: file_id, relation, child_qualified_name,
 // parent_name) so the incremental update reconstructs the exact
-// `Vec<HierarchyFact>` resolve needs (`is_django_model_type`) WITHOUT scanning
+// `Vec<HierarchyFact>` resolve needs (`DjangoModelNames`) WITHOUT scanning
 // the full symbol table. Distinct from the lossy query sidecar
 // `callgraph-hierarchy-by-parent` (which drops the relation, is type-kind-only,
 // and is lookup-key-multiplied). Sharded by file like ref_sites.
@@ -262,6 +262,8 @@ const GRAPH_TOKEN_SHAPE_TARGET_COUNT_SHARD_PREFIX: &str =
     "callgraph-token-shape-target-count-by-key";
 const GRAPH_FILE_TABLE_NAME: &str = "callgraph-file-table.bin";
 const GRAPH_SHARD_COUNT: usize = 128;
+// Directory walkers used to discover rebuild sources (see discover_graph_source_files_with_progress).
+const GRAPH_DISCOVERY_THREADS: usize = 4;
 // Per-source-file scoped + MUST outgoing-target tally (overlay count deltas).
 // A distinct name prevents old two-counter rows being decoded as four counters.
 const GRAPH_OUTGOING_TALLY_BY_FILE_SHARD_PREFIX: &str = "callgraph-outgoing-tally-by-file-v2";
@@ -1266,15 +1268,113 @@ fn load_token_shape_tally(
     Ok((bare, member))
 }
 
+/// `load_token_shape_tally` restricted to `keys`: same per-key candidates in the
+/// same order, but other keys in the touched shards are skipped instead of
+/// decoded. A shard is a bincode `Vec<((u64, u64, u64), Vec<TokenShapeCandidate>)>`
+/// (fixed-width integers), so each entry is a 24-byte key followed by a length-
+/// prefixed run of fixed-size candidates and can be stepped over by length.
+#[allow(clippy::type_complexity)]
+fn load_token_shape_tally_for_keys(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    keys: &HashSet<(u64, u64, u64)>,
+) -> io::Result<(
+    HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
+    HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
+)> {
+    let mut bare: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>> = HashMap::default();
+    let mut member: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>> = HashMap::default();
+    let shards: HashSet<usize> = keys.iter().map(|key| token_shape_shard_for_key(*key)).collect();
+    for shard in 0..GRAPH_SHARD_COUNT {
+        if !shards.contains(&shard) {
+            continue;
+        }
+        let path =
+            graph_shard_path(workspace_root, config, GRAPH_TOKEN_SHAPE_SHARD_PREFIX, shard);
+        if !path.exists() {
+            continue;
+        }
+        let bytes = fs::read(&path)?;
+        if bytes.is_empty() {
+            continue;
+        }
+        for (key, candidates) in token_shape_entries_for_keys(&bytes, keys)? {
+            for c in candidates {
+                if c.access_kind_id() == ACCESS_KIND_MEMBER {
+                    member.entry(key).or_default().push(c);
+                } else if c.access_kind_id() == ACCESS_KIND_BARE {
+                    bare.entry(key).or_default().push(c);
+                }
+            }
+        }
+    }
+    Ok((bare, member))
+}
+
+/// The entries of one serialized token-shape shard whose key is in `keys`, in
+/// stored order.
+#[allow(clippy::type_complexity)]
+fn token_shape_entries_for_keys(
+    bytes: &[u8],
+    keys: &HashSet<(u64, u64, u64)>,
+) -> io::Result<Vec<((u64, u64, u64), Vec<TokenShapeCandidate>)>> {
+    let truncated = || invalid_data("token-shape shard truncated");
+    let word = |at: usize| -> io::Result<u64> {
+        bytes
+            .get(at..at + 8)
+            .map(|value| u64::from_le_bytes(value.try_into().unwrap()))
+            .ok_or_else(truncated)
+    };
+    let candidate_size = bincode::serialized_size(&TokenShapeCandidate {
+        source_ref_id: 0,
+        enclosing_id: 0,
+        file_id: 0,
+        start_line: 0,
+        start_column: 0,
+        end_line: 0,
+        end_column: 0,
+        edge_kind_id: 0,
+        access_kind_id: 0,
+    })
+    .map_err(|e| invalid_data(format!("token-shape candidate size: {e}")))? as usize;
+    let entry_count = word(0)?;
+    let mut cursor = 8usize;
+    let mut out = Vec::new();
+    for _ in 0..entry_count {
+        let key = (word(cursor)?, word(cursor + 8)?, word(cursor + 16)?);
+        let candidates_at = cursor + 24;
+        let candidate_count = usize::try_from(word(candidates_at)?).map_err(|_| truncated())?;
+        let end = candidate_count
+            .checked_mul(candidate_size)
+            .and_then(|len| len.checked_add(candidates_at + 8))
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(truncated)?;
+        if keys.contains(&key) {
+            let candidates: Vec<TokenShapeCandidate> =
+                bincode::deserialize(&bytes[candidates_at..end]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("token-shape de: {e}"))
+                })?;
+            out.push((key, candidates));
+        }
+        cursor = end;
+    }
+    Ok(out)
+}
+
 /// A multi-declaration member key is still a single semantic family when the
 /// queried declaration is the ancestor contract and every other eligible
 /// declaration is its method implementation. This preserves interface/base
 /// Find Usages without reopening unrelated same-name fanout.
+///
+/// `families` caches, per container id, the descendant types and every method
+/// they declare: all methods of one container share that family, so a query
+/// over many of them loads it once instead of once per method.
 fn token_shape_member_family_covers_key(
     workspace_root: &Path,
     config: &EngineConfig,
     symbol: &GraphSymbol,
     target_count: u32,
+    families: &mut HashMap<String, Option<MemberImplementationFamily>>,
 ) -> io::Result<bool> {
     if target_count <= 1 || symbol.kind != "method" {
         return Ok(target_count == 1);
@@ -1282,6 +1382,52 @@ fn token_shape_member_family_covers_key(
     let Some(container_id) = symbol.container_id.as_deref() else {
         return Ok(false);
     };
+    if !families.contains_key(container_id) {
+        let family = load_member_implementation_family(workspace_root, config, container_id)?;
+        families.insert(container_id.to_string(), family);
+    }
+    let Some(family) = families.get(container_id).and_then(Option::as_ref) else {
+        return Ok(false);
+    };
+    let target_scope = source_scope_key(&symbol.rel_path);
+    let mut related_ids: HashSet<String> = [symbol.id.clone()].into_iter().collect();
+    for candidate in family
+        .methods
+        .iter()
+        .filter(|candidate| is_method_of_containers(candidate, &symbol.name, &family.descendant_names))
+    {
+        if candidate.language == symbol.language
+            && source_scope_key(&candidate.rel_path) == target_scope
+            && candidate.name_hash == symbol.name_hash
+            && candidate
+                .container_id
+                .as_deref()
+                .is_some_and(|id| family.descendant_ids.contains(id))
+            && uses_member_token_shape_for_likely_count(candidate)
+        {
+            related_ids.insert(candidate.id.clone());
+        }
+    }
+    Ok(related_ids.len() as u64 == target_count as u64)
+}
+
+/// The types below one container and the methods they declare, as used by
+/// `token_shape_member_family_covers_key`.
+struct MemberImplementationFamily {
+    descendant_ids: HashSet<String>,
+    descendant_names: HashSet<String>,
+    /// Every symbol listed under the descendants in the method-container index,
+    /// before filtering by method name.
+    methods: Vec<GraphSymbol>,
+}
+
+/// `None` when the container is missing or has no descendant types, in which
+/// case no method of it covers a multi-target key.
+fn load_member_implementation_family(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    container_id: &str,
+) -> io::Result<Option<MemberImplementationFamily>> {
     let container_ids: HashSet<String> = [container_id.to_string()].into_iter().collect();
     let Some(container) = read_symbols_for_symbol_ids_indexed(
         workspace_root,
@@ -1291,34 +1437,23 @@ fn token_shape_member_family_covers_key(
     .into_iter()
     .find(|candidate| candidate.id == container_id)
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let (descendant_ids, descendant_names) =
         descendant_type_ids_and_names_indexed(workspace_root, config, &container)?;
     if descendant_ids.is_empty() || descendant_names.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
-    let target_scope = source_scope_key(&symbol.rel_path);
-    let mut related_ids: HashSet<String> = [symbol.id.clone()].into_iter().collect();
-    for candidate in read_methods_for_container_names_indexed(
+    let methods = read_method_candidates_for_container_names_indexed(
         workspace_root,
         config,
         &descendant_names,
-        &symbol.name,
-    )? {
-        if candidate.language == symbol.language
-            && source_scope_key(&candidate.rel_path) == target_scope
-            && candidate.name_hash == symbol.name_hash
-            && candidate
-                .container_id
-                .as_deref()
-                .is_some_and(|id| descendant_ids.contains(id))
-            && uses_member_token_shape_for_likely_count(&candidate)
-        {
-            related_ids.insert(candidate.id);
-        }
-    }
-    Ok(related_ids.len() as u64 == target_count as u64)
+    )?;
+    Ok(Some(MemberImplementationFamily {
+        descendant_ids,
+        descendant_names,
+        methods,
+    }))
 }
 
 /// Append the conservative occurrence set for the requested symbols from the
@@ -1339,18 +1474,18 @@ fn append_lazy_token_shape_references(
     if symbols.is_empty() {
         return Ok(());
     }
-    let shards: HashSet<usize> = symbols
+    let keys: HashSet<(u64, u64, u64)> = symbols
         .iter()
         .map(|symbol| {
-            let key = (
+            (
                 stable_hash(&symbol.language),
                 stable_hash(source_scope_key(&symbol.rel_path)),
                 symbol.name_hash,
-            );
-            token_shape_shard_for_key(key)
+            )
         })
         .collect();
-    let (bare, member) = load_token_shape_tally(workspace_root, config, Some(&shards))?;
+    let shards: HashSet<usize> = keys.iter().map(|key| token_shape_shard_for_key(*key)).collect();
+    let (bare, member) = load_token_shape_tally_for_keys(workspace_root, config, &keys)?;
     let mut target_counts =
         load_token_shape_target_counts(workspace_root, config, Some(&shards))?;
     let built_at_unix_ms =
@@ -1381,6 +1516,8 @@ fn append_lazy_token_shape_references(
     // suppressing lazy ones. Import/type/lexical rows are independent of this
     // cardinality and remain untouched.
     let mut assignable_targets: HashSet<&str> = HashSet::default();
+    let mut member_families: HashMap<String, Option<MemberImplementationFamily>> =
+        HashMap::default();
     for symbol in symbols {
         let key = (
             stable_hash(&symbol.language),
@@ -1394,6 +1531,7 @@ fn append_lazy_token_shape_references(
                 config,
                 symbol,
                 count.member,
+                &mut member_families,
             )?
         } else {
             count.bare == 1
@@ -1901,6 +2039,45 @@ fn read_all_symbols_from_id_shards(
             continue;
         }
         out.extend(read_symbols(&path, file_table)?);
+    }
+    Ok(out)
+}
+
+/// The symbols of one document, in the order `read_all_symbols_from_id_shards`
+/// yields them. Symbols are sharded by id, so every shard is scanned, but only
+/// records whose `uri` matches are decoded; shards are scanned in parallel and
+/// concatenated in shard order.
+fn read_symbols_for_uri_from_id_shards(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    file_table: &FileTable,
+    uri: &str,
+) -> io::Result<Vec<GraphSymbol>> {
+    use rayon::prelude::*;
+    let per_shard: Vec<io::Result<Vec<GraphSymbol>>> = (0..GRAPH_SHARD_COUNT)
+        .into_par_iter()
+        .map(|shard| {
+            let path =
+                graph_shard_path(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
+            if !path.exists() {
+                return Ok(Vec::new());
+            }
+            let bytes = fs::read(&path)?;
+            let mut symbols = Vec::new();
+            let mut cursor = 0;
+            while cursor < bytes.len() {
+                let (record_uri, end) = symbol_binary_uri_and_end(&bytes, cursor)?;
+                if record_uri == uri.as_bytes() {
+                    symbols.push(parse_symbol_binary(&bytes, &mut cursor, file_table)?);
+                }
+                cursor = end;
+            }
+            Ok(symbols)
+        })
+        .collect();
+    let mut out = Vec::new();
+    for symbols in per_shard {
+        out.extend(symbols?);
     }
     Ok(out)
 }
@@ -2563,87 +2740,25 @@ where
     F: FnMut(GraphRebuildProgress),
 {
     // Skip pre-count: sequential recursive walk of 100K+ files takes seconds.
-    // Progress shows running totals during the actual parallel walk instead.
-    let total = 0usize;
-    let mut top_level_dirs: Vec<PathBuf> = Vec::new();
-    let mut candidates: Vec<GraphSourceCandidate> = Vec::new();
-    for item in fs::read_dir(workspace_root)? {
-        let item = item?;
-        let path = item.path();
-        let metadata = item.metadata()?;
-        if metadata.is_dir() {
-            let file_name = item.file_name();
-            let name = file_name.to_string_lossy();
-            if path == config.index_root(workspace_root)
-                || config.is_extension_state_dir_name(&name)
-                || config.is_excluded_dir_name(&name)
-            {
-                continue;
-            }
-            top_level_dirs.push(path);
-            continue;
-        }
-        if !metadata.is_file() {
-            continue;
-        }
-        let rel_path = normalize_graph_rel_path(path.strip_prefix(workspace_root).unwrap_or(&path));
-        if config.is_excluded_normalized_relative_path(&rel_path)
-            || !is_graph_source_path(&rel_path)
-        {
-            continue;
-        }
-        if metadata.len() > config.max_file_size_bytes || config.is_binary_extension(&path) {
-            continue;
-        }
-        let modified_unix_secs = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .map(|value| value.as_secs())
-            .unwrap_or(0);
-        candidates.push(GraphSourceCandidate {
-            rel_path,
-            abs_path: path,
-            size_bytes: metadata.len(),
-            modified_unix_secs,
-        });
-    }
-    if !top_level_dirs.is_empty() {
-        let dir_results: Vec<Vec<GraphSourceCandidate>> =
-            std::thread::scope(|s| -> io::Result<Vec<Vec<GraphSourceCandidate>>> {
-                let mut handles = Vec::with_capacity(top_level_dirs.len());
-                for dir in &top_level_dirs {
-                    let dir_ref = dir.as_path();
-                    handles.push(s.spawn(move || -> io::Result<Vec<GraphSourceCandidate>> {
-                        let mut local_candidates: Vec<GraphSourceCandidate> = Vec::new();
-                        let mut local_visited = 0usize;
-                        let mut noop = |_: GraphRebuildProgress| {};
-                        walk_graph_source_dir(
-                            dir_ref,
-                            workspace_root,
-                            config,
-                            0,
-                            &mut local_visited,
-                            &mut local_candidates,
-                            &mut noop,
-                        )?;
-                        Ok(local_candidates)
-                    }));
-                }
-                let mut combined = Vec::with_capacity(top_level_dirs.len());
-                for h in handles {
-                    combined.push(h.join().expect("discover walk worker panicked")?);
-                }
-                Ok(combined)
-            })?;
-        for r in dir_results {
-            candidates.extend(r);
-        }
-    }
+    // Progress reports the discovered total once the parallel walk finishes.
+    let index_root = config.index_root(workspace_root);
+    // A few directory walkers already hide most readdir latency; more of them
+    // mostly contend in the kernel (on a 27K-file workspace, 64 walkers cut
+    // wall time by only 0.1s versus 4 but more than doubled system CPU).
+    let threads = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(GRAPH_DISCOVERY_THREADS);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    let mut candidates =
+        pool.install(|| walk_graph_source_dir(workspace_root, workspace_root, &index_root, config))?;
     progress(GraphRebuildProgress {
         stage: "discovering",
         current: candidates.len(),
-        total,
+        total: 0,
         message: "discovered graph source files".to_string(),
     });
     candidates.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
@@ -2673,67 +2788,60 @@ fn read_graph_source_candidate(
     }))
 }
 
-fn walk_graph_source_dir<F>(
+/// Collect graph source candidates under `dir`. Subdirectories fan out over the
+/// rayon pool so one large subtree cannot serialize discovery. Entries are
+/// classified by their directory-entry type, and only files whose name has a
+/// graph source extension are stat'ed for size and mtime: most entries in a
+/// workspace are neither directories to descend nor source files.
+fn walk_graph_source_dir(
     dir: &Path,
     workspace_root: &Path,
+    index_root: &Path,
     config: &EngineConfig,
-    total: usize,
-    visited: &mut usize,
-    candidates: &mut Vec<GraphSourceCandidate>,
-    progress: &mut F,
-) -> io::Result<()>
-where
-    F: FnMut(GraphRebuildProgress),
-{
+) -> io::Result<Vec<GraphSourceCandidate>> {
+    use rayon::prelude::*;
+    let mut candidates: Vec<GraphSourceCandidate> = Vec::new();
+    let mut subdirs: Vec<PathBuf> = Vec::new();
     for item in fs::read_dir(dir)? {
         let item = item?;
-        let path = item.path();
-        let metadata = item.metadata()?;
-        if metadata.is_dir() {
+        let file_type = item.file_type()?;
+        if file_type.is_dir() {
+            let path = item.path();
             let file_name = item.file_name();
             let name = file_name.to_string_lossy();
-            if path == config.index_root(workspace_root)
+            if path == index_root
                 || config.is_extension_state_dir_name(&name)
+                || is_version_control_metadata_dir_name(&name)
                 || config.is_excluded_dir_name(&name)
             {
                 continue;
             }
-            walk_graph_source_dir(
-                &path,
-                workspace_root,
-                config,
-                total,
-                visited,
-                candidates,
-                progress,
-            )?;
+            subdirs.push(path);
             continue;
         }
-        if !metadata.is_file() {
+        if !file_type.is_file() {
             continue;
         }
-
+        // The extension alone decides `is_graph_source_path`, so reject other
+        // files before building their relative path. A name containing `\` is
+        // re-split by path normalization; leave those to the full check.
+        let file_name = item.file_name();
+        let name = file_name.to_string_lossy();
+        if !name.contains('\\') && !is_graph_source_path(&name) {
+            continue;
+        }
+        let path = item.path();
         let rel_path = normalize_graph_rel_path(path.strip_prefix(workspace_root).unwrap_or(&path));
         if config.is_excluded_normalized_relative_path(&rel_path)
             || !is_graph_source_path(&rel_path)
+            || config.is_binary_extension(&path)
         {
             continue;
         }
-
-        *visited += 1;
-        if *visited == 1 || *visited % 128 == 0 || *visited == total {
-            progress(GraphRebuildProgress {
-                stage: "discovering",
-                current: *visited,
-                total,
-                message: "discovering graph source files".to_string(),
-            });
-        }
-
-        if metadata.len() > config.max_file_size_bytes || config.is_binary_extension(&path) {
+        let metadata = item.metadata()?;
+        if metadata.len() > config.max_file_size_bytes {
             continue;
         }
-
         let modified_unix_secs = metadata
             .modified()
             .ok()
@@ -2747,42 +2855,20 @@ where
             modified_unix_secs,
         });
     }
-    Ok(())
+    let nested: Vec<io::Result<Vec<GraphSourceCandidate>>> = subdirs
+        .par_iter()
+        .map(|subdir| walk_graph_source_dir(subdir, workspace_root, index_root, config))
+        .collect();
+    for subdir_candidates in nested {
+        candidates.extend(subdir_candidates?);
+    }
+    Ok(candidates)
 }
 
-fn count_graph_source_candidates(
-    dir: &Path,
-    workspace_root: &Path,
-    config: &EngineConfig,
-) -> io::Result<usize> {
-    let mut total = 0usize;
-    for item in fs::read_dir(dir)? {
-        let item = item?;
-        let path = item.path();
-        let metadata = item.metadata()?;
-        if metadata.is_dir() {
-            let file_name = item.file_name();
-            let name = file_name.to_string_lossy();
-            if path == config.index_root(workspace_root)
-                || config.is_extension_state_dir_name(&name)
-                || config.is_excluded_dir_name(&name)
-            {
-                continue;
-            }
-            total += count_graph_source_candidates(&path, workspace_root, config)?;
-            continue;
-        }
-        if metadata.is_file() {
-            let rel_path =
-                normalize_graph_rel_path(path.strip_prefix(workspace_root).unwrap_or(&path));
-            if !config.is_excluded_normalized_relative_path(&rel_path)
-                && is_graph_source_path(&rel_path)
-            {
-                total += 1;
-            }
-        }
-    }
-    Ok(total)
+/// Version-control metadata never holds project source; skipping it matches the
+/// search index, which excludes the same directories from its file listing.
+fn is_version_control_metadata_dir_name(name: &str) -> bool {
+    matches!(name, ".git" | ".hg" | ".svn" | ".jj")
 }
 
 /// Drop each `foo.pyi` type stub whose `foo.py` implementation is also present.
@@ -3991,6 +4077,10 @@ where
     // W23: write_store skipped the overlapped ref_site shards; fold their byte
     // count back in so the reported total matches the non-overlapped path.
     summary.bytes += overlap_ref_site_bytes;
+    // The new base reflects every file on disk, so an edit overlay written
+    // against the previous base is superseded; drop it rather than keep a file
+    // that queries would only reject.
+    let _ = crate::graph_overlay::GraphOverlay::clear(workspace_root, config);
     let indexing_ms = indexing_started.elapsed().as_millis();
     let total_ms = started.elapsed().as_millis();
     dump_parse_profile_if_enabled();
@@ -4226,7 +4316,7 @@ pub fn update_graph_native(
     // A2 v3 — S3/S6 (memory floor): reconstruct the current `Vec<HierarchyFact>`
     // from the faithful per-file sidecar (prior facts minus changed/deleted files
     // + freshly parsed changed files' facts) instead of scanning the full symbol
-    // table. `is_django_model_type` (resolve's only hierarchy consumer) computes an
+    // table. `DjangoModelNames` (resolve's only hierarchy consumer) computes an
     // order-independent closure, so shard/file order is fine. The sidecar is
     // guaranteed present by the `sidecars_ready` gate (else a full rebuild ran).
     let hierarchy_facts = {
@@ -5723,9 +5813,9 @@ pub fn query_graph_document_symbols_with_options(
             s.uri == uri && s.start_line <= end && s.end_line >= start
         })?
     } else {
-        read_all_symbols_from_id_shards(workspace_root, config, &file_table)?
+        read_symbols_for_uri_from_id_shards(workspace_root, config, &file_table, uri)?
             .into_iter()
-            .filter(|s| s.uri == uri && s.start_line <= end && s.end_line >= start)
+            .filter(|s| s.start_line <= end && s.end_line >= start)
             .collect()
     };
     merge_overlay_symbols(
@@ -8958,6 +9048,7 @@ fn resolve_ref_sites_a_to_e<'a>(
     let type_facts_by_file_local = type_facts_by_file_local(type_facts);
     let function_return_facts_by_file_name =
         function_return_facts_by_file_name(function_return_facts);
+    let django_model_names = DjangoModelNames::new(hierarchy_facts);
     // W12-Stage 3: 2-level views of (rel_path, name)-keyed maps. Phase E
     // bucket loop / prefilter per-worker file cache look the outer key up
     // once per file, then probe small inner maps by name only — eliminates
@@ -9625,7 +9716,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                                 &type_facts_by_file_local,
                                 &symbols_by_file_and_name,
                                 &function_return_facts_by_file_name,
-                                hierarchy_facts,
+                                &django_model_names,
                             );
                             receiver_resolution_to_cols(&res)
                         });
@@ -9698,7 +9789,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                                 &type_facts_by_file_local,
                                 &symbols_by_file_and_name,
                                 &function_return_facts_by_file_name,
-                                hierarchy_facts,
+                                &django_model_names,
                             )
                         });
                         expand_receiver_for_name(
@@ -10316,7 +10407,7 @@ fn combined_member_candidates<'a>(
     import_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a ImportFact>>,
     type_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a TypeFact>>,
     function_return_facts_by_file_name: &HashMap<(&'a str, &'a str), Vec<&'a FunctionReturnFact>>,
-    hierarchy_facts: &[HierarchyFact],
+    django_model_names: &DjangoModelNames<'_>,
     fallback: &mut Vec<&'a GraphSymbol>,
     exact: &mut Vec<MemberExactCandidate<'a>>,
 ) {
@@ -10340,7 +10431,7 @@ fn combined_member_candidates<'a>(
         import_facts_by_file_local,
         type_facts_by_file_local,
         function_return_facts_by_file_name,
-        hierarchy_facts,
+        django_model_names,
         fallback,
         exact,
     );
@@ -10363,7 +10454,7 @@ fn combined_member_candidates_by_key<'a>(
     import_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a ImportFact>>,
     type_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a TypeFact>>,
     function_return_facts_by_file_name: &HashMap<(&'a str, &'a str), Vec<&'a FunctionReturnFact>>,
-    hierarchy_facts: &[HierarchyFact],
+    django_model_names: &DjangoModelNames<'_>,
     fallback: &mut Vec<&'a GraphSymbol>,
     exact: &mut Vec<MemberExactCandidate<'a>>,
 ) {
@@ -10510,7 +10601,7 @@ fn combined_member_candidates_by_key<'a>(
                 import_targets,
                 import_facts_by_file_local,
                 function_return_facts_by_file_name,
-                hierarchy_facts,
+                django_model_names,
             );
             for target_type in targets {
                 extend_members_for_type(
@@ -10720,7 +10811,7 @@ fn compute_receiver_resolution<'a>(
     type_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a TypeFact>>,
     symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
     function_return_facts_by_file_name: &HashMap<(&'a str, &'a str), Vec<&'a FunctionReturnFact>>,
-    hierarchy_facts: &[HierarchyFact],
+    django_model_names: &DjangoModelNames<'_>,
 ) -> ReceiverResolution<'a> {
     let mut type_targets: Vec<TypeTarget<'a>> = Vec::new();
     let mut import_facts_out: Vec<&'a ImportFact> = Vec::new();
@@ -10795,7 +10886,7 @@ fn compute_receiver_resolution<'a>(
                 import_targets,
                 import_facts_by_file_local,
                 function_return_facts_by_file_name,
-                hierarchy_facts,
+                django_model_names,
             );
             for t in targets {
                 type_targets.push(TypeTarget { sym: t, provenance: "type-fact" });
@@ -10917,7 +11008,7 @@ fn resolve_type_fact_targets_by_key<'a>(
     import_targets: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
     import_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a ImportFact>>,
     function_return_facts_by_file_name: &HashMap<(&'a str, &'a str), Vec<&'a FunctionReturnFact>>,
-    hierarchy_facts: &[HierarchyFact],
+    django_model_names: &DjangoModelNames<'_>,
 ) -> Vec<&'a GraphSymbol> {
     if let Some(model_name) = fact
         .type_name
@@ -10934,7 +11025,7 @@ fn resolve_type_fact_targets_by_key<'a>(
             import_facts_by_file_local,
         )
         .into_iter()
-        .filter(|symbol| is_django_model_type(symbol, hierarchy_facts))
+        .filter(|symbol| django_model_names.contains(symbol))
         .collect();
         sort_dedup_symbols(&mut out);
         return out;
@@ -11124,7 +11215,7 @@ fn resolve_type_fact_targets<'a>(
     import_targets: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
     import_facts_by_file_local: &HashMap<(&'a str, &'a str), Vec<&'a ImportFact>>,
     function_return_facts_by_file_name: &HashMap<(&'a str, &'a str), Vec<&'a FunctionReturnFact>>,
-    hierarchy_facts: &[HierarchyFact],
+    django_model_names: &DjangoModelNames<'_>,
 ) -> Vec<&'a GraphSymbol> {
     if let Some(model_name) = fact
         .type_name
@@ -11141,7 +11232,7 @@ fn resolve_type_fact_targets<'a>(
             import_facts_by_file_local,
         )
         .into_iter()
-        .filter(|symbol| is_django_model_type(symbol, hierarchy_facts))
+        .filter(|symbol| django_model_names.contains(symbol))
         .collect();
         sort_dedup_symbols(&mut out);
         return out;
@@ -11224,6 +11315,67 @@ fn resolve_type_name_targets<'a>(
     )
 }
 
+/// Names from which an `extends` chain reaches a Django model base, matched the
+/// way the ancestor walk matches them: a fact applies to its child's qualified
+/// name and to that name's dotted tail, and makes its parent's name and tail
+/// known. Built once per resolve, so each model check is two set probes instead
+/// of a fixpoint rescan of every hierarchy fact for every candidate symbol.
+struct DjangoModelNames<'a> {
+    reaching: HashSet<&'a str>,
+}
+
+impl<'a> DjangoModelNames<'a> {
+    fn new(hierarchy_facts: &'a [HierarchyFact]) -> Self {
+        let extends = || hierarchy_facts.iter().filter(|fact| fact.relation == "extends");
+        let mut facts_by_parent_name: HashMap<&'a str, Vec<&'a HierarchyFact>> = HashMap::default();
+        for fact in extends() {
+            let parent = fact.parent_name.as_str();
+            facts_by_parent_name.entry(parent).or_default().push(fact);
+            let tail = type_tail(parent);
+            if tail != parent {
+                facts_by_parent_name.entry(tail).or_default().push(fact);
+            }
+        }
+        // Propagate backwards from facts whose parent is a model base: any name
+        // that applies such a fact reaches a model, and so does any name that
+        // applies a fact producing an already-reaching name.
+        fn mark<'a>(
+            fact: &'a HierarchyFact,
+            reaching: &mut HashSet<&'a str>,
+            pending: &mut Vec<&'a str>,
+        ) {
+            let child = fact.child_qualified_name.as_str();
+            for name in [child, type_tail(child)] {
+                if reaching.insert(name) {
+                    pending.push(name);
+                }
+            }
+        }
+        let mut reaching: HashSet<&'a str> = HashSet::default();
+        let mut pending: Vec<&'a str> = Vec::new();
+        for fact in extends().filter(|fact| is_django_model_parent_name(&fact.parent_name)) {
+            mark(fact, &mut reaching, &mut pending);
+        }
+        while let Some(name) = pending.pop() {
+            for fact in facts_by_parent_name.get(name).into_iter().flatten() {
+                mark(fact, &mut reaching, &mut pending);
+            }
+        }
+        Self { reaching }
+    }
+
+    fn contains(&self, symbol: &GraphSymbol) -> bool {
+        symbol
+            .extends_names
+            .iter()
+            .any(|name| is_django_model_parent_name(name))
+            || self.reaching.contains(symbol.qualified_name.as_str())
+            || self.reaching.contains(symbol.name.as_str())
+    }
+}
+
+/// Reference ancestor walk that `DjangoModelNames` precomputes.
+#[cfg(test)]
 fn is_django_model_type(symbol: &GraphSymbol, hierarchy_facts: &[HierarchyFact]) -> bool {
     if symbol
         .extends_names
@@ -12087,39 +12239,62 @@ fn build_and_write_outgoing_tally(workspace_root: &Path, config: &EngineConfig) 
             .or_insert_with(|| source_scope_key(&c.rel_path).into());
     }
     drop(compact);
-    // Accumulate per (source rel_path → target → (usage, calls)) by streaming the
-    // by-target reference shards one at a time (never holds the full ref set).
-    let mut tally: HashMap<String, AHashMap<u64, [u32; 4]>> = HashMap::default();
-    for shard in 0..GRAPH_SHARD_COUNT {
-        let path = graph_shard_path(
-            workspace_root,
-            config,
-            GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
-            shard,
-        );
-        if !path.exists() {
-            continue;
-        }
-        let refs = read_binary_references_matching(&path, &file_table, |r| {
-            r.provenance.as_ref() != "token-shape"
-        })?;
-        for r in &refs {
-            let Some(t) = r
-                .target_symbol_id
-                .as_deref()
-                .and_then(parse_stable_symbol_id_to_u64)
-            else {
-                continue;
-            };
-            let same_scope = scope_by_target
-                .get(&t)
-                .is_some_and(|root| source_scope_key(&r.rel_path) == &**root);
-            let entry = tally
-                .entry(r.rel_path.to_string())
-                .or_default()
-                .entry(t)
-                .or_default();
-            add_outgoing_usage_contribution(entry, r, same_scope);
+    // Accumulate per (source rel_path → target → (usage, calls)) from the
+    // by-target reference shards. Shards are decoded in parallel, each into its
+    // own partial tally that is dropped with its shard's references, so only one
+    // shard per worker is resident; the counters are sums, so merging the
+    // partials in any order gives the sequential totals.
+    type OutgoingTally = HashMap<String, AHashMap<u64, [u32; 4]>>;
+    let partials: Vec<io::Result<OutgoingTally>> = {
+        use rayon::prelude::*;
+        (0..GRAPH_SHARD_COUNT)
+            .into_par_iter()
+            .map(|shard| -> io::Result<OutgoingTally> {
+                let mut partial = OutgoingTally::default();
+                let path = graph_shard_path(
+                    workspace_root,
+                    config,
+                    GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
+                    shard,
+                );
+                if !path.exists() {
+                    return Ok(partial);
+                }
+                let refs = read_binary_references_matching(&path, &file_table, |r| {
+                    r.provenance.as_ref() != "token-shape"
+                })?;
+                for r in &refs {
+                    let Some(t) = r
+                        .target_symbol_id
+                        .as_deref()
+                        .and_then(parse_stable_symbol_id_to_u64)
+                    else {
+                        continue;
+                    };
+                    let same_scope = scope_by_target
+                        .get(&t)
+                        .is_some_and(|root| source_scope_key(&r.rel_path) == &**root);
+                    let entry = partial
+                        .entry(r.rel_path.to_string())
+                        .or_default()
+                        .entry(t)
+                        .or_default();
+                    add_outgoing_usage_contribution(entry, r, same_scope);
+                }
+                Ok(partial)
+            })
+            .collect()
+    };
+    let mut tally = OutgoingTally::default();
+    for partial in partials {
+        for (rel_path, targets) in partial? {
+            let merged = tally.entry(rel_path).or_default();
+            for (target, contribution) in targets {
+                let counts = merged.entry(target).or_default();
+                for (count, add) in counts.iter_mut().zip(contribution) {
+                    *count = count.saturating_add(add);
+                }
+            }
         }
     }
     // Write sharded by source rel_path. Per record: u32 path_len, path bytes,
@@ -12773,11 +12948,27 @@ fn clear_graph_shard_families(layout_root: &Path) -> io::Result<()> {
         let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
             continue;
         };
-        if is_graph_shard_file_name(name) {
+        if is_graph_shard_file_name(name) || is_retired_graph_file_name(name) {
             fs::remove_file(path)?;
         }
     }
     Ok(())
+}
+
+/// Graph files that no current reader opens: relation/symbol chunks of the
+/// pre-shard format, outgoing-tally shards superseded by the `-v2` family, and
+/// shard temp files left by an interrupted writer (a full rebuild holds the
+/// graph lock, so no live writer owns one). Nothing else ever deletes them, so
+/// a rebuild removes them instead of letting them outlive their format.
+fn is_retired_graph_file_name(name: &str) -> bool {
+    if !name.starts_with("callgraph-") {
+        return false;
+    }
+    let superseded_tally = name
+        .strip_prefix("callgraph-outgoing-tally-by-file-")
+        .and_then(|rest| rest.strip_suffix(".tsv"))
+        .is_some_and(|shard| shard.len() == 3 && shard.bytes().all(|byte| byte.is_ascii_digit()));
+    superseded_tally || name.ends_with(".ijg") || name.ends_with(".ijgs") || name.ends_with(".tsv.tmp")
 }
 
 fn is_graph_shard_file_name(name: &str) -> bool {
@@ -15650,7 +15841,7 @@ fn serialize_symbol_hierarchy_facts(symbol: &GraphSymbol, file_id: u32, out: &mu
 /// `file_id` is in `exclude_file_ids` (a changed/deleted file in an incremental
 /// update). Reads every shard; no `FileTable` needed (child/parent/relation are
 /// stored inline). Order is shard/file order, not symbol order — fine, since the
-/// only consumer (`is_django_model_type`) computes an order-independent closure.
+/// only consumer (`DjangoModelNames`) computes an order-independent closure.
 #[allow(dead_code)] // wired into the incremental resolve path in S3.
 fn load_hierarchy_facts_from_sidecar(
     workspace_root: &Path,
@@ -15738,6 +15929,62 @@ fn serialize_symbol_binary(symbol: &GraphSymbol, file_id: u32, out: &mut Vec<u8>
     write_opt_u64(out, symbol.implementation_count);
     write_opt_u64(out, symbol.implementation_must_count);
     write_opt_u64(out, symbol.implementation_may_count);
+}
+
+/// The `uri` field and end offset of the binary symbol record at `start`. Walks
+/// the layout `parse_symbol_binary` reads without decoding any string, so scans
+/// that select records by file can skip every other record cheaply.
+fn symbol_binary_uri_and_end(bytes: &[u8], start: usize) -> io::Result<(&[u8], usize)> {
+    fn take<'b>(bytes: &'b [u8], cursor: &mut usize, len: usize) -> io::Result<&'b [u8]> {
+        let slice = bytes
+            .get(*cursor..*cursor + len)
+            .ok_or_else(|| invalid_data("symbol record truncated"))?;
+        *cursor += len;
+        Ok(slice)
+    }
+    fn u16_str<'b>(bytes: &'b [u8], cursor: &mut usize) -> io::Result<&'b [u8]> {
+        let len = take(bytes, cursor, 2)?;
+        let len = u16::from_le_bytes([len[0], len[1]]) as usize;
+        take(bytes, cursor, len)
+    }
+    fn byte(bytes: &[u8], cursor: &mut usize) -> io::Result<u8> {
+        Ok(take(bytes, cursor, 1)?[0])
+    }
+    let mut cursor = start;
+    let id = take(bytes, &mut cursor, 8)?;
+    if id == u64::MAX.to_le_bytes() {
+        u16_str(bytes, &mut cursor)?;
+    }
+    u16_str(bytes, &mut cursor)?; // name
+    u16_str(bytes, &mut cursor)?; // qualified_name
+    if kind_str_from_id(byte(bytes, &mut cursor)?).is_none() {
+        u16_str(bytes, &mut cursor)?;
+    }
+    if language_str_from_id(u16::from(byte(bytes, &mut cursor)?)).is_none() {
+        u16_str(bytes, &mut cursor)?;
+    }
+    let uri = u16_str(bytes, &mut cursor)?;
+    take(bytes, &mut cursor, 4 * 9)?; // file_id + eight position fields
+    for _ in 0..3 {
+        // container_id, container_name, package_name
+        if byte(bytes, &mut cursor)? == 1 {
+            u16_str(bytes, &mut cursor)?;
+        }
+    }
+    for _ in 0..2 {
+        // extends_names, implements_names
+        let count = take(bytes, &mut cursor, 2)?;
+        for _ in 0..u16::from_le_bytes([count[0], count[1]]) {
+            u16_str(bytes, &mut cursor)?;
+        }
+    }
+    for _ in 0..6 {
+        // usage and implementation counts
+        if byte(bytes, &mut cursor)? == 1 {
+            take(bytes, &mut cursor, 8)?;
+        }
+    }
+    Ok((uri, cursor))
 }
 
 fn parse_symbol_binary(
@@ -16098,6 +16345,74 @@ fn parse_ref_site_binary(
         access_kind_id,
         edge_kind_id,
     })
+}
+
+/// How a binary reference record stores its target, as read by
+/// `reference_binary_target_and_end`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReferenceTargetField<'a> {
+    None,
+    /// A standard `sym:HEX16` id stored as its integer value.
+    Id(u64),
+    /// Any other id, stored as a string.
+    Inline(&'a [u8]),
+}
+
+/// The target field and end offset of the binary reference record at `start`.
+/// Walks the layout `parse_reference_binary` reads without decoding strings, so
+/// scans that select references by target skip the rest cheaply.
+fn reference_binary_target_and_end(
+    bytes: &[u8],
+    start: usize,
+) -> io::Result<(ReferenceTargetField<'_>, usize)> {
+    fn take<'b>(bytes: &'b [u8], cursor: &mut usize, len: usize) -> io::Result<&'b [u8]> {
+        let slice = bytes
+            .get(*cursor..*cursor + len)
+            .ok_or_else(|| invalid_data("reference record truncated"))?;
+        *cursor += len;
+        Ok(slice)
+    }
+    fn u16_str<'b>(bytes: &'b [u8], cursor: &mut usize) -> io::Result<&'b [u8]> {
+        let len = take(bytes, cursor, 2)?;
+        let len = u16::from_le_bytes([len[0], len[1]]) as usize;
+        take(bytes, cursor, len)
+    }
+    fn byte(bytes: &[u8], cursor: &mut usize) -> io::Result<u8> {
+        Ok(take(bytes, cursor, 1)?[0])
+    }
+    fn optional_id<'b>(bytes: &'b [u8], cursor: &mut usize) -> io::Result<ReferenceTargetField<'b>> {
+        match byte(bytes, cursor)? {
+            0 => Ok(ReferenceTargetField::None),
+            1 => {
+                let value = take(bytes, cursor, 8)?;
+                Ok(ReferenceTargetField::Id(u64::from_le_bytes(value.try_into().unwrap())))
+            }
+            2 => Ok(ReferenceTargetField::Inline(u16_str(bytes, cursor)?)),
+            other => Err(invalid_data(format!("reference invalid id marker {other}"))),
+        }
+    }
+    let mut cursor = start;
+    if take(bytes, &mut cursor, 8)? == u64::MAX.to_le_bytes() {
+        u16_str(bytes, &mut cursor)?; // inline source_ref_id
+    }
+    let target = optional_id(bytes, &mut cursor)?;
+    if edge_kind_str_from_id(byte(bytes, &mut cursor)?).is_none() {
+        u16_str(bytes, &mut cursor)?;
+    }
+    u16_str(bytes, &mut cursor)?; // name
+    if byte(bytes, &mut cursor)? != 0 {
+        u16_str(bytes, &mut cursor)?; // raw_text differing from name
+    }
+    take(bytes, &mut cursor, 4 * 5)?; // file_id + four position fields
+    optional_id(bytes, &mut cursor)?; // enclosing_symbol_id
+    byte(bytes, &mut cursor)?; // bound_mask
+    if confidence_str_from_id(byte(bytes, &mut cursor)?).is_none() {
+        u16_str(bytes, &mut cursor)?;
+    }
+    if provenance_str_from_id(byte(bytes, &mut cursor)?).is_none() {
+        u16_str(bytes, &mut cursor)?;
+    }
+    Ok((target, cursor))
 }
 
 fn parse_reference_binary(
@@ -16659,9 +16974,38 @@ fn read_symbols_for_symbol_ids_indexed(
                 |s| symbol_ids.contains(&s.id),
             );
         }
-        symbols.extend(read_symbols_matching(&shard_path, &file_table, |s| {
-            shard_symbol_ids.contains(&s.id)
-        })?);
+        symbols.extend(read_symbols_with_ids(&shard_path, &file_table, &shard_symbol_ids)?);
+    }
+    Ok(symbols)
+}
+
+/// `read_symbols_matching(path, |s| ids.contains(&s.id))` without decoding the
+/// other records. A record starts with its id as an integer (or the sentinel
+/// for an inline string id), so records for other ids are stepped over.
+fn read_symbols_with_ids(
+    path: &Path,
+    file_table: &FileTable,
+    ids: &HashSet<String>,
+) -> io::Result<Vec<GraphSymbol>> {
+    // An integer id reads back as `sym:{:016x}`; only ids in that exact form
+    // can match one.
+    let id_values: HashSet<u64> = ids
+        .iter()
+        .filter_map(|id| parse_stable_symbol_id_to_u64(id).filter(|value| format!("sym:{value:016x}") == *id))
+        .collect();
+    let bytes = fs::read(path)?;
+    let mut symbols = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let (_, end) = symbol_binary_uri_and_end(&bytes, cursor)?;
+        let leading = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        if leading == u64::MAX || id_values.contains(&leading) {
+            let symbol = parse_symbol_binary(&bytes, &mut cursor, file_table)?;
+            if ids.contains(&symbol.id) {
+                symbols.push(symbol);
+            }
+        }
+        cursor = end;
     }
     Ok(symbols)
 }
@@ -16671,6 +17015,35 @@ fn read_methods_for_container_names_indexed(
     config: &EngineConfig,
     container_names: &HashSet<String>,
     method_name: &str,
+) -> io::Result<Vec<GraphSymbol>> {
+    Ok(read_method_candidates_for_container_names_indexed(workspace_root, config, container_names)?
+        .into_iter()
+        .filter(|s| is_method_of_containers(s, method_name, container_names))
+        .collect())
+}
+
+/// Whether `symbol` is a method named `method_name` declared on one of
+/// `container_names` (matched by container name or its dotted tail).
+fn is_method_of_containers(
+    symbol: &GraphSymbol,
+    method_name: &str,
+    container_names: &HashSet<String>,
+) -> bool {
+    if symbol.name != method_name || symbol.kind != "method" {
+        return false;
+    }
+    match symbol.container_name.as_deref() {
+        Some(cn) => container_names.contains(cn) || container_names.contains(type_tail(cn)),
+        None => false,
+    }
+}
+
+/// Every symbol the method-container index lists under `container_names`, in
+/// id-shard order, not yet filtered by method name.
+fn read_method_candidates_for_container_names_indexed(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    container_names: &HashSet<String>,
 ) -> io::Result<Vec<GraphSymbol>> {
     if container_names.is_empty() {
         return Ok(Vec::new());
@@ -16714,19 +17087,7 @@ fn read_methods_for_container_names_indexed(
     if candidate_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let all = read_symbols_for_symbol_ids_indexed(workspace_root, config, &candidate_ids)?;
-    Ok(all
-        .into_iter()
-        .filter(|s| {
-            if s.name != method_name || s.kind != "method" {
-                return false;
-            }
-            match s.container_name.as_deref() {
-                Some(cn) => container_names.contains(cn) || container_names.contains(type_tail(cn)),
-                None => false,
-            }
-        })
-        .collect())
+    read_symbols_for_symbol_ids_indexed(workspace_root, config, &candidate_ids)
 }
 
 fn read_hierarchy_children_for_parent_keys_indexed(
@@ -17465,12 +17826,37 @@ fn deduped_reference_counts_for_symbol_ids_indexed(
                 continue;
             }
             let shard_set: HashSet<String> = shard_ids.into_iter().collect();
-            references.extend(read_binary_references_matching(&path, &file_table, |r| {
+            // A target stored as an integer reads back as `sym:{:016x}`, so it
+            // matches exactly the requested ids that round-trip to that form.
+            let shard_id_values: HashSet<u64> = shard_set
+                .iter()
+                .filter_map(|id| {
+                    parse_stable_symbol_id_to_u64(id).filter(|value| format!("sym:{value:016x}") == *id)
+                })
+                .collect();
+            let matches = |r: &GraphReference| {
                 r.target_symbol_id
                     .as_deref()
                     .map(|target| shard_set.contains(&target.to_ascii_lowercase()))
                     .unwrap_or(false)
-            })?);
+            };
+            let bytes = fs::read(&path)?;
+            let mut cursor = 0;
+            while cursor < bytes.len() {
+                let (target, end) = reference_binary_target_and_end(&bytes, cursor)?;
+                let candidate = match target {
+                    ReferenceTargetField::None => false,
+                    ReferenceTargetField::Id(value) => shard_id_values.contains(&value),
+                    ReferenceTargetField::Inline(_) => true,
+                };
+                if candidate {
+                    let reference = parse_reference_binary(&bytes, &mut cursor, &file_table)?;
+                    if matches(&reference) {
+                        references.push(reference);
+                    }
+                }
+                cursor = end;
+            }
         }
     } else {
         let relation_path = graph_index_path(workspace_root, config);
@@ -19733,6 +20119,531 @@ mod tests {
             read_family(GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX, 3),
             read_family(GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX, 4),
         )
+    }
+
+    #[test]
+    fn django_model_names_match_ancestor_walk() {
+        // Qualified names, bare tails, and the three recognized model bases, so
+        // chains cross between qualified and tail matching in both directions.
+        let pool = [
+            "Model",
+            "models.Model",
+            "django.db.models.Model",
+            "Base",
+            "pkg.Base",
+            "pkg.mod.Base",
+            "Mixin",
+            "pkg.Mixin",
+            "Entity",
+            "other.Entity",
+            "Node",
+            "pkg.mod.Node",
+            "",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |bound: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let symbol = |name: &str, qualified_name: &str, extends: Vec<String>| GraphSymbol {
+            id: String::new(),
+            name: name.to_string(),
+            qualified_name: qualified_name.to_string(),
+            kind: "class".to_string(),
+            language: "python".to_string(),
+            uri: String::new(),
+            rel_path: String::new(),
+            start_line: 0,
+            start_column: 0,
+            end_line: 0,
+            end_column: 0,
+            body_start_line: 0,
+            body_start_column: 0,
+            body_end_line: 0,
+            body_end_column: 0,
+            container_id: None,
+            container_name: None,
+            package_name: None,
+            extends_names: extends,
+            implements_names: Vec::new(),
+            usage_count: None,
+            usage_must_count: None,
+            usage_may_count: None,
+            implementation_count: None,
+            implementation_must_count: None,
+            implementation_may_count: None,
+            kind_flags: 0,
+            language_id: 0,
+            id_u64: 0,
+            rel_path_hash: 0,
+            name_hash: 0,
+        };
+        let mut compared = 0usize;
+        for _ in 0..3_000 {
+            let facts: Vec<HierarchyFact> = (0..next(24))
+                .map(|_| HierarchyFact {
+                    child_qualified_name: pool[next(pool.len())].to_string(),
+                    parent_name: pool[next(pool.len())].to_string(),
+                    relation: if next(5) == 0 { "implements" } else { "extends" }.to_string(),
+                })
+                .collect();
+            let names = DjangoModelNames::new(&facts);
+            for _ in 0..8 {
+                let qualified_name = pool[next(pool.len())];
+                let name = type_tail(pool[next(pool.len())]);
+                let extends = (0..next(3)).map(|_| pool[next(pool.len())].to_string()).collect();
+                let candidate = symbol(name, qualified_name, extends);
+                assert_eq!(
+                    names.contains(&candidate),
+                    is_django_model_type(&candidate, &facts),
+                    "symbol {name}/{qualified_name} extends {:?} facts {:?}",
+                    candidate.extends_names,
+                    facts
+                        .iter()
+                        .map(|f| format!("{}:{}->{}", f.relation, f.child_qualified_name, f.parent_name))
+                        .collect::<Vec<_>>()
+                );
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 24_000);
+    }
+
+    #[test]
+    fn symbol_binary_walker_matches_parser_layout() {
+        let mut file_table = FileTable::default();
+        let file_id = file_table.intern("pkg/mod.py");
+        let variant = |i: usize| {
+            let text = |label: &str| format!("{label}{}", "x".repeat(i % 5));
+            GraphSymbol {
+                // Every fourth id is non-standard, which is stored inline.
+                id: if i % 4 == 0 { format!("custom-{i}") } else { format!("sym:{:016x}", i as u64 * 7919) },
+                name: text("name"),
+                qualified_name: text("pkg.mod.name"),
+                // Unknown kinds and languages are stored inline too.
+                kind: if i % 3 == 0 { text("custom-kind") } else { "class".to_string() },
+                language: if i % 5 == 0 { text("custom-lang") } else { "python".to_string() },
+                uri: format!("file:///workspace/pkg/mod{}.py", i % 3),
+                rel_path: "pkg/mod.py".to_string(),
+                start_line: i as u32,
+                start_column: 1,
+                end_line: i as u32 + 3,
+                end_column: 2,
+                body_start_line: i as u32,
+                body_start_column: 3,
+                body_end_line: i as u32 + 3,
+                body_end_column: 4,
+                container_id: (i % 2 == 0).then(|| text("sym:container")),
+                container_name: (i % 3 == 1).then(|| text("Container")),
+                package_name: (i % 4 == 1).then(|| text("pkg")),
+                extends_names: (0..i % 3).map(|n| format!("Base{n}")).collect(),
+                implements_names: (0..i % 2).map(|n| format!("Iface{n}")).collect(),
+                usage_count: (i % 2 == 1).then_some(i),
+                usage_must_count: (i % 3 == 2).then_some(i),
+                usage_may_count: None,
+                implementation_count: (i % 4 == 3).then_some(1),
+                implementation_must_count: Some(0),
+                implementation_may_count: (i % 5 == 4).then_some(2),
+                kind_flags: 0,
+                language_id: 0,
+                id_u64: 0,
+                rel_path_hash: 0,
+                name_hash: 0,
+            }
+        };
+        let symbols: Vec<GraphSymbol> = (0..40).map(variant).collect();
+        let mut bytes = Vec::new();
+        for symbol in &symbols {
+            serialize_symbol_binary(symbol, file_id, &mut bytes);
+        }
+        let mut cursor = 0;
+        for symbol in &symbols {
+            let (uri, end) = symbol_binary_uri_and_end(&bytes, cursor).expect("walk record");
+            assert_eq!(uri, symbol.uri.as_bytes());
+            let parsed = parse_symbol_binary(&bytes, &mut cursor, &file_table).expect("parse record");
+            assert_eq!(end, cursor, "walker must end where the parser ends for {}", symbol.id);
+            assert_eq!(parsed.id, symbol.id);
+        }
+        assert_eq!(cursor, bytes.len());
+        assert!(symbol_binary_uri_and_end(&bytes[..bytes.len() - 1], 0).is_ok());
+        let last_start = bytes.len() - {
+            let mut tail = Vec::new();
+            serialize_symbol_binary(symbols.last().unwrap(), file_id, &mut tail);
+            tail.len()
+        };
+        assert!(symbol_binary_uri_and_end(&bytes[..bytes.len() - 1], last_start).is_err());
+
+        let path = std::env::temp_dir().join(format!(
+            "zoek-symbol-walker-{}-{}.tsv",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        // Standard, inline, differently-cased and absent ids.
+        let ids: HashSet<String> = ["sym:0000000000007bbf", "custom-8", "SYM:000000000000F75E", "sym:ffff"]
+            .into_iter()
+            .map(str::to_string)
+            .chain(symbols.iter().step_by(3).map(|s| s.id.clone()))
+            .collect();
+        let render = |list: Vec<GraphSymbol>| -> Vec<String> { list.iter().map(|s| format!("{s:?}")).collect() };
+        let expected = read_symbols_matching(&path, &file_table, |s| ids.contains(&s.id)).unwrap();
+        let actual = read_symbols_with_ids(&path, &file_table, &ids).unwrap();
+        assert!(!expected.is_empty());
+        assert_eq!(render(actual), render(expected));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn token_shape_key_filter_matches_full_decode() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |bound: u64| -> u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for round in 0..200 {
+            let entries: Vec<((u64, u64, u64), Vec<TokenShapeCandidate>)> = (0..next(12))
+                .map(|i| {
+                    let key = (next(3), next(4), i);
+                    let candidates = (0..next(6))
+                        .map(|_| TokenShapeCandidate {
+                            source_ref_id: next(u64::MAX),
+                            enclosing_id: next(1_000),
+                            file_id: next(50) as u32,
+                            start_line: next(500) as u32,
+                            start_column: next(80) as u32,
+                            end_line: next(500) as u32,
+                            end_column: next(80) as u32,
+                            edge_kind_id: next(6) as u8,
+                            access_kind_id: next(8) as u8,
+                        })
+                        .collect();
+                    (key, candidates)
+                })
+                .collect();
+            let bytes = bincode::serialize(&entries).unwrap();
+            let wanted: HashSet<(u64, u64, u64)> = entries
+                .iter()
+                .map(|(key, _)| *key)
+                .filter(|_| next(2) == 0)
+                .chain([(9, 9, 9)])
+                .collect();
+            let render = |list: &[((u64, u64, u64), Vec<TokenShapeCandidate>)]| -> Vec<String> {
+                list.iter()
+                    .map(|(key, candidates)| {
+                        let fields: Vec<String> = candidates
+                            .iter()
+                            .map(|c| {
+                                format!(
+                                    "{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                                    c.source_ref_id,
+                                    c.enclosing_id,
+                                    c.file_id,
+                                    c.start_line,
+                                    c.start_column,
+                                    c.end_line,
+                                    c.end_column,
+                                    c.edge_kind_id,
+                                    c.access_kind_id
+                                )
+                            })
+                            .collect();
+                        format!("{key:?}:{}", fields.join(","))
+                    })
+                    .collect()
+            };
+            let expected: Vec<_> =
+                entries.iter().filter(|(key, _)| wanted.contains(key)).cloned().collect();
+            let filtered = token_shape_entries_for_keys(&bytes, &wanted).expect("walk shard");
+            assert_eq!(render(&filtered), render(&expected), "round {round}");
+            if !entries.is_empty() {
+                assert!(token_shape_entries_for_keys(&bytes[..bytes.len() - 1], &wanted).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn reference_binary_walker_matches_parser_layout() {
+        let mut file_table = FileTable::default();
+        let file_id = file_table.intern("pkg/use.py");
+        let references: Vec<GraphReference> = (0..36)
+            .map(|i| {
+                let mut reference = test_graph_reference(
+                    if i % 3 == 0 { "exact" } else { "custom-confidence" },
+                    if i % 4 == 0 { "semantic" } else { "custom-provenance" },
+                    if i % 5 == 0 { "call" } else { "custom-edge" },
+                );
+                reference.source_ref_id = if i % 6 == 0 {
+                    format!("custom-ref-{i}").into()
+                } else {
+                    format!("ref:{:016x}", i as u64 + 1).into()
+                };
+                reference.target_symbol_id = match i % 3 {
+                    0 => None,
+                    1 => Some(format!("sym:{:016x}", i as u64 * 31).into()),
+                    _ => Some(format!("custom-target-{i}").into()),
+                };
+                reference.enclosing_symbol_id = match i % 4 {
+                    0 => None,
+                    1 => Some(format!("sym:{:016x}", i as u64 * 17).into()),
+                    _ => Some(format!("custom-enclosing-{i}").into()),
+                };
+                reference.name = format!("name{}", "n".repeat(i % 4)).into();
+                reference.raw_text = if i % 2 == 0 {
+                    reference.name.clone()
+                } else {
+                    format!("receiver.{}", reference.name).into()
+                };
+                reference.start_line = i as u32;
+                reference
+            })
+            .collect();
+        let mut bytes = Vec::new();
+        for reference in &references {
+            serialize_reference_binary(reference, file_id, &mut bytes);
+        }
+        let mut cursor = 0;
+        for reference in &references {
+            let (target, end) = reference_binary_target_and_end(&bytes, cursor).expect("walk record");
+            let expected = match reference.target_symbol_id.as_deref() {
+                None => ReferenceTargetField::None,
+                Some(id) => match parse_stable_symbol_id_to_u64(id) {
+                    Some(value) => ReferenceTargetField::Id(value),
+                    None => ReferenceTargetField::Inline(id.as_bytes()),
+                },
+            };
+            assert_eq!(target, expected);
+            let parsed = parse_reference_binary(&bytes, &mut cursor, &file_table).expect("parse record");
+            assert_eq!(end, cursor, "walker must end where the parser ends at line {}", reference.start_line);
+            assert_eq!(parsed.target_symbol_id, reference.target_symbol_id);
+        }
+        assert_eq!(cursor, bytes.len());
+    }
+
+    // Order-independent dump of every persisted graph family, for proving that a
+    // performance change leaves the index content unchanged. Parallel writers
+    // make within-shard record order vary between runs, so each family is
+    // decoded record-by-record and written as sorted lines (duplicates kept).
+    // Compare two dumps with `diff -r`. Run with:
+    //   ZOEK_DIGEST_ROOT=<workspace> ZOEK_DIGEST_OUT=<dir> cargo test --release -p zoek-rs --lib \
+    //     graph::tests::canonical_index_digest -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn canonical_index_digest() {
+        let (Ok(root), Ok(out)) = (std::env::var("ZOEK_DIGEST_ROOT"), std::env::var("ZOEK_DIGEST_OUT"))
+        else {
+            eprintln!("[digest] set ZOEK_DIGEST_ROOT and ZOEK_DIGEST_OUT — skipping");
+            return;
+        };
+        let root = PathBuf::from(root);
+        let out = PathBuf::from(out);
+        std::fs::create_dir_all(&out).expect("create digest dir");
+        let config = EngineConfig::default();
+        let ft = read_file_table_binary(&graph_file_table_path(&root, &config)).expect("file table");
+        // Comma-separated families to leave out, e.g. byte-stable ones that are
+        // cheaper to compare by file hash on very large indexes.
+        let skip: HashSet<String> = std::env::var("ZOEK_DIGEST_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|family| !family.is_empty())
+            .map(str::to_string)
+            .collect();
+        let write = |family: &str, mut lines: Vec<String>, sort: bool| {
+            if skip.contains(family) {
+                return;
+            }
+            if sort {
+                lines.sort();
+            }
+            let mut text = lines.join("\n");
+            text.push('\n');
+            std::fs::write(out.join(format!("{family}.txt")), text).expect("write digest");
+            eprintln!("[digest] {family}: {} records", lines.len());
+        };
+        let shard_bytes = |prefix: &str| -> Vec<Vec<u8>> {
+            (0..GRAPH_SHARD_COUNT)
+                .map(|shard| graph_shard_path(&root, &config, prefix, shard))
+                .filter(|path| path.exists())
+                .map(|path| std::fs::read(path).expect("read shard"))
+                .collect()
+        };
+
+        // The file table's order defines every file_id, so it stays ordered.
+        write("file-table", ft.paths.clone(), false);
+        let manifest = std::fs::read_to_string(graph_manifest_path(&root, &config)).expect("manifest");
+        let manifest = manifest
+            .split(',')
+            .filter(|field| !field.starts_with("\"indexedAtUnixSecs\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        write("manifest", vec![manifest], false);
+
+        for prefix in [GRAPH_SYMBOL_ID_SHARD_PREFIX, GRAPH_RESOLVE_INDEX_SHARD_PREFIX] {
+            let mut lines = Vec::new();
+            for bytes in shard_bytes(prefix) {
+                let mut c = 0;
+                while c < bytes.len() {
+                    lines.push(format!("{:?}", parse_symbol_binary(&bytes, &mut c, &ft).expect("symbol")));
+                }
+            }
+            write(prefix, lines, true);
+        }
+        let mut lines = Vec::new();
+        for bytes in shard_bytes(GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX) {
+            let mut c = 0;
+            while c < bytes.len() {
+                let s = parse_symbol_compact_binary(&bytes, &mut c, &ft).expect("compact");
+                lines.push(format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    s.id, s.rel_path, s.name, s.name_hash, s.lang_hash, s.kind_id
+                ));
+            }
+        }
+        write(GRAPH_SYMBOL_COMPACT_BY_FILE_SHARD_PREFIX, lines, true);
+        let mut lines = Vec::new();
+        for bytes in shard_bytes(GRAPH_HIERARCHY_PARENT_SHARD_PREFIX) {
+            let mut c = 0;
+            while c < bytes.len() {
+                let fields: Vec<String> =
+                    (0..4).map(|_| read_u16_str(&bytes, &mut c).expect("hierarchy")).collect();
+                lines.push(fields.join("\t"));
+            }
+        }
+        write(GRAPH_HIERARCHY_PARENT_SHARD_PREFIX, lines, true);
+        let mut lines = Vec::new();
+        for bytes in shard_bytes(GRAPH_METHOD_CONTAINER_SHARD_PREFIX) {
+            let mut c = 0;
+            while c < bytes.len() {
+                let fields: Vec<String> =
+                    (0..2).map(|_| read_u16_str(&bytes, &mut c).expect("method")).collect();
+                lines.push(fields.join("\t"));
+            }
+        }
+        write(GRAPH_METHOD_CONTAINER_SHARD_PREFIX, lines, true);
+        let mut lines = Vec::new();
+        for bytes in shard_bytes(GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX) {
+            let mut c = 0;
+            while c < bytes.len() {
+                let file_id = read_u32_le(&bytes, &mut c).expect("fact file");
+                let relation = read_u8_at(&bytes, &mut c).expect("fact relation");
+                let child = read_u16_str(&bytes, &mut c).expect("fact child");
+                let parent = read_u16_str(&bytes, &mut c).expect("fact parent");
+                let rel_path = ft.get_path(file_id).unwrap_or("");
+                lines.push(format!("{rel_path}\t{relation}\t{child}\t{parent}"));
+            }
+        }
+        write(GRAPH_HIERARCHY_FACTS_BY_FILE_SHARD_PREFIX, lines, true);
+        if !skip.contains(GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX) {
+            let mut lines = Vec::new();
+            for bytes in shard_bytes(GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX) {
+                let mut c = 0;
+                while c < bytes.len() {
+                    lines.push(format!("{:?}", parse_ref_site_binary(&bytes, &mut c, &ft).expect("ref site")));
+                }
+            }
+            write(GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX, lines, true);
+        }
+        for prefix in [GRAPH_REFERENCE_TARGET_SHARD_PREFIX, GRAPH_REFERENCE_ENCLOSING_SHARD_PREFIX] {
+            let mut lines = Vec::new();
+            for bytes in shard_bytes(prefix) {
+                let mut c = 0;
+                while c < bytes.len() {
+                    lines.push(format!("{:?}", parse_reference_binary(&bytes, &mut c, &ft).expect("reference")));
+                }
+            }
+            write(prefix, lines, true);
+        }
+        let mut lines = Vec::new();
+        for shard in 0..GRAPH_SHARD_COUNT {
+            let path = graph_shard_path(&root, &config, GRAPH_COUNT_ID_SHARD_PREFIX, shard);
+            if path.exists() {
+                for (id, count) in read_counts(&path).expect("counts") {
+                    lines.push(format!("{id}\t{count:?}"));
+                }
+            }
+        }
+        write(GRAPH_COUNT_ID_SHARD_PREFIX, lines, true);
+        let empty: HashSet<String> = HashSet::default();
+        let (imports, types, returns) =
+            read_facts_excluding_paths(&root, &config, &empty, &ft).expect("facts");
+        let mut lines: Vec<String> = imports.iter().map(|f| format!("I {f:?}")).collect();
+        lines.extend(types.iter().map(|f| format!("T {f:?}")));
+        lines.extend(returns.iter().map(|f| format!("R {f:?}")));
+        write(GRAPH_FACTS_BY_FILE_SHARD_PREFIX, lines, true);
+        // Candidate order inside a key is consumed in order by phase F, so keep
+        // an order-preserving view next to the sorted multiset view.
+        let (mut sorted, mut ordered) = (Vec::new(), Vec::new());
+        for bytes in shard_bytes(GRAPH_TOKEN_SHAPE_SHARD_PREFIX) {
+            if bytes.is_empty() {
+                continue;
+            }
+            let entries: Vec<((u64, u64, u64), Vec<TokenShapeCandidate>)> =
+                bincode::deserialize(&bytes).expect("token shape");
+            for (key, candidates) in entries {
+                let rendered: Vec<String> = candidates
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{:x}/{:x}/{}/{}:{}-{}:{}/{}/{}",
+                            c.source_ref_id,
+                            c.enclosing_id,
+                            ft.get_path(c.file_id).unwrap_or(""),
+                            c.start_line,
+                            c.start_column,
+                            c.end_line,
+                            c.end_column,
+                            c.edge_kind_id,
+                            c.access_kind_id
+                        )
+                    })
+                    .collect();
+                sorted.extend(rendered.iter().map(|c| format!("{key:?}\t{c}")));
+                ordered.push(format!("{key:?}\t{}", rendered.join(" ")));
+            }
+        }
+        write(GRAPH_TOKEN_SHAPE_SHARD_PREFIX, sorted, true);
+        write("callgraph-token-shape-by-key.ordered", ordered, true);
+        let mut lines = Vec::new();
+        for bytes in shard_bytes(GRAPH_TOKEN_SHAPE_TARGET_COUNT_SHARD_PREFIX) {
+            if bytes.is_empty() {
+                continue;
+            }
+            let entries: Vec<((u64, u64, u64), TokenShapeTargetCount)> =
+                bincode::deserialize(&bytes).expect("target count");
+            lines.extend(
+                entries
+                    .into_iter()
+                    .map(|(key, count)| format!("{key:?}\t{}\t{}", count.bare, count.member)),
+            );
+        }
+        write(GRAPH_TOKEN_SHAPE_TARGET_COUNT_SHARD_PREFIX, lines, true);
+        let mut lines = Vec::new();
+        for bytes in shard_bytes(GRAPH_OUTGOING_TALLY_BY_FILE_SHARD_PREFIX) {
+            let mut c = 0usize;
+            while c + 4 <= bytes.len() {
+                let len = u32::from_le_bytes(bytes[c..c + 4].try_into().unwrap()) as usize;
+                c += 4;
+                let rel_path = String::from_utf8_lossy(&bytes[c..c + len]).into_owned();
+                c += len;
+                let n = u32::from_le_bytes(bytes[c..c + 4].try_into().unwrap()) as usize;
+                c += 4;
+                for _ in 0..n {
+                    let target = u64::from_le_bytes(bytes[c..c + 8].try_into().unwrap());
+                    let values: Vec<String> = (0..4)
+                        .map(|i| {
+                            let at = c + 8 + i * 4;
+                            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()).to_string()
+                        })
+                        .collect();
+                    lines.push(format!("{rel_path}\t{target:x}\t{}", values.join("\t")));
+                    c += 24;
+                }
+            }
+        }
+        write(GRAPH_OUTGOING_TALLY_BY_FILE_SHARD_PREFIX, lines, true);
     }
 
     fn walk_first_py(root: &Path) -> Option<PathBuf> {

@@ -153,6 +153,12 @@ impl GraphOverlay {
         current_base_built_at: u64,
     ) -> Self {
         let path = Self::path(workspace_root, config);
+        // `base_built_at_unix_ms` is the first field and bincode writes it as a
+        // fixed 8-byte integer, so a superseded overlay is rejected from its
+        // header instead of reading and decoding the whole file on every query.
+        if Self::read_base_built_at(&path).is_some_and(|built_at| built_at != current_base_built_at) {
+            return Self::new(current_base_built_at);
+        }
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(_) => return Self::new(current_base_built_at),
@@ -162,6 +168,13 @@ impl GraphOverlay {
             // Corrupt, or built against a different (now-superseded) base.
             _ => Self::new(current_base_built_at),
         }
+    }
+
+    fn read_base_built_at(path: &Path) -> Option<u64> {
+        use std::io::Read;
+        let mut header = [0u8; 8];
+        std::fs::File::open(path).ok()?.read_exact(&mut header).ok()?;
+        Some(u64::from_le_bytes(header))
     }
 
     /// Load the overlay regardless of base build (for compaction, which folds
@@ -458,5 +471,44 @@ mod tests {
         );
         assert_eq!(overlay.entry_count(), 1);
         assert_eq!(overlay.ref_count(), 2); // latest wins, not summed
+    }
+
+    #[test]
+    fn load_valid_rejects_superseded_base_from_header() {
+        let root = std::env::temp_dir().join(format!(
+            "zoek-overlay-header-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        let config = EngineConfig::default();
+        std::fs::create_dir_all(config.index_root(&root)).unwrap();
+        let mut overlay = GraphOverlay::new(7);
+        overlay.upsert(
+            "a.py",
+            GraphOverlayEntry {
+                kind: GraphOverlayEntryKind::Changed,
+                refs: vec![rref("sym:1", "a.py", "import")],
+                symbols: vec![sym("sym:1", "a.py")],
+                contrib: BTreeMap::new(),
+                token_shape_target_deltas: BTreeMap::new(),
+            },
+        );
+        overlay.save(&root, &config).unwrap();
+        let path = GraphOverlay::path(&root, &config);
+        assert_eq!(GraphOverlay::read_base_built_at(&path), Some(7));
+
+        let current = GraphOverlay::load_valid(&root, &config, 7);
+        assert_eq!(current.entry_count(), 1);
+        let superseded = GraphOverlay::load_valid(&root, &config, 8);
+        assert_eq!(superseded.base_built_at_unix_ms, 8);
+        assert!(superseded.is_empty());
+
+        // A header that matches but a body that does not decode stays empty.
+        std::fs::write(&path, 7u64.to_le_bytes()).unwrap();
+        assert!(GraphOverlay::load_valid(&root, &config, 7).is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
