@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7150 - 2026-10-01
+
+- Sped up full call graph rebuilds by about a quarter on a 27K-file workspace: Django model ancestry is computed once per resolve, source discovery makes fewer file-system calls on a small walker pool, and the outgoing usage tally is built in parallel. Index contents are unchanged, so no reindex is needed.
+- Made per-file symbol summaries for inline usage hints decode only the requested file's records and load each class's implementation family once per query. Typical files answer in under 0.2s with about a quarter of the memory, and large library modules that hit the 3s query timeout now complete.
+- Paced call graph overlay compaction by its measured cost (about 1/20 of wall time, with at most 10 minutes of idle wait), while still compacting 12s after edits once the overlay reaches 64 files or 16 MiB.
+- Removed retired call graph files and superseded edit overlays during full rebuilds, and rejected stale overlays without reading them.
+- Skipped common binary image, media, model-weight, compiled-module, archive and database formats by extension in the search index. The next index run rebuilds once to apply this.
+
 ## 0.1.7149 - 2026-09-07
 
 - Resolved member usages by declaring class ID so unrelated classes with the same name no longer lose exact references or share inferred member targets.
