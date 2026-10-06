@@ -2914,6 +2914,9 @@ export class OverlayPanel {
     initialQuery: string,
     options: ShowOptions,
   ): Promise<EvaluatedShow | undefined> {
+    const completionToken = [
+      process.pid.toString(36), Date.now().toString(36), (++this.showEvaluationSeq).toString(36),
+    ].join('-');
     if (options.spawn) {
       this.spawnInjectionAttempts++;
       let spawnedFast = false;
@@ -2922,8 +2925,8 @@ export class OverlayPanel {
         // cached source string. The installer was registered through main's
         // privileged executeJavaScript and is just a normal JS function
         // from the renderer's perspective, so Trusted Types doesn't object.
-        const fastReport = await this.evalInWindow(windowId, `
-          (function(){
+        const fastResponse = await this.evalInWindow(windowId, `
+          (async function(){
             try {
               if (window.__ijFindAdditionalPatchVersion !== ${JSON.stringify(RENDERER_PATCH_VERSION)}) {
                 return 'missing:version';
@@ -2931,12 +2934,30 @@ export class OverlayPanel {
               var fn = window.__ijFindAdditionalPatchInstaller;
               if (typeof fn !== 'function') { return 'missing:fn'; }
               var value = fn();
-              return String(value || '');
+              var report = String(value || '');
+              if (report !== 'ij-find patch installed' && report.indexOf('already patched') !== 0) { return report; }
+              var result;
+              try { result = window.__ijFindShow ? await window.__ijFindShow(${JSON.stringify(initialQuery)}, ${JSON.stringify(options)}) : 'no-show-fn'; }
+              catch (showError) { result = 'show-throw:' + (showError && showError.message); }
+              result = String(result || 'ok');
+              window.__ijFindLastShowCompletion = { token: ${JSON.stringify(completionToken)}, result: result, completedAt: Date.now() };
+              return 'spawn-shown:' + JSON.stringify({ report: report, result: result });
             } catch (e) {
               return 'err:' + (e && e.message);
             }
           })()
-        `.trim());
+        `.trim(), 10_000, 750, completionToken);
+        if (/^pending:renderer-busy:/.test(fastResponse)) {
+          return { fid: windowId, result: `show pending ${fastResponse.slice('pending:'.length)}`, completionToken };
+        }
+        if (fastResponse.startsWith('spawn-shown:')) {
+          const shown = JSON.parse(fastResponse.slice('spawn-shown:'.length)) as { report: string; result: string };
+          this.lastSpawnInjectionFastReport = shown.report;
+          this.spawnInjectionFastSuccess++;
+          this.log.appendLine(`Spawn instance fast injection and show(win=${windowId}): ${shown.report}`);
+          return { fid: windowId, result: shown.result, completionToken };
+        }
+        const fastReport = fastResponse;
         this.lastSpawnInjectionFastReport = fastReport;
         if (fastReport === 'ij-find patch installed' || fastReport.indexOf('already patched') === 0) {
           this.log.appendLine(`Spawn instance fast injection(win=${windowId}): ${fastReport}`);
@@ -2969,11 +2990,6 @@ export class OverlayPanel {
         }
       }
     }
-    const completionToken = [
-      process.pid.toString(36),
-      Date.now().toString(36),
-      (++this.showEvaluationSeq).toString(36),
-    ].join('-');
     const showExpr = `(async function(){` +
       `var token=${JSON.stringify(completionToken)};var value;` +
       `try{value=window.__ijFindShow?await window.__ijFindShow(${JSON.stringify(initialQuery)},${JSON.stringify(options)}):'no-show-fn';}` +
