@@ -17,6 +17,8 @@ if ($AsTestUser) {
   if ($isAdministrator) { throw 'UserSetup acceptance must run under a standard, non-administrator account.' }
   $osInfo = Get-CimInstance Win32_OperatingSystem
   if ($osInfo.Caption -notmatch 'Windows 11') { throw "Expected Windows 11, got $($osInfo.Caption)" }
+  $hostArchitecture = $env:PROCESSOR_ARCHITECTURE
+  if ($env:PROCESSOR_ARCHITEW6432) { $hostArchitecture = $env:PROCESSOR_ARCHITEW6432 }
   $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
   $env:USERPROFILE = [Environment]::GetFolderPath('UserProfile')
   $env:LOCALAPPDATA = $localAppData
@@ -53,7 +55,7 @@ if ($AsTestUser) {
   } finally {
     @{ exitCode = $exitCode; user = $identity.Name; administrator = $isAdministrator;
        os = $osInfo.Caption; osBuild = $osInfo.BuildNumber; executable = $codeExecutable;
-       hostArchitecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() } |
+       hostArchitecture = $hostArchitecture } |
       ConvertTo-Json | Set-Content (Join-Path $ArtifactRoot 'standard-user-result.json') -Encoding UTF8
   }
   exit $exitCode

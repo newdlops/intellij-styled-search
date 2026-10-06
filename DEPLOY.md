@@ -178,6 +178,13 @@ native binaries. See the [official platform-specific publishing guide](https://c
 
 After packaging, verify the produced VSIX in a clean VS Code environment.
 
+The desktop compatibility workflow also tests x64 VS Code UserSetup 1.114.0
+and stable on Windows 11 under a newly created standard account. It checks the
+extension host's actual executable, architecture, OS, and non-administrator
+token before exercising the native engine and overlay. This uses x64
+application emulation on GitHub's `windows-11-arm` runner; native x64 Windows 11
+hardware and native ARM64 VS Code are separate environments.
+
 Recommended smoke checks:
 
 - Open `IntelliJ Search: Find in Path (IntelliJ Style)`.

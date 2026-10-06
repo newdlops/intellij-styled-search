@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7152 - 2026-10-06
+
+- Kept each renderer click's source window and preview intent through asynchronous command dispatch, and allowed an immediately repeated completed inlay action to run again.
+- Used current rendered inlay metadata before requesting providers again; retained label-based recovery for recycled view lines.
+- Removed repeated full theme-token copies from preview switching and separated computed-style reads from writes while preserving theme-change observers.
+- Preserved the executable identity expected by Node launcher shims when starting the JavaScript graph worker.
+- Added Windows 11 x64 UserSetup acceptance under a standard account on the Windows ARM64 runner, with x64 application emulation recorded explicitly.
+
 ## 0.1.7151 - 2026-10-06
 
 - Added an isolated Windows desktop adapter for Electron process discovery and on-demand inspector activation; preserved the macOS bundle fast path.

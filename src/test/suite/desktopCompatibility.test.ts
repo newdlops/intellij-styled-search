@@ -38,7 +38,10 @@ suite('Desktop compatibility', () => {
       assert.strictEqual(process.platform, 'win32');
       assert.strictEqual(process.arch, 'x64', 'the original issue uses the x64 UserSetup build');
       const expectedExecutable = path.join(process.env.LOCALAPPDATA!, 'Programs', 'Microsoft VS Code', 'Code.exe');
-      assert.strictEqual(path.resolve(process.execPath).toLowerCase(), path.resolve(expectedExecutable).toLowerCase());
+      const relativeExecutable = path.relative(path.dirname(expectedExecutable).toLowerCase(), path.resolve(process.execPath).toLowerCase());
+      assert.ok(relativeExecutable && !relativeExecutable.startsWith('..') && !path.isAbsolute(relativeExecutable),
+        'the extension host must belong to the per-user installation, including versioned update layouts');
+      assert.strictEqual(path.basename(relativeExecutable), 'code.exe');
       const host = await invoke('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
         "$id=[Security.Principal.WindowsIdentity]::GetCurrent(); $p=[Security.Principal.WindowsPrincipal]::new($id); " +
         "@{user=$id.Name;administrator=$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);" +

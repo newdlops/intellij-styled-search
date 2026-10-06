@@ -165,6 +165,12 @@ Windows opens the Electron main inspector through Node's native debug hook. It d
 
 Run `npm run compile`, `npm run test:unit`, and `cargo test --locked -p zoek-rs` for structural regression checks. After `npm run build:zoek-runtime`, `npm test` runs the actual desktop extension. The [desktop compatibility workflow](.github/workflows/desktop-compatibility.yml) checks current macOS/Windows builds plus VS Code 1.114.0 on Windows, requires renderer attachment, exercises on-demand inspector activation, and saves rendered workbench screenshots at Chromium viewports of 1440×900, 1024×768, and 800×600 under `artifacts/desktop-compatibility/`.
 
+Its Windows 11 job installs x64 UserSetup 1.114.0 and stable as a standard
+account and verifies that the extension host actually runs without administrator
+privileges. The host is ARM64, so these x64 application checks use Windows
+emulation; they do not certify native ARM64 VS Code or native x64 Windows 11
+hardware.
+
 CI gates native tests, desktop acceptance, extension functional regressions, and renderer save/recovery acceptance. It also runs the full renderer suite as diagnostics, including the strict hardware timing budgets; inspect that step separately when reviewing performance results from shared runners. Windows graph caches created before the URI correction require one rebuild; macOS graph cache versions are unchanged.
 
 ## Deployment

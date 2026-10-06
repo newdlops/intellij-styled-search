@@ -2330,6 +2330,47 @@ suite('Activation', () => {
     }
   });
 
+  test('a completed symbol action can run again immediately and separate renderer clicks do not coalesce', async function () {
+    const { overlay, callGraph } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalPendingWindow = anyOverlay.rendererCommandPendingPanelWindowId;
+    const originalPendingExpiry = anyOverlay.rendererCommandPendingPanelExpiresAt;
+    const originalShow = overlay.show;
+    const originalShowStatic = overlay.showStaticResults;
+    const originalResolve = callGraph.resolveSymbolsResolved;
+    const originalUsages = callGraph.findUsagesForSymbolIdFromCache;
+    const originalRefine = callGraph.refineUsageReferencesWithCurrentSources;
+    const shown: Array<number | undefined> = [];
+    const results: Array<number | undefined> = [];
+    try {
+      overlay.show = async () => { shown.push(overlay.getRendererCommandWindowIdForShow()); };
+      overlay.showStaticResults = async () => { results.push(overlay.getRendererCommandWindowIdForShow()); };
+      callGraph.resolveSymbolsResolved = async () => [];
+      callGraph.findUsagesForSymbolIdFromCache = async () => [];
+      callGraph.refineUsageReferencesWithCurrentSources = async () => [];
+      const command = 'intellijStyledSearch.showUsagesForSymbol';
+      const args = ['sym:repeatable_action', 'Repeatable action', 1];
+      await vscode.commands.executeCommand(command, ...args);
+      await vscode.commands.executeCommand(command, ...args);
+      assert.strictEqual(shown.length, 2, 'the second completed action must open its own pending panel');
+      assert.strictEqual(results.length, 2, 'the second completed action must deliver results again');
+      await Promise.all([
+        anyOverlay.runHoverCommand(command, args, 41, true),
+        anyOverlay.runHoverCommand(command, args, 42, true),
+      ]);
+      assert.deepStrictEqual(shown.slice(2).sort(), [41, 42]);
+      assert.deepStrictEqual(results.slice(2).sort(), [41, 42]);
+    } finally {
+      overlay.show = originalShow;
+      overlay.showStaticResults = originalShowStatic;
+      callGraph.resolveSymbolsResolved = originalResolve;
+      callGraph.findUsagesForSymbolIdFromCache = originalUsages;
+      callGraph.refineUsageReferencesWithCurrentSources = originalRefine;
+      anyOverlay.rendererCommandPendingPanelWindowId = originalPendingWindow;
+      anyOverlay.rendererCommandPendingPanelExpiresAt = originalPendingExpiry;
+    }
+  });
+
   test('a cold show reuses the renderer window selected by its own injection', async function () {
     const { overlay } = await getApi();
     const anyOverlay = overlay as any;

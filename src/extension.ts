@@ -86,7 +86,7 @@ class CallGraphInlayRegistry {
 
   replaceRange(uri: vscode.Uri, range: vscode.Range, entries: CallGraphInlayRegistryEntry[]): void {
     const uriKey = uri.toString();
-    this.invalidatedUris.delete(uriKey);
+    if (entries.length > 0) { this.invalidatedUris.delete(uriKey); }
     const byLine = this.entriesByUri.get(uriKey) ?? new Map<number, CallGraphInlayRegistryEntry[]>();
     const startLine = Math.max(0, range.start.line);
     const endLine = Math.max(startLine, range.end.line);

@@ -266,6 +266,9 @@ function assertTimingsWithin(label: string, timings: number[], budgetMs: number)
   const maxMs = sorted[sorted.length - 1] ?? 0;
   const p95Ms = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)] ?? maxMs;
   const avgMs = timings.reduce((sum, value) => sum + value, 0) / timings.length;
+  if (process.env.IJSS_E2E_TIMING_REPORT === '1') {
+    console.info(`[timings] ${label}: samples=${timings.join(',')}ms max=${maxMs}ms p95=${p95Ms}ms budget=${budgetMs}ms`);
+  }
   assert.ok(
     maxMs <= budgetMs,
     `${label} max should stay <= ${budgetMs}ms under load; timings=${timings.join(',')}ms max=${maxMs}ms p95=${p95Ms}ms avg=${Math.round(avgMs)}ms`,
