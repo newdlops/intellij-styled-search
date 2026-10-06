@@ -40,6 +40,11 @@ jobs:
       - run: npm run test:build-cache
       - run: cargo test --locked -p zoek-rs
       - run: npm run build:zoek-runtime
+      - uses: actions/upload-artifact@v7
+        if: matrix.os == 'windows-latest' && matrix.vscode == 'stable'
+        with:
+          name: native-win32-x64
+          path: resources/bin/win32-x64/
       - name: Desktop acceptance
         run: npm test -- --run out/test/suite/desktopCompatibility.test.js
       - name: Extension functional regressions
@@ -53,21 +58,21 @@ jobs:
           IJSS_RENDERER_DIAGNOSTICS_OUTCOME: ${{ steps.renderer_diagnostics.outcome }}
         run: |
           node -e "const fs = require('node:fs'); const outcome = process.env.IJSS_RENDERER_DIAGNOSTICS_OUTCOME || 'skipped'; fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, '### Full renderer acceptance\n\nResult: **' + outcome + '**.\n\nThe complete renderer suite, including save/recovery, repeated-click behavior and the existing hardware timing budgets, is required. Failures fail this job.\n');"
+      - name: Collect desktop logs
+        if: always()
+        run: node scripts/collectDesktopTestLogs.js
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: desktop-${{ matrix.os }}-${{ matrix.vscode }}
           path: |
             artifacts/desktop-compatibility/
+            artifacts/desktop-test-logs/
             resources/bin/*/
-      - uses: actions/upload-artifact@v7
-        if: matrix.os == 'windows-latest' && matrix.vscode == 'stable'
-        with:
-          name: native-win32-x64
-          path: resources/bin/win32-x64/
 
   windows-user-setup:
     needs: desktop
+    if: always() && !cancelled()
     runs-on: windows-11-arm
     timeout-minutes: 20
     steps:

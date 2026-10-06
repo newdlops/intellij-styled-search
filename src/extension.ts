@@ -238,6 +238,7 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   const mcpServer = new CallGraphMcpServer(callGraph, callGraphLog, overlay);
   context.subscriptions.push(
     callGraph,
+    callGraphInlayHintsProvider,
     mcpServer,
     callGraphDurableInlayCommands,
     { dispose: () => overlay.setPreviewCallGraphInlayProvider(undefined) },
@@ -2178,8 +2179,10 @@ function buildPreviewCallGraphInlayEntries(
   return entries;
 }
 
-class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
-  readonly onDidChangeInlayHints: vscode.Event<void>;
+class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider, vscode.Disposable {
+  private readonly changeEmitter = new vscode.EventEmitter<void>();
+  readonly onDidChangeInlayHints = this.changeEmitter.event;
+  private readonly preparationSubscriptions: vscode.Disposable[];
   private allowUnfocusedForTests = false;
 
   constructor(
@@ -2188,7 +2191,43 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
     private readonly registry: CallGraphInlayRegistry,
     private readonly durableCommands: CallGraphDurableInlayCommandRegistry,
   ) {
-    this.onDidChangeInlayHints = callGraph.onDidChangeSnapshot;
+    this.preparationSubscriptions = [
+      callGraph.onDidChangeSnapshot(() => {
+        // Prepare durable command metadata while the graph is being published.
+        // Registering hundreds of commands during an inlay request fills the
+        // workbench RPC queue before it can deliver the hints themselves.
+        this.prepareOpenDocumentCommands();
+        this.changeEmitter.fire();
+      }),
+      vscode.workspace.onDidOpenTextDocument((document) => this.prepareDocumentCommands(document)),
+    ];
+  }
+
+  dispose(): void {
+    this.preparationSubscriptions.forEach((subscription) => subscription.dispose());
+    this.changeEmitter.dispose();
+  }
+
+  private prepareOpenDocumentCommands(): void {
+    for (const document of vscode.workspace.textDocuments) {
+      this.prepareDocumentCommands(document);
+    }
+  }
+
+  private prepareDocumentCommands(document: vscode.TextDocument): void {
+    if (!vscode.window.state.focused && !this.allowUnfocusedForTests) { return; }
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    if (!cfg.get<boolean>('callGraphInlayHints', true)) { return; }
+    // Use only metadata already available in memory. Opening a background
+    // document must not restore disk caches or trigger graph/index work.
+    const summaries = this.callGraph.getSymbolRelationSummariesForDocument(document.uri);
+    const showCallees = cfg.get<boolean>('callGraphShowCalleeInlayHints', false);
+    for (const summary of summaries) {
+      if (summary.symbol.range.startLine < 0 || summary.symbol.range.startLine >= document.lineCount ||
+          !isCallGraphInlayDefinitionLine(document, summary.symbol)) { continue; }
+      buildCallGraphInlayHint(summary, document.uri, this.durableCommands, showCallees,
+        document.lineAt(summary.symbol.range.startLine).range.end.character);
+    }
   }
 
   setAllowUnfocusedForTests(allow: boolean): void {
@@ -2200,6 +2239,7 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
     range: vscode.Range,
     token: vscode.CancellationToken,
   ): Promise<vscode.InlayHint[]> {
+    const started = performance.now();
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     if (token.isCancellationRequested) { return []; }
     // Provider calls are automatic work. Do not hydrate persisted summaries in
@@ -2223,9 +2263,11 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
       }
     }
     const showCalleeInlayHints = cfg.get<boolean>('callGraphShowCalleeInlayHints', false);
+    const restoredAt = performance.now();
     const summaries = hasSnapshot
       ? this.callGraph.getSymbolRelationSummariesForDocument(document.uri, range)
       : this.callGraph.getCachedSymbolRelationSummariesForDocument(document.uri, range);
+    const summarizedAt = performance.now();
     const hints: vscode.InlayHint[] = [];
     const registryEntries: CallGraphInlayRegistryEntry[] = [];
     for (const summary of summaries
@@ -2244,6 +2286,9 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider {
       registryEntries.push(...buildCallGraphInlayRegistryEntries(summary, showCalleeInlayHints, lineEndColumn));
     }
     this.registry.replaceRange(document.uri, range, registryEntries);
+    if (process.env.IJSS_E2E_TIMING_REPORT === '1' && range.start.line === 0 && range.end.line >= document.lineCount - 1) {
+      console.info(`[inlay-provider] lines=${document.lineCount} hints=${hints.length} restore=${Math.round(restoredAt - started)}ms summaries=${Math.round(summarizedAt - restoredAt)}ms build=${Math.round(performance.now() - summarizedAt)}ms`);
+    }
     if (hints.length > 0) {
       this.overlay.scheduleRendererInlayClickHookWarmup('call-graph-inlay-hints');
     }

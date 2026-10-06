@@ -3,6 +3,7 @@ import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { WebSocketServer } from 'ws';
 import { createRustGraphMemoryEnv } from '../../callGraph';
 import type { ExtensionTestApi } from '../../extension';
 import { IndexingMemoryProtection } from '../../internal/indexingMemoryProtection';
@@ -69,6 +70,53 @@ async function getApi(): Promise<ExtensionTestApi> {
 }
 
 suite('Activation', () => {
+  test('late events from a replaced CDP socket cannot close its successor or settle its requests', async function () {
+    this.timeout(10_000);
+    const { overlay } = await getApi();
+    const control = overlay as any;
+    const saved = { ws: control.ws, pending: control.pending, injectPromise: control.injectPromise,
+      findMainPid: control.findMainPid, findInspectorWebSocketForPid: control.findInspectorWebSocketForPid,
+      probeRetainedRendererPatch: control.probeRetainedRendererPatch, markRendererInlayClickHookReady: control.markRendererInlayClickHookReady };
+    const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    server.on('connection', (socket) => socket.on('message', (data) => {
+      const request = JSON.parse(String(data));
+      if (request.method !== 'hold') socket.send(JSON.stringify({ id: request.id, result: { value: 'current' } }));
+    }));
+    let first: any;
+    let second: any;
+    try {
+      control.pending = new Map();
+      control.findMainPid = async () => 1;
+      control.findInspectorWebSocketForPid = async () => ({ wsUrl: `ws://127.0.0.1:${address.port}`, port: address.port, attempts: 1 });
+      control.probeRetainedRendererPatch = async () => 'ok:1:already patched:retained';
+      control.markRendererInlayClickHookReady = () => {};
+      await control.inject();
+      first = control.ws;
+      await control.inject();
+      second = control.ws;
+      assert.notStrictEqual(first, second);
+      const held = control.send('hold', {}, 2_000);
+      const heldId = [...control.pending.keys()][0];
+      first.emit('message', Buffer.from(JSON.stringify({ id: heldId, result: { value: 'obsolete' } })));
+      first.emit('close');
+      first.emit('error', new Error('obsolete socket error'));
+      assert.strictEqual(control.ws, second, 'the old socket must not erase the new connection');
+      assert.strictEqual(control.pending.size, 1, 'the old socket must not reject or complete new requests');
+      second.emit('message', Buffer.from(JSON.stringify({ id: heldId, result: { value: 'current' } })));
+      assert.strictEqual((await held).value, 'current');
+      assert.strictEqual((await control.send('live', {}, 2_000)).value, 'current');
+    } finally {
+      Object.assign(control, saved);
+      first?.terminate();
+      second?.terminate();
+      for (const socket of server.clients) socket.terminate();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test('extension is present and activates', async function () {
     this.timeout(15_000);
     const api = await getApi();

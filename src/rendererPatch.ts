@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 148;
+export const RENDERER_PATCH_VERSION = 149;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -14040,7 +14040,7 @@ export function getRendererPatchScript(
   };
   window.__ijFindGetPreviewDecorations = function () {
     try {
-      var editor = state.previewMonacoEditor;
+      var editor = state.previewMonacoEditor || state.monacoEditor;
       if (!editor) { return { editor: null, decorations: [] }; }
       var model = editor.getModel && editor.getModel();
       if (!model) { return { editor: 'no-model', decorations: [] }; }

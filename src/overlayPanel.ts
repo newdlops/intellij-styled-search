@@ -3604,16 +3604,17 @@ export class OverlayPanel {
   }
 
   private closeCdpWebSocket(reason: string): void {
+    const closingSocket = this.ws;
+    this.ws = undefined;
+    this.injectPromise = undefined;
     const pending = Array.from(this.pending.values());
     this.pending.clear();
     for (const cb of pending) {
       try { cb({ error: { message: `CDP connection closed (${reason})` } }); } catch {}
     }
-    if (this.ws) {
-      try { this.ws.close(); } catch {}
-      this.ws = undefined;
+    if (closingSocket) {
+      try { closingSocket.close(); } catch {}
     }
-    this.injectPromise = undefined;
   }
 
   private async closeCdpAndInspectorSoon(reason: string): Promise<void> {
@@ -3883,15 +3884,20 @@ export class OverlayPanel {
     const tWs = Date.now();
     this.log.appendLine(`WebSocket open after ${tWs - tInspector}ms`);
     this.ws = ws;
-    ws.on('message', (data) => this.handleWsMessage(data));
+    ws.on('message', (data) => {
+      if (this.ws === ws) { this.handleWsMessage(data); }
+    });
+    ws.on('error', (error) => {
+      if (this.ws !== ws) { return; }
+      this.log.appendLine(`CDP WebSocket error: ${error.message}`);
+      this.closeCdpWebSocket('socket error');
+    });
     ws.on('close', () => {
+      // A previous socket can finish closing after its successor is ready.
+      // Late events must not reject the new connection's pending requests.
+      if (this.ws !== ws) { return; }
       this.log.appendLine('CDP WebSocket closed');
-      const pending = Array.from(this.pending.values());
-      this.pending.clear();
-      for (const cb of pending) {
-        try { cb({ error: { message: 'CDP WebSocket closed' } }); } catch {}
-      }
-      this.ws = undefined;
+      this.closeCdpWebSocket('socket closed');
     });
 
     await this.send('Runtime.enable', {});

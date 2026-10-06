@@ -13,5 +13,7 @@ artifacts/desktop-compatibility/
 artifacts/desktop-runtime-download/
 artifacts/desktop-compatibility-download/
 artifacts/release-check/
+artifacts/desktop-test-logs/
+artifacts/windows-user-setup/
 .lh/**/*.*
 .vscode/**/*.*

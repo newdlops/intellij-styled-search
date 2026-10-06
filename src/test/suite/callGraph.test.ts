@@ -97,6 +97,34 @@ async function useCallGraphBackend(backend: 'rust-native' | 'javascript'): Promi
 }
 
 suite('Call graph', () => {
+  test('publishing a graph prepares durable inlay commands for open documents before the first hint request', async function () {
+    this.timeout(30_000);
+    const restoreBackend = await useCallGraphBackend('javascript');
+    const api = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder);
+    const uri = vscode.Uri.joinPath(folder!.uri, 'prepared_inlay_metadata.ts');
+    try {
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(
+        'export function calculate(value: number) { return value + 1; }\nexport function consume() { return calculate(1); }\n'));
+      const document = await vscode.workspace.openTextDocument(uri);
+      await api.callGraph.rebuild(undefined, undefined, { force: true });
+      const summary = api.callGraph.getSymbolRelationSummariesForDocument(uri)
+        .find((item) => item.symbol.name === 'calculate');
+      assert.ok(summary && summary.usageCount > 0);
+      const command = 'intellijStyledSearch.showUsagesForSymbol' + CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER +
+        encodeURIComponent(JSON.stringify([summary.symbol.id, summary.symbol.qualifiedName, summary.usageCount]));
+      assert.ok((await vscode.commands.getCommands(true)).includes(command),
+        'the workbench must already know the command before it requests a full-file inlay set');
+      const hints = await vscode.commands.executeCommand<vscode.InlayHint[]>('vscode.executeInlayHintProvider', uri,
+        new vscode.Range(0, 0, document.lineCount, 0));
+      assert.ok(hints?.some((hint) => Array.isArray(hint.label) && hint.label.some((part) => part.command?.command === command)));
+    } finally {
+      await vscode.workspace.fs.delete(uri);
+      await restoreBackend();
+    }
+  });
+
   let suiteApi: ExtensionTestApi | undefined;
 
   suiteSetup(async function () {

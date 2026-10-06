@@ -2,6 +2,8 @@
 
 ## 0.1.7152 - 2026-10-06
 
+- Prepared durable inlay commands from available graph metadata before notifying the workbench, keeping large first-time hint requests out of the command-registration backlog.
+- Ignored late events from replaced CDP sockets so they cannot close a newer connection or cancel its requests.
 - Kept each renderer click's source window and preview intent through asynchronous command dispatch, and allowed an immediately repeated completed inlay action to run again.
 - Used current rendered inlay metadata before requesting providers again; retained label-based recovery for recycled view lines.
 - Removed repeated full theme-token copies from preview switching and separated computed-style reads from writes while preserving theme-change observers.
