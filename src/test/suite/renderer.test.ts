@@ -13253,6 +13253,23 @@ suite('Renderer — overlay UI probes', () => {
       const timings: number[] = [];
       const revealLines = [0, 2_000, 4_000, 6_000, 8_000];
       let expectedUsageHintCount: number | undefined;
+      const profileColdRequest = process.env.IJSS_E2E_TIMING_REPORT === '1';
+      const rendererProfiler = async (method: string): Promise<any> => {
+        const anyOverlay = api.overlay as any;
+        const windowId = await anyOverlay.resolveTargetWorkbenchWindowId(anyOverlay.activeWindowId);
+        assert.ok(Number.isFinite(windowId), 'expected a workbench window for profiling');
+        const response = await anyOverlay.send('Runtime.evaluate', {
+          expression: `(async function(){
+            var w = require('electron').BrowserWindow.fromId(${windowId});
+            if (!w) { throw new Error('missing profiler window'); }
+            if (!w.webContents.debugger.isAttached()) { w.webContents.debugger.attach('1.3'); }
+            return await w.webContents.debugger.sendCommand(${JSON.stringify(method)});
+          })()`,
+          awaitPromise: true, returnByValue: true, includeCommandLineAPI: true,
+        }, 10_000);
+        assert.strictEqual(response?.exceptionDetails, undefined, 'renderer profiling should succeed');
+        return response?.result?.value;
+      };
       for (let i = 0; i < revealLines.length; i++) {
         let activeEditor = vscode.window.activeTextEditor;
         let visibleOrdinal: number | undefined;
@@ -13280,6 +13297,10 @@ suite('Renderer — overlay UI probes', () => {
           undefined,
           `expected reveal line ${revealLines[i]} to be visible before requesting inlays`,
         );
+        if (profileColdRequest && i === 0) {
+          await rendererProfiler('Profiler.enable');
+          await rendererProfiler('Profiler.start');
+        }
         const started = Date.now();
         const hints = await vscode.commands.executeCommand<vscode.InlayHint[]>(
           'vscode.executeInlayHintProvider',
@@ -13294,6 +13315,18 @@ suite('Renderer — overlay UI probes', () => {
         });
         const elapsedMs = Date.now() - started;
         timings.push(elapsedMs);
+        if (process.env.IJSS_E2E_TIMING_REPORT === '1') {
+          console.info(`[inlay-request] round=${i} startedAt=${started} finishedAt=${Date.now()} elapsed=${elapsedMs}ms`);
+        }
+        if (profileColdRequest && i === 0) {
+          const result = await rendererProfiler('Profiler.stop');
+          await rendererProfiler('Profiler.disable');
+          const fs = await import('fs/promises');
+          const path = await import('path');
+          const output = path.join(__dirname, '../../../artifacts/desktop-compatibility', `${process.platform}-${process.arch}`, 'inlay-cold.cpuprofile');
+          await fs.mkdir(path.dirname(output), { recursive: true });
+          await fs.writeFile(output, JSON.stringify(result?.profile));
+        }
         if (expectedUsageHintCount === undefined) {
           expectedUsageHintCount = usageHints.length;
           assert.ok(expectedUsageHintCount >= 500, `expected a high-load full-file inlay set, got ${expectedUsageHintCount}`);

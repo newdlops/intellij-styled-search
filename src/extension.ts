@@ -2240,6 +2240,7 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider, vscode.D
     token: vscode.CancellationToken,
   ): Promise<vscode.InlayHint[]> {
     const started = performance.now();
+    const startedAt = Date.now();
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     if (token.isCancellationRequested) { return []; }
     // Provider calls are automatic work. Do not hydrate persisted summaries in
@@ -2287,7 +2288,7 @@ class CallGraphInlayHintsProvider implements vscode.InlayHintsProvider, vscode.D
     }
     this.registry.replaceRange(document.uri, range, registryEntries);
     if (process.env.IJSS_E2E_TIMING_REPORT === '1' && range.start.line === 0 && range.end.line >= document.lineCount - 1) {
-      console.info(`[inlay-provider] lines=${document.lineCount} hints=${hints.length} restore=${Math.round(restoredAt - started)}ms summaries=${Math.round(summarizedAt - restoredAt)}ms build=${Math.round(performance.now() - summarizedAt)}ms`);
+      console.info(`[inlay-provider] startedAt=${startedAt} finishedAt=${Date.now()} lines=${document.lineCount} hints=${hints.length} restore=${Math.round(restoredAt - started)}ms summaries=${Math.round(summarizedAt - restoredAt)}ms build=${Math.round(performance.now() - summarizedAt)}ms`);
     }
     if (hints.length > 0) {
       this.overlay.scheduleRendererInlayClickHookWarmup('call-graph-inlay-hints');

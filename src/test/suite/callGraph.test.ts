@@ -26,10 +26,11 @@ async function getApi(): Promise<ExtensionTestApi> {
   return ext.activate();
 }
 
-function waitForCallGraphSnapshot(callGraph: ExtensionTestApi['callGraph'], timeoutMs = 6_000): Promise<void> {
+function waitForCallGraphSnapshot(callGraph: ExtensionTestApi['callGraph'], ready: () => boolean, timeoutMs = 6_000): Promise<void> {
   return new Promise((resolve, reject) => {
     let timer: ReturnType<typeof setTimeout>;
     const disposable = callGraph.onDidChangeSnapshot(() => {
+      if (!ready()) { return; }
       clearTimeout(timer);
       disposable.dispose();
       resolve();
@@ -665,7 +666,9 @@ suite('Call graph', () => {
         'expected restored persisted call graph snapshot to retain incrementally added usage',
       );
       const savedDoc = await vscode.workspace.openTextDocument(savePy);
-      const savedUpdate = waitForCallGraphSnapshot(api.callGraph);
+      const hasSavedUsage = () => api.callGraph.findUsages('GraphPy')
+        .some((reference) => reference.enclosingSymbolId?.includes('graph_py_top3'));
+      const savedUpdate = waitForCallGraphSnapshot(api.callGraph, hasSavedUsage);
       const savedEdit = new vscode.WorkspaceEdit();
       const lastLine = savedDoc.lineAt(savedDoc.lineCount - 1);
       savedEdit.insert(

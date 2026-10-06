@@ -1310,8 +1310,16 @@ export class ZoektRuntime implements vscode.Disposable {
         this.pendingRenames.length > 0 ||
         !!this.flushTimer;
       const movedThisRound = beforeChanged + beforeDeleted + beforeRenamed > 0;
-      if (!stillPending && !movedThisRound) { return; }
-      if (!stillPending) { return; }
+      if (!stillPending && !movedThisRound) { break; }
+      if (!stillPending) { break; }
+    }
+    // Branch/HEAD detection is intentionally lazy in normal searches, where
+    // sync has a short responsiveness budget. Explicit test drains must await
+    // that writer too before asserting which engine answered the next query.
+    const workspaceRoot = this.getWorkspaceRootPath();
+    if (workspaceRoot && this.getConfiguredEngine() === 'zoekt') {
+      const binary = await this.resolveBinary(false);
+      if (binary) { await this.syncWorkspaceIndexIfNeeded(workspaceRoot, binary, 'test drain'); }
     }
   }
 
