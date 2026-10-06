@@ -203,6 +203,39 @@ suite('Extension-typing filter — client-side narrowing', () => {
     );
   });
 
+  test('a delayed base-search start preserves the newer client-side query filter', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(15_000);
+    const api = await getApi();
+    try {
+      assert.strictEqual(await api.overlay.showAndWaitForTests('Beta',
+        { forceLiteral: true, __skipBridgeRepair: true }), true);
+      await waitUntil(api, (s) => !s.searching && s.rgQuery === 'Beta' && s.flatCount > 0,
+        10_000, 'base query to finish');
+      assert.strictEqual(await api.overlay.showAndWaitForTests('BetaWidget', { __skipBridgeRepair: true }), true);
+      await waitUntil(api, (s) => s.filterQuery === 'BetaWidget', 5_000, 'newer query to narrow the base results');
+      // Delivery can lag behind the input transition. The start notification
+      // belongs to the base request, whose newer filter must remain active.
+      await api.overlay.evalInActiveWindowForTests(`(function () {
+        var state = window.__ijFindGetSearchState();
+        window.__ijFindOnMessage({ type: 'results:start', searchId: state.searchId,
+          __targetSrc: state.rendererInstanceId });
+        return 'delivered';
+      })()`);
+      const afterStart = await probeState(api);
+      assert.strictEqual(afterStart.inputValue, 'BetaWidget');
+      assert.strictEqual(afterStart.rgQuery, 'Beta');
+      assert.strictEqual(afterStart.filterQuery, 'BetaWidget', 'a delayed start must retain the newer filter');
+    } finally {
+      await api.overlay.evalInActiveWindowForTests(`(function () {
+        window.__ijFindRefreshSearch(); return 'refreshed';
+      })()`);
+    }
+    const refreshed = await waitUntil(api, (s) => !s.searching && s.rgQuery === 'BetaWidget',
+      10_000, 'explicit refresh to replace the base query');
+    assert.strictEqual(refreshed.filterQuery, '', 'a newly submitted base query must clear the old filter');
+  });
+
   test('refresh button is rendered in the toolbar', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     const api = await getApi();

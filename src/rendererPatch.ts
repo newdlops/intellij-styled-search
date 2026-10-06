@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 146;
+export const RENDERER_PATCH_VERSION = 147;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -14092,7 +14092,8 @@ export function getRendererPatchScript(
         state.candidateTotal = 0; state.confirmedUris = {}; state.fileIndexByUri = {};
         state.matchCount = 0;
         state.searchId = msgSearchId !== null ? msgSearchId : ((state.searchId || 0) + 1);
-        state.filterQuery = '';
+        // A new base request clears its filter in triggerSearch/show. Keep
+        // any newer narrowing entered while this start message was in flight.
         state.hasMoreResults = false;
         state.loadingMore = false;
         state.lastBatchOffset = 0;

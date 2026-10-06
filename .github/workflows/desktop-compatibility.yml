@@ -43,6 +43,10 @@ jobs:
         run: npm test -- --run out/test/suite/desktopCompatibility.test.js
       - name: Extension functional regressions
         run: npm test -- --exclude out/test/suite/renderer.test.js --exclude out/test/suite/captainIndexGate.test.js
+      - name: Renderer save and recovery acceptance
+        env:
+          IJSS_E2E_GREP: 'shared bundled preview model preserves|bundled preview stays dirty|real preview save preserves|renderer recovery only pauses'
+        run: npm test -- --run out/test/suite/renderer.test.js
       - name: Renderer diagnostics and hardware timing budgets
         continue-on-error: true
         run: npm test -- --run out/test/suite/renderer.test.js

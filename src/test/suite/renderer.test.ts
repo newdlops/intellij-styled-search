@@ -3249,8 +3249,10 @@ suite('Renderer — overlay UI probes', () => {
     const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
     const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
     const previewUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
-    const baselineText = (await vscode.workspace.openTextDocument(previewUri)).getText();
-    const unsavedText = `${baselineText}\n# unsaved shared preview edit ${Date.now()}`;
+    const previewDocument = await vscode.workspace.openTextDocument(previewUri);
+    const baselineText = previewDocument.getText();
+    const eol = previewDocument.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    const unsavedText = `${baselineText}${eol}# unsaved shared preview edit ${Date.now()}`;
     const switchUri = vscode.Uri.joinPath(folder!.uri, `shared-preview-switch-${Date.now()}.txt`).toString();
     const firstQuery = 'BundledSharedModelOwnerA';
     const secondQuery = 'BundledSharedModelOwnerB';
@@ -3471,11 +3473,13 @@ suite('Renderer — overlay UI probes', () => {
     const priorDisable = cfg.inspect<boolean>('disableMonacoCapture')?.workspaceValue;
     const priorTransient = cfg.inspect<boolean>('allowTransientPreviewCaptureEditor')?.workspaceValue;
     const previewUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py');
-    const baselineText = (await vscode.workspace.openTextDocument(previewUri)).getText();
-    const firstSavedText = `${baselineText}\n# first acknowledged preview edit ${Date.now()}`;
-    const formattedFirstSavedText = `${firstSavedText}\n# format-on-save output`;
-    const secondSavedText = `${firstSavedText}\n# second pending preview edit`;
-    const interveningText = `${secondSavedText}\n# edit made while save is pending`;
+    const previewDocument = await vscode.workspace.openTextDocument(previewUri);
+    const baselineText = previewDocument.getText();
+    const eol = previewDocument.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    const firstSavedText = `${baselineText}${eol}# first acknowledged preview edit ${Date.now()}`;
+    const formattedFirstSavedText = `${firstSavedText}${eol}# format-on-save output`;
+    const secondSavedText = `${firstSavedText}${eol}# second pending preview edit`;
+    const interveningText = `${secondSavedText}${eol}# edit made while save is pending`;
     const queryValue = 'BundledSaveAcknowledgementProbe';
 
     try {

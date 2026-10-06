@@ -79,6 +79,8 @@ export default defineConfig({
   workspaceFolder,
   mocha: {
     ui: 'tdd',
+    reporter: path.join(repoRoot, 'tests', 'e2e-reporter.cjs'),
+    grep: process.env.IJSS_E2E_GREP,
     timeout: captainWorkspace ? 600_000 : 30_000,
     bail: captainWorkspace,
     // Tests build the trigram index from scratch (rebuild() walks the

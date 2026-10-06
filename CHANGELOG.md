@@ -6,6 +6,7 @@
 - Bounded ripgrep candidate arguments by the Windows command-line limit and corrected drive/UNC file URI identity in native and JavaScript graph indexes.
 - Made literal snippets match LF and CRLF files consistently while retaining indentation, punctuation, candidate narrowing, and multiline highlight ranges.
 - Normalized ripgrep file-list paths before removing current-directory prefixes so Windows index identities and exclusions agree.
+- Preserved newer client-side query narrowing when a base search start notification arrives late.
 - Serialized concurrent graph writers with OS locks on Windows as well as POSIX systems.
 - Read Windows file IDs and independent change timestamps for safe unchanged-index reuse and incremental sync, including edits that restore modification times.
 - Invalidated old Windows graph URI caches while retaining existing macOS caches, and packaged Windows runtimes with a static C runtime.
