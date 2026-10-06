@@ -24,7 +24,7 @@ async function invoke(binary: string, args: string[]): Promise<any> {
   return new Promise((resolve, reject) => {
     execFile(binary, args, { windowsHide: true, timeout: 30_000, maxBuffer: 4 * 1024 * 1024,
       env: { ...process.env, ZOEK_GRAPH_WORKERS: '2' } }, (error, stdout, stderr) => {
-      if (error) { reject(new Error(`${error.message}\n${stderr}`)); return; }
+      if (error) { reject(new Error(`${error.message}\n${stderr}\nsignal=${error.signal ?? 'none'} killed=${error.killed}`)); return; }
       try { resolve(JSON.parse(stdout)); } catch (err) { reject(err); }
     });
   });
@@ -44,8 +44,11 @@ suite('Desktop compatibility', () => {
       assert.strictEqual(path.basename(relativeExecutable), 'code.exe');
       const host = await invoke('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
         "$id=[Security.Principal.WindowsIdentity]::GetCurrent(); $p=[Security.Principal.WindowsPrincipal]::new($id); " +
-        "@{user=$id.Name;administrator=$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);" +
-        "os=(Get-CimInstance Win32_OperatingSystem).Caption} | ConvertTo-Json -Compress"]);
+        "@{user=$id.Name;administrator=$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)} | ConvertTo-Json -Compress"]);
+      // Query this extension host's kernel directly, avoiding a cold WMI
+      // provider query inside the x64-emulated PowerShell process.
+      host.os = os.version();
+      host.osRelease = os.release();
       assert.strictEqual(host.administrator, false, 'the extension host itself must run without administrator privileges');
       assert.match(host.os, /Windows 11/);
       const artifacts = process.env.IJSS_E2E_WINDOWS_USER_SETUP_ARTIFACTS!;
