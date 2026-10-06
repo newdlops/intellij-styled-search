@@ -1974,7 +1974,7 @@ suite('Activation', () => {
     }
   });
 
-  test('preview requests render immediately and defer native warmup until bundled Monaco starts', async function () {
+  test('preview delivery does not await bundled or native Monaco warmup', async function () {
     this.timeout(5_000);
     const { overlay } = await getApi();
     const anyOverlay = overlay as any;
@@ -1992,8 +1992,15 @@ suite('Activation', () => {
     const previewSeq = 42;
     let resolveWarmup: (() => void) | undefined;
     const warmupPromise = new Promise<void>((resolve) => { resolveWarmup = resolve; });
-    const sends: Array<{ at: number; args: unknown[] }> = [];
+    let resolveBundle: (() => void) | undefined;
+    const bundlePromise = new Promise<void>((resolve) => { resolveBundle = resolve; });
+    let resolveCaptureStarted: (() => void) | undefined;
+    const captureStarted = new Promise<void>((resolve) => { resolveCaptureStarted = resolve; });
+    let resolveRefresh: (() => void) | undefined;
+    const refreshed = new Promise<void>((resolve) => { resolveRefresh = resolve; });
+    const sends: Array<{ args: unknown[] }> = [];
     const captureCalls: unknown[][] = [];
+    let bundleStarted = false;
 
     anyOverlay.activeWindowId = 7;
     anyOverlay.isMonacoCaptureEnabled = () => true;
@@ -2002,12 +2009,17 @@ suite('Activation', () => {
     };
     anyOverlay.ensureMonacoCapture = async (...args: unknown[]) => {
       captureCalls.push(args);
+      resolveCaptureStarted?.();
       return warmupPromise;
     };
-    anyOverlay.injectStandaloneMonacoBundle = async () => {};
+    anyOverlay.injectStandaloneMonacoBundle = async () => {
+      bundleStarted = true;
+      return bundlePromise;
+    };
     anyOverlay.isMonacoReadyInWindow = async () => true;
     anyOverlay.sendPreview = async (...args: unknown[]) => {
-      sends.push({ at: Date.now(), args });
+      sends.push({ args });
+      if (sends.filter((send) => send.args[0] === previewUri).length === 2) { resolveRefresh?.(); }
     };
     anyOverlay.releasePreviewCaptureTabsSoon = () => {};
     anyOverlay.scheduleCdpSearchIdleClose = () => {};
@@ -2015,7 +2027,6 @@ suite('Activation', () => {
 
     let requestPromise: Promise<void> | undefined;
     try {
-      const started = Date.now();
       requestPromise = anyOverlay.handlePreviewRequest({
         type: 'requestPreview',
         uri: previewUri,
@@ -2025,27 +2036,30 @@ suite('Activation', () => {
         previewSeq,
       });
       const targetSends = () => sends.filter((send) => send.args[0] === previewUri);
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      assert.strictEqual(targetSends().length, 1, 'preview should render once when Monaco warmup exceeds the budget');
-      assert.strictEqual(captureCalls.length, 0, 'native capture should wait until the bundled Monaco path gets the first turn');
-      await new Promise((resolve) => setTimeout(resolve, 160));
+      // Hold both initialization dependencies open. A shared runner's wall
+      // clock cannot prove whether preview delivery awaits either dependency.
+      await requestPromise;
+      assert.strictEqual(targetSends().length, 1, 'preview delivery must finish while bundled Monaco is still loading');
+      assert.strictEqual(bundleStarted, true, 'preview delivery should start bundled Monaco in the background');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.strictEqual(captureCalls.length, 0, 'native capture must wait for the pending bundled Monaco load');
+      resolveBundle?.();
+      await captureStarted;
       assert.strictEqual(captureCalls.length, 1, 'preview should attempt Monaco warmup once');
+      assert.strictEqual(targetSends().length, 1, 'pending native warmup must not refresh or block the delivered preview');
       assert.strictEqual(captureCalls[0]?.[1], undefined, 'preview warmup should not pass a force-open URI');
       assert.strictEqual(
         (captureCalls[0]?.[2] as { allowForceOpen?: boolean } | undefined)?.allowForceOpen,
         false,
         'preview warmup must not force-open an editor tab or column',
       );
-      assert.ok(
-        targetSends()[0]!.at - started < 80,
-        `preview should not wait for full Monaco warmup; waited ${targetSends()[0]!.at - started}ms`,
-      );
       resolveWarmup?.();
-      await requestPromise;
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await refreshed;
+      await new Promise<void>((resolve) => setImmediate(resolve));
       assert.strictEqual(targetSends().length, 2, 'preview should refresh after late Monaco warmup becomes ready');
       assert.deepStrictEqual(targetSends().map((send) => send.args[0]), [previewUri, previewUri]);
     } finally {
+      resolveBundle?.();
       resolveWarmup?.();
       if (requestPromise) {
         try { await Promise.race([requestPromise, new Promise((resolve) => setTimeout(resolve, 100))]); } catch {}
