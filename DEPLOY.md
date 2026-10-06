@@ -37,12 +37,12 @@ On Windows the packaged runtime tuple is `resources/bin/win32-x64/` (or the matc
 
 ## Release Checklist
 
-1. Update the extension version in `package.json`.
+1. Update the extension version in `package.json` and `package-lock.json`.
 2. Update `CHANGELOG.md`.
 3. Compile the extension:
 
 ```bash
-npm install
+npm ci
 npm run compile
 ```
 
@@ -53,28 +53,34 @@ npm test
 cargo test -p zoek-rs
 ```
 
-5. Build the Rust binaries you intend to ship:
+5. Build and stage the Rust binaries on each platform you intend to ship:
 
 ```bash
-cargo build --release -p zoek-rs
+npm run build:zoek-runtime
 ```
 
-That single Cargo command builds both:
+This builds both executables and writes their source-fingerprinted manifest to
+`resources/bin/<platform-arch>/`. A plain `cargo build` leaves binaries under
+`target/`, which is excluded from the VSIX.
 
-- `target/release/zoek-rs`
-- `target/release/ijss-rebuild`
+6. Package the staged tuples, verify the VSIX contents, and publish that exact
+file using the universal or platform-specific flow below.
 
 ## Default `vsce package` Behavior
 
-The current `.vscodeignore` excludes `target/**`.
+The current `.vscodeignore` excludes `target/**` and includes
+`resources/bin/<platform-arch>/`.
 
-That means a plain:
+On a fresh checkout without staged tuples:
 
 ```bash
 vsce package
 ```
 
-produces a VSIX without prebuilt Rust executables.
+produces a VSIX without prebuilt Rust executables. If tuples have already been
+staged under `resources/bin/`, the same command includes them in a universal
+VSIX. The prepublish step compiles TypeScript; it does not build or download
+Rust runtimes.
 
 What that implies:
 
@@ -121,13 +127,52 @@ node scripts/buildZoekRuntime.js \
    fingerprint, and SHA-256 pair identity. It fails if the Rust sources change
    while Cargo is building.
 
-2. Package the extension for that same target:
+2. Choose a universal package containing all staged tuples, or a
+   platform-specific package containing the matching tuple.
+
+### Universal Marketplace release
+
+Build the Windows and macOS tuples separately, or download their runtime pairs
+from the same successful desktop compatibility workflow commit. Copy each
+complete tuple, including `manifest.json`, into its own `resources/bin/`
+directory. Preserve Unix executable permissions when staging macOS binaries.
+
+The current desktop release bundles `win32-x64` and `darwin-arm64`. Other
+architectures need their own matching tuples to use the native engine without
+a local Cargo build; a universal package does not create missing binaries.
+
+Package without `--target`:
+
+```bash
+vsce package --out intellij-styled-search-universal.vsix
+```
+
+Before publishing, verify both tuples are present, their manifest fingerprints
+match the packaged Rust sources, and their binary hashes match the manifests.
+Confirm the version and compiled JavaScript match the release checkout.
+Install and smoke-test the package as described below.
+
+Publish the exact file that was verified:
+
+```bash
+vsce publish --packagePath intellij-styled-search-universal.vsix
+```
+
+This is one upload to the existing `newdlops.intellij-styled-search` Marketplace
+listing. The extension selects its native runtime by OS and architecture.
+
+### Platform-specific Marketplace release
+
+Stage the matching tuple and package it with a target:
 
 ```bash
 vsce package --target <platform-arch>
 ```
 
-3. Install and verify the packaged VSIX on a machine without Cargo or repo-local state.
+Publish each verified target VSIX under the same extension ID and version with
+`vsce publish --packagePath <target-vsix>`. VS Code selects the matching package;
+separate Marketplace listings are unnecessary. `--target` does not compile the
+native binaries. See the [official platform-specific publishing guide](https://code.visualstudio.com/api/working-with-extensions/publishing-extension#platform-specific-extensions).
 
 ## Local Verification
 
@@ -144,4 +189,4 @@ Recommended smoke checks:
 
 - `npm run compile` only builds the TypeScript side and bundles Monaco.
 - `vscode:prepublish` currently runs `npm run compile`; it does not build Rust binaries for you.
-- If you want reproducible release artifacts, prefer shipping prebuilt `target/release` binaries instead of relying on first-run Cargo builds.
+- For reproducible release artifacts, stage complete, source-matched runtime tuples under `resources/bin/` instead of relying on first-run Cargo builds.

@@ -173,9 +173,10 @@ Deployment and release steps now live in [DEPLOY.md](DEPLOY.md).
 
 Short version:
 
-- `vsce package` builds a lightweight VSIX from the current `.vscodeignore`.
+- `vsce package` includes any staged `resources/bin/<platform-arch>/` tuples in a universal VSIX; a fresh checkout without tuples produces a lightweight package.
 - Without a `resources/bin/<platform-arch>/` tuple it relies on the global Cargo cache and a one-time local Rust build per Rust-source revision.
 - Run `npm run build:zoek-runtime` before packaging a self-contained host-platform VSIX; use the explicit target options in `DEPLOY.md` for cross-platform artifacts.
+- The current universal desktop release bundles Windows x64 and Apple Silicon macOS runtimes in one Marketplace package.
 
 Quick local package:
 
