@@ -423,6 +423,7 @@ type RustGraphQueryResponse = {
   generation?: string;
   references?: RustGraphQueryReference[];
   warnings?: string[];
+  message?: string;
 };
 
 export type CallGraphUsagePage = {
@@ -4484,6 +4485,9 @@ export class CallGraphService implements vscode.Disposable {
         '--offset', String(Math.max(0, Math.floor(offset))),
         ...(generation !== undefined ? ['--generation', generation] : []),
       ]) as RustGraphQueryResponse;
+      if (response.ok === false) {
+        throw new Error(response.message || 'Native usage query failed.');
+      }
       if (
         response.type !== 'graph-query' ||
         response.ok !== true ||

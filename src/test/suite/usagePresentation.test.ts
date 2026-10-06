@@ -81,8 +81,12 @@ suite('Usage result presentation', () => {
     const { callGraph } = await getApi();
     const config = vscode.workspace.getConfiguration('intellijStyledSearch');
     const previous = config.inspect<string>('callGraphBackend')?.workspaceValue;
+    const previousWatch = config.inspect<boolean>('callGraphWatchExternalFileChanges')?.workspaceValue;
     const file = vscode.Uri.joinPath(vscode.workspace.workspaceFolders![0].uri, 'usage_native_pages.py');
     try {
+      // Own index changes explicitly; delayed file events must not race the
+      // stable-page assertions. Generation invalidation is exercised below.
+      await config.update('callGraphWatchExternalFileChanges', false, vscode.ConfigurationTarget.Workspace);
       await config.update('callGraphBackend', 'rust-native', vscode.ConfigurationTarget.Workspace);
       await vscode.workspace.fs.writeFile(file, Buffer.from('def native_page_target():\n    return 1\n\ndef invoke():\n' + '    native_page_target()\n'.repeat(17)));
       await callGraph.rebuild(undefined, undefined, { force: true });
@@ -100,9 +104,18 @@ suite('Usage result presentation', () => {
       assert.strictEqual(second.totalReferences, 17);
       assert.strictEqual(second.generation, first.generation);
       assert.strictEqual(new Set([...first.references, ...second.references].map((reference) => reference.sourceRefId)).size, 10);
+      await vscode.workspace.fs.writeFile(file, Buffer.from('def native_page_target():\n    return 1\n\ndef invoke():\n' + '    native_page_target()\n'.repeat(18)));
+      await callGraph.refreshChangedFilesForTests([file]);
+      await assert.rejects(() => callGraph.findUsagePageForSymbolIdFromCache(target.id, 5, first.nextOffset, first.generation),
+        /Usage results changed/, 'native JSON errors must reach the pagination refresh path');
+      const refreshed = await callGraph.findUsagePageForSymbolIdFromCache(target.id, 5);
+      assert.ok(refreshed);
+      assert.strictEqual(refreshed.totalReferences, 18);
+      assert.notStrictEqual(refreshed.generation, first.generation);
     } finally {
       await vscode.workspace.fs.delete(file);
       await config.update('callGraphBackend', previous, vscode.ConfigurationTarget.Workspace);
+      await config.update('callGraphWatchExternalFileChanges', previousWatch, vscode.ConfigurationTarget.Workspace);
     }
   });
 
@@ -130,6 +143,9 @@ suite('Usage result presentation', () => {
     let release!: (references: CallGraphReference[]) => void;
     let firstRefinement = true;
     let failNextPage = true;
+    let staleNextPage = false;
+    let pageGeneration = 'fixture:1';
+    let firstPageGeneration = '';
     let src = '';
     let harness: Awaited<ReturnType<typeof debuggerHarness>> | undefined;
     try {
@@ -139,9 +155,15 @@ suite('Usage result presentation', () => {
       callGraph.findUsagePageForSymbolIdFromCache = async (_id, limit = 10, offset = 0) => {
         assert.strictEqual(limit, 10, 'the inlay total must not inflate the page allocation');
         if (offset > 0 && failNextPage) { failNextPage = false; throw new Error('temporary page failure'); }
+        if (offset > 0 && staleNextPage) {
+          staleNextPage = false;
+          pageGeneration = 'fixture:2';
+          throw new Error('Usage results changed; reload the first page.');
+        }
+        if (offset === 0) { firstPageGeneration = pageGeneration; }
         const end = Math.min(references.length, offset + limit);
         return { references: references.slice(offset, end), totalReferences: references.length, offset,
-          ...(end < references.length ? { nextOffset: end } : {}), generation: 'fixture:1' };
+          ...(end < references.length ? { nextOffset: end } : {}), generation: pageGeneration };
       };
       callGraph.refineUsageReferencesWithCurrentSources = async (batch) => {
         if (!firstRefinement) { return [...batch]; }
@@ -196,6 +218,11 @@ suite('Usage result presentation', () => {
       await vscode.commands.executeCommand('intellijStyledSearch.showUsagesForSymbol', target.id, 'Usage scroll fixture', 35);
       await waitFor(async () => (await rendererState(overlay, src)).flatCount === 10, 'a fresh query starts at one page');
       const scrollPoint = JSON.parse(await overlay.evalInActiveWindowForTests(`(function(){var r=window.__ijFindInstances[${JSON.stringify(src)}].panel.querySelector('.ij-find-results').getBoundingClientRect();return JSON.stringify({x:r.left+r.width/2,y:r.top+r.height/2});})()`));
+      staleNextPage = true;
+      await harness.command('Input.dispatchMouseEvent', { type: 'mouseWheel', ...scrollPoint, deltaX: 0, deltaY: 400 });
+      await waitFor(async () => firstPageGeneration === 'fixture:2' && (await rendererState(overlay, src)).flatCount === 10,
+        'a stale continuation refreshes the first page');
+      assert.ok(!(await rendererState(overlay, src)).status.includes('Could not load more'));
       await harness.command('Input.dispatchMouseEvent', { type: 'mouseWheel', ...scrollPoint, deltaX: 0, deltaY: 400 });
       await waitFor(async () => (await rendererState(overlay, src)).flatCount === 20, 'ordinary wheel input loads the next usage page');
     } finally {
