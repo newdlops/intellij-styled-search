@@ -10,7 +10,7 @@ function collect(directory) {
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
     const file = path.join(directory, entry.name);
     if (entry.isDirectory()) collect(file);
-    else if (entry.isFile() && names.has(entry.name)) {
+    else if (entry.isFile() && (names.has(entry.name) || /^\d+-IntelliJ Styled Search\.log$/.test(entry.name))) {
       const output = path.join(destination, path.relative(source, file));
       fs.mkdirSync(path.dirname(output), { recursive: true });
       const content = fs.readFileSync(file, 'utf8')

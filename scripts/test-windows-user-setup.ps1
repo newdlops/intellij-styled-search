@@ -19,10 +19,16 @@ if ($AsTestUser) {
   if ($osInfo.Caption -notmatch 'Windows 11') { throw "Expected Windows 11, got $($osInfo.Caption)" }
   $hostArchitecture = $env:PROCESSOR_ARCHITECTURE
   if ($env:PROCESSOR_ARCHITEW6432) { $hostArchitecture = $env:PROCESSOR_ARCHITEW6432 }
-  $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
-  $env:USERPROFILE = [Environment]::GetFolderPath('UserProfile')
+  $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($identity.User.Value)"
+  $profilePath = [Environment]::ExpandEnvironmentVariables((Get-ItemProperty $profileKey).ProfileImagePath)
+  if (!$profilePath) { throw 'Windows did not load the standard account profile.' }
+  $env:USERPROFILE = $profilePath
+  $localAppData = [Environment]::GetFolderPath('LocalApplicationData', 'Create')
+  if (!$localAppData) { $localAppData = Join-Path $profilePath 'AppData/Local' }
   $env:LOCALAPPDATA = $localAppData
-  $env:APPDATA = [Environment]::GetFolderPath('ApplicationData')
+  $env:APPDATA = [Environment]::GetFolderPath('ApplicationData', 'Create')
+  if (!$env:APPDATA) { $env:APPDATA = Join-Path $profilePath 'AppData/Roaming' }
+  New-Item -ItemType Directory -Force $localAppData, $env:APPDATA | Out-Null
   $env:TEMP = Join-Path $localAppData 'Temp'
   $env:TMP = $env:TEMP
   New-Item -ItemType Directory -Force $env:TEMP | Out-Null

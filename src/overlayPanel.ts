@@ -351,7 +351,11 @@ function wrapLogWithPrefix(channel: vscode.OutputChannel, version: string): vsco
   return new Proxy(channel, {
     get(target, prop, receiver) {
       if (prop === 'appendLine') {
-        return (value: string) => target.appendLine(prefix() + value);
+        return (value: string) => {
+          const line = prefix() + value;
+          target.appendLine(line);
+          if (process.env.IJSS_E2E_MIRROR_LOGS === '1') { console.info(line); }
+        };
       }
       if (prop === 'append') {
         return (value: string) => target.append(prefix() + value);
@@ -3901,7 +3905,43 @@ export class OverlayPanel {
     });
 
     await this.send('Runtime.enable', {});
-    await this.send('Runtime.addBinding', { name: BRIDGE_BINDING });
+    const bridge = await this.ensureLocalBridgeServer();
+    // Node inspector bindings belong to their CDP session. Renderer/console
+    // listeners outlive socket reconnects, so use an ordinary JS function
+    // backed by the extension host's loopback endpoint instead of retaining a
+    // session-owned native callback in Electron's main process.
+    await this.send('Runtime.evaluate', {
+      expression: `(function(){
+        var defaultTarget = ${JSON.stringify(bridge)};
+        var bindingName = ${JSON.stringify(BRIDGE_BINDING)};
+        global[bindingName] = function(raw) {
+          var payload = String(raw);
+          var windowId = 0;
+          try { windowId = JSON.parse(payload).__win || 0; } catch (_) {}
+          var targets = global.__ijFindConsoleBridgeTargets;
+          var target = targets && targets.get(windowId) || defaultTarget;
+          if (!global.__ijFindMainHttpBridgeChains) global.__ijFindMainHttpBridgeChains = new Map();
+          var chains = global.__ijFindMainHttpBridgeChains;
+          var post = function(){return new Promise(function(resolve){
+            try {
+              var request = require('http').request({hostname:'127.0.0.1',port:target.port,
+                path:'/ijss-bridge',method:'POST',headers:{'content-type':'application/json','x-ijss-token':target.token}},
+                function(response){response.resume();response.on('end',resolve);response.on('error',resolve)});
+              request.on('error',resolve);
+              request.setTimeout(2000,function(){request.destroy();resolve()});
+              request.end(payload);
+            } catch (_) { resolve(); }
+          })};
+          var previous = chains.get(windowId) || Promise.resolve();
+          var next = previous.then(post,post);
+          chains.set(windowId,next);
+          next.then(function(){if(chains.get(windowId)===next)chains.delete(windowId)});
+        };
+        return 'main-http-bridge';
+      })()`,
+      includeCommandLineAPI: true,
+      returnByValue: true,
+    });
 
     const retainedReport = await this.probeRetainedRendererPatch(options);
     if (retainedReport) {

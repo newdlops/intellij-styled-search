@@ -27,6 +27,7 @@ jobs:
       IJSS_E2E_REQUIRE_CDP: '1'
       IJSS_E2E_VSCODE_VERSION: ${{ matrix.vscode }}
       IJSS_E2E_TIMING_REPORT: '1'
+      IJSS_E2E_MIRROR_LOGS: '1'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
