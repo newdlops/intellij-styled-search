@@ -165,7 +165,7 @@ Windows opens the Electron main inspector through Node's native debug hook. It d
 
 Run `npm run compile`, `npm run test:unit`, and `cargo test --locked -p zoek-rs` for structural regression checks. After `npm run build:zoek-runtime`, `npm test` runs the actual desktop extension. The [desktop compatibility workflow](.github/workflows/desktop-compatibility.yml) checks current macOS/Windows builds plus VS Code 1.114.0 on Windows, requires renderer attachment, exercises on-demand inspector activation, and saves rendered workbench screenshots at Chromium viewports of 1440×900, 1024×768, and 800×600 under `artifacts/desktop-compatibility/`.
 
-Full renderer functional checks remain required on shared CI runners. Hardware timing measurements, unchanged budgets, and any overruns are shown in the job summary and desktop artifact. Local renderer tests enforce those budgets by default; manual workflow runs can also enable `enforce_timings`. See [performance verification](DEPLOY.md#local-verification) for the strict and report modes.
+Full renderer functional checks remain required on shared CI runners. Hardware timing measurements, unchanged budgets, and any overruns are shown in the job summary and desktop artifact. Local renderer tests enforce those budgets by default. The workflow's `enforce_timings` input supports strict manual runs once the workflow is registered on the default branch. See [performance verification](DEPLOY.md#local-verification) for the strict and report modes and current branch prerequisites.
 
 Its Windows 11 job installs x64 UserSetup 1.114.0 and stable as a standard
 account and verifies that the extension host actually runs without administrator

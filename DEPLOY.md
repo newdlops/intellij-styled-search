@@ -208,8 +208,11 @@ npm test -- --run out/test/suite/renderer.test.js
 `IJSS_E2E_TIMING_MODE=strict` makes that policy explicit;
 `IJSS_E2E_TIMING_MODE=report` records hardware measurements without failing on
 wall-clock overruns. Unknown modes and incomplete/non-finite measurements fail
-in either mode. Manual workflow runs also offer `enforce_timings` to opt into
-strict budgets on the hosted runner.
+in either mode. The workflow defines `enforce_timings` for strict manual runs.
+GitHub requires the workflow to be registered on the repository's default
+branch before manual dispatch is available. This workflow currently lives on
+`main2`, while the default branch is `main`; use the local strict command until
+that registration is made. See [GitHub's manual workflow requirements](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
 
 Recommended smoke checks:
 
