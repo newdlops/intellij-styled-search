@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import {
   IndexingMemoryPressureError,
   IndexingMemoryProtection,
@@ -15,6 +15,16 @@ const GIB = 1024 * MIB;
 
 function snapshot(totalBytes: number, availableBytes: number): SystemMemorySnapshot {
   return { totalBytes, availableBytes, source: 'os-freemem' };
+}
+
+function mockIntervals(context: TestContext): { tick(milliseconds: number): void } {
+  // Tests run on Node 22; the repository retains Node 18 type definitions.
+  const timers = context.mock.timers as unknown as {
+    enable(options: { apis: string[] }): void;
+    tick(milliseconds: number): void;
+  };
+  timers.enable({ apis: ['setInterval'] });
+  return timers;
 }
 
 test('classifies scalable host reserves without making small hosts unusable', () => {
@@ -91,7 +101,8 @@ test('blocks a new index before work starts and reports actionable memory totals
   );
 });
 
-test('stops sustained pressure while tolerating a single transient sample', async () => {
+test('stops sustained pressure while tolerating a single transient sample', (context) => {
+  const timers = mockIntervals(context);
   const healthy = snapshot(16 * GIB, 4 * GIB);
   const pressured = snapshot(16 * GIB, 1_500 * MIB);
   const samples = [pressured, healthy, pressured, pressured];
@@ -106,14 +117,21 @@ test('stops sustained pressure while tolerating a single transient sample', asyn
     sustainedPressureSamples: 2,
   });
   const monitor = protection.monitor('fixture running index', (error) => errors.push(error));
-  await new Promise<void>((resolve) => setTimeout(resolve, 70));
-  monitor.dispose();
+  for (let sample = 0; sample < 3; sample++) {
+    timers.tick(10);
+    assert.equal(errors.length, 0, 'a transient sample or recovery must not stop the index');
+  }
+  timers.tick(10);
   assert.equal(errors.length, 1);
   assert.equal(errors[0].phase, 'running');
   assert.match(errors[0].message, /fixture running index stopped/);
+  timers.tick(100);
+  assert.equal(errors.length, 1, 'the pressure monitor must stop after its first cancellation');
+  monitor.dispose();
 });
 
-test('stops critical pressure on the first sample', async () => {
+test('stops critical pressure on the first sample', (context) => {
+  const timers = mockIntervals(context);
   const errors: IndexingMemoryPressureError[] = [];
   const protection = new IndexingMemoryProtection({
     sample: () => snapshot(16 * GIB, 256 * MIB),
@@ -121,8 +139,10 @@ test('stops critical pressure on the first sample', async () => {
     sustainedPressureSamples: 5,
   });
   const monitor = protection.monitor('fixture critical index', (error) => errors.push(error));
-  await new Promise<void>((resolve) => setTimeout(resolve, 25));
-  monitor.dispose();
+  timers.tick(10);
   assert.equal(errors.length, 1);
   assert.equal(errors[0].assessment.level, 'critical');
+  timers.tick(100);
+  assert.equal(errors.length, 1, 'critical pressure must cancel once without waiting for more samples');
+  monitor.dispose();
 });
