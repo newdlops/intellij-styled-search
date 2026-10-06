@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 151;
+export const RENDERER_PATCH_VERSION = 152;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -9101,7 +9101,13 @@ export function getRendererPatchScript(
         var layoutT0 = perfNow();
         try {
           var rect = state.previewMonacoHost.getBoundingClientRect();
-          state.previewMonacoEditor.layout({ width: Math.floor(rect.width), height: Math.floor(rect.height) });
+          var width = Math.floor(rect.width);
+          var height = Math.floor(rect.height);
+          var currentLayout = null;
+          try { currentLayout = state.previewMonacoEditor.getLayoutInfo && state.previewMonacoEditor.getLayoutInfo(); } catch (eLayoutInfo) {}
+          if (!currentLayout || currentLayout.width !== width || currentLayout.height !== height) {
+            state.previewMonacoEditor.layout({ width: width, height: height });
+          }
         } catch (e) {}
         var layoutMs = Math.round(perfNow() - layoutT0);
         wirePreviewMonacoEditor(state.previewMonacoEditor);
@@ -12660,7 +12666,13 @@ export function getRendererPatchScript(
         rect = state.monacoHost.getBoundingClientRect();
       }
       if (editor && rect && rect.width > 0 && rect.height > 0 && typeof editor.layout === 'function') {
-        editor.layout({ width: Math.max(1, Math.floor(rect.width)), height: Math.max(1, Math.floor(rect.height)) });
+        var width = Math.max(1, Math.floor(rect.width));
+        var height = Math.max(1, Math.floor(rect.height));
+        var currentLayout = null;
+        try { currentLayout = editor.getLayoutInfo && editor.getLayoutInfo(); } catch (eLayoutInfo) {}
+        if (!currentLayout || currentLayout.width !== width || currentLayout.height !== height) {
+          editor.layout({ width: width, height: height });
+        }
         // Make preview readiness deterministic: model/layout changes normally
         // paint on a later animation frame, while our success check must reject
         // an editor whose real view rows failed to render.

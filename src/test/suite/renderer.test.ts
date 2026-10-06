@@ -6312,7 +6312,9 @@ suite('Renderer — overlay UI probes', () => {
       if (!monacoReady) { this.skip(); return; }
 
       await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true, spawn: true });
-      await warmMonacoPreviewForRendererTest(overlay, queryValue);
+      // Load the bundled implementation without mounting a preview that can
+      // commit native before the test has installed its cold-capture guards.
+      await anyOverlay.injectStandaloneMonacoBundle(anyOverlay.activeWindowId);
       const raw = await overlay.evalInActiveWindowForTests(
         `(async function(){
           var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
@@ -6533,7 +6535,7 @@ suite('Renderer — overlay UI probes', () => {
       if (!monacoReady) { this.skip(); return; }
 
       await overlay.show(queryValue, { forceLiteral: true, suppressSearch: true, spawn: true });
-      await warmMonacoPreviewForRendererTest(overlay, queryValue);
+      await anyOverlay.injectStandaloneMonacoBundle(anyOverlay.activeWindowId);
       const raw = await overlay.evalInActiveWindowForTests(
         `(async function(){
           var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
@@ -6565,6 +6567,7 @@ suite('Renderer — overlay UI probes', () => {
           var standaloneModel = null;
           try {
             window.__ijFindMonacoStatus = function () { return 'not-ready:test-dirty-before-capture'; };
+            var mountedStandalone = false;
             window.__ijFindCaptureFromDom = function () { return 'test-dirty-capture-suppressed'; };
             window.__ijFindTestCreateWidget = function () { return 'test-dirty-widget-suppressed'; };
             window.__ijFindOnMessage(msg);
@@ -6578,11 +6581,12 @@ suite('Renderer — overlay UI probes', () => {
               standaloneModel = standaloneEditor && standaloneEditor.getModel ? standaloneEditor.getModel() : null;
               if (state && state.previewEngine === 'standalone' && standaloneModel &&
                   String(standaloneModel.uri || '') === uri) {
+                mountedStandalone = true;
                 break;
               }
               await new Promise(function (resolve) { setTimeout(resolve, 20); });
             }
-            if (!standaloneEditor || !standaloneModel) {
+            if (!mountedStandalone || !standaloneEditor || !standaloneModel) {
               return JSON.stringify({ err: 'dirty probe did not mount bundled preview' });
             }
 

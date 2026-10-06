@@ -3,6 +3,7 @@
 ## 0.1.7152 - 2026-10-06
 
 - Shared the search stylesheet across panel instances and removed exact legacy duplicates so repeated panel opens do not accumulate CSS rules.
+- Reused the preview editor's current layout when its viewport dimensions have not changed.
 - Routed asynchronous usage results to the panel created by their own click and discarded results after that panel closed, preserving sibling panels and focus.
 - Removed the extra passive capture dwell when a preview has an explicitly enabled transient-editor fallback.
 - Prepared durable inlay commands from available graph metadata before notifying the workbench, keeping large first-time hint requests out of the command-registration backlog.
