@@ -4222,6 +4222,67 @@ suite('Renderer — overlay UI probes', () => {
     }
   });
 
+  test('native preview reuses only clean isolated models with the same source and language', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(20_000);
+    const { overlay } = await getApi();
+    const fixture = vscode.Uri.joinPath(vscode.workspace.workspaceFolders![0]!.uri, 'alpha.py');
+    await vscode.window.showTextDocument(fixture, { preview: false, preserveFocus: false });
+    await overlay.show('IsolatedModelReuseProbe', { forceLiteral: true, suppressSearch: true });
+    const anyOverlay = overlay as any;
+    await anyOverlay.ensureMonacoCapture(anyOverlay.activeWindowId, undefined, { allowForceOpen: true, bypassThrottle: true, reason: 'test-isolated-model-reuse' });
+    assert.ok(await overlay.waitForMonacoReadyForTests(6_000), 'expected a native model service for ownership checks');
+    const raw = await overlay.evalInActiveWindowForTests(`(function(){
+      var source=window.__ijFindActiveInstanceId;
+      var inst=window.__ijFindInstances[source];
+      if(!inst)return JSON.stringify({err:'missing preview fixture'});
+      var currentModel=null;
+      var widget={getModel:function(){return currentModel},setModel:function(model){currentModel=model}};
+      var original=null;
+      var originalContent='';
+      var temporaryModels=[];
+      try {
+        var set=window.__ijFindSetPreviewContent;
+        if(!set(widget,'first','plaintext','untitled:first-source',true))throw new Error('first content failed');
+        var first=widget.getModel();
+        temporaryModels.push(first);
+        var factory=window.__ijFindMonacoFactory||window.__ijFindMonaco;
+        original=factory.modelSvc.getModels().find(function(model){return model&&model.uri&&model.uri.scheme==='file'&&(!model.isDisposed||!model.isDisposed())});
+        if(!original)throw new Error('missing shared resource model');
+        originalContent=original.getValue();
+        if(!set(widget,'second','plaintext','untitled:first-source',true))throw new Error('second content failed');
+        var reused=widget.getModel();
+        var same=reused===first&&reused.getValue()==='second';
+        reused.setValue('unsaved edit');
+        if(!set(widget,'third','plaintext','untitled:first-source',true))throw new Error('dirty replacement failed');
+        var afterDirty=widget.getModel();
+        temporaryModels.push(afterDirty);
+        var dirtyExcluded=afterDirty!==reused;
+        if(!set(widget,'third','plaintext','untitled:second-source',true))throw new Error('other source failed');
+        var afterSource=widget.getModel();
+        temporaryModels.push(afterSource);
+        var sourceExcluded=afterSource!==afterDirty;
+        if(!set(widget,'third','typescript','untitled:second-source',true))throw new Error('other language failed');
+        var afterLanguage=widget.getModel();
+        temporaryModels.push(afterLanguage);
+        var languageExcluded=afterLanguage!==afterSource;
+        widget.setModel(original);
+        if(!set(widget,'fourth','plaintext','untitled:second-source',true))throw new Error('shared replacement failed');
+        temporaryModels.push(widget.getModel());
+        var sharedUntouched=widget.getModel()!==original&&(!original.isDisposed||!original.isDisposed())&&original.getValue()===originalContent;
+        return JSON.stringify({same:same,dirtyExcluded:dirtyExcluded,sourceExcluded:sourceExcluded,languageExcluded:languageExcluded,sharedUntouched:sharedUntouched});
+      }catch(error){
+        return JSON.stringify({err:String(error&&error.message||error)});
+      }finally{
+        widget.setModel(original);
+        temporaryModels.forEach(function(model){if(model&&model!==original&&model.dispose&&(!model.isDisposed||!model.isDisposed()))model.dispose()});
+      }
+    })()`);
+    const parsed = JSON.parse(raw);
+    assert.strictEqual(parsed.err, undefined, raw);
+    assert.deepStrictEqual(parsed, { same: true, dirtyExcluded: true, sourceExcluded: true, languageExcluded: true, sharedUntouched: true });
+  });
+
   test('rapid Monaco preview switches keep the latest preview without resource-model fanout', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(20_000);

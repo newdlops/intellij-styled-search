@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 152;
+export const RENDERER_PATCH_VERSION = 153;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -1748,7 +1748,8 @@ export function getRendererPatchScript(
     return null;
   }
   window.__ijFindCreatePreviewEditor = createPreviewEditor;
-  function createPreviewTextModel(content, languageId, uriStr, fullFile) {
+  var isolatedPreviewModelMetadata = new WeakMap();
+  function createPreviewTextModel(content, languageId, uriStr, fullFile, priorModel) {
     var m = getMonacoFactorySingleton();
     if (!m || !m.modelSvc) {
       var modelChoice = chooseLiveModelService(true, null);
@@ -1756,6 +1757,23 @@ export function getRendererPatchScript(
     }
     if (!m || !m.modelSvc) { return null; }
     var lang = languageId || 'plaintext';
+    var priorMetadata = priorModel && isolatedPreviewModelMetadata.get(priorModel);
+    // Reuse only this instance's unchanged, isolated model for the same source
+    // identity. Resource models belong to the workbench; user edits and
+    // another file/language must never be overwritten through this fast path.
+    if (priorMetadata && priorMetadata.uri === String(uriStr || '') &&
+        priorMetadata.language === lang && priorMetadata.fullFile === !!fullFile &&
+        (!priorModel.isDisposed || !priorModel.isDisposed()) &&
+        priorModel.getValue && priorModel.getValue() === priorMetadata.content) {
+      if (priorMetadata.content !== (content || '')) {
+        var priorSuppressDirty = state.previewSuppressDirty;
+        state.previewSuppressDirty = true;
+        try { priorModel.setValue(content || ''); }
+        finally { state.previewSuppressDirty = priorSuppressDirty; }
+        priorMetadata.content = content || '';
+      }
+      return priorModel;
+    }
     // Default: isolated model. Rapid-switch / pressure callers need to
     // create-and-throw-away models without paying LSP startup cost. We
     // upgrade to resource-bound asynchronously once the preview settles
@@ -1763,6 +1781,9 @@ export function getRendererPatchScript(
     // for the URI the user actually keeps reading without spamming LSP
     // for 64 burst-clicked previews.
     var isolated = m.modelSvc.createModel(content || '', lang);
+    isolatedPreviewModelMetadata.set(isolated, {
+      uri: String(uriStr || ''), language: lang, fullFile: !!fullFile, content: content || '',
+    });
     state.previewIsolatedModelCreates++;
     send({ type: 'log', msg: 'setPreviewContent: isolated preview model for ' + uriStr });
     return isolated;
@@ -2033,9 +2054,9 @@ export function getRendererPatchScript(
     if (!m.modelSvc || validateModelService(m.modelSvc)) { return false; }
     try {
       var old = editor.getModel && editor.getModel();
-      var model = createPreviewTextModel(content, languageId, uriStr, !!fullFile);
+      var model = createPreviewTextModel(content, languageId, uriStr, !!fullFile, old);
       if (!model) { return false; }
-      editor.setModel(model);
+      if (old !== model) { editor.setModel(model); }
       if (old && old.dispose && old !== model) {
         // Only dispose models we own (isolated, scheme=inmemory). A
         // resource-bound model (scheme=file) is shared with the workbench
