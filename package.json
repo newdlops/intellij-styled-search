@@ -550,6 +550,7 @@
     "bundle:monaco": "node scripts/bundleMonaco.js",
     "bundle:callgraph-worker": "node scripts/bundleCallGraphWorker.js",
     "test:build-cache": "node --test scripts/buildCache.test.js",
+    "test:unit": "node scripts/runUnitTests.js",
     "build:zoek-runtime": "node scripts/buildZoekRuntime.js",
     "bench:zoekt": "node scripts/runZoektBenchmark.js",
     "bench:trigram": "node scripts/runTrigramResourceBenchmark.js",

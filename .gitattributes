@@ -1,0 +1,4 @@
+# Native runtime fingerprints must use the same source bytes on every OS.
+*.rs text eol=lf
+Cargo.toml text eol=lf
+Cargo.lock text eol=lf

@@ -157,6 +157,14 @@ npm run bench:trigram
 
 `npm run bench:trigram` runs isolated synthetic extraction, selective-query, repeated-query, and unchanged-update workloads without accessing a workspace index. It reports elapsed time, posting reads, and retained heap/array-buffer memory after GC. Use `-- --output=/tmp/trigram.json` to save the report, or `-- --module=/path/to/earlier-bundle.cjs` to compare an earlier build on the same host. These are codesearch measurements, not end-to-end Rust engine timings.
 
+## Desktop platform compatibility
+
+The search overlay uses separate desktop adapters. Windows process discovery and inspector activation live in `src/platform/windows/`; macOS bundle discovery lives in `src/platform/darwin/`, with POSIX process operations in `src/platform/posix/`. The overlay only calls their shared interface. Windows discovery follows the local extension host's ancestors and checks the installation path, so portable installations and paths containing spaces or Unicode are supported without selecting another running editor.
+
+Windows opens the Electron main inspector through Node's native debug hook. It does not require a Unix signal or a manually configured startup flag. Search commands account for the Windows command-line limit, and both the Rust graph and JavaScript graph worker serialize drive and UNC file paths with VS Code's URI identity. OS-specific Rust URI code lives under `crates/zoek-rs/src/platform/`.
+
+Run `npm run compile`, `npm run test:unit`, and `cargo test --locked -p zoek-rs` for structural regression checks. After `npm run build:zoek-runtime`, `npm test` runs the actual desktop extension. The [desktop compatibility workflow](.github/workflows/desktop-compatibility.yml) runs these checks on macOS and Windows, requires renderer attachment, exercises on-demand inspector activation, and saves workbench screenshots at 1440×900, 1024×768, and 800×600 under `artifacts/desktop-compatibility/`.
+
 ## Deployment
 
 Deployment and release steps now live in [DEPLOY.md](DEPLOY.md).

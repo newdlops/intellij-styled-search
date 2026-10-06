@@ -70,7 +70,7 @@ export default defineConfig({
   // The --user-data-dir + --extensions-dir flags ensure this test VS Code
   // does not share preferences/workspace state with the dev instance.
   launchArgs: [
-    '--inspect=9239',
+    ...(process.env.IJSS_E2E_INSPECTOR_ON_DEMAND === '1' ? [] : ['--inspect=9239']),
     `--user-data-dir=${isolatedUserData}`,
     `--extensions-dir=${isolatedExtensions}`,
     '--disable-gpu-sandbox',

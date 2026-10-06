@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { fileURLToPath } from 'url';
+import { filePathToUriString } from './platform/fileUri';
 
 export enum FileType {
   Unknown = 0,
@@ -34,7 +35,7 @@ export class Uri {
   }
 
   toString(): string {
-    return pathToFileURL(this.fsPath).toString();
+    return filePathToUriString(this.fsPath);
   }
 }
 

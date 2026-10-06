@@ -3,6 +3,7 @@ use crate::corpus::{
     decode_bytes, read_file_bytes_with_limit_if_not_binary, CorpusEntry, ReadTextBytesOutcome,
 };
 use crate::mmap_store::write_atomically;
+use crate::platform::file_uri;
 use ahash::{AHashMap, AHashSet, HashMapExt, HashSetExt};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -118,7 +119,7 @@ fn worker_memory_limit() -> usize {
         .unwrap_or(0)
 }
 
-/// Acquire an exclusive flock on the workspace's graph build lockfile.
+/// Acquire an exclusive OS lock on the workspace's graph build lockfile.
 /// Subsequent zoek-rs invocations that race to rebuild/update the same
 /// graph will block here (kernel-side, no CPU/memory busy-wait) until the
 /// first process drops the lock. Drop the returned guard to release.
@@ -132,22 +133,16 @@ fn acquire_graph_lock(workspace_root: &Path) -> io::Result<fs::File> {
         .create(true)
         .truncate(false)
         .open(&lock_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = file.as_raw_fd();
-        // Non-blocking try first; if it fails, log once and block.
-        let try_now = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if try_now != 0 {
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
             eprintln!(
                 "[graph-lock] another zoek-rs is holding {} — waiting",
                 lock_path.display()
             );
-            let r = unsafe { libc::flock(fd, libc::LOCK_EX) };
-            if r != 0 {
-                return Err(io::Error::last_os_error());
-            }
+            file.lock()?;
         }
+        Err(fs::TryLockError::Error(err)) => return Err(err),
     }
     Ok(file)
 }
@@ -19779,10 +19774,6 @@ fn is_ident_continue(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
 }
 
-fn file_uri(path: &Path) -> String {
-    format!("file://{}", percent_encode_path(&path.to_string_lossy()))
-}
-
 fn rebuild_reference_uris(workspace_root: &Path, references: &mut [GraphReference]) {
     for reference in references {
         if reference.uri.is_empty() && !reference.rel_path.is_empty() {
@@ -19793,23 +19784,25 @@ fn rebuild_reference_uris(workspace_root: &Path, references: &mut [GraphReferenc
     }
 }
 
-fn percent_encode_path(value: &str) -> String {
-    let mut out = String::new();
-    for byte in value.as_bytes() {
-        let ch = *byte as char;
-        if ch.is_ascii_alphanumeric() || matches!(ch, '/' | '-' | '_' | '.' | '~' | ':') {
-            out.push(ch);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::corpus::TextEncoding;
+
+    #[test]
+    fn graph_build_lock_serializes_writers_on_every_platform() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!("zoek-rs-graph-lock-{}-{}",
+            std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let first = acquire_graph_lock(&root)?;
+        let second = fs::OpenOptions::new().read(true).write(true)
+            .open(root.join(".zoek-rs/graph-rebuild.lock"))?;
+        assert!(matches!(second.try_lock(), Err(fs::TryLockError::WouldBlock)));
+        drop(first);
+        second.try_lock().expect("the OS releases the first writer's lock on close");
+        drop(second);
+        fs::remove_dir_all(root)
+    }
 
     fn test_graph_reference(confidence: &str, provenance: &str, edge_kind: &str) -> GraphReference {
         GraphReference {

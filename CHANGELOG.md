@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added an isolated Windows desktop adapter for Electron process discovery and on-demand inspector activation; preserved the macOS bundle fast path.
+- Bounded ripgrep candidate arguments by the Windows command-line limit and corrected drive/UNC file URI identity in native and JavaScript graph indexes.
+- Serialized concurrent graph writers with OS locks on Windows as well as POSIX systems.
+- Added macOS/Windows desktop CI with native runtime builds, required renderer checks, and workbench screenshots.
+
 ## 0.1.7150 - 2026-10-01
 
 - Sped up full call graph rebuilds by about a quarter on a 27K-file workspace: Django model ancestry is computed once per resolve, source discovery makes fewer file-system calls on a small walker pool, and the outgoing usage tally is built in parallel. Index contents are unchanged, so no reindex is needed.

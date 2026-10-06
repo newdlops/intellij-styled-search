@@ -8,6 +8,7 @@ pub mod mmap_store;
 pub mod ops;
 pub mod overlay;
 pub mod path_scope;
+mod platform;
 pub mod planner;
 pub mod protocol;
 pub mod regex_plan;

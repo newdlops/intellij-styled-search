@@ -300,6 +300,7 @@ suite('Renderer — overlay UI probes', () => {
     } catch (err) {
       cdpAvailable = false;
       cdpSkipReason = err instanceof Error ? err.message : String(err);
+      if (process.env.IJSS_E2E_REQUIRE_CDP === '1') { throw err; }
     }
   });
 

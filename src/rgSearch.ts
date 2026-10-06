@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
+import { canPassSearchCandidates } from './platform/commandLine';
 import * as fs from 'fs';
 import * as https from 'https';
 import * as os from 'os';
@@ -383,10 +384,6 @@ export async function runRgSearch(
   if (opts.caseSensitive) { args.push('--case-sensitive'); }
   else { args.push('--ignore-case'); }
   if (opts.wholeWord) { args.push('--word-regexp'); }
-  // macOS/Linux ARG_MAX is typically ~1MB. With ~80 bytes per path and some
-  // headroom for other args, 5000 paths is a safe ceiling before `spawn`
-  // would start erroring with E2BIG.
-  const MAX_POSITIONAL = 5000;
   const narrowedFiles = candidateFiles && (pathScopeMatcher || pathRegexMatcher)
     ? candidateFiles.filter((fsPath) => {
         const relPath = vscode.workspace.asRelativePath(vscode.Uri.file(fsPath), false);
@@ -397,7 +394,10 @@ export async function runRgSearch(
     progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
     return;
   }
-  const useNarrowing = !!(narrowedFiles && narrowedFiles.length > 0 && narrowedFiles.length <= MAX_POSITIONAL);
+  const queryArgs = queryTerms.flatMap((term) => ['-e', term]);
+  const useNarrowing = !!(narrowedFiles && canPassSearchCandidates(
+    rgPath, [...args, '--no-ignore', ...queryArgs], narrowedFiles,
+  ));
   // Always disable rg's gitignore handling: our trigram index indexes every
   // non-binary file (including .venv, node_modules, site-packages). If rg
   // were allowed to respect .gitignore, narrowed queries would silently
@@ -412,9 +412,7 @@ export async function runRgSearch(
     // globs to ripgrep's format (which is the same glob syntax).
     for (const g of excludeGlobs) { args.push('--glob', '!' + g); }
   }
-  for (const term of queryTerms) {
-    args.push('-e', term);
-  }
+  args.push(...queryArgs);
   if (useNarrowing) {
     // Pass files as positional args after `--`. We previously used
     // `--files-from=-` (stdin) and `--files-from <file>` (tmp file), but
@@ -425,7 +423,7 @@ export async function runRgSearch(
     for (const p of narrowedFiles!) { args.push(p); }
   } else {
     // Search each workspace folder.
-    for (const f of folders) { args.push('--', f.uri.fsPath); }
+    args.push('--', ...folders.map((folder) => folder.uri.fsPath));
   }
 
   let totalMatches = 0;
@@ -449,6 +447,7 @@ export async function runRgSearch(
     cwd: folders[0].uri.fsPath,
     env: { ...process.env },
     stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
   });
 
   const cancelHandler = token.onCancellationRequested(() => {

@@ -2,7 +2,6 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
-import { execFileSync } from 'child_process';
 import WebSocket from 'ws';
 import {
   runSearch,
@@ -30,7 +29,7 @@ import { TrigramIndex, extractTrigramsLower } from './trigramIndex';
 import { compilePathScopeMatcher } from './pathScope';
 import { ZoektRuntime, type ZoektFreshnessStatus } from './zoekRuntime';
 import type { ZoektInfoResponse } from './zoekProtocol';
-import { inferBundledElectronMainPid } from './electronMainProcess';
+import { getElectronMainProcessPlatform, findAncestorElectronMainProcess, type ElectronProcess } from './electronMainProcess';
 import { isIndexingMemoryPressureError } from './internal/indexingMemoryProtection';
 
 type RendererEvent =
@@ -3818,7 +3817,7 @@ export class OverlayPanel {
   }
 
   private async inject(options: PatchScriptOptions = {}): Promise<number | undefined> {
-    const mainPid = this.findMainPid();
+    const mainPid = await this.findMainPid();
     if (!mainPid) { throw new Error('Could not locate VSCode main (Electron) process'); }
     const tStart = Date.now();
     // If VS Code's main inspector is already open, reuse it without sending
@@ -3828,16 +3827,16 @@ export class OverlayPanel {
     let wsUrl = inspector.wsUrl;
     if (!wsUrl) {
       await this.closeStaleIjFindInspectorBlockingTarget(mainPid);
-      this.log.appendLine(`Main PID ${mainPid}: sending SIGUSR1`);
-      try { process.kill(mainPid, 'SIGUSR1'); } catch (e) {
-        throw new Error(`SIGUSR1 to pid ${mainPid} failed: ${e instanceof Error ? e.message : e}`);
+      this.log.appendLine(`Main PID ${mainPid}: requesting inspector activation`);
+      try { getElectronMainProcessPlatform().requestInspector(mainPid); } catch (e) {
+        throw new Error(`Inspector activation for pid ${mainPid} failed: ${e instanceof Error ? e.message : e}`);
       }
       inspector = await this.findInspectorWebSocketForPid(mainPid);
       wsUrl = inspector.wsUrl;
       if (!wsUrl && await this.closeStaleIjFindInspectorBlockingTarget(mainPid)) {
-        this.log.appendLine(`Main PID ${mainPid}: retrying SIGUSR1 after closing stale inspector`);
-        try { process.kill(mainPid, 'SIGUSR1'); } catch (e) {
-          throw new Error(`SIGUSR1 retry to pid ${mainPid} failed: ${e instanceof Error ? e.message : e}`);
+        this.log.appendLine(`Main PID ${mainPid}: retrying inspector activation after closing stale inspector`);
+        try { getElectronMainProcessPlatform().requestInspector(mainPid); } catch (e) {
+          throw new Error(`Inspector activation retry for pid ${mainPid} failed: ${e instanceof Error ? e.message : e}`);
         }
         inspector = await this.findInspectorWebSocketForPid(mainPid);
         wsUrl = inspector.wsUrl;
@@ -6243,16 +6242,8 @@ export class OverlayPanel {
     });
   }
 
-  private isVscodeMainProcessCommand(cmd: string): boolean {
-    if (/Helper(?:\.app|\s|\))/.test(cmd)) { return false; }
-    const patterns: RegExp[] = [
-      /\/Visual Studio Code\.app\/Contents\/MacOS\/(?:Electron|Code)(?:\s|$)/,
-      /\/Visual Studio Code - Insiders\.app\/Contents\/MacOS\/(?:Electron|Code - Insiders)(?:\s|$)/,
-      /\/VSCodium\.app\/Contents\/MacOS\/(?:Electron|VSCodium)(?:\s|$)/,
-      /\/Code - OSS\.app\/Contents\/MacOS\/(?:Electron|Code - OSS)(?:\s|$)/,
-      /\/Electron\.app\/Contents\/MacOS\/Electron(?:\s|$)/,
-    ];
-    return patterns.some((p) => p.test(cmd));
+  private isElectronMainProcess(proc: ElectronProcess): boolean {
+    return getElectronMainProcessPlatform().isMainProcess(proc, this.electronHostContext());
   }
 
   private isProcessAlive(pid: number): boolean {
@@ -6267,20 +6258,21 @@ export class OverlayPanel {
     }
   }
 
-  private inferBundledParentMainPid(): number | null {
-    return inferBundledElectronMainPid({
+  private electronHostContext() {
+    return {
       platform: process.platform,
       appRoot: vscode.env.appRoot,
       execPath: process.execPath,
       ppid: process.ppid,
-    });
+    };
   }
 
-  private readMainProcessSnapshot(): string {
-    return execFileSync('/bin/ps', ['-o', 'pid=,ppid=,command=', '-ax'], {
-      encoding: 'utf8',
-      maxBuffer: 8 * 1024 * 1024,
-    });
+  private inferBundledParentMainPid(): number | null {
+    return getElectronMainProcessPlatform().inferParentPid(this.electronHostContext());
+  }
+
+  private readMainProcessSnapshot(): Promise<ElectronProcess[]> {
+    return getElectronMainProcessPlatform().readProcessSnapshot();
   }
 
   private rememberAncestorMainPid(pid: number, source: string): number {
@@ -6289,7 +6281,7 @@ export class OverlayPanel {
     return pid;
   }
 
-  private findMainPid(): number | null {
+  private async findMainPid(): Promise<number | null> {
     // The Electron main process owns this local extension host. Once that
     // relationship has been verified, the main process cannot normally be
     // replaced while this OverlayPanel instance survives. Avoid spawning `ps`
@@ -6318,33 +6310,11 @@ export class OverlayPanel {
     // A global "first Code.app process" match can attach CDP to another VSCode
     // window group and make the Search UI appear in the wrong workspace.
     try {
-      const out = this.readMainProcessSnapshot();
-      const lines = out.split('\n');
-      const processes = new Map<number, { pid: number; ppid: number; cmd: string }>();
-      for (const line of lines) {
-        const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-        if (!m) { continue; }
-        const pid = parseInt(m[1], 10);
-        const ppid = parseInt(m[2], 10);
-        if (!Number.isFinite(pid) || !Number.isFinite(ppid)) { continue; }
-        processes.set(pid, { pid, ppid, cmd: m[3] });
-      }
-
-      let cursor = process.pid;
-      const visited = new Set<number>();
-      while (cursor > 0 && !visited.has(cursor)) {
-        visited.add(cursor);
-        const proc = processes.get(cursor);
-        if (!proc) { break; }
-        if (this.isVscodeMainProcessCommand(proc.cmd)) {
-          return this.rememberAncestorMainPid(proc.pid, 'ancestor');
-        }
-        cursor = proc.ppid;
-      }
-
-      const directParent = processes.get(process.ppid);
-      if (directParent && this.isVscodeMainProcessCommand(directParent.cmd)) {
-        return this.rememberAncestorMainPid(directParent.pid, 'direct parent');
+      const processes = await this.readMainProcessSnapshot();
+      const ancestor = findAncestorElectronMainProcess(processes, process.pid, process.ppid,
+        (proc) => this.isElectronMainProcess(proc));
+      if (ancestor) {
+        return this.rememberAncestorMainPid(ancestor.pid, 'ancestor');
       }
 
       // When running under @vscode/test-electron, never fall back to a
@@ -6353,18 +6323,18 @@ export class OverlayPanel {
       // up its inspector, hijacking its CDP). Tests must stay inside their
       // own ancestor chain.
       const inTest = process.env.VSCODE_TEST === '1' || !!process.env.IJSS_E2E_WORKSPACE;
-      if (!inTest) {
-        for (const proc of processes.values()) {
-          if (this.isVscodeMainProcessCommand(proc.cmd)) {
+      if (!inTest && getElectronMainProcessPlatform().allowGlobalFallback) {
+        for (const proc of processes) {
+          if (this.isElectronMainProcess(proc)) {
             this.log.appendLine(`findMainPid: fallback global main pid=${proc.pid}`);
             return proc.pid;
           }
         }
       } else {
-        this.log.appendLine('findMainPid: test mode — skipping global fallback to protect dev VS Code');
+        this.log.appendLine('findMainPid: skipping global fallback; no owning ancestor found');
       }
     } catch (e) {
-      this.log.appendLine(`findMainPid ps error: ${e instanceof Error ? e.message : e}`);
+      this.log.appendLine(`findMainPid process snapshot error: ${e instanceof Error ? e.message : e}`);
     }
     return null;
   }

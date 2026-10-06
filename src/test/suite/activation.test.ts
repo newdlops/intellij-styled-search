@@ -151,12 +151,12 @@ suite('Activation', () => {
     const originalCachedPid = overlay.lastKnownAncestorMainPid;
     const originalInfer = overlay.inferBundledParentMainPid;
     const originalRead = overlay.readMainProcessSnapshot;
-    const originalIsMain = overlay.isVscodeMainProcessCommand;
+    const originalIsMain = overlay.isElectronMainProcess;
     let reads = 0;
     try {
       overlay.lastKnownAncestorMainPid = undefined;
       overlay.inferBundledParentMainPid = () => null;
-      overlay.isVscodeMainProcessCommand = (command: string) => command === 'neutral-electron-main';
+      overlay.isElectronMainProcess = (proc: { cmd: string }) => proc.cmd === 'neutral-electron-main';
       overlay.readMainProcessSnapshot = () => {
         reads += 1;
         if (reads > 1) {
@@ -165,13 +165,13 @@ suite('Activation', () => {
           throw error;
         }
         return [
-          `${process.pid} ${process.ppid} extension-host`,
-          `${process.ppid} 1 neutral-electron-main`,
-        ].join('\n');
+          { pid: process.pid, ppid: process.ppid, cmd: 'extension-host' },
+          { pid: process.ppid, ppid: 1, cmd: 'neutral-electron-main' },
+        ];
       };
 
-      const first = overlay.findMainPid();
-      const second = overlay.findMainPid();
+      const first = await overlay.findMainPid();
+      const second = await overlay.findMainPid();
       assert.strictEqual(first, process.ppid);
       assert.strictEqual(second, process.ppid);
       assert.strictEqual(reads, 1, 'a live verified parent should be reused without spawning ps again');
@@ -179,7 +179,7 @@ suite('Activation', () => {
       overlay.lastKnownAncestorMainPid = originalCachedPid;
       overlay.inferBundledParentMainPid = originalInfer;
       overlay.readMainProcessSnapshot = originalRead;
-      overlay.isVscodeMainProcessCommand = originalIsMain;
+      overlay.isElectronMainProcess = originalIsMain;
     }
   });
 
@@ -190,7 +190,7 @@ suite('Activation', () => {
     const configText = fs.readFileSync(configPath, 'utf8');
     assert.match(
       configText,
-      /launchArgs:\s*\[[^\]]*['"]--inspect=9239['"]/,
+      /launchArgs:\s*\[[\s\S]*?['"]--inspect=9239['"]/,
       'e2e must launch the test VS Code main process on an inspector port separate from the developer VS Code default 9229',
     );
     assert.doesNotMatch(
