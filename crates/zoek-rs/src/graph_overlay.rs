@@ -39,12 +39,21 @@
 //! yields the edit once, never twice.
 
 use crate::config::EngineConfig;
-use crate::graph::{GraphReference, GraphSymbol};
+use crate::graph::{restore_graph_symbol_metadata, GraphReference, GraphSymbol};
 use crate::mmap_store::write_atomically;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// A lossless candidate from an edited file. The path belongs to its overlay
+/// entry, so new files do not need an integer in the immutable base file table.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OverlayTokenShapeCandidate {
+    pub reference: GraphReference,
+    pub access_kind_id: u8,
+    pub is_definition: bool,
+}
 
 /// On-disk name of the call-graph overlay, alongside the base shards in
 /// `.zoek-rs/`. Distinct from the text-search overlay (`hot-overlay.json`).
@@ -88,6 +97,8 @@ pub struct GraphOverlayEntry {
     /// not become stale between an edit and the next compaction.
     #[serde(default)]
     pub token_shape_target_deltas: BTreeMap<(u64, u64, u64), (i32, i32)>,
+    #[serde(default)]
+    pub token_shape_candidates: BTreeMap<(u64, u64, u64), Vec<OverlayTokenShapeCandidate>>,
 }
 
 impl GraphOverlayEntry {
@@ -98,6 +109,7 @@ impl GraphOverlayEntry {
             symbols: Vec::new(),
             contrib: BTreeMap::new(),
             token_shape_target_deltas: BTreeMap::new(),
+            token_shape_candidates: BTreeMap::new(),
         }
     }
 }
@@ -124,6 +136,12 @@ pub struct GraphOverlay {
     /// tally sends edits through the full update path instead.
     #[serde(default)]
     pub count_deltas: BTreeMap<u64, [i64; 4]>,
+    /// Absolute live query counts for targets touched by this overlay. Produced
+    /// on the update path, so rendering a usage hint does not scan references.
+    #[serde(default)]
+    pub usage_counts: BTreeMap<u64, usize>,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl GraphOverlay {
@@ -133,6 +151,8 @@ impl GraphOverlay {
             updated_unix_secs: 0,
             entries: BTreeMap::new(),
             count_deltas: BTreeMap::new(),
+            usage_counts: BTreeMap::new(),
+            revision: 0,
         }
     }
 
@@ -164,7 +184,7 @@ impl GraphOverlay {
             Err(_) => return Self::new(current_base_built_at),
         };
         match bincode::deserialize::<GraphOverlay>(&bytes) {
-            Ok(overlay) if overlay.base_built_at_unix_ms == current_base_built_at => overlay,
+            Ok(overlay) if overlay.base_built_at_unix_ms == current_base_built_at => Self::restore_metadata(overlay),
             // Corrupt, or built against a different (now-superseded) base.
             _ => Self::new(current_base_built_at),
         }
@@ -182,7 +202,7 @@ impl GraphOverlay {
     pub fn load_any(workspace_root: &Path, config: &EngineConfig) -> Self {
         let path = Self::path(workspace_root, config);
         match std::fs::read(&path) {
-            Ok(bytes) => bincode::deserialize::<GraphOverlay>(&bytes).unwrap_or_default(),
+            Ok(bytes) => Self::restore_metadata(bincode::deserialize::<GraphOverlay>(&bytes).unwrap_or_default()),
             Err(_) => Self::default(),
         }
     }
@@ -192,6 +212,13 @@ impl GraphOverlay {
         let bytes = bincode::serialize(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("overlay ser: {e}")))?;
         write_atomically(&path, &bytes)
+    }
+
+    fn restore_metadata(mut overlay: Self) -> Self {
+        for symbol in overlay.entries.values_mut().flat_map(|entry| &mut entry.symbols) {
+            restore_graph_symbol_metadata(symbol);
+        }
+        overlay
     }
 
     /// Remove the overlay file entirely (used by compaction after the base has
@@ -392,6 +419,7 @@ mod tests {
                 symbols: vec![sym("sym:1", "a.py")],
                 contrib: BTreeMap::new(),
                 token_shape_target_deltas: BTreeMap::new(),
+                token_shape_candidates: BTreeMap::new(),
             },
         );
         overlay.upsert_tombstone("gone.py", GraphOverlayEntryKind::Deleted);
@@ -413,6 +441,7 @@ mod tests {
                 symbols: vec![sym("sym:c", "changed.py")],
                 contrib: BTreeMap::new(),
                 token_shape_target_deltas: BTreeMap::new(),
+                token_shape_candidates: BTreeMap::new(),
             },
         );
         overlay.upsert(
@@ -423,6 +452,7 @@ mod tests {
                 symbols: Vec::new(),
                 contrib: BTreeMap::new(),
                 token_shape_target_deltas: BTreeMap::new(),
+                token_shape_candidates: BTreeMap::new(),
             },
         );
         overlay.upsert_tombstone("deleted.py", GraphOverlayEntryKind::Deleted);
@@ -454,6 +484,7 @@ mod tests {
                 symbols: Vec::new(),
                 contrib: BTreeMap::new(),
                 token_shape_target_deltas: BTreeMap::new(),
+                token_shape_candidates: BTreeMap::new(),
             },
         );
         overlay.upsert(
@@ -467,6 +498,7 @@ mod tests {
                 symbols: Vec::new(),
                 contrib: BTreeMap::new(),
                 token_shape_target_deltas: BTreeMap::new(),
+                token_shape_candidates: BTreeMap::new(),
             },
         );
         assert_eq!(overlay.entry_count(), 1);
@@ -494,6 +526,7 @@ mod tests {
                 symbols: vec![sym("sym:1", "a.py")],
                 contrib: BTreeMap::new(),
                 token_shape_target_deltas: BTreeMap::new(),
+                token_shape_candidates: BTreeMap::new(),
             },
         );
         overlay.save(&root, &config).unwrap();

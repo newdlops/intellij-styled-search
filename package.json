@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.7152",
+  "version": "0.1.7153",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -483,7 +483,7 @@
           "type": "number",
           "default": 10000,
           "minimum": 1,
-          "description": "Maximum number of usage results returned by Find Usages and the call graph inlay click flow. The previous hard cap of 500 truncated heavy callers like model classes; bump this if your repository still hits the new ceiling."
+          "description": "Number of usages to load per page in Find Usages. Scroll or use More to continue loading results."
         },
         "intellijStyledSearch.callGraphShowCalleeInlayHints": {
           "type": "boolean",
@@ -551,6 +551,8 @@
     "bundle:callgraph-worker": "node scripts/bundleCallGraphWorker.js",
     "test:build-cache": "node --test scripts/buildCache.test.js scripts/platform/windowsBuild.test.js",
     "test:unit": "node scripts/runUnitTests.js",
+    "test:usage": "node scripts/checkUsageSemantics.js",
+    "bench:usage": "node scripts/benchmarkUsageCounts.js",
     "build:zoek-runtime": "node scripts/buildZoekRuntime.js",
     "bench:zoekt": "node scripts/runZoektBenchmark.js",
     "bench:trigram": "node scripts/runTrigramResourceBenchmark.js",

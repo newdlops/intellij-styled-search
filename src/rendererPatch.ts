@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 153;
+export const RENDERER_PATCH_VERSION = 154;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -2871,6 +2871,11 @@ export function getRendererPatchScript(
     '  color: var(--vscode-descriptionForeground, #9d9d9d);',
     '  min-height: 14px;',
     '}',
+    '.ij-find-status { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }',
+    '.ij-find-more-usages { flex-shrink: 0; }',
+    '.ij-find-more-usages[hidden] { display: none; }',
+    '.ij-find-more-usages:disabled { opacity: 0.45; cursor: default; }',
+    '.ij-find-more-usages:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007acc); outline-offset: 2px; }',
     '.ij-find-spinner {',
     '  width: 10px; height: 10px;',
     '  border: 2px solid var(--vscode-descriptionForeground, #9d9d9d);',
@@ -3439,9 +3444,11 @@ export function getRendererPatchScript(
   });
   var $scopeRow = el('div', { className: 'ij-find-scope-row', children: [$scope] });
 
-  var $status = el('span', { className: 'ij-find-status', text: 'Type a query' });
+  var $status = el('span', { className: 'ij-find-status', text: 'Type a query', attrs: { role: 'status', 'aria-live': 'polite' } });
   var $spinner = el('span', { className: 'ij-find-spinner hidden' });
-  var $statusRow = el('div', { className: 'ij-find-status-row', children: [$status, $spinner] });
+  var $moreUsages = el('button', { className: 'ij-find-opt ij-find-more-usages', text: 'More',
+    attrs: { type: 'button', 'aria-label': 'Load more usages', hidden: '' } });
+  var $statusRow = el('div', { className: 'ij-find-status-row', children: [$status, $spinner, $moreUsages] });
 
   var $toolbar = el('div', { className: 'ij-find-toolbar', children: [$searchRow, $scopeRow, $statusRow] });
   var $results = el('div', { className: 'ij-find-results', attrs: { tabindex: '0' } });
@@ -4702,7 +4709,12 @@ export function getRendererPatchScript(
 
   function setStatus(text, spinning) {
     $status.textContent = text;
+    $status.title = text;
     $spinner.classList.toggle('hidden', !spinning);
+    $moreUsages.hidden = !(state.staticSessionId && state.hasMoreResults);
+    // Keep the focused button in the tab order while loading. Native disabled
+    // buttons lose focus, so keyboard users could not request the next page.
+    $moreUsages.setAttribute('aria-disabled', String(!!state.loadingMore));
   }
   function setSummary() {
     var files = state.files.length;
@@ -5975,6 +5987,7 @@ export function getRendererPatchScript(
   }
 
 	  function triggerSearch(forceRestart, recordHistory) {
+    state.staticSessionId = null;
 	    var raw = $q.value;
 	    var scopeRaw = $scope.value || '';
     // Preserve the query byte-for-byte. Multi-line search selections often
@@ -6095,6 +6108,7 @@ export function getRendererPatchScript(
 
   function requestMoreResults() {
     if (state.searching || state.loadingMore || !state.hasMoreResults || !$q.value) { return; }
+    state.staticScrollIntent = false;
     state.loadingMore = true;
     setStatus('Loading next ' + state.pageSize + ' results\u2026', true);
     scheduleRender();
@@ -6103,6 +6117,9 @@ export function getRendererPatchScript(
 
   function maybeLoadMoreResults() {
     if (state.searching || state.loadingMore || !state.hasMoreResults) { return; }
+    // Static usage pages wait for deliberate input. Rendering a short page or
+    // refining its rows must not drain all pages or retry a failed request.
+    if (state.staticSessionId && !state.staticScrollIntent) { return; }
     var viewportHeight = Math.max($results.clientHeight || 0, RESULT_ROW_HEIGHT);
     var threshold = RESULT_ROW_HEIGHT * 6;
     var totalHeight = totalRenderableRows() * RESULT_ROW_HEIGHT;
@@ -6173,7 +6190,7 @@ export function getRendererPatchScript(
     selectMatch(next);
   }
 
-  on($q, 'input', function () { autosizeQuery(); markSearchDirty(); });
+  on($q, 'input', function () { state.staticSessionId = null; $moreUsages.hidden = true; autosizeQuery(); markSearchDirty(); });
   on($scope, 'input', scheduleSearch);
   on($history, 'click', function (e) {
     e.preventDefault();
@@ -6257,14 +6274,21 @@ export function getRendererPatchScript(
   on($optWord, 'click', function () { toggleOpt('wholeWord', $optWord); });
   on($optRegex, 'click', function () { toggleOpt('useRegex', $optRegex); });
   on($optEst, 'click', function () {
-    // Optimistically flip; the extension re-renders and confirms via an
-    // estimatedToggle message. Re-running the query is the extension's job.
+    // The owning usage session updates this panel and confirms the selection.
     var pressed = $optEst.getAttribute('aria-pressed') === 'true';
     $optEst.setAttribute('aria-pressed', String(!pressed));
     send({ type: 'runCommand', command: 'intellijStyledSearch.toggleEstimatedUsages', args: [] });
   });
   on($optRegexMultiline, 'click', function () { toggleOpt('regexMultiline', $optRegexMultiline); });
   on($refresh, 'click', refreshSearch);
+  on($moreUsages, 'click', requestMoreResults);
+  on($moreUsages, 'keydown', function (e) {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      e.stopPropagation();
+      requestMoreResults();
+    }
+  });
   syncPreviewSaveButton();
   on($savePreview, 'click', function (e) {
     e.preventDefault();
@@ -6374,6 +6398,17 @@ export function getRendererPatchScript(
     if (state.flat.length > 0 || state.resultsInfoText) { scheduleResultsViewportRender(); }
     maybeLoadMoreResults();
   });
+  on($results, 'wheel', function (e) {
+    if (state.staticSessionId && e.isTrusted && e.deltaY > 0) {
+      state.staticScrollIntent = true;
+      maybeLoadMoreResults();
+    }
+  }, { passive: true });
+  on($results, 'keydown', function (e) {
+    if (state.staticSessionId && e.isTrusted && (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === 'End')) {
+      state.staticScrollIntent = true;
+    }
+  }, true);
 
   function addTemporaryDocumentMouseHandlers(moveHandler, upHandler) {
     var active = true;
@@ -13581,6 +13616,7 @@ export function getRendererPatchScript(
   // workbench file editor would).
 
 	  function showSearchPanel(initialQuery, showOptions) {
+    state.staticSessionId = null;
 	    try {
 	      if (Date.now() < (state.recoveryUntil || 0)) { return 'suppressed:recovery'; }
 	      var wasVisible = panel.classList.contains('visible');
@@ -14163,6 +14199,8 @@ export function getRendererPatchScript(
         } catch (eEst) {}
         return 'ok';
 	      case 'results:start':
+        state.staticSessionId = msg.staticSessionId || null;
+        state.staticScrollIntent = false;
         panelDiagMark('results:start', { searchId: msgSearchId });
         setShellMode(false);
         startPerfWatch('results:start', 12000);
@@ -14291,6 +14329,7 @@ export function getRendererPatchScript(
             false
           );
         }
+        if (msg.statusText) { setStatus(msg.statusText, !!msg.refining); }
 	        render();
 	        if (state.activeIndex < 0 && state.flat.length > 0) { selectMatch(0); }
         trace('results:done:end', {
@@ -14304,6 +14343,44 @@ export function getRendererPatchScript(
           activeIndex: state.activeIndex,
         });
 	        break;
+      case 'results:ownership':
+        return msg.staticSessionId === state.staticSessionId ? 'owned' : 'ignored:static-owner';
+      case 'results:replace':
+        if (!msg.staticSessionId || msg.staticSessionId !== state.staticSessionId) { return 'ignored:static-owner'; }
+        cancelScheduledRender();
+        var selectedRow = state.flat[state.activeIndex];
+        var selectedFile = selectedRow && state.files[selectedRow.fi];
+        var selectedMatch = selectedFile && selectedFile.matches[selectedRow.mi];
+        var selectedLocation = selectedMatch ? [selectedFile.uri, selectedMatch.line, JSON.stringify(selectedMatch.ranges || [])] : null;
+        var priorScroll = $results.scrollTop;
+        state.files = []; state.flat = []; state.candidates = [];
+        state.candidateTotal = 0; state.confirmedUris = {}; state.fileIndexByUri = {};
+        state.matchCount = 0;
+        state.searching = false; state.loadingMore = false;
+        state.hasMoreResults = !!msg.hasMore;
+        state.resultsInfoText = '';
+        if (msg.pageSize > 0) { state.pageSize = msg.pageSize; }
+        if (state.searchTicker) { clearInterval(state.searchTicker); state.searchTicker = null; }
+        for (var ri = 0; ri < (msg.matches || []).length; ri++) { acceptFileMatch(msg.matches[ri]); }
+        $q.value = msg.query || $q.value;
+        autosizeQuery();
+        render();
+        state.activeIndex = -1;
+        if (selectedLocation) {
+          for (var si = 0; si < state.flat.length; si++) {
+            var row = state.flat[si];
+            var file = state.files[row.fi];
+            var match = file && file.matches[row.mi];
+            if (match && file.uri === selectedLocation[0] && match.line === selectedLocation[1]
+                && JSON.stringify(match.ranges || []) === selectedLocation[2]) { state.activeIndex = si; break; }
+          }
+        }
+        $results.scrollTop = priorScroll;
+        applyActive(false);
+        // Result refinements do not select another preview or move focus.
+        setStatus(msg.statusText || (state.matchCount + ' usages shown'), !!msg.refining);
+        if (msg.candidates) { onSearchMessage(Object.assign({ type: 'estimatedToggle' }, msg.candidates)); }
+        return 'updated';
       case 'results:error':
         if (msgSearchId !== null && msgSearchId !== state.searchId) { break; }
         cancelScheduledRender();

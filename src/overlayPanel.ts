@@ -138,6 +138,23 @@ type RendererMessageRoute = {
   rendererSrc?: string;
 };
 
+export type StaticResultState = {
+  totalMatches?: number;
+  hasMore?: boolean;
+  pageSize?: number;
+  statusText?: string;
+  refining?: boolean;
+  candidates?: { visible: boolean; pressed: boolean };
+};
+
+export type StaticResultsPresenter = {
+  update(query: string, matches: FileMatch[], state: StaticResultState): Promise<void>;
+  onLoadMore(callback: () => Promise<void>): void;
+  onToggleCandidates(callback: () => Promise<void>): void;
+};
+
+type StaticResultsSession = { id: number; loadMore?: () => Promise<void>; toggleCandidates?: () => Promise<void> };
+
 type RendererCommandContext = {
   windowId?: number;
   invocationId: number;
@@ -148,7 +165,9 @@ type RendererCommandContext = {
 
 type OverlayMessage =
   | { type: 'estimatedToggle'; visible: boolean; pressed: boolean }
-  | { type: 'results:start'; searchId: number }
+  | { type: 'results:start'; searchId: number; staticSessionId?: number }
+  | ({ type: 'results:replace'; staticSessionId: number; query: string; matches: FileMatch[] } & StaticResultState)
+  | { type: 'results:ownership'; staticSessionId: number }
   | { type: 'results:candidates'; searchId: number; candidates: Array<{ uri: string; relPath: string }>; total: number }
   | { type: 'results:file'; searchId: number; match: FileMatch }
   | { type: 'results:batch'; searchId: number; matches: FileMatch[] }
@@ -162,6 +181,8 @@ type OverlayMessage =
       pageFiles: number;
       pageMatches: number;
       offset: number;
+      statusText?: string;
+      refining?: boolean;
     }
   | { type: 'results:error'; searchId: number; message: string }
   | { type: 'history:update'; entries: string[]; limit: number }
@@ -309,6 +330,7 @@ type PendingPreviewForceOpen = {
 type PendingStaticResults = {
   query: string;
   matches: FileMatch[];
+  state?: StaticResultState & { staticSessionId?: number };
   requestId: number;
   sourceWindowId?: number;
   resolve: () => void;
@@ -552,6 +574,8 @@ export class OverlayPanel {
   private pendingStaticResultsTimer: ReturnType<typeof setTimeout> | undefined;
   private staticResultsRequestSeq = 0;
   private staticResultsChain: Promise<void> = Promise.resolve();
+  private staticSessionSeq = 0;
+  private readonly staticSessions = new Map<string, StaticResultsSession>();
   private rendererCommandWindowId: number | undefined;
   private readonly rendererCommandContext = new AsyncLocalStorage<RendererCommandContext>();
   private rendererCommandInvocationSeq = 0;
@@ -2697,11 +2721,11 @@ export class OverlayPanel {
     deferredSettler?.(false);
   }
 
-  async showStaticResults(initialQuery: string, matches: FileMatch[]): Promise<void> {
+  async showStaticResults(initialQuery: string, matches: FileMatch[], state?: StaticResultState & { staticSessionId?: number }): Promise<void> {
     const commandContext = this.rendererCommandContext.getStore();
     if (commandContext?.pendingPanel) {
       if (!commandContext.pendingPanelShown || !commandContext.pendingPanel.rendererSrc) { return; }
-      await this.showStaticResultsInPendingPanel(initialQuery, matches, commandContext.pendingPanel);
+      await this.showStaticResultsInPendingPanel(initialQuery, matches, commandContext.pendingPanel, state);
       return;
     }
     const requestId = ++this.staticResultsRequestSeq;
@@ -2717,6 +2741,7 @@ export class OverlayPanel {
       this.pendingStaticResults = {
         query: initialQuery,
         matches,
+        state,
         requestId,
         sourceWindowId: this.getRendererCommandWindowIdForShow(),
         resolve,
@@ -2732,12 +2757,41 @@ export class OverlayPanel {
           pending.matches,
           pending.requestId,
           pending.sourceWindowId,
+          pending.state,
         );
         const next = this.staticResultsChain.then(run, run);
         this.staticResultsChain = next.then(() => undefined, () => undefined);
         void next.then(pending.resolve, pending.reject);
       }, 45);
     });
+  }
+
+  async presentStaticResults(query: string, matches: FileMatch[], state: StaticResultState = {}): Promise<StaticResultsPresenter | undefined> {
+    const id = ++this.staticSessionSeq;
+    await this.showStaticResults(query, matches, { ...state, staticSessionId: id });
+    const command = this.rendererCommandContext.getStore();
+    const route = command?.pendingPanel ?? { windowId: this.activeWindowId, rendererSrc: this.activeRendererSrc };
+    if (route.windowId === undefined || !route.rendererSrc || (command?.pendingPanel && !command.pendingPanelShown)) { return undefined; }
+    const ownership = await this.evalInWindow(route.windowId, `(function(){var inst=window.__ijFindInstances&&window.__ijFindInstances[${JSON.stringify(route.rendererSrc)}];
+      if(!inst||!inst.panel||!inst.panel.isConnected||!inst.panel.classList.contains('visible'))return 'closed';
+      return inst.onMessage({type:'results:ownership',staticSessionId:${id}});})()`);
+    if (ownership !== 'owned') { return undefined; }
+    const key = `${route.windowId}:${route.rendererSrc}`;
+    const session: StaticResultsSession = { id };
+    this.staticSessions.set(key, session);
+    return {
+      onLoadMore: (callback) => { session.loadMore = callback; },
+      onToggleCandidates: (callback) => { session.toggleCandidates = callback; },
+      update: async (title, next, options) => {
+        if (this.staticSessions.get(key) !== session) { return; }
+        const message: OverlayMessage = { type: 'results:replace', staticSessionId: id, query: title, matches: next, ...options };
+        const expression = `(function(){var inst=window.__ijFindInstances&&window.__ijFindInstances[${JSON.stringify(route.rendererSrc)}];
+          if(!inst||!inst.panel||!inst.panel.isConnected||!inst.panel.classList.contains('visible'))return 'closed';
+          return inst.onMessage(${JSON.stringify(message)});})()`;
+        await this.ensureInjected();
+        await this.evalInWindow(route.windowId!, expression);
+      },
+    };
   }
 
   // Drive the in-panel "Estimated" toggle button from the extension: `visible`
@@ -2758,9 +2812,10 @@ export class OverlayPanel {
     initialQuery: string,
     matches: FileMatch[],
     route: RendererMessageRoute,
+    state?: StaticResultState & { staticSessionId?: number },
   ): Promise<void> {
     if (route.windowId === undefined || !route.rendererSrc) { return; }
-    const messages = this.staticResultMessages(matches);
+    const messages = this.staticResultMessages(matches, state);
     // Checking visibility, changing the header and delivering the result are
     // one renderer operation. Closing a panel cancels its recipient; a late
     // result must never show a sibling or recreate a closed instance.
@@ -2782,6 +2837,7 @@ export class OverlayPanel {
     matches: FileMatch[],
     requestId: number,
     sourceWindowId?: number,
+    state?: StaticResultState & { staticSessionId?: number },
   ): Promise<void> {
     if (requestId !== this.staticResultsRequestSeq) { return; }
     this.cancelActive();
@@ -2802,14 +2858,14 @@ export class OverlayPanel {
     });
     if (!shown) { return; }
     if (requestId !== this.staticResultsRequestSeq) { return; }
-    await this.postMessagesToRenderer(this.staticResultMessages(matches));
+    await this.postMessagesToRenderer(this.staticResultMessages(matches, state));
     this.scheduleCdpSearchIdleClose('static-results-done');
   }
 
-  private staticResultMessages(matches: FileMatch[]): OverlayMessage[] {
+  private staticResultMessages(matches: FileMatch[], state?: StaticResultState & { staticSessionId?: number }): OverlayMessage[] {
     const searchId = ++this.searchSeq;
     const totalMatches = matches.reduce((sum, match) => sum + match.matches.length, 0);
-    const messages: OverlayMessage[] = [{ type: 'results:start', searchId }];
+    const messages: OverlayMessage[] = [{ type: 'results:start', searchId, staticSessionId: state?.staticSessionId }];
     const batchSize = 64;
     for (let i = 0; i < matches.length; i += batchSize) {
       messages.push({
@@ -2822,13 +2878,16 @@ export class OverlayPanel {
       type: 'results:done',
       searchId,
       totalFiles: matches.length,
-      totalMatches,
-      truncated: false,
-      pageSize: Math.max(totalMatches, getConfiguredResultLimit()),
+      totalMatches: state?.totalMatches ?? totalMatches,
+      truncated: state?.hasMore ?? false,
+      pageSize: state?.pageSize ?? Math.max(totalMatches, getConfiguredResultLimit()),
       pageFiles: matches.length,
       pageMatches: totalMatches,
       offset: 0,
+      statusText: state?.statusText,
+      refining: state?.refining,
     });
+    if (state?.candidates) { messages.push({ type: 'estimatedToggle', ...state.candidates }); }
     return messages;
   }
 
@@ -3595,6 +3654,7 @@ export class OverlayPanel {
   }
 
   private async disposeInternal(): Promise<void> {
+    this.staticSessions.clear();
     this.cancelActive();
     this.showSeq++;
     this.cancelShowPump();
@@ -4423,6 +4483,10 @@ export class OverlayPanel {
     } else {
       this.log.appendLine(`handleRendererEvent: no __seq/__src, type=${(evt as any).type}`);
     }
+    const staticRouteKey = typeof evt.__win === 'number' && evt.__src ? `${evt.__win}:${evt.__src}` : '';
+    if (evt.type === 'panelHidden' || evt.type === 'panelDisposed' || evt.type === 'search') {
+      this.staticSessions.delete(staticRouteKey);
+    }
     if (Date.now() < this.rendererRecoveryUntil && evt.type !== 'log') {
       this.log.appendLine(`drop renderer event during recovery: type=${(evt as any).type}`);
       return;
@@ -4432,6 +4496,8 @@ export class OverlayPanel {
 	      this.activeWindowId !== undefined &&
 	      evt.__win !== this.activeWindowId &&
 	      evt.type !== 'log' &&
+	      !(evt.type === 'loadMore' && this.staticSessions.has(staticRouteKey)) &&
+	      !(evt.type === 'runCommand' && evt.command === 'intellijStyledSearch.toggleEstimatedUsages' && this.staticSessions.has(staticRouteKey)) &&
 	      evt.type !== 'trace' &&
 	      evt.type !== 'requestStandaloneMonaco' &&
 	      evt.type !== 'requestPreviewNativeRecovery' &&
@@ -4457,6 +4523,10 @@ export class OverlayPanel {
         void this.runSearch(evt.options);
         break;
       case 'loadMore':
+        if (this.staticSessions.get(staticRouteKey)?.loadMore) {
+          void this.staticSessions.get(staticRouteKey)!.loadMore!().catch((err) => this.log.appendLine(`static results page failed: ${String(err)}`));
+          break;
+        }
         if (evt.__src) { this.activeRendererSrc = evt.__src; }
         if (typeof evt.__win === 'number') { this.activeWindowId = evt.__win; }
         void this.loadMoreSearch();
@@ -4553,7 +4623,11 @@ export class OverlayPanel {
 	      // embedded preview Monaco editor now drives hover natively
 	      // through VSCode's language services, so the renderer never
 	      // asks the extension host for hover content.
-	      case 'runCommand': void this.runHoverCommand(evt.command, evt.args, evt.__win, evt.fromPreview); break;
+	      case 'runCommand':
+          if (evt.command === 'intellijStyledSearch.toggleEstimatedUsages' && this.staticSessions.get(staticRouteKey)?.toggleCandidates) {
+            void this.staticSessions.get(staticRouteKey)!.toggleCandidates!().catch((err) => this.log.appendLine(`usage candidates toggle failed: ${String(err)}`));
+          } else { void this.runHoverCommand(evt.command, evt.args, evt.__win, evt.fromPreview); }
+          break;
 	      case 'saveFile':
           void this.enqueuePreviewSave(evt.uri, evt.content, evt.requestId, evt.expectedContentHash, {
             windowId: typeof evt.__win === 'number' ? evt.__win : undefined,

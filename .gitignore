@@ -1,5 +1,6 @@
 out/
 node_modules/
+__pycache__/
 .vscode-test/
 *.vsix
 resources/monaco.bundle.js
@@ -13,6 +14,7 @@ artifacts/desktop-compatibility/
 artifacts/desktop-runtime-download/
 artifacts/desktop-compatibility-download/
 artifacts/release-check/
+artifacts/release/
 artifacts/desktop-test-logs/
 artifacts/windows-user-setup/
 .lh/**/*.*

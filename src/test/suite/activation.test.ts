@@ -2387,6 +2387,7 @@ suite('Activation', () => {
     const originalShowStatic = overlay.showStaticResults;
     const originalResolve = callGraph.resolveSymbolsResolved;
     const originalUsages = callGraph.findUsagesForSymbolIdFromCache;
+    const originalUsagePage = callGraph.findUsagePageForSymbolIdFromCache;
     const originalRefine = callGraph.refineUsageReferencesWithCurrentSources;
     const shown: Array<number | undefined> = [];
     const results: Array<number | undefined> = [];
@@ -2395,6 +2396,7 @@ suite('Activation', () => {
       overlay.showStaticResults = async () => { results.push(overlay.getRendererCommandWindowIdForShow()); };
       callGraph.resolveSymbolsResolved = async () => [];
       callGraph.findUsagesForSymbolIdFromCache = async () => [];
+      callGraph.findUsagePageForSymbolIdFromCache = async () => ({ references: [], totalReferences: 0, offset: 0, generation: 'fixture' });
       callGraph.refineUsageReferencesWithCurrentSources = async () => [];
       const command = 'intellijStyledSearch.showUsagesForSymbol';
       const args = ['sym:repeatable_action', 'Repeatable action', 1];
@@ -2413,6 +2415,7 @@ suite('Activation', () => {
       overlay.showStaticResults = originalShowStatic;
       callGraph.resolveSymbolsResolved = originalResolve;
       callGraph.findUsagesForSymbolIdFromCache = originalUsages;
+      callGraph.findUsagePageForSymbolIdFromCache = originalUsagePage;
       callGraph.refineUsageReferencesWithCurrentSources = originalRefine;
       anyOverlay.rendererCommandPendingPanelWindowId = originalPendingWindow;
       anyOverlay.rendererCommandPendingPanelExpiresAt = originalPendingExpiry;

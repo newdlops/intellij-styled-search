@@ -11,7 +11,7 @@ use zoek_rs::config::{ripgrep_executable, EngineConfig};
 use zoek_rs::graph::{
     audit_usage_counts, compact_graph_overlay, dump_references_tsv,
     dump_references_with_overlay_tsv, index_graph_from_tsv, overlay_update_graph_native,
-    query_graph, query_graph_callees, query_graph_document_symbols_with_options,
+    query_graph_page, query_graph_callees, query_graph_document_symbols_with_options,
     query_graph_implementations, query_graph_symbols_with_options, rebuild_graph_native,
     update_graph_native, GraphSymbol, GraphSymbolQueryOptions,
 };
@@ -1260,6 +1260,8 @@ fn run_graph_query(args: &[String]) -> Result<EngineResponse, String> {
     let workspace_root = PathBuf::from(args.first().cloned().ok_or_else(usage)?);
     let mut symbol_id: Option<String> = None;
     let mut limit = 500usize;
+    let mut offset = 0usize;
+    let mut generation: Option<String> = None;
     let mut idx = 1usize;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -1280,11 +1282,20 @@ fn run_graph_query(args: &[String]) -> Result<EngineResponse, String> {
                     .max(1);
                 idx += 2;
             }
+            "--offset" => {
+                offset = args.get(idx + 1).ok_or("--offset requires a value")?
+                    .parse::<usize>().map_err(|_| "--offset must be a non-negative integer")?;
+                idx += 2;
+            }
+            "--generation" => {
+                generation = Some(args.get(idx + 1).ok_or("--generation requires a value")?.clone());
+                idx += 2;
+            }
             other => return Err(format!("unknown graph-query flag: {other}")),
         }
     }
     let symbol_id = symbol_id.ok_or_else(|| "--symbol-id requires a value".to_string())?;
-    let result = query_graph(&workspace_root, &symbol_id, limit, &EngineConfig::default())
+    let result = query_graph_page(&workspace_root, &symbol_id, limit, offset, generation.as_deref(), &EngineConfig::for_workspace(&workspace_root))
         .map_err(|err| err.to_string())?;
     let Some(result) = result else {
         return Ok(EngineResponse::GraphQuery(GraphQueryResponse {
@@ -1295,6 +1306,9 @@ fn run_graph_query(args: &[String]) -> Result<EngineResponse, String> {
             built_at_unix_ms: 0,
             total_references: 0,
             references: Vec::new(),
+            offset: 0,
+            next_offset: None,
+            generation: String::new(),
             warnings: vec!["call graph binary index missing".to_string()],
         }));
     };
@@ -1305,6 +1319,9 @@ fn run_graph_query(args: &[String]) -> Result<EngineResponse, String> {
         symbol_id: result.symbol_id,
         built_at_unix_ms: result.built_at_unix_ms,
         total_references: result.total_references,
+        offset: result.offset,
+        next_offset: result.next_offset,
+        generation: result.generation,
         references: result
             .references
             .into_iter()
@@ -1405,6 +1422,9 @@ fn run_graph_callees(args: &[String]) -> Result<EngineResponse, String> {
             built_at_unix_ms: 0,
             total_references: 0,
             references: Vec::new(),
+            offset: 0,
+            next_offset: None,
+            generation: String::new(),
             warnings: vec!["call graph binary index missing".to_string()],
         }));
     };
@@ -1415,6 +1435,9 @@ fn run_graph_callees(args: &[String]) -> Result<EngineResponse, String> {
         symbol_id: result.symbol_id,
         built_at_unix_ms: result.built_at_unix_ms,
         total_references: result.total_references,
+        offset: result.offset,
+        next_offset: result.next_offset,
+        generation: result.generation,
         references: result
             .references
             .into_iter()

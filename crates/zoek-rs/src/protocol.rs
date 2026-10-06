@@ -257,6 +257,9 @@ pub struct GraphQueryResponse {
     pub built_at_unix_ms: u64,
     pub total_references: usize,
     pub references: Vec<GraphQueryReference>,
+    pub offset: usize,
+    pub next_offset: Option<usize>,
+    pub generation: String,
     pub warnings: Vec<String>,
 }
 
@@ -648,7 +651,7 @@ impl GraphQueryReference {
 impl GraphQueryResponse {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"type\":\"graph-query\",\"ok\":{},\"engine\":{},\"workspaceRoot\":{},\"symbolId\":{},\"builtAtUnixMs\":{},\"totalReferences\":{},\"references\":[{}],\"warnings\":[{}]}}",
+            "{{\"type\":\"graph-query\",\"ok\":{},\"engine\":{},\"workspaceRoot\":{},\"symbolId\":{},\"builtAtUnixMs\":{},\"totalReferences\":{},\"references\":[{}],\"offset\":{},\"nextOffset\":{},\"generation\":{},\"warnings\":[{}]}}",
             self.ok,
             self.engine.to_json(),
             json_string(&self.workspace_root),
@@ -660,6 +663,9 @@ impl GraphQueryResponse {
                 .map(GraphQueryReference::to_json)
                 .collect::<Vec<_>>()
                 .join(","),
+            self.offset,
+            self.next_offset.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string()),
+            json_string(&self.generation),
             json_string_vec(&self.warnings)
         )
     }

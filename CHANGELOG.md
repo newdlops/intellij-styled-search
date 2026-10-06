@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.7153 - 2026-10-07
+
+- Made usage hints count the distinct references returned by Find Usages, including conservative candidates, across rebuilds, edits, deletions and compaction. Materialized count shards avoid repeated reference scans.
+- Displayed indexed usages before source/provider refinement, and bounded refinement reuse by source and graph versions.
+- Added usage paging through scrolling and an accessible More button, preserving selection, focus, preview and panel ownership. Stale continuation pages refresh from the current index generation.
+- Excluded Python parameter declarations and captured parameter uses from unrelated same-name usages while preserving header defaults, annotations, explicit globals and member references.
+- Used Unicode identifier boundaries and UTF-16 reference columns, including after Unicode strings. Filtered binary symbol names before decoding metadata and read counts only for returned symbols.
+- Added independent semantic reference expectations and live count/list parity checks to macOS/Windows CI. Graph cache v20 / native v12 on POSIX and cache v21 / native v13 on Windows require one reindex.
+
 ## 0.1.7152 - 2026-10-06
 
 - Shared the search stylesheet across panel instances and removed exact legacy duplicates so repeated panel opens do not accumulate CSS rules.

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "symbols": [
+    {"query": "compute", "relPath": "pkg/provider.py", "edgeKinds": ["call"], "confidences": ["exact", "resolved", "possible"],
+      "locations": [["pkg/consumer.py", 4, 11], ["pkg/shadowing.py", 17, 15], ["pkg/shadowing.py", 20, 0]],
+      "requiredLocations": [["pkg/shadowing.py", 2, 21], ["pkg/shadowing.py", 8, 13], ["pkg/shadowing.py", 12, 20]],
+      "forbiddenLocations": [["pkg/consumer.py", 7, 11], ["pkg/consumer.py", 8, 11],
+        ["pkg/shadowing.py", 2, 12], ["pkg/shadowing.py", 4, 15], ["pkg/shadowing.py", 5, 11],
+        ["pkg/shadowing.py", 8, 4], ["pkg/shadowing.py", 10, 11], ["pkg/shadowing.py", 12, 11],
+        ["pkg/shadowing.py", 12, 38], ["pkg/shadowing.py", 14, 13], ["pkg/shadowing.py", 18, 11]]},
+    {"query": "First.run", "relPath": "pkg/provider.py", "edgeKinds": ["call"], "locations": [["pkg/consumer.py", 12, 18]]},
+    {"query": "Second.run", "relPath": "pkg/provider.py", "edgeKinds": ["call"], "locations": [["pkg/consumer.py", 16, 18]]},
+    {"query": "계산", "relPath": "pkg/unicode.py", "edgeKinds": ["call"], "locations": [["pkg/unicode.py", 4, 22]]}
+  ]
+}

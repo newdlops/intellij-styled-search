@@ -2,7 +2,7 @@
 use std::path::Path;
 
 #[cfg(windows)]
-pub(crate) const GRAPH_STORAGE_VERSION: u32 = 10;
+pub(crate) const GRAPH_STORAGE_VERSION: u32 = 13;
 
 /// NTFS/ReFS change time and file ID provide the independent identity that
 /// std::fs::Metadata lacks on Windows. Failure keeps content verification on.

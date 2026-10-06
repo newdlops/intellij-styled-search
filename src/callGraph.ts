@@ -9,6 +9,7 @@ import { gzip, gunzip } from 'zlib';
 import * as vscode from 'vscode';
 import { graphStorageVersions } from './platform/graphStorage';
 import { AsyncWeightedLruCache } from './internal/asyncWeightedLruCache';
+import { UsageRefinementCache } from './internal/usageRefinementCache';
 import { DocumentSummaryRetentionStore, type DocumentSummaryLoadTicket } from './internal/documentSummaryRetention';
 import {
   IndexingMemoryProtection,
@@ -417,8 +418,19 @@ type RustGraphQueryResponse = {
   ok?: boolean;
   builtAtUnixMs?: number;
   totalReferences?: number;
+  offset?: number;
+  nextOffset?: number | null;
+  generation?: string;
   references?: RustGraphQueryReference[];
   warnings?: string[];
+};
+
+export type CallGraphUsagePage = {
+  references: CallGraphReference[];
+  totalReferences: number;
+  offset: number;
+  nextOffset?: number;
+  generation: string;
 };
 
 type RustGraphIndexResponse = {
@@ -933,6 +945,11 @@ export class CallGraphService implements vscode.Disposable {
   private readonly rustSymbolQueryFlights = new Map<string, Promise<CallGraphSymbol[] | undefined>>();
   private rustSymbolQueryCacheWeight = 0;
   private rustSymbolQueryGeneration = 0;
+  private readonly usageRefinementCache = new UsageRefinementCache<CallGraphReference[]>(
+    (references) => references.map((reference) => ({ ...reference, range: { ...reference.range },
+      ...(reference.evidence ? { evidence: [...reference.evidence] } : {}) })),
+    (references) => references.length,
+  );
   private rustSymbolQueryForTests: ((
     workspaceRoot: string,
     query: string,
@@ -971,6 +988,7 @@ export class CallGraphService implements vscode.Disposable {
       );
     }
     disposables.push(
+      vscode.workspace.onDidChangeTextDocument(() => this.usageRefinementCache.clear()),
       vscode.workspace.onDidCreateFiles((event) => {
         for (const uri of event.files) {
           this.scheduleIncrementalRefreshIfSupported(uri, 'created');
@@ -990,7 +1008,10 @@ export class CallGraphService implements vscode.Disposable {
       vscode.workspace.onDidSaveTextDocument((document) => {
         this.scheduleIncrementalRefreshIfSupported(document.uri, 'saved', CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS);
       }),
-      vscode.workspace.onDidCloseTextDocument((document) => this.releaseDocumentSummaryOwner(document.uri.toString())),
+      vscode.workspace.onDidCloseTextDocument((document) => {
+        this.usageRefinementCache.clear();
+        this.releaseDocumentSummaryOwner(document.uri.toString());
+      }),
       vscode.window.onDidChangeWindowState((state) => this.handleWindowStateChange(state.focused)),
     );
     context.subscriptions.push(
@@ -1557,6 +1578,29 @@ export class CallGraphService implements vscode.Disposable {
     return undefined;
   }
 
+  async findUsagePageForSymbolIdFromCache(
+    symbolId: string, limit = 500, offset = 0, generation?: string,
+  ): Promise<CallGraphUsagePage | undefined> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const manifest = this.cacheManifest;
+    if (folder && manifest?.snapshot && isRustNativeGraphManifest(manifest)) {
+      return this.queryRustGraphUsagePage(folder.uri.fsPath, symbolId, limit, manifest.builtAtUnixMs, offset, generation);
+    }
+    const currentGeneration = String(this.rustSymbolQueryGeneration);
+    if (generation !== undefined && generation !== currentGeneration) {
+      throw new Error('Usage results changed; reload the first page.');
+    }
+    const all = await this.findUsagesForSymbolIdFromCache(symbolId, Number.MAX_SAFE_INTEGER)
+      ?? (this.snapshot ? this.findUsages(symbolId, Number.MAX_SAFE_INTEGER) : undefined);
+    if (currentGeneration !== String(this.rustSymbolQueryGeneration)) {
+      throw new Error('Usage results changed; reload the first page.');
+    }
+    if (!all) { return undefined; }
+    const end = Math.min(all.length, offset + limit);
+    return { references: all.slice(offset, end), totalReferences: all.length, offset,
+      ...(end < all.length ? { nextOffset: end } : {}), generation: currentGeneration };
+  }
+
   async refineUsageReferencesWithOpenDocuments(
     references: readonly CallGraphReference[],
     options: CallGraphUsageRefinementOptions = {},
@@ -1567,6 +1611,30 @@ export class CallGraphService implements vscode.Disposable {
   async refineUsageReferencesWithCurrentSources(
     references: readonly CallGraphReference[],
     options: CallGraphUsageRefinementOptions = {},
+  ): Promise<CallGraphReference[]> {
+    const input = dedupeCallGraphUsageReferences(references);
+    if (input.every((reference) => callGraphUsageConfidenceBucket(reference) === 'resolved')) { return input; }
+    const uris = [...new Set([
+      ...input.filter((reference) => callGraphUsageConfidenceBucket(reference) !== 'resolved')
+        .map((reference) => reference.uri).slice(0, USAGE_SOURCE_REFINEMENT_MAX_OCCURRENCES),
+      ...(options.targetSymbols ?? []).map((symbol) => symbol.uri),
+    ])].slice(0, USAGE_SOURCE_REFINEMENT_MAX_URIS + USAGE_SOURCE_REFINEMENT_MAX_TARGET_CONTEXT_URIS);
+    const sources = await Promise.all(uris.map(async (uri) => {
+      const document = vscode.workspace.textDocuments.find((open) => open.uri.toString() === uri);
+      if (document) { return [uri, 'document', document.version]; }
+      try {
+        const result = await promiseWithTimeout(vscode.workspace.fs.stat(vscode.Uri.parse(uri)), 100);
+        return [uri, result.value?.mtime, result.value?.size, result.timedOut];
+      } catch { return [uri, 'unavailable']; }
+    }));
+    const key = JSON.stringify({ generation: this.rustSymbolQueryGeneration, sources, references: input, options });
+    return this.usageRefinementCache.get(key, () => this.refineUsageReferencesUncached(input, options), (result) =>
+      result.some((reference, index) => callGraphUsageConfidenceBucket(reference) === 'resolved'
+        && callGraphUsageConfidenceBucket(input[index] ?? reference) !== 'resolved'));
+  }
+
+  private async refineUsageReferencesUncached(
+    references: readonly CallGraphReference[], options: CallGraphUsageRefinementOptions,
   ): Promise<CallGraphReference[]> {
     const deduped = dedupeCallGraphUsageReferences(references);
     if (deduped.length === 0) { return deduped; }
@@ -2548,6 +2616,7 @@ export class CallGraphService implements vscode.Disposable {
     delayMs = CALL_GRAPH_EXTERNAL_INCREMENTAL_DEBOUNCE_MS,
   ): void {
     if (this.disposed || isCallGraphExcludedUri(uri)) { return; }
+    this.usageRefinementCache.clear();
     this.pendingChangedUris.add(uri.toString());
     this.boundSuspendedIncrementalBacklog();
     if (!this.incrementalReason || reason === 'saved' || this.incrementalReason.startsWith('external-')) {
@@ -4205,6 +4274,7 @@ export class CallGraphService implements vscode.Disposable {
   }
 
   private invalidateRustSymbolQueryCache(): void {
+    this.usageRefinementCache.clear();
     this.rustSymbolQueryGeneration++;
     this.rustSymbolQueryCache.clear();
     this.rustSymbolQueryCacheWeight = 0;
@@ -4393,6 +4463,13 @@ export class CallGraphService implements vscode.Disposable {
     limit: number,
     builtAtUnixMs: number,
   ): Promise<CallGraphReference[] | undefined> {
+    return (await this.queryRustGraphUsagePage(workspaceRoot, symbolId, limit, builtAtUnixMs))?.references;
+  }
+
+  private async queryRustGraphUsagePage(
+    workspaceRoot: string, symbolId: string, limit: number, builtAtUnixMs: number,
+    offset = 0, generation?: string,
+  ): Promise<CallGraphUsagePage | undefined> {
     const binary = await this.resolveRustGraphBinary(false);
     if (!binary) { return undefined; }
     try {
@@ -4404,6 +4481,8 @@ export class CallGraphService implements vscode.Disposable {
         symbolId,
         '--limit',
         String(Math.max(1, Math.floor(limit))),
+        '--offset', String(Math.max(0, Math.floor(offset))),
+        ...(generation !== undefined ? ['--generation', generation] : []),
       ]) as RustGraphQueryResponse;
       if (
         response.type !== 'graph-query' ||
@@ -4416,7 +4495,7 @@ export class CallGraphService implements vscode.Disposable {
       for (const warning of response.warnings ?? []) {
         this.log.appendLine(`call graph rust graph query warning: ${warning}`);
       }
-      return response.references.map((reference) => ({
+      const references = response.references.map((reference) => ({
         symbolId: String(reference.targetSymbolId ?? symbolId),
         ...(reference.sourceRefId ? { sourceRefId: String(reference.sourceRefId) } : {}),
         ...(reference.edgeKind ? { edgeKind: String(reference.edgeKind) } : {}),
@@ -4430,8 +4509,13 @@ export class CallGraphService implements vscode.Disposable {
         ...(reference.confidence ? { confidence: String(reference.confidence) } : {}),
         ...(reference.provenance ? { provenance: String(reference.provenance) } : {}),
       }));
+      const total = Math.max(references.length, Math.floor(response.totalReferences ?? references.length));
+      return { references, totalReferences: total, offset: response.offset ?? offset,
+        ...(typeof response.nextOffset === 'number' ? { nextOffset: response.nextOffset } : {}),
+        generation: response.generation ?? String(builtAtUnixMs) };
     } catch (err) {
       this.log.appendLine(`call graph rust graph query skipped: ${err instanceof Error ? err.message : String(err)}`);
+      if (offset > 0) { throw err; }
       return undefined;
     }
   }

@@ -4274,6 +4274,19 @@ suite('Call graph', () => {
 
       // 2) An explicit small limit still pins the result count.
       const trimmed = await api.callGraph.findUsagesForSymbolIdFromCache(fn!.id, 7);
+      const firstPage = await api.callGraph.findUsagePageForSymbolIdFromCache(fn!.id, 7);
+      assert.ok(firstPage, 'expected an indexed usage page');
+      assert.strictEqual(firstPage.references.length, 7);
+      assert.strictEqual(firstPage.offset, 0);
+      assert.ok(firstPage.totalReferences >= callCount);
+      assert.strictEqual(firstPage.nextOffset, 7);
+      const nextPage = await api.callGraph.findUsagePageForSymbolIdFromCache(fn!.id, 7, firstPage.nextOffset, firstPage.generation);
+      assert.ok(nextPage);
+      assert.strictEqual(nextPage.offset, 7);
+      assert.strictEqual(nextPage.totalReferences, firstPage.totalReferences);
+      assert.strictEqual(nextPage.generation, firstPage.generation);
+      assert.strictEqual(new Set([...firstPage.references, ...nextPage.references].map(usageLocationKey)).size, 14,
+        'page boundaries must not repeat source locations');
       assert.ok(trimmed, 'expected cache lookup to return a non-undefined slice for an explicit small limit');
       assert.ok(
         trimmed!.length <= 7,

@@ -263,6 +263,12 @@ const GRAPH_DISCOVERY_THREADS: usize = 4;
 // A distinct name prevents old two-counter rows being decoded as four counters.
 const GRAPH_OUTGOING_TALLY_BY_FILE_SHARD_PREFIX: &str = "callgraph-outgoing-tally-by-file-v2";
 
+#[path = "graph_usage_counts.rs"]
+mod usage_counts;
+
+#[path = "graph_python_bindings.rs"]
+mod python_bindings;
+
 const BOUND_MAY: u8 = 0b0001;
 const BOUND_MUST: u8 = 0b0010;
 const _BOUND_OBSERVED: u8 = 0b0100;
@@ -647,6 +653,17 @@ pub struct GraphQueryResult {
     pub built_at_unix_ms: u64,
     pub total_references: usize,
     pub references: Vec<GraphReference>,
+    pub offset: usize,
+    pub next_offset: Option<usize>,
+    pub generation: String,
+}
+
+pub(crate) fn restore_graph_symbol_metadata(symbol: &mut GraphSymbol) {
+    symbol.kind_flags = compute_kind_flags(&symbol.kind);
+    symbol.language_id = compute_language_id(&symbol.language);
+    symbol.id_u64 = parse_stable_symbol_id_to_u64(&symbol.id).unwrap_or(0);
+    symbol.rel_path_hash = stable_hash(&symbol.rel_path);
+    symbol.name_hash = stable_hash(&symbol.name);
 }
 
 #[derive(Clone, Debug)]
@@ -1459,12 +1476,13 @@ fn load_member_implementation_family(
 /// dedupe. Raw candidates are attached only when the key has one eligible target
 /// or the queried ancestor owns the key's complete implementation family. Other
 /// multi-target keys have no structural evidence for per-symbol assignment.
-fn append_lazy_token_shape_references(
+fn append_lazy_token_shape_references_with_overlay(
     workspace_root: &Path,
     config: &EngineConfig,
     symbols: &[GraphSymbol],
     file_table: &FileTable,
     references: &mut Vec<GraphReference>,
+    overlay: &crate::graph_overlay::GraphOverlay,
 ) -> io::Result<()> {
     if symbols.is_empty() {
         return Ok(());
@@ -1483,25 +1501,16 @@ fn append_lazy_token_shape_references(
     let (bare, member) = load_token_shape_tally_for_keys(workspace_root, config, &keys)?;
     let mut target_counts =
         load_token_shape_target_counts(workspace_root, config, Some(&shards))?;
-    let built_at_unix_ms =
-        read_built_at_unix_ms(&graph_manifest_path(workspace_root, config)).unwrap_or(0);
-    let overlay = crate::graph_overlay::GraphOverlay::load_valid(
-        workspace_root,
-        config,
-        built_at_unix_ms,
-    );
     for (key, (bare_delta, member_delta)) in overlay.total_token_shape_target_deltas() {
         if !shards.contains(&token_shape_shard_for_key(key)) {
             continue;
         }
         let count = target_counts.entry(key).or_default();
-        // The overlay does not rewrite the candidate tally. Positive deltas can
-        // safely make a base key ambiguous immediately; a negative delta must
-        // not make it newly assignable while deleted/changed base candidates
-        // remain in that tally. Compaction applies the exact lower count.
-        count.bare = (count.bare as i64 + bare_delta.max(0))
+        // Edited/deleted candidates are replaced below, so both positive and
+        // negative declaration deltas are safe before compaction.
+        count.bare = (count.bare as i64 + bare_delta)
             .clamp(0, u32::MAX as i64) as u32;
-        count.member = (count.member as i64 + member_delta.max(0))
+        count.member = (count.member as i64 + member_delta)
             .clamp(0, u32::MAX as i64) as u32;
     }
 
@@ -1573,6 +1582,9 @@ fn append_lazy_token_shape_references(
             );
         for candidate in candidates {
             let rel_path = file_table.get_path(candidate.file_id).unwrap_or("");
+            if overlay.entries.contains_key(rel_path) {
+                continue;
+            }
             // Find-usages excludes the requested declaration itself. Other
             // declaration occurrences remain conservative candidates: in
             // structural type systems an interface member, class member and
@@ -1603,6 +1615,24 @@ fn append_lazy_token_shape_references(
                 confidence: "possible".into(),
                 provenance: "token-shape".into(),
             });
+        }
+        for (rel_path, entry) in &overlay.entries {
+            for candidate in entry.token_shape_candidates.get(&key).into_iter().flatten() {
+                let primary = assignable_targets.contains(symbol.id.as_str())
+                    && candidate.access_kind_id == if member_symbol { ACCESS_KIND_MEMBER } else { ACCESS_KIND_BARE };
+                let declaration = member_symbol && target_count.bare == 1
+                    && candidate.access_kind_id == ACCESS_KIND_BARE && candidate.is_definition;
+                if !(primary || declaration)
+                    || (rel_path == &symbol.rel_path
+                        && candidate.reference.start_line == symbol.start_line
+                        && candidate.reference.start_column == symbol.start_column)
+                {
+                    continue;
+                }
+                let mut reference = candidate.reference.clone();
+                reference.target_symbol_id = Some(symbol.id.as_str().into());
+                references.push(reference);
+            }
         }
     }
     Ok(())
@@ -4094,6 +4124,7 @@ where
     if let Err(err) = build_and_write_outgoing_tally(workspace_root, config) {
         eprintln!("[graph-rebuild] outgoing-tally build skipped: {err}");
     }
+    usage_counts::build(workspace_root, config)?;
     Ok(summary)
 }
 
@@ -4920,6 +4951,7 @@ pub fn update_graph_native(
         // The next overlay must subtract the newly written base contribution,
         // including when this update was invoked directly rather than compacted.
         build_and_write_outgoing_tally(workspace_root, config)?;
+        usage_counts::build(workspace_root, config)?;
     }
     result
 }
@@ -5410,6 +5442,7 @@ pub fn overlay_update_graph_native(
     };
 
     let mut overlay = GraphOverlay::load_valid(workspace_root, config, base_built_at);
+    let mut candidates_by_file = usage_counts::overlay_candidates(&ref_sites);
     // Changed (non-deleted) files: supersede base refs + symbols.
     for rel in exclude_paths.iter().filter(|r| !deleted_rel.contains(*r)) {
         let refs = refs_by_file.remove(rel).unwrap_or_default();
@@ -5424,6 +5457,7 @@ pub fn overlay_update_graph_native(
                 token_shape_target_deltas: token_target_deltas_by_file
                     .remove(rel)
                     .unwrap_or_default(),
+                token_shape_candidates: candidates_by_file.remove(rel).unwrap_or_default(),
             },
         );
     }
@@ -5439,6 +5473,7 @@ pub fn overlay_update_graph_native(
                 token_shape_target_deltas: token_target_deltas_by_file
                     .remove(rel)
                     .unwrap_or_default(),
+                token_shape_candidates: Default::default(),
             },
         );
     }
@@ -5454,6 +5489,7 @@ pub fn overlay_update_graph_native(
                 symbols: Vec::new(),
                 contrib,
                 token_shape_target_deltas: std::collections::BTreeMap::new(),
+                token_shape_candidates: candidates_by_file.remove(rel).unwrap_or_default(),
             },
         );
     }
@@ -5480,7 +5516,9 @@ pub fn overlay_update_graph_native(
         }
     }
     overlay.count_deltas = count_deltas;
+    usage_counts::update_overlay(workspace_root, config, &prior_compact, &mut overlay)?;
     overlay.updated_unix_secs = unix_secs_now();
+    overlay.revision = overlay.revision.saturating_add(1);
     overlay.save(workspace_root, config)?;
     if probe {
         eprintln!(
@@ -5643,42 +5681,38 @@ pub fn query_graph_symbols_with_options(
     if query.starts_with("sym:") {
         return query_graph_symbol_id_with_options(workspace_root, query, limit, config, options);
     }
-    let Some(mut store) = read_symbol_store(workspace_root, config)? else {
+    if !graph_index_available(workspace_root, config) {
         return Ok(None);
+    }
+    let built_at_unix_ms = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config))?;
+    let file_table_path = graph_file_table_path(workspace_root, config);
+    let file_table = if file_table_path.exists() {
+        read_file_table_binary(&file_table_path)?
+    } else {
+        FileTable::default()
     };
-    merge_overlay_count_deltas(workspace_root, config, store.built_at_unix_ms, &mut store.counts);
     let query_lower = query.to_ascii_lowercase();
-    let mut symbols: Vec<GraphSymbol> = store
-        .symbols
-        .iter()
-        .filter(|symbol| {
-            query.is_empty()
-                || symbol.id.eq_ignore_ascii_case(query)
-                || symbol.name.eq_ignore_ascii_case(query)
-                || symbol.qualified_name.eq_ignore_ascii_case(query)
-                || symbol.name.to_ascii_lowercase().contains(&query_lower)
-                || symbol
-                    .qualified_name
-                    .to_ascii_lowercase()
-                    .contains(&query_lower)
-        })
-        .cloned()
-        .collect();
+    let symbol_path = graph_symbol_index_path(workspace_root, config);
+    let mut symbols = Vec::new();
+    if symbol_path.exists() {
+        symbols = read_symbols_for_name_query(&symbol_path, &file_table, &query_lower)?;
+    } else {
+        for shard in 0..GRAPH_SHARD_COUNT {
+            let path = graph_shard_path(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
+            if path.exists() {
+                symbols.extend(read_symbols_for_name_query(&path, &file_table, &query_lower)?);
+            }
+        }
+    }
     merge_overlay_symbols(
         workspace_root,
         config,
-        store.built_at_unix_ms,
+        built_at_unix_ms,
         &mut symbols,
         |symbol| {
-            query.is_empty()
-                || symbol.id.eq_ignore_ascii_case(query)
-                || symbol.name.eq_ignore_ascii_case(query)
-                || symbol.qualified_name.eq_ignore_ascii_case(query)
-                || symbol.name.to_ascii_lowercase().contains(&query_lower)
-                || symbol
-                    .qualified_name
-                    .to_ascii_lowercase()
-                    .contains(&query_lower)
+            symbol.id.eq_ignore_ascii_case(query)
+                || contains_ignore_ascii_case(symbol.name.as_bytes(), query_lower.as_bytes())
+                || contains_ignore_ascii_case(symbol.qualified_name.as_bytes(), query_lower.as_bytes())
         },
     );
     symbols.sort_by(|left, right| {
@@ -5690,13 +5724,11 @@ pub fn query_graph_symbols_with_options(
     });
     let total_symbols = symbols.len();
     symbols.truncate(limit);
-    for symbol in &mut symbols {
-        apply_count_options(symbol, &store.counts, options);
-    }
-    apply_deduped_usage_counts_for_symbols(workspace_root, config, &mut symbols, options)?;
+    // Count I/O is proportional to the returned page, not the whole index.
+    apply_count_options_for_symbols(workspace_root, config, &mut symbols, options)?;
     Ok(Some(GraphSymbolQueryResult {
-        workspace_root: store.workspace_root,
-        built_at_unix_ms: store.built_at_unix_ms,
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        built_at_unix_ms,
         total_symbols,
         symbols,
     }))
@@ -6158,9 +6190,7 @@ fn merge_overlay_query_refs(
         return;
     }
     let ref_superseded = overlay.ref_superseded();
-    base_refs.retain(|r| {
-        r.provenance.as_ref() == "token-shape" || !ref_superseded.contains(&*r.rel_path)
-    });
+    base_refs.retain(|r| !ref_superseded.contains(&*r.rel_path));
     for r in overlay.live_refs() {
         if keep_overlay_ref(r) {
             base_refs.push(r.clone());
@@ -6174,11 +6204,28 @@ pub fn query_graph(
     limit: usize,
     config: &EngineConfig,
 ) -> io::Result<Option<GraphQueryResult>> {
+    query_graph_page(workspace_root, symbol_id, limit, 0, None, config)
+}
+
+pub fn query_graph_page(
+    workspace_root: &Path,
+    symbol_id: &str,
+    limit: usize,
+    offset: usize,
+    expected_generation: Option<&str>,
+    config: &EngineConfig,
+) -> io::Result<Option<GraphQueryResult>> {
     if !graph_index_available(workspace_root, config) {
         return Ok(None);
     }
     let relation_path = graph_index_path(workspace_root, config);
     let built_at_unix_ms = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config))?;
+    let overlay = crate::graph_overlay::GraphOverlay::load_valid(workspace_root, config, built_at_unix_ms);
+    let base_generation = usage_counts::base_generation(workspace_root, config, built_at_unix_ms)?;
+    let generation = format!("{built_at_unix_ms}:{base_generation}:{}", overlay.revision);
+    if expected_generation.is_some_and(|expected| expected != generation) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Usage results changed; reload the first page."));
+    }
     let target_shard_path = graph_reference_target_shard_path(workspace_root, config, symbol_id);
     let file_table_path = graph_file_table_path(workspace_root, config);
     let file_table = if file_table_path.exists() {
@@ -6199,28 +6246,23 @@ pub fn query_graph(
     } else {
         Vec::new()
     };
-    merge_overlay_query_refs(workspace_root, config, built_at_unix_ms, &mut references, |r| {
-        r.target_symbol_id
-            .as_deref()
-            .is_some_and(|t| t.eq_ignore_ascii_case(symbol_id))
-    });
+    references.retain(|reference| !overlay.entries.contains_key(&*reference.rel_path));
+    references.extend(overlay.live_refs().filter(|reference| reference.target_symbol_id.as_deref()
+        .is_some_and(|target| target.eq_ignore_ascii_case(symbol_id))).cloned());
     let mut requested_ids = HashSet::default();
     requested_ids.insert(symbol_id.to_string());
     let mut target_symbols =
         read_symbols_for_symbol_ids_indexed(workspace_root, config, &requested_ids)?;
-    merge_overlay_symbols(
-        workspace_root,
-        config,
-        built_at_unix_ms,
-        &mut target_symbols,
-        |symbol| symbol.id.eq_ignore_ascii_case(symbol_id),
-    );
-    append_lazy_token_shape_references(
+    let superseded = overlay.symbol_superseded();
+    target_symbols.retain(|symbol| !superseded.contains(&symbol.rel_path));
+    target_symbols.extend(overlay.live_symbols().filter(|symbol| symbol.id.eq_ignore_ascii_case(symbol_id)).cloned());
+    append_lazy_token_shape_references_with_overlay(
         workspace_root,
         config,
         &target_symbols,
         &file_table,
         &mut references,
+        &overlay,
     )?;
     references = dedupe_graph_references_by_source_occurrence(references);
     references.sort_by(|left, right| {
@@ -6231,7 +6273,12 @@ pub fn query_graph(
             .then_with(|| left.target_symbol_id.cmp(&right.target_symbol_id))
     });
     let total_references = references.len();
-    references.truncate(limit);
+    let offset = offset.min(total_references);
+    if usage_counts::base_generation(workspace_root, config, built_at_unix_ms)? != base_generation {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Usage results changed; reload the first page."));
+    }
+    let end = offset.saturating_add(limit).min(total_references);
+    references = references.into_iter().skip(offset).take(end - offset).collect();
     rebuild_reference_uris(workspace_root, &mut references);
     Ok(Some(GraphQueryResult {
         workspace_root: workspace_root.to_string_lossy().into_owned(),
@@ -6239,6 +6286,9 @@ pub fn query_graph(
         built_at_unix_ms,
         total_references,
         references,
+        offset,
+        next_offset: (end < total_references).then_some(end),
+        generation,
     }))
 }
 
@@ -6298,6 +6348,9 @@ pub fn query_graph_callees(
         built_at_unix_ms,
         total_references,
         references,
+        offset: 0,
+        next_offset: (limit < total_references).then_some(limit),
+        generation: format!("{built_at_unix_ms}:0"),
     }))
 }
 
@@ -6471,7 +6524,7 @@ fn extract_python_symbol_defs(
                 start_line: line_idx as u32,
                 start_column: column,
                 end_line: line_idx as u32,
-                end_column: column + name.len() as u32,
+                end_column: column + name.encode_utf16().count() as u32,
                 container_name: class_stack.last().map(|(_, value)| value.clone()),
                 package_name: package_name.clone(),
                 extends_names: extends,
@@ -6499,7 +6552,7 @@ fn extract_python_symbol_defs(
                 start_line: line_idx as u32,
                 start_column: column,
                 end_line: line_idx as u32,
-                end_column: column + name.len() as u32,
+                end_column: column + name.encode_utf16().count() as u32,
                 container_name,
                 package_name: package_name.clone(),
                 extends_names: Vec::new(),
@@ -6528,7 +6581,7 @@ fn extract_python_symbol_defs(
                 start_line: line_idx as u32,
                 start_column: column,
                 end_line: line_idx as u32,
-                end_column: column + name.len() as u32,
+                end_column: column + name.encode_utf16().count() as u32,
                 container_name,
                 package_name: package_name.clone(),
                 extends_names: Vec::new(),
@@ -6590,7 +6643,7 @@ fn extract_python_pass1(
                     start_line: line_idx as u32,
                     start_column: column,
                     end_line: line_idx as u32,
-                    end_column: column + name.len() as u32,
+                    end_column: column + name.encode_utf16().count() as u32,
                     container_name: class_stack.last().map(|(_, value)| value.clone()),
                     package_name: package_name.clone(),
                     extends_names: extends,
@@ -6615,7 +6668,7 @@ fn extract_python_pass1(
                     start_line: line_idx as u32,
                     start_column: column,
                     end_line: line_idx as u32,
-                    end_column: column + name.len() as u32,
+                    end_column: column + name.encode_utf16().count() as u32,
                     container_name,
                     package_name: package_name.clone(),
                     extends_names: Vec::new(),
@@ -6641,7 +6694,7 @@ fn extract_python_pass1(
                     start_line: line_idx as u32,
                     start_column: column,
                     end_line: line_idx as u32,
-                    end_column: column + name.len() as u32,
+                    end_column: column + name.encode_utf16().count() as u32,
                     container_name,
                     package_name: package_name.clone(),
                     extends_names: Vec::new(),
@@ -6739,7 +6792,7 @@ fn extract_brace_symbol_defs(
                 start_line: line_idx as u32,
                 start_column: column,
                 end_line: line_idx as u32,
-                end_column: column + name.len() as u32,
+                end_column: column + name.encode_utf16().count() as u32,
                 container_name,
                 package_name: package_name.clone(),
                 extends_names: extends,
@@ -6771,7 +6824,7 @@ fn extract_brace_symbol_defs(
                 start_line: line_idx as u32,
                 start_column: column,
                 end_line: line_idx as u32,
-                end_column: column + name.len() as u32,
+                end_column: column + name.encode_utf16().count() as u32,
                 container_name,
                 package_name: package_name.clone(),
                 extends_names: Vec::new(),
@@ -6797,7 +6850,7 @@ fn extract_brace_symbol_defs(
                 start_line: line_idx as u32,
                 start_column: column,
                 end_line: line_idx as u32,
-                end_column: column + name.len() as u32,
+                end_column: column + name.encode_utf16().count() as u32,
                 container_name,
                 package_name: package_name.clone(),
                 extends_names: Vec::new(),
@@ -8438,14 +8491,21 @@ fn extract_ref_sites(
     let mut brace_sanitize_state = BraceSanitizeState::default();
     let line_count = entry.text.lines().count().max(1) as u32;
     let line_enclosing_cache = precompute_enclosing_per_line(symbols, line_count);
-    for (line_idx, line) in entry.text.lines().enumerate() {
-        let sanitized =
+    let sanitized_lines: Vec<_> = entry.text.lines().map(|line| {
             sanitize_ref_site_code_line(
                 line,
                 language,
                 &mut python_multiline_string_quote,
                 &mut brace_sanitize_state,
-            );
+            )
+        }).collect();
+    let mut parameter_bindings = if language == "python" {
+        python_bindings::ParameterBindings::new(&sanitized_lines, symbols)
+    } else {
+        python_bindings::ParameterBindings::default()
+    };
+    for (line_idx, (line, sanitized)) in entry.text.lines().zip(&sanitized_lines).enumerate() {
+        parameter_bindings.advance_line(line_idx);
         let is_import_context = is_import_context_line(sanitized.trim_start(), language);
         // B6 stage-3: enclosing is line-constant; parse the "sym:HEX16" id to
         // its u64 once per line (0 = none) instead of cloning the String per
@@ -8459,8 +8519,10 @@ fn extract_ref_sites(
             if is_keyword(&name, language) {
                 continue;
             }
+            let start_column = utf16_column(line, start);
+            let end_column = utf16_column(line, end);
             let is_definition =
-                definition_positions.contains(&(line_idx as u32, start as u32, name.as_str()));
+                definition_positions.contains(&(line_idx as u32, start_column, name.as_str()));
             let edge_kind = if next_nonspace_char(&sanitized, end) == Some('(') {
                 "call"
             } else {
@@ -8479,9 +8541,17 @@ fn extract_ref_sites(
             } else {
                 "bare"
             };
+            // A parameter is a lexical value binding, not a candidate for a
+            // same-named module/imported symbol. Member names are independent.
+            if !is_definition
+                && access_kind == "bare"
+                && parameter_bindings.excludes(line_idx, start, &name)
+            {
+                continue;
+            }
             // B6 stage-2: build the u64 directly (no "ref:HEX16" string alloc).
             let source_ref_id =
-                stable_ref_id_u64(&entry.rel_path, line_idx as u32, start as u32, &name);
+                stable_ref_id_u64(&entry.rel_path, line_idx as u32, start_column, &name);
             let name_hash = stable_hash(&name);
             let receiver_name_hash = receiver_name
                 .as_deref()
@@ -8496,9 +8566,9 @@ fn extract_ref_sites(
                 rel_path: rel_path_arc.clone(),
                 language: language_arc.clone(),
                 start_line: line_idx as u32,
-                start_column: start as u32,
+                start_column,
                 end_line: line_idx as u32,
-                end_column: end as u32,
+                end_column,
                 edge_kind: if edge_kind == "call" {
                     arc_call.clone()
                 } else {
@@ -12865,8 +12935,10 @@ fn write_store(
     let bytes = shard_bytes + file_table_bytes;
     let reference_count_emitted = reference_count_override.unwrap_or(references.len());
     let symbol_count_emitted = symbol_count_override.unwrap_or(symbols.len());
+    let query_generation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|time| time.as_nanos() as u64).unwrap_or(built_at_unix_ms);
     let manifest = format!(
-        "{{\"engine\":\"zoek-rs\",\"type\":\"semantic-serving-graph\",\"version\":{},\"workspaceRoot\":{},\"indexedAtUnixSecs\":{},\"builtAtUnixMs\":{},\"fileCount\":{},\"symbolCount\":{},\"referenceCount\":{},\"bytes\":{}}}",
+        "{{\"engine\":\"zoek-rs\",\"type\":\"semantic-serving-graph\",\"version\":{},\"workspaceRoot\":{},\"indexedAtUnixSecs\":{},\"builtAtUnixMs\":{},\"fileCount\":{},\"symbolCount\":{},\"referenceCount\":{},\"bytes\":{},\"queryGeneration\":{}}}",
         GRAPH_VERSION,
         crate::protocol::json_string(&workspace_root.to_string_lossy()),
         indexed_at_unix_secs,
@@ -12874,7 +12946,8 @@ fn write_store(
         file_count,
         symbol_count_emitted,
         reference_count_emitted,
-        bytes
+        bytes,
+        query_generation
     );
     write_atomically(
         &graph_manifest_path(workspace_root, config),
@@ -12975,6 +13048,7 @@ fn is_graph_shard_file_name(name: &str) -> bool {
             GRAPH_SYMBOL_ID_SHARD_PREFIX,
             GRAPH_SYMBOL_URI_SHARD_PREFIX,
             GRAPH_COUNT_ID_SHARD_PREFIX,
+            usage_counts::SHARD_PREFIX,
             GRAPH_HIERARCHY_PARENT_SHARD_PREFIX,
             GRAPH_METHOD_CONTAINER_SHARD_PREFIX,
             GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX,
@@ -15930,6 +16004,20 @@ fn serialize_symbol_binary(symbol: &GraphSymbol, file_id: u32, out: &mut Vec<u8>
 /// the layout `parse_symbol_binary` reads without decoding any string, so scans
 /// that select records by file can skip every other record cheaply.
 fn symbol_binary_uri_and_end(bytes: &[u8], start: usize) -> io::Result<(&[u8], usize)> {
+    let record = symbol_binary_record(bytes, start)?;
+    Ok((record.uri, record.end))
+}
+
+struct SymbolBinaryRecord<'a> {
+    id: u64,
+    inline_id: Option<&'a [u8]>,
+    name: &'a [u8],
+    qualified_name: &'a [u8],
+    uri: &'a [u8],
+    end: usize,
+}
+
+fn symbol_binary_record(bytes: &[u8], start: usize) -> io::Result<SymbolBinaryRecord<'_>> {
     fn take<'b>(bytes: &'b [u8], cursor: &mut usize, len: usize) -> io::Result<&'b [u8]> {
         let slice = bytes
             .get(*cursor..*cursor + len)
@@ -15946,12 +16034,14 @@ fn symbol_binary_uri_and_end(bytes: &[u8], start: usize) -> io::Result<(&[u8], u
         Ok(take(bytes, cursor, 1)?[0])
     }
     let mut cursor = start;
-    let id = take(bytes, &mut cursor, 8)?;
-    if id == u64::MAX.to_le_bytes() {
-        u16_str(bytes, &mut cursor)?;
-    }
-    u16_str(bytes, &mut cursor)?; // name
-    u16_str(bytes, &mut cursor)?; // qualified_name
+    let id = u64::from_le_bytes(take(bytes, &mut cursor, 8)?.try_into().unwrap());
+    let inline_id = if id == u64::MAX {
+        Some(u16_str(bytes, &mut cursor)?)
+    } else {
+        None
+    };
+    let name = u16_str(bytes, &mut cursor)?;
+    let qualified_name = u16_str(bytes, &mut cursor)?;
     if kind_str_from_id(byte(bytes, &mut cursor)?).is_none() {
         u16_str(bytes, &mut cursor)?;
     }
@@ -15979,7 +16069,7 @@ fn symbol_binary_uri_and_end(bytes: &[u8], start: usize) -> io::Result<(&[u8], u
             take(bytes, &mut cursor, 8)?;
         }
     }
-    Ok((uri, cursor))
+    Ok(SymbolBinaryRecord { id, inline_id, name, qualified_name, uri, end: cursor })
 }
 
 fn parse_symbol_binary(
@@ -16635,6 +16725,37 @@ where
     Ok(symbols)
 }
 
+fn contains_ignore_ascii_case(value: &[u8], query: &[u8]) -> bool {
+    query.is_empty() || value.windows(query.len()).any(|part| part.eq_ignore_ascii_case(query))
+}
+
+/// Select by borrowed binary fields before allocating/decoding symbol metadata.
+/// Substring matching and total/ranking semantics are identical to a full scan.
+fn read_symbols_for_name_query(
+    path: &Path,
+    file_table: &FileTable,
+    query: &str,
+) -> io::Result<Vec<GraphSymbol>> {
+    let query_id = (query.len() == 20)
+        .then(|| parse_stable_symbol_id_to_u64(query))
+        .flatten();
+    let bytes = fs::read(path)?;
+    let mut symbols = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let record = symbol_binary_record(&bytes, cursor)?;
+        let matches = contains_ignore_ascii_case(record.name, query.as_bytes())
+            || contains_ignore_ascii_case(record.qualified_name, query.as_bytes())
+            || record.inline_id.is_some_and(|id| id.eq_ignore_ascii_case(query.as_bytes()))
+            || (record.inline_id.is_none() && query_id == Some(record.id));
+        if matches {
+            symbols.push(parse_symbol_binary(&bytes, &mut cursor, file_table)?);
+        }
+        cursor = record.end;
+    }
+    Ok(symbols)
+}
+
 /// A2 v3 (memory floor) — S2: load only the resolve-index candidate symbols
 /// whose `name_hash` is in `name_hashes`, by reading just the
 /// `callgraph-resolve-by-name` shards those hashes map to (shard == name_hash %
@@ -17256,362 +17377,13 @@ fn read_counts(path: &Path) -> io::Result<HashMap<String, GraphCount>> {
     Ok(counts)
 }
 
-/// Audit the accuracy of the inline usage hint (`usage_likely`, the number the
-/// "N usages" inlay shows) against the number of EMITTED, queryable references
-/// per target (exactly what `graph-query --symbol-id` / the Find-Usages panel
-/// returns on click — `total_references`).
-///
-/// Definitions, per symbol that has a count row (i.e. one that can show an inlay):
-///   * `inlay      = usage_likely`           (source-root scoped count index)
-///   * `panel      = emitted_refs[target]`   (tally of all reference rows whose
-///                                            target == this symbol, across all
-///                                            128 reference-target shards)
-///   * UNDERCOUNT  ⇔ inlay <  panel  (the inlay shows fewer than a click reveals)
-///   * OVERCOUNT   ⇔ inlay >  panel  (the inlay over-promises)
-///   * EXACT       ⇔ inlay == panel
-///
-/// The user-facing acceptance bar is `undercount.symbols == 0`. Returns a JSON
-/// report string (hand-rolled, matching `protocol::*::to_json` style — the
-/// crate has no `serde_json`). NOTE: this is a static shard tally; it does NOT
-/// merge the (normally empty on a freshly built index) hot call-graph overlay
-/// that `query_graph` would, so on a workspace with pending un-compacted edits
-/// the panel side can differ by the overlay delta.
+/// Compare displayed counts with the live deduplicated reference union.
+/// Includes pending edits and lazy candidates; semantic accuracy is verified
+/// separately by fixtures with independently specified reference locations.
 pub fn audit_usage_counts(
-    workspace_root: &Path,
-    config: &EngineConfig,
-    top_n: usize,
-    dump_first_party: Option<&Path>,
+    workspace_root: &Path, config: &EngineConfig, top_n: usize, dump_first_party: Option<&Path>,
 ) -> io::Result<String> {
-    use crate::protocol::json_string;
-    use std::fmt::Write as _;
-
-    // When dumping, capture (lowercased id, name, rel_path, kind) for every
-    // first-party symbol (not vendored) so an external rg-based ground-truth pass
-    // can compare each symbol's graph usage count to its textual occurrences.
-    let want_dump = dump_first_party.is_some();
-    let is_first_party = |rel: &str| {
-        !rel.contains(".venv/")
-            && !rel.contains("node_modules/")
-            && !rel.contains("site-packages/")
-    };
-    let mut fp_syms: Vec<(String, String, String, String)> = Vec::new();
-
-    let file_table_path = graph_file_table_path(workspace_root, config);
-    let file_table = if file_table_path.exists() {
-        read_file_table_binary(&file_table_path).unwrap_or_default()
-    } else {
-        FileTable::default()
-    };
-
-    // 1) Tally emitted references per (lowercased) target symbol id. All refs for
-    //    a given target live in that target's shard, so a cross-shard tally by
-    //    target reproduces `query_graph`'s `total_references` exactly.
-    // Map each symbol id -> interned source-root id (`source_scope_key` = top path
-    // segment), so a reference can be classified same-root vs cross-root relative
-    // to its target. Built by streaming the symbol-id shards one at a time.
-    let mut root_intern: HashMap<String, u32> = HashMap::default();
-    let mut root_name: Vec<String> = Vec::new();
-    let mut root_of: HashMap<String, u32> = HashMap::default();
-    for shard in 0..GRAPH_SHARD_COUNT {
-        let path = graph_shard_path(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
-        if !path.exists() {
-            continue;
-        }
-        for s in read_symbols(&path, &file_table)? {
-            let root = source_scope_key(&s.rel_path);
-            let rid = match root_intern.get(root) {
-                Some(rid) => *rid,
-                None => {
-                    let rid = root_name.len() as u32;
-                    root_intern.insert(root.to_string(), rid);
-                    root_name.push(root.to_string());
-                    rid
-                }
-            };
-            let id_lc = s.id.to_ascii_lowercase();
-            if want_dump && is_first_party(&s.rel_path) {
-                fp_syms.push((id_lc.clone(), s.name.clone(), s.rel_path.clone(), s.kind.clone()));
-            }
-            root_of.insert(id_lc, rid);
-        }
-    }
-
-    // Per target: [total, exact, same_root_total, same_root_exact]. `same_root` =
-    // reference whose own source-root equals the target symbol's source-root.
-    let mut stats: HashMap<String, [u64; 4]> = HashMap::default();
-    let mut total_emitted: u64 = 0;
-    let mut total_emitted_exact: u64 = 0;
-    let mut untargeted_refs: u64 = 0;
-    for shard in 0..GRAPH_SHARD_COUNT {
-        let path =
-            graph_shard_path(workspace_root, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX, shard);
-        if !path.exists() {
-            continue;
-        }
-        let bytes = fs::read(&path)?;
-        let mut cursor = 0;
-        while cursor < bytes.len() {
-            let r = parse_reference_binary(&bytes, &mut cursor, &file_table)?;
-            let Some(target) = r.target_symbol_id.as_deref() else {
-                untargeted_refs += 1;
-                continue;
-            };
-            total_emitted += 1;
-            let key = target.to_ascii_lowercase();
-            let is_exact = &*r.confidence == "exact";
-            let same_root = root_of
-                .get(&key)
-                .map(|rid| source_scope_key(&r.rel_path) == root_name[*rid as usize].as_str())
-                .unwrap_or(false);
-            let e = stats.entry(key).or_insert([0; 4]);
-            e[0] += 1;
-            if is_exact {
-                total_emitted_exact += 1;
-                e[1] += 1;
-            }
-            if same_root {
-                e[2] += 1;
-                if is_exact {
-                    e[3] += 1;
-                }
-            }
-        }
-    }
-    let emitted: HashMap<String, u64> = stats.iter().map(|(k, v)| (k.clone(), v[0])).collect();
-
-    // 2) Load every count row (keyed lowercased to match emitted tally + ids).
-    let mut counts: HashMap<String, GraphCount> = HashMap::default();
-    for shard in 0..GRAPH_SHARD_COUNT {
-        let path = graph_shard_path(workspace_root, config, GRAPH_COUNT_ID_SHARD_PREFIX, shard);
-        if !path.exists() {
-            continue;
-        }
-        for (id, c) in read_counts(&path)? {
-            counts.insert(id.to_ascii_lowercase(), c);
-        }
-    }
-
-    // 3) Classify every counted symbol (these are the ones that get an inlay).
-    let mut exact: u64 = 0;
-    let mut under_symbols: u64 = 0;
-    let mut under_deficit: u64 = 0;
-    let mut under_max: u64 = 0;
-    let mut under_explained_by_may: u64 = 0;
-    // SERIOUS undercount: inlay below the count of EXACT/high-confidence refs.
-    let mut under_exact_symbols: u64 = 0;
-    let mut under_exact_deficit: u64 = 0;
-    let mut under_exact_max: u64 = 0;
-    let mut over_symbols: u64 = 0;
-    let mut over_excess: u64 = 0;
-    let mut over_max: u64 = 0;
-    // Fix-B simulation: the panel shows the top `usage_likely` references ranked
-    // [exact, then same-root possible, then cross-root possible], folding the rest.
-    // That makes panel-primary count == usage_likely == inlay (undercount=0 AND
-    // overcount=0 by construction). The only quality risk is "noise promotion":
-    // when usage_likely exceeds (same_root_total + cross_root_exact), the primary
-    // list must reach into cross-root *possible* (look-alike) refs to fill its
-    // quota. We want that count ~0.
-    let mut fixb_noise_promoted_symbols: u64 = 0;
-    let mut fixb_noise_promoted_refs: u64 = 0;
-    let mut fixb_noise_promoted_max: u64 = 0;
-    // Option-B simulation: if cross-root NON-exact emitted refs are NOT emitted,
-    // each target keeps `same_root_total + cross_root_exact` refs. Measures the
-    // resulting undercount (usage_likely < kept), how many refs would be dropped,
-    // and how many symbols' panels would go empty (all refs were cross-root
-    // low-confidence) — and of those, how many still show a non-zero inlay
-    // (potential real-usage loss to inspect).
-    let mut optb_dropped_refs: u64 = 0;
-    let mut optb_undercount_after: u64 = 0;
-    let mut optb_undercount_after_deficit: u64 = 0;
-    let mut optb_emptied_symbols: u64 = 0;
-    let mut optb_emptied_with_nonzero_inlay: u64 = 0;
-    // (id, usage_likely, emitted, same_root_total) for emptied-with-inlay symbols
-    // — the only real-usage-loss risk of Option B, to inspect before committing.
-    let mut optb_emptied_off: Vec<(String, usize, u64, u64)> = Vec::new();
-    // (id, usage_likely, usage_must, usage_may, emitted, emitted_exact, delta)
-    let mut under_off: Vec<(String, usize, usize, usize, u64, u64, u64)> = Vec::new();
-    let mut over_off: Vec<(String, usize, usize, usize, u64, u64, u64)> = Vec::new();
-
-    for (id, c) in &counts {
-        let st = stats.get(id).copied().unwrap_or([0; 4]);
-        let em = st[0];
-        let em_exact = st[1];
-        let same_root_total = st[2];
-        let cross_root_exact = st[1].saturating_sub(st[3]);
-        let ul = c.usage_likely as u64;
-        // Fix-B noise-promotion check (only matters when refs are actually folded).
-        if ul < em {
-            let high_conf = same_root_total + cross_root_exact;
-            if ul > high_conf {
-                let promoted = ul - high_conf;
-                fixb_noise_promoted_symbols += 1;
-                fixb_noise_promoted_refs += promoted;
-                fixb_noise_promoted_max = fixb_noise_promoted_max.max(promoted);
-            }
-        }
-        // Option-B simulation: keep only same-root + cross-root-exact refs.
-        let optb_kept = same_root_total + cross_root_exact;
-        optb_dropped_refs += em.saturating_sub(optb_kept);
-        if ul < optb_kept {
-            optb_undercount_after += 1;
-            optb_undercount_after_deficit += optb_kept - ul;
-        }
-        if em > 0 && optb_kept == 0 {
-            optb_emptied_symbols += 1;
-            if ul > 0 {
-                optb_emptied_with_nonzero_inlay += 1;
-                optb_emptied_off.push((id.clone(), c.usage_likely, em, same_root_total));
-            }
-        }
-        if ul < em {
-            let d = em - ul;
-            under_symbols += 1;
-            under_deficit += d;
-            under_max = under_max.max(d);
-            if c.usage_may as u64 >= em {
-                under_explained_by_may += 1;
-            }
-            if ul < em_exact {
-                under_exact_symbols += 1;
-                under_exact_deficit += em_exact - ul;
-                under_exact_max = under_exact_max.max(em_exact - ul);
-            }
-            under_off.push((id.clone(), c.usage_likely, c.usage_must, c.usage_may, em, em_exact, d));
-        } else if ul > em {
-            let e = ul - em;
-            over_symbols += 1;
-            over_excess += e;
-            over_max = over_max.max(e);
-            over_off.push((id.clone(), c.usage_likely, c.usage_must, c.usage_may, em, em_exact, e));
-        } else {
-            exact += 1;
-        }
-    }
-
-    // Emitted targets that have NO count row: refs point at them (panel shows N)
-    // but they carry no inlay number at all.
-    let mut emitted_without_count: u64 = 0;
-    let mut emitted_without_count_refs: u64 = 0;
-    for (id, em) in &emitted {
-        if !counts.contains_key(id) {
-            emitted_without_count += 1;
-            emitted_without_count_refs += *em;
-        }
-    }
-
-    if let Some(dump_path) = dump_first_party {
-        let mut out = String::with_capacity(fp_syms.len().saturating_mul(64));
-        out.push_str("relPath\tname\tkind\tusageLikely\tusageMust\tusageMay\temitted\n");
-        for (id, name, rel, kind) in &fp_syms {
-            let c = counts.get(id).copied().unwrap_or_default();
-            let em = stats.get(id).map(|s| s[0]).unwrap_or(0);
-            let _ = write!(
-                out,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                rel, name, kind, c.usage_likely, c.usage_must, c.usage_may, em
-            );
-        }
-        fs::write(dump_path, out)?;
-    }
-
-    under_off.sort_by(|a, b| b.6.cmp(&a.6).then_with(|| b.4.cmp(&a.4)));
-    over_off.sort_by(|a, b| b.6.cmp(&a.6).then_with(|| b.4.cmp(&a.4)));
-    under_off.truncate(top_n);
-    over_off.truncate(top_n);
-    optb_emptied_off.sort_by(|a, b| b.2.cmp(&a.2));
-    optb_emptied_off.truncate(top_n);
-
-    // Resolve names/paths for the offenders only.
-    let ids: HashSet<String> = under_off
-        .iter()
-        .chain(over_off.iter())
-        .map(|o| o.0.clone())
-        .chain(optb_emptied_off.iter().map(|o| o.0.clone()))
-        .collect();
-    let mut sym_by_id: HashMap<String, GraphSymbol> = HashMap::default();
-    for s in read_symbols_for_symbol_ids_indexed(workspace_root, config, &ids).unwrap_or_default() {
-        sym_by_id.insert(s.id.to_ascii_lowercase(), s);
-    }
-
-    let render = |off: &[(String, usize, usize, usize, u64, u64, u64)]| -> String {
-        off.iter()
-            .map(|(id, ul, must, may, em, em_exact, delta)| {
-                let (name, rel, kind) = sym_by_id
-                    .get(id)
-                    .map(|s| (s.name.clone(), s.rel_path.clone(), s.kind.clone()))
-                    .unwrap_or_default();
-                format!(
-                    "{{\"symbolId\":{},\"name\":{},\"relPath\":{},\"kind\":{},\"usageLikely\":{},\"usageMust\":{},\"usageMay\":{},\"emitted\":{},\"emittedExact\":{},\"delta\":{}}}",
-                    json_string(id),
-                    json_string(&name),
-                    json_string(&rel),
-                    json_string(&kind),
-                    ul,
-                    must,
-                    may,
-                    em,
-                    em_exact,
-                    delta
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let render_emptied = |off: &[(String, usize, u64, u64)]| -> String {
-        off.iter()
-            .map(|(id, ul, em, same_root)| {
-                let (name, rel, kind) = sym_by_id
-                    .get(id)
-                    .map(|s| (s.name.clone(), s.rel_path.clone(), s.kind.clone()))
-                    .unwrap_or_default();
-                format!(
-                    "{{\"symbolId\":{},\"name\":{},\"relPath\":{},\"kind\":{},\"usageLikely\":{},\"emitted\":{},\"sameRoot\":{}}}",
-                    json_string(id),
-                    json_string(&name),
-                    json_string(&rel),
-                    json_string(&kind),
-                    ul,
-                    em,
-                    same_root
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-
-    Ok(format!(
-        "{{\"type\":\"graph-audit-counts\",\"workspaceRoot\":{},\"symbolsWithCounts\":{},\"distinctEmittedTargets\":{},\"totalEmittedRefs\":{},\"totalEmittedExactRefs\":{},\"untargetedRefs\":{},\"exact\":{},\"undercount\":{{\"symbols\":{},\"totalDeficit\":{},\"maxDeficit\":{},\"explainedByUsageMay\":{},\"exactDeficitSymbols\":{},\"exactDeficitTotal\":{},\"exactDeficitMax\":{},\"topOffenders\":[{}]}},\"overcount\":{{\"symbols\":{},\"totalExcess\":{},\"maxExcess\":{},\"topOffenders\":[{}]}},\"fixB\":{{\"noisePromotedSymbols\":{},\"noisePromotedRefs\":{},\"noisePromotedMax\":{}}},\"optB\":{{\"droppedRefs\":{},\"undercountAfter\":{},\"undercountAfterDeficit\":{},\"emptiedSymbols\":{},\"emptiedWithNonzeroInlay\":{},\"emptiedOffenders\":[{}]}},\"emittedTargetsWithoutCountRow\":{{\"symbols\":{},\"refs\":{}}}}}",
-        json_string(&workspace_root.to_string_lossy()),
-        counts.len(),
-        emitted.len(),
-        total_emitted,
-        total_emitted_exact,
-        untargeted_refs,
-        exact,
-        under_symbols,
-        under_deficit,
-        under_max,
-        under_explained_by_may,
-        under_exact_symbols,
-        under_exact_deficit,
-        under_exact_max,
-        render(&under_off),
-        over_symbols,
-        over_excess,
-        over_max,
-        render(&over_off),
-        fixb_noise_promoted_symbols,
-        fixb_noise_promoted_refs,
-        fixb_noise_promoted_max,
-        optb_dropped_refs,
-        optb_undercount_after,
-        optb_undercount_after_deficit,
-        optb_emptied_symbols,
-        optb_emptied_with_nonzero_inlay,
-        render_emptied(&optb_emptied_off),
-        emitted_without_count,
-        emitted_without_count_refs,
-    ))
+    usage_counts::audit(workspace_root, config, top_n, dump_first_party)
 }
 
 fn read_counts_for_symbol_ids(
@@ -17737,7 +17509,13 @@ fn apply_count_options_for_symbols(
     symbols: &mut [GraphSymbol],
     options: GraphSymbolQueryOptions,
 ) -> io::Result<()> {
+    if symbols.is_empty() {
+        return Ok(());
+    }
     if !options.include_usage_counts && !options.include_implementation_counts {
+        for symbol in symbols {
+            apply_count_options(symbol, &HashMap::new(), options);
+        }
         return Ok(());
     }
     let count_path = graph_count_index_path(workspace_root, config);
@@ -17794,11 +17572,25 @@ fn deduped_reference_counts_for_symbol_ids_indexed(
     symbol_ids: &HashSet<String>,
     symbols: &[GraphSymbol],
 ) -> io::Result<HashMap<String, usize>> {
+    if let Some(counts) = usage_counts::read(workspace_root, config, symbol_ids)? {
+        return Ok(counts);
+    }
+    let built_at = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config)).unwrap_or(0);
+    let overlay = crate::graph_overlay::GraphOverlay::load_valid(workspace_root, config, built_at);
+    deduped_reference_counts_from_index(workspace_root, config, symbol_ids, symbols, &overlay)
+}
+
+fn deduped_reference_counts_from_index(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbol_ids: &HashSet<String>,
+    symbols: &[GraphSymbol],
+    overlay: &crate::graph_overlay::GraphOverlay,
+) -> io::Result<HashMap<String, usize>> {
     if symbol_ids.is_empty() || !graph_index_available(workspace_root, config) {
         return Ok(HashMap::new());
     }
     let ids_lower: HashSet<String> = symbol_ids.iter().map(|id| id.to_ascii_lowercase()).collect();
-    let built_at_unix_ms = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config)).unwrap_or(0);
     let file_table_path = graph_file_table_path(workspace_root, config);
     let file_table = if file_table_path.exists() {
         read_file_table_binary(&file_table_path).unwrap_or_default()
@@ -17861,18 +17653,16 @@ fn deduped_reference_counts_for_symbol_ids_indexed(
             })?);
         }
     }
-    merge_overlay_query_refs(workspace_root, config, built_at_unix_ms, &mut references, |r| {
-        r.target_symbol_id
-            .as_deref()
-            .map(|target| ids_lower.contains(&target.to_ascii_lowercase()))
-            .unwrap_or(false)
-    });
-    append_lazy_token_shape_references(
+    references.retain(|r| !overlay.entries.contains_key(&*r.rel_path));
+    references.extend(overlay.live_refs().filter(|r| r.target_symbol_id.as_deref()
+        .is_some_and(|target| ids_lower.contains(&target.to_ascii_lowercase()))).cloned());
+    append_lazy_token_shape_references_with_overlay(
         workspace_root,
         config,
         symbols,
         &file_table,
         &mut references,
+        overlay,
     )?;
     let mut counts: HashMap<String, usize> = HashMap::default();
     for reference in dedupe_graph_references_by_source_occurrence(references) {
@@ -19002,16 +18792,16 @@ fn sanitize_code_line<'a>(line: &'a str, language: &str) -> Cow<'a, str> {
     while let Some(ch) = chars.next() {
         if let Some(active) = quote {
             if ch == '\\' {
-                out.push(' ');
-                if chars.next().is_some() {
-                    out.push(' ');
+                push_ascii_spaces(&mut out, ch.len_utf8());
+                if let Some(escaped) = chars.next() {
+                    push_ascii_spaces(&mut out, escaped.len_utf8());
                 }
                 continue;
             }
             if ch == active {
                 quote = None;
             }
-            out.push(' ');
+            push_ascii_spaces(&mut out, ch.len_utf8());
             continue;
         }
         if ch == '"' || ch == '\'' || ch == '`' {
@@ -19069,7 +18859,7 @@ fn sanitize_python_ref_site_code_line<'a>(
                 *multiline_string_quote = None;
             } else {
                 let ch = line[idx..].chars().next().unwrap_or(' ');
-                out.push(' ');
+                push_ascii_spaces(&mut out, ch.len_utf8());
                 idx += ch.len_utf8();
             }
             continue;
@@ -19162,12 +18952,12 @@ fn sanitize_python_single_line_string_tail(
 ) -> usize {
     while idx < line.len() {
         let ch = line[idx..].chars().next().unwrap_or(' ');
-        out.push(' ');
+        push_ascii_spaces(out, ch.len_utf8());
         idx += ch.len_utf8();
         if ch == '\\' {
             if idx < line.len() {
                 let escaped = line[idx..].chars().next().unwrap_or(' ');
-                out.push(' ');
+                push_ascii_spaces(out, escaped.len_utf8());
                 idx += escaped.len_utf8();
             }
             continue;
@@ -19186,9 +18976,7 @@ fn push_ascii_spaces(out: &mut String, count: usize) {
 }
 
 fn push_spaces_for_slice(out: &mut String, value: &str) {
-    for _ in value.chars() {
-        out.push(' ');
-    }
+    push_ascii_spaces(out, value.len());
 }
 
 fn sanitize_import_line(line: &str, language: &str) -> String {
@@ -19763,15 +19551,20 @@ fn line_indent(line: &str) -> usize {
 }
 
 fn find_column(line: &str, name: &str) -> u32 {
-    line.find(name).unwrap_or(0) as u32
+    utf16_column(line, line.find(name).unwrap_or(0))
+}
+
+fn utf16_column(line: &str, byte_offset: usize) -> u32 {
+    // Token extraction uses UTF-8 byte offsets; VS Code uses UTF-16 positions.
+    line[..byte_offset].encode_utf16().count() as u32
 }
 
 fn is_ident_start(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphabetic()
+    ch == '_' || unicode_ident::is_xid_start(ch)
 }
 
 fn is_ident_continue(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphanumeric()
+    unicode_ident::is_xid_continue(ch)
 }
 
 fn rebuild_reference_uris(workspace_root: &Path, references: &mut [GraphReference]) {
@@ -20213,8 +20006,8 @@ mod tests {
             GraphSymbol {
                 // Every fourth id is non-standard, which is stored inline.
                 id: if i % 4 == 0 { format!("custom-{i}") } else { format!("sym:{:016x}", i as u64 * 7919) },
-                name: text("name"),
-                qualified_name: text("pkg.mod.name"),
+                name: if i == 7 { "작업MiXeD".to_string() } else { text("name") },
+                qualified_name: if i == 7 { "pkg.작업MiXeD".to_string() } else { text("pkg.mod.name") },
                 // Unknown kinds and languages are stored inline too.
                 kind: if i % 3 == 0 { text("custom-kind") } else { "class".to_string() },
                 language: if i % 5 == 0 { text("custom-lang") } else { "python".to_string() },
@@ -20285,6 +20078,16 @@ mod tests {
         let actual = read_symbols_with_ids(&path, &file_table, &ids).unwrap();
         assert!(!expected.is_empty());
         assert_eq!(render(actual), render(expected));
+        for query in ["", "name", "NAME", "pkg.MOD", "작업", "작업mixed", "custom-8", "SYM:0000000000007BBF", "absent"] {
+            let lower = query.to_ascii_lowercase();
+            let expected = read_symbols_matching(&path, &file_table, |s| {
+                s.id.eq_ignore_ascii_case(query)
+                    || s.name.to_ascii_lowercase().contains(&lower)
+                    || s.qualified_name.to_ascii_lowercase().contains(&lower)
+            }).unwrap();
+            let actual = read_symbols_for_name_query(&path, &file_table, &lower).unwrap();
+            assert_eq!(render(actual), render(expected), "query {query}");
+        }
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -20668,6 +20471,15 @@ mod tests {
             modified_unix_secs: 0,
             encoding: TextEncoding::Utf8,
         }
+    }
+
+    #[test]
+    fn python_parameter_filter_preserves_members_and_indexed_local_redefinitions() {
+        let entry = test_entry("pkg/scopes.py", "def action():\n    pass\ndef consume(action, client):\n    action = client.run\n    action()\n    client.action()\n");
+        let graph = build_file_graph(&entry);
+        let positions: Vec<_> = graph.ref_sites.iter().filter(|site| site.name == "action")
+            .map(|site| (site.start_line, site.start_column, site.is_definition)).collect();
+        assert_eq!(positions, vec![(0, 4, true), (3, 4, true), (4, 4, false), (5, 11, false)]);
     }
 
     fn unique_temp_workspace(prefix: &str) -> PathBuf {

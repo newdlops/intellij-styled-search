@@ -122,9 +122,9 @@ test('native Windows CIM snapshot includes the running Node host', { skip: proce
   assert.equal(snapshot.find((p) => p.pid === process.pid)?.ppid, process.ppid);
 });
 
-test('Windows URI cache migration preserves the existing macOS storage versions', () => {
-  assert.deepEqual(graphStorageVersions('win32'), { cache: 18, native: 10 });
-  assert.deepEqual(graphStorageVersions('darwin'), { cache: 17, native: 9 });
+test('usage binding migration invalidates old overlays while retaining platform URI versions', () => {
+  assert.deepEqual(graphStorageVersions('win32'), { cache: 21, native: 13 });
+  assert.deepEqual(graphStorageVersions('darwin'), { cache: 20, native: 12 });
 });
 
 test('native Windows inspector activation starts a running child without SIGUSR1', {

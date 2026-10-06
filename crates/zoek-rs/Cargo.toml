@@ -20,6 +20,7 @@ path = "src/bin/ijss-rebuild.rs"
 
 [dependencies]
 regex = "1.11.1"
+unicode-ident = "1.0"
 ahash = "0.8"
 crossbeam-channel = "0.5"
 libc = "0.2"

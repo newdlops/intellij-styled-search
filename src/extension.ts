@@ -17,6 +17,7 @@ import {
   type CallGraphSymbolRelationSummary,
   type CallGraphUsageConfidence,
   type CallGraphUsageConfidenceCounts,
+  type CallGraphUsagePage,
 } from './callGraph';
 import { CallGraphMcpServer } from './mcpServer';
 import { DurableCommandOwnershipRegistry } from './internal/callGraphInlayCommandOwnership';
@@ -1451,9 +1452,8 @@ function getConfiguredCallGraphIncludeLowConfidenceUsages(): boolean {
 }
 
 function getEffectiveCallGraphUsageLimit(expectedUsageCount?: number): number {
-  const configured = getConfiguredCallGraphMaxUsageResults();
-  const expected = normalizeExpectedUsageCount(expectedUsageCount);
-  return expected === undefined ? configured : Math.max(configured, expected);
+  // The hint is a total, not permission to allocate all results in one page.
+  return getConfiguredCallGraphMaxUsageResults();
 }
 
 function normalizeExpectedUsageCount(value: unknown): number | undefined {
@@ -1595,8 +1595,8 @@ async function showCallGraphUsageResult(
           symbol: resolvedExplicitSymbol,
           expectedUsageCount: normalizedExpectedUsageCount,
         };
-        const cachedUsages = await callGraph.findUsagesForSymbolIdFromCache(explicitSymbolId, limit);
-        if (cachedUsages) {
+        const cachedPage = await callGraph.findUsagePageForSymbolIdFromCache(explicitSymbolId, limit);
+        if (cachedPage) {
           await showCallGraphUsageMatches(
             overlay,
             callGraph,
@@ -1604,12 +1604,13 @@ async function showCallGraphUsageResult(
             title,
             explicitQuery,
             resolvedExplicitSymbol,
-            cachedUsages,
+            cachedPage.references,
             'call graph cache-index',
             false,
             explicitLabel ?? resolvedExplicitSymbol?.qualifiedName ?? labelFromCallGraphSymbolId(explicitSymbolId),
             showedPendingPanel,
             forceIncludeLowConfidence,
+            cachedPage,
           );
           return;
         }
@@ -1633,9 +1634,8 @@ async function showCallGraphUsageResult(
     if (!explicitQuery && forceIncludeLowConfidence === undefined) {
       estimatedUsagesExpanded = getConfiguredCallGraphIncludeLowConfidenceUsages();
     }
-    const usages = targetSymbol && callGraph.isRustNativeIndexOnly()
-      ? await callGraph.findUsagesForSymbolIdFromCache(targetSymbol.id, limit) ?? []
-      : callGraph.findUsages(query, limit);
+    const page = targetSymbol ? await callGraph.findUsagePageForSymbolIdFromCache(targetSymbol.id, limit) : undefined;
+    const usages = page?.references ?? callGraph.findUsages(query, limit);
     await showCallGraphUsageMatches(
       overlay,
       callGraph,
@@ -1649,6 +1649,7 @@ async function showCallGraphUsageResult(
       explicitLabel,
       showedPendingPanel,
       forceIncludeLowConfidence,
+      page,
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1669,77 +1670,124 @@ async function showCallGraphUsageMatches(
   targetLabelOverride?: string,
   showEmptyPanel = false,
   forceIncludeLowConfidence?: boolean,
+  initialPage?: CallGraphUsagePage,
 ): Promise<void> {
-  let sourceLabel = initialSourceLabel;
   const targetLabel = targetLabelOverride ?? targetSymbol?.qualifiedName ?? query;
-  const normalizedUsages = dedupeCallGraphUsageReferences(await callGraph.refineUsageReferencesWithCurrentSources(usages, {
-    ...(targetSymbol ? { targetSymbols: [targetSymbol] } : {}),
-    targetLabel,
-  }));
-  // Split confirmed vs low-confidence usages. By default we show both so the
-  // panel can match the inline "N usages" envelope; users can opt into folding
-  // estimated rows out of the primary result set.
-  const includeLowConfidence =
-    forceIncludeLowConfidence ?? getConfiguredCallGraphIncludeLowConfidenceUsages();
-  const usageConfidenceCounts = summarizeCallGraphUsageConfidence(normalizedUsages);
-  const confirmedUsages = normalizedUsages.filter(isConfirmedUsage);
-  const lowConfidenceCount = usageConfidenceCounts.ambiguous + usageConfidenceCounts.textual;
-  const showFolded = includeLowConfidence || confirmedUsages.length === 0;
-  const displayUsages = showFolded ? normalizedUsages : confirmedUsages;
-  let matches = await buildCallGraphUsageFileMatches(displayUsages);
-  const graphMatchCount = countFileMatchMatches(matches);
-  // Gate the text fallback on the FULL graph count, not the (possibly folded)
-  // displayed count — otherwise folding a noisy symbol down to a few confirmed
-  // rows would wrongly trigger a workspace-wide text search and re-flood it.
-  const graphTotalCount = normalizedUsages.length;
-  callGraphLog.appendLine(
-    `find usages source: ${initialSourceLabel} query=${JSON.stringify(targetLabel)} ` +
-    `matches=${graphMatchCount} confirmed=${confirmedUsages.length} lowConfidence=${lowConfidenceCount} ` +
-    `folded=${!showFolded && lowConfidenceCount > 0}`,
-  );
-  if (allowTextFallback && targetSymbol && shouldSearchUsageTextFallback(targetSymbol, graphTotalCount)) {
-    const searched = await searchWorkspaceForUsageText(overlay, targetSymbol);
-    const searchMatches = searched.result.matches;
-    const total = countFileMatchMatches(searchMatches);
-    if (total > 0) {
-      const searchLabel = searched.result.requestedEngine === searched.result.effectiveEngine
-        ? searched.result.effectiveEngine
-        : `${searched.result.requestedEngine}->${searched.result.effectiveEngine}`;
-      sourceLabel = graphMatchCount > 0 ? `${sourceLabel}+${searchLabel}` : searchLabel;
-      const taggedSearchMatches = tagFileMatchesWithUsageConfidence(
-        searchMatches,
-        'textual',
-        `text fallback via ${searchLabel}`,
-      );
-      matches = graphMatchCount > 0 ? mergeFileMatches(matches, taggedSearchMatches) : taggedSearchMatches;
+  let includeLowConfidence = forceIncludeLowConfidence ?? getConfiguredCallGraphIncludeLowConfidenceUsages();
+  let references = dedupeCallGraphUsageReferences(usages);
+  let page = initialPage;
+  let sourceLabel = initialSourceLabel;
+  let textMatches: FileMatch[] = [];
+  let pendingRefinements = 0;
+  let loadingPage = false;
+  let presentationRevision = 0;
+  const fallbackNeeded = allowTextFallback && targetSymbol
+    && shouldSearchUsageTextFallback(targetSymbol, page?.totalReferences ?? references.length);
+
+  const buildPresentation = async (checking: boolean, notice?: string) => {
+    const snapshot = references;
+    const counts = summarizeCallGraphUsageConfidence(snapshot);
+    const lowConfidence = counts.ambiguous + counts.textual;
+    const confirmed = snapshot.filter(isConfirmedUsage);
+    const shownCandidates = includeLowConfidence || confirmed.length === 0;
+    const shown = shownCandidates ? snapshot : confirmed;
+    let matches = await buildCallGraphUsageFileMatches(shown);
+    if (textMatches.length) { matches = mergeFileMatches(matches, textMatches); }
+    const total = page?.totalReferences ?? snapshot.length;
+    const shownCount = countFileMatchMatches(matches);
+    const breakdown = formatUsageConfidenceBreakdown(summarizeFileMatchUsageConfidence(matches));
+    const progress = page?.nextOffset !== undefined || snapshot.length < total
+      ? `Loaded ${snapshot.length} of ${total} usages` : `${shownCount} usages shown`;
+    const candidates = lowConfidence > 0 ? ` · ${lowConfidence} candidates ${shownCandidates ? 'shown' : 'hidden'}` : '';
+    return {
+      query: `${title} [${sourceLabel}]: ${targetLabel}${breakdown ? ` · ${breakdown}` : ''}`,
+      matches,
+      state: {
+        totalMatches: Math.max(total, shownCount), hasMore: page?.nextOffset !== undefined,
+        pageSize: getConfiguredCallGraphMaxUsageResults(), refining: checking,
+        statusText: `${notice ? `${notice} · ` : ''}${progress}${candidates}${checking ? ' · Checking candidates…' : ''}`,
+        candidates: { visible: lowConfidence > 0, pressed: shownCandidates },
+      },
+    };
+  };
+
+  const checking = references.some((reference) => !isConfirmedUsage(reference)) || !!fallbackNeeded;
+  const initial = await buildPresentation(checking);
+  const presenter = await overlay.presentStaticResults(initial.query, initial.matches, initial.state);
+  callGraphLog.appendLine(`find usages first results: query=${JSON.stringify(targetLabel)} loaded=${references.length} total=${page?.totalReferences ?? references.length}`);
+  if (!presenter) { return; }
+
+  const refresh = async (notice?: string) => {
+    const revision = ++presentationRevision;
+    const next = await buildPresentation(pendingRefinements > 0, notice);
+    if (revision !== presentationRevision) { return; }
+    await presenter.update(next.query, next.matches, next.state);
+  };
+  const refine = (batch: CallGraphReference[], generation = page?.generation) => {
+    if (!batch.some((reference) => !isConfirmedUsage(reference))) { return; }
+    pendingRefinements++;
+    void callGraph.refineUsageReferencesWithCurrentSources(batch, {
+      ...(targetSymbol ? { targetSymbols: [targetSymbol] } : {}), targetLabel,
+    }).then(async (refined) => {
+      if (generation !== page?.generation) { return; }
+      references = dedupeCallGraphUsageReferences([...references, ...refined]);
+    }).catch((error) => {
+      callGraphLog.appendLine(`usage refinement failed: ${String(error)}`);
+    }).finally(() => {
+      pendingRefinements--;
+      if (generation === page?.generation) { void refresh().catch((error) => callGraphLog.appendLine(`usage panel update failed: ${String(error)}`)); }
+    });
+  };
+
+  presenter.onLoadMore(async () => {
+    if (loadingPage || page?.nextOffset === undefined || !targetSymbol) { return; }
+    loadingPage = true;
+    try {
+      let next: CallGraphUsagePage | undefined;
+      try {
+        next = await callGraph.findUsagePageForSymbolIdFromCache(targetSymbol.id,
+          getConfiguredCallGraphMaxUsageResults(), page.nextOffset, page.generation);
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes('Usage results changed')) { throw error; }
+        next = await callGraph.findUsagePageForSymbolIdFromCache(targetSymbol.id, getConfiguredCallGraphMaxUsageResults());
+        references = [];
+        textMatches = [];
+      }
+      if (!next) { throw new Error('Usage index is unavailable.'); }
+      references = dedupeCallGraphUsageReferences([...references, ...next.references]);
+      page = next;
+      loadingPage = false;
+      refine(next.references);
+      await refresh();
+    } catch (error) {
+      loadingPage = false;
+      await refresh(`Could not load more: ${error instanceof Error ? error.message : String(error)}. Use More to retry.`);
+    } finally {
+      loadingPage = false;
     }
-    callGraphLog.appendLine(
-      `find usages text fallback: query=${JSON.stringify(targetSymbol.name)} requested=${searched.result.requestedEngine} ` +
-      `effective=${searched.result.effectiveEngine} matches=${total}` +
-      `${searched.result.fallbackReason ? ` fallbackReason=${searched.result.fallbackReason}` : ''}`,
-    );
-  }
-  if (matches.length === 0) {
-    if (showEmptyPanel) {
-      await overlay.showStaticResults(`${title} [${sourceLabel}]: ${targetLabel}`, []);
-    }
+  });
+  presenter.onToggleCandidates(async () => {
+    includeLowConfidence = !includeLowConfidence;
+    await refresh();
+  });
+  refine(references);
+
+  if (fallbackNeeded && targetSymbol) {
+    pendingRefinements++;
+    void searchWorkspaceForUsageText(overlay, targetSymbol).then(async (searched) => {
+      const result = searched.result;
+      const label = result.requestedEngine === result.effectiveEngine ? result.effectiveEngine : `${result.requestedEngine}->${result.effectiveEngine}`;
+      textMatches = tagFileMatchesWithUsageConfidence(result.matches, 'textual', `text fallback via ${label}`);
+      if (textMatches.length) { sourceLabel = `${initialSourceLabel}+${label}`; }
+    }).catch((error) => {
+      callGraphLog.appendLine(`usage text fallback failed: ${String(error)}`);
+    }).finally(() => {
+      pendingRefinements--;
+      void refresh().catch((error) => callGraphLog.appendLine(`usage panel update failed: ${String(error)}`));
+    });
+  } else if (initial.matches.length === 0) {
     vscode.window.showInformationMessage('No usages found for the selected call graph symbol.');
-    return;
   }
-  const displayedConfidenceCounts = summarizeFileMatchUsageConfidence(matches);
-  const breakdown = formatUsageConfidenceBreakdown(displayedConfidenceCounts);
-  const statusSuffix = [
-    breakdown ? ` · ${breakdown}` : '',
-    !showFolded && lowConfidenceCount > 0
-      ? ` · ${lowConfidenceCount} candidates hidden`
-      : showFolded && lowConfidenceCount > 0
-        ? ` · ${lowConfidenceCount} candidates shown`
-        : '',
-  ].join('');
-  await overlay.showStaticResults(`${title} [${sourceLabel}]: ${targetLabel}${statusSuffix}`, matches);
-  // Drive the in-panel candidate toggle button: visible only when there is a
-  // low-confidence envelope to reveal; pressed when it is currently shown.
-  overlay.setEstimatedToggleState({ visible: lowConfidenceCount > 0, pressed: showFolded });
 }
 
 function labelFromCallGraphSymbolId(symbolId: string): string {
