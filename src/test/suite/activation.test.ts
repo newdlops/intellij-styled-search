@@ -1707,7 +1707,8 @@ suite('Activation', () => {
 
     try {
       await runtime.flushPendingUpdates();
-      assert.deepStrictEqual(invoked[0], ['/tmp/zoek-rs', 'update', workspaceRoot, 'docs.md']);
+      assert.deepStrictEqual(invoked[0]?.slice(0, 3), ['/tmp/zoek-rs', 'update', workspaceRoot]);
+      assert.ok(invoked[0]?.slice(3).includes('docs.md'), 'the queued document must be updated before search');
       assert.deepStrictEqual(invoked[1], ['/tmp/zoek-rs', 'compact', workspaceRoot]);
       const refresh = runtime.indexPromises.get(workspaceRoot);
       if (refresh) {

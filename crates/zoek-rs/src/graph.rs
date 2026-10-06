@@ -210,7 +210,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // Outgoing tallies distinguish scoped possible usages from MUST usages so edits
 // update exact counts without promoting uncertain references. Requires a
 // one-time reindex, paired with the TS cache/manifest version bump.
-const GRAPH_VERSION: u32 = 9;
+const GRAPH_VERSION: u32 = crate::platform::GRAPH_STORAGE_VERSION;
 const GRAPH_FILE_NAME: &str = "callgraph-relations.tsv";
 const GRAPH_SYMBOL_FILE_NAME: &str = "callgraph-symbols.tsv";
 const GRAPH_COUNT_FILE_NAME: &str = "callgraph-counts.tsv";

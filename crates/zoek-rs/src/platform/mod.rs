@@ -4,9 +4,9 @@ mod posix;
 mod windows;
 
 #[cfg(not(windows))]
-pub(crate) use posix::file_uri;
+pub(crate) use posix::{file_uri, metadata_change_identity, GRAPH_STORAGE_VERSION};
 #[cfg(windows)]
-pub(crate) use windows::file_uri;
+pub(crate) use windows::{file_uri, metadata_change_identity, GRAPH_STORAGE_VERSION};
 
 fn percent_encode_path(value: &str, allow_colon: bool) -> String {
     let mut out = String::new();

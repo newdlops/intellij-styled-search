@@ -7,6 +7,7 @@ import * as v8 from 'v8';
 import { pathToFileURL } from 'url';
 import { gzip, gunzip } from 'zlib';
 import * as vscode from 'vscode';
+import { graphStorageVersions } from './platform/graphStorage';
 import { AsyncWeightedLruCache } from './internal/asyncWeightedLruCache';
 import { DocumentSummaryRetentionStore, type DocumentSummaryLoadTicket } from './internal/documentSummaryRetention';
 import {
@@ -790,8 +791,8 @@ const CALL_GRAPH_SOURCE_GLOB = '**/*.{py,java,kt,kts,ts,tsx,js,jsx,mjs,cjs}';
 // cannot retain links between unrelated classes with the same name, and the
 // overlay tally distinguishes possible usages from MUST usages after edits.
 // MUST move together with the GRAPH_VERSION bump + the rebuilt binary.
-const CALL_GRAPH_CACHE_VERSION = 17;
-const RUST_NATIVE_GRAPH_MANIFEST_VERSION = 9;
+const CALL_GRAPH_CACHE_VERSION = graphStorageVersions().cache;
+const RUST_NATIVE_GRAPH_MANIFEST_VERSION = graphStorageVersions().native;
 const RUST_NATIVE_GRAPH_REBUILD_WARNING = 'rust-native graph rebuild stores the primary graph in zoek-rs binary index; JS snapshot arrays are intentionally not materialized';
 const CALL_GRAPH_EXTERNAL_INCREMENTAL_DEBOUNCE_MS = 1_500;
 const CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS = 75;

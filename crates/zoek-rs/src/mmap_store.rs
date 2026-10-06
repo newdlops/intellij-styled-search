@@ -347,6 +347,9 @@ mod tests {
             .try_lock()
             .expect("dropping the guard must release the lock");
 
+        // Explicitly unlock before closing, just like the production guard.
+        // A concurrent subprocess launch can briefly inherit the descriptor.
+        fs::File::unlock(&second).expect("release the second writer's lock");
         drop(second);
         let mut permissions = fs::metadata(layout.write_lock_path())
             .expect("stat lock file")

@@ -6,6 +6,7 @@ import { isWindowsMainProcess, parseWindowsProcessSnapshot, requestWindowsInspec
 import { canPassSearchCandidates } from '../../platform/commandLine';
 import { windowsCommandLineLength, fitsWindowsCommandLine, WINDOWS_COMMAND_LINE_LIMIT } from '../../platform/windows/commandLine';
 import { windowsFileUri } from '../../platform/windows/fileUri';
+import { graphStorageVersions } from '../../platform/graphStorage';
 
 const host = {
   platform: 'win32' as const,
@@ -100,6 +101,11 @@ test('Windows file URIs share VS Code drive/UNC identity and encode reserved cha
 test('native Windows CIM snapshot includes the running Node host', { skip: process.platform !== 'win32' }, async () => {
   const snapshot = await windowsElectronMainProcess.readProcessSnapshot();
   assert.equal(snapshot.find((p) => p.pid === process.pid)?.ppid, process.ppid);
+});
+
+test('Windows URI cache migration preserves the existing macOS storage versions', () => {
+  assert.deepEqual(graphStorageVersions('win32'), { cache: 18, native: 10 });
+  assert.deepEqual(graphStorageVersions('darwin'), { cache: 17, native: 9 });
 });
 
 test('native Windows inspector activation starts a running child without SIGUSR1', {

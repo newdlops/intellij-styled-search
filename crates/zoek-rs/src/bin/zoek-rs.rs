@@ -630,7 +630,7 @@ fn stat_current_candidates(
             if !metadata.is_file() || metadata.len() > config.max_file_size_bytes {
                 return Ok(None);
             }
-            let hash = zoek_rs::indexer::stable_record_hash_for_metadata(&rel_path, &metadata);
+            let hash = zoek_rs::indexer::stable_record_hash_for_metadata(&rel_path, &abs_path, &metadata);
             Ok(Some((rel_path, hash)))
         })
         .collect::<io::Result<Vec<_>>>()?;

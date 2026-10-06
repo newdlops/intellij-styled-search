@@ -5,6 +5,8 @@
 - Added an isolated Windows desktop adapter for Electron process discovery and on-demand inspector activation; preserved the macOS bundle fast path.
 - Bounded ripgrep candidate arguments by the Windows command-line limit and corrected drive/UNC file URI identity in native and JavaScript graph indexes.
 - Serialized concurrent graph writers with OS locks on Windows as well as POSIX systems.
+- Read Windows file IDs and independent change timestamps for safe unchanged-index reuse and incremental sync, including edits that restore modification times.
+- Invalidated old Windows graph URI caches while retaining existing macOS caches, and packaged Windows runtimes with a static C runtime.
 - Added macOS/Windows desktop CI with native runtime builds, required renderer checks, and workbench screenshots.
 
 ## 0.1.7150 - 2026-10-01

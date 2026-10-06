@@ -163,7 +163,9 @@ The search overlay uses separate desktop adapters. Windows process discovery and
 
 Windows opens the Electron main inspector through Node's native debug hook. It does not require a Unix signal or a manually configured startup flag. Search commands account for the Windows command-line limit, and both the Rust graph and JavaScript graph worker serialize drive and UNC file paths with VS Code's URI identity. OS-specific Rust URI code lives under `crates/zoek-rs/src/platform/`.
 
-Run `npm run compile`, `npm run test:unit`, and `cargo test --locked -p zoek-rs` for structural regression checks. After `npm run build:zoek-runtime`, `npm test` runs the actual desktop extension. The [desktop compatibility workflow](.github/workflows/desktop-compatibility.yml) runs these checks on macOS and Windows, requires renderer attachment, exercises on-demand inspector activation, and saves workbench screenshots at 1440×900, 1024×768, and 800×600 under `artifacts/desktop-compatibility/`.
+Run `npm run compile`, `npm run test:unit`, and `cargo test --locked -p zoek-rs` for structural regression checks. After `npm run build:zoek-runtime`, `npm test` runs the actual desktop extension. The [desktop compatibility workflow](.github/workflows/desktop-compatibility.yml) checks current macOS/Windows builds plus VS Code 1.114.0 on Windows, requires renderer attachment, exercises on-demand inspector activation, and saves rendered workbench screenshots at Chromium viewports of 1440×900, 1024×768, and 800×600 under `artifacts/desktop-compatibility/`.
+
+CI gates native tests, desktop acceptance, and extension functional regressions. It also runs the full renderer suite as diagnostics, including the strict hardware timing budgets; inspect that step separately when reviewing performance results from shared runners. Windows graph caches created before the URI correction require one rebuild; macOS graph cache versions are unchanged.
 
 ## Deployment
 

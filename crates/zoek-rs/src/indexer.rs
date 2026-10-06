@@ -1014,7 +1014,7 @@ where
                     if metadata.len() > config.max_file_size_bytes {
                         return Ok(Some(RgScanOutcome::TooLarge));
                     }
-                    let metadata_parts = metadata_fingerprint_parts(&metadata);
+                    let metadata_parts = metadata_fingerprint_parts(&abs_path, &metadata);
                     Ok(Some(RgScanOutcome::Candidate(IndexFileRecord {
                         rel_path,
                         abs_path,
@@ -1265,7 +1265,7 @@ fn scan_index_dir_one_level(
             stats.skipped_too_large += 1;
             continue;
         }
-        let metadata_parts = metadata_fingerprint_parts(&metadata);
+        let metadata_parts = metadata_fingerprint_parts(&path, &metadata);
         records.push(IndexFileRecord {
             rel_path,
             abs_path: path,
@@ -1355,7 +1355,7 @@ where
             stats.skipped_too_large += 1;
             continue;
         }
-        let metadata_parts = metadata_fingerprint_parts(&metadata);
+        let metadata_parts = metadata_fingerprint_parts(&path, &metadata);
         records.push(IndexFileRecord {
             rel_path,
             abs_path: path,
@@ -1475,7 +1475,7 @@ fn ensure_record_metadata_unchanged(
     record: &IndexFileRecord,
     metadata: &fs::Metadata,
 ) -> io::Result<()> {
-    let parts = metadata_fingerprint_parts(metadata);
+    let parts = metadata_fingerprint_parts(&record.abs_path, metadata);
     if !metadata.is_file()
         || metadata.len() != record.size_bytes
         || parts.modified_unix_secs != record.modified_unix_secs
@@ -1805,7 +1805,7 @@ fn is_within_relative_prefix(rel_path: &str, prefix: Option<&str>) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn metadata_fingerprint_parts(metadata: &fs::Metadata) -> MetadataFingerprintParts {
+fn metadata_fingerprint_parts(path: &Path, metadata: &fs::Metadata) -> MetadataFingerprintParts {
     let modified = metadata
         .modified()
         .ok()
@@ -1814,20 +1814,18 @@ fn metadata_fingerprint_parts(metadata: &fs::Metadata) -> MetadataFingerprintPar
         .as_ref()
         .map(|value| (value.as_secs(), value.subsec_nanos()))
         .unwrap_or((0, 0));
+    let identity = crate::platform::metadata_change_identity(path, metadata);
     MetadataFingerprintParts {
         modified_unix_secs,
         modified_subsec_nanos,
-        change_token: metadata_change_token(metadata),
-        // Unix ctime + inode/device below provide an independent change
-        // identity when tools preserve size and mtime. The portable std
-        // metadata API has no equivalent Windows change-time field, so a
-        // metadata-only equality is not safe enough there; force a rebuild or
-        // sync update instead of risking a stale base snapshot.
-        reuse_safe: modified.is_some() && cfg!(unix),
+        change_token: metadata_change_token(metadata, identity),
+        // A timestamp alone cannot detect same-size edits that restore mtime.
+        // Each OS adapter must provide an independent file/change identity.
+        reuse_safe: modified.is_some() && identity.is_some(),
     }
 }
 
-fn metadata_change_token(metadata: &fs::Metadata) -> u64 {
+fn metadata_change_token(metadata: &fs::Metadata, identity: Option<[u64; 4]>) -> u64 {
     let mut hasher = FingerprintHasher::new();
     let created = metadata
         .created()
@@ -1838,13 +1836,8 @@ fn metadata_change_token(metadata: &fs::Metadata) -> u64 {
         hasher.write_u64(created.as_secs());
         hasher.write_u64(u64::from(created.subsec_nanos()));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        hasher.write_u64(metadata.dev());
-        hasher.write_u64(metadata.ino());
-        hasher.write_u64(metadata.ctime() as u64);
-        hasher.write_u64(metadata.ctime_nsec() as u64);
+    if let Some(identity) = identity {
+        for value in identity { hasher.write_u64(value); }
     }
     hasher.finish()
 }
@@ -1877,11 +1870,11 @@ pub fn stable_record_hash(
 }
 
 /// Return the metadata identity used by base shards and `update --sync`.
-/// `None` means the platform could not provide a usable modification time;
+/// `None` means the platform could not provide a usable change identity;
 /// callers must conservatively treat that file as changed instead of allowing
 /// two unknown timestamps to compare equal.
-pub fn stable_record_hash_for_metadata(rel_path: &str, metadata: &fs::Metadata) -> Option<u64> {
-    let parts = metadata_fingerprint_parts(metadata);
+pub fn stable_record_hash_for_metadata(rel_path: &str, path: &Path, metadata: &fs::Metadata) -> Option<u64> {
+    let parts = metadata_fingerprint_parts(path, metadata);
     parts.reuse_safe.then(|| {
         stable_record_hash(
             rel_path,
@@ -1964,7 +1957,7 @@ fn fingerprint_shard_metadata(shards: &[ShardArtifact]) -> io::Result<(u64, bool
     hasher.write_u64(shards.len() as u64);
     for shard in shards {
         let metadata = fs::metadata(&shard.path)?;
-        let parts = metadata_fingerprint_parts(&metadata);
+        let parts = metadata_fingerprint_parts(&shard.path, &metadata);
         reuse_safe &= parts.reuse_safe;
         hasher.write_u64(u64::from(shard.shard_id));
         hasher.write_bytes(shard.file_name.as_bytes());
@@ -2517,7 +2510,7 @@ mod tests {
         let path = root.join("record.txt");
         fs::write(&path, "before\n")?;
         let metadata = fs::metadata(&path)?;
-        let parts = metadata_fingerprint_parts(&metadata);
+        let parts = metadata_fingerprint_parts(&path, &metadata);
         let record = IndexFileRecord {
             rel_path: "record.txt".to_string(),
             abs_path: path.clone(),
@@ -2551,7 +2544,7 @@ mod tests {
         let path = root.join("record.txt");
         fs::write(&path, "before")?;
         let before_metadata = fs::metadata(&path)?;
-        let before_parts = metadata_fingerprint_parts(&before_metadata);
+        let before_parts = metadata_fingerprint_parts(&path, &before_metadata);
         let before_record = IndexFileRecord {
             rel_path: "record.txt".to_string(),
             abs_path: path.clone(),
@@ -2566,7 +2559,7 @@ mod tests {
 
         fs::write(&path, "after!")?;
         let after_metadata = fs::metadata(&path)?;
-        let after_parts = metadata_fingerprint_parts(&after_metadata);
+        let after_parts = metadata_fingerprint_parts(&path, &after_metadata);
         let after_record = IndexFileRecord {
             rel_path: "record.txt".to_string(),
             abs_path: path,
@@ -2960,7 +2953,7 @@ mod tests {
         let artifacts = index_directory(&root, &config)?;
 
         let metadata = fs::metadata(&file_path)?;
-        let expected = super::stable_record_hash_for_metadata("src/record.rs", &metadata)
+        let expected = super::stable_record_hash_for_metadata("src/record.rs", &file_path, &metadata)
             .expect("fixture metadata must expose a modification time");
         let mut actual = None;
         for shard in &artifacts.shards {

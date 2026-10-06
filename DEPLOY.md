@@ -33,7 +33,7 @@ another's output while extension hosts run concurrently.
 - Rust + Cargo if you want the Rust engine to be available without relying on an already-built `target/`
 - `vsce` to package a VSIX
 
-On Windows the packaged runtime tuple is `resources/bin/win32-x64/` (or the matching `win32-arm64` / `win32-ia32` tuple), containing `zoek-rs.exe`, `ijss-rebuild.exe`, and `manifest.json`. Run `npm run build:zoek-runtime` on the target Windows architecture before packaging to avoid requiring Cargo on the user's machine. The desktop compatibility workflow uploads its native runtime pair as a build artifact. Preserve its manifest when including the pair in a VSIX; `.gitattributes` keeps Rust source fingerprints consistent between Windows and macOS checkouts.
+On Windows the packaged runtime tuple is `resources/bin/win32-x64/` (or the matching `win32-arm64` / `win32-ia32` tuple), containing `zoek-rs.exe`, `ijss-rebuild.exe`, and `manifest.json`. Run `npm run build:zoek-runtime` on the target Windows architecture before packaging. Windows builds link the MSVC C runtime statically, avoiding a separate Cargo or Visual C++ runtime installation on the user's machine. The desktop compatibility workflow uploads its native runtime pair as a build artifact. Preserve its manifest when including the pair in a VSIX; `.gitattributes` keeps Rust source fingerprints consistent between Windows and macOS checkouts.
 
 ## Release Checklist
 

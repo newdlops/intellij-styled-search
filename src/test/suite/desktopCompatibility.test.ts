@@ -87,7 +87,7 @@ suite('Desktop compatibility', () => {
     }
   });
 
-  test('opens, searches, previews and reopens the real overlay at desktop window sizes', async function () {
+  test('opens, searches, previews and reopens the real overlay at desktop viewport sizes', async function () {
     this.timeout(60_000);
     const { overlay } = await getApi();
     await overlay.awaitInjection();
@@ -122,12 +122,20 @@ suite('Desktop compatibility', () => {
       assert.ok(!response.exceptionDetails, JSON.stringify(response.exceptionDetails));
       return response.result?.value;
     };
-    const original = await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).getBounds()`);
+    const ownsDebugger = await evaluateMain(`(function () {
+      var debuggerApi = require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger;
+      if (debuggerApi.isAttached()) { return false; }
+      debuggerApi.attach('1.3'); return true;
+    })()`);
     await fs.promises.mkdir(artifactRoot, { recursive: true });
     const reports: any[] = [];
     try {
       for (const [width, height] of [[1440, 900], [1024, 768], [800, 600]]) {
-        await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).setContentSize(${width}, ${height})`);
+        // Hosted runners may have a 1024×768 virtual display. Chromium viewport
+        // emulation renders all requested sizes independently of that display.
+        await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.sendCommand(
+          'Emulation.setDeviceMetricsOverride', { width: ${width}, height: ${height},
+            screenWidth: ${width}, screenHeight: ${height}, deviceScaleFactor: 1, mobile: false })`);
         await overlay.evalInActiveWindowForTests(`new Promise(function (resolve) {
           requestAnimationFrame(function () { requestAnimationFrame(function () { resolve('stable'); }); });
         })()`);
@@ -145,15 +153,16 @@ suite('Desktop compatibility', () => {
         assert.strictEqual(layout.height, height);
         assert.ok(layout.left >= -1 && layout.top >= -1 && layout.right <= layout.width + 1 &&
           layout.bottom <= layout.height + 1, `overlay must remain in the workbench viewport: ${JSON.stringify(layout)}`);
-        const captured = await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).webContents.capturePage().then(function(image) {
-          return image.toPNG().toString('base64'); })`);
+        const captured = await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.sendCommand(
+          'Page.captureScreenshot', { format: 'png', captureBeyondViewport: true }).then(function(image) { return image.data; })`);
         assert.ok(typeof captured === 'string' && captured.length > 0, 'capture actual rendered workbench');
         await fs.promises.writeFile(path.join(artifactRoot, `${width}x${height}.png`), Buffer.from(captured, 'base64'));
       }
       await fs.promises.writeFile(path.join(artifactRoot, 'layout.json'), JSON.stringify(reports, null, 2));
     } finally {
-      if (original) {
-        await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).setBounds(${JSON.stringify(original)})`);
+      await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.sendCommand('Emulation.clearDeviceMetricsOverride')`);
+      if (ownsDebugger) {
+        await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.detach()`);
       }
       await overlay.evalInActiveWindowForTests(`(function () {
         window.__ijFindHide(window.__ijssDesktopTestSrc); return 'closed';

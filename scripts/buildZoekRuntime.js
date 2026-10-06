@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { windowsRuntimeBuildEnv } = require('./platform/windowsBuild');
 
 const root = path.resolve(__dirname, '..');
 const args = process.argv.slice(2);
@@ -129,13 +130,15 @@ const cargoArgs = [
   '--bins',
   '--message-format=json-render-diagnostics',
 ];
-if (rustTarget) {
-  cargoArgs.push('--target', rustTarget);
+// An explicit Windows target keeps CRT flags off host proc-macro builds.
+const effectiveRustTarget = rustTarget || (platformKey.startsWith('win32-') ? rustTargetsByPlatform[platformKey] : undefined);
+if (effectiveRustTarget) {
+  cargoArgs.push('--target', effectiveRustTarget);
 }
 const sourceFingerprint = rustSourceFingerprint();
 const build = spawnSync('cargo', cargoArgs, {
   cwd: root,
-  env: process.env,
+  env: platformKey.startsWith('win32-') ? windowsRuntimeBuildEnv(process.env) : process.env,
   encoding: 'utf8',
   stdio: ['ignore', 'pipe', 'inherit'],
   windowsHide: true,
@@ -151,8 +154,8 @@ if (rustSourceFingerprint() !== sourceFingerprint) {
 const targetRoot = process.env.CARGO_TARGET_DIR
   ? path.resolve(root, process.env.CARGO_TARGET_DIR)
   : path.join(root, 'target');
-const releaseDir = rustTarget
-  ? path.join(targetRoot, rustTarget, 'release')
+const releaseDir = effectiveRustTarget
+  ? path.join(targetRoot, effectiveRustTarget, 'release')
   : path.join(targetRoot, 'release');
 const destinationDir = path.join(root, 'resources', 'bin', platformKey);
 const exeSuffix = platformKey.startsWith('win32-') ? '.exe' : '';
@@ -176,7 +179,7 @@ for (const baseName of ['zoek-rs', 'ijss-rebuild']) {
 const manifest = {
   formatVersion: 2,
   platformKey,
-  rustTarget: rustTarget || null,
+  rustTarget: effectiveRustTarget || null,
   protocolVersion: 1,
   schemaVersion: 22,
   sourceFingerprint,

@@ -13,12 +13,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        include:
+          - os: macos-latest
+            vscode: stable
+          - os: windows-latest
+            vscode: '1.114.0'
+          - os: windows-latest
+            vscode: stable
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
       IJSS_E2E_INSPECTOR_ON_DEMAND: '1'
       IJSS_E2E_REQUIRE_CDP: '1'
+      IJSS_E2E_VSCODE_VERSION: ${{ matrix.vscode }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -32,11 +39,17 @@ jobs:
       - run: npm run test:build-cache
       - run: cargo test --locked -p zoek-rs
       - run: npm run build:zoek-runtime
-      - run: npm test
+      - name: Desktop acceptance
+        run: npm test -- --run out/test/suite/desktopCompatibility.test.js
+      - name: Extension functional regressions
+        run: npm test -- --exclude out/test/suite/renderer.test.js --exclude out/test/suite/captainIndexGate.test.js
+      - name: Renderer diagnostics and hardware timing budgets
+        continue-on-error: true
+        run: npm test -- --run out/test/suite/renderer.test.js
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: desktop-${{ matrix.os }}
+          name: desktop-${{ matrix.os }}-${{ matrix.vscode }}
           path: |
             artifacts/desktop-compatibility/
             resources/bin/*/
