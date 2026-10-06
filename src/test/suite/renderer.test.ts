@@ -2769,13 +2769,29 @@ suite('Renderer — overlay UI probes', () => {
             if (!textMateApi || typeof textMateApi.getTokenAtPosition !== 'function') {
               return JSON.stringify({ err: 'missing bundled TextMate API' });
             }
-            var injectionToken = textMateApi.getTokenAtPosition(languageId, model, {
+            // A lookup deliberately stops when its tokenizer/hover work budget
+            // expires. Resume only when the same ready grammar made progress;
+            // absent models, changed generations and wrong scopes still fail.
+            async function lookupLexicalToken(id, textModel, position) {
+              var deadline = performance.now() + 1000;
+              do {
+                var before = textMateApi.getStatus(id);
+                var token = textMateApi.getTokenAtPosition(id, textModel, position);
+                var after = textMateApi.getStatus(id);
+                if (token || before.status !== 'ready' || after.status !== 'ready' ||
+                    before.generation !== after.generation ||
+                    !(after.tokenizeCount > before.tokenizeCount)) { return token; }
+                await new Promise(function (resolve) { setTimeout(resolve, 16); });
+              } while (performance.now() < deadline);
+              return null;
+            }
+            var injectionToken = await lookupLexicalToken(languageId, model, {
               lineNumber: injectionLine + 1,
               column: injectionStart + 2
             });
             // Query backwards after the later injection line so the bridge
             // must reuse the cached multiline state, not single-line tokenize.
-            var multilineToken = textMateApi.getTokenAtPosition(languageId, model, {
+            var multilineToken = await lookupLexicalToken(languageId, model, {
               lineNumber: multilineLine + 1,
               column: multilineStart + 2
             });
@@ -2830,7 +2846,7 @@ suite('Renderer — overlay UI probes', () => {
             await oldRaceInstall;
             var raceStatus = textMateApi.getStatus(raceLanguageId);
             var raceModel = globalThis.__ijFindMonacoApi.editor.createModel('RaceToken', raceLanguageId);
-            var raceToken = textMateApi.getTokenAtPosition(raceLanguageId, raceModel, {
+            var raceToken = await lookupLexicalToken(raceLanguageId, raceModel, {
               lineNumber: 1, column: 2
             });
             try { raceModel.dispose(); } catch (eDisposeRaceModel) {}
