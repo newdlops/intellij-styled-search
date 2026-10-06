@@ -10,5 +10,6 @@ target/
 .codeidx/
 artifacts/benchmarks/
 artifacts/desktop-compatibility/
+artifacts/desktop-runtime-download/
 .lh/**/*.*
 .vscode/**/*.*

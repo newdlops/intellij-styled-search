@@ -1,5 +1,10 @@
 .vscode/**
 .github/**
+.plan/**
+.portmanager/**
+--capabilities/**
+irlog.txt
+log.txt
 .zoek-rs/**
 .codeidx/**
 .codex/**

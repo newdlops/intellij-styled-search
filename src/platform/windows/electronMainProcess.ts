@@ -32,13 +32,16 @@ export function isWindowsMainProcess(proc: ElectronProcess, context: ElectronExt
   const executable = proc.execPath || firstArgument?.[1] || firstArgument?.[2];
   if (!executable || !path.win32.isAbsolute(executable) || !/\.exe$/i.test(executable)) { return false; }
   const normalize = (value: string) => path.win32.normalize(value).toLowerCase();
-  // The local desktop host runs the executable beside resources/app. This
-  // also works for portable installs, Insiders and renamed distributions.
+  // Desktop resources may sit beside the executable or in one versioned
+  // child directory used by an update launcher. Use that bundle structure,
+  // without depending on the product name or the version directory's name.
   const appRoot = path.win32.normalize(context.appRoot);
   if (path.win32.basename(appRoot).toLowerCase() !== 'app' ||
       path.win32.basename(path.win32.dirname(appRoot)).toLowerCase() !== 'resources') { return false; }
-  if (normalize(path.win32.dirname(executable)) !==
-      normalize(path.win32.resolve(appRoot, '..', '..'))) { return false; }
+  const bundleDirectory = path.win32.resolve(appRoot, '..', '..');
+  const executableDirectory = normalize(path.win32.dirname(executable));
+  if (executableDirectory !== normalize(bundleDirectory) &&
+      executableDirectory !== normalize(path.win32.dirname(bundleDirectory))) { return false; }
   return !/(?:^|\s|["'])--(?:type(?:=|\s|["']|$)|ms-enable-electron-run-as-node\b)/i.test(proc.cmd);
 }
 

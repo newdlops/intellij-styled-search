@@ -46,6 +46,22 @@ test('does not attach a Windows remote host or broken ancestry to an unrelated d
     execPath: "C:\\Portable Tools\\사용자's Workbench\\resources\\app\\node_modules\\runtime\\node.exe" }), true);
 });
 
+test('Windows update launchers can own resources in a versioned child directory', () => {
+  const versionedHost = { ...host, appRoot: pathForVersionedResources() };
+  const snapshot = [proc(120, 1), proc(220, 120, '--type=utility'), proc(330, 220, '--type=renderer')];
+  assert.equal(findAncestorElectronMainProcess(snapshot, 330, 220,
+    (p) => isWindowsMainProcess(p, versionedHost))?.pid, 120);
+  assert.equal(isWindowsMainProcess({ ...proc(120, 1), execPath: undefined }, versionedHost), true);
+  assert.equal(isWindowsMainProcess(proc(220, 120, '--type=utility'), versionedHost), false);
+  assert.equal(isWindowsMainProcess(proc(220, 120, '--ms-enable-electron-run-as-node'), versionedHost), false);
+  assert.equal(isWindowsMainProcess(proc(120, 1, '', 'C:\\Portable Tools\\Launcher.exe'), versionedHost), false);
+  assert.equal(isWindowsMainProcess(proc(120, 1, '', 'C:\\Other Workbench\\Workbench.exe'), versionedHost), false);
+});
+
+function pathForVersionedResources(): string {
+  return "C:\\Portable Tools\\사용자's Workbench\\version 2\\resources\\app";
+}
+
 test('parses CIM JSON arrays, single rows, BOM, unavailable command lines and Unicode', () => {
   const row = { ProcessId: 120, ParentProcessId: 1, ExecutablePath: host.execPath, CommandLine: `"${host.execPath}"` };
   assert.deepEqual(parseWindowsProcessSnapshot('\uFEFF' + JSON.stringify(row)), [proc(120, 1)]);
