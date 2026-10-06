@@ -34,6 +34,24 @@ suite('Desktop compatibility', () => {
   test('extension search uses the packaged zoekt engine without fallback after a real rebuild', async function () {
     this.timeout(60_000);
     const { overlay } = await getApi();
+    if (process.env.IJSS_E2E_EXPECT_USER_SETUP === '1') {
+      assert.strictEqual(process.platform, 'win32');
+      assert.strictEqual(process.arch, 'x64', 'the original issue uses the x64 UserSetup build');
+      const expectedExecutable = path.join(process.env.LOCALAPPDATA!, 'Programs', 'Microsoft VS Code', 'Code.exe');
+      assert.strictEqual(path.resolve(process.execPath).toLowerCase(), path.resolve(expectedExecutable).toLowerCase());
+      const host = await invoke('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        "$id=[Security.Principal.WindowsIdentity]::GetCurrent(); $p=[Security.Principal.WindowsPrincipal]::new($id); " +
+        "@{user=$id.Name;administrator=$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);" +
+        "os=(Get-CimInstance Win32_OperatingSystem).Caption} | ConvertTo-Json -Compress"]);
+      assert.strictEqual(host.administrator, false, 'the extension host itself must run without administrator privileges');
+      assert.match(host.os, /Windows 11/);
+      const artifacts = process.env.IJSS_E2E_WINDOWS_USER_SETUP_ARTIFACTS!;
+      await fs.promises.mkdir(artifacts, { recursive: true });
+      await fs.promises.writeFile(path.join(artifacts, `extension-host-${vscode.version}.json`), JSON.stringify({
+        ...host, vscode: vscode.version, arch: process.arch, execPath: process.execPath,
+        installation: 'UserSetup', hostArchitecture: 'arm64 (x64 application emulation)',
+      }, null, 2));
+    }
     const folder = vscode.workspace.workspaceFolders?.[0];
     assert.ok(folder);
     const source = path.join(folder!.uri.fsPath, `native engine ${Date.now()}.ts`);

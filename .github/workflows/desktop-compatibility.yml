@@ -64,3 +64,36 @@ jobs:
           path: |
             artifacts/desktop-compatibility/
             resources/bin/*/
+      - uses: actions/upload-artifact@v7
+        if: matrix.os == 'windows-latest' && matrix.vscode == 'stable'
+        with:
+          name: native-win32-x64
+          path: resources/bin/win32-x64/
+
+  windows-user-setup:
+    needs: desktop
+    runs-on: windows-11-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - uses: actions/download-artifact@v7
+        with:
+          name: native-win32-x64
+          path: resources/bin/win32-x64/
+      - name: Windows 11 x64 UserSetup under a standard account
+        shell: pwsh
+        run: ./scripts/test-windows-user-setup.ps1
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: windows-11-standard-user-setup
+          path: |
+            artifacts/windows-user-setup/*.json
+            artifacts/windows-user-setup/*.log
+            artifacts/desktop-compatibility/

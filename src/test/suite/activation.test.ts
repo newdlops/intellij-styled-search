@@ -2287,6 +2287,49 @@ suite('Activation', () => {
     }
   });
 
+  test('overlapping renderer commands retain their source and click intent after out-of-order completion', async function () {
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    const originalProbe = anyOverlay.ensureRendererPatchAlive;
+    let probes = 0;
+    const releases: Array<() => void> = [];
+    const entered: Array<() => void> = [];
+    const started = [0, 1].map((index) => new Promise<void>((resolve) => { entered[index] = resolve; }));
+    const gates = [0, 1].map((index) => new Promise<void>((resolve) => { releases[index] = resolve; }));
+    const observations: Array<{ windowId?: number; invocationId?: number; context: unknown }> = [];
+    const disposable = vscode.commands.registerCommand('ijss.test.concurrentRendererOrigin', async (index: number) => {
+      entered[index]!();
+      await gates[index];
+      observations[index] = {
+        windowId: overlay.getRendererCommandWindowIdForShow(),
+        invocationId: overlay.getRendererCommandInvocationId(),
+        context: await overlay.getSearchSelectionShowContext(),
+      };
+    });
+    try {
+      anyOverlay.ensureRendererPatchAlive = async () => { probes++; };
+      const first = anyOverlay.runHoverCommand('ijss.test.concurrentRendererOrigin', [0], 41, true);
+      await started[0];
+      const second = anyOverlay.runHoverCommand('ijss.test.concurrentRendererOrigin', [1], 42, false);
+      await started[1];
+      releases[1]!();
+      await second;
+      releases[0]!();
+      await first;
+      assert.strictEqual(observations[0]!.windowId, 41);
+      assert.strictEqual(observations[1]!.windowId, 42);
+      assert.deepStrictEqual(observations[0]!.context, { preferredWindowId: 41, spawn: true });
+      assert.deepStrictEqual(observations[1]!.context, { preferredWindowId: 42, spawn: false });
+      assert.notStrictEqual(observations[0]!.invocationId, observations[1]!.invocationId);
+      assert.strictEqual(probes, 0, 'click intent must survive without querying the later focused editor');
+      assert.strictEqual(overlay.getRendererCommandInvocationId(), undefined);
+    } finally {
+      releases.forEach((release) => release());
+      disposable.dispose();
+      anyOverlay.ensureRendererPatchAlive = originalProbe;
+    }
+  });
+
   test('a cold show reuses the renderer window selected by its own injection', async function () {
     const { overlay } = await getApi();
     const anyOverlay = overlay as any;

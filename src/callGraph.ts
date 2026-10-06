@@ -5238,7 +5238,6 @@ export class CallGraphService implements vscode.Disposable {
     );
     const result = await new Promise<CallGraphWorkerRebuildResult>((resolve, reject) => {
       const child = spawn(runtime.command, runtime.args, {
-        argv0: 'ijss-callgraph-worker',
         cwd: this.context.extensionUri.fsPath,
         env: runtime.env,
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -5246,7 +5245,7 @@ export class CallGraphService implements vscode.Disposable {
       });
       this.log.appendLine(
         `call graph worker spawned: hostPid=${process.pid} workerPid=${child.pid ?? 'unknown'} ` +
-        `argv0=ijss-callgraph-worker`,
+        `worker=ijss-callgraph-worker`,
       );
       let stderr = '';
       let stdout = '';

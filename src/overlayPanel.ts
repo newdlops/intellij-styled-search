@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
+import { AsyncLocalStorage } from 'async_hooks';
 import WebSocket from 'ws';
 import {
   runSearch,
@@ -76,7 +77,7 @@ type RendererEvent =
   | { type: 'openInSideEditor'; uri: string; line: number; column: number }
   | { type: 'pinInSideEditor'; uri: string; line: number; column: number }
   // 'requestHover' was removed in #32 along with the DIY $hoverTooltip.
-  | { type: 'runCommand'; command: string; args: unknown[] }
+  | { type: 'runCommand'; command: string; args: unknown[]; fromPreview?: boolean }
   | {
       type: 'saveFile';
       uri: string;
@@ -539,6 +540,12 @@ export class OverlayPanel {
   private staticResultsRequestSeq = 0;
   private staticResultsChain: Promise<void> = Promise.resolve();
   private rendererCommandWindowId: number | undefined;
+  private readonly rendererCommandContext = new AsyncLocalStorage<{
+    windowId?: number;
+    invocationId: number;
+    fromPreview?: boolean;
+  }>();
+  private rendererCommandInvocationSeq = 0;
   private rendererCommandPendingPanelWindowId: number | undefined;
   private rendererCommandPendingPanelExpiresAt = 0;
   private activeRendererSrc: string | undefined;
@@ -586,7 +593,11 @@ export class OverlayPanel {
   }
 
   getRendererCommandWindowIdForShow(): number | undefined {
-    return this.rendererCommandWindowId;
+    return this.rendererCommandContext.getStore()?.windowId ?? this.rendererCommandWindowId;
+  }
+
+  getRendererCommandInvocationId(): number | undefined {
+    return this.rendererCommandContext.getStore()?.invocationId;
   }
 
   /** @internal E2E diagnostics for preview capture resource throttling. */
@@ -724,8 +735,14 @@ export class OverlayPanel {
     // Only renderer-originated commands need the preview/spawn probe. A normal
     // workbench keybinding may still have an old activeWindowId, but probing it
     // here performs a full renderer liveness check before show() can even start.
-    const windowId = this.rendererCommandWindowId;
+    const commandContext = this.rendererCommandContext.getStore();
+    const windowId = this.getRendererCommandWindowIdForShow();
     if (windowId === undefined) { return {}; }
+    // The pointer event owns this intent. Focus can move to a new panel while
+    // symbol resolution awaits providers, so probing focus later loses it.
+    if (commandContext?.fromPreview !== undefined) {
+      return { preferredWindowId: windowId, spawn: commandContext.fromPreview };
+    }
     try {
       await this.ensureRendererPatchAlive(windowId, 'search-selection-context');
       const result = await this.evalInWindow(
@@ -2666,7 +2683,7 @@ export class OverlayPanel {
         query: initialQuery,
         matches,
         requestId,
-        sourceWindowId: this.rendererCommandWindowId,
+        sourceWindowId: this.getRendererCommandWindowIdForShow(),
         resolve,
         reject,
       };
@@ -2758,7 +2775,7 @@ export class OverlayPanel {
     this.log.appendLine(
       `doShow: initialQueryLen=${initialQuery.length} preview=${JSON.stringify(initialQuery.slice(0, 80))}`,
     );
-    const directWindowId = options.preferredWindowId ?? this.rendererCommandWindowId ?? this.activeWindowId;
+    const directWindowId = options.preferredWindowId ?? this.getRendererCommandWindowIdForShow() ?? this.activeWindowId;
     const useDirectWindow = !options.__forceReinjectBeforeShow &&
       directWindowId !== undefined && this.shouldEnableRendererInlayClickHook();
     const targetMarker = useDirectWindow ? new vscode.Disposable(() => undefined) : this.beginTargetWindowMarker();
@@ -4403,7 +4420,7 @@ export class OverlayPanel {
 	      // embedded preview Monaco editor now drives hover natively
 	      // through VSCode's language services, so the renderer never
 	      // asks the extension host for hover content.
-	      case 'runCommand': void this.runHoverCommand(evt.command, evt.args, evt.__win); break;
+	      case 'runCommand': void this.runHoverCommand(evt.command, evt.args, evt.__win, evt.fromPreview); break;
 	      case 'saveFile':
           void this.enqueuePreviewSave(evt.uri, evt.content, evt.requestId, evt.expectedContentHash, {
             windowId: typeof evt.__win === 'number' ? evt.__win : undefined,
@@ -4675,20 +4692,18 @@ export class OverlayPanel {
     }, route);
   }
 
-  private async runHoverCommand(command: string, args: unknown[], sourceWindowId?: number) {
+  private async runHoverCommand(command: string, args: unknown[], sourceWindowId?: number, fromPreview?: boolean) {
     if (typeof command !== 'string' || !command) { return; }
-    const previousWindowId = this.rendererCommandWindowId;
-    if (typeof sourceWindowId === 'number') {
-      this.rendererCommandWindowId = sourceWindowId;
-    }
     try {
       const safeArgs = Array.isArray(args) ? args : (args === undefined || args === null ? [] : [args]);
-      await vscode.commands.executeCommand(command, ...safeArgs);
+      await this.rendererCommandContext.run({
+        windowId: sourceWindowId,
+        invocationId: ++this.rendererCommandInvocationSeq,
+        fromPreview: typeof fromPreview === 'boolean' ? fromPreview : undefined,
+      }, () => vscode.commands.executeCommand(command, ...safeArgs));
     } catch (err) {
       this.log.appendLine(`runHoverCommand(${command}) failed: ${err instanceof Error ? err.message : err}`);
       vscode.window.showErrorMessage(`Command failed: ${command}`);
-    } finally {
-      this.rendererCommandWindowId = previousWindowId;
     }
   }
 

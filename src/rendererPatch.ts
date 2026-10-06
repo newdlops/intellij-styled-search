@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 147;
+export const RENDERER_PATCH_VERSION = 148;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -816,16 +816,24 @@ export function getRendererPatchScript(
       var source = document.querySelector('.monaco-workbench:not(.ij-find-preview-overflow-root)') || document.body;
       if (!source || !root || !window.getComputedStyle) { return; }
       var cs = window.getComputedStyle(source);
+      var values = [];
       for (var i = 0; i < cs.length; i++) {
         var name = cs[i];
         if (name && name.indexOf('--vscode-') === 0) {
           var value = cs.getPropertyValue(name);
-          if (value) { root.style.setProperty(name, value); }
+          if (value) { values.push([name, value]); }
         }
       }
-      root.style.setProperty('color', cs.getPropertyValue('--vscode-foreground') || cs.color || 'inherit');
-      root.style.setProperty('font-family', cs.getPropertyValue('--vscode-font-family') || cs.fontFamily || 'inherit');
-      root.style.setProperty('font-size', cs.getPropertyValue('--vscode-font-size') || cs.fontSize || 'inherit');
+      values.push(['color', cs.getPropertyValue('--vscode-foreground') || cs.color || 'inherit']);
+      values.push(['font-family', cs.getPropertyValue('--vscode-font-family') || cs.fontFamily || 'inherit']);
+      values.push(['font-size', cs.getPropertyValue('--vscode-font-size') || cs.fontSize || 'inherit']);
+      // Read the live computed style before writing any properties. Interleaved
+      // reads/writes force repeated style recalculation for hundreds of tokens.
+      for (var vi = 0; vi < values.length; vi++) {
+        if (root.style.getPropertyValue(values[vi][0]) !== values[vi][1]) {
+          root.style.setProperty(values[vi][0], values[vi][1]);
+        }
+      }
       var overflowNode = root.querySelector && root.querySelector('.ij-find-preview-overflow');
       var themeClasses = ['vs', 'vs-dark', 'hc-black', 'hc-light'];
       for (var ti = 0; ti < themeClasses.length; ti++) {
@@ -930,7 +938,8 @@ export function getRendererPatchScript(
       try { root.setAttribute('data-ij-find-src', __ijFindInstanceId); } catch (eRootSrcExisting) {}
       try { existing.setAttribute('data-ij-find-src', __ijFindInstanceId); } catch (eNodeSrcExisting) {}
       if (root.parentElement !== document.body) { document.body.appendChild(root); }
-      syncPreviewOverflowTheme(root);
+      // Creation and the theme observer already synchronize the palette.
+      // Reusing this host is on every result-click path.
       syncPreviewOverflowStacking(root);
       ensurePreviewOverflowThemeObserver();
       return existing;
@@ -8993,6 +9002,7 @@ export function getRendererPatchScript(
 
   function renderPreviewMonacoReal(msg, trigger) {
     var renderT0 = perfNow();
+    var renderDiagnostics = isRendererDiagnosticsEnabled();
     var nativeCommittedAtEntry = !!state.previewNativeCommitted;
     if (state.stolenEditor) { restoreStolenEditor(); }
     // Upgrade from the extension-owned standalone editor to the captured
@@ -9034,8 +9044,10 @@ export function getRendererPatchScript(
     var preMonacoHovers = 0;
     var preIjRoots = 0;
     try {
-      preMonacoHovers = document.querySelectorAll('.monaco-hover,.monaco-editor-hover').length;
-      preIjRoots = document.querySelectorAll('[data-ijss-root="true"]').length;
+      if (renderDiagnostics) {
+        preMonacoHovers = document.querySelectorAll('.monaco-hover,.monaco-editor-hover').length;
+        preIjRoots = document.querySelectorAll('[data-ijss-root="true"]').length;
+      }
     } catch (ePreDom) {}
     trace('preview/render/start', {
       uri: msg && msg.uri ? String(msg.uri) : '',
@@ -9098,8 +9110,10 @@ export function getRendererPatchScript(
         var postReuseMonacoHovers = 0;
         var postReuseIjRoots = 0;
         try {
-          postReuseMonacoHovers = document.querySelectorAll('.monaco-hover,.monaco-editor-hover').length;
-          postReuseIjRoots = document.querySelectorAll('[data-ijss-root="true"]').length;
+          if (renderDiagnostics) {
+            postReuseMonacoHovers = document.querySelectorAll('.monaco-hover,.monaco-editor-hover').length;
+            postReuseIjRoots = document.querySelectorAll('[data-ijss-root="true"]').length;
+          }
         } catch (ePostReuse) {}
         trace('preview/render/done', {
           path: 'reuse',
@@ -9114,7 +9128,7 @@ export function getRendererPatchScript(
           postIjRoots: postReuseIjRoots,
           deltaHovers: postReuseMonacoHovers - preMonacoHovers,
           deltaIjRoots: postReuseIjRoots - preIjRoots,
-          intellisense: gatherEmbedEditorIntellisenseSnapshot(state.previewMonacoEditor),
+          intellisense: renderDiagnostics ? gatherEmbedEditorIntellisenseSnapshot(state.previewMonacoEditor) : undefined,
         });
         return;
       }
@@ -11815,12 +11829,14 @@ export function getRendererPatchScript(
             inlayClasses: ((renderTaggedSpan.className || '') + '').slice(0, 120),
             command: symCommand,
             args: symArgs,
+            fromPreview: fromPreviewEditor,
             renderLine: renderLine,
           });
           sendPersistent({
             type: 'runCommand',
             command: symCommand,
             args: symArgs,
+            fromPreview: fromPreviewEditor,
           });
           reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-callgraph-render-tagged-symbol');
           return;
@@ -11855,6 +11871,7 @@ export function getRendererPatchScript(
               type: 'runCommand',
               command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
               args: renderArgs,
+              fromPreview: fromPreviewEditor,
             });
             reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-callgraph-render-tagged');
             return;
@@ -11885,11 +11902,13 @@ export function getRendererPatchScript(
             inlayClasses: ((hit.element && hit.element.className) || '').slice(0, 120),
             command: inlayLabel.commandId,
             args: inlayLabel.commandArguments,
+            fromPreview: fromPreviewEditor,
           });
           sendPersistent({
             type: 'runCommand',
             command: inlayLabel.commandId,
             args: inlayLabel.commandArguments,
+            fromPreview: fromPreviewEditor,
           });
           reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-callgraph-inlay-label');
           return;
@@ -11920,11 +11939,13 @@ export function getRendererPatchScript(
             inlayClasses: ((hit.element && hit.element.className) || '').slice(0, 120),
             command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
             args: posLineCol,
+            fromPreview: fromPreviewEditor,
           });
           sendPersistent({
             type: 'runCommand',
             command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
             args: posLineCol,
+            fromPreview: fromPreviewEditor,
           });
           reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-callgraph-dispatch');
           return;
@@ -11987,11 +12008,13 @@ export function getRendererPatchScript(
             inlayClasses: ((hit.element && hit.element.className) || '').slice(0, 120),
             command: 'intellijStyledSearch.activateCallGraphInlayAtVisibleLine',
             args: vlArgs,
+            fromPreview: fromPreviewEditor,
           });
           sendPersistent({
             type: 'runCommand',
             command: 'intellijStyledSearch.activateCallGraphInlayAtVisibleLine',
             args: vlArgs,
+            fromPreview: fromPreviewEditor,
           });
           reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'native-callgraph-visible-line');
           return;
@@ -12020,11 +12043,13 @@ export function getRendererPatchScript(
         inlayClasses: ((hit.element && hit.element.className) || '').slice(0, 120),
         command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
         args: [hit.kind, position.uri, position.line, position.column],
+        fromPreview: fromPreviewEditor,
       });
       sendPersistent({
         type: 'runCommand',
         command: 'intellijStyledSearch.activateCallGraphInlayAtPosition',
         args: [hit.kind, position.uri, position.line, position.column],
+        fromPreview: fromPreviewEditor,
       });
       reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'hit-position');
       return;
@@ -12048,11 +12073,13 @@ export function getRendererPatchScript(
         inlayClasses: ((hit.element && hit.element.className) || '').slice(0, 120),
         command: 'intellijStyledSearch.activateCallGraphInlayAtVisibleLine',
         args: [hit.kind, visibleLine.lineOrdinal, visibleLine.column],
+        fromPreview: fromPreviewEditor,
       });
       sendPersistent({
         type: 'runCommand',
         command: 'intellijStyledSearch.activateCallGraphInlayAtVisibleLine',
         args: [hit.kind, visibleLine.lineOrdinal, visibleLine.column],
+        fromPreview: fromPreviewEditor,
       });
       reportCallGraphInlayHook('pointerdown', hookT0, event, hit, 'hit-visible-line');
       return;
@@ -12563,12 +12590,13 @@ export function getRendererPatchScript(
       if (state.monacoHost) {
         state.monacoHost.style.colorScheme = nextTheme === 'vs-dark' || nextTheme === 'hc-black' ? 'dark' : 'light';
       }
-      if (state.standaloneMonacoTheme !== nextTheme && api && api.editor &&
+      var changed = state.standaloneMonacoTheme !== nextTheme;
+      if (changed && api && api.editor &&
           typeof api.editor.setTheme === 'function') {
         api.editor.setTheme(nextTheme);
       }
       var overflowRoot = findPreviewOverflowRootForInstance();
-      if (overflowRoot) { syncPreviewOverflowTheme(overflowRoot); }
+      if (changed && overflowRoot) { syncPreviewOverflowTheme(overflowRoot); }
       state.standaloneMonacoTheme = nextTheme;
       return nextTheme;
     } catch (eSyncStandaloneTheme) {
@@ -13455,11 +13483,13 @@ export function getRendererPatchScript(
       inlayClasses: ((inlay.className || '') + '').slice(0, 120),
       command: resolvedCommand,
       args: args,
+      fromPreview: true,
     });
     sendPersistent({
       type: 'runCommand',
       command: resolvedCommand,
       args: args,
+      fromPreview: true,
     });
   }
 

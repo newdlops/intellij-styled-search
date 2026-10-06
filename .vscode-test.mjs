@@ -38,7 +38,10 @@ const isolatedExtensions = path.join(isolatedRoot, 'extensions');
 // a clean test checkout works with either archive layout without mutating the
 // shared .vscode-test cache.
 const requestedCodeVersion = process.env.IJSS_E2E_VSCODE_VERSION || 'stable';
-const downloadedExecutable = await downloadAndUnzipVSCode(requestedCodeVersion);
+// UserSetup acceptance supplies the actual per-user installation rather than
+// replacing it with the portable archive downloaded by the usual harness.
+const downloadedExecutable = process.env.IJSS_E2E_VSCODE_EXECUTABLE ||
+  await downloadAndUnzipVSCode(requestedCodeVersion);
 const vscodeExecutable = existsSync(downloadedExecutable)
   ? downloadedExecutable
   : process.platform === 'darwin'

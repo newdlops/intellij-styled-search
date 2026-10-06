@@ -86,6 +86,7 @@ class CallGraphInlayRegistry {
 
   replaceRange(uri: vscode.Uri, range: vscode.Range, entries: CallGraphInlayRegistryEntry[]): void {
     const uriKey = uri.toString();
+    this.invalidatedUris.delete(uriKey);
     const byLine = this.entriesByUri.get(uriKey) ?? new Map<number, CallGraphInlayRegistryEntry[]>();
     const startLine = Math.max(0, range.start.line);
     const endLine = Math.max(startLine, range.end.line);
@@ -652,6 +653,11 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
         callGraphLog.appendLine(`call graph inlay click ignored: visible line ${lineOrdinal} is outside active editor ranges`);
         return;
       }
+      const cached = resolveRenderedInlayEntry(callGraphInlayRegistry, editor.document.uri, line, kind, column, inlayText);
+      if (cached) {
+        await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, cached, 'inlay registry visible-line', undefined, editor.document.uri);
+        return;
+      }
       // #48: same fast-path — read InlayHintLabelPart.command Monaco
       // rendered for this line and execute it directly. When inlayText
       // is provided, allow a small window above/below the line so we
@@ -911,6 +917,11 @@ async function activateCallGraphInlayAtPosition(
     callGraphLog.appendLine('call graph inlay click ignored: no active editor for fallback resolution');
     return;
   }
+  const cached = resolveRenderedInlayEntry(registry, uri, safeLine, normalizedKind, safeColumn, options.inlayText);
+  if (cached) {
+    await activateCallGraphInlayEntry(overlay, callGraph, callGraphLog, cached, 'inlay registry position', undefined, uri);
+    return;
+  }
   // #48: try Monaco's inlay-label command FIRST. That's what the
   // inlay's "Execute command" hover popup would invoke — guaranteed
   // exact symbolId, no nearby-fallback drift.
@@ -953,6 +964,24 @@ async function activateCallGraphInlayAtPosition(
     symbol,
     uri,
   );
+}
+
+function resolveRenderedInlayEntry(
+  registry: CallGraphInlayRegistry,
+  uri: vscode.Uri,
+  line: number,
+  kind: string,
+  column?: number,
+  inlayText?: string,
+): CallGraphInlayRegistryEntry | undefined {
+  if (registry.isInvalidated(uri)) { return undefined; }
+  const entry = registry.resolve(uri, line, kind, column);
+  if (!entry) { return undefined; }
+  const text = (inlayText ?? '').trim().replace(/\s+/g, ' ');
+  // A differing label can indicate recycled/wrapped view-line drift. Keep
+  // the provider-based recovery path for those clicks instead of guessing.
+  if (text && text !== `${entry.kind} ${entry.count}`) { return undefined; }
+  return entry;
 }
 
 async function activateCallGraphInlayEntry(
@@ -1036,29 +1065,27 @@ function documentLineFromVisibleLineOrdinal(
   return undefined;
 }
 
-const callGraphSymbolCommandDedupe = new Map<string, { startedAt: number; promise: Promise<void> }>();
-const CALL_GRAPH_SYMBOL_COMMAND_DEDUPE_MS = 1_000;
+const callGraphSymbolCommandDedupe = new Map<string, Promise<void>>();
 
 async function runDedupedCallGraphSymbolCommand(
   command: string,
   symbolId: string,
   run: () => Promise<void>,
 ): Promise<void> {
-  const key = `${command}\n${symbolId}`;
-  const now = Date.now();
+  // Nested dispatches for one click share work. A later click, including one
+  // from another preview panel, must keep its own destination and result.
+  const invocationId = activeOverlay?.getRendererCommandInvocationId();
+  const key = `${invocationId ?? 'workbench'}\n${command}\n${symbolId}`;
   const existing = callGraphSymbolCommandDedupe.get(key);
-  if (existing && now - existing.startedAt < CALL_GRAPH_SYMBOL_COMMAND_DEDUPE_MS) {
-    return existing.promise;
+  if (existing) {
+    return existing;
   }
   const promise = run().finally(() => {
-    setTimeout(() => {
-      const current = callGraphSymbolCommandDedupe.get(key);
-      if (current?.promise === promise) {
-        callGraphSymbolCommandDedupe.delete(key);
-      }
-    }, CALL_GRAPH_SYMBOL_COMMAND_DEDUPE_MS);
+    if (callGraphSymbolCommandDedupe.get(key) === promise) {
+      callGraphSymbolCommandDedupe.delete(key);
+    }
   });
-  callGraphSymbolCommandDedupe.set(key, { startedAt: now, promise });
+  callGraphSymbolCommandDedupe.set(key, promise);
   return promise;
 }
 
