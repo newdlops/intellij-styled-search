@@ -369,7 +369,11 @@ suite('Renderer — overlay UI probes', () => {
       });
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      await overlay.show('ColdPreviewProbe', { forceLiteral: true, suppressSearch: true });
+      assert.strictEqual(
+        await overlay.showAndWaitForTests('ColdPreviewProbe', { forceLiteral: true, suppressSearch: true }),
+        true,
+        'the cold preview panel must settle before the capture probe runs',
+      );
       const raw = await overlay.evalInActiveWindowForTests(
         `(async function(){
           var alpha = ${JSON.stringify(alpha.toString())};
