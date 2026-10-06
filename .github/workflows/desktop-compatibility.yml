@@ -44,20 +44,15 @@ jobs:
         run: npm test -- --run out/test/suite/desktopCompatibility.test.js
       - name: Extension functional regressions
         run: npm test -- --exclude out/test/suite/renderer.test.js --exclude out/test/suite/captainIndexGate.test.js
-      - name: Renderer save and recovery acceptance
-        env:
-          IJSS_E2E_GREP: 'shared bundled preview model preserves|bundled preview stays dirty|real preview save preserves|renderer recovery only pauses'
-        run: npm test -- --run out/test/suite/renderer.test.js
-      - name: Renderer diagnostics and hardware timing budgets
+      - name: Renderer acceptance and hardware timing budgets
         id: renderer_diagnostics
-        continue-on-error: true
         run: npm test -- --run out/test/suite/renderer.test.js
       - name: Summarize renderer diagnostics
         if: always()
         env:
           IJSS_RENDERER_DIAGNOSTICS_OUTCOME: ${{ steps.renderer_diagnostics.outcome }}
         run: |
-          node -e "const fs = require('node:fs'); const outcome = process.env.IJSS_RENDERER_DIAGNOSTICS_OUTCOME || 'skipped'; fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, '### Full renderer diagnostics\n\nResult: **' + outcome + '**.\n\nThis additional suite includes repeated-load functional probes and hardware timing budgets. Its failures remain in the test log and annotations, but do not change the required acceptance checks.\n');"
+          node -e "const fs = require('node:fs'); const outcome = process.env.IJSS_RENDERER_DIAGNOSTICS_OUTCOME || 'skipped'; fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, '### Full renderer acceptance\n\nResult: **' + outcome + '**.\n\nThe complete renderer suite, including save/recovery, repeated-click behavior and the existing hardware timing budgets, is required. Failures fail this job.\n');"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

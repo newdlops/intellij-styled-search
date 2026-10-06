@@ -7,6 +7,7 @@
 - Removed repeated full theme-token copies from preview switching and separated computed-style reads from writes while preserving theme-change observers.
 - Preserved the executable identity expected by Node launcher shims when starting the JavaScript graph worker.
 - Added Windows 11 x64 UserSetup acceptance under a standard account on the Windows ARM64 runner, with x64 application emulation recorded explicitly.
+- Made the complete renderer suite required after the macOS and both Windows desktop configurations passed the existing timing budgets.
 
 ## 0.1.7151 - 2026-10-06
 

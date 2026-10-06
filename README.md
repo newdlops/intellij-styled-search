@@ -171,7 +171,7 @@ privileges. The host is ARM64, so these x64 application checks use Windows
 emulation; they do not certify native ARM64 VS Code or native x64 Windows 11
 hardware.
 
-CI gates native tests, desktop acceptance, extension functional regressions, and renderer save/recovery acceptance. It also runs the full renderer suite as diagnostics, including the strict hardware timing budgets; inspect that step separately when reviewing performance results from shared runners. Windows graph caches created before the URI correction require one rebuild; macOS graph cache versions are unchanged.
+CI gates native tests, desktop acceptance, extension functional regressions, and the complete renderer suite, including save/recovery, repeated clicks and the existing hardware timing budgets. Timing samples are recorded in the CI log. Windows graph caches created before the URI correction require one rebuild; macOS graph cache versions are unchanged.
 
 ## Deployment
 

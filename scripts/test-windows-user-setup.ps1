@@ -63,14 +63,20 @@ if ($AsTestUser) {
 
 if (!$env:GITHUB_ACTIONS) { throw 'This script creates an ephemeral account and is intended for GitHub-hosted CI only.' }
 if (!$NodeExecutable) { $NodeExecutable = (Get-Command node).Source }
+$downloads = @()
 foreach ($version in @('1.114.0', 'stable')) {
   $installer = Join-Path $ArtifactRoot "VSCodeUserSetup-x64-$version.exe"
-  $url = "https://update.code.visualstudio.com/$version/win32-x64-user/stable"
+  $updateVersion = $version
+  if ($version -eq 'stable') { $updateVersion = 'latest' }
+  $url = "https://update.code.visualstudio.com/$updateVersion/win32-x64-user/stable"
   Invoke-WebRequest -Uri $url -OutFile $installer
   $signature = Get-AuthenticodeSignature $installer
   if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
     throw "The downloaded UserSetup $version does not have a valid Microsoft signature."
   }
+  $downloads += @{ version = $version; url = $url; sha256 = (Get-FileHash $installer -Algorithm SHA256).Hash;
+    signature = $signature.Status.ToString() }
+  ConvertTo-Json -InputObject $downloads | Set-Content (Join-Path $ArtifactRoot 'installer-downloads.json') -Encoding UTF8
 }
 $accountName = 'ijss-user-setup'
 $passwordText = 'Ijss!' + [Guid]::NewGuid().ToString('N') + '9'
