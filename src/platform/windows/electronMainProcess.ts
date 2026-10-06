@@ -24,17 +24,22 @@ export function parseWindowsProcessSnapshot(output: string): ElectronProcess[] {
 }
 
 export function isWindowsMainProcess(proc: ElectronProcess, context: ElectronExtensionHostContext): boolean {
-  if (!proc.execPath || !proc.cmd) { return false; }
+  if (!proc.cmd) { return false; }
+  // CIM's ExecutablePath can be absent without debug privileges even when
+  // CommandLine is readable. Its first argument supplies the same structural
+  // installation check; ownership is still proved by the ancestor traversal.
+  const firstArgument = proc.cmd.match(/^\s*"([^"]+)"|^\s*(\S+)/);
+  const executable = proc.execPath || firstArgument?.[1] || firstArgument?.[2];
+  if (!executable || !path.win32.isAbsolute(executable) || !/\.exe$/i.test(executable)) { return false; }
   const normalize = (value: string) => path.win32.normalize(value).toLowerCase();
   // The local desktop host runs the executable beside resources/app. This
   // also works for portable installs, Insiders and renamed distributions.
   const appRoot = path.win32.normalize(context.appRoot);
   if (path.win32.basename(appRoot).toLowerCase() !== 'app' ||
       path.win32.basename(path.win32.dirname(appRoot)).toLowerCase() !== 'resources') { return false; }
-  if (normalize(path.win32.dirname(context.execPath)) !==
+  if (normalize(path.win32.dirname(executable)) !==
       normalize(path.win32.resolve(appRoot, '..', '..'))) { return false; }
-  return normalize(proc.execPath) === normalize(context.execPath) &&
-    !/(?:^|\s|["'])--(?:type(?:=|\s|["']|$)|ms-enable-electron-run-as-node\b)/i.test(proc.cmd);
+  return !/(?:^|\s|["'])--(?:type(?:=|\s|["']|$)|ms-enable-electron-run-as-node\b)/i.test(proc.cmd);
 }
 
 type DebugProcessHost = { _debugProcess?: (pid: number) => void };
@@ -61,7 +66,7 @@ export const windowsElectronMainProcess: ElectronMainProcessPlatform = {
       'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     return new Promise((resolve, reject) => {
       execFile(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', PROCESS_SNAPSHOT_SCRIPT], {
-        encoding: 'utf8', windowsHide: true, timeout: 5000, maxBuffer: 8 * 1024 * 1024,
+        encoding: 'utf8', windowsHide: true, timeout: 15_000, maxBuffer: 8 * 1024 * 1024,
       }, (error, stdout) => {
         if (error) { reject(error); return; }
         try { resolve(parseWindowsProcessSnapshot(stdout)); } catch (err) { reject(err); }

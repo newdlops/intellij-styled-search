@@ -40,7 +40,10 @@ test('does not attach a Windows remote host or broken ancestry to an unrelated d
   assert.equal(findAncestorElectronMainProcess([unrelated, proc(220, 330, '--type=utility'),
     proc(330, 220, '--type=renderer')], 330, 220, (p) => isWindowsMainProcess(p, host)), undefined);
   assert.equal(findAncestorElectronMainProcess([unrelated], 330, 220, (p) => isWindowsMainProcess(p, host)), undefined);
-  assert.equal(isWindowsMainProcess({ ...unrelated, execPath: undefined }, host), false);
+  assert.equal(isWindowsMainProcess({ ...unrelated, execPath: undefined }, host), true);
+  assert.equal(isWindowsMainProcess({ ...unrelated, execPath: undefined, cmd: '' }, host), false);
+  assert.equal(isWindowsMainProcess(unrelated, { ...host,
+    execPath: "C:\\Portable Tools\\사용자's Workbench\\resources\\app\\node_modules\\runtime\\node.exe" }), true);
 });
 
 test('parses CIM JSON arrays, single rows, BOM, unavailable command lines and Unicode', () => {

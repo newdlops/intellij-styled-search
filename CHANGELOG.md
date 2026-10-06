@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.7151 - 2026-10-06
 
 - Added an isolated Windows desktop adapter for Electron process discovery and on-demand inspector activation; preserved the macOS bundle fast path.
 - Bounded ripgrep candidate arguments by the Windows command-line limit and corrected drive/UNC file URI identity in native and JavaScript graph indexes.

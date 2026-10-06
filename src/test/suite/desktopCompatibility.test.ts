@@ -6,6 +6,7 @@ import { execFile } from 'child_process';
 import * as vscode from 'vscode';
 import type { ExtensionTestApi } from '../../extension';
 import { windowsFileUri } from '../../platform/windows/fileUri';
+import { windowsElectronMainProcess } from '../../platform/windows/electronMainProcess';
 import { Uri as WorkerUri } from '../../nodeVscodeShim';
 import { runRgSearch } from '../../rgSearch';
 import type { FileMatch } from '../../search';
@@ -30,6 +31,32 @@ async function invoke(binary: string, args: string[]): Promise<any> {
 }
 
 suite('Desktop compatibility', () => {
+  test('extension search uses the packaged zoekt engine without fallback after a real rebuild', async function () {
+    this.timeout(60_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder);
+    const source = path.join(folder!.uri.fsPath, `native engine ${Date.now()}.ts`);
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const prior = cfg.inspect<string>('engine')?.workspaceValue;
+    const runtime = (overlay as any).zoektRuntime;
+    try {
+      await cfg.update('engine', 'zoekt', vscode.ConfigurationTarget.Workspace);
+      await fs.promises.writeFile(source, 'const signal = "native_engine_acceptance_token";\n');
+      assert.strictEqual(await runtime.rebuildIndex(), true, 'the dedicated packaged indexer must run');
+      const result = await overlay.searchForTestsDetailed({ query: 'native_engine_acceptance_token',
+        useRegex: false, caseSensitive: true, wholeWord: false, fallbackPolicy: 'never' });
+      assert.strictEqual(result.requestedEngine, 'zoekt');
+      assert.strictEqual(result.effectiveEngine, 'zoekt');
+      assert.strictEqual(result.fallbackReason, undefined);
+      assert.ok(result.matches.some((file) => file.uri === vscode.Uri.file(source).toString()),
+        `the extension must return the indexed source URI: ${JSON.stringify(result)}`);
+    } finally {
+      await fs.promises.rm(source, { force: true });
+      await cfg.update('engine', prior, vscode.ConfigurationTarget.Workspace);
+    }
+  });
+
   test('Windows ripgrep searches a candidate list larger than CreateProcess permits', async function () {
     if (process.platform !== 'win32') { this.skip(); return; }
     this.timeout(30_000);
@@ -66,7 +93,7 @@ suite('Desktop compatibility', () => {
     }
   });
 
-  test('native graph document queries use the same URI as the editor in a Unicode workspace', async function () {
+  test('native binary pair rebuilds, reuses, searches and queries editor URIs in a Unicode workspace', async function () {
     this.timeout(60_000);
     const { overlay } = await getApi();
     const binary = await overlay.resolveZoekEngineBinaryForGraph(false);
@@ -75,6 +102,19 @@ suite('Desktop compatibility', () => {
     const source = path.join(root, 'source file#1.ts');
     try {
       await fs.promises.writeFile(source, 'export function measure(value: number) { return value + 1; }\nexport function consume() { return measure(1); }\n');
+      const rebuildBinary = path.join(path.dirname(binary!), process.platform === 'win32' ? 'ijss-rebuild.exe' : 'ijss-rebuild');
+      const indexed = await invoke(rebuildBinary, [root]);
+      assert.strictEqual(indexed.ok, true, JSON.stringify(indexed));
+      assert.strictEqual(indexed.stats.indexedFiles, 1);
+      const manifestPath = path.join(root, '.zoek-rs', 'manifest.json');
+      const before = await fs.promises.readFile(manifestPath, 'utf8');
+      const reused = await invoke(rebuildBinary, [root]);
+      assert.strictEqual(reused.ok, true);
+      assert.strictEqual(await fs.promises.readFile(manifestPath, 'utf8'), before,
+        'a second unchanged rebuild must reuse the published index');
+      const searched = await invoke(binary!, ['search', root, 'measure']);
+      assert.strictEqual(searched.ok, true, JSON.stringify(searched));
+      assert.strictEqual(searched.totalMatches, 2);
       const rebuilt = await invoke(binary!, ['graph-rebuild', root, '--workers', '2']);
       assert.strictEqual(rebuilt.ok, true);
       const documentUri = vscode.Uri.file(source).toString();
@@ -90,7 +130,34 @@ suite('Desktop compatibility', () => {
   test('opens, searches, previews and reopens the real overlay at desktop viewport sizes', async function () {
     this.timeout(60_000);
     const { overlay } = await getApi();
-    await overlay.awaitInjection();
+    try {
+      await overlay.awaitInjection();
+    } catch (error) {
+      if (process.platform === 'win32') {
+        const diagnostic: Record<string, unknown> = { error: String(error), pid: process.pid,
+          ppid: process.ppid, execPath: process.execPath, appRoot: vscode.env.appRoot };
+        try {
+          const rows = await windowsElectronMainProcess.readProcessSnapshot();
+          const byPid = new Map(rows.map((row) => [row.pid, row]));
+          const ancestors: unknown[] = [];
+          const visited = new Set<number>();
+          let pid = process.pid;
+          while (pid > 0 && !visited.has(pid)) {
+            visited.add(pid);
+            const row = byPid.get(pid);
+            if (!row) { break; }
+            ancestors.push({ pid: row.pid, ppid: row.ppid, execPath: row.execPath,
+              role: row.cmd.match(/--type[=\s]+([^\s"]+)/)?.[1] });
+            pid = row.ppid;
+          }
+          diagnostic.ancestors = ancestors;
+        } catch (snapshotError) { diagnostic.snapshotError = String(snapshotError); }
+        await fs.promises.mkdir(artifactRoot, { recursive: true });
+        await fs.promises.writeFile(path.join(artifactRoot, 'attachment-failure.json'), JSON.stringify(diagnostic, null, 2));
+        console.error('Windows attachment diagnostics:', JSON.stringify(diagnostic));
+      }
+      throw error;
+    }
     const folder = vscode.workspace.workspaceFolders?.[0];
     assert.ok(folder);
     await vscode.window.showTextDocument(vscode.Uri.joinPath(folder!.uri, 'beta.js'));
