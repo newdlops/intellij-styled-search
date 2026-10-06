@@ -5466,6 +5466,19 @@ suite('Renderer — overlay UI probes', () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     await overlay.show('PreviewExistingEditorWarmupProbe', { forceLiteral: true, suppressSearch: true });
 
+    // Earlier tests intentionally destroy private editor instances. Capture
+    // a newly mounted real workbench editor rather than relying on whichever
+    // old constructor/service objects happen to survive their cleanup.
+    await overlay.evalInActiveWindowForTests(`(function(){
+      window.__ijFindMonaco=null;window.__ijFindMonacoFactory=null;
+      window.__ijFindDisableMonacoProbes=false;window.__ijFindMonacoCapturePaused=false;
+      return window.__ijFindRefreshCapture?window.__ijFindRefreshCapture('test-existing-editor-mount'):'missing-refresh';
+    })()`);
+    await closeTabsByUri(activeFixture);
+    await vscode.window.showTextDocument(activeFixture, {
+      preview: false, preserveFocus: false, viewColumn: vscode.ViewColumn.One,
+    });
+
     const tabsBefore = snapshotTabCounts();
     const groupsBefore = snapshotTabGroupCount();
     const activeBefore = vscode.window.activeTextEditor?.document.uri.toString();
