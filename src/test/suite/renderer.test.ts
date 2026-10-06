@@ -5488,6 +5488,19 @@ suite('Renderer — overlay UI probes', () => {
             return String(active + 1);
           })()`,
         ));
+      // This regression starts from real captured service roots. Establish
+      // that dependency explicitly instead of racing a background warmup.
+      const captureDeadline = Date.now() + 3_000;
+      let serviceRoots = 0;
+      while (Date.now() < captureDeadline && serviceRoots === 0) {
+        serviceRoots = Number(await overlay.evalInActiveWindowForTests(`(function(){
+          window.__ijFindMonaco=null;window.__ijFindMonacoFactory=null;
+          window.__ijFindDisableMonacoProbes=false;window.__ijFindMonacoCapturePaused=false;
+          if(window.__ijFindCaptureFromDom)window.__ijFindCaptureFromDom();
+          return String((window.__ijFindCaptures&&window.__ijFindCaptures.services||[]).length);
+        })()`));
+        if (serviceRoots === 0) { await new Promise(resolve => setTimeout(resolve, 25)); }
+      }
       const coldCaptureRaw = await overlay.evalInActiveWindowForTests(
         `(function(){
           window.__ijFindMonaco = null;
@@ -13235,6 +13248,42 @@ suite('Renderer — overlay UI probes', () => {
       try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
       try { await vscode.workspace.fs.delete(fixture); } catch {}
       await restoreBackend();
+    }
+  });
+
+  test('spawned panels share one stylesheet and retire exact legacy copies while preserving overrides', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(20_000);
+    const { overlay } = await getApi();
+    await overlay.show('SharedStylesHost', { forceLiteral: true, suppressSearch: true });
+    await overlay.evalInActiveWindowForTests(`(function(){
+      var sheet=document.getElementById('ijss-search-ui-style');
+      if(!sheet)throw new Error('missing shared style');
+      var legacy=sheet.cloneNode(true);legacy.removeAttribute('id');
+      var override=document.createElement('style');override.textContent='.ij-find-overlay { --ijss-style-probe: preserved; }';
+      document.head.appendChild(legacy);document.head.appendChild(override);
+      sheet.setAttribute('data-ij-find-style-version','0');
+      window.__ijssSharedStyleProbe={sheet:sheet,legacy:legacy,override:override};
+      return 'prepared';
+    })()`);
+    try {
+      for (let index = 0; index < 4; index++) {
+        const query = `SharedStylesChild${index}`;
+        await overlay.show(query, { forceLiteral: true, suppressSearch: true, spawn: true });
+        const probe = JSON.parse(await overlay.evalInActiveWindowForTests(`(function(){
+          var p=window.__ijssSharedStyleProbe;var sheet=document.getElementById('ijss-search-ui-style');
+          var copies=Array.from(document.head.querySelectorAll('style')).filter(function(s){return s.textContent===sheet.textContent}).length;
+          return JSON.stringify({same:sheet===p.sheet,copies:copies,legacy:p.legacy.isConnected,override:p.override.isConnected});
+        })()`));
+        assert.deepStrictEqual(probe, { same: true, copies: 1, legacy: false, override: true });
+        await overlay.evalInActiveWindowForTests(`(function(){
+          Array.from(document.querySelectorAll('.ij-find-overlay.visible')).forEach(function(panel){
+            var q=panel.querySelector('.ij-find-query');if(q&&q.value===${JSON.stringify(query)})panel.querySelector('.ij-find-close').click();
+          });return 'closed';
+        })()`);
+      }
+    } finally {
+      try { await overlay.evalInActiveWindowForTests("(function(){var p=window.__ijssSharedStyleProbe;if(p){p.legacy.remove();p.override.remove();delete window.__ijssSharedStyleProbe;}return 'cleaned';})()"); } catch {}
     }
   });
 

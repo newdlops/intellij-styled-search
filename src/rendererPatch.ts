@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 150;
+export const RENDERER_PATCH_VERSION = 151;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -2592,8 +2592,13 @@ export function getRendererPatchScript(
   // any straggler references in the source compile, but they are no-ops.
   function isDomPreviewHoverEnabled() { return false; }
 
-  var style = document.createElement('style');
-  style.textContent = [
+  // Every instance uses the same selectors. Keep one stylesheet per patch;
+  // adding another on each spawn permanently grows style matching work even
+  // after its panel and editor have been disposed.
+  var sharedStyleId = 'ijss-search-ui-style';
+  var style = document.getElementById(sharedStyleId);
+  if (!style || style.tagName !== 'STYLE' || style.getAttribute('data-ij-find-style-version') !== String(__ijFindPatchVersion)) {
+  var styleText = [
     '.ij-find-overlay {',
     '  position: fixed; top: 60px; left: 50%;',
     '  transform: translateX(-50%);',
@@ -3338,7 +3343,19 @@ export function getRendererPatchScript(
     '.ij-find-preview-overflow .monaco-hover .hover-row .verbosity-actions .codicon.enabled { color: var(--vscode-textLink-foreground); }',
     '.ij-find-preview-overflow .monaco-hover .hover-row .verbosity-actions .codicon.disabled { opacity: 0.6; }',
   ].join('\\n');
-  document.head.appendChild(style);
+  // Retire exact duplicate sheets from older installers without changing
+  // user overrides or styles owned by the workbench/other extensions.
+  Array.from(document.head.querySelectorAll('style')).forEach(function (candidate) {
+    if (candidate !== style && candidate.textContent === styleText) { candidate.remove(); }
+  });
+  if (!style || style.tagName !== 'STYLE') {
+    style = document.createElement('style');
+    style.id = sharedStyleId;
+  }
+  style.textContent = styleText;
+  style.setAttribute('data-ij-find-style-version', String(__ijFindPatchVersion));
+  }
+  if (style.parentElement !== document.head) { document.head.appendChild(style); }
 
   var $title = el('span', { className: 'ij-find-title', text: 'Find in Files' });
   var $summary = el('span', { className: 'ij-find-summary', text: '' });
