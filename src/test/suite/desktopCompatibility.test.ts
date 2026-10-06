@@ -268,9 +268,13 @@ suite('Desktop compatibility', () => {
         assert.ok(layout.left >= -1 && layout.top >= -1 && layout.right <= layout.width + 1 &&
           layout.bottom <= layout.height + 1, `overlay must remain in the workbench viewport: ${JSON.stringify(layout)}`);
         const captured = await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.sendCommand(
-          'Page.captureScreenshot', { format: 'png', captureBeyondViewport: true }).then(function(image) { return image.data; })`);
+          'Page.captureScreenshot', { format: 'png', captureBeyondViewport: true,
+            clip: { x: 0, y: 0, width: ${width}, height: ${height}, scale: 1 } }).then(function(image) { return image.data; })`);
         assert.ok(typeof captured === 'string' && captured.length > 0, 'capture actual rendered workbench');
-        await fs.promises.writeFile(path.join(artifactRoot, `${width}x${height}.png`), Buffer.from(captured, 'base64'));
+        const png = Buffer.from(captured, 'base64');
+        assert.strictEqual(png.readUInt32BE(16), width, 'the PNG must capture the emulated viewport width');
+        assert.strictEqual(png.readUInt32BE(20), height, 'the PNG must capture the emulated viewport height');
+        await fs.promises.writeFile(path.join(artifactRoot, `${width}x${height}.png`), png);
       }
       await fs.promises.writeFile(path.join(artifactRoot, 'layout.json'), JSON.stringify(reports, null, 2));
     } finally {

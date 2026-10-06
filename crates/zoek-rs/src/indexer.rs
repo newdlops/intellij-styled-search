@@ -978,7 +978,7 @@ where
     let mut lines = stdout
         .lines()
         .filter(|line| !line.is_empty())
-        .map(|line| line.strip_prefix("./").unwrap_or(line).replace('\\', "/"));
+        .map(normalize_ripgrep_relative_path);
     let mut records = Vec::new();
     let mut stats = CorpusStats::default();
     let mut processed_enumerated = 0usize;
@@ -1769,6 +1769,13 @@ fn merge_corpus_stats(target: &mut CorpusStats, source: CorpusStats) {
     target.decoded_utf16_files += source.decoded_utf16_files;
 }
 
+fn normalize_ripgrep_relative_path(value: &str) -> String {
+    // Windows rg emits `.\path`; normalize its separators before stripping
+    // the current-directory prefix so persisted paths and excludes agree.
+    let normalized = value.replace('\\', "/");
+    normalized.strip_prefix("./").unwrap_or(&normalized).to_string()
+}
+
 fn normalize_rel_path(path: &Path) -> String {
     let path = path.to_string_lossy();
     if path.contains('\\') {
@@ -2151,6 +2158,15 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn ripgrep_relative_paths_share_identity_across_separator_styles() {
+        for value in ["./nested/source.rs", r".\nested\source.rs", "nested/source.rs"] {
+            assert_eq!(super::normalize_ripgrep_relative_path(value), "nested/source.rs");
+        }
+        assert_eq!(super::normalize_ripgrep_relative_path(r".\.cache\source.rs"), ".cache/source.rs");
+        assert_eq!(super::normalize_ripgrep_relative_path(".hidden.rs"), ".hidden.rs");
+    }
 
     #[test]
     fn index_directory_writes_manifest_and_multiple_shards() -> io::Result<()> {
