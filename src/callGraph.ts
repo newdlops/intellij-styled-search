@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import { spawn, type ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import * as v8 from 'v8';
-import { pathToFileURL } from 'url';
+import { filePathToUriString } from './platform/fileUri';
 import { gzip, gunzip } from 'zlib';
 import * as vscode from 'vscode';
 import { graphStorageVersions } from './platform/graphStorage';
@@ -6823,7 +6823,7 @@ function nodeFileUri(fsPath: string): NodeFileUri {
   return {
     scheme: 'file',
     fsPath: normalized,
-    toString: () => pathToFileURL(normalized).toString(),
+    toString: () => filePathToUriString(normalized),
   };
 }
 

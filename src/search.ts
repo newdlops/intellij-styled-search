@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { findWorkspaceFilesDirect } from './fileDiscovery';
 import { compilePathScopeMatcher } from './pathScope';
 import { decodeTextBytes, hasBinaryFileExtension, looksBinaryContent } from './textFiles';
+import { literalSearchRegexSource } from './literalSearch';
 
 export interface SearchOptions {
   query: string;
@@ -65,10 +66,6 @@ export interface SearchProgress {
 
 export type SearchEngine = 'zoekt' | 'codesearch';
 
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 export function searchQueryTerms(opts: Pick<SearchOptions, 'query' | 'queries'>): string[] {
   const terms = (opts.queries && opts.queries.length > 0 ? opts.queries : [opts.query])
     .map((term) => term.trim())
@@ -86,7 +83,7 @@ function buildRegex(opts: SearchOptions): RegExp | null {
   const terms = searchQueryTerms(opts);
   if (terms.length === 0) { return null; }
   let src = terms
-    .map((term) => opts.useRegex ? `(?:${term})` : escapeRegex(term))
+    .map((term) => opts.useRegex ? `(?:${term})` : literalSearchRegexSource(term))
     .join('|');
   if (terms.length > 1) { src = `(?:${src})`; }
   if (opts.wholeWord) { src = `\\b${src}\\b`; }

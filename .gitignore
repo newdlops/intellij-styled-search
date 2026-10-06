@@ -11,5 +11,6 @@ target/
 artifacts/benchmarks/
 artifacts/desktop-compatibility/
 artifacts/desktop-runtime-download/
+artifacts/desktop-compatibility-download/
 .lh/**/*.*
 .vscode/**/*.*

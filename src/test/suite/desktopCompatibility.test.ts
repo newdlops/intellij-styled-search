@@ -83,6 +83,53 @@ suite('Desktop compatibility', () => {
     }
   });
 
+  test('native and codesearch engines find LF and CRLF literal snippets with correct line ranges', async function () {
+    this.timeout(60_000);
+    const { overlay } = await getApi();
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder);
+    const root = await fs.promises.mkdtemp(path.join(folder!.uri.fsPath, 'line ending '));
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    const prior = cfg.inspect<string>('engine')?.workspaceValue;
+    const lines = ['const value = [1, 2];', '  return value;'];
+    try {
+      await fs.promises.writeFile(path.join(root, 'lf.txt'), lines.join('\n') + '\n');
+      await fs.promises.writeFile(path.join(root, 'crlf.txt'), lines.join('\r\n') + '\r\n');
+      await fs.promises.writeFile(path.join(root, 'different.txt'), [lines[0], ' return value;'].join('\r\n'));
+      for (const engine of ['zoekt', 'codesearch']) {
+        await cfg.update('engine', engine, vscode.ConfigurationTarget.Workspace);
+        await overlay.rebuildIndex();
+        for (const ending of ['\n', '\r\n']) {
+          if (engine === 'codesearch') {
+            const candidates = (overlay as any).trigramIndex.candidatesFor(lines.join(ending),
+              { useRegex: false, caseSensitive: true, wholeWord: false });
+            assert.ok(candidates.uris, JSON.stringify(candidates.reason));
+            for (const file of ['lf.txt', 'crlf.txt']) {
+              assert.ok(candidates.uris.has(vscode.Uri.file(path.join(root, file)).toString()),
+                `literal narrowing must retain ${file} for both line-ending forms`);
+            }
+          }
+          const result = await overlay.searchForTestsDetailed({ query: lines.join(ending),
+            useRegex: false, caseSensitive: true, wholeWord: false,
+            includePatterns: [path.basename(root) + '/'], fallbackPolicy: 'never' });
+          assert.strictEqual(result.effectiveEngine, engine, JSON.stringify(result));
+          assert.deepStrictEqual(result.matches.map((file) => path.basename(vscode.Uri.parse(file.uri).fsPath)).sort(),
+            ['crlf.txt', 'lf.txt'], JSON.stringify(result));
+          for (const file of result.matches) {
+            const range = file.matches[0].ranges[0];
+            assert.strictEqual(file.matches[0].line, 0);
+            assert.strictEqual(range.start, 0);
+            assert.strictEqual(range.endLine, 1);
+            assert.strictEqual(range.endCol, lines[1].length);
+          }
+        }
+      }
+    } finally {
+      await fs.promises.rm(root, { recursive: true, force: true });
+      await cfg.update('engine', prior, vscode.ConfigurationTarget.Workspace);
+    }
+  });
+
   test('Windows worker and native path encoders match the actual VS Code URI API', function () {
     if (process.platform !== 'win32') { this.skip(); return; }
     const paths = ['C:\\Work Space\\한글\\source#.ts', 'D:\\src\\a%20b.ts', '\\\\SERVER\\Share\\a b.ts'];

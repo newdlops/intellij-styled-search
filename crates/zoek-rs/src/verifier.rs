@@ -28,7 +28,14 @@ pub fn verify_literal(
         return Vec::new();
     }
 
-    let pattern = regex::escape(query);
+    // Editor selections use logical line breaks; the same literal snippet
+    // must match files saved with either LF or CRLF on any operating system.
+    let pattern = if query.contains('\n') {
+        query.replace("\r\n", "\n").split('\n')
+            .map(regex::escape).collect::<Vec<_>>().join(r"\r?\n")
+    } else {
+        regex::escape(query)
+    };
     let regex = match RegexBuilder::new(&pattern)
         .case_insensitive(!case_sensitive)
         .multi_line(true)
@@ -382,6 +389,25 @@ mod tests {
         let matches = verify_literal("alpha Alpha alphaBeta", "alpha", false, true, 10);
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].line, 0);
+    }
+
+    #[test]
+    fn literal_snippets_match_lf_and_crlf_with_exact_indentation_and_ranges() {
+        let lines = ["const value = [1, 2];", "  return value;"];
+        for query_ending in ["\n", "\r\n"] {
+            let query = lines.join(query_ending);
+            for file_ending in ["\n", "\r\n"] {
+                let text = lines.join(file_ending);
+                let matches = verify_literal(&text, &query, true, false, 10);
+                assert_eq!(matches.len(), 1);
+                assert_eq!(matches[0].line, 0);
+                assert_eq!(matches[0].start_column, 0);
+                assert_eq!(matches[0].end_line, Some(1));
+                assert_eq!(matches[0].end_column, lines[1].len());
+                let different = [lines[0], " return value;"].join(file_ending);
+                assert!(verify_literal(&different, &query, true, false, 10).is_empty());
+            }
+        }
     }
 
     #[test]

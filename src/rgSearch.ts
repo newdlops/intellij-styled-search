@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import { canPassSearchCandidates } from './platform/commandLine';
+import { literalSearchRegexSource } from './literalSearch';
 import * as fs from 'fs';
 import * as https from 'https';
 import * as os from 'os';
@@ -378,7 +379,7 @@ export async function runRgSearch(
     if (isRegexMultiline) {
       args.push('--multiline-dotall');
     }
-  } else {
+  } else if (!isMultiline) {
     args.push('--fixed-strings');
   }
   if (opts.caseSensitive) { args.push('--case-sensitive'); }
@@ -394,7 +395,8 @@ export async function runRgSearch(
     progress.onDone({ totalFiles: 0, totalMatches: 0, truncated: false });
     return;
   }
-  const queryArgs = queryTerms.flatMap((term) => ['-e', term]);
+  const queryArgs = queryTerms.flatMap((term) => ['-e',
+    !opts.useRegex && isMultiline ? literalSearchRegexSource(term) : term]);
   const useNarrowing = !!(narrowedFiles && canPassSearchCandidates(
     rgPath, [...args, '--no-ignore', ...queryArgs], narrowedFiles,
   ));
@@ -545,7 +547,7 @@ export async function runRgSearch(
               smEndCol = subEnd - lStart;
               break;
             }
-            cursor = lEnd + 1; // +1 for the \n between split lines
+            cursor = lEnd + 1; // +1 for the \n between split lines, retaining raw CR offsets
           }
           if (smStartLine === smEndLine) {
             ranges.push({ start: smStartCol, end: smEndCol });
@@ -555,7 +557,7 @@ export async function runRgSearch(
             // list's inline highlight); endLine/endCol carry the full span
             // so the preview Monaco decoration covers every line.
             const firstLineIdx = smStartLine - startLine;
-            const firstLineLen = splitLines[firstLineIdx].length;
+            const firstLineLen = splitLines[firstLineIdx].replace(/\r$/, '').length;
             ranges.push({
               start: smStartCol,
               end: firstLineLen,
@@ -566,7 +568,7 @@ export async function runRgSearch(
         }
         // Preview the first line only in the result list; renderer fetches
         // surrounding lines on demand.
-        const displayLine = splitLines[0];
+        const displayLine = splitLines[0].replace(/\r$/, '');
         const firstRange = ranges[0];
         if (firstRange) {
           const clipped = clipLine(displayLine, {

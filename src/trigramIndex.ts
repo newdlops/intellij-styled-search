@@ -8,6 +8,7 @@ import { analyze } from './codesearch/regexInfo';
 import { PostingSource, TrigramQuery, evalQuery, qAnd, qTri } from './codesearch/trigramQuery';
 import { serializeV3 } from './codesearch/binaryIndex';
 import { extractTrigramsLower } from './codesearch/trigrams';
+import { literalSearchRegexSource } from './literalSearch';
 export { extractTrigramsLower } from './codesearch/trigrams';
 import { findWorkspaceFilesDirect } from './fileDiscovery';
 import {
@@ -934,16 +935,16 @@ export class TrigramIndex {
     // planner is for REGEX analysis. Running the planner on a 174-char
     // multi-line paste costs ~500 ms per keystroke (64×64 suffix×prefix
     // combos feed trigramsOf thousands of times); fast-path is ~5 ms.
-    // Multi-line is SAFE here because extractTrigramsLower walks the full
-    // byte sequence — newline chars are just characters that contribute
-    // trigrams like "):\n" and "\n   ". The file-indexing path does the
-    // exact same extraction, so a file containing the multi-line literal
-    // must contain every trigram we extract from the query.
+    // Require grams within each logical line. Grams spanning a line ending
+    // differ between LF and CRLF even when the editor displays the same
+    // snippet; the verifier still checks adjacency and exact indentation.
     if (!opts.useRegex && !opts.wholeWord) {
       if (query.length < 3) {
         return { uris: null, reason: `query-too-short(${query.length})` };
       }
-      const qtris = extractTrigramsLower(query);
+      const qtris = query.includes('\n')
+        ? new Set(query.split(/\r?\n/).flatMap((line) => [...extractTrigramsLower(line)]))
+        : extractTrigramsLower(query);
       if (qtris.size === 0) {
         return { uris: null, reason: 'no-extractable-trigrams' };
       }
@@ -1000,7 +1001,7 @@ export class TrigramIndex {
     if (opts.useRegex) {
       patternSrc = query;
     } else {
-      patternSrc = escapeRegexSource(query);
+      patternSrc = literalSearchRegexSource(query);
       if (opts.wholeWord) { patternSrc = '\\b' + patternSrc + '\\b'; }
     }
     const regexMultiline = opts.useRegex && opts.regexMultiline === true;
@@ -1075,10 +1076,6 @@ export class TrigramIndex {
     }
     return out;
   }
-}
-
-function escapeRegexSource(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function getExt(fsPath: string): string {

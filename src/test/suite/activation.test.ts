@@ -1636,10 +1636,14 @@ suite('Activation', () => {
     assert.ok(workspaceRoot, 'expected fixture workspace folder');
 
     const originalScheduleFlush = runtime.scheduleFlush.bind(runtime);
+    const priorChanged = new Set<string>(runtime.pendingChanged);
+    const priorDeleted = new Set<string>(runtime.pendingDeleted);
     let flushes = 0;
     runtime.scheduleFlush = () => { flushes++; };
 
     try {
+      runtime.pendingChanged.clear();
+      runtime.pendingDeleted.clear();
       runtime.queueRename(
         vscode.Uri.file(path.join(workspaceRoot, 'alpha.py')),
         vscode.Uri.file(path.join(workspaceRoot, '.zoek-rs', 'alpha.py')),
@@ -1658,6 +1662,8 @@ suite('Activation', () => {
     } finally {
       runtime.pendingChanged.clear();
       runtime.pendingDeleted.clear();
+      for (const relPath of priorChanged) { runtime.pendingChanged.add(relPath); }
+      for (const relPath of priorDeleted) { runtime.pendingDeleted.add(relPath); }
       runtime.scheduleFlush = originalScheduleFlush;
     }
   });
@@ -1887,7 +1893,8 @@ suite('Activation', () => {
       });
       cts.dispose();
       assert.strictEqual(result.ready, true);
-      assert.deepStrictEqual(invoked[0], ['/tmp/zoek-rs', 'update', workspaceRoot, 'docs.md']);
+      assert.deepStrictEqual(invoked[0]?.slice(0, 3), ['/tmp/zoek-rs', 'update', workspaceRoot]);
+      assert.ok(invoked[0]?.slice(3).includes('docs.md'), 'the queued document must be updated before search');
       assert.strictEqual(invoked[1]?.[1], 'search');
       assert.strictEqual(runtime.pendingChanged.size, 0);
     } finally {
