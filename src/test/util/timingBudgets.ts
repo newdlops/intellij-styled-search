@@ -42,7 +42,7 @@ export function assertTimingBudget(
   }
   if (process.env.IJSS_E2E_TIMING_REPORT === '1' || mode === 'report') {
     console.info(`[timings] ${label}: samples=${samples.join(',')}ms max=${maxMs}ms p95=${p95Ms}ms ` +
-      `${statistic}=${observedMs}ms budget=${comparison}${budgetMs}ms mode=${mode} ` +
+      `observed(${statistic})=${observedMs}ms budget=${comparison}${budgetMs}ms mode=${mode} ` +
       `result=${exceeded ? 'budget-exceeded' : 'within-budget'}`);
   }
   if (mode === 'strict') {

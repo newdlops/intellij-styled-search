@@ -16,6 +16,8 @@ if (timings.length) {
   for (const item of timings) {
     summary += `| ${item.label} | ${item.statistic} | ${item.observedMs} ms | ${item.comparison} ${item.budgetMs} ms | ${item.exceeded ? '**Exceeded**' : 'Within budget'} |\n`;
   }
+} else {
+  summary += 'No timing samples were collected. Check the suite result and desktop logs.\n';
 }
 fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
 console.log(`Renderer summary: outcome=${outcome} mode=${mode} measurements=${timings.length} exceeded=${exceeded.length}`);
