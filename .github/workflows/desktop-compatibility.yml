@@ -56,6 +56,10 @@ jobs:
           # Preserve channel logs/artifacts without stdout IPC changing the
           # rendering latency measured by this step.
           IJSS_E2E_MIRROR_LOGS: '0'
+          # Interactive budgets require foreground scheduling even when the
+          # hosted desktop session is disconnected or occluded. The test logs
+          # the actual window policy; it does not warm the first hint request.
+          IJSS_E2E_FOREGROUND_TIMINGS: '1'
         run: npm test -- --run out/test/suite/renderer.test.js
       - name: Summarize renderer diagnostics
         if: always()

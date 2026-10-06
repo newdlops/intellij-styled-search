@@ -2,6 +2,8 @@
 
 ## 0.1.7152 - 2026-10-06
 
+- Routed asynchronous usage results to the panel created by their own click and discarded results after that panel closed, preserving sibling panels and focus.
+- Removed the extra passive capture dwell when a preview has an explicitly enabled transient-editor fallback.
 - Prepared durable inlay commands from available graph metadata before notifying the workbench, keeping large first-time hint requests out of the command-registration backlog.
 - Ignored late events from replaced CDP sockets so they cannot close a newer connection or cancel its requests.
 - Kept main-process event forwarding independent of inspector-session native bindings during reconnects.
@@ -12,6 +14,7 @@
 - Preserved the executable identity expected by Node launcher shims when starting the JavaScript graph worker.
 - Added Windows 11 x64 UserSetup acceptance under a standard account on the Windows ARM64 runner, with x64 application emulation recorded explicitly.
 - Made the complete renderer suite required after the macOS and both Windows desktop configurations passed the existing timing budgets.
+- Measured required interactive timing budgets with foreground scheduling in the isolated CI workbench and recorded the window policy separately from optional CPU profiling.
 
 ## 0.1.7151 - 2026-10-06
 

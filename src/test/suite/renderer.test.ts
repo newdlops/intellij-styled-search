@@ -299,6 +299,23 @@ suite('Renderer — overlay UI probes', () => {
     const { overlay } = api;
     try {
       await overlay.awaitInjection();
+      if (process.env.IJSS_E2E_FOREGROUND_TIMINGS === '1') {
+        // A disconnected/occluded CI desktop can pause Chromium work. Measure
+        // interactive budgets with foreground scheduling, without issuing a
+        // warm-up inlay request or attaching a renderer profiler.
+        const response = await (overlay as any).send('Runtime.evaluate', {
+          expression: `(function(){return require('electron').BrowserWindow.getAllWindows().filter(function(w){
+            return /workbench\\.(?:esm\\.)?html(?:\\?|#|$)/.test(w.webContents.getURL());
+          }).map(function(w){var before=w.webContents.getBackgroundThrottling();
+            w.webContents.setBackgroundThrottling(false);
+            return {windowId:w.id,focused:w.isFocused(),visible:w.isVisible(),before:before,after:w.webContents.getBackgroundThrottling()};
+          })})()`,
+          returnByValue: true, includeCommandLineAPI: true,
+        });
+        assert.strictEqual(response?.exceptionDetails, undefined);
+        assert.ok(response?.result?.value?.length > 0, 'expected an isolated workbench for foreground timing');
+        console.info('[timing-environment]', JSON.stringify(response.result.value));
+      }
       cdpAvailable = true;
     } catch (err) {
       cdpAvailable = false;
@@ -13221,6 +13238,80 @@ suite('Renderer — overlay UI probes', () => {
     }
   });
 
+  test('out-of-order pending results update their own panel and closed panels stay closed', async function () {
+    if (!cdpAvailable) { this.skip(); return; }
+    this.timeout(30_000);
+    const { overlay } = await getApi();
+    const anyOverlay = overlay as any;
+    await overlay.show('PendingResultsHost', { forceLiteral: true, suppressSearch: true });
+    const hostSrc = await overlay.evalInActiveWindowForTests("document.querySelector('.ij-find-overlay.visible').getAttribute('data-ij-find-src')");
+    const windowId = overlay.getConnectionStateForTests().activeWindowId!;
+    const releases: Array<() => void> = [];
+    const gates = [0, 1, 2].map((index) => new Promise<void>((resolve) => { releases[index] = resolve; }));
+    const entered: Array<() => void> = [];
+    const started = [0, 1, 2].map((index) => new Promise<void>((resolve) => { entered[index] = resolve; }));
+    const sources: string[] = [];
+    const folder = vscode.workspace.workspaceFolders![0]!;
+    const matches = (count: number) => [{
+      uri: vscode.Uri.joinPath(folder.uri, 'alpha.py').toString(), relPath: 'alpha.py',
+      matches: Array.from({ length: count }, (_, line) => ({ line, preview: 'result', ranges: [{ start: 0, end: 1 }] })),
+    }];
+    const command = vscode.commands.registerCommand('ijss.test.ownedPendingResults', async (index: number) => {
+      overlay.markRendererCommandPendingPanel(windowId);
+      await overlay.show(`Pending ${index}`, {
+        forceLiteral: true, suppressSearch: true, preferredWindowId: windowId, spawn: true, loading: true,
+      });
+      sources[index] = anyOverlay.rendererCommandContext.getStore()?.pendingPanel?.rendererSrc;
+      entered[index]!();
+      await gates[index];
+      await overlay.showStaticResults(`Completed ${index}`, matches(index + 1));
+      if (index === 0) {
+        entered[2]!();
+        await gates[2];
+        await overlay.showStaticResults('Late closed result', matches(3));
+      }
+    });
+    const probe = async () => JSON.parse(await overlay.evalInActiveWindowForTests(`(function(){
+      return JSON.stringify(Array.from(document.querySelectorAll('.ij-find-overlay.visible')).map(function(panel){
+        var src=panel.getAttribute('data-ij-find-src');var q=panel.querySelector('.ij-find-query');
+        return {src:src,query:q&&q.value,count:window.__ijFindGetSearchState(src).flatCount};
+      }));
+    })()`)) as Array<{ src: string; query: string; count: number }>;
+    let first: Promise<void> | undefined;
+    let second: Promise<void> | undefined;
+    try {
+      first = anyOverlay.runHoverCommand('ijss.test.ownedPendingResults', [0], windowId, true);
+      await started[0];
+      second = anyOverlay.runHoverCommand('ijss.test.ownedPendingResults', [1], windowId, true);
+      await started[1];
+      assert.ok(sources[0] && sources[1] && sources[0] !== sources[1] && sources[0] !== hostSrc && sources[1] !== hostSrc);
+      releases[1]!();
+      await second;
+      await overlay.evalInActiveWindowForTests(`(function(){window.__ijFindInstances[${JSON.stringify(sources[1])}].panel.querySelector('.ij-find-query').focus();return 'focused';})()`);
+      releases[0]!();
+      await started[2];
+      const completed = await probe();
+      assert.deepStrictEqual(completed.find(panel => panel.src === sources[0]), { src: sources[0], query: 'Completed 0', count: 1 });
+      assert.deepStrictEqual(completed.find(panel => panel.src === sources[1]), { src: sources[1], query: 'Completed 1', count: 2 });
+      assert.strictEqual(completed.find(panel => panel.src === hostSrc)?.query, 'PendingResultsHost');
+      const focusedSrc = await overlay.evalInActiveWindowForTests("(function(){var panel=document.activeElement&&document.activeElement.closest('.ij-find-overlay');return panel&&panel.getAttribute('data-ij-find-src')||''})()");
+      assert.strictEqual(focusedSrc, sources[1], 'a sibling result must preserve the current input focus');
+      await overlay.evalInActiveWindowForTests(`(function(){var p=window.__ijFindInstances[${JSON.stringify(sources[0])}].panel;p.querySelector('.ij-find-close').click();return 'closed';})()`);
+      releases[2]!();
+      await first;
+      const afterClose = await probe();
+      assert.strictEqual(afterClose.length, 2, 'a late result must not create another panel');
+      assert.ok(!afterClose.some(panel => panel.src === sources[0] || panel.query === 'Late closed result'));
+      assert.strictEqual(afterClose.find(panel => panel.src === hostSrc)?.query, 'PendingResultsHost');
+      assert.strictEqual(afterClose.find(panel => panel.src === sources[1])?.count, 2);
+    } finally {
+      releases.forEach(release => release());
+      await Promise.allSettled([first, second]);
+      command.dispose();
+      try { await overlay.evalInActiveWindowForTests("Array.from(document.querySelectorAll('.ij-find-overlay.visible .ij-find-close')).forEach(function(button){button.click()});'closed'"); } catch {}
+    }
+  });
+
   test('full-file call graph inlays surface within 200ms for a 10k-line file under repeated load', async function () {
     if (!cdpAvailable) { this.skip(); return; }
     this.timeout(120_000);
@@ -13253,7 +13344,7 @@ suite('Renderer — overlay UI probes', () => {
       const timings: number[] = [];
       const revealLines = [0, 2_000, 4_000, 6_000, 8_000];
       let expectedUsageHintCount: number | undefined;
-      const profileColdRequest = process.env.IJSS_E2E_TIMING_REPORT === '1';
+      const profileColdRequest = process.env.IJSS_E2E_PROFILE_INLAYS === '1';
       const rendererProfiler = async (method: string): Promise<any> => {
         const anyOverlay = api.overlay as any;
         const windowId = await anyOverlay.resolveTargetWorkbenchWindowId(anyOverlay.activeWindowId);

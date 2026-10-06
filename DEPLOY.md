@@ -185,6 +185,12 @@ token before exercising the native engine and overlay. This uses x64
 application emulation on GitHub's `windows-11-arm` runner; native x64 Windows 11
 hardware and native ARM64 VS Code are separate environments.
 
+Renderer timing checks disable Chromium's background animation/timer throttling
+only in the isolated test workbench and log its actual window policy. Their
+interactive deadlines still include the first full-file hint request without
+provider warmup. CPU profiling is separately opt-in via
+`IJSS_E2E_PROFILE_INLAYS=1`; required CI timings run without that profiler.
+
 Recommended smoke checks:
 
 - Open `IntelliJ Search: Find in Path (IntelliJ Style)`.

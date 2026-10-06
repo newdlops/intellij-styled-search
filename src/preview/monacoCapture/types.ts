@@ -6,6 +6,8 @@ export type CaptureDiagnosticOptions = {
   holdForceOpenedTab?: boolean;
   reason?: string;
   shouldContinue?: () => boolean;
+  /** A caller with an explicit reliable fallback can finish its probe promptly. */
+  passiveDwellMs?: number;
 };
 
 export type MonacoCaptureRuntime = {

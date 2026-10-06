@@ -138,6 +138,14 @@ type RendererMessageRoute = {
   rendererSrc?: string;
 };
 
+type RendererCommandContext = {
+  windowId?: number;
+  invocationId: number;
+  fromPreview?: boolean;
+  pendingPanel?: RendererMessageRoute;
+  pendingPanelShown?: boolean;
+};
+
 type OverlayMessage =
   | { type: 'estimatedToggle'; visible: boolean; pressed: boolean }
   | { type: 'results:start'; searchId: number }
@@ -262,6 +270,7 @@ type PendingShow = {
   query: string;
   options?: ShowOptions;
   onSettled?: (shown: boolean) => void;
+  commandContext?: RendererCommandContext;
 };
 
 type EvaluatedShow = {
@@ -544,11 +553,7 @@ export class OverlayPanel {
   private staticResultsRequestSeq = 0;
   private staticResultsChain: Promise<void> = Promise.resolve();
   private rendererCommandWindowId: number | undefined;
-  private readonly rendererCommandContext = new AsyncLocalStorage<{
-    windowId?: number;
-    invocationId: number;
-    fromPreview?: boolean;
-  }>();
+  private readonly rendererCommandContext = new AsyncLocalStorage<RendererCommandContext>();
   private rendererCommandInvocationSeq = 0;
   private rendererCommandPendingPanelWindowId: number | undefined;
   private rendererCommandPendingPanelExpiresAt = 0;
@@ -731,6 +736,12 @@ export class OverlayPanel {
 
   markRendererCommandPendingPanel(windowId: number | undefined): void {
     if (windowId === undefined) { return; }
+    const commandContext = this.rendererCommandContext.getStore();
+    if (commandContext) {
+      commandContext.pendingPanel = { windowId };
+      commandContext.pendingPanelShown = false;
+      return;
+    }
     this.rendererCommandPendingPanelWindowId = windowId;
     this.rendererCommandPendingPanelExpiresAt = Date.now() + 30_000;
   }
@@ -952,6 +963,7 @@ export class OverlayPanel {
       this.backgroundCapturePromise = this.triggerCaptureDiagnostic(undefined, {
         allowForceOpen: false,
         reason: `background:${reason}`,
+        passiveDwellMs: this.shouldAllowTransientPreviewCaptureEditor() ? 0 : undefined,
       });
       await this.backgroundCapturePromise;
     } finally {
@@ -968,6 +980,7 @@ export class OverlayPanel {
       reason?: string;
       bypassThrottle?: boolean;
       shouldContinue?: () => boolean;
+      passiveDwellMs?: number;
     } = {},
   ): Promise<void> {
     if (options.shouldContinue && !options.shouldContinue()) { return; }
@@ -1000,6 +1013,7 @@ export class OverlayPanel {
         holdForceOpenedTab: options.holdForceOpenedTab ?? false,
         reason: options.reason ?? (forceOpenUri ? `preview:${forceOpenUri.toString()}` : 'foreground'),
         shouldContinue: options.shouldContinue,
+        passiveDwellMs: options.passiveDwellMs,
       });
       await this.capturePromise;
     } finally {
@@ -2566,6 +2580,13 @@ export class OverlayPanel {
   }
 
   async show(initialQuery: string, options?: ShowOptions): Promise<void> {
+    const commandContext = this.rendererCommandContext.getStore();
+    if (commandContext?.pendingPanel && options?.loading) {
+      // Results must belong to the exact pending panel, including a show
+      // deferred by a busy renderer. A coalesced/closed show has no recipient.
+      commandContext.pendingPanelShown = await this.showAndWaitForSettlement(initialQuery, options);
+      return;
+    }
     await this.enqueueShow(initialQuery, options);
   }
 
@@ -2609,7 +2630,8 @@ export class OverlayPanel {
     // Coalesce a burst of command invocations (user mashing a shortcut)
     // into one effective show; we just remember the last query.
     this.pendingShow?.onSettled?.(false);
-    this.pendingShow = { query: initialQuery, options, onSettled };
+    this.pendingShow = { query: initialQuery, options, onSettled,
+      commandContext: this.rendererCommandContext.getStore() };
     if (this.showInFlight) { return; }
     this.showInFlight = true;
     const pumpGeneration = ++this.showPumpGeneration;
@@ -2639,7 +2661,10 @@ export class OverlayPanel {
         // this request and canceled the then-current timers.
         this.cancelCdpIdleClose();
         this.cancelCdpSearchIdleClose();
-        const dispatched = await this.doShow(pending.query, pending.options);
+        const show = () => this.doShow(pending.query, pending.options);
+        const dispatched = await (pending.commandContext
+          ? this.rendererCommandContext.run(pending.commandContext, show)
+          : this.rendererCommandContext.exit(show));
         if (pumpGeneration !== this.showPumpGeneration) {
           pending.onSettled?.(false);
           return;
@@ -2673,6 +2698,12 @@ export class OverlayPanel {
   }
 
   async showStaticResults(initialQuery: string, matches: FileMatch[]): Promise<void> {
+    const commandContext = this.rendererCommandContext.getStore();
+    if (commandContext?.pendingPanel) {
+      if (!commandContext.pendingPanelShown || !commandContext.pendingPanel.rendererSrc) { return; }
+      await this.showStaticResultsInPendingPanel(initialQuery, matches, commandContext.pendingPanel);
+      return;
+    }
     const requestId = ++this.staticResultsRequestSeq;
     if (this.pendingStaticResultsTimer) {
       clearTimeout(this.pendingStaticResultsTimer);
@@ -2714,11 +2745,36 @@ export class OverlayPanel {
   // whether the envelope is currently shown. Fire-and-forget; harmless if the
   // renderer is not up yet.
   setEstimatedToggleState(state: { visible: boolean; pressed: boolean }): void {
+    const commandContext = this.rendererCommandContext.getStore();
+    if (commandContext?.pendingPanel && !commandContext.pendingPanelShown) { return; }
     void this.postToRenderer({
       type: 'estimatedToggle',
       visible: state.visible,
       pressed: state.pressed,
-    });
+    }, commandContext?.pendingPanel);
+  }
+
+  private async showStaticResultsInPendingPanel(
+    initialQuery: string,
+    matches: FileMatch[],
+    route: RendererMessageRoute,
+  ): Promise<void> {
+    if (route.windowId === undefined || !route.rendererSrc) { return; }
+    const messages = this.staticResultMessages(matches);
+    // Checking visibility, changing the header and delivering the result are
+    // one renderer operation. Closing a panel cancels its recipient; a late
+    // result must never show a sibling or recreate a closed instance.
+    const expression = `(function(){
+      var inst=window.__ijFindInstances&&window.__ijFindInstances[${JSON.stringify(route.rendererSrc)}];
+      if(!inst||!inst.panel||!inst.panel.isConnected||!inst.panel.classList.contains('visible'))return 'closed';
+      inst.show(${JSON.stringify(initialQuery)},{forceLiteral:true,suppressSearch:true,preservePreview:true,preserveFocus:true});
+      var messages=${JSON.stringify(messages)};
+      for(var i=0;i<messages.length;i++)inst.onMessage(messages[i]);
+      return 'updated';
+    })()`;
+    await this.ensureInjected();
+    await this.evalInWindow(route.windowId, expression);
+    this.scheduleCdpSearchIdleClose('static-results-done');
   }
 
   private async showStaticResultsNow(
@@ -2746,19 +2802,22 @@ export class OverlayPanel {
     });
     if (!shown) { return; }
     if (requestId !== this.staticResultsRequestSeq) { return; }
+    await this.postMessagesToRenderer(this.staticResultMessages(matches));
+    this.scheduleCdpSearchIdleClose('static-results-done');
+  }
+
+  private staticResultMessages(matches: FileMatch[]): OverlayMessage[] {
     const searchId = ++this.searchSeq;
     const totalMatches = matches.reduce((sum, match) => sum + match.matches.length, 0);
     const messages: OverlayMessage[] = [{ type: 'results:start', searchId }];
     const batchSize = 64;
     for (let i = 0; i < matches.length; i += batchSize) {
-      if (requestId !== this.staticResultsRequestSeq) { return; }
       messages.push({
         type: 'results:batch',
         searchId,
         matches: matches.slice(i, i + batchSize),
       });
     }
-    if (requestId !== this.staticResultsRequestSeq) { return; }
     messages.push({
       type: 'results:done',
       searchId,
@@ -2770,8 +2829,7 @@ export class OverlayPanel {
       pageMatches: totalMatches,
       offset: 0,
     });
-    await this.postMessagesToRenderer(messages);
-    this.scheduleCdpSearchIdleClose('static-results-done');
+    return messages;
   }
 
   private async doShow(initialQuery: string, options: ShowOptions = {}): Promise<boolean> {
@@ -2843,6 +2901,11 @@ export class OverlayPanel {
       const shownRendererSrc = this.extractRendererSource(v.result);
       if (shownRendererSrc) {
         this.activeRendererSrc = shownRendererSrc;
+        const pendingPanel = this.rendererCommandContext.getStore()?.pendingPanel;
+        if (pendingPanel && options.loading) {
+          pendingPanel.windowId = v.fid;
+          pendingPanel.rendererSrc = shownRendererSrc;
+        }
       }
       this.cdpCloseDeferredReasons.clear();
       this.cancelCdpIdleClose();
@@ -3166,6 +3229,7 @@ export class OverlayPanel {
             query: initialQuery,
             options: { ...options, __deferredPatchRetry: true },
             onSettled: retrySettler,
+            commandContext: this.rendererCommandContext.getStore(),
           };
         }
         this.finishDeferredShow(showSeq);
@@ -3209,7 +3273,14 @@ export class OverlayPanel {
             this.finishDeferredShow(showSeq);
             return;
           }
-          if (visibility.src) { this.activeRendererSrc = visibility.src; }
+          if (visibility.src) {
+            this.activeRendererSrc = visibility.src;
+            const pendingPanel = this.rendererCommandContext.getStore()?.pendingPanel;
+            if (pendingPanel && options.loading) {
+              pendingPanel.windowId = windowId;
+              pendingPanel.rendererSrc = visibility.src;
+            }
+          }
         } catch {
           report = `visibility:${visibilityReport}`;
           // The completion is terminal, but a temporarily busy renderer can
@@ -4870,6 +4941,7 @@ export class OverlayPanel {
             bypassThrottle: true,
             reason: attempt === 0 ? 'preview-request' : `preview-passive-retry-${attempt}`,
             shouldContinue,
+            passiveDwellMs: this.shouldAllowTransientPreviewCaptureEditor() ? 0 : undefined,
           });
         } catch (err) {
           // A CDP reconnect/eval race is transient. Do not discard the rest of

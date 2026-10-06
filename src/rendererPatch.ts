@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 149;
+export const RENDERER_PATCH_VERSION = 150;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -13729,12 +13729,12 @@ export function getRendererPatchScript(
           setTimeout(fireShowSearch, 50);
         }
       }
-	      setTimeout(function () {
+	      if (!showOptions || !showOptions.preserveFocus) { setTimeout(function () {
         var focusT0 = perfNow();
         try { $q.focus(); $q.select(); } catch (e) {}
         reportPerfPhase('show:focusSelect', focusT0, { activeTag: document.activeElement && document.activeElement.tagName ? String(document.activeElement.tagName).toLowerCase() : '' }, 1);
         panelDiagMark('show:focusSelect', {});
-      }, 0);
+      }, 0); }
       if (findBundledMonacoSync() && state.lastPreviewMsg &&
           (state.previewMode === 'monaco-loading' || state.previewMode === 'monaco-error')) {
         setTimeout(function () {

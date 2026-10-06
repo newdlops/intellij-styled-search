@@ -135,6 +135,25 @@ suite('Monaco passive capture diagnostic', () => {
     assert.strictEqual(state.stops, 1, 'capture hooks should be restored after promotion');
   });
 
+  test('a probe with a reliable fallback does not wait for a delayed mount or open a tab', async () => {
+    const state = emptyState();
+    let delayedCapture: NodeJS.Timeout | undefined;
+    const runtime = makeRuntime(state, () => {
+      delayedCapture = setTimeout(() => {
+        state.buffer = 'widgets=1 services=1 ctors=1 installed=true';
+      }, 0);
+    });
+    try {
+      await runMonacoCaptureDiagnostic(runtime, 17, { allowForceOpen: false, passiveDwellMs: 0 });
+      assert.strictEqual(state.domScans, 2, 'the immediate probe should still consider DOM evidence');
+      assert.strictEqual(state.widgetTests, 0, 'the caller can proceed before a later editor mount');
+      assert.strictEqual(state.clears, 0, 'a bounded probe must not itself enter force-open');
+      assert.strictEqual(state.stops, 1, 'the short probe must restore its hooks');
+    } finally {
+      if (delayedCapture) { clearTimeout(delayedCapture); }
+    }
+  });
+
   test('cancels the passive dwell promptly without rescanning or entering force-open', async () => {
     const state = emptyState();
     let keepGoing = true;

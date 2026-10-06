@@ -199,7 +199,9 @@ export async function runMonacoCaptureDiagnostic(
     // above, so do not add a 450ms idle dwell before creating the capture
     // editor.
     if (allowForceOpen) { return canContinue(); }
-    const deadline = Date.now() + PASSIVE_CAPTURE_DWELL_MS;
+    const dwellMs = options?.passiveDwellMs === undefined ? PASSIVE_CAPTURE_DWELL_MS
+      : Math.max(0, Math.min(PASSIVE_CAPTURE_DWELL_MS, options.passiveDwellMs));
+    const deadline = Date.now() + dwellMs;
     while (canContinue()) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) { return true; }
