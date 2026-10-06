@@ -8,6 +8,8 @@ import {
 } from '../util/fixtureWorkspace';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
+// Hidden sibling panels remain in the DOM; match the panel used by probeState.
+const rendererPanel = 'window.__ijFindInstances[window.__ijFindGetSearchState().rendererInstanceId].panel';
 
 async function getApi(): Promise<ExtensionTestApi> {
   const ext = vscode.extensions.getExtension<ExtensionTestApi>(EXTENSION_ID);
@@ -108,15 +110,15 @@ suite('Extension-typing filter — client-side narrowing', () => {
     );
     await api.overlay.evalInActiveWindowForTests(
       `(function(){
-        var q = document.querySelector('.ij-find-query');
-        var scope = document.querySelector('.ij-find-scope');
+        var q = ${rendererPanel}.querySelector('.ij-find-query');
+        var scope = ${rendererPanel}.querySelector('.ij-find-scope');
         if (!q || !scope) { return 'no-query'; }
         q.value = '';
         scope.value = '';
-        var caseSensitive = document.querySelector('[data-opt="caseSensitive"]');
+        var caseSensitive = ${rendererPanel}.querySelector('[data-opt="caseSensitive"]');
         if (caseSensitive && caseSensitive.getAttribute('aria-pressed') === 'true') { caseSensitive.click(); }
         ['wholeWord', 'useRegex'].forEach(function (key) {
-          var btn = document.querySelector('[data-opt="' + key + '"]');
+          var btn = ${rendererPanel}.querySelector('[data-opt="' + key + '"]');
           if (btn && btn.getAttribute('aria-pressed') === 'true') { btn.click(); }
         });
         q.dispatchEvent(new Event('input', { bubbles: true }));
@@ -150,7 +152,7 @@ suite('Extension-typing filter — client-side narrowing', () => {
     const api = await getApi();
     await api.overlay.evalInActiveWindowForTests(
       `(function(){
-        var scope = document.querySelector('.ij-find-scope');
+        var scope = ${rendererPanel}.querySelector('.ij-find-scope');
         if (!scope) { return 'no-scope'; }
         scope.value = '';
         scope.dispatchEvent(new Event('input', { bubbles: true }));
@@ -242,7 +244,7 @@ suite('Extension-typing filter — client-side narrowing', () => {
     await api.overlay.show('class');
     const raw = await api.overlay.evalInActiveWindowForTests(
       `(function(){
-        var btn = document.querySelector('.ij-find-refresh');
+        var btn = ${rendererPanel}.querySelector('.ij-find-refresh');
         return JSON.stringify({
           hasButton: !!btn,
           text: btn ? btn.textContent : null,
@@ -267,7 +269,7 @@ suite('Extension-typing filter — client-side narrowing', () => {
 
     await api.overlay.evalInActiveWindowForTests(
       `(function(){
-        var q = document.querySelector('.ij-find-query');
+        var q = ${rendererPanel}.querySelector('.ij-find-query');
         if (!q) { return 'no-query'; }
         q.value = ${JSON.stringify(query)};
         q.dispatchEvent(new Event('input', { bubbles: true }));
@@ -281,7 +283,7 @@ suite('Extension-typing filter — client-side narrowing', () => {
 
     await api.overlay.evalInActiveWindowForTests(
       `(function(){
-        var q = document.querySelector('.ij-find-query');
+        var q = ${rendererPanel}.querySelector('.ij-find-query');
         if (!q) { return 'no-query'; }
         q.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
         return 'entered';
@@ -297,9 +299,9 @@ suite('Extension-typing filter — client-side narrowing', () => {
 
     await api.overlay.evalInActiveWindowForTests(
       `(function(){
-        var q = document.querySelector('.ij-find-query');
-        var h = document.querySelector('.ij-find-history');
-        var menu = document.querySelector('.ij-find-history-menu');
+        var q = ${rendererPanel}.querySelector('.ij-find-query');
+        var h = ${rendererPanel}.querySelector('.ij-find-history');
+        var menu = ${rendererPanel}.querySelector('.ij-find-history-menu');
         if (!q || !h || !menu) { return 'missing'; }
         q.value = '';
         q.dispatchEvent(new Event('input', { bubbles: true }));
@@ -391,7 +393,7 @@ suite('Extension-typing filter — client-side narrowing', () => {
     await waitUntil(api, (s) => s.inputValue === 'class', 10_000, 'seed search for scope test');
     await api.overlay.evalInActiveWindowForTests(
       `(function(){
-        var scope = document.querySelector('.ij-find-scope');
+        var scope = ${rendererPanel}.querySelector('.ij-find-scope');
         if (!scope) { return 'no-scope'; }
         scope.value = 'tests/fixtures/workspace/**/*.py';
         return 'ok';
@@ -418,7 +420,7 @@ suite('Extension-typing filter — client-side narrowing', () => {
     // Apply scope by user-typed input. Search should not start until Run.
     await api.overlay.evalInActiveWindowForTests(
       `(function(){
-        var scope = document.querySelector('.ij-find-scope');
+        var scope = ${rendererPanel}.querySelector('.ij-find-scope');
         if (!scope) { return 'no-scope'; }
         scope.value = 'nested/';
         scope.dispatchEvent(new Event('input', { bubbles: true }));
@@ -431,7 +433,7 @@ suite('Extension-typing filter — client-side narrowing', () => {
 
     await api.overlay.evalInActiveWindowForTests(
       `(function(){
-        var btn = document.querySelector('.ij-find-refresh');
+        var btn = ${rendererPanel}.querySelector('.ij-find-refresh');
         if (!btn) { return 'no-run'; }
         btn.click();
         return 'clicked';

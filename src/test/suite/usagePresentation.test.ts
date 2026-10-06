@@ -48,8 +48,22 @@ async function debuggerHarness(overlay: ExtensionTestApi['overlay']) {
   return {
     command,
     click: async (src: string, selector: string) => {
-      const point = JSON.parse(await overlay.evalInActiveWindowForTests(`(function(){var node=window.__ijFindInstances[${JSON.stringify(src)}].panel.querySelector(${JSON.stringify(selector)});
-        var r=node.getBoundingClientRect();return JSON.stringify({x:r.left+r.width/2,y:r.top+r.height/2});})()`));
+      let point: { x: number; y: number } | undefined;
+      let diagnostic = '';
+      await waitFor(async () => {
+        diagnostic = await overlay.evalInActiveWindowForTests(`(function(){
+          var inst=window.__ijFindInstances[${JSON.stringify(src)}],panel=inst&&inst.panel;
+          var node=panel&&panel.querySelector(${JSON.stringify(selector)});
+          if(!node)return JSON.stringify({ready:false,rows:panel?Array.from(panel.querySelectorAll('[data-flat]')).map(function(row){return row.getAttribute('data-flat');}):[]});
+          var r=node.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;
+          return JSON.stringify({ready:r.width>0&&r.height>0&&x>=0&&y>=0&&x<innerWidth&&y<innerHeight,point:{x:x,y:y}});
+        })()`);
+        assert.ok(!diagnostic.startsWith('err:'), diagnostic);
+        const state = JSON.parse(diagnostic);
+        point = state.point;
+        return state.ready;
+      }, `expected a rendered clickable control: ${selector}`);
+      assert.ok(point, diagnostic);
       await command('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button: 'left', clickCount: 1 });
       await command('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button: 'left', clickCount: 1 });
     },

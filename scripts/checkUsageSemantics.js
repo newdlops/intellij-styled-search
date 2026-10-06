@@ -8,7 +8,10 @@ const binary = path.resolve(process.argv[2] || path.join(root, 'resources', 'bin
   `${process.platform}-${process.arch}`, `zoek-rs${process.platform === 'win32' ? '.exe' : ''}`));
 const python = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
 const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ijss-usage-semantics-'));
-const invokePython = (...args) => execFileSync(python, args, { cwd: root, stdio: 'inherit', timeout: 120000, windowsHide: true });
+const invokePython = (...args) => execFileSync(python, args, {
+  cwd: root, stdio: 'inherit', timeout: 120000, windowsHide: true,
+  env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+});
 try {
   fs.cpSync(path.join(root, 'tests', 'fixtures', 'usage-semantics'), workspace, {
     recursive: true, filter: (source) => !source.split(path.sep).some((part) => part === '.zoek-rs' || part === '__pycache__'),
