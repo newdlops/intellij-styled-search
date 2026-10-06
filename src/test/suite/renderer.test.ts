@@ -1,6 +1,7 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import type { ExtensionTestApi } from '../../extension';
+import { assertTimingBudget } from '../util/timingBudgets';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 const CALL_GRAPH_DURABLE_INLAY_COMMAND_MARKER = '.__ijssInlay__.';
@@ -261,22 +262,7 @@ function buildInlayClickLoadFixture(): string {
 }
 
 function assertTimingsWithin(label: string, timings: number[], budgetMs: number): void {
-  assert.ok(timings.length > 0, `${label} should record timings`);
-  const sorted = [...timings].sort((a, b) => a - b);
-  const maxMs = sorted[sorted.length - 1] ?? 0;
-  const p95Ms = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)] ?? maxMs;
-  const avgMs = timings.reduce((sum, value) => sum + value, 0) / timings.length;
-  if (process.env.IJSS_E2E_TIMING_REPORT === '1') {
-    console.info(`[timings] ${label}: samples=${timings.join(',')}ms max=${maxMs}ms p95=${p95Ms}ms budget=${budgetMs}ms`);
-  }
-  assert.ok(
-    maxMs <= budgetMs,
-    `${label} max should stay <= ${budgetMs}ms under load; timings=${timings.join(',')}ms max=${maxMs}ms p95=${p95Ms}ms avg=${Math.round(avgMs)}ms`,
-  );
-  assert.ok(
-    p95Ms <= budgetMs,
-    `${label} p95 should stay <= ${budgetMs}ms under load; timings=${timings.join(',')}ms max=${maxMs}ms p95=${p95Ms}ms avg=${Math.round(avgMs)}ms`,
-  );
+  assertTimingBudget(label, timings, budgetMs);
 }
 
 // Renderer-level tests require the CDP injection chain (SIGUSR1 → Node
@@ -4884,10 +4870,7 @@ suite('Renderer — overlay UI probes', () => {
       activeBefore,
       'overlay.show should keep the user active editor selected',
     );
-    assert.ok(
-      elapsedMs <= 120,
-      `overlay.show over an already-open editor should render within the 10x tighter budget; elapsed=${elapsedMs}ms`,
-    );
+    assertTimingsWithin('overlay.show with an open editor', [elapsedMs], 120);
   });
 
   test('opted-in preview force-open capture fallback is coalesced during burst navigation', async function () {
@@ -5740,17 +5723,8 @@ suite('Renderer — overlay UI probes', () => {
       assertNoAddedTabs(tabsBefore, `warm overlay.show ${query}`);
     }
 
-    const maxMs = Math.max(...timings);
-    const avgMs = timings.reduce((sum, value) => sum + value, 0) / timings.length;
-    const medianMs = [...timings].sort((a, b) => a - b)[Math.floor(timings.length / 2)] ?? Number.POSITIVE_INFINITY;
-    assert.ok(
-      maxMs <= 120,
-      `warm overlay.show should keep isolated full-run CDP stalls bounded; timings=${timings.join(',')}ms`,
-    );
-    assert.ok(
-      medianMs <= 35,
-      `warm overlay.show steady-state median should stay under the 10x tighter 35ms budget; timings=${timings.join(',')}ms avg=${Math.round(avgMs)}ms median=${medianMs}ms`,
-    );
+    assertTimingsWithin('warm overlay.show maximum', timings, 120);
+    assertTimingBudget('warm overlay.show steady-state', timings, 35, { statistic: 'median' });
   });
 
   // Repro for log.txt observation: every `Find Usages` inlay click spawns a
@@ -8346,15 +8320,7 @@ suite('Renderer — overlay UI probes', () => {
       assert.ok(parsed.measurements && parsed.measurements.length === 4,
         `expected 4 large-switch measurements; got ${JSON.stringify(parsed).slice(0, 300)}`);
       const syncs = parsed.measurements!.map((m) => m.syncMs);
-      const maxSync = Math.max(...syncs);
-      assert.ok(
-        maxSync < 60,
-        `renderPreviewMonacoReal reuse-path sync work should stay under 60ms on a ` +
-        `2000-line preview. Got maxSync=${maxSync}ms syncTimings=${JSON.stringify(syncs)}. ` +
-        `If this fails, a recent change pushed expensive work back onto the click ` +
-        `path — check setPreviewContent, applyPreviewMatchDecorations, and the ` +
-        `synchronous portion of renderPreviewMonacoCallGraphInlays.`,
-      );
+      assertTimingBudget('2000-line native preview render', syncs, 60, { comparison: '<' });
     } finally {
       try {
         await overlay.evalInActiveWindowForTests(
@@ -9165,19 +9131,8 @@ suite('Renderer — overlay UI probes', () => {
         true,
         `show must restore the hover transit guard before the next preview render: ${secondRender}`,
       );
-      // Reuse-path sync work should be way under create-path. Captain log
-      // showed create=124ms+ vs reuse=~6-9ms. Even on small fixture the
-      // gap is meaningful — assert <= 50ms so we have a real guard but no
-      // flake on slower CI.
-      assert.ok(
-        (secondParsed.syncMs || 0) <= 50,
-        `post-hide-show render should hit reuse path (fast). Got syncMs=${secondParsed.syncMs}ms ` +
-        `editorIdBefore=${secondParsed.editorIdBefore} editorIdAfter=${secondParsed.editorIdAfter} ` +
-        `hostInPreviewBody=${secondParsed.hostInPreviewBody} ` +
-        `previewBodyConnected=${secondParsed.previewBodyConnected} ` +
-        `panelConnected=${secondParsed.panelConnected} ` +
-        `beforeState=${JSON.stringify(secondParsed.beforeState)}`,
-      );
+      assertTimingsWithin('native preview render after hide/show',
+        [secondParsed.syncMs ?? Number.POSITIVE_INFINITY], 50);
     } finally {
       try {
         await overlay.evalInActiveWindowForTests(
@@ -9306,11 +9261,8 @@ suite('Renderer — overlay UI probes', () => {
         `idBefore=${parsed.editorIdBefore} idAfter=${parsed.editorIdAfter} ` +
         `sameInstance=${parsed.sameInstance} syncMs=${parsed.syncMs}ms`,
       );
-      assert.ok(
-        (parsed.syncMs || 0) <= 50,
-        `first preview after prewarm should hit reuse path (fast). Got syncMs=${parsed.syncMs}ms ` +
-        `editorIdBefore=${parsed.editorIdBefore} editorIdAfter=${parsed.editorIdAfter}`,
-      );
+      assertTimingsWithin('first preview render after prewarm',
+        [parsed.syncMs ?? Number.POSITIVE_INFINITY], 50);
     } finally {
       try {
         await overlay.evalInActiveWindowForTests(
@@ -12854,8 +12806,8 @@ suite('Renderer — overlay UI probes', () => {
         timing.after >= timing.before + 1,
         `preview inlay click ${index} should synchronously send at least one command: ${raw}`,
       );
-      assert.ok(timing.elapsedMs <= 10, `preview inlay click ${index} should respond within one event loop turn: ${raw}`);
     }
+    assertTimingsWithin('synchronous preview inlay dispatch', (parsed.timings ?? []).map((timing) => timing.elapsedMs), 10);
     const commands = (parsed.sent ?? []).filter((msg) =>
       msg.type === 'runCommand' &&
       msg.command === 'intellijStyledSearch.showUsagesForSymbol' &&
@@ -13061,10 +13013,8 @@ suite('Renderer — overlay UI probes', () => {
         !parsed.firstPanel?.query.includes('[call graph'),
         `first spawned panel should be the pending header before call graph source labeling: ${raw}`,
       );
-      assert.ok(
-        (parsed.elapsedMs ?? Number.POSITIVE_INFINITY) <= 75,
-        `pending result header should appear promptly after preview inlay click: ${raw}`,
-      );
+      assertTimingsWithin('pending result header after preview inlay click',
+        [parsed.elapsedMs ?? Number.POSITIVE_INFINITY], 75);
     } finally {
       try {
         await overlay.evalInActiveWindowForTests(

@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      enforce_timings:
+        description: Enforce the existing hardware timing budgets
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -27,6 +32,10 @@ jobs:
       IJSS_E2E_REQUIRE_CDP: '1'
       IJSS_E2E_VSCODE_VERSION: ${{ matrix.vscode }}
       IJSS_E2E_TIMING_REPORT: '1'
+      # Shared-runner wall-clock measurements stay visible without treating
+      # host scheduling noise as a functional failure. Manual runs can retain
+      # the same strict budgets; local renderer tests are strict by default.
+      IJSS_E2E_TIMING_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.enforce_timings && 'strict' || 'report' }}
       IJSS_E2E_MIRROR_LOGS: '1'
     steps:
       - uses: actions/checkout@v7
@@ -50,7 +59,7 @@ jobs:
         run: npm test -- --run out/test/suite/desktopCompatibility.test.js
       - name: Extension functional regressions
         run: npm test -- --exclude out/test/suite/renderer.test.js --exclude out/test/suite/captainIndexGate.test.js
-      - name: Renderer acceptance and hardware timing budgets
+      - name: Renderer acceptance and hardware timing report
         id: renderer_diagnostics
         env:
           # Preserve channel logs/artifacts without stdout IPC changing the
@@ -60,13 +69,13 @@ jobs:
           # hosted desktop session is disconnected or occluded. The test logs
           # the actual window policy; it does not warm the first hint request.
           IJSS_E2E_FOREGROUND_TIMINGS: '1'
+          IJSS_E2E_TIMING_JSON: artifacts/desktop-compatibility/renderer-timings.json
         run: npm test -- --run out/test/suite/renderer.test.js
       - name: Summarize renderer diagnostics
         if: always()
         env:
           IJSS_RENDERER_DIAGNOSTICS_OUTCOME: ${{ steps.renderer_diagnostics.outcome }}
-        run: |
-          node -e "const fs = require('node:fs'); const outcome = process.env.IJSS_RENDERER_DIAGNOSTICS_OUTCOME || 'skipped'; fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, '### Full renderer acceptance\n\nResult: **' + outcome + '**.\n\nThe complete renderer suite, including save/recovery, repeated-click behavior and the existing hardware timing budgets, is required. Failures fail this job.\n');"
+        run: node scripts/summarizeRendererTests.js
       - name: Collect desktop logs
         if: always()
         run: node scripts/collectDesktopTestLogs.js

@@ -189,7 +189,27 @@ Renderer timing checks disable Chromium's background animation/timer throttling
 only in the isolated test workbench and log its actual window policy. Their
 interactive deadlines still include the first full-file hint request without
 provider warmup. CPU profiling is separately opt-in via
-`IJSS_E2E_PROFILE_INLAYS=1`; required CI timings run without that profiler.
+`IJSS_E2E_PROFILE_INLAYS=1`; CI timing measurements run without that profiler.
+
+Shared hosted runners report hardware timing budgets separately from required
+functional checks. Every measured operation must still complete, and all
+renderer, save/recovery, repeated-click, stale-response, and ownership assertions
+remain required. The job summary lists every original budget, measured value,
+and overrun; raw samples are saved as `renderer-timings.json` in the desktop
+artifact. An overrun in report mode does not mean the performance budget passed.
+
+Local renderer tests enforce the original budgets by default. Use a controlled
+foreground desktop for strict performance verification:
+
+```bash
+npm test -- --run out/test/suite/renderer.test.js
+```
+
+`IJSS_E2E_TIMING_MODE=strict` makes that policy explicit;
+`IJSS_E2E_TIMING_MODE=report` records hardware measurements without failing on
+wall-clock overruns. Unknown modes and incomplete/non-finite measurements fail
+in either mode. Manual workflow runs also offer `enforce_timings` to opt into
+strict budgets on the hosted runner.
 
 Recommended smoke checks:
 

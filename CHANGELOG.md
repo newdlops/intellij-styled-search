@@ -5,6 +5,7 @@
 - Shared the search stylesheet across panel instances and removed exact legacy duplicates so repeated panel opens do not accumulate CSS rules.
 - Reused the preview editor's current layout when its viewport dimensions have not changed.
 - Reused clean isolated native-preview models for the same source and language, avoiding model replacement on repeated result selection while keeping workbench models and edited models outside that path.
+- Kept full renderer functional checks required on shared CI runners while preserving hardware timing measurements and budget overruns in job summaries and artifacts. Local tests and opt-in strict workflow runs enforce the unchanged timing budgets.
 - Routed asynchronous usage results to the panel created by their own click and discarded results after that panel closed, preserving sibling panels and focus.
 - Removed the extra passive capture dwell when a preview has an explicitly enabled transient-editor fallback.
 - Prepared durable inlay commands from available graph metadata before notifying the workbench, keeping large first-time hint requests out of the command-registration backlog.
