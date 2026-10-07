@@ -4,6 +4,8 @@ Two real source trees were copied into isolated temporary workspaces. Existing
 project files and indexes were not modified. Raw paths, symbol names, source
 hashes and measurements stay in the ignored `artifacts/benchmarks/real-usage/`
 directory; this report contains aggregate results.
+The initial measurements below describe 0.1.7153. The 0.1.7154 follow-up uses
+the same frozen source hashes and declarations and is recorded at the end.
 
 ## Dataset and count/list parity
 
@@ -80,9 +82,10 @@ isolation across Python 3.11 and [3.12's inlining](https://peps.python.org/pep-0
 The Python sample exposes 150 missing required locations. Observed patterns
 include expressions inside f-strings and calls assigned to tuple targets. Seven
 returned occurrences have evidence for a different lexical binding: four are
-currently labelled exact and three possible. Context-manager local bindings are
-one observed pattern. These inference gaps remain follow-up work; count/list
-parity must not be presented as proof that they are fixed.
+currently labelled exact and three possible. Local assignments and generator
+comprehension bindings are observed patterns. They were follow-up work at this
+baseline; the 0.1.7154 results below verify their resolution independently of
+count/list parity.
 
 Thousands of dynamic, attribute and re-export occurrences remain unclassified.
 The TypeScript audit does not copy external dependencies or project path aliases,
@@ -127,3 +130,67 @@ The optional `realProjectUsage.test.js` extension test accepts
 2,000 indexed files and over 40 references, runs the real public command, checks
 rendered rows and trusted mouse paging, and captures the actual panel. It skips
 in ordinary fixture CI so private project source is not uploaded.
+
+## 0.1.7154 follow-up
+
+The same Python 3.12 oracle and forty declarations now find all 7,357 required
+locations (4,141 and 3,216), with zero returned occurrences proven to use a
+different binding. All targets are fully enumerated and both trees have zero
+parse errors. The initial 150 missing locations and seven other-binding
+occurrences are resolved. An intermediate run exposed two additional local
+named-expression bindings; those are also removed from unrelated function
+usages in the final run.
+
+The fixes retain executable f-string fields and nested format expressions,
+assemble parenthesized/continued imports, and distinguish parameters, local
+assignments, closures, lambdas, comprehensions and named expressions. Literal
+examples and keyword argument labels no longer create declarations or usages.
+Indexed local usages bind to their own declaration rather than being discarded.
+Lexical evidence persists through the full, overlay and compaction paths.
+Native graph/cache versions 14/22 on POSIX and 15/23 on Windows require one
+reindex after upgrading.
+
+| Same frozen source tree | Indexed files | Symbols | Stored references | Count/list mismatches |
+| --- | ---: | ---: | ---: | ---: |
+| Monorepo | 23,097 | 235,043 | 808,543 | 0 |
+| Django platform | 5,638 | 163,201 | 408,468 | 0 |
+
+The lower symbol totals reflect removal of declarations inferred from literal
+examples and continued keyword arguments. The stored reference sets also
+change because local bindings retain their legitimate references.
+
+| Source tree | 0.1.7153 build | 0.1.7154 build | Peak RSS before | Peak RSS after |
+| --- | ---: | ---: | ---: | ---: |
+| Monorepo | 56.28 s | 36.49 s | 2,287 MiB | 2,208 MiB |
+| Django platform | 31.65 s | 14.98 s | 1,382 MiB | 1,602 MiB |
+
+These are individual runs, with no cache flush or statistical confidence claim.
+The platform workload uses about 16% more peak memory despite its faster build;
+this is a measured tradeoff, not a memory improvement. First-page CLI p95 was
+41.0 ms and 40.2 ms under the original twenty-probe selection.
+
+The actual 5,638-file panel was rebuilt and checked again at 1440 × 900.
+Its audited declaration returns 1,151 references, including all 872 locations
+required by the independent oracle. The first forty rows became visible in
+257 ms including 118 ms preparation (139 ms from command to rendered rows);
+repeat deliveries were 83, 76 and 178 ms. A trusted More click produced eighty
+rows without changing the total. The screenshot was inspected separately:
+the existing dense layout, selection and intended horizontal source scrolling
+remain usable.
+
+The original TypeScript and JavaScript twenty-declaration samples retain 51/51
+and 36/36 required locations, with zero proven other bindings. Thousands of
+dynamic, attribute and re-export occurrences still remain unclassified, so
+these results do not establish whole-project precision/recall.
+
+An exploratory JavaScript expansion inspected 311 declarations: 740 required
+locations, 650 found, 81 enumerated missing usages and five declarations not
+uniquely indexed (covering nine more locations). That expansion is separate
+from the Python regression scope and needs a language-specific follow-up.
+The audit now rejects a non-numeric sample limit instead of silently expanding
+its selection.
+
+The independent fixture gate includes f-string fields, explicit multi-line
+imports, same-file local shadowing, named expressions and lambda isolation:
+nineteen required locations are found, with zero proven other bindings, and all
+41 indexed fixture symbols have count/list parity.

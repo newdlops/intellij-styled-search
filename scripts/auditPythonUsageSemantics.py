@@ -267,6 +267,8 @@ def main():
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--samples', type=int, default=20)
+    parser.add_argument('--fail-on-proven-errors', action='store_true',
+                        help='Fail for missing required locations, other bindings, or unindexed declarations.')
     args = parser.parse_args()
     oracle = Oracle(args.workspace.resolve())
     targets = sorted(oracle.required, key=lambda key: (-len(oracle.required[key]), key))[:args.samples]
@@ -307,7 +309,12 @@ def main():
                       'found': sum(x.get('requiredFound', 0) for x in results),
                       'provenOtherBinding': sum(x.get('provenOtherBinding', 0) for x in results),
                       'unclassified': sum(x.get('unclassified', 0) for x in results)}))
+    if args.fail_on_proven_errors and any(entry.get('error') or entry.get('missing')
+                                        or entry.get('provenOtherBinding') or not entry.get('fullyEnumerated')
+                                        for entry in results):
+        return 1
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

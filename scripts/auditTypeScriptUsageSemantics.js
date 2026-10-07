@@ -13,6 +13,9 @@ if (!workspaceArg || !binaryArg || !outputArg) {
 const workspace = path.resolve(workspaceArg);
 const binary = path.resolve(binaryArg);
 const sampleCount = Number(sampleArg);
+if (!Number.isSafeInteger(sampleCount) || sampleCount <= 0) {
+  throw new Error('SAMPLES must be a positive integer.');
+}
 const sources = [];
 function walk(directory) {
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {

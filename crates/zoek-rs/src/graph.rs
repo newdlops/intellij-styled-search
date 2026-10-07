@@ -268,6 +268,8 @@ mod usage_counts;
 
 #[path = "graph_python_bindings.rs"]
 mod python_bindings;
+#[path = "graph_python_strings.rs"]
+mod python_strings;
 
 const BOUND_MAY: u8 = 0b0001;
 const BOUND_MUST: u8 = 0b0010;
@@ -626,6 +628,9 @@ pub struct GraphSymbol {
     pub implementation_count: Option<usize>,
     pub implementation_must_count: Option<usize>,
     pub implementation_may_count: Option<usize>,
+    /// A function-local Python declaration, not a module export or a member.
+    #[serde(default)]
+    pub is_local_binding: bool,
     #[serde(skip, default)]
     pub kind_flags: u8,
     #[serde(skip, default)]
@@ -660,6 +665,7 @@ pub struct GraphQueryResult {
 
 pub(crate) fn restore_graph_symbol_metadata(symbol: &mut GraphSymbol) {
     symbol.kind_flags = compute_kind_flags(&symbol.kind);
+    if symbol.is_local_binding { symbol.kind_flags &= !(KF_BARE_FB | KF_MEMBER_FB); }
     symbol.language_id = compute_language_id(&symbol.language);
     symbol.id_u64 = parse_stable_symbol_id_to_u64(&symbol.id).unwrap_or(0);
     symbol.rel_path_hash = stable_hash(&symbol.rel_path);
@@ -803,6 +809,9 @@ struct RefSite {
     /// gone it cannot be rederived after a spill round-trip, so it is serialized
     /// directly and the load FIXUP no longer recomputes it.
     enclosing_id: u64,
+    /// A statically proven local binding, independent of the caller scope.
+    /// Zero leaves imports/member inference to the ordinary resolver.
+    lexical_target_id: u64,
     /// W2: precomputed FNV-1a hash of rel_path. See GraphSymbol::rel_path_hash.
     #[serde(skip, default)]
     rel_path_hash: u64,
@@ -924,6 +933,7 @@ struct SiteCols {
     /// member receiver cache key is `(receiver_name_hash, enclosing_id)`; having
     /// it here lets the worker build that key without reading the `RefSite`.
     enclosing_id: u64,
+    lexical_target_id: u64,
     /// B4: precomputed `site_partial_hash(source_ref_id, edge_kind)` — the
     /// per-site invariant prefix of every `(site, target)` dedup key. Computed
     /// once in the column build (same hash fn as before, so dedup keys are
@@ -956,6 +966,7 @@ const SITE_FLAG_IS_IMPORT_CONTEXT: u8 = 1 << 2;
 struct RefWriteCol {
     source_ref_id: u64,
     enclosing_id: u64,
+    lexical_target_id: u64,
     name_id: u32,
     file_id: u32,
     start_line: u32,
@@ -1535,6 +1546,7 @@ fn append_lazy_token_shape_references_with_overlay_and_families(
     // cardinality and remain untouched.
     let mut assignable_targets: HashSet<&str> = HashSet::default();
     for symbol in symbols {
+        if symbol.is_local_binding { continue; }
         let key = (
             stable_hash(&symbol.language),
             stable_hash(source_scope_key(&symbol.rel_path)),
@@ -1565,6 +1577,7 @@ fn append_lazy_token_shape_references_with_overlay_and_families(
     });
 
     for symbol in symbols {
+        if symbol.is_local_binding { continue; }
         let key = (
             stable_hash(&symbol.language),
             stable_hash(source_scope_key(&symbol.rel_path)),
@@ -1706,6 +1719,7 @@ fn emit_token_shape_refs_from_tally(
     let mut cached_rel_path: &str = "";
     let mut cached_scope_hash: u64 = 0;
     for symbol in symbols {
+        if symbol.is_local_binding { continue; }
         let path: &str = &symbol.rel_path;
         if path != cached_rel_path {
             cached_rel_path = path;
@@ -1728,7 +1742,7 @@ fn emit_token_shape_refs_from_tally(
     for symbol in symbols {
         // v2: emit only the recompute_set; all other targets' token-shape is
         // carried from the prior index by the caller.
-        if !recompute_set.contains(&symbol.id_u64) {
+        if symbol.is_local_binding || !recompute_set.contains(&symbol.id_u64) {
             continue;
         }
         let path: &str = &symbol.rel_path;
@@ -6412,7 +6426,7 @@ fn build_file_graph(entry: &CorpusEntry) -> FileGraph {
     let function_return_facts = extract_function_return_facts(entry, &language);
     if profile { PROFILE_NS_FUNCTION_RETURNS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
     let t = std::time::Instant::now();
-    let ref_sites = extract_ref_sites(entry, &symbols, &language);
+    let ref_sites = extract_ref_sites(entry, &mut symbols, &language);
     if profile { PROFILE_NS_REF_SITES.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
     FileGraph {
         file_id,
@@ -6511,8 +6525,10 @@ fn extract_python_symbol_defs(
     // the class's own indent and would otherwise evict it, misclassifying every
     // method below as a container-less top-level function) nor be parsed as defs.
     let mut header_bracket_depth: i32 = 0;
+    let mut string_state = python_strings::Sanitizer::default();
     for (line_idx, line) in entry.text.lines().enumerate() {
-        let trimmed = line.trim_start();
+        let sanitized = string_state.line(line);
+        let trimmed = sanitized.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
@@ -6521,7 +6537,8 @@ fn extract_python_symbol_defs(
             continue;
         }
         let line_bracket_delta = net_bracket_depth(trimmed);
-        let indent = line_indent(line);
+        header_bracket_depth = line_bracket_delta.max(0);
+        let indent = python_bindings::python_indent(line);
         while class_stack
             .last()
             .is_some_and(|(class_indent, _)| indent <= *class_indent)
@@ -6606,10 +6623,8 @@ fn extract_python_symbol_defs(
                 implements_names: Vec::new(),
             });
         }
-        // NOTE: continuation tracking is entered ONLY from `class`/`def` headers
-        // (above), never from arbitrary statements — a bare statement with an
-        // unbalanced bracket inside a multi-line string (e.g. SQL `"""SELECT ("""`)
-        // would otherwise wrongly swallow the defs that follow it.
+        // Literal text has been masked, so all logical statement continuations
+        // are safe to skip. Keyword arguments are not variable declarations.
         if package_name.is_none() {
             package_name = python_package_name(&entry.rel_path);
         }
@@ -6941,6 +6956,7 @@ fn materialize_symbols(symbol_defs: Vec<SymbolDef>, line_count: u32) -> Vec<Grap
             implementation_count: None,
             implementation_must_count: None,
             implementation_may_count: None,
+            is_local_binding: false,
             kind_flags,
             language_id,
             id_u64,
@@ -7035,6 +7051,22 @@ fn hierarchy_facts_from_symbols(symbols: &[GraphSymbol]) -> Vec<HierarchyFact> {
 
 fn extract_import_facts(entry: &CorpusEntry, language: &str, file_id: &str) -> Vec<ImportFact> {
     let mut facts = Vec::new();
+    if language == "python" {
+        let mut state = python_strings::Sanitizer::default();
+        let mut code = String::with_capacity(entry.text.len());
+        for line in entry.text.lines() {
+            code.push_str(&state.line(line));
+            code.push('\n');
+        }
+        for (start, end) in python_bindings::logical_statements(&code) {
+            let statement = code[start..end].trim();
+            if !statement.starts_with("from") && !statement.starts_with("import") { continue; }
+            let joined = statement.replace("\\\n", "");
+            let joined = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+            collect_python_import_facts(&joined, entry, file_id, &mut facts);
+        }
+        return facts;
+    }
     for line in entry.text.lines() {
         let sanitized = sanitize_import_line(line, language);
         let trimmed = sanitized.trim();
@@ -7072,7 +7104,8 @@ fn collect_python_import_facts(
             });
             return;
         }
-        let module_candidates = python_module_candidates(&entry.rel_path, module.trim());
+        let module = module.split_whitespace().collect::<String>();
+        let module_candidates = python_module_candidates(&entry.rel_path, &module);
         for item in split_top_level_commas(strip_grouping_parens(names.trim())) {
             let (imported_name, local_name) = import_alias_pair(&item);
             if imported_name.is_empty() || local_name.is_empty() {
@@ -8485,15 +8518,11 @@ fn is_iterable_type_wrapper_name(name: &str) -> bool {
 
 fn extract_ref_sites(
     entry: &CorpusEntry,
-    symbols: &[GraphSymbol],
+    symbols: &mut [GraphSymbol],
     language: &str,
 ) -> Vec<RefSite> {
     // Borrow the symbol names instead of cloning them into the set, so each
     // membership check only hashes &str (no String allocation per token).
-    let definition_positions: HashSet<(u32, u32, &str)> = symbols
-        .iter()
-        .map(|symbol| (symbol.start_line, symbol.start_column, symbol.name.as_str()))
-        .collect();
     let mut ref_sites = Vec::new();
     let rel_path_hash = stable_hash(&entry.rel_path);
     // P1: allocate the per-file-constant / tiny-fixed-set strings ONCE, then
@@ -8505,7 +8534,7 @@ fn extract_ref_sites(
     let arc_usage: Arc<str> = Arc::from("usage");
     let arc_member: Arc<str> = Arc::from("member");
     let arc_bare: Arc<str> = Arc::from("bare");
-    let mut python_multiline_string_quote = None;
+    let mut python_string_state = python_strings::Sanitizer::default();
     let mut brace_sanitize_state = BraceSanitizeState::default();
     let line_count = entry.text.lines().count().max(1) as u32;
     let line_enclosing_cache = precompute_enclosing_per_line(symbols, line_count);
@@ -8513,15 +8542,18 @@ fn extract_ref_sites(
             sanitize_ref_site_code_line(
                 line,
                 language,
-                &mut python_multiline_string_quote,
+                &mut python_string_state,
                 &mut brace_sanitize_state,
             )
         }).collect();
     let mut parameter_bindings = if language == "python" {
-        python_bindings::ParameterBindings::new(&sanitized_lines, symbols)
+        python_bindings::LexicalBindings::new(&sanitized_lines, symbols)
     } else {
-        python_bindings::ParameterBindings::default()
+        python_bindings::LexicalBindings::default()
     };
+    if language == "python" { parameter_bindings.mark_local_symbols(&sanitized_lines, symbols); }
+    let definition_positions: HashSet<(u32, u32, &str)> = symbols.iter()
+        .map(|symbol| (symbol.start_line, symbol.start_column, symbol.name.as_str())).collect();
     for (line_idx, (line, sanitized)) in entry.text.lines().zip(&sanitized_lines).enumerate() {
         parameter_bindings.advance_line(line_idx);
         let is_import_context = is_import_context_line(sanitized.trim_start(), language);
@@ -8568,12 +8600,13 @@ fn extract_ref_sites(
             };
             // A parameter is a lexical value binding, not a candidate for a
             // same-named module/imported symbol. Member names are independent.
-            if !is_definition
-                && access_kind == "bare"
-                && parameter_bindings.excludes(line_idx, start, &name)
-            {
-                continue;
-            }
+            let lexical_target_id = if !is_definition && access_kind == "bare" {
+                match parameter_bindings.binding(line_idx, start, &name) {
+                    python_bindings::Binding::Excluded => continue,
+                    python_bindings::Binding::Indexed(id) => id,
+                    python_bindings::Binding::Unbound => 0,
+                }
+            } else { 0 };
             // B6 stage-2: build the u64 directly (no "ref:HEX16" string alloc).
             let source_ref_id =
                 stable_ref_id_u64(&entry.rel_path, line_idx as u32, start_column, &name);
@@ -8608,6 +8641,7 @@ fn extract_ref_sites(
                 is_import_context,
                 receiver_name,
                 enclosing_id: line_enclosing_id,
+                lexical_target_id,
                 rel_path_hash,
                 name_hash,
                 receiver_name_hash,
@@ -8947,6 +8981,7 @@ fn resolve_ref_sites_a_to_e<'a>(
     let mut member_symbols_by_language_and_name: AHashMap<(u16, u64), Vec<&GraphSymbol>> =
         AHashMap::default();
     let mut symbols_by_id: AHashMap<&str, &GraphSymbol> = AHashMap::with_capacity(n_syms);
+    let mut symbols_by_id_u64: AHashMap<u64, &GraphSymbol> = AHashMap::with_capacity(n_syms);
     let mut types_by_name: AHashMap<&str, Vec<&GraphSymbol>> = AHashMap::default();
     let mut members_by_container_and_name: AHashMap<(&str, &str), Vec<&GraphSymbol>> =
         AHashMap::default();
@@ -8978,6 +9013,7 @@ fn resolve_ref_sites_a_to_e<'a>(
         // GA — every-symbol (rel_path, name) maps (string + hash twin).
         || {
             for symbol in symbols {
+                if symbol.is_local_binding { continue; }
                 symbols_by_file_and_name
                     .entry((&symbol.rel_path, &symbol.name))
                     .or_default()
@@ -8994,6 +9030,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                 || {
                     for symbol in symbols {
                         symbols_by_id.insert(&symbol.id, symbol);
+                        symbols_by_id_u64.insert(symbol.id_u64, symbol);
                         symbol_name_hashes.insert(symbol.name_hash);
                     }
                 },
@@ -9002,6 +9039,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                         // GC — type + container-member maps.
                         || {
                             for symbol in symbols {
+                                if symbol.is_local_binding { continue; }
                                 if symbol.kind_flags & KF_TYPE != 0 {
                                     types_by_name.entry(&symbol.name).or_default().push(symbol);
                                 }
@@ -9430,6 +9468,10 @@ fn resolve_ref_sites_a_to_e<'a>(
                             if c.flags & SITE_FLAG_IS_DEFINITION != 0 {
                                 continue;
                             }
+                            if c.lexical_target_id != 0 {
+                                buf.push(i as u32);
+                                continue;
+                            }
                             let access_id = c.access_kind_id;
                             let language_id = c.language_id;
                             if c.rel_path_hash != cached_rel_hash {
@@ -9484,6 +9526,10 @@ fn resolve_ref_sites_a_to_e<'a>(
                         for i in start..end {
                             let site = &ref_sites[i];
                             if site.is_definition {
+                                continue;
+                            }
+                            if site.lexical_target_id != 0 {
+                                buf.push(i as u32);
                                 continue;
                             }
                             // W12: precomputed `access_kind_id` saves 2 memcmps
@@ -9725,6 +9771,19 @@ fn resolve_ref_sites_a_to_e<'a>(
                 current_file_type_facts = type_facts_by_rel.get(&current_file_hash);
             }
             if c.flags & SITE_FLAG_IS_DEFINITION != 0 {
+                continue;
+            }
+            if c.lexical_target_id != 0 {
+                if let Some(target) = symbols_by_id_u64.get(&c.lexical_target_id) {
+                    let edge_key = edge_key_from_partial_u64(c.site_partial, target.id_u64);
+                    add_resolution_count(&mut counts, &mut id_to_string,
+                        &mut counted_likely, &mut counted_exact, c.edge_kind_id, target,
+                        BOUND_MAY | BOUND_MUST, false, true, edge_key);
+                    push_light_resolved_reference(&mut light_refs, &mut dedup,
+                        Some(&mut local_target_tally), light_sender, site_idx, target,
+                        BOUND_MAY | BOUND_MUST, LightConfidence::Exact,
+                        LightProvenance::Lexical, edge_key);
+                }
                 continue;
             }
             // W12: precomputed access_kind_id replaces 2 memcmps per site.
@@ -11694,6 +11753,9 @@ fn phase_c_process_chunk(
     let mut cached_scope_hash: u64 = 0;
     let mut cached_lang_hash: u64 = 0;
     for i in start..end {
+        // Proven local bindings are emitted directly. They cannot become
+        // candidates for an unrelated declaration with the same spelling.
+        if site_cols[i].lexical_target_id != 0 { continue; }
         // Gated dense read. With `soa_b5` the per-site fields come from the 48B
         // `SiteCols`; otherwise from the 292B `RefSite`. The values are
         // identical (SiteCols is a field-for-field copy), so the maps below are
@@ -11873,6 +11935,7 @@ fn apply_token_shape_likely_count_baseline(
     let mut cached_language: &str = "";
     let mut cached_lang_hash: u64 = 0;
     for symbol in symbols {
+        if symbol.is_local_binding { continue; }
         let path = symbol.rel_path.as_str();
         if path != cached_rel_path {
             cached_rel_path = path;
@@ -11956,6 +12019,7 @@ fn apply_token_shape_likely_count_baseline(
         let mut cached_language: &str = "";
         let mut cached_lang_hash: u64 = 0;
         for symbol in symbol_slice {
+            if symbol.is_local_binding { continue; }
             let path = symbol.rel_path.as_str();
             if path != cached_rel_path {
                 cached_rel_path = path;
@@ -13322,6 +13386,7 @@ fn build_ref_write_cols(
             RefWriteCol {
                 source_ref_id: s.source_ref_id,
                 enclosing_id: s.enclosing_id,
+                lexical_target_id: s.lexical_target_id,
                 name_id,
                 file_id,
                 start_line: s.start_line,
@@ -13373,6 +13438,7 @@ fn build_site_cols(ref_sites: &[RefSite]) -> Vec<SiteCols> {
                 rel_path_hash: s.rel_path_hash,
                 receiver_name_hash: s.receiver_name_hash,
                 enclosing_id: s.enclosing_id,
+                lexical_target_id: s.lexical_target_id,
                 site_partial: site_partial_hash_u64(s.source_ref_id, &s.edge_kind),
                 language_id: compute_language_id(s.language.as_str()),
                 access_kind_id: s.access_kind_id,
@@ -15824,6 +15890,7 @@ struct CompactSym {
     name_hash: u64,
     lang_hash: u64,
     kind_id: u8,
+    is_local_binding: bool,
 }
 
 #[allow(dead_code)] // is_member/scope_key wired into emit + scoped-likely in S4.
@@ -15854,6 +15921,7 @@ fn serialize_symbol_compact_binary(symbol: &GraphSymbol, file_id: u32, out: &mut
     write_u16_str(out, &symbol.name);
     out.push(compute_kind_id(&symbol.kind));
     out.extend_from_slice(&file_id.to_le_bytes());
+    out.push(u8::from(symbol.is_local_binding));
 }
 
 fn parse_symbol_compact_binary(
@@ -15874,6 +15942,7 @@ fn parse_symbol_compact_binary(
     let name = read_u16_str(bytes, cursor)?.into_boxed_str();
     let kind_id = read_u8_at(bytes, cursor)?;
     let file_id = read_u32_le(bytes, cursor)?;
+    let is_local_binding = read_u8_at(bytes, cursor)? != 0;
     let rel_path = file_table
         .get_path(file_id)
         .ok_or_else(|| invalid_data(format!("unknown compact-symbol file_id {file_id}")))?
@@ -15887,6 +15956,7 @@ fn parse_symbol_compact_binary(
         name_hash,
         lang_hash,
         kind_id,
+        is_local_binding,
     })
 }
 
@@ -15904,6 +15974,7 @@ fn compact_sym_from_graph(symbol: &GraphSymbol, file_id: u32) -> CompactSym {
         name_hash: symbol.name_hash,
         lang_hash: stable_hash(symbol.language.as_str()),
         kind_id: compute_kind_id(&symbol.kind),
+        is_local_binding: symbol.is_local_binding,
     }
 }
 
@@ -16023,6 +16094,7 @@ fn serialize_symbol_binary(symbol: &GraphSymbol, file_id: u32, out: &mut Vec<u8>
     write_opt_u64(out, symbol.implementation_count);
     write_opt_u64(out, symbol.implementation_must_count);
     write_opt_u64(out, symbol.implementation_may_count);
+    out.push(u8::from(symbol.is_local_binding));
 }
 
 /// The `uri` field and end offset of the binary symbol record at `start`. Walks
@@ -16094,6 +16166,7 @@ fn symbol_binary_record(bytes: &[u8], start: usize) -> io::Result<SymbolBinaryRe
             take(bytes, &mut cursor, 8)?;
         }
     }
+    byte(bytes, &mut cursor)?; // lexical declaration scope
     Ok(SymbolBinaryRecord { id, inline_id, name, qualified_name, uri, end: cursor })
 }
 
@@ -16157,7 +16230,8 @@ fn parse_symbol_binary(
     let implementation_count = read_opt_u64(bytes, cursor)?;
     let implementation_must_count = read_opt_u64(bytes, cursor)?;
     let implementation_may_count = read_opt_u64(bytes, cursor)?;
-    let kind_flags = compute_kind_flags(&kind);
+    let is_local_binding = read_u8_at(bytes, cursor)? != 0;
+    let kind_flags = compute_kind_flags(&kind) & if is_local_binding { !(KF_BARE_FB | KF_MEMBER_FB) } else { u8::MAX };
     let language_id = compute_language_id(&language);
     let id_u64 = parse_stable_symbol_id_to_u64(&id).unwrap_or(0);
     let rel_path_hash = stable_hash(&rel_path);
@@ -16189,6 +16263,7 @@ fn parse_symbol_binary(
         implementation_count,
         implementation_must_count,
         implementation_may_count,
+        is_local_binding,
         kind_flags,
         language_id,
         id_u64,
@@ -16259,6 +16334,7 @@ fn serialize_ref_site_binary(site: &RefSite, file_id: u32, out: &mut Vec<u8>) {
     } else {
         out.push(0);
     }
+    write_lexical_target(out, site.lexical_target_id);
 }
 
 /// B6 stage-5b: column twin of `serialize_ref_site_binary` — produces the
@@ -16315,6 +16391,27 @@ fn serialize_ref_site_binary_from_cols(
         out.extend_from_slice(&col.enclosing_id.to_le_bytes());
     } else {
         out.push(0);
+    }
+    write_lexical_target(out, col.lexical_target_id);
+}
+
+fn write_lexical_target(out: &mut Vec<u8>, id: u64) {
+    out.push(u8::from(id != 0));
+    if id != 0 { out.extend_from_slice(&id.to_le_bytes()); }
+}
+
+fn read_lexical_target(bytes: &[u8], cursor: &mut usize) -> io::Result<u64> {
+    let marker = *bytes.get(*cursor).ok_or_else(|| invalid_data("ref_site truncated (binding marker)"))?;
+    *cursor += 1;
+    match marker {
+        0 => Ok(0),
+        1 => {
+            let data = bytes.get(*cursor..*cursor + 8)
+                .ok_or_else(|| invalid_data("ref_site truncated (binding id)"))?;
+            *cursor += 8;
+            Ok(u64::from_le_bytes(data.try_into().unwrap()))
+        }
+        _ => Err(invalid_data("ref_site invalid binding marker")),
     }
 }
 
@@ -16449,6 +16546,7 @@ fn parse_ref_site_binary(
         is_import_context,
         receiver_name,
         enclosing_id,
+        lexical_target_id: read_lexical_target(bytes, cursor)?,
         rel_path_hash,
         name_hash,
         receiver_name_hash,
@@ -17321,6 +17419,7 @@ fn parse_symbol_fields(fields: &[&str]) -> io::Result<GraphSymbol> {
         implementation_count: None,
         implementation_must_count: None,
         implementation_may_count: None,
+        is_local_binding: false,
         kind_flags,
         language_id,
         id_u64,
@@ -18859,160 +18958,20 @@ fn sanitize_code_line<'a>(line: &'a str, language: &str) -> Cow<'a, str> {
 fn sanitize_ref_site_code_line<'a>(
     line: &'a str,
     language: &str,
-    python_multiline_string_quote: &mut Option<char>,
+    python_string_state: &mut python_strings::Sanitizer,
     brace_state: &mut BraceSanitizeState,
 ) -> Cow<'a, str> {
     if language == "python" {
-        sanitize_python_ref_site_code_line(line, python_multiline_string_quote)
+        python_string_state.line(line)
     } else {
         sanitize_brace_code_line(line, language, brace_state)
     }
-}
-
-fn sanitize_python_ref_site_code_line<'a>(
-    line: &'a str,
-    multiline_string_quote: &mut Option<char>,
-) -> Cow<'a, str> {
-    // P2: when not inside a triple-quoted string and the line has no quote or
-    // `#`, no literal can start and no comment can begin → it sanitizes to
-    // itself; borrow it (state stays None). Otherwise build the owned copy.
-    if multiline_string_quote.is_none()
-        && !line
-            .as_bytes()
-            .iter()
-            .any(|&b| b == b'"' || b == b'\'' || b == b'#')
-    {
-        return Cow::Borrowed(line);
-    }
-    let mut out = String::with_capacity(line.len());
-    let mut idx = 0usize;
-    while idx < line.len() {
-        if let Some(quote) = *multiline_string_quote {
-            let delimiter = python_triple_quote_delimiter(quote);
-            if line[idx..].starts_with(delimiter) {
-                push_ascii_spaces(&mut out, delimiter.len());
-                idx += delimiter.len();
-                *multiline_string_quote = None;
-            } else {
-                let ch = line[idx..].chars().next().unwrap_or(' ');
-                push_ascii_spaces(&mut out, ch.len_utf8());
-                idx += ch.len_utf8();
-            }
-            continue;
-        }
-
-        let rest = &line[idx..];
-        if rest.starts_with('#') {
-            break;
-        }
-        if let Some(start) = python_string_literal_start(rest) {
-            push_ascii_spaces(&mut out, start.prefix_len + start.quote_len);
-            idx += start.prefix_len + start.quote_len;
-            if start.quote_len == 3 {
-                let delimiter = python_triple_quote_delimiter(start.quote);
-                if let Some(end) = line[idx..].find(delimiter) {
-                    push_spaces_for_slice(&mut out, &line[idx..idx + end + delimiter.len()]);
-                    idx += end + delimiter.len();
-                } else {
-                    push_spaces_for_slice(&mut out, &line[idx..]);
-                    *multiline_string_quote = Some(start.quote);
-                    break;
-                }
-            } else {
-                idx = sanitize_python_single_line_string_tail(line, idx, start.quote, &mut out);
-            }
-            continue;
-        }
-
-        let ch = rest.chars().next().unwrap_or(' ');
-        out.push(ch);
-        idx += ch.len_utf8();
-    }
-    Cow::Owned(out)
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PythonStringLiteralStart {
-    prefix_len: usize,
-    quote: char,
-    quote_len: usize,
-}
-
-fn python_string_literal_start(rest: &str) -> Option<PythonStringLiteralStart> {
-    for prefix in ["fr", "rf", "br", "rb", "ur", "ru", "f", "r", "b", "u", ""] {
-        if !rest
-            .get(..prefix.len())
-            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
-        {
-            continue;
-        }
-        let tail = &rest[prefix.len()..];
-        let quote = if tail.starts_with("'''") {
-            Some('\'')
-        } else if tail.starts_with("\"\"\"") {
-            Some('"')
-        } else if tail.starts_with('\'') {
-            Some('\'')
-        } else if tail.starts_with('"') {
-            Some('"')
-        } else {
-            None
-        }?;
-        let quote_len = if tail.starts_with(python_triple_quote_delimiter(quote)) {
-            3
-        } else {
-            1
-        };
-        return Some(PythonStringLiteralStart {
-            prefix_len: prefix.len(),
-            quote,
-            quote_len,
-        });
-    }
-    None
-}
-
-fn python_triple_quote_delimiter(quote: char) -> &'static str {
-    if quote == '\'' {
-        "'''"
-    } else {
-        "\"\"\""
-    }
-}
-
-fn sanitize_python_single_line_string_tail(
-    line: &str,
-    mut idx: usize,
-    quote: char,
-    out: &mut String,
-) -> usize {
-    while idx < line.len() {
-        let ch = line[idx..].chars().next().unwrap_or(' ');
-        push_ascii_spaces(out, ch.len_utf8());
-        idx += ch.len_utf8();
-        if ch == '\\' {
-            if idx < line.len() {
-                let escaped = line[idx..].chars().next().unwrap_or(' ');
-                push_ascii_spaces(out, escaped.len_utf8());
-                idx += escaped.len_utf8();
-            }
-            continue;
-        }
-        if ch == quote {
-            break;
-        }
-    }
-    idx
 }
 
 fn push_ascii_spaces(out: &mut String, count: usize) {
     for _ in 0..count {
         out.push(' ');
     }
-}
-
-fn push_spaces_for_slice(out: &mut String, value: &str) {
-    push_ascii_spaces(out, value.len());
 }
 
 fn sanitize_import_line(line: &str, language: &str) -> String {
@@ -20009,6 +19968,7 @@ mod tests {
             implementation_count: None,
             implementation_must_count: None,
             implementation_may_count: None,
+            is_local_binding: false,
             kind_flags: 0,
             language_id: 0,
             id_u64: 0,
@@ -20081,6 +20041,7 @@ mod tests {
                 implementation_count: (i % 4 == 3).then_some(1),
                 implementation_must_count: Some(0),
                 implementation_may_count: (i % 5 == 4).then_some(2),
+                is_local_binding: i % 2 == 0,
                 kind_flags: 0,
                 language_id: 0,
                 id_u64: 0,
@@ -20100,6 +20061,7 @@ mod tests {
             let parsed = parse_symbol_binary(&bytes, &mut cursor, &file_table).expect("parse record");
             assert_eq!(end, cursor, "walker must end where the parser ends for {}", symbol.id);
             assert_eq!(parsed.id, symbol.id);
+            assert_eq!(parsed.is_local_binding, symbol.is_local_binding);
         }
         assert_eq!(cursor, bytes.len());
         assert!(symbol_binary_uri_and_end(&bytes[..bytes.len() - 1], 0).is_ok());
@@ -20529,6 +20491,52 @@ mod tests {
         let positions: Vec<_> = graph.ref_sites.iter().filter(|site| site.name == "action")
             .map(|site| (site.start_line, site.start_column, site.is_definition)).collect();
         assert_eq!(positions, vec![(0, 4, true), (3, 4, true), (4, 4, false), (5, 11, false)]);
+    }
+
+    #[test]
+    fn python_local_bindings_retain_their_own_usages_without_module_candidates() {
+        let entry = test_entry("pkg/bindings.py", "def action():\n    pass\nclass Consumer:\n    def consume(self):\n        action = 1\n        return action\n    def other(self):\n        return action()\n");
+        let graph = build_file_graph(&entry);
+        let local = graph.symbols.iter().find(|s| s.name == "action" && s.start_line == 4).unwrap();
+        let function = graph.symbols.iter().find(|s| s.name == "action" && s.start_line == 0).unwrap();
+        let result = resolve_ref_sites(&graph.symbols, &graph.ref_sites, &graph.import_facts,
+            &graph.type_facts, &graph.function_return_facts, &graph.hierarchy_facts);
+        assert!(result.references.iter().any(|r| r.start_line == 5 && r.target_symbol_id.as_deref() == Some(local.id.as_str())
+            && r.confidence.as_ref() == "exact"));
+        assert!(!result.references.iter().any(|r| r.start_line == 5 && r.target_symbol_id.as_deref() == Some(function.id.as_str())));
+        assert!(result.references.iter().any(|r| r.start_line == 7 && r.target_symbol_id.as_deref() == Some(function.id.as_str())));
+    }
+
+    #[test]
+    fn python_fstring_fields_are_executable_usages_with_original_utf16_columns() {
+        let source = "def action():\n    pass\nvalue = f\"한글 {{action()}} {action('hidden()'):>{width()}}\"\n";
+        let graph = build_file_graph(&test_entry("pkg/fields.py", source));
+        let line = source.lines().nth(2).unwrap();
+        let call_byte = line.rfind("action(").unwrap();
+        let calls: Vec<_> = graph.ref_sites.iter().filter(|s| s.name == "action" && s.start_line == 2).collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].start_column, line[..call_byte].encode_utf16().count() as u32);
+        assert_eq!(calls[0].edge_kind.as_ref(), "call");
+        assert!(!graph.ref_sites.iter().any(|s| s.name == "hidden"));
+    }
+
+    #[test]
+    fn python_multiline_imports_keep_aliases_comments_and_relative_modules() {
+        let entry = test_entry("pkg/consumer.py", "from .provider import (\n    action, # a comment\n    other as renamed,\n)\nfrom .provider \\\n    import third\n\"\"\"\nfrom .fake import ignored\n\"\"\"\n");
+        let facts = extract_import_facts(&entry, "python", "fixture");
+        assert_eq!(facts.iter().map(|f| (f.imported_name.as_str(), f.local_name.as_str()))
+            .collect::<Vec<_>>(), vec![("action", "action"), ("other", "renamed"), ("third", "third")]);
+        assert!(facts.iter().all(|f| f.module_candidates.iter().any(|path| path == "pkg/provider.py")));
+    }
+
+    #[test]
+    fn python_docstrings_and_keyword_arguments_do_not_declare_or_load_names() {
+        let graph = build_file_graph(&test_entry("pkg/keywords.py",
+            "from pkg.provider import action\ndef consume():\n    \"\"\"\n    def action():\n        action = 1\n    \"\"\"\n    value = factory(\n        action=action(),\n    )\n    return action()\n"));
+        assert!(!graph.symbols.iter().any(|s| s.name == "action"));
+        let calls: Vec<_> = graph.ref_sites.iter().filter(|s| s.name == "action" && s.start_line > 0)
+            .map(|s| (s.start_line, s.start_column, s.edge_kind.as_ref())).collect();
+        assert_eq!(calls, vec![(7, 15, "call"), (9, 11, "call")]);
     }
 
     fn unique_temp_workspace(prefix: &str) -> PathBuf {

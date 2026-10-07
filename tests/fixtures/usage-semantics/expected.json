@@ -10,6 +10,25 @@
         ["pkg/shadowing.py", 12, 38], ["pkg/shadowing.py", 14, 13], ["pkg/shadowing.py", 18, 11]]},
     {"query": "First.run", "relPath": "pkg/provider.py", "edgeKinds": ["call"], "locations": [["pkg/consumer.py", 12, 18]]},
     {"query": "Second.run", "relPath": "pkg/provider.py", "edgeKinds": ["call"], "locations": [["pkg/consumer.py", 16, 18]]},
-    {"query": "계산", "relPath": "pkg/unicode.py", "edgeKinds": ["call"], "locations": [["pkg/unicode.py", 4, 22]]}
+    {"query": "계산", "relPath": "pkg/unicode.py", "edgeKinds": ["call"], "locations": [["pkg/unicode.py", 4, 22]]},
+    {"query": "evaluate", "relPath": "pkg/evaluation.py", "edgeKinds": ["call"],
+      "locations": [["pkg/evaluation_user.py", 8, 43], ["pkg/evaluation_user.py", 8, 68],
+        ["pkg/evaluation_user.py", 12, 16], ["pkg/evaluation_user.py", 13, 1], ["pkg/evaluation_user.py", 13, 12],
+        ["pkg/evaluation_user.py", 18, 20], ["pkg/evaluation_user.py", 28, 15],
+        ["pkg/evaluation_user.py", 41, 39], ["pkg/evaluation_user.py", 45, 27],
+        ["pkg/evaluation_user.py", 57, 11], ["pkg/evaluation_user.py", 60, 1],
+        ["pkg/evaluation_user.py", 75, 11]],
+      "forbiddenLocations": [["pkg/evaluation_user.py", 8, 16], ["pkg/evaluation_user.py", 8, 29],
+        ["pkg/evaluation_user.py", 24, 8], ["pkg/evaluation_user.py", 25, 15],
+        ["pkg/evaluation_user.py", 32, 22], ["pkg/evaluation_user.py", 33, 15],
+        ["pkg/evaluation_user.py", 37, 12], ["pkg/evaluation_user.py", 37, 36],
+        ["pkg/evaluation_user.py", 41, 12], ["pkg/evaluation_user.py", 41, 27],
+        ["pkg/evaluation_user.py", 45, 18], ["pkg/evaluation_user.py", 45, 38],
+        ["pkg/evaluation_user.py", 49, 4], ["pkg/evaluation_user.py", 51, 15],
+        ["pkg/evaluation_user.py", 56, 11], ["pkg/evaluation_user.py", 66, 7],
+        ["pkg/evaluation_user.py", 67, 15], ["pkg/evaluation_user.py", 72, 9],
+        ["pkg/evaluation_user.py", 73, 8], ["pkg/evaluation_user.py", 79, 15],
+        ["pkg/evaluation_user.py", 80, 11]]},
+    {"query": "evaluate", "relPath": "pkg/another.py", "confidences": ["exact", "resolved", "possible"], "locations": []}
   ]
 }

@@ -368,6 +368,7 @@ mod tests {
             implementation_count: None,
             implementation_must_count: None,
             implementation_may_count: None,
+            is_local_binding: false,
             kind_flags: 0,
             language_id: 0,
             id_u64: 0,

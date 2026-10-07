@@ -14,6 +14,10 @@ on:
         type: choice
         options: ['1', '5', '10', '20']
         default: '1'
+      profile_inlays:
+        description: Capture a renderer CPU profile of the first full-file inlay request
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -81,6 +85,8 @@ jobs:
           IJSS_E2E_FOREGROUND_TIMINGS: '1'
           IJSS_E2E_PREVIEW_CLICK_REPEATS: ${{ inputs.preview_click_repeats || '10' }}
           IJSS_E2E_TIMING_JSON: artifacts/desktop-compatibility/renderer-timings.json
+          # Profiling is opt-in and excluded from normal timing comparisons.
+          IJSS_E2E_PROFILE_INLAYS: ${{ inputs.profile_inlays && '1' || '0' }}
         run: npm test -- --run out/test/suite/renderer.test.js
       - name: Summarize renderer diagnostics
         if: always()

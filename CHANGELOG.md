@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.1.7154 - 2026-10-07
+
+- Indexed executable f-string expressions, nested fields and dynamic format specifications while preserving UTF-16 reference positions and excluding literal text.
+- Resolved parenthesized and continued Python imports, and excluded docstring examples and keyword argument labels from declarations and usages.
+- Kept Python local assignments, named expressions, closures, lambda parameters and comprehension bindings in their lexical scopes; indexed local usages no longer become candidates for unrelated module symbols.
+- Persisted lexical binding metadata across rebuilds, edits and compaction. Native graph/cache versions are now 14/22 on POSIX and 15/23 on Windows and require one reindex.
+- Added an independent semantic audit gate and opt-in cold-inlay CPU profiling to desktop CI.
 
 - Fixed UTF-8 boundary panics in Unicode trailing identifiers and member receivers, including JSX text, and counted UTF-16 positions with one forward cursor per line.
 - Reused bounded inheritance-family lookups across usage count shards while preserving count records, and reported rebuild completion only after required counts finish.

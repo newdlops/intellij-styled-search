@@ -221,6 +221,9 @@ See [GitHub's manual workflow requirements](https://docs.github.com/en/actions/h
 
 The optional repeat count expands the existing preview-click probe without
 changing its request/render budgets or per-click completion assertions.
+For a separate first-inlay diagnosis, dispatch with `-f profile_inlays=true`.
+That records `inlay-cold.cpuprofile` in each desktop artifact. Compare normal
+timings with profiling disabled; the CPU profiler adds measurement overhead.
 Development tests use Mocha 12 through a test-cli override because test-cli's
 declared Mocha 11 dependency retains a vulnerable serialization dependency.
 The override is covered by the desktop extension suites; these packages are
