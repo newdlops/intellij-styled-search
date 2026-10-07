@@ -8779,7 +8779,7 @@ fn extract_ref_sites(
     };
     if language == "python" { parameter_bindings.mark_local_symbols(&sanitized_lines, symbols); }
     let javascript_bindings = if matches!(language, "javascript" | "typescript") {
-        let bindings = js_bindings::LexicalBindings::new(&sanitized_lines, &entry.text, symbols);
+        let bindings = js_bindings::LexicalBindings::new(&sanitized_lines, &entry.text, symbols, import_facts);
         bindings.mark_local_symbols(symbols);
         for (property, source) in &bindings.globals {
             import_facts.push(ImportFact {
@@ -8854,6 +8854,10 @@ fn extract_ref_sites(
             // B6 stage-2: build the u64 directly (no "ref:HEX16" string alloc).
             let source_ref_id =
                 stable_ref_id_u64(&entry.rel_path, line_idx as u32, start_column, &name);
+            // A different value declaration is not a usage of a same-named
+            // callable. Keep structural member declarations and import sites.
+            if matches!(language, "javascript" | "typescript") && is_definition
+                && access_kind == "bare" && !import_site_ids.contains(&source_ref_id) { continue; }
             if name == "default" && !import_site_ids.contains(&source_ref_id) { continue; }
             let name_hash = stable_hash(&name);
             let receiver_name_hash = receiver_name
@@ -22748,6 +22752,18 @@ def use(client):
             assert!(!references.is_empty(), "wrapper input should remain a conservative export candidate");
             assert!(references.iter().all(|reference| reference.bound_mask == BOUND_MAY && &*reference.confidence == "possible"));
         }
+    }
+
+    #[test]
+    fn javascript_destructuring_and_curried_closures_preserve_binding_identity() {
+        let source = test_entry("pkg/patterns.js", include_str!("../../../tests/fixtures/usage-semantics/js/patterns.js"));
+        let (symbols, result) = resolve_test_entries(&[source]);
+        let target = symbols.iter().find(|symbol| symbol.name == "transform" && symbol.start_line == 0).unwrap();
+        let locations: HashSet<_> = result.references.iter()
+            .filter(|reference| reference.target_symbol_id.as_deref() == Some(&target.id))
+            .map(|reference| (reference.start_line, reference.start_column)).collect();
+        assert_eq!(locations, [(1, 0), (8, 31), (24, 19)].into_iter().collect(),
+            "defaults and shorthand values use the module callable; binding names, closures and unrelated declarations do not");
     }
 
     #[test]

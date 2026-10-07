@@ -1818,7 +1818,9 @@ suite('Renderer — overlay UI probes', () => {
           var engineBadge = root.querySelector('.ij-find-preview-engine');
 
           var position = { lineNumber: 1, column: 8 };
-          try { editor.revealPositionInCenter(position, 0); } catch (eReveal) {}
+          // ScrollType.Immediate = 1; smooth scrolling moves the target after
+          // its coordinates are captured for trusted pointer input.
+          try { editor.revealPositionInCenter(position, 1); } catch (eReveal) {}
           try { if (typeof editor.render === 'function') { editor.render(true); } } catch (eRender) {}
           await Promise.race([
             new Promise(function (resolve) { requestAnimationFrame(function () { requestAnimationFrame(resolve); }); }),

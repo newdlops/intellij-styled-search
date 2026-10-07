@@ -68,6 +68,23 @@ const location = (file, offset) => {
   return [path.relative(workspace, file).split(path.sep).join('/'), point.line, point.character];
 };
 const key = point => JSON.stringify(point);
+function isValueDeclarationName(source, offset) {
+  let declaration = false;
+  function visit(node) {
+    if (offset < node.getFullStart() || offset >= node.end) return;
+    if (ts.isIdentifier(node) && node.getStart(source) === offset) {
+      const parent = node.parent;
+      declaration = parent.name === node && (ts.isVariableDeclaration(parent)
+        || ts.isParameter(parent) || ts.isBindingElement(parent)
+        || ts.isFunctionDeclaration(parent) || ts.isFunctionExpression(parent)
+        || ts.isClassDeclaration(parent) || ts.isClassExpression(parent));
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(source);
+  return declaration;
+}
 const results = [];
 let candidatesChecked = 0;
 for (const candidate of declarations) {
@@ -75,6 +92,14 @@ for (const candidate of declarations) {
   const { file, source, node, position } = candidate;
   candidatesChecked++;
   const groups = service.findReferences(file, position) || [];
+  const targetDefinitions = new Set(groups.map(group =>
+    key([path.resolve(group.definition.fileName), group.definition.textSpan.start])));
+  targetDefinitions.add(key([path.resolve(file), position]));
+  // A named function expression has an internal function name and an outer
+  // variable binding. Compiler definitions at a call can use either identity.
+  if (ts.isVariableDeclaration(node) && node.initializer?.name) {
+    targetDefinitions.add(key([path.resolve(file), node.initializer.name.getStart(source)]));
+  }
   const expected = new Set(groups.flatMap(group => group.references)
     .filter(reference => !reference.isDefinition)
     .map(reference => location(reference.fileName, reference.textSpan.start))
@@ -95,14 +120,19 @@ for (const candidate of declarations) {
   const missing = [...expected].filter(point => !actual.has(point)).map(JSON.parse);
   const extra = page.references.filter(reference => !expected.has(key([reference.relPath, reference.range.startLine, reference.range.startColumn])));
   const otherBinding = [];
+  const nonReferences = [];
   for (const reference of extra) {
     const refFile = path.join(workspace, reference.relPath);
     const refSource = program.getSourceFile(refFile);
     if (!refSource) continue;
     const offset = refSource.getPositionOfLineAndCharacter(reference.range.startLine, reference.range.startColumn);
+    if (isValueDeclarationName(refSource, offset)) {
+      nonReferences.push([reference.relPath, reference.range.startLine, reference.range.startColumn]);
+      continue;
+    }
     const definitions = service.getDefinitionAtPosition(refFile, offset) || [];
-    if (definitions.length === 1 && definitions[0].kind === ts.ScriptElementKind.functionElement &&
-        !(definitions[0].fileName === file && definitions[0].textSpan.start === position)) {
+    if (definitions.length === 1 && [ts.ScriptElementKind.functionElement, ts.ScriptElementKind.localFunctionElement].includes(definitions[0].kind) &&
+        !targetDefinitions.has(key([path.resolve(definitions[0].fileName), definitions[0].textSpan.start]))) {
       otherBinding.push([reference.relPath, reference.range.startLine, reference.range.startColumn]);
     }
   }
@@ -111,21 +141,23 @@ for (const candidate of declarations) {
     fullyEnumerated: page.totalReferences === page.references.length,
     missing: page.totalReferences === page.references.length ? missing : null,
     provenOtherBinding: otherBinding.length, otherBindingLocations: otherBinding,
-    unclassified: extra.length - otherBinding.length, totalReferences: page.totalReferences });
+    provenNonReference: nonReferences.length, nonReferenceLocations: nonReferences,
+    unclassified: extra.length - otherBinding.length - nonReferences.length, totalReferences: page.totalReferences });
 }
 const report = { oracle: `TypeScript ${ts.version} language service references and definitions`,
   sourceFiles: sources.length, candidatesChecked, compilerOptions: options,
-  limitations: 'Sampled top-level callables; no project path aliases or external dependencies copied. Compiler definition entries are filtered; reported import/export specifier references are included. Dynamic/unresolved locations remain unclassified.',
+  limitations: 'Sampled top-level callables; no project path aliases or external dependencies copied. Compiler definition entries are filtered; reported import/export specifier references are included. Value declaration names are checked independently as non-references. Other function bindings are proven separately; dynamic/unresolved values, parameters and properties remain unclassified.',
   targets: results };
 fs.mkdirSync(path.dirname(path.resolve(outputArg)), { recursive: true });
 fs.writeFileSync(outputArg, JSON.stringify(report, null, 2) + '\n');
 console.log(JSON.stringify({ targets: results.length, required: results.reduce((n, r) => n + r.required, 0),
   found: results.reduce((n, r) => n + r.requiredFound, 0),
   provenOtherBinding: results.reduce((n, r) => n + r.provenOtherBinding, 0),
+  provenNonReference: results.reduce((n, r) => n + (r.provenNonReference || 0), 0),
   unclassified: results.reduce((n, r) => n + r.unclassified, 0) }));
 service.dispose();
 const failures = results.filter(result => result.error
-  || !result.fullyEnumerated || result.missing?.length || result.provenOtherBinding);
+  || !result.fullyEnumerated || result.missing?.length || result.provenOtherBinding || result.provenNonReference);
 if (failOnProvenErrors && (!results.length || failures.length)) {
   console.error(JSON.stringify({ check: 'compiler-reference-locations', failures }));
   process.exitCode = 1;

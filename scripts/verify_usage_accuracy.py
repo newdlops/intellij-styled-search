@@ -77,7 +77,8 @@ def verify_semantics(workspace, expectations, binary, rebuild=False):
     for item in expected["symbols"]:
         response = run_query(binary, "graph-symbol-query", workspace, "--query", item["query"], "--limit", 100)
         symbols = [symbol for symbol in response.get("symbols", [])
-                   if symbol["qualifiedName"] == item["query"] and symbol["relPath"] == item["relPath"]]
+                   if symbol["qualifiedName"] == item["query"] and symbol["relPath"] == item["relPath"]
+                   and ("declarationLine" not in item or symbol["range"]["startLine"] == item["declarationLine"])]
         if len(symbols) != 1:
             failures.append({"query": item["query"], "error": "expected one matching declaration", "matches": len(symbols)})
             continue

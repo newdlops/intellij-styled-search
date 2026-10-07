@@ -3,7 +3,7 @@
 //! Global script declarations are possible cross-file bindings, never proof
 //! that a particular script is loaded at runtime.
 use super::python_bindings::Binding;
-use super::{is_ident_continue, is_ident_start, GraphSymbol, KF_BARE_FB, KF_MEMBER_FB};
+use super::{is_ident_continue, is_ident_start, GraphSymbol, ImportFact, KF_BARE_FB, KF_MEMBER_FB};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
@@ -19,6 +19,43 @@ struct Scope {
     names: HashMap<String, Binding>,
 }
 
+// Only binding positions introduce names. Object keys, computed keys and
+// default-value expressions keep their ordinary reference semantics.
+fn binding_pattern(
+    tokens: &[Token], code: &str, pairs: &[Option<usize>], start: usize,
+    names: &mut Vec<usize>,
+) -> usize {
+    let text = |index: usize| tokens.get(index)
+        .map(|token| &code[token.start..token.end]).unwrap_or("");
+    let mut start = start;
+    while text(start) == "." { start += 1; }
+    if super::is_identifier(text(start)) {
+        names.push(start);
+        return start + 1;
+    }
+    if !matches!(text(start), "{" | "[") { return start + 1; }
+    let Some(end) = pairs.get(start).copied().flatten() else { return start + 1; };
+    let object = text(start) == "{";
+    let mut part = start + 1;
+    while part < end {
+        if text(part) == "," { part += 1; continue; }
+        let mut value = part;
+        if object && text(part) != "." {
+            let key_end = pairs[part].filter(|close| *close > part).map_or(part + 1, |close| close + 1);
+            if text(key_end) == ":" { value = key_end + 1; }
+            // A quoted key is blanked by the sanitizer, leaving just ':'.
+            else if text(part) == ":" { value = part + 1; }
+        }
+        let mut cursor = binding_pattern(tokens, code, pairs, value, names);
+        while cursor < end && text(cursor) != "," {
+            if let Some(close) = pairs[cursor].filter(|close| *close > cursor) { cursor = close; }
+            cursor += 1;
+        }
+        part = cursor + 1;
+    }
+    end + 1
+}
+
 #[derive(Default)]
 pub(super) struct LexicalBindings {
     offsets: Vec<usize>,
@@ -30,7 +67,7 @@ pub(super) struct LexicalBindings {
 }
 
 impl LexicalBindings {
-    pub(super) fn new(lines: &[Cow<'_, str>], original: &str, symbols: &[GraphSymbol]) -> Self {
+    pub(super) fn new(lines: &[Cow<'_, str>], original: &str, symbols: &[GraphSymbol], imports: &[ImportFact]) -> Self {
         let mut result = Self::default();
         let mut code = String::new();
         for line in lines {
@@ -207,13 +244,15 @@ impl LexicalBindings {
                     while text(parameter) == "." {
                         parameter += 1;
                     }
-                    if super::is_identifier(text(parameter)) {
+                    let mut names = Vec::new();
+                    let after_pattern = binding_pattern(&tokens, &code, &pairs, parameter, &mut names);
+                    for parameter in names {
                         result.declarations.insert(tokens[parameter].start);
                         result.scopes[scope]
                             .names
                             .insert(text(parameter).to_string(), Binding::Excluded);
                     }
-                    let mut cursor = parameter + 1;
+                    let mut cursor = after_pattern;
                     while cursor < end && text(cursor) != "," {
                         if let Some(close) = pairs[cursor].filter(|close| *close > cursor) {
                             cursor = close;
@@ -259,6 +298,21 @@ impl LexicalBindings {
                 std::cmp::Reverse(result.scopes[*index].end),
             )
         });
+        // Expression arrows have no brace scope. Reparent contained scopes
+        // after discovering every function, so curried arrows retain outer
+        // parameters in their closures.
+        let mut parents = vec![0];
+        for &scope in &result.scope_order {
+            if scope == 0 { continue; }
+            while parents.len() > 1 {
+                let parent = *parents.last().unwrap();
+                if result.scopes[scope].start < result.scopes[parent].end
+                    && result.scopes[scope].end <= result.scopes[parent].end { break; }
+                parents.pop();
+            }
+            result.scopes[scope].parent = *parents.last().unwrap();
+            parents.push(scope);
+        }
         let script = !tokens.iter().enumerate().any(|(i, _)| {
             scope_at[i] == 0
                 && (i == 0 || text(i - 1) != ".")
@@ -276,29 +330,28 @@ impl LexicalBindings {
             }
             let mut name = i + 1;
             loop {
-                if !super::is_identifier(text(name)) {
-                    break;
-                }
-                let binding = definitions
-                    .get(&tokens[name].start)
-                    .copied()
-                    .map(Binding::Indexed)
-                    .unwrap_or(Binding::Excluded);
-                result.scopes[scope]
-                    .names
-                    .insert(text(name).to_string(), binding);
-                result.declarations.insert(tokens[name].start);
-                if scope != 0 {
-                    if let Binding::Indexed(id) = binding {
-                        result.local_ids.insert(id);
+                if !super::is_identifier(text(name)) && !matches!(text(name), "{" | "[") { break; }
+                let mut names = Vec::new();
+                let after_pattern = binding_pattern(&tokens, &code, &pairs, name, &mut names);
+                for name in names {
+                    let binding = definitions.get(&tokens[name].start).copied()
+                        .map(Binding::Indexed).unwrap_or_else(|| {
+                            // CommonJS destructuring can introduce an import
+                            // alias without a separate indexed value symbol.
+                            if scope == 0 && imports.iter().any(|fact| fact.local_name == text(name)) {
+                                Binding::Unbound
+                            } else { Binding::Excluded }
+                        });
+                    result.scopes[scope].names.insert(text(name).to_string(), binding);
+                    result.declarations.insert(tokens[name].start);
+                    if scope != 0 {
+                        if let Binding::Indexed(id) = binding { result.local_ids.insert(id); }
+                    }
+                    if script && scope == 0 && text(i) == "var" {
+                        result.globals.push((text(name).to_string(), text(name).to_string()));
                     }
                 }
-                if script && scope == 0 && text(i) == "var" {
-                    result
-                        .globals
-                        .push((text(name).to_string(), text(name).to_string()));
-                }
-                let mut cursor = name + 1;
+                let mut cursor = after_pattern;
                 while cursor < tokens.len()
                     && !matches!(text(cursor), "," | ";" | ")" | "in" | "of")
                 {

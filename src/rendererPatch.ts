@@ -13094,7 +13094,7 @@ export function getRendererPatchScript(
     var focusLine = previewModelLineForFileLine(msg.focusLine);
     var col = (msg.ranges && msg.ranges[0]) ? msg.ranges[0].start + 1 : 1;
     try {
-      editor.revealLineInCenter(focusLine, 0);
+      editor.revealLineInCenter(focusLine, 1);
       editor.setPosition({ lineNumber: focusLine, column: col });
     } catch (e) {}
     // Share the native preview's multi-line/minimap/overview-ruler behavior.

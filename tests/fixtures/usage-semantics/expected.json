@@ -29,6 +29,11 @@
         ["pkg/evaluation_user.py", 67, 15], ["pkg/evaluation_user.py", 72, 9],
         ["pkg/evaluation_user.py", 73, 8], ["pkg/evaluation_user.py", 79, 15],
         ["pkg/evaluation_user.py", 80, 11]]},
-    {"query": "evaluate", "relPath": "pkg/another.py", "confidences": ["exact", "resolved", "possible"], "locations": []}
+    {"query": "evaluate", "relPath": "pkg/another.py", "confidences": ["exact", "resolved", "possible"], "locations": []},
+    {"query": "transform", "relPath": "js/patterns.js", "declarationLine": 0,
+      "locations": [["js/patterns.js", 1, 0], ["js/patterns.js", 8, 31], ["js/patterns.js", 24, 19]],
+      "forbiddenLocations": [["js/patterns.js", 3, 9], ["js/patterns.js", 6, 9],
+        ["js/patterns.js", 11, 37], ["js/patterns.js", 14, 9], ["js/patterns.js", 17, 6],
+        ["js/patterns.js", 18, 9], ["js/patterns.js", 21, 11], ["js/patterns.js", 22, 9]]}
   ]
 }

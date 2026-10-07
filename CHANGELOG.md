@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.7155 - 2026-10-07
 
 - Resolved JavaScript/TypeScript imports with explicit source extensions, default export aliases and cyclic re-export chains.
 - Indexed assigned function expressions under their outer binding, and kept parameters, closures, block bindings and method-local variables in their lexical scopes.
@@ -8,7 +8,10 @@
 - Persisted import/export and type evidence in pending overlays, refreshed dependent consumers when bindings change, and preserved edited symbols during later consumer refreshes.
 - Added an independent TypeScript compiler reference gate to the semantic fixture checks on macOS and Windows.
 - Removed a second full reference array during occurrence deduplication, reducing peak memory in the measured platform workload.
-- Native graph/cache versions are now 15/23 on POSIX and 16/24 on Windows and require one reindex.
+- Kept nested object/array destructuring and curried arrow parameters in their lexical scopes, and excluded unrelated value declarations from callable usages.
+- Extended the independent compiler gate to reject value declaration names reported as usages.
+- Used immediate scrolling in bundled previews so result selection and trusted pointer hover target a stable line.
+- Native graph/cache versions are now 16/24 on POSIX and 17/25 on Windows and require one reindex.
 
 ## 0.1.7154 - 2026-10-07
 

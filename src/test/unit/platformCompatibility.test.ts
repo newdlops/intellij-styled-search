@@ -123,8 +123,8 @@ test('native Windows CIM snapshot includes the running Node host', { skip: proce
 });
 
 test('usage binding migration invalidates old overlays while retaining platform URI versions', () => {
-  assert.deepEqual(graphStorageVersions('win32'), { cache: 24, native: 16 });
-  assert.deepEqual(graphStorageVersions('darwin'), { cache: 23, native: 15 });
+  assert.deepEqual(graphStorageVersions('win32'), { cache: 25, native: 17 });
+  assert.deepEqual(graphStorageVersions('darwin'), { cache: 24, native: 16 });
 });
 
 test('native Windows inspector activation starts a running child without SIGUSR1', {

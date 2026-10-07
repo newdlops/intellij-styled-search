@@ -195,7 +195,7 @@ imports, same-file local shadowing, named expressions and lambda isolation:
 nineteen required locations are found, with zero proven other bindings, and all
 41 indexed fixture symbols have count/list parity.
 
-## JavaScript follow-up — not yet released
+## JavaScript follow-up — before final binding cleanup
 
 The expanded compiler audit now finds **740/740 required locations across all
 311 declarations**, with zero missing declarations and zero returned locations
@@ -221,7 +221,7 @@ the compiler oracle; reported import/export specifier references are included.
 | Monorepo | 23,097 | 235,043 | 740,360 | 0 |
 | Django platform | 5,638 | 163,201 | 424,869 | 0 |
 
-The final macOS ARM64 release binary has SHA-256
+The macOS ARM64 candidate used for these measurements has SHA-256
 `1dfe35d5398aedf9219c8bac72b39af11fce3b98f0fd56d238a9c72be5d52c59`.
 One eight-worker run measured 36.22 s / 2,272 MiB and 14.62 s / 1,152 MiB.
 The monorepo's single-run peak is slightly higher than its 0.1.7154 observation;

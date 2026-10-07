@@ -10,6 +10,26 @@ from verify_usage_accuracy import verify_dump, verify_semantics, lexical_frequen
 
 
 class UsageVerificationTests(unittest.TestCase):
+    def test_declaration_location_selects_among_same_named_lexical_bindings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected = root / "expected.json"
+            item = {"query": "work", "relPath": "source.js", "declarationLine": 0, "locations": []}
+            expected.write_text(json.dumps({"version": 1, "symbols": [item]}))
+            symbols = {"symbols": [
+                {"qualifiedName": "work", "relPath": "source.js", "id": "sym:1", "usageCount": 0,
+                 "range": {"startLine": 0}},
+                {"qualifiedName": "work", "relPath": "source.js", "id": "sym:2", "usageCount": 3,
+                 "range": {"startLine": 5}},
+            ]}
+            with patch("verify_usage_accuracy.run_query", side_effect=[symbols, {"totalReferences": 0, "references": []}]) as query, contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(verify_semantics(root, expected, "unused-binary"))
+            self.assertIn("sym:1", query.call_args.args)
+            del item["declarationLine"]
+            expected.write_text(json.dumps({"version": 1, "symbols": [item]}))
+            with patch("verify_usage_accuracy.run_query", return_value=symbols), contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(verify_semantics(root, expected, "unused-binary"))
+
     def test_possible_references_cannot_hide_forbidden_semantic_locations(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
