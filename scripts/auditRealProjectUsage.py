@@ -28,7 +28,7 @@ EXCLUDES = {'.git', '.zoek-rs', '.zoekt-rs', '.codeidx', '.vscode', '.vscode-tes
 
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
 
 
 def snapshot(source, destination):
@@ -100,7 +100,7 @@ def percentile(values, fraction):
 
 def audit(binary, source, output, workers, samples, resume=False):
     if resume and (output / 'snapshot.json').exists():
-        report = json.loads((output / 'snapshot.json').read_text())
+        report = json.loads((output / 'snapshot.json').read_text(encoding='utf-8'))
         if report['source'] != str(source) or not Path(report['workspace']).is_dir():
             raise ValueError('The recorded source snapshot is unavailable or belongs to another project.')
         workspace = Path(report['workspace'])

@@ -12,7 +12,7 @@ class ScopeOracleTests(unittest.TestCase):
         for name, text in files.items():
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text)
+            path.write_text(text, encoding='utf-8')
         return Oracle(root)
 
     def test_import_aliases_and_module_receivers_use_the_declaring_module(self):

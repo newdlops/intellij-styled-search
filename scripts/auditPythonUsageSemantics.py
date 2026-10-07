@@ -301,7 +301,7 @@ def main():
               'pythonFilesParsed': len(oracle.modules), 'parseErrors': oracle.parse_errors,
               'targets': results}
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
+    args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(json.dumps({key: value for key, value in report.items() if key != 'targets'}, ensure_ascii=False))
     print(json.dumps({'targets': len(results), 'required': sum(x.get('required', 0) for x in results),
                       'found': sum(x.get('requiredFound', 0) for x in results),
