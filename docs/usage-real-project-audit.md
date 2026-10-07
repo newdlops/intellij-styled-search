@@ -199,7 +199,8 @@ nineteen required locations are found, with zero proven other bindings, and all
 
 The expanded compiler audit now finds **740/740 required locations across all
 311 declarations**, with zero missing declarations and zero returned locations
-proven to bind to another function. Every target is fully enumerated. This
+proven to bind to another function under the then-current function-definition
+filter. Every target is fully enumerated. This
 resolves the previously observed 81 missing usages and five declaration indexing
 errors, including their nine additional required locations.
 
@@ -259,3 +260,53 @@ failure or the earlier shared-runner inlay delay.
 The previously observed macOS shared-runner delay before provider entry remains
 unresolved. No timing budget has been changed, and no whole-project semantic
 accuracy claim is made.
+
+## 0.1.7155 release validation
+
+The final binding cleanup handles nested object/array patterns, curried arrow
+closures, catch parameters and dollar-sign identifiers. A resolved import alias
+does not also become a name-based candidate for an unrelated callable. Value
+declaration names are checked independently as non-references; named function
+expressions retain both their outer and internal compiler identities.
+
+The final compiler sample finds **740/740 JavaScript locations across 311
+declarations**, with zero missing declarations, zero proven other function
+bindings and zero value declaration names reported as usages. All targets are
+fully enumerated. **203 dynamic, parameter, property or unresolved candidates
+remain unclassified**, compared with 372 before the final cleanup. This remains
+a sampled audit, not a whole-project precision/recall claim.
+
+Python 3.12 AST/symtable checks retain **7,357/7,357** required locations, zero
+proven other bindings and zero parse errors across 16,612 files. The TypeScript
+sample retains **51/51**, zero proven errors and three unclassified locations.
+
+| Same frozen source tree | Indexed files | Symbols | Stored references | Count/list mismatches |
+| --- | ---: | ---: | ---: | ---: |
+| Monorepo | 23,097 | 235,071 | 725,933 | 0 |
+| Django platform | 5,638 | 163,710 | 427,600 | 0 |
+
+All **398,781** symbols have live count/list parity. The final macOS ARM64
+`zoek-rs` SHA-256 is
+`d2bf4745bdccc13a3d9e080adb017758f7baab4860009247d8c936315d0174fc`.
+Both packaged runtime pairs use Rust-source fingerprint
+`9dd6c85c07fc5ef7c37e80b2`. Native graph/cache versions are **16/24 on POSIX and
+17/25 on Windows**, requiring one reindex from 0.1.7154.
+
+The independent fixture gate finds 32/32 JavaScript and 19/19 Python locations,
+with zero proven errors and count/list parity across 70 symbols. Local native
+checks pass 194 tests (four existing opt-in tests ignored). Extension unit and
+build-cache checks pass 35 and four tests respectively; two Windows-only unit
+checks are skipped locally.
+
+Bundled preview selection and the trusted-pointer hover probe now use immediate
+scrolling. The full local foreground renderer suite passes 92 tests with four
+existing pending cases, including exact hover position and dismissal. All local
+strict timing checks pass; preview request/render maxima are 0/7 ms. A prior
+combined build/test run hit repeated CDP timeouts and was stopped; its log is
+retained. The successful isolated run does not prove the cause of those timeouts.
+
+[Release implementation CI](https://github.com/newdlops/intellij-styled-search/actions/runs/37639792665)
+uses the same required desktop checks and unchanged timing budgets. In its
+macOS shared-runner report, preview render p95 is 6 ms but one sample is 29 ms
+(20 ms budget); native preview after hide/show is 71 ms (50 ms budget). These
+overruns remain visible and are not classified as resolved performance issues.
