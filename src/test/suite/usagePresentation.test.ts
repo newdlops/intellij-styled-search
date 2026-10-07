@@ -81,12 +81,12 @@ suite('Usage result presentation', () => {
     const { callGraph } = await getApi();
     const config = vscode.workspace.getConfiguration('intellijStyledSearch');
     const previous = config.inspect<string>('callGraphBackend')?.workspaceValue;
-    const previousWatch = config.inspect<boolean>('callGraphWatchExternalFileChanges')?.workspaceValue;
     const file = vscode.Uri.joinPath(vscode.workspace.workspaceFolders![0].uri, 'usage_native_pages.py');
     try {
-      // Own index changes explicitly; delayed file events must not race the
-      // stable-page assertions. Generation invalidation is exercised below.
-      await config.update('callGraphWatchExternalFileChanges', false, vscode.ConfigurationTarget.Workspace);
+      // The watcher is created on activation, so changing its setting here
+      // cannot stop it. Suspend automatic drains while explicitly owning the
+      // index updates; generation invalidation is exercised below.
+      callGraph.setWindowFocusedForTests(false);
       await config.update('callGraphBackend', 'rust-native', vscode.ConfigurationTarget.Workspace);
       await vscode.workspace.fs.writeFile(file, Buffer.from('def native_page_target():\n    return 1\n\ndef invoke():\n' + '    native_page_target()\n'.repeat(17)));
       await callGraph.rebuild(undefined, undefined, { force: true });
@@ -113,9 +113,9 @@ suite('Usage result presentation', () => {
       assert.strictEqual(refreshed.totalReferences, 18);
       assert.notStrictEqual(refreshed.generation, first.generation);
     } finally {
+      callGraph.setWindowFocusedForTests(undefined);
       await vscode.workspace.fs.delete(file);
       await config.update('callGraphBackend', previous, vscode.ConfigurationTarget.Workspace);
-      await config.update('callGraphWatchExternalFileChanges', previousWatch, vscode.ConfigurationTarget.Workspace);
     }
   });
 
