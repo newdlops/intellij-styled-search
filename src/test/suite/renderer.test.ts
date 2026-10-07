@@ -13817,6 +13817,9 @@ suite('Renderer — overlay UI probes', () => {
     assert.ok(folder, 'expected fixture workspace folder');
     const alphaUri = vscode.Uri.joinPath(folder!.uri, 'alpha.py').toString();
     const betaUri = vscode.Uri.joinPath(folder!.uri, 'beta.js').toString();
+    const repeatCount = Number(process.env.IJSS_E2E_PREVIEW_CLICK_REPEATS || 1);
+    assert.ok(Number.isInteger(repeatCount) && repeatCount >= 1 && repeatCount <= 20,
+      'preview click repeats must be an integer from 1 to 20');
 
     await overlay.show('PreviewClickProbe', { forceLiteral: true, suppressSearch: true });
     await warmMonacoPreviewForRendererTest(overlay, 'PreviewClickProbe');
@@ -13863,7 +13866,7 @@ suite('Renderer — overlay UI probes', () => {
           });
           window.__ijFindOnMessage({ type: 'results:done', searchId: 940, totalFiles: 2, totalMatches: 32, truncated: false, __targetSrc: targetSrc });
           function resultRow(idx) {
-            return document.querySelector('.ij-find-row[data-flat="' + idx + '"]');
+            return root && root.querySelector('.ij-find-row[data-flat="' + idx + '"]');
           }
           for (var rowWait = 0; rowWait < 20 && !resultRow(1); rowWait++) {
             await new Promise(function (resolve) { setTimeout(resolve, 10); });
@@ -13879,7 +13882,8 @@ suite('Renderer — overlay UI probes', () => {
         var timings = [];
         var requestTimings = [];
         var renderTimings = [];
-        for (var idx = 1; idx <= 16; idx++) {
+        for (var click = 0; click < ${repeatCount * 16}; click++) {
+          var idx = click % 16 + 1;
             var row = resultRow(idx);
           if (!row) {
             globalThis.irSearchEvent = oldBridge;
@@ -13895,7 +13899,7 @@ suite('Renderer — overlay UI probes', () => {
             timings.push({ idx: idx, requestAtMs: null, previewAtMs: null, uri: null });
             continue;
           }
-          var uniquePreviewText = 'preview click load row ' + idx + ' ' + previewReq.uri;
+          var uniquePreviewText = 'preview click load row ' + click + ' ' + previewReq.uri;
           window.__ijFindOnMessage({
             type: 'preview',
             uri: previewReq.uri,
@@ -13957,8 +13961,8 @@ suite('Renderer — overlay UI probes', () => {
     assert.strictEqual(parsed.err, undefined, `expected repeated search result rows: ${raw}`);
     assert.strictEqual(parsed.activeIndex, 16, `final click should select the final loaded row: ${raw}`);
     assert.ok(parsed.previewUri === alphaUri || parsed.previewUri === betaUri, `final click should switch preview to a fixture URI: ${raw}`);
-    assert.strictEqual(parsed.requestTimings.length, 16, `expected every loaded click to request preview: ${raw}`);
-    assert.strictEqual(parsed.renderTimings.length, 16, `expected every loaded click to render preview: ${raw}`);
+    assert.strictEqual(parsed.requestTimings.length, repeatCount * 16, `expected every loaded click to request preview: ${raw}`);
+    assert.strictEqual(parsed.renderTimings.length, repeatCount * 16, `expected every loaded click to render preview: ${raw}`);
     assertTimingsWithin('result click preview request latency', parsed.requestTimings, 10);
     // Native Monaco model replacement on current VS Code builds can cross
     // 10ms during first-language activation. Keep it within a 60Hz frame plus

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Fixed UTF-8 boundary panics in Unicode trailing identifiers and member receivers, including JSX text, and counted UTF-16 positions with one forward cursor per line.
+- Reused bounded inheritance-family lookups across usage count shards while preserving count records, and reported rebuild completion only after required counts finish.
+- Added isolated real-project usage resource and independent Python/TypeScript semantic audits, plus an opt-in real-workspace panel delivery test.
+- Added repeatable preview-click timing probes without changing existing budgets.
+- Updated development test tooling to remove all audited dependency vulnerabilities; Node 22.12+ is required for development tests. The default/release branch is now main2, with main retained as historical reference.
+
 ## 0.1.7153 - 2026-10-07
 
 - Made usage hints count the distinct references returned by Find Usages, including conservative candidates, across rebuilds, edits, deletions and compaction. Materialized count shards avoid repeated reference scans.

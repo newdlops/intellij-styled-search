@@ -9,6 +9,11 @@ on:
         description: Enforce the existing hardware timing budgets
         type: boolean
         default: false
+      preview_click_repeats:
+        description: Repetitions of the 16-click preview latency probe
+        type: choice
+        options: ['1', '5', '10', '20']
+        default: '1'
 
 permissions:
   contents: read
@@ -74,6 +79,7 @@ jobs:
           # hosted desktop session is disconnected or occluded. The test logs
           # the actual window policy; it does not warm the first hint request.
           IJSS_E2E_FOREGROUND_TIMINGS: '1'
+          IJSS_E2E_PREVIEW_CLICK_REPEATS: ${{ inputs.preview_click_repeats || '10' }}
           IJSS_E2E_TIMING_JSON: artifacts/desktop-compatibility/renderer-timings.json
         run: npm test -- --run out/test/suite/renderer.test.js
       - name: Summarize renderer diagnostics

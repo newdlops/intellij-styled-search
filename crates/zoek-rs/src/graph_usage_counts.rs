@@ -8,6 +8,16 @@ pub(super) const SHARD_PREFIX: &str = "callgraph-usage-counts-by-id-v1";
 const MAGIC: &[u8; 8] = b"IJSSUC01";
 type CandidateMap = BTreeMap<(u64, u64, u64), Vec<OverlayTokenShapeCandidate>>;
 
+// A build/audit reads one immutable graph generation. Reuse hierarchy lookups
+// across target shards, with a boundary on retained declarations and entries.
+fn bound_member_families(families: &mut HashMap<String, Option<MemberImplementationFamily>>) {
+    let methods: usize = families.values().filter_map(Option::as_ref)
+        .map(|family| family.methods.len()).sum();
+    if methods > 50_000 || families.len() > 65_536 {
+        families.clear();
+    }
+}
+
 // Compaction preserves builtAt for the extension's cache guard. Serving
 // generations additionally identify the immutable base so an old cursor
 // cannot become valid again when the overlay revision resets.
@@ -69,6 +79,7 @@ pub(super) fn build(workspace: &Path, config: &EngineConfig) -> io::Result<()> {
     let generation = base_generation(workspace, config, built_at)?;
     let files = read_file_table_binary(&graph_file_table_path(workspace, config))?;
     let empty_overlay = GraphOverlay::new(built_at);
+    let mut member_families = HashMap::default();
     for shard in 0..GRAPH_SHARD_COUNT {
         let symbol_path = graph_shard_path(workspace, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
         let symbols = if symbol_path.exists() {
@@ -78,7 +89,8 @@ pub(super) fn build(workspace: &Path, config: &EngineConfig) -> io::Result<()> {
         };
         let ids: HashSet<String> = symbols.iter().map(|symbol| symbol.id.clone()).collect();
         let counts =
-            deduped_reference_counts_from_index(workspace, config, &ids, &symbols, &empty_overlay)?;
+            deduped_reference_counts_from_index_with_families(workspace, config, &ids, &symbols, &empty_overlay, &mut member_families)?;
+        bound_member_families(&mut member_families);
         let mut rows: Vec<(u64, u64)> = symbols
             .iter()
             .filter_map(|symbol| {
@@ -282,6 +294,9 @@ pub(super) fn audit(
     top_n: usize,
     dump: Option<&Path>,
 ) -> io::Result<String> {
+    // Keep the base immutable while hierarchy entries are reused across the
+    // audit. Writers already hold this lock throughout count materialization.
+    let _graph_lock = acquire_graph_lock(workspace)?;
     let built_at = read_built_at_unix_ms(&graph_manifest_path(workspace, config))?;
     let overlay = GraphOverlay::load_valid(workspace, config, built_at);
     let table = read_file_table_binary(&graph_file_table_path(workspace, config))?;
@@ -295,6 +310,7 @@ pub(super) fn audit(
     let mut over_total = 0usize;
     let mut dump_text =
         String::from("relPath\tname\tkind\tusageCount\tusageMust\tusageMay\tqueryable\n");
+    let mut member_families = HashMap::default();
     for shard in 0..GRAPH_SHARD_COUNT {
         let path = graph_shard_path(workspace, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
         let mut symbols = if path.exists() {
@@ -311,7 +327,8 @@ pub(super) fn audit(
         );
         let ids: HashSet<String> = symbols.iter().map(|symbol| symbol.id.clone()).collect();
         let actual =
-            deduped_reference_counts_from_index(workspace, config, &ids, &symbols, &overlay)?;
+            deduped_reference_counts_from_index_with_families(workspace, config, &ids, &symbols, &overlay, &mut member_families)?;
+        bound_member_families(&mut member_families);
         let mut displayed = symbols.clone();
         apply_count_options_for_symbols(
             workspace,
@@ -615,6 +632,21 @@ mod tests {
         assert_eq!(result.symbols[0].id, target.id);
         assert_eq!(result.symbols[0].usage_count, None);
         assert_eq!(result.symbols[0].implementation_count, None);
+    }
+
+    #[test]
+    fn jsx_unicode_text_before_parentheses_does_not_abort_usage_indexing() {
+        let ws = Workspace::new();
+        let config = EngineConfig::default();
+        fs::write(ws.0.join("pkg/view.tsx"),
+            "export function act() { return 1; }\nexport const View = () => (\n  <section>\n    説明 文字 (optional)\n    你好 🙂 (details)\n    {act()}\n  </section>\n);\nfunction probe(value) { return value.flag名前.test(); }\n").unwrap();
+        rebuild_graph_native(&ws.0, 400, &config, 2, &mut |_| {}).unwrap();
+        let target = query_graph_symbols(&ws.0, "act", 10, &config)
+            .unwrap().unwrap().symbols.into_iter().find(|symbol| symbol.name == "act").unwrap();
+        let result = query_graph(&ws.0, &target.id, 10, &config).unwrap().unwrap();
+        assert_eq!(target.usage_count, Some(1));
+        assert_eq!(result.total_references, 1);
+        assert_eq!(result.references[0].start_line, 5);
     }
 
     #[test]

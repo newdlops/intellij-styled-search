@@ -1484,6 +1484,20 @@ fn append_lazy_token_shape_references_with_overlay(
     references: &mut Vec<GraphReference>,
     overlay: &crate::graph_overlay::GraphOverlay,
 ) -> io::Result<()> {
+    append_lazy_token_shape_references_with_overlay_and_families(
+        workspace_root, config, symbols, file_table, references, overlay, &mut HashMap::default(),
+    )
+}
+
+fn append_lazy_token_shape_references_with_overlay_and_families(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &[GraphSymbol],
+    file_table: &FileTable,
+    references: &mut Vec<GraphReference>,
+    overlay: &crate::graph_overlay::GraphOverlay,
+    member_families: &mut HashMap<String, Option<MemberImplementationFamily>>,
+) -> io::Result<()> {
     if symbols.is_empty() {
         return Ok(());
     }
@@ -1520,8 +1534,6 @@ fn append_lazy_token_shape_references_with_overlay(
     // suppressing lazy ones. Import/type/lexical rows are independent of this
     // cardinality and remain untouched.
     let mut assignable_targets: HashSet<&str> = HashSet::default();
-    let mut member_families: HashMap<String, Option<MemberImplementationFamily>> =
-        HashMap::default();
     for symbol in symbols {
         let key = (
             stable_hash(&symbol.language),
@@ -1535,7 +1547,7 @@ fn append_lazy_token_shape_references_with_overlay(
                 config,
                 symbol,
                 count.member,
-                &mut member_families,
+                member_families,
             )?
         } else {
             count.bare == 1
@@ -4107,6 +4119,19 @@ where
     // that queries would only reject.
     let _ = crate::graph_overlay::GraphOverlay::clear(workspace_root, config);
     let indexing_ms = indexing_started.elapsed().as_millis();
+    progress(GraphRebuildProgress {
+        stage: "indexing",
+        current: 0,
+        total: summary.symbol_count,
+        message: "computing live usage counts and outgoing reference tallies".to_string(),
+    });
+    let counts_started = std::time::Instant::now();
+    // A failed optional outgoing tally retains the existing base-only fallback.
+    if let Err(err) = build_and_write_outgoing_tally(workspace_root, config) {
+        eprintln!("[graph-rebuild] outgoing-tally build skipped: {err}");
+    }
+    usage_counts::build(workspace_root, config)?;
+    let counts_ms = counts_started.elapsed().as_millis();
     let total_ms = started.elapsed().as_millis();
     dump_parse_profile_if_enabled();
     progress(GraphRebuildProgress {
@@ -4114,17 +4139,10 @@ where
         current: streamed_reference_count,
         total: streamed_reference_count,
         message: format!(
-            "wrote graph index files={} symbols={} references={} discover={discover_ms}ms parse={parsing_ms}ms resolve={resolving_ms}ms index={indexing_ms}ms total={total_ms}ms",
+            "wrote graph index files={} symbols={} references={} discover={discover_ms}ms parse={parsing_ms}ms resolve={resolving_ms}ms index={indexing_ms}ms counts={counts_ms}ms total={total_ms}ms",
             summary.file_count, summary.symbol_count, summary.reference_count
         ),
     });
-    // Post-build pass: the per-source-file scoped outgoing tally that the overlay
-    // edit path needs for exact count deltas. Best-effort — a failure here must
-    // not fail the rebuild (the overlay degrades to base-only counts).
-    if let Err(err) = build_and_write_outgoing_tally(workspace_root, config) {
-        eprintln!("[graph-rebuild] outgoing-tally build skipped: {err}");
-    }
-    usage_counts::build(workspace_root, config)?;
     Ok(summary)
 }
 
@@ -8515,12 +8533,19 @@ fn extract_ref_sites(
             .and_then(|o| o.as_deref())
             .and_then(parse_stable_symbol_id_to_u64)
             .unwrap_or(0);
+        // Tokens arrive in byte order. Count each intervening UTF-8 span
+        // once instead of rescanning the entire prefix for every token.
+        let mut column_byte_cursor = 0;
+        let mut column_utf16_cursor = 0u32;
         for (name, start, end) in identifier_tokens(&sanitized) {
             if is_keyword(&name, language) {
                 continue;
             }
-            let start_column = utf16_column(line, start);
-            let end_column = utf16_column(line, end);
+            column_utf16_cursor += line[column_byte_cursor..start].encode_utf16().count() as u32;
+            let start_column = column_utf16_cursor;
+            column_utf16_cursor += line[start..end].encode_utf16().count() as u32;
+            let end_column = column_utf16_cursor;
+            column_byte_cursor = end;
             let is_definition =
                 definition_positions.contains(&(line_idx as u32, start_column, name.as_str()));
             let edge_kind = if next_nonspace_char(&sanitized, end) == Some('(') {
@@ -17587,6 +17612,19 @@ fn deduped_reference_counts_from_index(
     symbols: &[GraphSymbol],
     overlay: &crate::graph_overlay::GraphOverlay,
 ) -> io::Result<HashMap<String, usize>> {
+    deduped_reference_counts_from_index_with_families(
+        workspace_root, config, symbol_ids, symbols, overlay, &mut HashMap::default(),
+    )
+}
+
+fn deduped_reference_counts_from_index_with_families(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbol_ids: &HashSet<String>,
+    symbols: &[GraphSymbol],
+    overlay: &crate::graph_overlay::GraphOverlay,
+    member_families: &mut HashMap<String, Option<MemberImplementationFamily>>,
+) -> io::Result<HashMap<String, usize>> {
     if symbol_ids.is_empty() || !graph_index_available(workspace_root, config) {
         return Ok(HashMap::new());
     }
@@ -17656,13 +17694,14 @@ fn deduped_reference_counts_from_index(
     references.retain(|r| !overlay.entries.contains_key(&*r.rel_path));
     references.extend(overlay.live_refs().filter(|r| r.target_symbol_id.as_deref()
         .is_some_and(|target| ids_lower.contains(&target.to_ascii_lowercase()))).cloned());
-    append_lazy_token_shape_references_with_overlay(
+    append_lazy_token_shape_references_with_overlay_and_families(
         workspace_root,
         config,
         symbols,
         &file_table,
         &mut references,
         overlay,
+        member_families,
     )?;
     let mut counts: HashMap<String, usize> = HashMap::default();
     for reference in dedupe_graph_references_by_source_occurrence(references) {
@@ -18336,17 +18375,14 @@ fn leading_identifier(value: &str) -> Option<String> {
 }
 
 fn trailing_identifier(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut end = bytes.len();
-    while end > 0 && !is_ident_continue(bytes[end - 1] as char) {
-        end -= 1;
-    }
-    let mut start = end;
-    while start > 0 && is_ident_continue(bytes[start - 1] as char) {
-        start -= 1;
-    }
-    if start == end {
-        return None;
+    let mut chars = value.char_indices().rev();
+    let (mut start, last) = chars.find(|(_, ch)| is_ident_continue(*ch))?;
+    let end = start + last.len_utf8();
+    for (offset, ch) in chars {
+        if !is_ident_continue(ch) {
+            break;
+        }
+        start = offset;
     }
     let name = &value[start..end];
     name.chars().next().filter(|ch| is_ident_start(*ch))?;
@@ -19197,30 +19233,11 @@ fn followed_by_property_colon(line: &str, idx: usize) -> bool {
 }
 
 fn member_receiver_name(line: &str, member_start: usize) -> Option<String> {
-    let bytes = line.as_bytes();
-    let mut dot = member_start;
-    while dot > 0 && bytes[dot - 1].is_ascii_whitespace() {
-        dot -= 1;
-    }
-    if dot == 0 || bytes[dot - 1] != b'.' {
-        return None;
-    }
-    let mut end = dot - 1;
-    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    let mut start = end;
-    while start > 0 {
-        let ch = bytes[start - 1] as char;
-        if !is_ident_continue(ch) {
-            break;
-        }
-        start -= 1;
-    }
-    if start == end {
-        return None;
-    }
-    let receiver = &line[start..end];
+    let prefix = line[..member_start].trim_end().strip_suffix('.')?.trim_end();
+    let start = prefix.char_indices().rev()
+        .take_while(|(_, ch)| is_ident_continue(*ch))
+        .map(|(offset, _)| offset).last()?;
+    let receiver = &prefix[start..];
     is_identifier(receiver).then(|| receiver.to_string())
 }
 
@@ -19614,6 +19631,38 @@ mod tests {
             bound_mask: 0,
             confidence: confidence.into(),
             provenance: provenance.into(),
+        }
+    }
+
+    #[test]
+    fn member_receivers_keep_complete_unicode_identifiers() {
+        for (source, expected) in [
+            ("if (this.flag名前.test(value)) {", Some("flag名前")),
+            ("résumé . run()", Some("résumé")),
+            ("🙂名前.test()", Some("名前")),
+            ("e\u{301}.test()", Some("e\u{301}")),
+            ("factory().test()", None),
+        ] {
+            let member_start = source.find("test").or_else(|| source.find("run")).unwrap();
+            assert_eq!(member_receiver_name(source, member_start).as_deref(), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn trailing_identifiers_follow_unicode_boundaries_and_identifier_rules() {
+        for (source, expected) in [
+            ("object.member()", Some("member")),
+            ("ข้อความ 名称", Some("名称")),
+            ("<span>表示 (required)", Some("required")),
+            ("résumé", Some("résumé")),
+            ("e\u{301}!", Some("e\u{301}")),
+            ("🙂名前…", Some("名前")),
+            ("42", None),
+            ("\u{301}", None),
+            ("🙂", None),
+            ("", None),
+        ] {
+            assert_eq!(trailing_identifier(source).as_deref(), expected, "{source}");
         }
     }
 

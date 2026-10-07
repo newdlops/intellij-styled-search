@@ -89,3 +89,6 @@ including process startup and JSON serialization; they do not establish rebuild
 throughput or precision/recall on arbitrary projects. Raw samples and binary
 hashes are in `artifacts/benchmarks/usage-query-paired-comparison.json`; the local
 reproduction script is `node scripts/compareUsageQueries.js BEFORE AFTER`.
+
+For real workload size, resource measurements, independent semantic samples and
+their remaining inference gaps, see [the real-project audit](usage-real-project-audit.md).

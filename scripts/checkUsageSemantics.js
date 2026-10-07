@@ -17,6 +17,7 @@ try {
     recursive: true, filter: (source) => !source.split(path.sep).some((part) => part === '.zoek-rs' || part === '__pycache__'),
   });
   invokePython('scripts/verify_usage_accuracy_test.py');
+  invokePython('scripts/auditPythonUsageSemantics_test.py');
   invokePython('scripts/verify_usage_accuracy.py', workspace, '--expectations', path.join(workspace, 'expected.json'), '--binary', binary, '--rebuild');
   const dump = path.join(workspace, 'live-audit.tsv');
   const audit = JSON.parse(execFileSync(binary, ['graph-audit-counts', workspace, '--dump-first-party', dump], { encoding: 'utf8', timeout: 120000, windowsHide: true }));

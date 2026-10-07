@@ -29,7 +29,7 @@ another's output while extension hosts run concurrently.
 
 ## Prerequisites
 
-- Node.js + npm for extension compilation
+- Node.js 22.12 or newer + npm for compilation and development tests
 - Rust + Cargo if you want the Rust engine to be available without relying on an already-built `target/`
 - `vsce` to package a VSIX
 
@@ -209,10 +209,22 @@ npm test -- --run out/test/suite/renderer.test.js
 `IJSS_E2E_TIMING_MODE=report` records hardware measurements without failing on
 wall-clock overruns. Unknown modes and incomplete/non-finite measurements fail
 in either mode. The workflow defines `enforce_timings` for strict manual runs.
-GitHub requires the workflow to be registered on the repository's default
-branch before manual dispatch is available. This workflow currently lives on
-`main2`, while the default branch is `main`; use the local strict command until
-that registration is made. See [GitHub's manual workflow requirements](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
+The repository's default and release branch is `main2`. The older `main`
+history is retained for reference. Desktop compatibility is registered on the
+default branch and supports manual strict runs:
+
+```bash
+gh workflow run desktop-compatibility.yml --ref main2 -f enforce_timings=true -f preview_click_repeats=10
+```
+
+See [GitHub's manual workflow requirements](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
+
+The optional repeat count expands the existing preview-click probe without
+changing its request/render budgets or per-click completion assertions.
+Development tests use Mocha 12 through a test-cli override because test-cli's
+declared Mocha 11 dependency retains a vulnerable serialization dependency.
+The override is covered by the desktop extension suites; these packages are
+development-only and are excluded from the VSIX.
 
 Recommended smoke checks:
 
