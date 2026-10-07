@@ -310,3 +310,10 @@ uses the same required desktop checks and unchanged timing budgets. In its
 macOS shared-runner report, preview render p95 is 6 ms but one sample is 29 ms
 (20 ms budget); native preview after hide/show is 71 ms (50 ms budget). These
 overruns remain visible and are not classified as resolved performance issues.
+
+The initial Windows 11 standard-account UserSetup job failed: the independent
+PowerShell account probe exceeded its 30-second limit, and main-process discovery
+failed before a later diagnostic CIM snapshot succeeded. Four native/path/search
+checks passed in that job. Its failure logs and attachment diagnostics are
+retained. The preceding implementation run passed the same account test; a fresh
+acceptance result is required before publishing this release.
