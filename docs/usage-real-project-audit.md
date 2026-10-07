@@ -315,5 +315,8 @@ The initial Windows 11 standard-account UserSetup job failed: the independent
 PowerShell account probe exceeded its 30-second limit, and main-process discovery
 failed before a later diagnostic CIM snapshot succeeded. Four native/path/search
 checks passed in that job. Its failure logs and attachment diagnostics are
-retained. The preceding implementation run passed the same account test; a fresh
-acceptance result is required before publishing this release.
+retained. The preceding implementation run passed the same account test. The
+failed job was rerun on the identical implementation commit without changing
+the checks or timeouts: both 1.114.0 and stable UserSetup acceptance passed,
+and the overall four-job CI run succeeded on attempt two. This repetition does
+not establish the root cause of the initial PowerShell startup timeout.
