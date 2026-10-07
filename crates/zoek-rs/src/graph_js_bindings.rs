@@ -164,7 +164,10 @@ impl LexicalBindings {
         // Discover all function bodies before assigning var declarations.
         let mut functions = Vec::new();
         for i in 0..tokens.len() {
-            let (params, body, internal_name) = if text(i) == "function" {
+            let (params, body, internal_name) = if text(i) == "catch" && text(i + 1) == "(" {
+                let Some(close) = pairs[i + 1] else { continue; };
+                (Some((i + 2, close)), close + 1, None)
+            } else if text(i) == "function" {
                 let mut open = i + 1;
                 if text(open) == "*" {
                     open += 1;
@@ -233,7 +236,7 @@ impl LexicalBindings {
             } else {
                 continue;
             };
-            result.scopes[scope].function = true;
+            result.scopes[scope].function = text(i) != "catch";
             functions.push((i, scope, params, internal_name));
         }
         for (keyword, scope, params, internal_name) in functions {

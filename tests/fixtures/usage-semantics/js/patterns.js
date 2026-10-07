@@ -23,3 +23,18 @@ function localCallable() {
   return transform(3);
 }
 const selected = { transform };
+function listBindings() {
+  var $node,
+    transform = function (value) { return value; },
+    other;
+  return () => transform($node);
+}
+function caught() {
+  try { throw 1; } catch ({ transform }) {
+    var retained = transform;
+    return () => transform();
+  }
+  return retained;
+}
+export function $apply(value) { return value; }
+$apply(4);

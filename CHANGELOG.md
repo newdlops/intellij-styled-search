@@ -9,6 +9,7 @@
 - Added an independent TypeScript compiler reference gate to the semantic fixture checks on macOS and Windows.
 - Removed a second full reference array during occurrence deduplication, reducing peak memory in the measured platform workload.
 - Kept nested object/array destructuring and curried arrow parameters in their lexical scopes, and excluded unrelated value declarations from callable usages.
+- Recognized dollar-sign identifiers and catch bindings, and kept resolved import aliases out of unrelated name-based usage candidates.
 - Extended the independent compiler gate to reject value declaration names reported as usages.
 - Used immediate scrolling in bundled previews so result selection and trusted pointer hover target a stable line.
 - Native graph/cache versions are now 16/24 on POSIX and 17/25 on Windows and require one reindex.

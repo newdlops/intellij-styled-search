@@ -34,6 +34,9 @@
       "locations": [["js/patterns.js", 1, 0], ["js/patterns.js", 8, 31], ["js/patterns.js", 24, 19]],
       "forbiddenLocations": [["js/patterns.js", 3, 9], ["js/patterns.js", 6, 9],
         ["js/patterns.js", 11, 37], ["js/patterns.js", 14, 9], ["js/patterns.js", 17, 6],
-        ["js/patterns.js", 18, 9], ["js/patterns.js", 21, 11], ["js/patterns.js", 22, 9]]}
+        ["js/patterns.js", 18, 9], ["js/patterns.js", 21, 11], ["js/patterns.js", 22, 9],
+        ["js/patterns.js", 27, 4], ["js/patterns.js", 29, 15], ["js/patterns.js", 32, 27],
+        ["js/patterns.js", 33, 19], ["js/patterns.js", 34, 17],
+        ["js/import-shadow.js", 0, 7], ["js/import-shadow.js", 1, 0]]}
   ]
 }

@@ -9541,6 +9541,12 @@ fn resolve_ref_sites_a_to_e<'a>(
     let soa_b5 = force_columns || std::env::var("ZOEK_SOA_OFF").is_err();
     let symbol_name_hashes_ref = &symbol_name_hashes;
     let site_cols_ref = site_cols;
+    // A resolved JavaScript import introduces a lexical value binding. Its
+    // uses belong to the imported candidates, even when an unrelated callable
+    // in the same source root has the consumer's alias spelling.
+    let resolved_js_import_bindings: AHashSet<_> = import_targets.iter()
+        .filter(|((_, name), targets)| is_identifier(name) && !targets.is_empty())
+        .map(|((rel, name), _)| (stable_hash(rel), stable_hash(name))).collect();
     let phase_c_outputs = if phase_c_total == 0 || phase_c_workers <= 1 {
         vec![phase_c_process_chunk(
             ref_sites,
@@ -9550,6 +9556,7 @@ fn resolve_ref_sites_a_to_e<'a>(
             symbol_name_hashes_ref,
             soa_b5,
             recon.and_then(|r| r.file),
+            &resolved_js_import_bindings,
         )]
     } else {
         use rayon::prelude::*;
@@ -9571,6 +9578,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                     symbol_name_hashes_ref,
                     soa_b5,
                     recon.and_then(|r| r.file),
+                    &resolved_js_import_bindings,
                 )
             })
             .collect()
@@ -12037,6 +12045,7 @@ fn phase_c_process_chunk(
     // `None` reads the site. Reconstruction is byte-exact: file_id round-trips
     // the path and site languages are canonical (probe: 0 unknown languages).
     file_recon: Option<(&FileTable, &[u32])>,
+    resolved_js_import_bindings: &AHashSet<(u64, u64)>,
 ) -> PhaseCAccums {
     let mut bare_usage_may: AHashMap<u64, usize> = AHashMap::default();
     let mut bare_call_may: AHashMap<u64, usize> = AHashMap::default();
@@ -12065,6 +12074,9 @@ fn phase_c_process_chunk(
         // Proven local bindings are emitted directly. They cannot become
         // candidates for an unrelated declaration with the same spelling.
         if site_cols[i].lexical_target_id != 0 { continue; }
+        let site = site_cols[i];
+        if site.access_kind_id == ACCESS_KIND_BARE && matches!(site.language_id, 2 | 3)
+            && resolved_js_import_bindings.contains(&(site.rel_path_hash, site.name_hash)) { continue; }
         // Gated dense read. With `soa_b5` the per-site fields come from the 48B
         // `SiteCols`; otherwise from the 292B `RefSite`. The values are
         // identical (SiteCols is a field-for-field copy), so the maps below are
@@ -19915,11 +19927,11 @@ fn utf16_column(line: &str, byte_offset: usize) -> u32 {
 }
 
 fn is_ident_start(ch: char) -> bool {
-    ch == '_' || unicode_ident::is_xid_start(ch)
+    ch == '_' || ch == '$' || unicode_ident::is_xid_start(ch)
 }
 
 fn is_ident_continue(ch: char) -> bool {
-    unicode_ident::is_xid_continue(ch)
+    ch == '$' || unicode_ident::is_xid_continue(ch)
 }
 
 fn rebuild_reference_uris(workspace_root: &Path, references: &mut [GraphReference]) {
@@ -22757,13 +22769,21 @@ def use(client):
     #[test]
     fn javascript_destructuring_and_curried_closures_preserve_binding_identity() {
         let source = test_entry("pkg/patterns.js", include_str!("../../../tests/fixtures/usage-semantics/js/patterns.js"));
-        let (symbols, result) = resolve_test_entries(&[source]);
+        let provider = test_entry("pkg/provider.js", "export default function Factory() { return 1; }\n");
+        let consumer = test_entry("pkg/import-shadow.js", include_str!("../../../tests/fixtures/usage-semantics/js/import-shadow.js"));
+        let (symbols, result) = resolve_test_entries(&[source, provider, consumer]);
         let target = symbols.iter().find(|symbol| symbol.name == "transform" && symbol.start_line == 0).unwrap();
         let locations: HashSet<_> = result.references.iter()
             .filter(|reference| reference.target_symbol_id.as_deref() == Some(&target.id))
             .map(|reference| (reference.start_line, reference.start_column)).collect();
         assert_eq!(locations, [(1, 0), (8, 31), (24, 19)].into_iter().collect(),
             "defaults and shorthand values use the module callable; binding names, closures and unrelated declarations do not");
+        let imported = symbol_id(&symbols, "Factory");
+        assert!(result.references.iter().any(|reference| reference.target_symbol_id.as_deref() == Some(imported)
+            && &*reference.rel_path == "pkg/import-shadow.js" && reference.start_line == 1));
+        let dollar = symbol_id(&symbols, "$apply");
+        assert!(result.references.iter().any(|reference| reference.target_symbol_id.as_deref() == Some(dollar)
+            && &*reference.rel_path == "pkg/patterns.js" && reference.start_line == 39));
     }
 
     #[test]
