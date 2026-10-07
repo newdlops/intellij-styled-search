@@ -67,11 +67,13 @@ Python 3.12 AST and symbol-table analysis supplied required locations for module
 functions and explicit imports, with lexical shadowing checked independently of
 the native resolver. TypeScript's language service supplied a separate sample
 for TypeScript/JavaScript module functions.
+Comprehension bindings are modelled explicitly so the oracle preserves their
+isolation across Python 3.11 and [3.12's inlining](https://peps.python.org/pep-0709/).
 
 | Oracle sample | Declarations | Required locations | Found |
 | --- | ---: | ---: | ---: |
-| Python monorepo | 20 | 4,127 | 4,010 |
-| Python Django platform | 20 | 3,211 | 3,178 |
+| Python monorepo | 20 | 4,141 | 4,024 |
+| Python Django platform | 20 | 3,216 | 3,183 |
 | TypeScript monorepo | 20 | 51 | 51 |
 | JavaScript Django platform | 20 | 36 | 36 |
 

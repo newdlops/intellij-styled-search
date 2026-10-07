@@ -44,6 +44,18 @@ class ScopeOracleTests(unittest.TestCase):
             'action()\n'})
         self.assertNotIn(('source.py', 'action'), oracle.targets)
 
+    def test_comprehension_locals_do_not_leak_and_nested_lambdas_capture_them(self):
+        oracle = self.oracle({'scope.py':
+            'def action():\n    pass\n'
+            'def outer():\n'
+            '    values = [action() for action in action()]\n'
+            '    deferred = [(lambda: action()) for action in []]\n'
+            '    return action()\n'})
+        self.assertEqual(oracle.required[('scope.py', 'action')],
+                         {('scope.py', 3, 37), ('scope.py', 5, 11)})
+        self.assertEqual(oracle.local_names[('scope.py', 3, 14)], 'action')
+        self.assertEqual(oracle.local_names[('scope.py', 4, 25)], 'action')
+
     def test_unicode_ast_bytes_are_converted_to_utf16_columns(self):
         oracle = self.oracle({'unicode.py':
             'def action():\n    pass\n'

@@ -100,6 +100,10 @@ class Visitor(ast.NodeVisitor):
     def resolve(self, name):
         free = False
         for frame in reversed(self.frames):
+            if 'comprehensionBindings' in frame:
+                if name in frame['comprehensionBindings']:
+                    return None
+                continue
             if free and frame['table'].get_type() == 'class':
                 continue
             try:
@@ -144,6 +148,11 @@ class Visitor(ast.NodeVisitor):
             # A parameter/local binding proves that this token does not use
             # an unrelated module function with the same spelling.
             for frame in reversed(self.frames[1:]):
+                if 'comprehensionBindings' in frame:
+                    if node.id in frame['comprehensionBindings']:
+                        self.oracle.local_names[point] = node.id
+                        break
+                    continue
                 try:
                     symbol = frame['table'].lookup(node.id)
                 except KeyError:
@@ -158,17 +167,24 @@ class Visitor(ast.NodeVisitor):
         self.visit(node.value)
         if isinstance(node.value, ast.Name):
             name = node.value.id
-            frame = self.frames[0]
-            if len(self.frames) > 1:
-                try:
-                    symbol = self.frames[-1]['table'].lookup(name)
-                    if symbol.is_local() and name not in self.frames[-1]['moduleAliases']:
+            module = None
+            for frame in reversed(self.frames):
+                if 'comprehensionBindings' in frame:
+                    if name in frame['comprehensionBindings']:
                         return
-                    if symbol.is_local():
-                        frame = self.frames[-1]
+                    continue
+                try:
+                    symbol = frame['table'].lookup(name)
                 except KeyError:
-                    pass
-            module = frame['moduleAliases'].get(name)
+                    continue
+                if symbol.is_global() or frame is self.frames[0]:
+                    module = self.frames[0]['moduleAliases'].get(name)
+                    break
+                if symbol.is_free() or symbol.is_nonlocal():
+                    continue
+                if symbol.is_local():
+                    module = frame['moduleAliases'].get(name)
+                    break
             if module:
                 target = self.oracle.imported(self.path, module, node.attr)
                 if target:
@@ -216,7 +232,20 @@ class Visitor(ast.NodeVisitor):
             remaining += [generator.iter, generator.target, *generator.ifs]
         remaining += [node.elt] if hasattr(node, 'elt') else [node.key, node.value]
         names = {ast.ListComp: 'listcomp', ast.SetComp: 'setcomp', ast.DictComp: 'dictcomp', ast.GeneratorExp: 'genexpr'}
-        self.enter(node, names[type(node)], remaining)
+        # PEP 709 removes list/set/dict comprehension child tables in 3.12.
+        # Bind iteration targets explicitly in both versions, while retaining
+        # the real table when present for lambdas nested in the comprehension.
+        parent = self.frames[-1]['table']
+        table = next((child for child in parent.get_children() if child not in self.used
+                      and child.get_name() == names[type(node)] and child.get_lineno() == node.lineno), parent)
+        if table is not parent:
+            self.used.add(table)
+        bindings = {item.id for generator in node.generators for item in ast.walk(generator.target)
+                    if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)}
+        self.frames.append({'table': table, 'imports': {}, 'moduleAliases': {}, 'comprehensionBindings': bindings})
+        for child in remaining:
+            self.visit(child)
+        self.frames.pop()
 
     visit_SetComp = visit_ListComp
     visit_DictComp = visit_ListComp
