@@ -48,16 +48,39 @@ Reference ranges use UTF-16 columns, including after masking Unicode literals.
 The [Python identifier rules](https://docs.python.org/3/reference/lexical_analysis.html#names-identifiers-and-keywords)
 are the language reference for the Unicode fixture.
 
-Python parameter declarations and their lexical value uses are excluded from
-unrelated same-name candidates. Header defaults and annotations stay in their
-enclosing scope; nested functions capture parameters unless an explicit global
-redirects lookup. Member names remain independent. Indexed local redefinitions
-retain conservative resolver handling. Lambda/comprehension bindings and complete
-local assignment scope resolution remain separate work. This follows the
+Python declarations and their lexical value uses are excluded from unrelated
+same-name candidates. Header defaults and annotations stay in their enclosing
+scope; nested functions capture parameters unless an explicit global redirects
+lookup. Local assignments, named expressions, lambdas and comprehension bindings
+retain their lexical scope. Indexed locals keep their own references. Member
+names remain independent. This follows the
 [Python name binding rules](https://docs.python.org/3/reference/executionmodel.html#resolution-of-names).
 The semantic oracle checks forbidden locations across every confidence level and
 required locations before applying its confirmed/call filters, so possible
 candidates cannot hide false positives or missing default references.
+
+JavaScript binding extraction distinguishes function `var` declarations, block
+`let`/`const` declarations, parameters, closures and named function expressions.
+Default imports follow the exported `default` binding, and alias propagation
+terminates on cycles without a depth cap. Explicit `.js`/`.jsx`/`.mjs`/`.cjs`
+imports retain their runtime path and the corresponding TypeScript source extension
+substitutions described in the [TypeScript module reference](https://www.typescriptlang.org/docs/handbook/modules/reference.html#file-extension-substitution).
+Import/export specifier locations retain their own binding evidence, including
+the `default` keyword in a re-export list.
+
+Script globals and explicit global-object assignments supply conservative
+cross-file candidates. Callable inputs to export wrappers also stay possible;
+syntax does not prove that the wrapper returns the identical callable. The
+independent compiler audit checks required locations and fully enumerated results
+before allowing the fixture gate to pass.
+
+Pending overlays store binding facts as well as symbols and references. A
+provider's alias edit invalidates transitive consumers; subsequent edits resolve
+against the provider's pending facts and symbols. Re-resolving a file that was
+already edited preserves its edited symbols and declaration-count deltas.
+Ordinary body edits with unchanged bindings avoid alias invalidation. A changed
+global binding scans one raw-site shard at a time to find consumers, including
+names that had no declaration at the previous build.
 
 Name lookup scans borrowed binary name fields and decodes matching symbols only.
 It preserves substring matches, ranking and total count, then reads count shards

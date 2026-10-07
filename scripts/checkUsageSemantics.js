@@ -21,6 +21,10 @@ try {
   invokePython('scripts/verify_usage_accuracy.py', workspace, '--expectations', path.join(workspace, 'expected.json'), '--binary', binary, '--rebuild');
   invokePython('scripts/auditPythonUsageSemantics.py', workspace, '--binary', binary,
     '--output', path.join(workspace, 'python-semantics.json'), '--fail-on-proven-errors');
+  execFileSync(process.execPath, ['scripts/auditTypeScriptUsageSemantics.js', workspace, binary,
+    path.join(workspace, 'javascript-semantics.json'), '1000', '--fail-on-proven-errors'], {
+    cwd: root, stdio: 'inherit', timeout: 120000, windowsHide: true,
+  });
   const dump = path.join(workspace, 'live-audit.tsv');
   const audit = JSON.parse(execFileSync(binary, ['graph-audit-counts', workspace, '--dump-first-party', dump], { encoding: 'utf8', timeout: 120000, windowsHide: true }));
   if (audit.undercount.symbols || audit.overcount.symbols) { throw new Error(JSON.stringify(audit)); }

@@ -472,6 +472,85 @@ mod tests {
     }
 
     #[test]
+    fn javascript_alias_edits_follow_dependencies_in_overlay_and_compaction() {
+        let ws = Workspace::new();
+        let config = EngineConfig::default();
+        let provider = ws.0.join("pkg/provider.js");
+        let consumer = ws.0.join("pkg/consumer.js");
+        let write_provider = |selected: &str| fs::write(&provider, format!(
+            "function First() {{ return 1; }}\nfunction Second() {{ return 2; }}\nexport default {selected};\n")).unwrap();
+        write_provider("First");
+        fs::write(ws.0.join("pkg/bridge.js"), "export { default as Alias } from './provider.js';\n").unwrap();
+        fs::write(&consumer, "import { Alias } from './bridge.js';\nAlias();\n").unwrap();
+        let lines = |name: &str| {
+            let symbols = query_graph_symbols(&ws.0, name, 100, &config).unwrap().unwrap().symbols;
+            let target = symbols.iter().find(|symbol| symbol.name == name && symbol.rel_path == "pkg/provider.js").unwrap();
+            let page = query_graph(&ws.0, &target.id, usize::MAX, &config).unwrap().unwrap();
+            assert_eq!(target.usage_count, Some(page.total_references));
+            let mut lines: Vec<_> = page.references.iter().filter(|reference| &*reference.rel_path == "pkg/consumer.js")
+                .map(|reference| reference.start_line).collect();
+            lines.sort(); lines.dedup(); lines
+        };
+        rebuild_graph_native(&ws.0, 700, &config, 1, &mut |_| {}).unwrap();
+        assert_eq!(lines("First"), [0, 1]);
+        fs::write(&consumer, "import { Alias } from './bridge.js';\nAlias();\nfunction local() {\n  var Alias = 0;\n  return Alias;\n}\n").unwrap();
+        overlay_update_graph_native(&ws.0, &[consumer.clone()], &[], 700, &config, 1).unwrap();
+        assert_eq!(lines("First"), [0, 1], "editing an importer must retain the transitive export binding");
+        write_provider("Second");
+        overlay_update_graph_native(&ws.0, &[provider.clone()], &[], 700, &config, 1).unwrap();
+        assert!(lines("First").is_empty(), "changing an export must invalidate unchanged consumers");
+        assert_eq!(lines("Second"), [0, 1]);
+        fs::write(&consumer, "import { Alias } from './bridge.js';\nAlias();\nAlias();\n").unwrap();
+        overlay_update_graph_native(&ws.0, &[consumer.clone()], &[], 700, &config, 1).unwrap();
+        assert_eq!(lines("Second"), [0, 1, 2], "later edits must use a provider's pending binding facts");
+        compact_graph_overlay(&ws.0, 701, &config, 1).unwrap();
+        assert_eq!(lines("Second"), [0, 1, 2]);
+        write_provider("First");
+        update_graph_native(&ws.0, &[provider], &[], 702, &config, 1).unwrap();
+        assert_eq!(lines("First"), [0, 1, 2]);
+        assert!(lines("Second").is_empty());
+        let report: serde_json::Value = serde_json::from_str(&audit(&ws.0, &config, 10, None).unwrap()).unwrap();
+        assert_eq!(report["undercount"]["symbols"], 0);
+        assert_eq!(report["overcount"]["symbols"], 0);
+    }
+
+    #[test]
+    fn javascript_global_assignment_edits_refresh_existing_and_pending_consumers() {
+        let ws = Workspace::new();
+        let config = EngineConfig::default();
+        let provider = ws.0.join("pkg/global-provider.js");
+        let consumer = ws.0.join("pkg/global-consumer.js");
+        let write_provider = |selected: &str| fs::write(&provider, format!(
+            "function First() {{ return 1; }}\nfunction Second() {{ return 2; }}\nexport {{}};\nwindow.published = {selected};\n")).unwrap();
+        write_provider("First");
+        fs::write(&consumer, "window.published();\n").unwrap();
+        let lines = |name: &str| {
+            let symbols = query_graph_symbols(&ws.0, name, 100, &config).unwrap().unwrap().symbols;
+            let target = symbols.iter().find(|symbol| symbol.name == name && symbol.rel_path == "pkg/global-provider.js").unwrap();
+            let page = query_graph(&ws.0, &target.id, usize::MAX, &config).unwrap().unwrap();
+            assert_eq!(target.usage_count, Some(page.total_references));
+            let mut lines: Vec<_> = page.references.iter().filter(|reference| &*reference.rel_path == "pkg/global-consumer.js")
+                .map(|reference| reference.start_line).collect();
+            lines.sort(); lines.dedup(); lines
+        };
+        rebuild_graph_native(&ws.0, 800, &config, 1, &mut |_| {}).unwrap();
+        assert_eq!(lines("First"), [0]);
+        fs::write(&consumer, "window.published();\nwindow.published();\n").unwrap();
+        overlay_update_graph_native(&ws.0, &[consumer.clone()], &[], 800, &config, 1).unwrap();
+        assert_eq!(lines("First"), [0, 1]);
+        write_provider("Second");
+        overlay_update_graph_native(&ws.0, &[provider], &[], 800, &config, 1).unwrap();
+        assert!(lines("First").is_empty());
+        assert_eq!(lines("Second"), [0, 1]);
+        fs::write(&consumer, "window.published();\nwindow.published();\nwindow.published();\n").unwrap();
+        overlay_update_graph_native(&ws.0, &[consumer], &[], 800, &config, 1).unwrap();
+        assert_eq!(lines("Second"), [0, 1, 2]);
+        compact_graph_overlay(&ws.0, 801, &config, 1).unwrap();
+        assert_eq!(lines("Second"), [0, 1, 2]);
+        assert!(lines("First").is_empty());
+    }
+
+    #[test]
     fn live_usage_counts_replace_removed_lazy_candidates_before_compaction() {
         let ws = Workspace::new();
         let config = EngineConfig::default();

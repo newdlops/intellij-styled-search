@@ -1,0 +1,11 @@
+import Local from './provider.js';
+import { Renamed, run, again } from './bridge.js';
+import * as api from './provider.js';
+import Wrapped from './wrapped.jsx';
+Local(1);
+Renamed(2);
+again(3);
+run();
+api.execute();
+api.count();
+Wrapped();

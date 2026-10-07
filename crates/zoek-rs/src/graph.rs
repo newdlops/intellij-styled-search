@@ -270,6 +270,14 @@ mod usage_counts;
 mod python_bindings;
 #[path = "graph_python_strings.rs"]
 mod python_strings;
+#[path = "graph_js_bindings.rs"]
+mod js_bindings;
+
+// A persisted cross-file script/global assignment binding, carried through
+// the same alias graph as imports. Invalid identifier prefix avoids collisions.
+const JS_GLOBAL_BINDING_PREFIX: &str = "@global:";
+const JS_IMPORT_SITE_PREFIX: &str = "@site:";
+const MAY_BINDING_PREFIX: &str = "@may:";
 
 const BOUND_MAY: u8 = 0b0001;
 const BOUND_MUST: u8 = 0b0010;
@@ -388,6 +396,7 @@ pub(crate) enum LightProvenance {
     UniqueName,
     TokenShape,
     ExternalTsv,
+    ScriptGlobal,
 }
 
 #[allow(dead_code)]
@@ -405,6 +414,7 @@ impl LightProvenance {
             LightProvenance::UniqueName => "unique-name",
             LightProvenance::TokenShape => "token-shape",
             LightProvenance::ExternalTsv => "external-tsv",
+            LightProvenance::ScriptGlobal => "script-global",
         }
     }
 }
@@ -578,6 +588,7 @@ fn compute_provenance_id(s: &str) -> u8 {
         "unique-name" => 8,
         "token-shape" => 9,
         "external-tsv" => 10,
+        "script-global" => 11,
         _ => PROVENANCE_OTHER,
     }
 }
@@ -596,6 +607,7 @@ fn provenance_str_from_id(id: u8) -> Option<&'static str> {
         8 => "unique-name",
         9 => "token-shape",
         10 => "external-tsv",
+        11 => "script-global",
         _ => return None,
     })
 }
@@ -735,7 +747,7 @@ struct HierarchyFact {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct ImportFact {
+pub(crate) struct ImportFact {
     file_id: String,
     rel_path: String,
     local_name: String,
@@ -744,7 +756,7 @@ struct ImportFact {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct TypeFact {
+pub(crate) struct TypeFact {
     rel_path: String,
     local_name: String,
     type_name: String,
@@ -752,7 +764,7 @@ struct TypeFact {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct FunctionReturnFact {
+pub(crate) struct FunctionReturnFact {
     rel_path: String,
     function_name: String,
     type_name: String,
@@ -2313,6 +2325,117 @@ fn read_facts_excluding_paths(
         returns.extend(r);
     }
     Ok((imports, types, returns))
+}
+
+fn read_facts_for_edit(
+    workspace: &Path, config: &EngineConfig, changed: &HashSet<String>, table: &FileTable,
+    include_overlay: bool,
+) -> io::Result<(Vec<ImportFact>, Vec<TypeFact>, Vec<FunctionReturnFact>, Vec<ImportFact>)> {
+    let (mut imports, mut types, mut returns) = read_facts_excluding_paths(workspace, config, &HashSet::new(), table)?;
+    if include_overlay {
+        let built_at = read_built_at_unix_ms(&graph_manifest_path(workspace, config)).unwrap_or(0);
+        let overlay = crate::graph_overlay::GraphOverlay::load_valid(workspace, config, built_at);
+        imports.retain(|fact| !overlay.entries.contains_key(&fact.rel_path));
+        types.retain(|fact| !overlay.entries.contains_key(&fact.rel_path));
+        returns.retain(|fact| !overlay.entries.contains_key(&fact.rel_path));
+        for (path, facts) in &overlay.binding_facts {
+            if overlay.entries.get(path).is_some_and(|entry| entry.kind != crate::graph_overlay::GraphOverlayEntryKind::Deleted) {
+                imports.extend(facts.imports.iter().cloned());
+                types.extend(facts.types.iter().cloned());
+                returns.extend(facts.returns.iter().cloned());
+            }
+        }
+    }
+    let prior = imports.iter().filter(|fact| changed.contains(&fact.rel_path)).cloned().collect();
+    imports.retain(|fact| !changed.contains(&fact.rel_path));
+    types.retain(|fact| !changed.contains(&fact.rel_path));
+    returns.retain(|fact| !changed.contains(&fact.rel_path));
+    Ok((imports, types, returns, prior))
+}
+
+fn changed_import_binding_paths(prior: &[ImportFact], current: &[ImportFact], changed: &HashSet<String>) -> HashSet<String> {
+    let signatures = |facts: &[ImportFact]| {
+        let mut result: HashMap<String, BTreeSet<(String, String, Vec<String>)>> = HashMap::new();
+        for fact in facts {
+            if changed.contains(&fact.rel_path) && !fact.local_name.starts_with(JS_IMPORT_SITE_PREFIX) {
+                result.entry(fact.rel_path.clone()).or_default().insert((fact.local_name.clone(), fact.imported_name.clone(), fact.module_candidates.clone()));
+            }
+        }
+        result
+    };
+    let old = signatures(prior);
+    let new = signatures(current);
+    changed.iter().filter(|path| old.get(*path) != new.get(*path)).cloned().collect()
+}
+
+fn extend_import_dependents(facts: &[ImportFact], seeds: &HashSet<String>, affected: &mut HashSet<String>) {
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for fact in facts {
+        for module in &fact.module_candidates { dependents.entry(module).or_default().push(&fact.rel_path); }
+    }
+    let mut visited = HashSet::new();
+    let mut queue: std::collections::VecDeque<&str> = seeds.iter().map(String::as_str).collect();
+    while let Some(module) = queue.pop_front() {
+        if !visited.insert(module) { continue; }
+        for importer in dependents.get(module).into_iter().flatten() {
+            affected.insert((*importer).to_string()); queue.push_back(importer);
+        }
+    }
+}
+
+fn extend_global_binding_dependents(
+    workspace: &Path, config: &EngineConfig, table: &FileTable,
+    prior: &[ImportFact], current: &[ImportFact], changed_bindings: &HashSet<String>,
+    affected: &mut HashSet<String>,
+) -> io::Result<()> {
+    let names: HashSet<_> = prior.iter().chain(current).filter(|fact| changed_bindings.contains(&fact.rel_path))
+        .filter_map(|fact| fact.local_name.strip_prefix(JS_GLOBAL_BINDING_PREFIX)).map(stable_hash).collect();
+    if names.is_empty() { return Ok(()); }
+    // A newly exposed property may have had no indexed declaration at the last
+    // build. Its raw sites still exist, even when the token-shape name filter
+    // had no candidate. Scan one file shard at a time, retaining only paths.
+    for shard in 0..GRAPH_SHARD_COUNT {
+        let path = graph_shard_path(workspace, config, GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX, shard);
+        if !path.exists() { continue; }
+        let bytes = fs::read(path)?;
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            let site = parse_ref_site_binary(&bytes, &mut cursor, table)?;
+            if matches!(site.language.as_ref(), "javascript" | "typescript") && !site.is_definition
+                && site.lexical_target_id == 0 && names.contains(&site.name_hash) {
+                affected.insert(site.rel_path.to_string());
+            }
+        }
+    }
+    let built_at = read_built_at_unix_ms(&graph_manifest_path(workspace, config)).unwrap_or(0);
+    let overlay = crate::graph_overlay::GraphOverlay::load_valid(workspace, config, built_at);
+    for (path, entry) in &overlay.entries {
+        if entry.token_shape_candidates.values().flatten().any(|candidate| names.contains(&stable_hash(&candidate.reference.name))) {
+            affected.insert(path.clone());
+        }
+    }
+    Ok(())
+}
+
+fn import_facts_for_resolution(facts: &[ImportFact], affected: &HashSet<String>, sites: &[RefSite]) -> Vec<ImportFact> {
+    let names: HashSet<_> = sites.iter().map(|site| site.name_hash).collect();
+    let mut by_file: HashMap<&str, Vec<&ImportFact>> = HashMap::new();
+    for fact in facts { by_file.entry(&fact.rel_path).or_default().push(fact); }
+    let mut reachable: HashSet<&str> = affected.iter().map(String::as_str).collect();
+    for fact in facts {
+        if fact.local_name.strip_prefix(JS_GLOBAL_BINDING_PREFIX).is_some_and(|name| names.contains(&stable_hash(name))) {
+            reachable.insert(&fact.rel_path);
+        }
+    }
+    let mut queue: std::collections::VecDeque<_> = reachable.iter().copied().collect();
+    while let Some(file) = queue.pop_front() {
+        for fact in by_file.get(file).into_iter().flatten() {
+            for module in &fact.module_candidates {
+                if by_file.contains_key(module.as_str()) && reachable.insert(module) { queue.push_back(module); }
+            }
+        }
+    }
+    facts.iter().filter(|fact| reachable.contains(fact.rel_path.as_str())).cloned().collect()
 }
 
 fn read_references_excluding_paths(
@@ -4294,8 +4417,8 @@ pub fn update_graph_native(
     // Changed files' freshly parsed sites are collected here and merged in then.
     let mut changed_ref_sites: Vec<RefSite> = Vec::new();
     let _t = std::time::Instant::now();
-    let (mut import_facts, mut type_facts, mut function_return_facts) =
-        read_facts_excluding_paths(workspace_root, config, &exclude_paths, &prior_file_table)?;
+    let (mut import_facts, mut type_facts, mut function_return_facts, prior_changed_imports) =
+        read_facts_for_edit(workspace_root, config, &exclude_paths, &prior_file_table, false)?;
     if probe { eprintln!("[flow] read_facts={}ms", _t.elapsed().as_millis()); }
     for path in changed_paths {
         let abs_path = if path.is_absolute() {
@@ -4409,6 +4532,13 @@ pub fn update_graph_native(
             affected_paths.insert(fact.rel_path.clone());
         }
     }
+    let mut dependency_seeds = changed_import_binding_paths(&prior_changed_imports, &import_facts, &exclude_paths);
+    let new_changed_ids: HashSet<_> = changed_full_symbols.iter().map(|symbol| symbol.id.clone()).collect();
+    if new_changed_ids != prior_changed_ids { dependency_seeds.extend(exclude_paths.iter().cloned()); }
+    dependency_seeds.extend(affected_paths.iter().filter(|path| !exclude_paths.contains(*path)).cloned());
+    extend_global_binding_dependents(workspace_root, config, &prior_file_table, &prior_changed_imports,
+        &import_facts, &dependency_seeds, &mut affected_paths)?;
+    extend_import_dependents(&import_facts, &dependency_seeds, &mut affected_paths);
     // Stage-1 slim: affected_paths is known now, so read only the ref_site shards
     // that hold those files (sharded by rel_path) instead of all 128, then merge
     // the freshly parsed changed sites. The affected files' sites live in these
@@ -4457,6 +4587,7 @@ pub fn update_graph_native(
     // `sidecars_ready` gate (else a full rebuild ran), so there is no full-symbol
     // fallback anymore (the carried table is gone).
     let _t = std::time::Instant::now();
+    let resolution_import_facts = import_facts_for_resolution(&import_facts, &affected_paths, &ref_sites);
     let resolve_candidates = build_resolve_candidate_symbols(
         workspace_root,
         config,
@@ -4466,7 +4597,7 @@ pub fn update_graph_native(
         &ref_sites,
         &affected_indices,
         &affected_paths,
-        &import_facts,
+        &resolution_import_facts,
         &type_facts,
         &function_return_facts,
         None, // full-incremental / compaction path reads importer symbols per-file
@@ -4484,7 +4615,7 @@ pub fn update_graph_native(
         &resolve_candidates,
         &ref_sites,
         Some(&affected_indices),
-        &import_facts,
+        &resolution_import_facts,
         &type_facts,
         &function_return_facts,
         &hierarchy_facts,
@@ -5161,8 +5292,8 @@ pub fn overlay_update_graph_native(
     let mut changed_full_symbols: Vec<GraphSymbol> = Vec::new();
     let mut changed_ref_sites: Vec<RefSite> = Vec::new();
     let t = std::time::Instant::now();
-    let (mut import_facts, mut type_facts, mut function_return_facts) =
-        read_facts_excluding_paths(workspace_root, config, &exclude_paths, &prior_file_table)?;
+    let (mut import_facts, mut type_facts, mut function_return_facts, prior_changed_imports) =
+        read_facts_for_edit(workspace_root, config, &exclude_paths, &prior_file_table, true)?;
     if probe { eprintln!("[overlay] read_facts={}ms", t.elapsed().as_millis()); }
     for path in changed_paths {
         if let Some(graph) = parse_overlay_file(workspace_root, path, config)? {
@@ -5247,6 +5378,12 @@ pub fn overlay_update_graph_native(
         }
         affected_paths.insert(fact.rel_path.clone());
     }
+    let mut dependency_seeds = changed_import_binding_paths(&prior_changed_imports, &import_facts, &exclude_paths);
+    if !changed_names.is_empty() { dependency_seeds.extend(exclude_paths.iter().cloned()); }
+    dependency_seeds.extend(affected_paths.iter().filter(|path| !exclude_paths.contains(*path)).cloned());
+    extend_global_binding_dependents(workspace_root, config, &prior_file_table, &prior_changed_imports,
+        &import_facts, &dependency_seeds, &mut affected_paths)?;
+    extend_import_dependents(&import_facts, &dependency_seeds, &mut affected_paths);
     if probe {
         eprintln!(
             "[overlay] changed_names={} (prior_names={} fresh_names={})",
@@ -5301,11 +5438,7 @@ pub fn overlay_update_graph_native(
     // and feeding that whole set to the resolver is a fixed O(total-facts)
     // map-build that dominates the floor of a low-fanout edit. (This is an
     // overlay-path-only narrowing; the full `update_graph_native` is unchanged.)
-    let aff_import_facts: Vec<ImportFact> = import_facts
-        .iter()
-        .filter(|f| affected_paths.contains(&f.rel_path))
-        .cloned()
-        .collect();
+    let aff_import_facts = import_facts_for_resolution(&import_facts, &affected_paths, &ref_sites);
     let aff_type_facts: Vec<TypeFact> = type_facts
         .iter()
         .filter(|f| affected_paths.contains(&f.rel_path))
@@ -5474,6 +5607,14 @@ pub fn overlay_update_graph_native(
     };
 
     let mut overlay = GraphOverlay::load_valid(workspace_root, config, base_built_at);
+    let mut facts_by_file: HashMap<String, crate::graph_overlay::BindingFacts> = HashMap::new();
+    for fact in &import_facts { if affected_paths.contains(&fact.rel_path) { facts_by_file.entry(fact.rel_path.clone()).or_default().imports.push(fact.clone()); } }
+    for fact in &type_facts { if affected_paths.contains(&fact.rel_path) { facts_by_file.entry(fact.rel_path.clone()).or_default().types.push(fact.clone()); } }
+    for fact in &function_return_facts { if affected_paths.contains(&fact.rel_path) { facts_by_file.entry(fact.rel_path.clone()).or_default().returns.push(fact.clone()); } }
+    for path in &affected_paths {
+        if deleted_rel.contains(path) { overlay.binding_facts.remove(path); }
+        else { overlay.binding_facts.insert(path.clone(), facts_by_file.remove(path).unwrap_or_default()); }
+    }
     let mut candidates_by_file = usage_counts::overlay_candidates(&ref_sites);
     // Changed (non-deleted) files: supersede base refs + symbols.
     for rel in exclude_paths.iter().filter(|r| !deleted_rel.contains(*r)) {
@@ -5513,14 +5654,16 @@ pub fn overlay_update_graph_native(
     for rel in affected_paths.iter().filter(|r| !exclude_paths.contains(*r)) {
         let refs = refs_by_file.remove(rel).unwrap_or_default();
         let contrib = scoped_contrib(&refs);
+        let prior = overlay.entries.get(rel).cloned();
+        let was_changed = prior.as_ref().is_some_and(|entry| entry.kind == GraphOverlayEntryKind::Changed);
         overlay.upsert(
             rel,
             GraphOverlayEntry {
-                kind: GraphOverlayEntryKind::AffectedRefs,
+                kind: if was_changed { GraphOverlayEntryKind::Changed } else { GraphOverlayEntryKind::AffectedRefs },
                 refs,
-                symbols: Vec::new(),
+                symbols: prior.as_ref().filter(|_| was_changed).map(|entry| entry.symbols.clone()).unwrap_or_default(),
                 contrib,
-                token_shape_target_deltas: std::collections::BTreeMap::new(),
+                token_shape_target_deltas: prior.filter(|_| was_changed).map(|entry| entry.token_shape_target_deltas).unwrap_or_default(),
                 token_shape_candidates: candidates_by_file.remove(rel).unwrap_or_default(),
             },
         );
@@ -6060,27 +6203,32 @@ pub fn query_graph_implementations(
 }
 
 fn dedupe_graph_references_by_source_occurrence(
-    references: Vec<GraphReference>,
+    mut references: Vec<GraphReference>,
 ) -> Vec<GraphReference> {
     let mut by_occurrence: HashMap<String, usize> = HashMap::default();
-    let mut out: Vec<GraphReference> = Vec::with_capacity(references.len());
-    for reference in references {
-        let key = graph_reference_source_occurrence_key(&reference);
+    // Compact the existing allocation. Keeping both full-sized reference
+    // vectors alive doubled the array working set in high-fanout count shards.
+    // Swaps preserve first-occurrence order and the preferred winning record.
+    let mut written = 0;
+    for read in 0..references.len() {
+        let key = graph_reference_source_occurrence_key(&references[read]);
         match by_occurrence.get(&key).copied() {
             Some(existing_idx) => {
-                if graph_reference_preference_score(&reference)
-                    > graph_reference_preference_score(&out[existing_idx])
+                if graph_reference_preference_score(&references[read])
+                    > graph_reference_preference_score(&references[existing_idx])
                 {
-                    out[existing_idx] = reference;
+                    references.swap(read, existing_idx);
                 }
             }
             None => {
-                by_occurrence.insert(key, out.len());
-                out.push(reference);
+                by_occurrence.insert(key, written);
+                references.swap(read, written);
+                written += 1;
             }
         }
     }
-    out
+    references.truncate(written);
+    references
 }
 
 fn graph_reference_source_occurrence_key(reference: &GraphReference) -> String {
@@ -6408,7 +6556,7 @@ fn build_file_graph(entry: &CorpusEntry) -> FileGraph {
     let symbol_defs = extract_symbol_defs(entry, &language, &uri, line_count);
     if profile { PROFILE_NS_SYMBOL_DEFS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
     let t = std::time::Instant::now();
-    let import_facts = extract_import_facts(entry, &language, &file_id);
+    let mut import_facts = extract_import_facts(entry, &language, &file_id);
     if profile { PROFILE_NS_IMPORT_FACTS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
     let t = std::time::Instant::now();
     let hierarchy_facts = hierarchy_facts_from_symbol_defs(&symbol_defs);
@@ -6426,7 +6574,7 @@ fn build_file_graph(entry: &CorpusEntry) -> FileGraph {
     let function_return_facts = extract_function_return_facts(entry, &language);
     if profile { PROFILE_NS_FUNCTION_RETURNS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
     let t = std::time::Instant::now();
-    let ref_sites = extract_ref_sites(entry, &mut symbols, &language);
+    let ref_sites = extract_ref_sites(entry, &mut symbols, &language, &mut import_facts);
     if profile { PROFILE_NS_REF_SITES.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
     FileGraph {
         file_id,
@@ -7067,7 +7215,7 @@ fn extract_import_facts(entry: &CorpusEntry, language: &str, file_id: &str) -> V
         }
         return facts;
     }
-    for line in entry.text.lines() {
+    for (line_index, line) in entry.text.lines().enumerate() {
         let sanitized = sanitize_import_line(line, language);
         let trimmed = sanitized.trim();
         if trimmed.is_empty() {
@@ -7077,11 +7225,37 @@ fn extract_import_facts(entry: &CorpusEntry, language: &str, file_id: &str) -> V
             collect_python_import_facts(trimmed, entry, file_id, &mut facts);
         } else if matches!(language, "typescript" | "javascript") {
             collect_ts_import_facts(trimmed, entry, file_id, &mut facts);
+            collect_ts_import_site_facts(&sanitized, line, line_index as u32, entry, file_id, &mut facts);
         } else if matches!(language, "java" | "kotlin") {
             collect_java_import_facts(trimmed, entry, file_id, &mut facts);
         }
     }
     facts
+}
+
+fn collect_ts_import_site_facts(
+    code: &str, original: &str, line: u32, entry: &CorpusEntry,
+    file_id: &str, out: &mut Vec<ImportFact>,
+) {
+    if !code.trim_start().starts_with("import ") && !code.trim_start().starts_with("export {") { return; }
+    let Some((start, end)) = brace_range(code) else { return; };
+    let modules = quoted_module_specifier(code).map(|module| ts_module_candidates(&entry.rel_path, &module))
+        .unwrap_or_else(|| vec![entry.rel_path.clone()]);
+    let mut item_start = start + 1;
+    for item in code[start + 1..end].split(',') {
+        let (imported, _) = import_alias_pair(item);
+        for (name, offset, _) in identifier_tokens(item) {
+            if name == "as" || name == "type" { continue; }
+            let column = original[..item_start + offset].encode_utf16().count() as u32;
+            let id = stable_ref_id_u64(&entry.rel_path, line, column, &name);
+            out.push(ImportFact {
+                file_id: file_id.to_string(), rel_path: entry.rel_path.clone(),
+                local_name: format!("{JS_IMPORT_SITE_PREFIX}{id:016x}"), imported_name: imported.clone(),
+                module_candidates: modules.clone(),
+            });
+        }
+        item_start += item.len() + 1;
+    }
 }
 
 fn collect_python_import_facts(
@@ -7195,7 +7369,7 @@ fn collect_ts_import_facts(
                 file_id: file_id.to_string(),
                 rel_path: entry.rel_path.clone(),
                 local_name: default_name.to_string(),
-                imported_name: default_name.to_string(),
+                imported_name: "default".to_string(),
                 module_candidates,
             });
         }
@@ -7208,7 +7382,58 @@ fn collect_ts_reexport_facts(
     file_id: &str,
     out: &mut Vec<ImportFact>,
 ) {
+    // Local export aliases are binding edges too. Default imports bind to the
+    // exported name `default`, irrespective of the spelling in the consumer.
     let Some(module_specifier) = quoted_module_specifier(trimmed) else {
+        if let Some(rest) = trimmed.strip_prefix("export default ") {
+            let rest = rest.trim_start_matches("async ");
+            let declaration = rest.starts_with("function ") || rest.starts_with("class ");
+            let rest = rest.strip_prefix("function ")
+                .or_else(|| rest.strip_prefix("class ")).unwrap_or(rest);
+            let value = rest.trim_end_matches(';').trim();
+            if let Some(name) = leading_identifier(value).filter(|name| {
+                value == name || declaration && (value[name.len()..].trim_start().starts_with('(')
+                    || value[name.len()..].trim_start().starts_with('{'))
+            }) {
+                out.push(ImportFact {
+                    file_id: file_id.to_string(), rel_path: entry.rel_path.clone(),
+                    local_name: "default".to_string(), imported_name: name,
+                    module_candidates: vec![entry.rel_path.clone()],
+                });
+            }
+            // A wrapper's returned value can retain a callable argument, but
+            // syntax alone cannot prove identity. Track final-call arguments
+            // as MAY aliases (including curried wrappers), not exact exports.
+            if value.ends_with(')') {
+                let mut depth = 0;
+                let open = value.char_indices().rev().find_map(|(offset, ch)| {
+                    if ch == ')' { depth += 1; }
+                    if ch == '(' { depth -= 1; if depth == 0 { return Some(offset); } }
+                    None
+                });
+                if let Some(open) = open {
+                    for argument in split_top_level_commas(&value[open + 1..value.len() - 1]) {
+                        if is_identifier(&argument) {
+                            out.push(ImportFact {
+                                file_id: file_id.to_string(), rel_path: entry.rel_path.clone(),
+                                local_name: format!("{MAY_BINDING_PREFIX}default"), imported_name: argument,
+                                module_candidates: vec![entry.rel_path.clone()],
+                            });
+                        }
+                    }
+                }
+            }
+        } else if let Some((start, end)) = brace_range(trimmed) {
+            for item in split_top_level_commas(&trimmed[start + 1..end]) {
+                let (imported_name, local_name) = import_alias_pair(&item);
+                if !imported_name.is_empty() && !local_name.is_empty() && imported_name != local_name {
+                    out.push(ImportFact {
+                        file_id: file_id.to_string(), rel_path: entry.rel_path.clone(),
+                        local_name, imported_name, module_candidates: vec![entry.rel_path.clone()],
+                    });
+                }
+            }
+        }
         return;
     };
     let module_candidates = ts_module_candidates(&entry.rel_path, &module_specifier);
@@ -8520,6 +8745,7 @@ fn extract_ref_sites(
     entry: &CorpusEntry,
     symbols: &mut [GraphSymbol],
     language: &str,
+    import_facts: &mut Vec<ImportFact>,
 ) -> Vec<RefSite> {
     // Borrow the symbol names instead of cloning them into the set, so each
     // membership check only hashes &str (no String allocation per token).
@@ -8552,8 +8778,23 @@ fn extract_ref_sites(
         python_bindings::LexicalBindings::default()
     };
     if language == "python" { parameter_bindings.mark_local_symbols(&sanitized_lines, symbols); }
+    let javascript_bindings = if matches!(language, "javascript" | "typescript") {
+        let bindings = js_bindings::LexicalBindings::new(&sanitized_lines, &entry.text, symbols);
+        bindings.mark_local_symbols(symbols);
+        for (property, source) in &bindings.globals {
+            import_facts.push(ImportFact {
+                file_id: stable_file_id(&entry.rel_path), rel_path: entry.rel_path.clone(),
+                local_name: format!("{JS_GLOBAL_BINDING_PREFIX}{property}"), imported_name: source.clone(),
+                module_candidates: vec![entry.rel_path.clone()],
+            });
+        }
+        bindings
+    } else { js_bindings::LexicalBindings::default() };
     let definition_positions: HashSet<(u32, u32, &str)> = symbols.iter()
         .map(|symbol| (symbol.start_line, symbol.start_column, symbol.name.as_str())).collect();
+    let import_site_ids: HashSet<u64> = import_facts.iter()
+        .filter_map(|fact| fact.local_name.strip_prefix(JS_IMPORT_SITE_PREFIX))
+        .filter_map(|id| u64::from_str_radix(id, 16).ok()).collect();
     for (line_idx, (line, sanitized)) in entry.text.lines().zip(&sanitized_lines).enumerate() {
         parameter_bindings.advance_line(line_idx);
         let is_import_context = is_import_context_line(sanitized.trim_start(), language);
@@ -8570,7 +8811,7 @@ fn extract_ref_sites(
         let mut column_byte_cursor = 0;
         let mut column_utf16_cursor = 0u32;
         for (name, start, end) in identifier_tokens(&sanitized) {
-            if is_keyword(&name, language) {
+            if is_keyword(&name, language) && !(name == "default" && is_import_context) {
                 continue;
             }
             column_utf16_cursor += line[column_byte_cursor..start].encode_utf16().count() as u32;
@@ -8601,7 +8842,10 @@ fn extract_ref_sites(
             // A parameter is a lexical value binding, not a candidate for a
             // same-named module/imported symbol. Member names are independent.
             let lexical_target_id = if !is_definition && access_kind == "bare" {
-                match parameter_bindings.binding(line_idx, start, &name) {
+                let binding = if matches!(language, "javascript" | "typescript") {
+                    javascript_bindings.binding(line_idx, start, &name)
+                } else { parameter_bindings.binding(line_idx, start, &name) };
+                match binding {
                     python_bindings::Binding::Excluded => continue,
                     python_bindings::Binding::Indexed(id) => id,
                     python_bindings::Binding::Unbound => 0,
@@ -8610,6 +8854,7 @@ fn extract_ref_sites(
             // B6 stage-2: build the u64 directly (no "ref:HEX16" string alloc).
             let source_ref_id =
                 stable_ref_id_u64(&entry.rel_path, line_idx as u32, start_column, &name);
+            if name == "default" && !import_site_ids.contains(&source_ref_id) { continue; }
             let name_hash = stable_hash(&name);
             let receiver_name_hash = receiver_name
                 .as_deref()
@@ -9063,6 +9308,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                         // GD — bare-fallback + member-fallback maps + counts.
                         || {
                             for symbol in symbols {
+                                if symbol.is_local_binding { continue; }
                                 let flags = symbol.kind_flags;
                                 if flags & KF_BARE_FB != 0 {
                                     bare_symbols_by_name
@@ -9153,6 +9399,25 @@ fn resolve_ref_sites_a_to_e<'a>(
     }
     let t_b = std::time::Instant::now();
     let import_targets = resolve_import_targets(import_facts, &symbols_by_file_and_name);
+    let may_import_bindings = resolve_may_import_bindings(import_facts);
+    let mut javascript_globals: HashMap<u64, Vec<&GraphSymbol>> = HashMap::new();
+    let mut import_site_targets: HashMap<u64, Vec<&GraphSymbol>> = HashMap::new();
+    let mut may_import_sites = HashSet::new();
+    for ((rel, name), targets) in &import_targets {
+        if let Some(property) = name.strip_prefix(JS_GLOBAL_BINDING_PREFIX) {
+            javascript_globals.entry(stable_hash(property)).or_default().extend(targets);
+        } else if let Some(id) = name.strip_prefix(JS_IMPORT_SITE_PREFIX).and_then(|id| u64::from_str_radix(id, 16).ok()) {
+            let partial = site_partial_hash_u64(id, "usage");
+            import_site_targets.entry(partial).or_default().extend(targets);
+            if may_import_bindings.contains(&(stable_hash(rel), stable_hash(name))) { may_import_sites.insert(partial); }
+        }
+    }
+    for targets in javascript_globals.values_mut() {
+        targets.sort_by_key(|target| target.id_u64); targets.dedup_by_key(|target| target.id_u64);
+    }
+    for targets in import_site_targets.values_mut() {
+        targets.sort_by_key(|target| target.id_u64); targets.dedup_by_key(|target| target.id_u64);
+    }
     let import_facts_by_file_local = import_facts_by_file_local(import_facts);
     let star_import_facts_by_file = star_import_facts_by_file(import_facts);
     // B4: rel_path_hash -> flattened module_candidate hashes for star imports,
@@ -9468,7 +9733,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                             if c.flags & SITE_FLAG_IS_DEFINITION != 0 {
                                 continue;
                             }
-                            if c.lexical_target_id != 0 {
+                            if c.lexical_target_id != 0 || import_site_targets.contains_key(&c.site_partial) {
                                 buf.push(i as u32);
                                 continue;
                             }
@@ -9492,6 +9757,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                                         || cached_type_facts.is_some_and(|s| s.contains(&rhash));
                                     has_receiver_match
                                         || member_lang_pf.contains_key(&(language_id, c.name_hash))
+                                        || matches!(language_id, 2 | 3) && javascript_globals.contains_key(&c.name_hash)
                                 } else {
                                     false
                                 }
@@ -9500,6 +9766,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                                     || cached_imports.is_some_and(|m| m.contains_key(&c.name_hash))
                                     || cached_has_star
                                     || bare_lang_pf.contains_key(&(language_id, c.name_hash))
+                                    || matches!(language_id, 2 | 3) && javascript_globals.contains_key(&c.name_hash)
                             } else {
                                 false
                             };
@@ -9528,7 +9795,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                             if site.is_definition {
                                 continue;
                             }
-                            if site.lexical_target_id != 0 {
+                            if site.lexical_target_id != 0 || import_site_targets.contains_key(&site_cols[i].site_partial) {
                                 buf.push(i as u32);
                                 continue;
                             }
@@ -9556,6 +9823,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                                         || cached_type_facts.is_some_and(|s| s.contains(&rhash));
                                     has_receiver_match
                                         || member_lang_pf.contains_key(&(language_id, site.name_hash))
+                                        || matches!(language_id, 2 | 3) && javascript_globals.contains_key(&site.name_hash)
                                 } else {
                                     false
                                 }
@@ -9564,6 +9832,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                                     || cached_imports.is_some_and(|m| m.contains_key(&site.name_hash))
                                     || star_imports_pf.contains_key(site.rel_path.as_str())
                                     || bare_lang_pf.contains_key(&(language_id, site.name_hash))
+                                    || matches!(language_id, 2 | 3) && javascript_globals.contains_key(&site.name_hash)
                             } else {
                                 false
                             };
@@ -9771,6 +10040,21 @@ fn resolve_ref_sites_a_to_e<'a>(
                 current_file_type_facts = type_facts_by_rel.get(&current_file_hash);
             }
             if c.flags & SITE_FLAG_IS_DEFINITION != 0 {
+                continue;
+            }
+            if let Some(targets) = import_site_targets.get(&c.site_partial) {
+                for target in targets {
+                    let exact = targets.len() == 1 && !may_import_sites.contains(&c.site_partial);
+                    let bound = if exact { BOUND_MAY | BOUND_MUST } else { BOUND_MAY };
+                    let edge_key = edge_key_from_partial_u64(c.site_partial, target.id_u64);
+                    add_resolution_count(&mut counts, &mut id_to_string,
+                        &mut counted_likely, &mut counted_exact, c.edge_kind_id, target,
+                        bound, false, true, edge_key);
+                    push_light_resolved_reference(&mut light_refs, &mut dedup,
+                        Some(&mut local_target_tally), light_sender, site_idx, target,
+                        bound, if exact { LightConfidence::Exact } else { LightConfidence::Possible },
+                        LightProvenance::Import, edge_key);
+                }
                 continue;
             }
             if c.lexical_target_id != 0 {
@@ -10001,6 +10285,26 @@ fn resolve_ref_sites_a_to_e<'a>(
             } else {
                 bare_symbols_by_name.contains_key(&c.name_hash)
             };
+            // Script globals and explicit global-object assignments can be
+            // reached across source roots. When lookup has no local/imported
+            // binding, retain all structurally supported global candidates.
+            // Unknown member receivers may expose the same global value;
+            // neither name coincidence nor script loading proves MUST.
+            if matches!(c.language_id, 2 | 3)
+                && ((is_bare && same_file_bare_count.get(&(c.name_hash, c.rel_path_hash)).copied().unwrap_or(0) == 0
+                    && imported_candidates.is_empty() && star_imported_candidates.is_empty())
+                    || (is_member && c.flags & SITE_FLAG_HAS_RECEIVER != 0 && fallback_candidates.is_empty()))
+            {
+                for target in javascript_globals.get(&c.name_hash).into_iter().flatten() {
+                    let edge_key = edge_key_from_partial_u64(c.site_partial, target.id_u64);
+                    add_resolution_count(&mut counts, &mut id_to_string,
+                        &mut counted_likely, &mut counted_exact, c.edge_kind_id, target,
+                        BOUND_MAY, is_bare && target.name_hash == c.name_hash, true, edge_key);
+                    push_light_resolved_reference(&mut light_refs, &mut dedup,
+                        Some(&mut local_target_tally), light_sender, site_idx, target,
+                        BOUND_MAY, LightConfidence::Possible, LightProvenance::ScriptGlobal, edge_key);
+                }
+            }
             if !has_fallback_candidates
                 && imported_candidates.is_empty()
                 && star_imported_candidates.is_empty()
@@ -10121,7 +10425,8 @@ fn resolve_ref_sites_a_to_e<'a>(
             };
             let import_is_exact = !imported_candidates.is_empty()
                 && imported_candidates.len() == 1
-                && same_file_count == 0;
+                && same_file_count == 0
+                && !may_import_bindings.contains(&(c.rel_path_hash, c.name_hash));
             for target in imported_candidates.iter() {
                 let bound_mask = if import_is_exact {
                     BOUND_MAY | BOUND_MUST
@@ -10143,7 +10448,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                     true,
                     edge_key,
                 );
-                if import_is_exact {
+                if import_is_exact || may_import_bindings.contains(&(c.rel_path_hash, c.name_hash)) {
                     let _ = push_light_resolved_reference(
                         &mut light_refs,
                         &mut dedup,
@@ -10152,7 +10457,7 @@ fn resolve_ref_sites_a_to_e<'a>(
                         site_idx,
                         target,
                         bound_mask,
-                        LightConfidence::Exact,
+                        if import_is_exact { LightConfidence::Exact } else { LightConfidence::Possible },
                         LightProvenance::Import,
                         edge_key,
                     );
@@ -12543,10 +12848,14 @@ fn resolve_import_targets<'a>(
     symbols_by_file_and_name: &HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>>,
 ) -> HashMap<(&'a str, &'a str), Vec<&'a GraphSymbol>> {
     let mut out: HashMap<(&str, &str), Vec<&GraphSymbol>> = HashMap::new();
+    let mut dependents: HashMap<(&str, &str), Vec<(&str, &str)>> = HashMap::new();
     for fact in import_facts {
         let _ = &fact.file_id;
+        let local_name = fact.local_name.strip_prefix(MAY_BINDING_PREFIX).unwrap_or(&fact.local_name);
         let mut targets = Vec::new();
         for module_path in &fact.module_candidates {
+            dependents.entry((module_path.as_str(), fact.imported_name.as_str()))
+                .or_default().push((fact.rel_path.as_str(), local_name));
             if let Some(symbols) =
                 symbols_by_file_and_name.get(&(module_path.as_str(), fact.imported_name.as_str()))
             {
@@ -12556,7 +12865,7 @@ fn resolve_import_targets<'a>(
         targets.sort_by(|left, right| left.id.cmp(&right.id));
         targets.dedup_by(|left, right| left.id == right.id);
         if !targets.is_empty() {
-            out.entry((fact.rel_path.as_str(), fact.local_name.as_str()))
+            out.entry((fact.rel_path.as_str(), local_name))
                 .or_default()
                 .extend(targets);
         }
@@ -12565,7 +12874,44 @@ fn resolve_import_targets<'a>(
         targets.sort_by(|left, right| left.id.cmp(&right.id));
         targets.dedup_by(|left, right| left.id == right.id);
     }
+    // Propagate through local aliases and re-export chains. Only newly reached
+    // (binding, declaration) pairs enter the queue, so cycles terminate without
+    // a depth cap or an order-dependent result.
+    let mut queue: std::collections::VecDeque<_> = out.iter()
+        .flat_map(|(&key, targets)| targets.iter().map(move |&target| (key, target)))
+        .collect();
+    while let Some((key, target)) = queue.pop_front() {
+        for &destination in dependents.get(&key).into_iter().flatten() {
+            let targets = out.entry(destination).or_default();
+            if !targets.iter().any(|existing| existing.id == target.id) {
+                targets.push(target);
+                queue.push_back((destination, target));
+            }
+        }
+    }
+    for targets in out.values_mut() { targets.sort_by(|left, right| left.id.cmp(&right.id)); }
     out
+}
+
+fn resolve_may_import_bindings(facts: &[ImportFact]) -> HashSet<(u64, u64)> {
+    let mut dependents: HashMap<(u64, u64), Vec<(u64, u64)>> = HashMap::new();
+    let mut may = HashSet::new();
+    for fact in facts {
+        let name = fact.local_name.strip_prefix(MAY_BINDING_PREFIX).unwrap_or(&fact.local_name);
+        let destination = (stable_hash(&fact.rel_path), stable_hash(name));
+        if fact.local_name.starts_with(MAY_BINDING_PREFIX) { may.insert(destination); }
+        for module in &fact.module_candidates {
+            dependents.entry((stable_hash(module), stable_hash(&fact.imported_name)))
+                .or_default().push(destination);
+        }
+    }
+    let mut queue: std::collections::VecDeque<_> = may.iter().copied().collect();
+    while let Some(key) = queue.pop_front() {
+        for destination in dependents.get(&key).into_iter().flatten() {
+            if may.insert(*destination) { queue.push_back(*destination); }
+        }
+    }
+    may
 }
 
 // B6 stage-2: `edge_key_hash` and the string-keyed `site_partial_hash` were
@@ -12710,6 +13056,7 @@ fn provenance_from_str(s: &str) -> LightProvenance {
         "unique-name" => LightProvenance::UniqueName,
         "token-shape" => LightProvenance::TokenShape,
         "external-tsv" => LightProvenance::ExternalTsv,
+        "script-global" => LightProvenance::ScriptGlobal,
         other => unreachable!("unknown provenance: {other}"),
     }
 }
@@ -17035,9 +17382,6 @@ fn build_resolve_candidate_symbols(
         }
     }
     for fact in import_facts {
-        if !affected_paths.contains(&fact.rel_path) {
-            continue;
-        }
         name_hashes.insert(stable_hash(&fact.imported_name));
         name_hashes.insert(stable_hash(&fact.local_name));
     }
@@ -17064,6 +17408,12 @@ fn build_resolve_candidate_symbols(
             .into_iter()
             .filter(|s| !affected_paths.contains(&s.rel_path))
             .collect();
+    let built_at = read_built_at_unix_ms(&graph_manifest_path(workspace_root, config)).unwrap_or(0);
+    let pending = crate::graph_overlay::GraphOverlay::load_valid(workspace_root, config, built_at);
+    let superseded = pending.symbol_superseded();
+    candidates.retain(|symbol| !superseded.contains(&symbol.rel_path));
+    candidates.extend(pending.live_symbols().filter(|symbol| !affected_paths.contains(&symbol.rel_path)
+        && name_hashes.contains(&symbol.name_hash)).cloned());
     // Affected files' own symbols. Changed files: freshly parsed (`changed_symbols`,
     // all ∈ exclude ⊆ affected). Importers (affected ∖ exclude, unchanged on disk):
     // loaded per-file from the symbol-id shards — usually none (a leaf edit has no
@@ -18096,6 +18446,18 @@ fn brace_function_from_line(
     language: &str,
     at_type_body: bool,
 ) -> Option<BraceFunctionDef> {
+    if matches!(language, "javascript" | "typescript") {
+        // A named function expression's outer binding is its assignment name;
+        // its optional internal name is visible only inside the function.
+        if let Some((left, right)) = trimmed.split_once('=') {
+            let right = right.trim_start().trim_start_matches("async ");
+            if right.starts_with("function") {
+                if let Some(name) = brace_assignment_name(left) {
+                    return Some(BraceFunctionDef { name, member_like: at_type_body });
+                }
+            }
+        }
+    }
     // Languages with an explicit declaration keyword are unambiguous even when
     // the parameter list continues on following physical lines.
     for keyword in ["function", "fn", "func", "fun"] {
@@ -18295,6 +18657,19 @@ fn ts_module_candidates(rel_path: &str, module_specifier: &str) -> Vec<String> {
     }
     let module_path = base.join("/");
     let mut out = Vec::new();
+    if let Some((stem, extension)) = module_path.rsplit_once('.') {
+        let replacements: &[&str] = match extension {
+            "js" => &["ts", "tsx", "js"],
+            "jsx" => &["tsx", "jsx"],
+            "mjs" => &["mts", "mjs"],
+            "cjs" => &["cts", "cjs"],
+            "ts" | "tsx" | "mts" | "cts" => return vec![module_path],
+            _ => &[],
+        };
+        if !replacements.is_empty() {
+            return replacements.iter().map(|extension| format!("{stem}.{extension}")).collect();
+        }
+    }
     for ext in ["ts", "tsx", "js", "jsx", "mjs", "cjs"] {
         out.push(format!("{module_path}.{ext}"));
         out.push(format!("{module_path}/index.{ext}"));
@@ -22358,6 +22733,68 @@ def use(client):
             count.usage_likely, 1,
             "leading ellipsis in Python relative imports is not member access"
         );
+    }
+
+    #[test]
+    fn javascript_wrapper_export_aliases_remain_possible_through_reexports() {
+        let provider = test_entry("pkg/provider.jsx", "const Item = () => null;\nexport default decorate(null)(Item);\n");
+        let bridge = test_entry("pkg/bridge.js", "export { default as Wrapped } from './provider.jsx';\n");
+        let consumer = test_entry("pkg/consumer.js", "import Local from './provider.jsx';\nimport { Wrapped } from './bridge.js';\nLocal();\nWrapped();\n");
+        let (symbols, result) = resolve_test_entries(&[provider, bridge, consumer]);
+        let item = symbol_id(&symbols, "Item");
+        for name in ["Local", "Wrapped"] {
+            let references: Vec<_> = result.references.iter().filter(|reference| reference.target_symbol_id.as_deref() == Some(item)
+                && &*reference.rel_path == "pkg/consumer.js" && &*reference.raw_text == name).collect();
+            assert!(!references.is_empty(), "wrapper input should remain a conservative export candidate");
+            assert!(references.iter().all(|reference| reference.bound_mask == BOUND_MAY && &*reference.confidence == "possible"));
+        }
+    }
+
+    #[test]
+    fn javascript_scopes_keep_object_values_and_globals_without_local_leaks() {
+        let script = test_entry("one/globals.js", "function shared() { return 1; }\nvar assigned = function inner() { return 2; };\nfunction outer() {\n  function hidden() { return 3; }\n  return hidden();\n}\n");
+        let module = test_entry("two/module.js", "export function selected() { return 4; }\nconst table = {\n  selected: selected,\n};\nfunction shadows() {\n  var selected = 0;\n  return selected;\n}\nfunction closure() {\n  const value = 1;\n  return () => value;\n}\nfunction parameter(shared) { return shared(); }\nconst arrow = (assigned) => assigned();\nclass Holder {\n  read() {\n    var selected = 0;\n    return selected;\n  }\n}\n");
+        let consumer = test_entry("two/consumer.js", "shared();\nwindow.assigned();\nwindow.shared();\nunknown.shared();\nhidden();\n");
+        let (symbols, result) = resolve_test_entries(&[script, module, consumer]);
+        let selected = symbol_id(&symbols, "selected");
+        assert!(result.references.iter().any(|reference| reference.target_symbol_id.as_deref() == Some(selected)
+            && &*reference.rel_path == "two/module.js" && reference.start_line == 2 && reference.start_column == 12));
+        assert!(!result.references.iter().any(|reference| reference.target_symbol_id.as_deref() == Some(selected)
+            && &*reference.rel_path == "two/module.js" && reference.start_line == 6));
+        let method_local = symbols.iter().find(|symbol| symbol.qualified_name == "Holder.selected").unwrap();
+        assert!(method_local.is_local_binding, "method-local variables are not fields of the class");
+        for (name, line) in [("shared", 0), ("assigned", 1), ("shared", 2), ("shared", 3)] {
+            let target = symbol_id(&symbols, name);
+            assert!(result.references.iter().any(|reference| reference.target_symbol_id.as_deref() == Some(target)
+                && &*reference.rel_path == "two/consumer.js" && reference.start_line == line
+                && &*reference.confidence == "possible"), "script global {name} on line {line}: {:?}", result.references);
+            assert!(!result.references.iter().any(|reference| reference.target_symbol_id.as_deref() == Some(target)
+                && &*reference.rel_path == "two/module.js" && reference.start_line >= 12));
+        }
+        let hidden = symbol_id(&symbols, "hidden");
+        assert!(!result.references.iter().any(|reference| reference.target_symbol_id.as_deref() == Some(hidden)
+            && &*reference.rel_path == "two/consumer.js"));
+        assert!(result.references.iter().any(|reference| reference.target_symbol_id.as_deref() == Some(hidden)
+            && &*reference.rel_path == "one/globals.js" && reference.start_line == 4));
+    }
+
+    #[test]
+    fn javascript_explicit_extensions_default_aliases_and_reexport_cycles() {
+        let provider = test_entry("pkg/provider.js", "var Factory = function internalFactory() { return 1; };\nexport default Factory;\nexport function execute() { return 2; }\n");
+        let bridge = test_entry("pkg/bridge.js", "export { default as Renamed, execute as run } from './provider.js';\nexport { again } from './cycle.js';\n");
+        let cycle = test_entry("pkg/cycle.js", "export { Renamed as again } from './bridge.js';\n");
+        let consumer = test_entry("pkg/consumer.js", "import Local from './provider.js';\nimport { Renamed, run, again } from './bridge.js';\nimport * as api from './provider.js';\nLocal();\nRenamed();\nrun();\nagain();\napi.execute();\n");
+        let (symbols, result) = resolve_test_entries(&[provider, bridge, cycle, consumer]);
+        let factory = symbol_id(&symbols, "Factory");
+        let execute = symbol_id(&symbols, "execute");
+        assert!(!symbols.iter().any(|symbol| symbol.name == "internalFactory"), "the expression name must not replace its outer binding");
+        for (name, id) in [("Local", factory), ("Renamed", factory), ("again", factory), ("run", execute), ("execute", execute)] {
+            assert!(result.references.iter().any(|reference| &*reference.rel_path == "pkg/consumer.js"
+                && &*reference.raw_text == name && reference.target_symbol_id.as_deref() == Some(id)
+                && &*reference.confidence == "exact"), "{name} should resolve through explicit module/export bindings");
+        }
+        assert_eq!(ts_module_candidates("pkg/consumer.ts", "./provider.js"), ["pkg/provider.ts", "pkg/provider.tsx", "pkg/provider.js"]);
+        assert_eq!(ts_module_candidates("pkg/consumer.ts", "./provider.mjs"), ["pkg/provider.mts", "pkg/provider.mjs"]);
     }
 
     #[test]

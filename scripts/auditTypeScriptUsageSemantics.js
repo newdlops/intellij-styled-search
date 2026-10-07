@@ -6,9 +6,11 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const ts = require('typescript');
 
-const [workspaceArg, binaryArg, outputArg, sampleArg = '20'] = process.argv.slice(2);
+const arguments_ = process.argv.slice(2);
+const failOnProvenErrors = arguments_.includes('--fail-on-proven-errors');
+const [workspaceArg, binaryArg, outputArg, sampleArg = '20'] = arguments_.filter(arg => arg !== '--fail-on-proven-errors');
 if (!workspaceArg || !binaryArg || !outputArg) {
-  throw new Error('Usage: node auditTypeScriptUsageSemantics.js WORKSPACE BINARY OUTPUT [SAMPLES]');
+  throw new Error('Usage: node auditTypeScriptUsageSemantics.js WORKSPACE BINARY OUTPUT [SAMPLES] [--fail-on-proven-errors]');
 }
 const workspace = path.resolve(workspaceArg);
 const binary = path.resolve(binaryArg);
@@ -113,7 +115,7 @@ for (const candidate of declarations) {
 }
 const report = { oracle: `TypeScript ${ts.version} language service references and definitions`,
   sourceFiles: sources.length, candidatesChecked, compilerOptions: options,
-  limitations: 'Sampled module functions; no project path aliases or external dependencies copied. Dynamic/unresolved locations and alias declaration entries are unclassified.',
+  limitations: 'Sampled top-level callables; no project path aliases or external dependencies copied. Compiler definition entries are filtered; reported import/export specifier references are included. Dynamic/unresolved locations remain unclassified.',
   targets: results };
 fs.mkdirSync(path.dirname(path.resolve(outputArg)), { recursive: true });
 fs.writeFileSync(outputArg, JSON.stringify(report, null, 2) + '\n');
@@ -122,3 +124,9 @@ console.log(JSON.stringify({ targets: results.length, required: results.reduce((
   provenOtherBinding: results.reduce((n, r) => n + r.provenOtherBinding, 0),
   unclassified: results.reduce((n, r) => n + r.unclassified, 0) }));
 service.dispose();
+const failures = results.filter(result => result.error
+  || !result.fullyEnumerated || result.missing?.length || result.provenOtherBinding);
+if (failOnProvenErrors && (!results.length || failures.length)) {
+  console.error(JSON.stringify({ check: 'compiler-reference-locations', failures }));
+  process.exitCode = 1;
+}

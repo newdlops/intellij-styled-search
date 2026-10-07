@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Resolved JavaScript/TypeScript imports with explicit source extensions, default export aliases and cyclic re-export chains.
+- Indexed assigned function expressions under their outer binding, and kept parameters, closures, block bindings and method-local variables in their lexical scopes.
+- Retained conservative candidates for script globals, explicit global-object assignments and callable inputs to export wrappers; these candidates are not promoted to exact references.
+- Persisted import/export and type evidence in pending overlays, refreshed dependent consumers when bindings change, and preserved edited symbols during later consumer refreshes.
+- Added an independent TypeScript compiler reference gate to the semantic fixture checks on macOS and Windows.
+- Removed a second full reference array during occurrence deduplication, reducing peak memory in the measured platform workload.
+- Native graph/cache versions are now 15/23 on POSIX and 16/24 on Windows and require one reindex.
+
 ## 0.1.7154 - 2026-10-07
 
 - Indexed executable f-string expressions, nested fields and dynamic format specifications while preserving UTF-16 reference positions and excluding literal text.

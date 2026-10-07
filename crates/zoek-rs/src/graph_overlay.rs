@@ -39,7 +39,7 @@
 //! yields the edit once, never twice.
 
 use crate::config::EngineConfig;
-use crate::graph::{restore_graph_symbol_metadata, GraphReference, GraphSymbol};
+use crate::graph::{restore_graph_symbol_metadata, GraphReference, GraphSymbol, ImportFact, TypeFact, FunctionReturnFact};
 use crate::mmap_store::write_atomically;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -58,6 +58,13 @@ pub struct OverlayTokenShapeCandidate {
 /// On-disk name of the call-graph overlay, alongside the base shards in
 /// `.zoek-rs/`. Distinct from the text-search overlay (`hot-overlay.json`).
 pub const GRAPH_OVERLAY_FILE: &str = "callgraph-overlay.bin";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct BindingFacts {
+    pub(crate) imports: Vec<ImportFact>,
+    pub(crate) types: Vec<TypeFact>,
+    pub(crate) returns: Vec<FunctionReturnFact>,
+}
 
 /// How an entry supersedes its source file's base contribution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +149,9 @@ pub struct GraphOverlay {
     pub usage_counts: BTreeMap<u64, usize>,
     #[serde(default)]
     pub revision: u64,
+    /// Current binding evidence for superseded files, used by subsequent edits.
+    #[serde(default)]
+    pub(crate) binding_facts: BTreeMap<String, BindingFacts>,
 }
 
 impl GraphOverlay {
@@ -153,6 +163,7 @@ impl GraphOverlay {
             count_deltas: BTreeMap::new(),
             usage_counts: BTreeMap::new(),
             revision: 0,
+            binding_facts: BTreeMap::new(),
         }
     }
 

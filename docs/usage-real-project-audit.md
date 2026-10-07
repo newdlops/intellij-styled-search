@@ -194,3 +194,68 @@ The independent fixture gate includes f-string fields, explicit multi-line
 imports, same-file local shadowing, named expressions and lambda isolation:
 nineteen required locations are found, with zero proven other bindings, and all
 41 indexed fixture symbols have count/list parity.
+
+## JavaScript follow-up — not yet released
+
+The expanded compiler audit now finds **740/740 required locations across all
+311 declarations**, with zero missing declarations and zero returned locations
+proven to bind to another function. Every target is fully enumerated. This
+resolves the previously observed 81 missing usages and five declaration indexing
+errors, including their nine additional required locations.
+
+The fixes cover explicit import extensions, default/export aliases, cyclic
+re-export propagation, assigned function expressions, lexical shadowing and
+script-global exposure. Wrapper exports and global candidates retain MAY-only
+confidence. The compiler sample's unclassified results increase from 54 to 372;
+the broader conservative envelope prevents known misses but does not establish
+precision for these additional candidates.
+
+The same Python samples retain 7,357/7,357 required locations, zero proven other
+bindings and zero parse errors. Their unclassified totals are 3,676 and 1,974.
+The TypeScript sample retains 51/51 required locations and zero proven other
+bindings, with three unclassified results. Definition entries are filtered by
+the compiler oracle; reported import/export specifier references are included.
+
+| Same frozen source tree | Indexed files | Symbols | Stored references | Count/list mismatches |
+| --- | ---: | ---: | ---: | ---: |
+| Monorepo | 23,097 | 235,043 | 740,360 | 0 |
+| Django platform | 5,638 | 163,201 | 424,869 | 0 |
+
+The final macOS ARM64 release binary has SHA-256
+`1dfe35d5398aedf9219c8bac72b39af11fce3b98f0fd56d238a9c72be5d52c59`.
+One eight-worker run measured 36.22 s / 2,272 MiB and 14.62 s / 1,152 MiB.
+The monorepo's single-run peak is slightly higher than its 0.1.7154 observation;
+these single samples are not evidence of an improvement in both workloads.
+First-page CLI p95 is 40.3 ms / 21.4 ms under the unchanged twenty-probe selection.
+
+Two alternating runs of the exact published 0.1.7154 binary and the updated
+release binary on the platform snapshot measured median peak RSS of
+**1,471.2 MiB / 1,233.4 MiB**, a 16.2% reduction. Median build time was
+17.87 s / 15.72 s. Deduplication compacts its existing reference array instead of
+allocating a second full array. This is a paired observation with two samples
+per binary, no cache flush and no statistical confidence interval.
+
+New regression fixtures cover import/export specifier positions, default aliases,
+cyclic re-exports, wrapper confidence, method-local variables, consumer edits,
+export rebinding, pending provider facts and compaction. The independent fixture
+gate finds 26/26 JavaScript and 19/19 Python locations, with zero proven other
+bindings and count/list parity across all 54 indexed symbols. Native storage/cache
+versions 15/23 on POSIX and 16/24 on Windows require one reindex.
+
+Local checks pass 193 native tests (four existing opt-in tests remain ignored),
+35 extension unit tests (two Windows-only skips), four build-cache tests and
+185 extension functional tests (four pending). An initial combined run also
+included renderer tests without the foreground timing policy and hit two hover
+failures. That failed log is retained; renderer acceptance is checked separately
+with the existing foreground policy and unchanged budgets.
+A separate foreground run had one pointer-position failure in the hover probe.
+The exact isolated probe then passed, followed by the complete foreground suite:
+92 passed and four pending, with every recorded timing budget satisfied. The
+first full-file inlay request was 11 ms (200 ms budget), and all five requests
+returned the same complete 500-hint set. Both failed logs are retained; these
+successful repetitions do not establish the cause of the intermittent hover
+failure or the earlier shared-runner inlay delay.
+
+The previously observed macOS shared-runner delay before provider entry remains
+unresolved. No timing budget has been changed, and no whole-project semantic
+accuracy claim is made.
