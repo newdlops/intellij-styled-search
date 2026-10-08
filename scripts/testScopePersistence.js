@@ -73,7 +73,16 @@ async function main() {
     console.log('[scope restart] all five launches passed');
   } finally {
     // Preserve failure logs/screenshots in artifacts, remove only this generated fixture/profile.
-    fs.rmSync(fixture, { recursive: true, force: true });
+    try {
+      fs.rmSync(fixture, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (error) {
+      // Windows can retain Git askpass scripts after Code exits. Cleanup must
+      // neither replace an assertion failure nor invalidate completed checks.
+      fs.writeFileSync(path.join(output, 'cleanup-warning.json'), JSON.stringify({
+        profile: fixture, code: error.code, message: error.message,
+      }, null, 2));
+      console.warn(`[scope restart] temporary profile retained after cleanup failed: ${error.code}; ${fixture}`);
+    }
   }
 }
 void main().catch(error => { console.error(error); process.exitCode = 1; });
