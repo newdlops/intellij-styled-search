@@ -10,6 +10,8 @@ let control: any;
 let savedHistory: unknown;
 let savedLimit: unknown;
 let windowId: number;
+const historyTasks = new Set<Promise<unknown>>();
+const originalHistoryMethods = new Map<string, (...args: any[]) => unknown>();
 const longQuery = 'prefix '.repeat(45) + 'historicalMarker\nsecond line <literal>';
 const entries = ['Recent unrelated query', longQuery, 'Alpha component query', 'alpha service query',
   ...Array.from({ length: 96 }, (_, i) => `older query ${i}`)];
@@ -26,8 +28,12 @@ async function main(expression: string): Promise<any> {
   return response.result?.value;
 }
 async function seed(values: string[]) {
+  // Previous real searches/configuration updates may still be publishing their
+  // history. Finish those actual operations before replacing the test fixture.
+  while (historyTasks.size > 0) { await Promise.allSettled([...historyTasks]); }
   await control.context.globalState.update(key, values);
   await control.postSearchHistoryToRenderer();
+  await waitForQuery(value => JSON.stringify(value.state.history) === JSON.stringify(values));
 }
 async function queryState(): Promise<any> {
   return renderer(`var input=panel.querySelector('.ij-find-query');return {
@@ -61,6 +67,16 @@ suite('Search history discovery', () => {
     assert.ok(ext);
     api = await ext!.activate();
     control = api.overlay as any;
+    for (const name of ['recordSearchHistory', 'trimSearchHistoryToLimit', 'postSearchHistoryToRenderer']) {
+      const original = control[name];
+      originalHistoryMethods.set(name, original);
+      control[name] = function (...args: any[]) {
+        const task = Promise.resolve(original.apply(this, args));
+        historyTasks.add(task);
+        void task.then(() => historyTasks.delete(task), () => historyTasks.delete(task));
+        return task;
+      };
+    }
     savedHistory = control.context.globalState.get(key);
     savedLimit = vscode.workspace.getConfiguration('intellijStyledSearch').inspect('searchHistoryLimit')?.workspaceValue;
     await vscode.workspace.getConfiguration('intellijStyledSearch').update('searchHistoryLimit', 100, vscode.ConfigurationTarget.Workspace);
@@ -72,9 +88,12 @@ suite('Search history discovery', () => {
     await main(`(function(){var win=require('electron').BrowserWindow.fromId(${windowId});win.show();win.focus();win.webContents.setBackgroundThrottling(false);})()`);
   });
   suiteTeardown(async () => {
+    while (historyTasks.size > 0) { await Promise.allSettled([...historyTasks]); }
     await vscode.workspace.getConfiguration('intellijStyledSearch').update('searchHistoryLimit', savedLimit, vscode.ConfigurationTarget.Workspace);
     await control.context.globalState.update(key, savedHistory);
     await control.postSearchHistoryToRenderer();
+    for (const [name, original] of originalHistoryMethods) { control[name] = original; }
+    originalHistoryMethods.clear();
   });
   setup(async () => {
     await renderer("var menu=panel.querySelector('.ij-find-history-menu');if(menu.classList.contains('open'))panel.querySelector('.ij-find-history').click();return true;");
