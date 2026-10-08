@@ -122,6 +122,24 @@ test('native Windows CIM snapshot includes the running Node host', { skip: proce
   assert.equal(snapshot.find((p) => p.pid === process.pid)?.ppid, process.ppid);
 });
 
+test('noninteractive Windows snapshot finishes a child that waits for input EOF', async () => {
+  const childProcess = require('child_process');
+  const original = childProcess.execFile;
+  const row = { ProcessId: 120, ParentProcessId: 1, ExecutablePath: host.execPath,
+    CommandLine: `"${host.execPath}"` };
+  // Use a real subprocess with the input protocol of an EOF-reading shell.
+  // Parsing must finish without waiting for the process timeout.
+  childProcess.execFile = (_binary: string, _args: string[], options: object, callback: Function) =>
+    original(process.execPath, ['-e', `process.stdin.resume();process.stdin.on('end',()=>{
+      process.stdout.write(${JSON.stringify(JSON.stringify([row]))});});`],
+    { ...options, timeout: 1_000 }, callback);
+  try {
+    assert.deepEqual(await windowsElectronMainProcess.readProcessSnapshot(), [proc(120, 1)]);
+  } finally {
+    childProcess.execFile = original;
+  }
+});
+
 test('usage binding migration invalidates old overlays while retaining platform URI versions', () => {
   assert.deepEqual(graphStorageVersions('win32'), { cache: 25, native: 17 });
   assert.deepEqual(graphStorageVersions('darwin'), { cache: 24, native: 16 });

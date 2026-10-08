@@ -22,11 +22,12 @@ async function getApi(): Promise<ExtensionTestApi> {
 
 async function invoke(binary: string, args: string[]): Promise<any> {
   return new Promise((resolve, reject) => {
-    execFile(binary, args, { windowsHide: true, timeout: 30_000, maxBuffer: 4 * 1024 * 1024,
+    const child = execFile(binary, args, { windowsHide: true, timeout: 30_000, maxBuffer: 4 * 1024 * 1024,
       env: { ...process.env, ZOEK_GRAPH_WORKERS: '2' } }, (error, stdout, stderr) => {
       if (error) { reject(new Error(`${error.message}\n${stderr}\nsignal=${error.signal ?? 'none'} killed=${error.killed}`)); return; }
       try { resolve(JSON.parse(stdout)); } catch (err) { reject(err); }
     });
+    child.stdin?.end();
   });
 }
 

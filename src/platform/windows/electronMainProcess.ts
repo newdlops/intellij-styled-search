@@ -68,12 +68,15 @@ export const windowsElectronMainProcess: ElectronMainProcessPlatform = {
     const powershell = path.win32.join(process.env.SystemRoot || 'C:\\Windows',
       'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     return new Promise((resolve, reject) => {
-      execFile(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', PROCESS_SNAPSHOT_SCRIPT], {
+      const child = execFile(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', PROCESS_SNAPSHOT_SCRIPT], {
         encoding: 'utf8', windowsHide: true, timeout: 15_000, maxBuffer: 8 * 1024 * 1024,
       }, (error, stdout) => {
         if (error) { reject(error); return; }
         try { resolve(parseWindowsProcessSnapshot(stdout)); } catch (err) { reject(err); }
       });
+      // The complete script is in argv; this read-only probe accepts no input.
+      // Signal EOF so a redirected PowerShell host cannot wait for more input.
+      child.stdin?.end();
     });
   },
 };

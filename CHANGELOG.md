@@ -1,9 +1,10 @@
 # Changelog
 
-## 0.1.7161 - 2026-10-08
+## 0.1.7161 - 2026-10-09
 
 - Retained saved changes, deletions and renames when the runtime is temporarily unavailable or the search index is not ready; retry after preparation recovers.
 - Kept search on the live codesearch backend while those known edits remain unindexed, with recovery regression checks for both preparation failures.
+- Closed unused input for Windows process probes and desktop acceptance commands so redirected shells receive EOF.
 
 ## 0.1.7160 - 2026-10-08
 
