@@ -1,0 +1,8 @@
+{
+  "name": "scope-restart-fixture",
+  "publisher": "fixture",
+  "version": "1.0.0",
+  "engines": { "vscode": "^1.75.0" },
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js"
+}

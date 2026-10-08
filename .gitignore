@@ -17,5 +17,6 @@ artifacts/release-check/
 artifacts/release/
 artifacts/desktop-test-logs/
 artifacts/windows-user-setup/
+artifacts/scope-persistence/
 .lh/**/*.*
 .vscode/**/*.*

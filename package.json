@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.7155",
+  "version": "0.1.7156",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -306,6 +306,12 @@
           "default": 100,
           "description": "Maximum number of executed search queries to keep in the search history dropdown. Set to 0 to disable storing search history."
         },
+        "intellijStyledSearch.defaultFilesScope": {
+          "type": "string",
+          "default": "",
+          "scope": "window",
+          "markdownDescription": "Initial Files scope for workspaces without a remembered scope. Use comma-separated Ant patterns, for example `**/*.vue,**/*.ts,!**/*.test.ts`. Each workspace remembers your edits across VS Code restarts; clearing the field remembers an unrestricted scope."
+        },
         "intellijStyledSearch.disableMonacoCapture": {
           "type": "boolean",
           "default": false,
@@ -551,6 +557,7 @@
     "bundle:callgraph-worker": "node scripts/bundleCallGraphWorker.js",
     "test:build-cache": "node --test scripts/buildCache.test.js scripts/platform/windowsBuild.test.js",
     "test:unit": "node scripts/runUnitTests.js",
+    "test:scope": "node scripts/testScopePersistence.js",
     "test:usage": "node scripts/checkUsageSemantics.js",
     "bench:usage": "node scripts/benchmarkUsageCounts.js",
     "build:zoek-runtime": "node scripts/buildZoekRuntime.js",

@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 154;
+export const RENDERER_PATCH_VERSION = 155;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -3437,6 +3437,7 @@ export function getRendererPatchScript(
     className: 'ij-find-scope',
     attrs: {
       placeholder: 'Files scope (Ant patterns: src/**, **/*.ts, !**/*.test.ts)',
+      'aria-label': 'Files scope',
       spellcheck: 'false',
       autocomplete: 'off',
       type: 'text',
@@ -6191,7 +6192,11 @@ export function getRendererPatchScript(
   }
 
   on($q, 'input', function () { state.staticSessionId = null; $moreUsages.hidden = true; autosizeQuery(); markSearchDirty(); });
-  on($scope, 'input', scheduleSearch);
+  on($scope, 'input', function () {
+    state.filesScopeEdited = true;
+    send({ type: 'filesScopeChanged', value: $scope.value || '' });
+    scheduleSearch();
+  });
   on($history, 'click', function (e) {
     e.preventDefault();
     toggleSearchHistory();
@@ -13620,6 +13625,11 @@ export function getRendererPatchScript(
 	    try {
 	      if (Date.now() < (state.recoveryUntil || 0)) { return 'suppressed:recovery'; }
 	      var wasVisible = panel.classList.contains('visible');
+      var scopeChangedForShow = false;
+      if (!state.filesScopeEdited && showOptions && typeof showOptions.filesScope === 'string') {
+        scopeChangedForShow = $scope.value !== showOptions.filesScope;
+        $scope.value = showOptions.filesScope;
+      }
 	      var suppressSearch = !!(showOptions && showOptions.suppressSearch);
 	      var forceLiteral = !!(showOptions && showOptions.forceLiteral);
       var preservePreview = !!(showOptions && showOptions.preservePreview);
@@ -13740,7 +13750,7 @@ export function getRendererPatchScript(
       // state in the idempotence check so a replay repairs that split state.
       var activeSearchQuery = state.filterQuery || state.rgQuery || '';
       if (typeof initialQuery === 'string' &&
-          (suppressSearch || initialQuery !== $q.value || initialQuery !== activeSearchQuery)) {
+          (suppressSearch || scopeChangedForShow || initialQuery !== $q.value || initialQuery !== activeSearchQuery)) {
         panelDiagMark('show:setQuery', { len: initialQuery.length, suppressSearch: suppressSearch });
         var oldQ = state.rgQuery || '';
         var oldOpts = state.rgOptions;
@@ -14119,6 +14129,7 @@ export function getRendererPatchScript(
   window.__ijFindSetScopeValue = function (value, forceRestart) {
     try {
       $scope.value = value == null ? '' : String(value);
+      state.filesScopeEdited = true;
       if (forceRestart) { refreshSearch(); }
       else { scheduleSearch(); }
       return window.__ijFindGetSearchState();

@@ -71,6 +71,8 @@ jobs:
           path: resources/bin/win32-x64/
       - name: Desktop acceptance
         run: npm test -- --run out/test/suite/desktopCompatibility.test.js
+      - name: Files scope persistence across normal VS Code restarts
+        run: npm run test:scope
       - name: Extension functional regressions
         run: npm test -- --exclude out/test/suite/renderer.test.js --exclude out/test/suite/captainIndexGate.test.js
       - name: Renderer acceptance and hardware timing report
@@ -103,6 +105,7 @@ jobs:
           path: |
             artifacts/desktop-compatibility/
             artifacts/desktop-test-logs/
+            artifacts/scope-persistence/
             resources/bin/*/
 
   windows-user-setup:
@@ -133,3 +136,4 @@ jobs:
             artifacts/windows-user-setup/*.json
             artifacts/windows-user-setup/*.log
             artifacts/desktop-compatibility/
+            artifacts/scope-persistence/

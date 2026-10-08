@@ -54,6 +54,9 @@ if ($AsTestUser) {
       $env:IJSS_E2E_GREP = ''
       & $NodeExecutable (Join-Path $repoRoot 'node_modules/@vscode/test-cli/out/bin.mjs')
       if ($LASTEXITCODE -ne 0) { throw "UserSetup $version desktop acceptance failed: $LASTEXITCODE" }
+      $env:IJSS_SCOPE_OUTPUT = Join-Path $repoRoot "artifacts/scope-persistence/user-setup-$version"
+      & $NodeExecutable (Join-Path $repoRoot 'scripts/testScopePersistence.js')
+      if ($LASTEXITCODE -ne 0) { throw "UserSetup $version scope restart acceptance failed: $LASTEXITCODE" }
     }
   } catch {
     $exitCode = 1

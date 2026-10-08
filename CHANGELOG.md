@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.7156 - 2026-10-08
+
+- Remembered the last Files scope separately for each workspace across VS Code restarts and fresh search panels, including an explicitly cleared unrestricted scope.
+- Added `intellijStyledSearch.defaultFilesScope` for workspaces without a remembered scope. Comma-separated patterns such as `**/*.vue,**/*.ts` retain their existing search behavior.
+- Added normal-workbench restart acceptance on macOS and Windows, checking defaults, project isolation, cleared values, filtered results and rendered restored fields.
+
 ## 0.1.7155 - 2026-10-07
 
 - Resolved JavaScript/TypeScript imports with explicit source extensions, default export aliases and cyclic re-export chains.

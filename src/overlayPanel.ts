@@ -32,9 +32,11 @@ import { ZoektRuntime, type ZoektFreshnessStatus } from './zoekRuntime';
 import type { ZoektInfoResponse } from './zoekProtocol';
 import { getElectronMainProcessPlatform, findAncestorElectronMainProcess, type ElectronProcess } from './electronMainProcess';
 import { isIndexingMemoryPressureError } from './internal/indexingMemoryProtection';
+import { SearchScopeState } from './internal/searchScopeState';
 
 type RendererEvent =
   | { type: 'search'; options: SearchOptions; recordHistory?: boolean }
+  | { type: 'filesScopeChanged'; value: string }
   | { type: 'loadMore' }
   | { type: 'cancel' }
   | { type: 'panelHidden' }
@@ -492,6 +494,8 @@ function buildPreviewPayload(
 }
 
 export class OverlayPanel {
+  private readonly filesScopeState: SearchScopeState;
+  private filesScopeSaveWarningShown = false;
   private static instance: OverlayPanel | undefined;
   private ws: WebSocket | undefined;
   private msgId = 1;
@@ -800,6 +804,8 @@ export class OverlayPanel {
   }
 
   private constructor(private readonly context: vscode.ExtensionContext) {
+    this.filesScopeState = new SearchScopeState(context.workspaceState,
+      () => vscode.workspace.getConfiguration('intellijStyledSearch').get<unknown>('defaultFilesScope', ''));
     const rawLog = vscode.window.createOutputChannel('IntelliJ Styled Search');
     const version = (context.extension?.packageJSON?.version as string | undefined) ?? 'unknown';
     this.log = wrapLogWithPrefix(rawLog, version);
@@ -3036,6 +3042,7 @@ export class OverlayPanel {
     initialQuery: string,
     options: ShowOptions,
   ): Promise<EvaluatedShow | undefined> {
+    const rendererOptions = { ...options, filesScope: this.filesScopeState.initialValue() };
     const completionToken = [
       process.pid.toString(36), Date.now().toString(36), (++this.showEvaluationSeq).toString(36),
     ].join('-');
@@ -3059,7 +3066,7 @@ export class OverlayPanel {
               var report = String(value || '');
               if (report !== 'ij-find patch installed' && report.indexOf('already patched') !== 0) { return report; }
               var result;
-              try { result = window.__ijFindShow ? await window.__ijFindShow(${JSON.stringify(initialQuery)}, ${JSON.stringify(options)}) : 'no-show-fn'; }
+              try { result = window.__ijFindShow ? await window.__ijFindShow(${JSON.stringify(initialQuery)}, ${JSON.stringify(rendererOptions)}) : 'no-show-fn'; }
               catch (showError) { result = 'show-throw:' + (showError && showError.message); }
               result = String(result || 'ok');
               window.__ijFindLastShowCompletion = { token: ${JSON.stringify(completionToken)}, result: result, completedAt: Date.now() };
@@ -3114,7 +3121,7 @@ export class OverlayPanel {
     }
     const showExpr = `(async function(){` +
       `var token=${JSON.stringify(completionToken)};var value;` +
-      `try{value=window.__ijFindShow?await window.__ijFindShow(${JSON.stringify(initialQuery)},${JSON.stringify(options)}):'no-show-fn';}` +
+      `try{value=window.__ijFindShow?await window.__ijFindShow(${JSON.stringify(initialQuery)},${JSON.stringify(rendererOptions)}):'no-show-fn';}` +
       `catch(e){value='show-throw:'+(e&&e.message);}` +
       `if(value===undefined||value===null||value===''){value='ok';}` +
       `value=String(value);` +
@@ -4499,6 +4506,7 @@ export class OverlayPanel {
 	      !(evt.type === 'loadMore' && this.staticSessions.has(staticRouteKey)) &&
 	      !(evt.type === 'runCommand' && evt.command === 'intellijStyledSearch.toggleEstimatedUsages' && this.staticSessions.has(staticRouteKey)) &&
 	      evt.type !== 'trace' &&
+	      evt.type !== 'filesScopeChanged' &&
 	      evt.type !== 'requestStandaloneMonaco' &&
 	      evt.type !== 'requestPreviewNativeRecovery' &&
 	      evt.type !== 'requestPreviewLanguageFeature'
@@ -4507,6 +4515,18 @@ export class OverlayPanel {
 	      return;
 	    }
     switch (evt.type) {
+      case 'filesScopeChanged':
+        if (typeof evt.value !== 'string') { break; }
+        void this.filesScopeState.save(evt.value).then(() => {
+          this.filesScopeSaveWarningShown = false;
+        }, (error) => {
+          this.log.appendLine(`Files scope save failed: ${error instanceof Error ? error.message : error}`);
+          if (!this.filesScopeSaveWarningShown) {
+            this.filesScopeSaveWarningShown = true;
+            void vscode.window.showWarningMessage('Files scope could not be saved. It will apply only in this session.');
+          }
+        });
+        break;
       case 'search':
         if (evt.__src) {
           this.activeRendererSrc = evt.__src;
