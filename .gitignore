@@ -18,5 +18,7 @@ artifacts/release/
 artifacts/desktop-test-logs/
 artifacts/windows-user-setup/
 artifacts/scope-persistence/
+artifacts/history-ux/
+artifacts/mcp-efficiency/
 .lh/**/*.*
 .vscode/**/*.*

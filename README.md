@@ -100,6 +100,8 @@ If a generated/full-scan request explicitly forbids fallback, MCP returns `fallb
 `codeidx_search_code` defaults to token-first `output_mode: "minimal"` and returns only `path:line` rows. Use `output_mode: "rg_like"` when you need line previews, and `codeidx_read_snippets` for selected ranges instead of paying snippet cost in the broad search response.
 Compact search diagnostics are opt-in for compact text calls: pass `"include_diagnostics": true` when you need engine/fallback/scope/timing metadata in `structuredContent`. Pass `"structured": true` or `"output_mode": "structured"` only for full JSON-rich search results.
 Pass `"diagnostic_level": "full"` only when you need full query terms and verbose ranking metadata.
+
+Envelope tools such as symbols, references, snippets, counts and health send a single JSON text copy by default. Read it from `content[0].text`; pass `"structured": true` if your client consumes `structuredContent`. Rich mode retains the full schema and its JSON text mirror. Warnings, confidence, IDs and continuation cursors remain available in both modes.
 Scope presets are explicit: `source` means production plus tests while excluding migrations/generated/dependencies/local editor context, `production` excludes tests too, `tests` keeps only tests, and `all` disables those preset filters.
 For architectural inventories, `codeidx_top_files` supports `group_by: "directory"` plus `directory_depth`; this is useful for summarizing where notification implementations, senders, or callers are concentrated before reading files.
 
@@ -133,6 +135,8 @@ Use the codeidx MCP mcp_health tool, then search for "UserService" with codeidx_
 | `intellijStyledSearch.defaultFilesScope` | `""` | Initial Files scope for a workspace with no remembered value. Accepts comma-separated Ant patterns, such as `**/*.vue,**/*.ts`. |
 
 The Files scope field remembers your last edit separately for each workspace, including after VS Code restarts. A remembered scope takes precedence over `defaultFilesScope`. Clearing the field remembers an unrestricted search, even when a default is configured. You can set the default in User or Workspace settings.
+
+Open **History** or press **Alt+H** in the search panel to filter previous queries. Matching is case-insensitive and supports multiple words. Use ↑/↓ and Enter to select a query; Escape closes the history popup. Selecting restores the complete query, including newlines, and waits for Enter or Run before searching. The current Files scope and options stay in effect.
 
 ## Runtime Notes
 

@@ -2076,7 +2076,7 @@ suite('Call graph', () => {
         method: 'tools/call',
         params: {
           name: 'codeidx_workspace_overview',
-          arguments: { include_examples: false },
+          arguments: { structured: true, include_examples: false },
         },
       });
       assert.strictEqual(overview.result?.isError, false);
@@ -2093,7 +2093,7 @@ suite('Call graph', () => {
         method: 'tools/call',
         params: {
           name: 'codeidx_index_status',
-          arguments: { include_counts: true },
+          arguments: { structured: true, include_counts: true },
         },
       });
       assert.strictEqual(indexStatus.result?.isError, false);
@@ -2111,7 +2111,7 @@ suite('Call graph', () => {
         method: 'tools/call',
         params: {
           name: 'codeidx_explain_search_query',
-          arguments: { query: 'GraphPy', query_kind: 'literal' },
+          arguments: { structured: true, query: 'GraphPy', query_kind: 'literal' },
         },
       });
       assert.strictEqual(queryExplain.result?.isError, false);
@@ -2122,7 +2122,7 @@ suite('Call graph', () => {
         method: 'tools/call',
         params: {
           name: 'codeidx_explain_search_query',
-          arguments: { query: '[unclosed', query_kind: 'regex' },
+          arguments: { structured: true, query: '[unclosed', query_kind: 'regex' },
         },
       });
       assert.strictEqual(invalidRegexExplain.result?.isError, true);
@@ -2210,6 +2210,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_count',
           arguments: {
+            structured: true,
             query: 'mcpFreshOverlayNewNeedle',
             query_kind: 'literal',
             include_globs: ['aaa_mcp_fresh_overlay.ts'],
@@ -2561,6 +2562,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_count',
           arguments: {
+            structured: true,
             query: 'mcpSearchCapNeedle\\d+',
             query_kind: 'auto',
             fallback_policy: 'always',
@@ -2588,6 +2590,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_count',
           arguments: {
+            structured: true,
             query: 'mcpGraphTarget',
             query_kind: 'literal',
             fallback_policy: 'always',
@@ -2615,6 +2618,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_count',
           arguments: {
+            structured: true,
             query: 'mcpDuplicateNeedle',
             query_kind: 'literal',
             fallback_policy: 'always',
@@ -2809,6 +2813,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_read_snippets',
           arguments: {
+            structured: true,
             snippets: [
               { file: 'mcp_graph_consumer.ts', start_line: 3, end_line: 4, context_lines: 0 },
               { file: 'mcp_graph_consumer.ts', start_line: 4, end_line: 5, context_lines: 0 },
@@ -2831,6 +2836,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_outline',
           arguments: {
+            structured: true,
             path: 'mcp_graph_target.ts',
             max_symbols: 20,
           },
@@ -2872,6 +2878,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_resolve_at',
           arguments: {
+            structured: true,
             file: 'mcp_python_model.py',
             line: 4,
             character_utf16: 8,
@@ -3080,6 +3087,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_count',
           arguments: {
+            structured: true,
             queries: ['mcpLargeGeneratedNeedle', 'mcpLargeGeneratedOtherNeedle'],
             query_kind: 'literal',
             query_operator: 'any',
@@ -3125,7 +3133,7 @@ suite('Call graph', () => {
         method: 'tools/call',
         params: {
           name: 'mcp_health',
-          arguments: { include_tools: true },
+          arguments: { structured: true, include_tools: true },
         },
       });
       assert.strictEqual(health.result?.isError, false);
@@ -3197,7 +3205,7 @@ suite('Call graph', () => {
         method: 'tools/call',
         params: {
           name: 'mcp_health',
-          arguments: { include_tools: true },
+          arguments: { structured: true, include_tools: true },
         },
       });
       assert.strictEqual(repairedHealth.result?.isError, false);
@@ -3209,7 +3217,7 @@ suite('Call graph', () => {
         method: 'tools/call',
         params: {
           name: 'mcp_health',
-          arguments: {},
+          arguments: { structured: true },
         },
       })));
       assert.ok(
@@ -3236,7 +3244,7 @@ suite('Call graph', () => {
         method: 'tools/call',
         params: {
           name: 'mcp_health',
-          arguments: {},
+          arguments: { structured: true },
         },
       });
       assert.strictEqual(postParallelHealth.result?.structuredContent?.health?.mcp_connection, 'ok');
@@ -3247,6 +3255,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_search_symbols',
           arguments: {
+            structured: true,
             query: 'mcpGraph',
             match: 'exact',
             limit: 10,
@@ -3266,6 +3275,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_search_symbols',
           arguments: {
+            structured: true,
             query: 'McpDeletedSymbolFreshness',
             match: 'exact',
             limit: 10,
@@ -3286,6 +3296,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_search_symbols',
           arguments: {
+            structured: true,
             query: 'McpDeletedSymbolFreshness',
             match: 'exact',
             limit: 10,
@@ -3309,6 +3320,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_search_symbols',
           arguments: {
+            structured: true,
             query: 'mcpGraphTarget',
             match: 'exact',
             limit: 10,
@@ -3345,6 +3357,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_signature',
           arguments: {
+            structured: true,
             symbol_id: quickPickSymbol.symbol_id,
           },
         },
@@ -3376,6 +3389,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_symbol_details',
           arguments: {
+            structured: true,
             symbol_id: quickPickSymbol.symbol_id,
             include_definition_snippet: false,
           },
@@ -3400,6 +3414,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_signature',
           arguments: {
+            structured: true,
             symbol_id: staleInternalId,
           },
         },
@@ -3417,6 +3432,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_get_context_bundle',
           arguments: {
+            structured: true,
             task: 'inspect seeded MCP graph target',
             seed_symbols: [quickPickSymbol.symbol_id],
             token_budget: 2_000,
@@ -3490,6 +3506,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_signature',
           arguments: {
+            structured: true,
             file: 'mcp_graph_consumer.ts',
             line: 3,
             character_utf16: 43,
@@ -3545,6 +3562,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_search_symbols',
           arguments: {
+            structured: true,
             query: 'mcpGraphBoxReport',
             container: 'McpGraphBox',
             limit: 10,
@@ -3566,6 +3584,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_search_symbols',
           arguments: {
+            structured: true,
             query: 'mcpGraphBoxReport',
             container: 'DoesNotExist',
             limit: 10,
@@ -3585,6 +3604,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_search_symbols',
           arguments: {
+            structured: true,
             query: 'mcpGraphTarget',
             frameworks: ['DoesNotExist'],
             limit: 10,
@@ -3604,6 +3624,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_find_references',
           arguments: {
+            structured: true,
             symbol_id: quickPickSymbol.symbol_id,
             limit: 20,
           },
@@ -3630,6 +3651,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_find_references',
           arguments: {
+            structured: true,
             symbol_id: quickPickSymbol.symbol_id,
             scope_preset: 'production',
             limit: 20,
@@ -3657,6 +3679,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_find_references',
           arguments: {
+            structured: true,
             symbol_id: quickPickSymbol.symbol_id,
             scope_preset: 'tests',
             limit: 20,
@@ -3680,6 +3703,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_find_references',
           arguments: {
+            structured: true,
             symbol_id: quickPickSymbol.symbol_id,
             edge_kinds: ['construct'],
             limit: 20,
@@ -3699,6 +3723,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_resolve_at',
           arguments: {
+            structured: true,
             file: 'mcp_graph_target.ts',
             line: 1,
             character_utf16: 20,
@@ -3719,6 +3744,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_find_references',
           arguments: {
+            structured: true,
             symbol_id: resolveDefinition.result?.structuredContent?.target_symbol?.symbol_id,
             limit: 20,
           },
@@ -3736,6 +3762,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_resolve_at',
           arguments: {
+            structured: true,
             file: 'mcp_graph_consumer.ts',
             line: 5,
             character_utf16: 12,
@@ -3751,6 +3778,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_resolve_at',
           arguments: {
+            structured: true,
             file: 'mcp_graph_consumer.ts',
             line: 4,
             character_utf16: 10,
@@ -3770,6 +3798,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_resolve_at',
           arguments: {
+            structured: true,
             file: 'mcp_graph_consumer.ts',
             line: 4,
             character_utf16: 3,
@@ -3789,6 +3818,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_graph_neighbors',
           arguments: {
+            structured: true,
             symbol_id: quickPickSymbol.symbol_id,
             directions: ['incoming'],
             max_edges: 20,
@@ -3807,6 +3837,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_graph_neighbors',
           arguments: {
+            structured: true,
             symbol_id: quickPickSymbol.symbol_id,
             directions: ['incoming'],
             edge_kinds: ['construct'],
@@ -3833,6 +3864,7 @@ suite('Call graph', () => {
         params: {
           name: 'codeidx_search_symbols',
           arguments: {
+            structured: true,
             query: 'mcpLateSymbol',
             limit: 10,
           },
@@ -3956,7 +3988,7 @@ suite('Call graph', () => {
           method: 'tools/call',
           params: {
             name: 'mcp_health',
-            arguments: {},
+            arguments: { structured: true },
           },
         });
         assert.strictEqual(envMismatchHealth.result?.structuredContent?.health?.workspace_root, workspaceRoot);
@@ -4132,7 +4164,7 @@ suite('Call graph', () => {
           method: 'tools/call',
           params: {
             name: 'mcp_start',
-            arguments: { timeout_ms: 5000 },
+            arguments: { structured: true, timeout_ms: 5000 },
           },
         });
         assert.strictEqual(staleStartResult.result?.structuredContent?.ok, true);
@@ -4175,20 +4207,29 @@ suite('Call graph', () => {
           method: 'tools/call',
           params: {
             name: 'mcp_health',
-            arguments: { include_tools: true },
+            arguments: { structured: true, include_tools: true },
           },
         });
         assert.strictEqual(stoppedHealth.result?.structuredContent?.health?.mcp_connection, 'stopped');
         assert.strictEqual(stoppedHealth.result?.structuredContent?.control?.available, true);
         assert.strictEqual(stoppedHealth.result?.structuredContent?.auto_setup?.ready_for_next_client, true);
         assert.deepStrictEqual(stoppedHealth.result?.structuredContent?.tools, ['mcp_health', 'mcp_start']);
+        const compactStoppedHealth = await sendStdioJson(stoppedProxy, {
+          jsonrpc: '2.0', id: 225, method: 'tools/call',
+          params: { name: 'mcp_health', arguments: { include_tools: true } },
+        });
+        assert.strictEqual(compactStoppedHealth.result?.structuredContent, undefined);
+        const compactStoppedEnvelope = JSON.parse(compactStoppedHealth.result.content[0].text);
+        assert.strictEqual(compactStoppedEnvelope.health.mcp_connection, 'stopped');
+        assert.strictEqual(compactStoppedEnvelope.health.workspace_root, workspaceRoot);
+        assert.deepStrictEqual(compactStoppedEnvelope.tools, ['mcp_health', 'mcp_start']);
         const startResult = await sendStdioJson(stoppedProxy, {
           jsonrpc: '2.0',
           id: 224,
           method: 'tools/call',
           params: {
             name: 'mcp_start',
-            arguments: { timeout_ms: 5000 },
+            arguments: { structured: true, timeout_ms: 5000 },
           },
         });
         assert.strictEqual(startResult.result?.structuredContent?.ok, true);

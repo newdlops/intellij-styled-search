@@ -3009,7 +3009,7 @@ Codex는 다음 원칙으로 구현한다.
 1. 기존 indexer의 storage/query API를 우선 재사용한다.
 2. MCP server는 기존 VSCode extension과 분리 가능한 standalone binary로 만든다.
 3. 먼저 stdio transport를 구현하고 HTTP는 그 다음에 구현한다.
-4. tool output은 반드시 `structuredContent`와 text content를 함께 제공한다.
+4. 기본 envelope tool output은 JSON text content 한 벌을 제공한다. `structured=true`를 요청하면 전체 `structuredContent`와 동일한 JSON text를 함께 제공한다. compact probe/search 도구의 기존 text 형식은 유지한다. 두 모드 모두 결과, confidence, warning, cursor를 보존한다.
 5. 모든 큰 tool은 limit/cursor/max_chars/token_budget을 지원한다.
 6. result에는 symbol_id, external_symbol_id, snippet_ref, resource_uri를 최대한 포함한다.
 7. 전체 파일 반환 기능은 만들지 않는다.

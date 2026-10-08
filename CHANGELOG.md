@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.7157 - 2026-10-08
+
+- Added filtering, matching excerpts, result counts and keyboard navigation to search history. Alt+H opens the popup; selecting a query restores its full text without running it automatically.
+- Made empty, no-match and disabled history states explicit, and preserved focus when history updates.
+- Removed duplicate JSON from default MCP envelope responses, including offline stdio health/start responses. Pass `structured: true` to receive the full `structuredContent` object with its JSON text mirror; the default JSON text keeps results, warnings, confidence, IDs and cursors.
+- Added live history UI acceptance and lossless MCP response-size checks across 15 envelope tools.
+
 ## 0.1.7156 - 2026-10-08
 
 - Remembered the last Files scope separately for each workspace across VS Code restarts and fresh search panels, including an explicitly cleared unrestricted scope.

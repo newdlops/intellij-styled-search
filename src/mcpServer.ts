@@ -792,17 +792,19 @@ export class CallGraphMcpServer implements vscode.Disposable {
       return toolErrorEnvelope('invalid_request', 'tools/call requires a string tool name.');
     }
     const args = isObject(params.arguments) ? params.arguments : {};
+    const formatResult = (envelope: Record<string, unknown>) =>
+      toolResult(envelope, readBoolArg(args, 'structured', false));
     try {
       switch (params.name) {
         case 'codeidx_workspace_overview':
-          return toolResult(this.capEnvelope(this.workspaceOverview(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return formatResult(this.capEnvelope(this.workspaceOverview(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
         case 'codeidx_index_status':
-          return toolResult(this.capEnvelope(await this.indexStatus(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.indexStatus(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
         case 'codeidx_search_code':
           return this.runSearchTool(args, () => this.searchCodeTool(args, token));
         case 'codeidx_count':
           return this.runSearchTool(args, async () =>
-            toolResult(this.capEnvelope(await this.countCode(args, token), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS))));
+            formatResult(this.capEnvelope(await this.countCode(args, token), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS))));
         case 'codeidx_probe':
           return this.runSearchTool(args, () => this.probeCode(args, token));
         case 'codeidx_exists':
@@ -814,9 +816,9 @@ export class CallGraphMcpServer implements vscode.Disposable {
         case 'codeidx_top_files':
           return this.runSearchTool(args, () => this.topFilesCode(args, token));
         case 'codeidx_search_symbols':
-          return toolResult(this.capEnvelope(await this.searchSymbols(args), readIntArg(args, 'max_chars', DEFAULT_SYMBOL_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.searchSymbols(args), readIntArg(args, 'max_chars', DEFAULT_SYMBOL_MAX_CHARS)));
         case 'codeidx_outline':
-          return toolResult(this.capEnvelope(await this.outline(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.outline(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
         case 'codeidx_file_digest':
           return this.fileDigest(args);
         case 'codeidx_exports':
@@ -832,27 +834,27 @@ export class CallGraphMcpServer implements vscode.Disposable {
         case 'codeidx_errors':
           return this.errorsDigest(args);
         case 'codeidx_resolve_at':
-          return toolResult(this.capEnvelope(await this.resolveAt(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.resolveAt(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
         case 'codeidx_signature':
-          return toolResult(this.capEnvelope(await this.signature(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.signature(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
         case 'codeidx_symbol_details':
-          return toolResult(this.capEnvelope(await this.symbolDetails(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.symbolDetails(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
         case 'codeidx_find_references':
-          return toolResult(this.capEnvelope(await this.findReferences(args, token), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.findReferences(args, token), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
         case 'codeidx_find_implementations':
-          return toolResult(this.capEnvelope(await this.findImplementations(args, token), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.findImplementations(args, token), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
         case 'codeidx_graph_neighbors':
-          return toolResult(this.capEnvelope(await this.graphNeighbors(args, token), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.graphNeighbors(args, token), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
         case 'codeidx_get_context_bundle':
-          return toolResult(this.capEnvelope(await this.getContextBundle(args, token), readIntArg(args, 'max_chars', DEFAULT_BUNDLE_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.getContextBundle(args, token), readIntArg(args, 'max_chars', DEFAULT_BUNDLE_MAX_CHARS)));
         case 'codeidx_read_snippets':
-          return toolResult(this.capEnvelope(await this.readSnippets(args), readIntArg(args, 'max_chars', DEFAULT_READ_SNIPPETS_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.readSnippets(args), readIntArg(args, 'max_chars', DEFAULT_READ_SNIPPETS_MAX_CHARS)));
         case 'codeidx_explain_search_query':
-          return toolResult(this.capEnvelope(await this.explainSearchQuery(args), DEFAULT_MCP_MAX_CHARS));
+          return formatResult(this.capEnvelope(await this.explainSearchQuery(args), DEFAULT_MCP_MAX_CHARS));
         case 'mcp_health':
-          return toolResult(this.capEnvelope(await this.mcpHealth(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.mcpHealth(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
         case 'mcp_start':
-          return toolResult(this.capEnvelope(await this.mcpStart(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
+          return formatResult(this.capEnvelope(await this.mcpStart(args), readIntArg(args, 'max_chars', DEFAULT_MCP_MAX_CHARS)));
 
         // Legacy compatibility for users who already configured the original
         // call-graph-only endpoint. These aliases are intentionally omitted
@@ -5008,7 +5010,10 @@ function promptTextFor(name: string, target: string, change: string, entrypoint:
 function objectSchema(properties: Record<string, unknown>, required: string[] = []): Record<string, unknown> {
   return {
     type: 'object',
-    properties,
+    properties: {
+      structured: { type: 'boolean', default: false, description: 'Also include structuredContent; default sends text only.' },
+      ...properties,
+    },
     required,
     additionalProperties: false,
   };
@@ -5058,10 +5063,10 @@ function idempotentControlAnnotations(): Record<string, unknown> {
   };
 }
 
-function toolResult(envelope: Record<string, unknown>): Record<string, unknown> {
+function toolResult(envelope: Record<string, unknown>, structured = true): Record<string, unknown> {
   return {
     content: [{ type: 'text', text: JSON.stringify(envelope) }],
-    structuredContent: envelope,
+    ...(structured ? { structuredContent: envelope } : {}),
     isError: envelope.ok === false,
   };
 }

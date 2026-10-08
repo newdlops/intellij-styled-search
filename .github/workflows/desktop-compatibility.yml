@@ -112,6 +112,8 @@ jobs:
             artifacts/desktop-compatibility/
             artifacts/desktop-test-logs/
             artifacts/scope-persistence/
+            artifacts/history-ux/
+            artifacts/mcp-efficiency/
             resources/bin/*/
 
   windows-user-setup:

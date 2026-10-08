@@ -84,6 +84,7 @@ const OFFLINE_HEALTH_TOOL = {
       include_tools: { type: 'boolean', default: false },
       include_discovery: { type: 'boolean', default: true },
       include_agent_policy: { type: 'boolean', default: true },
+      structured: { type: 'boolean', default: false },
       max_chars: { type: 'integer', minimum: 1000, maximum: 200000, default: 100000 },
     },
     additionalProperties: false,
@@ -103,6 +104,7 @@ const OFFLINE_START_TOOL = {
     type: 'object',
     properties: {
       timeout_ms: { type: 'integer', minimum: 100, maximum: 120000, default: 5000 },
+      structured: { type: 'boolean', default: false },
       max_chars: { type: 'integer', minimum: 1000, maximum: 200000, default: 100000 },
     },
     additionalProperties: false,
@@ -619,7 +621,7 @@ async function offlineResponseForMessage(options: CliOptions, state: OfflineMcpS
       const args = isRecord(params.arguments) ? params.arguments : {};
       if (name === 'mcp_health') {
         const latest = buildOfflineMcpState(options, state.reason, state.message);
-        return jsonRpcResult(id, toolResult(offlineHealthEnvelope(latest, args, true)));
+        return jsonRpcResult(id, toolResult(offlineHealthEnvelope(latest, args, true), readBoolArg(args, 'structured', false)));
       }
       if (name === 'mcp_start') {
         return jsonRpcResult(id, await startWorkspaceMcpEndpoint(options, state, args));
@@ -848,7 +850,7 @@ async function startWorkspaceMcpEndpoint(
       'Retry the original codeidx tool only after health.mcp_connection == ok.',
     ],
   };
-  return toolResult(envelope);
+  return toolResult(envelope, readBoolArg(args, 'structured', false));
 }
 
 function offlineAgentPolicy(): Record<string, unknown> {
@@ -1227,10 +1229,10 @@ function jsonRpcResult(id: JsonRpcId, result: unknown): Record<string, unknown> 
   return { jsonrpc: '2.0', id, result };
 }
 
-function toolResult(envelope: Record<string, unknown>): Record<string, unknown> {
+function toolResult(envelope: Record<string, unknown>, structured = true): Record<string, unknown> {
   return {
     content: [{ type: 'text', text: JSON.stringify(envelope) }],
-    structuredContent: envelope,
+    ...(structured ? { structuredContent: envelope } : {}),
     isError: envelope.ok === false,
   };
 }

@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 155;
+export const RENDERER_PATCH_VERSION = 156;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -2806,8 +2806,8 @@ export function getRendererPatchScript(
     '.ij-find-history:disabled:hover { background: transparent; }',
     '.ij-find-history-menu {',
     '  position: absolute; top: 30px; right: 0;',
-    '  width: 340px; max-width: min(340px, calc(100vw - 48px));',
-    '  max-height: 220px; overflow: auto;',
+    '  width: 400px; max-width: min(400px, calc(100vw - 48px));',
+    '  overflow: hidden;',
     '  display: none;',
     '  z-index: 10005;',
     '  background: var(--vscode-editorWidget-background, #252526);',
@@ -2815,9 +2815,15 @@ export function getRendererPatchScript(
     '  border: 1px solid var(--vscode-widget-border, var(--vscode-contrastBorder, #454545));',
     '  border-radius: 3px;',
     '  box-shadow: none;',
-    '  padding: 3px 0;',
+    '  padding: 8px 0 0;',
     '}',
     '.ij-find-history-menu.open { display: block; }',
+    '.ij-find-history-heading { display: flex; justify-content: space-between; padding: 0 9px 6px; font-size: 11px; color: var(--vscode-descriptionForeground, #9d9d9d); }',
+    '.ij-find-history-filter { box-sizing: border-box; width: calc(100% - 18px); margin: 0 9px 7px; padding: 5px 7px; font: 12px var(--vscode-font-family, sans-serif); background: var(--vscode-input-background, #3c3c3c); color: var(--vscode-input-foreground, #cccccc); border: 1px solid var(--vscode-input-border, transparent); outline: none; }',
+    '.ij-find-history-filter:focus-visible { border-color: var(--vscode-focusBorder, #007acc); }',
+    '.ij-find-history-list { max-height: 220px; overflow-y: auto; overscroll-behavior: contain; }',
+    '.ij-find-history-empty { padding: 12px 9px; color: var(--vscode-descriptionForeground, #9d9d9d); font-size: 12px; }',
+    '.ij-find-history-hint { padding: 6px 9px; font-size: 10px; color: var(--vscode-descriptionForeground, #9d9d9d); border-top: 1px solid var(--vscode-widget-border, #454545); }',
     '.ij-find-history-item {',
     '  display: block; width: 100%;',
     '  padding: 5px 9px;',
@@ -2826,13 +2832,16 @@ export function getRendererPatchScript(
     '  border: 0;',
     '  text-align: left;',
     '  font: 12px var(--vscode-editor-font-family, monospace);',
-    '  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;',
+    '  white-space: normal; overflow-wrap: anywhere;',
     '  cursor: pointer;',
+    '  content-visibility: auto; contain-intrinsic-size: auto 24px;',
     '}',
     '.ij-find-history-item:hover, .ij-find-history-item:focus {',
     '  background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.08));',
     '  outline: none;',
     '}',
+    '.ij-find-history-item:focus-visible { background: var(--vscode-list-focusBackground, #04395e); color: var(--vscode-list-focusForeground, #ffffff); outline: 1px solid var(--vscode-focusBorder, #007acc); outline-offset: -1px; }',
+    '.ij-find-history-item mark { background: var(--vscode-list-filterMatchBackground, rgba(234,92,0,0.25)); color: inherit; }',
     '.ij-find-scope {',
     '  width: 100%; padding: 5px 8px;',
     '  font-family: var(--vscode-editor-font-family, monospace);',
@@ -3410,17 +3419,27 @@ export function getRendererPatchScript(
     text: 'History',
     attrs: {
       type: 'button',
-      title: 'Search history',
+      title: 'Search history (Alt+H)',
       'aria-label': 'Search history',
-      'aria-haspopup': 'listbox',
+      'aria-haspopup': 'dialog',
       'aria-expanded': 'false',
       disabled: 'true',
     },
   });
+  var historyListId = 'ij-history-' + Math.random().toString(36).slice(2);
+  var $historyCount = el('span', { attrs: { 'aria-live': 'polite' } });
+  var $historyFilter = el('input', { className: 'ij-find-history-filter', attrs: {
+    type: 'text', name: 'historyFilter', placeholder: 'Filter previous searches…', 'aria-label': 'Filter search history',
+    'aria-controls': historyListId, autocomplete: 'off', spellcheck: 'false',
+  } });
+  var $historyList = el('div', { className: 'ij-find-history-list', attrs: { id: historyListId, role: 'listbox', 'aria-label': 'Previous searches' } });
   var $historyMenu = el('div', {
     className: 'ij-find-history-menu',
-    attrs: { role: 'listbox' },
+    attrs: { id: historyListId + '-popup', role: 'dialog', 'aria-label': 'Search history' },
+    children: [el('div', { className: 'ij-find-history-heading', children: [el('span', { text: 'Recent searches' }), $historyCount] }),
+      $historyFilter, $historyList, el('div', { className: 'ij-find-history-hint', text: '↑ ↓ to browse · Enter to select · Esc to close' })],
   });
+  $history.setAttribute('aria-controls', historyListId + '-popup');
   var $historyWrap = el('div', { className: 'ij-find-history-wrap', children: [$history, $historyMenu] });
   var $optCase = el('button', { className: 'ij-find-opt', title: 'Case Sensitive (Alt+C)', text: 'aA', attrs: { 'data-opt': 'caseSensitive', 'aria-pressed': 'false' } });
   var $optWord = el('button', { className: 'ij-find-opt', title: 'Whole Word (Alt+W)', text: 'W', attrs: { 'data-opt': 'wholeWord', 'aria-pressed': 'false' } });
@@ -5303,24 +5322,52 @@ export function getRendererPatchScript(
   }
 
   function renderSearchHistory() {
-    clearChildren($historyMenu);
+    var focused = document.activeElement;
+    var focusedQuery = focused && $historyList.contains(focused) ? focused.title : null;
+    clearChildren($historyList);
     var items = state.searchHistory || [];
+    var filter = String($historyFilter.value || '').trim().toLowerCase();
+    var terms = filter ? filter.split(/\\s+/) : [];
+    var matched = 0;
     for (var i = 0; i < items.length; i++) {
+      var label = String(items[i]).replace(/[\\r\\n\\t ]+/g, ' ').trim();
+      var lower = label.toLowerCase();
+      if (!terms.every(function (term) { return lower.indexOf(term) >= 0; })) { continue; }
+      matched++;
       var item = document.createElement('button');
       item.type = 'button';
       item.className = 'ij-find-history-item';
       item.setAttribute('role', 'option');
+      item.setAttribute('aria-selected', 'false');
+      item.tabIndex = -1;
       item.setAttribute('data-history-index', String(i));
-      var label = String(items[i]).replace(/[\\r\\n\\t ]+/g, ' ').trim();
-      item.textContent = label.length > 96 ? label.slice(0, 93) + '...' : (label || '(blank)');
+      var matchAt = terms.length ? lower.indexOf(terms[0]) : 0;
+      var from = label.length > 180 ? Math.max(0, matchAt - 48) : 0;
+      var excerpt = (from > 0 ? '…' : '') + label.slice(from, from + 180) + (from + 180 < label.length ? '…' : '');
+      var excerptLower = excerpt.toLowerCase();
+      var at = terms.length ? excerptLower.indexOf(terms[0]) : -1;
+      if (at >= 0) {
+        item.appendChild(document.createTextNode(excerpt.slice(0, at)));
+        item.appendChild(el('mark', { text: excerpt.slice(at, at + terms[0].length) }));
+        item.appendChild(document.createTextNode(excerpt.slice(at + terms[0].length)));
+      } else { item.textContent = excerpt || '(blank)'; }
       item.title = String(items[i]);
-      $historyMenu.appendChild(item);
+      $historyList.appendChild(item);
+      if (focusedQuery === item.title) { try { item.focus(); } catch (eFocus) {} }
     }
-    if (items.length > 0) { $history.removeAttribute('disabled'); }
+    $historyCount.textContent = filter ? matched + ' of ' + items.length : String(items.length);
+    if (!matched) { $historyList.appendChild(el('div', { className: 'ij-find-history-empty', text: filter ? 'No matching searches. Try another phrase.' : 'No searches yet. Press Enter or Run to save a search.' })); }
+    if (focusedQuery && document.activeElement !== focused) {
+      var replacement = $historyList.querySelector('.ij-find-history-item:focus');
+      if (!replacement) { try { $historyFilter.focus(); } catch (eFocus2) {} }
+    }
+    if (state.searchHistoryLimit > 0) { $history.removeAttribute('disabled'); }
     else {
       $history.setAttribute('disabled', 'true');
+      $history.title = 'Search history is disabled (searchHistoryLimit = 0)';
       closeSearchHistory();
     }
+    if (state.searchHistoryLimit > 0) { $history.title = 'Search history (Alt+H)'; }
   }
 
   function closeSearchHistory() {
@@ -5329,9 +5376,14 @@ export function getRendererPatchScript(
   }
 
   function openSearchHistory() {
-    if (!state.searchHistory || state.searchHistory.length === 0) { return; }
+    if (state.searchHistoryLimit <= 0) { return; }
+    $historyFilter.value = '';
+    renderSearchHistory();
+    var available = Math.min(innerHeight, panel.getBoundingClientRect().bottom) - $history.getBoundingClientRect().bottom - 16;
+    $historyList.style.maxHeight = Math.max(64, Math.min(220, available - 100)) + 'px';
     $historyMenu.classList.add('open');
     $history.setAttribute('aria-expanded', 'true');
+    try { $historyFilter.focus(); } catch (eFocus) {}
   }
 
   function toggleSearchHistory() {
@@ -5342,6 +5394,8 @@ export function getRendererPatchScript(
   function selectSearchHistory(idx) {
     if (idx >= 0 && state.searchHistory && idx < state.searchHistory.length) {
       $q.value = state.searchHistory[idx];
+      state.staticSessionId = null;
+      $moreUsages.hidden = true;
       autosizeQuery();
       markSearchDirty();
       closeSearchHistory();
@@ -6160,6 +6214,12 @@ export function getRendererPatchScript(
     var withModifier = !!e.altKey && !e.ctrlKey && !e.metaKey;
     var plainFromOptions = isPlainOptionKeyAllowed(e);
     if (!withModifier && !plainFromOptions) { return false; }
+    if (withModifier && optionShortcutMatches(e, 'KeyH', 'h')) {
+      if (!(e.target instanceof Node) || !panel.contains(e.target)) { return false; }
+      e.preventDefault();
+      toggleSearchHistory();
+      return true;
+    }
     if (optionShortcutMatches(e, 'KeyC', 'c')) {
       e.preventDefault();
       toggleOpt('caseSensitive', $optCase);
@@ -6221,17 +6281,26 @@ export function getRendererPatchScript(
     e.preventDefault();
     selectSearchHistory(parseInt(item.getAttribute('data-history-index') || '-1', 10));
   });
+  on($historyFilter, 'input', function () { renderSearchHistory(); $historyList.scrollTop = 0; });
+  on($historyList, 'focusin', function (e) {
+    var items = $historyList.querySelectorAll('.ij-find-history-item');
+    for (var i = 0; i < items.length; i++) { items[i].setAttribute('aria-selected', String(items[i] === e.target)); }
+  });
   on($historyMenu, 'keydown', function (e) {
     if (e.key === 'Escape') {
       e.preventDefault();
+      e.stopPropagation();
+      e.stopPropagation();
       closeSearchHistory();
       try { $history.focus(); } catch (eFocus) {}
       return;
     }
     if (e.key === 'Enter' || e.key === ' ') {
       var active = document.activeElement instanceof HTMLElement ? document.activeElement.closest('.ij-find-history-item') : null;
+      if (e.key === 'Enter' && document.activeElement === $historyFilter) { active = $historyList.querySelector('.ij-find-history-item'); }
       if (active) {
         e.preventDefault();
+        e.stopPropagation();
         selectSearchHistory(parseInt(active.getAttribute('data-history-index') || '-1', 10));
       }
       return;
@@ -6240,6 +6309,7 @@ export function getRendererPatchScript(
       var items = Array.prototype.slice.call($historyMenu.querySelectorAll('.ij-find-history-item'));
       if (items.length === 0) { return; }
       e.preventDefault();
+      e.stopPropagation();
       var current = items.indexOf(document.activeElement);
       var next = e.key === 'ArrowDown'
         ? Math.min(items.length - 1, current + 1)
@@ -6252,6 +6322,9 @@ export function getRendererPatchScript(
     if (!$historyMenu.classList.contains('open')) { return; }
     if (e.target instanceof Node && $historyWrap.contains(e.target)) { return; }
     closeSearchHistory();
+  });
+  on($historyWrap, 'focusout', function (e) {
+    if (e.relatedTarget instanceof Node && !$historyWrap.contains(e.relatedTarget)) { closeSearchHistory(); }
   });
   on($q, 'keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) {
