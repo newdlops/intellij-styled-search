@@ -185,6 +185,13 @@ token before exercising the native engine and overlay. This uses x64
 application emulation on GitHub's `windows-11-arm` runner; native x64 Windows 11
 hardware and native ARM64 VS Code are separate environments.
 
+For a targeted standard-account rerun, dispatch the workflow with
+`native_run_id` set to a run whose `native-win32-x64` artifact passed desktop
+acceptance. The matrix is skipped for that manual run; the downloaded tuple's
+Rust source fingerprint, binary hashes and pair identity must match the current
+checkout before UserSetup acceptance starts. Leave the input empty for the full
+macOS/Windows workflow.
+
 Renderer timing checks disable Chromium's background animation/timer throttling
 only in the isolated test workbench and log its actual window policy. Their
 interactive deadlines still include the first full-file hint request without

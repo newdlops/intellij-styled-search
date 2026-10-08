@@ -5,6 +5,10 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      native_run_id:
+        description: Run only standard-account acceptance using a source-matched Windows runtime from this run ID
+        type: string
+        default: ''
       enforce_timings:
         description: Enforce the existing hardware timing budgets
         type: boolean
@@ -21,9 +25,11 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   desktop:
+    if: ${{ !inputs.native_run_id }}
     strategy:
       fail-fast: false
       matrix:
@@ -125,6 +131,10 @@ jobs:
         with:
           name: native-win32-x64
           path: resources/bin/win32-x64/
+          run-id: ${{ inputs.native_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify reused native runtime source and binary identity
+        run: node scripts/buildZoekRuntime.js --verify-staged --platform-key win32-x64
       - name: Windows 11 x64 UserSetup under a standard account
         shell: pwsh
         run: ./scripts/test-windows-user-setup.ps1

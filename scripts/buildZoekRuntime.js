@@ -112,13 +112,31 @@ if (!Object.prototype.hasOwnProperty.call(rustTargetsByPlatform, platformKey)) {
 if (rustTarget && !args.includes('--platform-key')) {
   throw new Error('--rust-target requires an explicit --platform-key');
 }
-if (!rustTarget && platformKey !== hostPlatformKey()) {
+if (!args.includes('--verify-staged') && !rustTarget && platformKey !== hostPlatformKey()) {
   throw new Error('a non-host --platform-key requires --rust-target');
 }
 if (rustTarget && rustTargetsByPlatform[platformKey] !== rustTarget) {
   throw new Error(
     `--rust-target ${rustTarget} does not match ${platformKey} (${rustTargetsByPlatform[platformKey]})`,
   );
+}
+
+if (args.includes('--verify-staged')) {
+  const directory = path.join(root, 'resources', 'bin', platformKey);
+  const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8'));
+  if (manifest.formatVersion !== 2 || manifest.platformKey !== platformKey ||
+      manifest.protocolVersion !== 1 || manifest.schemaVersion !== 22 ||
+      manifest.sourceFingerprint !== rustSourceFingerprint()) {
+    throw new Error('staged runtime metadata does not match this checkout; rebuild the native runtime');
+  }
+  const files = {};
+  for (const name of ['zoek-rs', 'ijss-rebuild']) {
+    files[name] = sha256(path.join(directory, name + (platformKey.startsWith('win32-') ? '.exe' : '')));
+    if (files[name] !== manifest.files[name]) { throw new Error(`staged runtime hash mismatch: ${name}`); }
+  }
+  if (binaryPairArtifactId(files) !== manifest.artifactId) { throw new Error('staged runtime pair identity mismatch'); }
+  console.log(`[runtime] verified ${platformKey}: ${manifest.sourceFingerprint} / ${manifest.artifactId}`);
+  process.exit(0);
 }
 
 const cargoArgs = [
