@@ -204,13 +204,16 @@ suite('Search history discovery', () => {
   });
 
   test('Enter runs a recalled query and starts a fresh history walk afterward', async () => {
+    assert.equal(await api.overlay.showAndWaitForTests('new draft',{forceLiteral:true,suppressSearch:true}),true);
     await seed(['function','return']);
     await setDraft('new draft');
     const before=await queryState();
+    assert.equal(before.state.rgQuery,'');
+    assert.equal(before.state.flatCount,0);
     await pressQueryKey('Up');
     await waitForQuery(value=>value.value==='function');
     await pressQueryKey('Enter');
-    await waitForQuery(value=>value.state.searchId!==before.state.searchId && value.state.rgQuery==='function'
+    await waitForQuery(value=>value.state.rgQuery==='function'
       && !value.state.searching && value.state.flatCount>1,5000);
     const results=await renderer(`var input=panel.querySelector('.ij-find-query');var before=window.__ijFindGetSearchState();
       input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',altKey:true,bubbles:true,cancelable:true}));
@@ -218,9 +221,11 @@ suite('Search history discovery', () => {
     assert.equal(results.after,results.before+1,'Alt+Down must keep result navigation available');
     assert.equal(results.value,'function');
     await pressQueryKey('Up');
-    await waitForQuery(value=>value.value==='return');
+    const recalled=await waitForQuery(value=>value.value==='return');
+    assert.equal(recalled.state.activeIndex,results.after);
     await pressQueryKey('Down');
-    await waitForQuery(value=>value.value==='function');
+    const restored=await waitForQuery(value=>value.value==='function');
+    assert.equal(restored.state.activeIndex,results.after);
   });
 
   test('empty and no-match states are clear and recover when the filter is cleared', async () => {
