@@ -18093,15 +18093,44 @@ fn deduped_reference_counts_from_index_with_families(
     if symbol_ids.is_empty() || !graph_index_available(workspace_root, config) {
         return Ok(HashMap::new());
     }
-    let ids_lower: HashSet<String> = symbol_ids.iter().map(|id| id.to_ascii_lowercase()).collect();
     let file_table_path = graph_file_table_path(workspace_root, config);
     let file_table = if file_table_path.exists() {
         read_file_table_binary(&file_table_path).unwrap_or_default()
     } else {
         FileTable::default()
     };
+    let context = ReferenceCountReadContext {
+        file_table: &file_table,
+        sharded_references: graph_shard_family_available(
+            workspace_root, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
+        ),
+    };
+    deduped_reference_counts_with_context(
+        workspace_root, config, symbol_ids, symbols, overlay, member_families, &context,
+    )
+}
+
+// Builds hold the graph lock and read one immutable base generation. Reuse
+// its file table and shard-family discovery across all target-count shards;
+// serving queries still load their own context for the current generation.
+struct ReferenceCountReadContext<'a> {
+    file_table: &'a FileTable,
+    sharded_references: bool,
+}
+
+fn deduped_reference_counts_with_context(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbol_ids: &HashSet<String>,
+    symbols: &[GraphSymbol],
+    overlay: &crate::graph_overlay::GraphOverlay,
+    member_families: &mut HashMap<String, Option<MemberImplementationFamily>>,
+    context: &ReferenceCountReadContext<'_>,
+) -> io::Result<HashMap<String, usize>> {
+    if symbol_ids.is_empty() { return Ok(HashMap::new()); }
+    let ids_lower: HashSet<String> = symbol_ids.iter().map(|id| id.to_ascii_lowercase()).collect();
     let mut references: Vec<GraphReference> = Vec::new();
-    if graph_shard_family_available(workspace_root, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX) {
+    if context.sharded_references {
         let mut shards: BTreeMap<usize, Vec<String>> = BTreeMap::new();
         for id in &ids_lower {
             shards
@@ -18140,7 +18169,7 @@ fn deduped_reference_counts_from_index_with_families(
                     ReferenceTargetField::Inline(_) => true,
                 };
                 if candidate {
-                    let reference = parse_reference_binary(&bytes, &mut cursor, &file_table)?;
+                    let reference = parse_reference_binary(&bytes, &mut cursor, context.file_table)?;
                     if matches(&reference) {
                         references.push(reference);
                     }
@@ -18163,7 +18192,7 @@ fn deduped_reference_counts_from_index_with_families(
         workspace_root,
         config,
         symbols,
-        &file_table,
+        context.file_table,
         &mut references,
         overlay,
         member_families,

@@ -518,6 +518,7 @@ export class ZoektRuntime implements vscode.Disposable {
   private readonly activeChildren = new Map<number, TrackedChild>();
   private readonly lastAutoBaseRefreshAt = new Map<string, number>();
   private workspaceSyncNeeded = false;
+  private workspaceSyncRequestVersion = 0;
   private readonly lastWorkspaceSyncAt = new Map<string, number>();
   private readonly lastGitState = new Map<string, string>();
   private readonly workspaceSyncPromises = new Map<string, Promise<void>>();
@@ -1468,9 +1469,14 @@ export class ZoektRuntime implements vscode.Disposable {
 
   private flushPendingUpdates(automatic = false): Promise<void> {
     if (this.flushPromise) { return this.flushPromise; }
-    this.flushPromise = this.doFlushPendingUpdates(automatic).finally(() => {
-      this.flushPromise = undefined;
-    });
+    this.flushPromise = this.doFlushPendingUpdates(automatic)
+      .catch((err) => {
+        this.lastUpdateFailed = true;
+        if (this.disposed) { return; }
+        this.scheduleFlush(isIndexingMemoryPressureError(err) ? MEMORY_PRESSURE_RETRY_MS : UPDATE_FAILURE_RETRY_MS);
+        this.log.appendLine(`zoek-rs update preparation deferred: ${err instanceof Error ? err.message : err}`);
+      })
+      .finally(() => { this.flushPromise = undefined; });
     return this.flushPromise;
   }
 
@@ -1622,6 +1628,7 @@ export class ZoektRuntime implements vscode.Disposable {
     if (pendingCount <= SUSPENDED_UPDATE_PATH_LIMIT) { return; }
     this.clearPending();
     this.workspaceSyncNeeded = true;
+    this.workspaceSyncRequestVersion++;
   }
 
   private syncWorkspaceIndexIfNeeded(
@@ -1632,11 +1639,17 @@ export class ZoektRuntime implements vscode.Disposable {
   ): Promise<void> {
     const existing = this.workspaceSyncPromises.get(workspaceRoot);
     if (existing) { return existing; }
-    const promise = this.doSyncWorkspaceIndexIfNeeded(workspaceRoot, binary, reason, automatic).finally(() => {
-      if (this.workspaceSyncPromises.get(workspaceRoot) === promise) {
-        this.workspaceSyncPromises.delete(workspaceRoot);
-      }
-    });
+    const promise = this.doSyncWorkspaceIndexIfNeeded(workspaceRoot, binary, reason, automatic)
+      .catch((err) => {
+        this.workspaceSyncNeeded = true;
+        this.scheduleFlush(isIndexingMemoryPressureError(err) ? MEMORY_PRESSURE_RETRY_MS : UPDATE_FAILURE_RETRY_MS);
+        this.log.appendLine(`zoek-rs workspace sync preparation deferred: ${err instanceof Error ? err.message : err}`);
+      })
+      .finally(() => {
+        if (this.workspaceSyncPromises.get(workspaceRoot) === promise) {
+          this.workspaceSyncPromises.delete(workspaceRoot);
+        }
+      });
     this.workspaceSyncPromises.set(workspaceRoot, promise);
     return promise;
   }
@@ -1670,6 +1683,7 @@ export class ZoektRuntime implements vscode.Disposable {
       ? await this.collectGitBranchChanges(workspaceRoot, previousHead, currentHead)
       : null;
     const branchChangeNeedsSync = !!gitState && previousGitState !== gitState && !changes;
+    const requestVersion = this.workspaceSyncRequestVersion;
     const started = Date.now();
     try {
       let response: ZoektEngineResponse | undefined;
@@ -1685,7 +1699,8 @@ export class ZoektRuntime implements vscode.Disposable {
       if (gitState) {
         this.lastGitState.set(workspaceRoot, gitState);
       }
-      this.workspaceSyncNeeded = false;
+      this.workspaceSyncNeeded = this.workspaceSyncRequestVersion !== requestVersion;
+      if (this.workspaceSyncNeeded) { this.scheduleFlush(); }
       this.log.appendLine(`zoek-rs workspace sync complete: reason=${reason} elapsed=${Date.now() - started}ms`);
     } catch (err) {
       this.workspaceSyncNeeded = true;

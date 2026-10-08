@@ -80,6 +80,13 @@ pub(super) fn build(workspace: &Path, config: &EngineConfig) -> io::Result<()> {
     let files = read_file_table_binary(&graph_file_table_path(workspace, config))?;
     let empty_overlay = GraphOverlay::new(built_at);
     let mut member_families = HashMap::default();
+    let graph_available = graph_index_available(workspace, config);
+    let context = ReferenceCountReadContext {
+        file_table: &files,
+        sharded_references: graph_shard_family_available(
+            workspace, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
+        ),
+    };
     for shard in 0..GRAPH_SHARD_COUNT {
         let symbol_path = graph_shard_path(workspace, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
         let symbols = if symbol_path.exists() {
@@ -88,8 +95,13 @@ pub(super) fn build(workspace: &Path, config: &EngineConfig) -> io::Result<()> {
             Vec::new()
         };
         let ids: HashSet<String> = symbols.iter().map(|symbol| symbol.id.clone()).collect();
-        let counts =
-            deduped_reference_counts_from_index_with_families(workspace, config, &ids, &symbols, &empty_overlay, &mut member_families)?;
+        let counts = if graph_available {
+            deduped_reference_counts_with_context(
+                workspace, config, &ids, &symbols, &empty_overlay, &mut member_families, &context,
+            )?
+        } else {
+            HashMap::default()
+        };
         bound_member_families(&mut member_families);
         let mut rows: Vec<(u64, u64)> = symbols
             .iter()

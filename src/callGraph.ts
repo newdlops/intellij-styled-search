@@ -2743,17 +2743,15 @@ export class CallGraphService implements vscode.Disposable {
       try {
         await this.processChangedFiles(uris, reason);
       } catch (err) {
+        for (const uriString of uriStrings) { this.pendingChangedUris.add(uriString); }
+        if (!this.incrementalReason) { this.incrementalReason = reason; }
+        this.boundSuspendedIncrementalBacklog();
         if (isIndexingMemoryPressureError(err)) {
-          for (const uriString of uriStrings) { this.pendingChangedUris.add(uriString); }
-          this.incrementalReason = reason;
           this.armIncrementalFlush(CALL_GRAPH_MEMORY_PRESSURE_RETRY_MS);
           this.log.appendLine(`call graph incremental update deferred: ${err.message}`);
           return;
         }
         this.log.appendLine(`call graph incremental update failed: ${err instanceof Error ? err.message : err}`);
-        for (const uriString of uriStrings) { this.pendingChangedUris.add(uriString); }
-        if (!this.incrementalReason) { this.incrementalReason = reason; }
-        this.boundSuspendedIncrementalBacklog();
         this.armIncrementalFlush(CALL_GRAPH_INCREMENTAL_FAILURE_RETRY_MS);
         return;
       }

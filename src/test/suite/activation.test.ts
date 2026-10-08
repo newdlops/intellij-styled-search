@@ -1755,6 +1755,7 @@ suite('Activation', () => {
     let startedFirst!: () => void;
     const firstStarted = new Promise<void>((resolve) => { startedFirst = resolve; });
     const invoked: string[][] = [];
+    const cancellation = new vscode.CancellationTokenSource();
     runtime.invokeJson = async (args: string[]) => {
       invoked.push(args);
       if (invoked.length === 1) { startedFirst(); await firstGate; }
@@ -1766,7 +1767,7 @@ suite('Activation', () => {
       await firstStarted;
       assert.strictEqual(invoked.length, 1, 'concurrent preparations must share a single flush');
       runtime.pendingChanged.add('second-edit.ts');
-      const drain = runtime.drainPendingUpdatesBeforeSearch(new vscode.CancellationTokenSource().token);
+      const drain = runtime.drainPendingUpdatesBeforeSearch(cancellation.token);
       releaseFirst();
       await Promise.all([first, concurrent]);
       assert.strictEqual(await drain, true);
@@ -1774,10 +1775,14 @@ suite('Activation', () => {
       assert.strictEqual(runtime.pendingChanged.size, 0);
       runtime.pendingChanged.add('failed-edit.ts');
       runtime.invokeJson = async () => { throw new Error('write failed'); };
-      assert.strictEqual(await runtime.drainPendingUpdatesBeforeSearch(new vscode.CancellationTokenSource().token), false,
+      assert.strictEqual(await runtime.drainPendingUpdatesBeforeSearch(cancellation.token), false,
         'a failed drain must select live search instead of accepting stale indexed results');
       assert.strictEqual(runtime.pendingDeleted.has('failed-edit.ts'), true);
+      runtime.hasReadyIndex = async () => { throw new Error('temporary readiness failure'); };
+      assert.strictEqual(await runtime.drainPendingUpdatesBeforeSearch(cancellation.token), false);
+      assert.strictEqual(runtime.pendingDeleted.has('failed-edit.ts'), true, 'preparation failures also retain queued paths');
     } finally {
+      cancellation.dispose();
       releaseFirst();
       runtime.resolveBinary = saved.resolveBinary;
       runtime.hasReadyIndex = saved.hasReadyIndex;
@@ -2073,10 +2078,14 @@ suite('Activation', () => {
     const runtime = (overlay as any).zoektRuntime as any;
     const workspaceRoot = runtime.getWorkspaceRootPath();
     const saved = { invokeJson: runtime.invokeJson, hasReadyIndex: runtime.hasReadyIndex,
-      readGitState: runtime.readGitState, sync: runtime.workspaceSyncNeeded };
+      readGitState: runtime.readGitState, sync: runtime.workspaceSyncNeeded,
+      version: runtime.workspaceSyncRequestVersion, scheduleFlush: runtime.scheduleFlush,
+      focus: runtime.windowFocusedForTests, changed: runtime.pendingChanged };
     runtime.workspaceSyncNeeded = true;
     runtime.hasReadyIndex = async () => true;
     runtime.readGitState = async () => null;
+    runtime.scheduleFlush = () => {};
+    runtime.pendingChanged = new Set();
     let invocations = 0;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -2086,9 +2095,15 @@ suite('Activation', () => {
       const second = runtime.syncWorkspaceIndexIfNeeded(workspaceRoot, '/tmp/zoek-rs', 'second');
       await new Promise<void>((resolve) => setImmediate(resolve));
       assert.strictEqual(invocations, 1);
+      runtime.setWindowFocusedForTests(false);
+      for (let i = 0; i < 201; i++) { runtime.pendingChanged.add(`during-sync-${i}.ts`); }
+      runtime.boundSuspendedPendingUpdates();
       release();
       await Promise.all([first, second]);
       assert.strictEqual(runtime.workspaceSyncPromises.size, 0);
+      assert.strictEqual(runtime.workspaceSyncNeeded, true, 'a newer suspended burst must survive an older sync completion');
+      await runtime.syncWorkspaceIndexIfNeeded(workspaceRoot, '/tmp/zoek-rs', 'newer-burst');
+      assert.strictEqual(invocations, 2);
       assert.strictEqual(runtime.workspaceSyncNeeded, false);
     } finally {
       release();
@@ -2096,6 +2111,10 @@ suite('Activation', () => {
       runtime.hasReadyIndex = saved.hasReadyIndex;
       runtime.readGitState = saved.readGitState;
       runtime.workspaceSyncNeeded = saved.sync;
+      runtime.workspaceSyncRequestVersion = saved.version;
+      runtime.scheduleFlush = saved.scheduleFlush;
+      runtime.pendingChanged = saved.changed;
+      runtime.setWindowFocusedForTests(saved.focus);
     }
   });
 

@@ -3,6 +3,7 @@
 ## 0.1.7159 - 2026-10-08
 
 - Parallelized full search indexing across files and shards with one bounded worker pool, preserving document order, postings and snapshot validation.
+- Reused the immutable graph file table and reference-shard discovery across usage count shards during full builds and compaction.
 - Removed eager native summary queries for closed files from call graph edit bursts; open documents and later summary requests read refreshed usage counts.
 - Coalesced concurrent saved-file flushes and drained edits arriving during an update before indexed search. Deferred or failed known changes use live search until indexing catches up.
 - Retained failed search and call graph batches for retry, reconciled failed rename/delete operations with newer events and current disk state, and preserved workspace catch-up after sync failures.
