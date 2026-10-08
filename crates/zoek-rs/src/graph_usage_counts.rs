@@ -81,11 +81,14 @@ pub(super) fn build(workspace: &Path, config: &EngineConfig) -> io::Result<()> {
     let empty_overlay = GraphOverlay::new(built_at);
     let mut member_families = HashMap::default();
     let graph_available = graph_index_available(workspace, config);
-    let context = ReferenceCountReadContext {
+    let mut context = ReferenceCountReadContext {
         file_table: &files,
         sharded_references: graph_shard_family_available(
             workspace, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
         ),
+        shard_cache: Some(CountShardCache::new(
+            if std::env::var("ZOEK_DISABLE_COUNT_SHARD_CACHE").is_ok() { 0 } else { 32 * 1024 * 1024 },
+        )),
     };
     for shard in 0..GRAPH_SHARD_COUNT {
         let symbol_path = graph_shard_path(workspace, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
@@ -97,7 +100,7 @@ pub(super) fn build(workspace: &Path, config: &EngineConfig) -> io::Result<()> {
         let ids: HashSet<String> = symbols.iter().map(|symbol| symbol.id.clone()).collect();
         let counts = if graph_available {
             deduped_reference_counts_with_context(
-                workspace, config, &ids, &symbols, &empty_overlay, &mut member_families, &context,
+                workspace, config, &ids, &symbols, &empty_overlay, &mut member_families, &mut context,
             )?
         } else {
             HashMap::default()
@@ -129,6 +132,11 @@ pub(super) fn build(workspace: &Path, config: &EngineConfig) -> io::Result<()> {
             &graph_shard_path(workspace, config, SHARD_PREFIX, shard),
             &bytes,
         )?;
+    }
+    if std::env::var("ZOEK_WRITE_PROBE").is_ok() {
+        if let Some(cache) = context.shard_cache.as_ref() {
+            eprintln!("[counts] token-shape shard reads={} cache_hits={}", cache.reads, cache.hits);
+        }
     }
     Ok(())
 }

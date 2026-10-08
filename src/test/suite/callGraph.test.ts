@@ -911,6 +911,61 @@ suite('Call graph', () => {
     }
   });
 
+  test('external disk edits refresh usages of an already-open document without an editor save', async function () {
+    this.timeout(30_000);
+    const restoreBackend = await useCallGraphBackend('rust-native');
+    const api = await getApi();
+    const service = api.callGraph as any;
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder);
+    assert.ok(service.watcher, 'external source watcher must be enabled in the fixture workspace');
+    const directory = fs.mkdtempSync(path.join(folder.uri.fsPath, 'external-open-'));
+    const provider = vscode.Uri.file(path.join(directory, 'provider.py'));
+    const consumer = vscode.Uri.file(path.join(directory, 'consumer.py'));
+    const beforeText = 'from provider import evaluate\n\ndef consume():\n    return evaluate()\n';
+    const afterText = 'from provider import evaluate\n\ndef consume():\n    evaluate()\n    return evaluate()\n';
+    const priorFocus = service.windowFocusedForTests;
+    let changes = 0;
+    const watcherSubscription = service.watcher.onDidChange((uri: vscode.Uri) => {
+      if (uri.toString() === consumer.toString()) { changes++; }
+    });
+    try {
+      fs.writeFileSync(provider.fsPath, 'def evaluate():\n    return 1\n');
+      fs.writeFileSync(consumer.fsPath, beforeText);
+      await api.callGraph.rebuild(undefined, undefined, { force: true });
+      const document = await vscode.workspace.openTextDocument(consumer);
+      assert.strictEqual(document.isDirty, false);
+      const target = (await api.callGraph.resolveSymbolsResolved('evaluate', 100))
+        .find((symbol) => symbol.uri === provider.toString());
+      assert.ok(target, 'the explicit import target must be indexed');
+      const initialCount = target.usageCount ?? 0;
+      service.setWindowFocusedForTests(false);
+      service.pendingChangedUris.delete(consumer.toString());
+      changes = 0;
+      // A real filesystem write, deliberately without document.save() or an
+      // explicit test notification: this exercises the production watcher.
+      fs.writeFileSync(consumer.fsPath, afterText);
+      const deadline = Date.now() + 8_000;
+      while (changes === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.ok(changes > 0, 'VS Code must deliver the external change event');
+      assert.ok(service.pendingChangedUris.has(consumer.toString()),
+        'an open document must not suppress saved disk changes from the incremental queue');
+      await service.kickIncrementalRefresh(false);
+      const updated = (await api.callGraph.resolveSymbolsResolved('evaluate', 100))
+        .find((symbol) => symbol.id === target.id);
+      assert.strictEqual(updated?.usageCount, initialCount + 1,
+        'one added call must update cross-file usages without an editor save');
+    } finally {
+      watcherSubscription.dispose();
+      service.setWindowFocusedForTests(priorFocus);
+      fs.rmSync(directory, { recursive: true, force: true });
+      try { await api.callGraph.refreshChangedFilesForTests([provider, consumer]); } catch {}
+      await restoreBackend();
+    }
+  });
+
   test('incremental create refreshes usage index and usage inlays', async function () {
     this.timeout(30_000);
     const restoreBackend = await useCallGraphBackend('javascript');
@@ -986,6 +1041,80 @@ suite('Call graph', () => {
       try { await vscode.workspace.fs.delete(consumer); } catch {}
       try { await vscode.workspace.fs.delete(target); } catch {}
       try { await api.callGraph.refreshChangedFilesForTests([consumer, target]); } catch {}
+      await restoreBackend();
+    }
+  });
+
+  test('workspace folder renames refresh descendant symbols and usage paths', async function () {
+    this.timeout(30_000);
+    const restoreBackend = await useCallGraphBackend('rust-native');
+    const api = await getApi();
+    const service = api.callGraph as any;
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(folder);
+    const original = fs.mkdtempSync(path.join(folder.uri.fsPath, 'directory-index-'));
+    const moved = original + '-moved';
+    const provider = vscode.Uri.file(path.join(original, 'provider.py'));
+    const consumer = vscode.Uri.file(path.join(original, 'consumer.py'));
+    const movedProvider = vscode.Uri.file(path.join(moved, 'provider.py'));
+    const movedConsumer = vscode.Uri.file(path.join(moved, 'consumer.py'));
+    const priorFocus = service.windowFocusedForTests;
+    try {
+      fs.writeFileSync(provider.fsPath, 'def evaluate():\n    return 1\n');
+      fs.writeFileSync(consumer.fsPath, 'from provider import evaluate\n\ndef consume():\n    return evaluate()\n');
+      await api.callGraph.rebuild(undefined, undefined, { force: true });
+      const initial = (await api.callGraph.resolveSymbolsResolved('evaluate', 100))
+        .find((symbol) => symbol.uri === provider.toString());
+      assert.ok(initial && (initial.usageCount ?? 0) > 0);
+      await api.overlay.rebuildIndex();
+      service.setWindowFocusedForTests(false);
+      service.pendingChangedUris.delete(movedProvider.toString());
+      service.pendingFullRefresh = false;
+      const edit = new vscode.WorkspaceEdit();
+      edit.renameFile(vscode.Uri.file(original), vscode.Uri.file(moved));
+      assert.ok(await vscode.workspace.applyEdit(edit));
+      assert.strictEqual(fs.readFileSync(movedProvider.fsPath, 'utf8'), 'def evaluate():\n    return 1\n');
+      assert.ok(fs.readFileSync(movedConsumer.fsPath, 'utf8').includes('return evaluate()'));
+      const deadline = Date.now() + 6_000;
+      while (!service.pendingFullRefresh && !service.pendingChangedUris.has(movedProvider.toString()) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.ok(service.pendingFullRefresh || service.pendingChangedUris.has(movedProvider.toString()),
+        'folder operations must not depend on receiving individual descendant watcher events');
+      await service.kickIncrementalRefresh(false);
+      const matches = await api.callGraph.resolveSymbolsResolved('evaluate', 100);
+      assert.ok(!matches.some((symbol) => symbol.uri === provider.toString()), 'old descendant paths must be removed');
+      const current = matches.find((symbol) => symbol.uri === movedProvider.toString());
+      assert.ok(current, 'renamed descendant declarations must be searchable');
+      assert.strictEqual(current.usageCount, initial.usageCount);
+      const usages = await api.callGraph.findUsagesResolved(current.id, 100);
+      assert.ok(usages.some((reference) => reference.uri === movedConsumer.toString()));
+      assert.ok(!usages.some((reference) => reference.uri === consumer.toString()));
+      await api.overlay.flushPendingUpdatesForTests();
+      const found = await api.overlay.searchForTestsDetailed({
+        query: 'return evaluate()', includePatterns: [path.basename(moved) + '/**'],
+        caseSensitive: true, wholeWord: false, useRegex: false,
+      });
+      assert.ok(found.matches.some((file) => file.uri.toString() === movedConsumer.toString()),
+        'text search must discover renamed descendants without per-file notifications');
+      const removal = new vscode.WorkspaceEdit();
+      removal.deleteFile(vscode.Uri.file(moved), { recursive: true });
+      assert.ok(await vscode.workspace.applyEdit(removal));
+      assert.ok(service.pendingFullRefresh, 'directory deletion must retain a complete refresh marker');
+      await service.kickIncrementalRefresh(false);
+      assert.ok(!(await api.callGraph.resolveSymbolsResolved('evaluate', 100))
+        .some((symbol) => symbol.uri === movedProvider.toString()));
+      await api.overlay.flushPendingUpdatesForTests();
+      const removed = await api.overlay.searchForTestsDetailed({
+        query: 'return evaluate()', includePatterns: [path.basename(moved) + '/**'],
+        caseSensitive: true, wholeWord: false, useRegex: false,
+      });
+      assert.strictEqual(removed.matches.length, 0, 'deleted descendants cannot remain in text results');
+    } finally {
+      service.setWindowFocusedForTests(priorFocus);
+      fs.rmSync(original, { recursive: true, force: true });
+      fs.rmSync(moved, { recursive: true, force: true });
+      try { await api.callGraph.refreshChangedFilesForTests([provider, consumer, movedProvider, movedConsumer]); } catch {}
       await restoreBackend();
     }
   });

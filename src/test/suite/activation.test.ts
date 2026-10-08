@@ -1832,6 +1832,44 @@ suite('Activation', () => {
     }
   });
 
+  test('explicit graph refresh joining an automatic update drains changes retained after blur', async () => {
+    const { callGraph } = await getApi();
+    const service = callGraph as any;
+    const saved = { processChangedFiles: service.processChangedFiles, pendingChangedUris: service.pendingChangedUris,
+      pendingFullRefresh: service.pendingFullRefresh, focus: service.windowFocusedForTests };
+    const first = vscode.Uri.file('/tmp/automatic-first.ts').toString();
+    const next = vscode.Uri.file('/tmp/explicit-next.ts').toString();
+    service.pendingChangedUris = new Set([first]);
+    service.pendingFullRefresh = false;
+    service.setWindowFocusedForTests(true);
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const firstStarted = new Promise<void>((resolve) => { started = resolve; });
+    const batches: string[][] = [];
+    service.processChangedFiles = async (uris: vscode.Uri[]) => {
+      batches.push(uris.map((uri) => uri.toString()));
+      if (batches.length === 1) { started(); await gate; }
+    };
+    try {
+      const automatic = service.kickIncrementalRefresh(true);
+      await firstStarted;
+      service.setWindowFocusedForTests(false);
+      service.pendingChangedUris.add(next);
+      const explicit = service.kickIncrementalRefresh(false);
+      release();
+      await Promise.all([automatic, explicit]);
+      assert.deepStrictEqual(batches, [[first], [next]]);
+      assert.strictEqual(service.pendingChangedUris.size, 0);
+    } finally {
+      release();
+      service.processChangedFiles = saved.processChangedFiles;
+      service.pendingChangedUris = saved.pendingChangedUris;
+      service.pendingFullRefresh = saved.pendingFullRefresh;
+      service.setWindowFocusedForTests(saved.focus);
+    }
+  });
+
   test('native graph edit bursts prepare open summaries and leave closed files fresh on demand', async () => {
     const { callGraph } = await getApi();
     const service = callGraph as any;

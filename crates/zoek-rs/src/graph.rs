@@ -9,6 +9,10 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+#[path = "graph_count_shard_cache.rs"]
+mod count_shard_cache;
+use count_shard_cache::CountShardCache;
+
 pub type ArcStr = Arc<str>;
 
 /// Phase 1: string interning infrastructure.
@@ -1216,6 +1220,15 @@ fn load_token_shape_target_counts(
     config: &EngineConfig,
     only_shards: Option<&HashSet<usize>>,
 ) -> io::Result<HashMap<(u64, u64, u64), TokenShapeTargetCount>> {
+    load_token_shape_target_counts_cached(workspace_root, config, only_shards, None)
+}
+
+fn load_token_shape_target_counts_cached(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    only_shards: Option<&HashSet<usize>>,
+    mut cache: Option<&mut CountShardCache>,
+) -> io::Result<HashMap<(u64, u64, u64), TokenShapeTargetCount>> {
     let mut out = HashMap::default();
     for shard in 0..GRAPH_SHARD_COUNT {
         if only_shards.is_some_and(|selected| !selected.contains(&shard)) {
@@ -1227,10 +1240,11 @@ fn load_token_shape_target_counts(
             GRAPH_TOKEN_SHAPE_TARGET_COUNT_SHARD_PREFIX,
             shard,
         );
-        if !path.exists() {
-            continue;
-        }
-        let bytes = fs::read(&path)?;
+        let bytes = match cache.as_deref_mut() {
+            Some(cache) => cache.read(&path)?,
+            None => count_shard_cache::read_optional_shard(&path)?,
+        };
+        let Some(bytes) = bytes else { continue; };
         if bytes.is_empty() {
             continue;
         }
@@ -1313,6 +1327,7 @@ fn load_token_shape_tally_for_keys(
     workspace_root: &Path,
     config: &EngineConfig,
     keys: &HashSet<(u64, u64, u64)>,
+    mut cache: Option<&mut CountShardCache>,
 ) -> io::Result<(
     HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
     HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
@@ -1326,10 +1341,11 @@ fn load_token_shape_tally_for_keys(
         }
         let path =
             graph_shard_path(workspace_root, config, GRAPH_TOKEN_SHAPE_SHARD_PREFIX, shard);
-        if !path.exists() {
-            continue;
-        }
-        let bytes = fs::read(&path)?;
+        let bytes = match cache.as_deref_mut() {
+            Some(cache) => cache.read(&path)?,
+            None => count_shard_cache::read_optional_shard(&path)?,
+        };
+        let Some(bytes) = bytes else { continue; };
         if bytes.is_empty() {
             continue;
         }
@@ -1508,7 +1524,7 @@ fn append_lazy_token_shape_references_with_overlay(
     overlay: &crate::graph_overlay::GraphOverlay,
 ) -> io::Result<()> {
     append_lazy_token_shape_references_with_overlay_and_families(
-        workspace_root, config, symbols, file_table, references, overlay, &mut HashMap::default(),
+        workspace_root, config, symbols, file_table, references, overlay, &mut HashMap::default(), None,
     )
 }
 
@@ -1520,6 +1536,7 @@ fn append_lazy_token_shape_references_with_overlay_and_families(
     references: &mut Vec<GraphReference>,
     overlay: &crate::graph_overlay::GraphOverlay,
     member_families: &mut HashMap<String, Option<MemberImplementationFamily>>,
+    mut cache: Option<&mut CountShardCache>,
 ) -> io::Result<()> {
     if symbols.is_empty() {
         return Ok(());
@@ -1535,9 +1552,9 @@ fn append_lazy_token_shape_references_with_overlay_and_families(
         })
         .collect();
     let shards: HashSet<usize> = keys.iter().map(|key| token_shape_shard_for_key(*key)).collect();
-    let (bare, member) = load_token_shape_tally_for_keys(workspace_root, config, &keys)?;
+    let (bare, member) = load_token_shape_tally_for_keys(workspace_root, config, &keys, cache.as_deref_mut())?;
     let mut target_counts =
-        load_token_shape_target_counts(workspace_root, config, Some(&shards))?;
+        load_token_shape_target_counts_cached(workspace_root, config, Some(&shards), cache.as_deref_mut())?;
     for (key, (bare_delta, member_delta)) in overlay.total_token_shape_target_deltas() {
         if !shards.contains(&token_shape_shard_for_key(key)) {
             continue;
@@ -3341,8 +3358,9 @@ where
         let parsed_ref = &parsed_counter;
         let worker_accums: io::Result<Vec<(ParseAccum, Vec<PathBuf>)>> =
             std::thread::scope(|scope| {
+                let (finished_tx, finished_rx) = std::sync::mpsc::channel();
                 let handle = scope.spawn(move || {
-                    ranges
+                    let result = ranges
                         .into_par_iter()
                         .map(|(w, start, end)| -> io::Result<(ParseAccum, Vec<PathBuf>)> {
                             let mut a = ParseAccum::new();
@@ -3387,19 +3405,27 @@ where
                 }
                             Ok((a, partial_paths))
                         })
-                        .collect::<io::Result<Vec<(ParseAccum, Vec<PathBuf>)>>>()
+                        .collect::<io::Result<Vec<(ParseAccum, Vec<PathBuf>)>>>();
+                    let _ = finished_tx.send(());
+                    result
                 });
-                while !handle.is_finished() {
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                    let cur = parsed_ref
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .min(total_entries);
-                    progress(GraphRebuildProgress {
-                        stage: "parsing",
-                        current: cur,
-                        total: total_entries,
-                        message: format!("extracting file graphs with {worker_count} workers"),
-                    });
+                loop {
+                    // Keep the progress heartbeat, but wake as soon as parsing
+                    // finishes rather than adding up to 150ms to every build.
+                    match finished_rx.recv_timeout(std::time::Duration::from_millis(150)) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let cur = parsed_ref
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .min(total_entries);
+                            progress(GraphRebuildProgress {
+                                stage: "parsing",
+                                current: cur,
+                                total: total_entries,
+                                message: format!("extracting file graphs with {worker_count} workers"),
+                            });
+                        }
+                    }
                 }
                 handle.join().expect("parse worker thread panicked")
             });
@@ -18099,14 +18125,15 @@ fn deduped_reference_counts_from_index_with_families(
     } else {
         FileTable::default()
     };
-    let context = ReferenceCountReadContext {
+    let mut context = ReferenceCountReadContext {
         file_table: &file_table,
         sharded_references: graph_shard_family_available(
             workspace_root, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
         ),
+        shard_cache: None,
     };
     deduped_reference_counts_with_context(
-        workspace_root, config, symbol_ids, symbols, overlay, member_families, &context,
+        workspace_root, config, symbol_ids, symbols, overlay, member_families, &mut context,
     )
 }
 
@@ -18116,6 +18143,7 @@ fn deduped_reference_counts_from_index_with_families(
 struct ReferenceCountReadContext<'a> {
     file_table: &'a FileTable,
     sharded_references: bool,
+    shard_cache: Option<CountShardCache>,
 }
 
 fn deduped_reference_counts_with_context(
@@ -18125,7 +18153,7 @@ fn deduped_reference_counts_with_context(
     symbols: &[GraphSymbol],
     overlay: &crate::graph_overlay::GraphOverlay,
     member_families: &mut HashMap<String, Option<MemberImplementationFamily>>,
-    context: &ReferenceCountReadContext<'_>,
+    context: &mut ReferenceCountReadContext<'_>,
 ) -> io::Result<HashMap<String, usize>> {
     if symbol_ids.is_empty() { return Ok(HashMap::new()); }
     let ids_lower: HashSet<String> = symbol_ids.iter().map(|id| id.to_ascii_lowercase()).collect();
@@ -18196,6 +18224,7 @@ fn deduped_reference_counts_with_context(
         &mut references,
         overlay,
         member_families,
+        context.shard_cache.as_mut(),
     )?;
     let mut counts: HashMap<String, usize> = HashMap::default();
     for reference in dedupe_graph_references_by_source_occurrence(references) {

@@ -515,6 +515,7 @@ export class ZoektRuntime implements vscode.Disposable {
   private pendingChanged = new Set<string>();
   private pendingDeleted = new Set<string>();
   private pendingRenames: QueuedRename[] = [];
+  private readonly pendingDeletedDirectories = new Set<string>();
   private readonly activeChildren = new Map<number, TrackedChild>();
   private readonly lastAutoBaseRefreshAt = new Map<string, number>();
   private workspaceSyncNeeded = false;
@@ -566,14 +567,26 @@ export class ZoektRuntime implements vscode.Disposable {
       ...(this.watcher ? [this.watcher] : []),
       vscode.workspace.onDidCreateFiles((event) => {
         for (const uri of event.files) {
+          if (this.isDirectoryUri(uri)) { this.queueDirectorySync([uri], 'directory-create'); continue; }
           this.queueChanged(uri, 'create');
         }
       }),
       vscode.workspace.onDidSaveTextDocument((document) => {
         this.queueSavedDocument(document);
       }),
+      vscode.workspace.onWillDeleteFiles((event) => {
+        for (const uri of event.files) {
+          if (this.isDirectoryUri(uri) && this.getRelativePath(vscode.Uri.joinPath(uri, '__ijss_probe__'))) {
+            this.pendingDeletedDirectories.add(uri.toString());
+          }
+        }
+      }),
       vscode.workspace.onDidDeleteFiles((event) => {
         for (const uri of event.files) {
+          if (this.pendingDeletedDirectories.delete(uri.toString())) {
+            this.queueDirectorySync([uri], 'directory-delete');
+            continue;
+          }
           this.queueDeleted(uri, 'delete');
         }
       }),
@@ -610,6 +623,7 @@ export class ZoektRuntime implements vscode.Disposable {
   dispose(): void {
     if (this.disposed) { return; }
     this.disposed = true;
+    this.pendingDeletedDirectories.clear();
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
@@ -1357,6 +1371,10 @@ export class ZoektRuntime implements vscode.Disposable {
   private queueRename(oldUri: vscode.Uri, newUri: vscode.Uri): void {
     if (this.disposed) { return; }
     if (!this.shouldRunIncrementalFileUpdates()) { return; }
+    if (this.isDirectoryUri(newUri)) {
+      this.queueDirectorySync([oldUri, newUri], 'directory-rename');
+      return;
+    }
     const oldRelPath = this.getRelativePath(oldUri);
     const newRelPath = this.getRelativePath(newUri);
     if (!oldRelPath && !newRelPath) { return; }
@@ -1392,6 +1410,21 @@ export class ZoektRuntime implements vscode.Disposable {
       this.pendingChanged.size > 0 ||
       this.pendingDeleted.size > 0 ||
       this.pendingRenames.length > 0;
+  }
+
+  private isDirectoryUri(uri: vscode.Uri): boolean {
+    if (uri.scheme !== 'file') { return false; }
+    try { return fs.statSync(uri.fsPath).isDirectory(); } catch { return false; }
+  }
+
+  private queueDirectorySync(uris: vscode.Uri[], reason: string): void {
+    if (this.disposed || !this.shouldRunIncrementalFileUpdates() || !uris.some((uri) => this.getRelativePath(vscode.Uri.joinPath(uri, '__ijss_probe__')))) { return; }
+    // A folder event can replace/delete many saved paths without descendant
+    // events. --sync discovers a delta and reuses unchanged indexed files.
+    this.workspaceSyncNeeded = true;
+    this.workspaceSyncRequestVersion++;
+    this.logQueuedUpdate(reason);
+    this.scheduleFlush();
   }
 
   private isWindowFocused(): boolean {

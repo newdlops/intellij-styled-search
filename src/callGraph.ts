@@ -917,6 +917,7 @@ export class CallGraphService implements vscode.Disposable {
   private incrementalTimer: ReturnType<typeof setTimeout> | undefined;
   private incrementalFlushAt = 0;
   private incrementalReason = '';
+  private readonly pendingDeletedDirectories = new Set<string>();
   private incrementalPromise: Promise<void> | undefined;
   // LSM overlay compaction (folds the delta overlay into the base on idle).
   private overlayDirty = false;
@@ -981,11 +982,10 @@ export class CallGraphService implements vscode.Disposable {
       disposables.push(
         this.watcher,
         this.watcher.onDidCreate((uri) => this.scheduleIncrementalRefresh(uri, 'external-created')),
-        this.watcher.onDidChange((uri) => {
-          const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
-          if (openDocument) { return; }
-          this.scheduleIncrementalRefresh(uri, 'external-changed');
-        }),
+        // The editor can reload a clean open document after an external write
+        // without firing onDidSaveTextDocument. Index saved disk state for all
+        // watcher changes; the existing queue coalesces duplicate save events.
+        this.watcher.onDidChange((uri) => this.scheduleIncrementalRefresh(uri, 'external-changed')),
         this.watcher.onDidDelete((uri) => this.scheduleIncrementalRefresh(uri, 'external-deleted')),
       );
     }
@@ -993,16 +993,31 @@ export class CallGraphService implements vscode.Disposable {
       vscode.workspace.onDidChangeTextDocument(() => this.usageRefinementCache.clear()),
       vscode.workspace.onDidCreateFiles((event) => {
         for (const uri of event.files) {
+          if (this.isDirectoryUri(uri)) { this.scheduleDirectoryRefresh([uri], 'directory-created'); continue; }
           this.scheduleIncrementalRefreshIfSupported(uri, 'created');
+        }
+      }),
+      vscode.workspace.onWillDeleteFiles((event) => {
+        for (const uri of event.files) {
+          if (this.isDirectoryUri(uri) && !isCallGraphExcludedUri(vscode.Uri.joinPath(uri, '__ijss_probe__'))) {
+            this.pendingDeletedDirectories.add(uri.toString());
+          }
         }
       }),
       vscode.workspace.onDidDeleteFiles((event) => {
         for (const uri of event.files) {
+          if (this.pendingDeletedDirectories.delete(uri.toString())) {
+            this.scheduleDirectoryRefresh([uri], 'directory-deleted');
+          }
           this.scheduleIncrementalRefreshIfSupported(uri, 'deleted');
         }
       }),
       vscode.workspace.onDidRenameFiles((event) => {
         for (const file of event.files) {
+          if (this.isDirectoryUri(file.newUri)) {
+            this.scheduleDirectoryRefresh([file.oldUri, file.newUri], 'directory-renamed');
+            continue;
+          }
           this.scheduleIncrementalRefreshIfSupported(file.oldUri, 'renamed-old');
           this.scheduleIncrementalRefreshIfSupported(file.newUri, 'renamed-new');
         }
@@ -1035,6 +1050,7 @@ export class CallGraphService implements vscode.Disposable {
     }
     this.incrementalFlushAt = 0;
     this.incrementalReason = '';
+    this.pendingDeletedDirectories.clear();
     this.cancelRustGraphProcesses('call graph disposed');
     this.watcher?.dispose();
     this.onDidChangeSnapshotEmitter.dispose();
@@ -2662,6 +2678,27 @@ export class CallGraphService implements vscode.Disposable {
     this.scheduleIncrementalRefresh(uri, reason, delayMs);
   }
 
+  private isDirectoryUri(uri: vscode.Uri): boolean {
+    if (uri.scheme !== 'file') { return false; }
+    try { return fs.statSync(uri.fsPath).isDirectory(); } catch { return false; }
+  }
+
+  private scheduleDirectoryRefresh(uris: vscode.Uri[], reason: string): void {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (this.disposed || !root || !uris.some((uri) => {
+      if (uri.scheme !== 'file' || isCallGraphExcludedUri(vscode.Uri.joinPath(uri, '__ijss_probe__'))) { return false; }
+      const relative = path.relative(root, uri.fsPath);
+      return relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
+    })) { return; }
+    // VS Code does not guarantee descendant watcher events for directory
+    // operations. A single bounded marker replaces every affected old/new
+    // path, including files with no declarations and previously edited files.
+    this.usageRefinementCache.clear();
+    this.pendingFullRefresh = true;
+    this.incrementalReason = reason;
+    this.armIncrementalFlush(CALL_GRAPH_SAVE_INCREMENTAL_DEBOUNCE_MS);
+  }
+
   private shouldWatchExternalFileChanges(): boolean {
     const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
     return cfg.get<boolean>('callGraphWatchExternalFileChanges', false);
@@ -2683,7 +2720,12 @@ export class CallGraphService implements vscode.Disposable {
   // and an incremental can still fall back to the full path when old sidecars are
   // missing. Serializing + coalescing bounds it to a single process.
   private kickIncrementalRefresh(automatic: boolean): Promise<void> {
-    if (this.incrementalPromise) { return this.incrementalPromise; }
+    if (this.incrementalPromise) {
+      if (automatic) { return this.incrementalPromise; }
+      // An automatic drain can stop on blur after its current batch. An
+      // explicit caller joining it still has to process its queued changes.
+      return this.incrementalPromise.then(() => this.kickIncrementalRefresh(false));
+    }
     this.incrementalPromise = this.drainIncrementalRefresh(automatic).finally(() => {
       this.incrementalPromise = undefined;
     });
@@ -2720,11 +2762,11 @@ export class CallGraphService implements vscode.Disposable {
       // incremental that assembles a huge delta against the full prior graph.
       if (fullRefresh || uriStrings.length >= CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD) {
         this.log.appendLine(
-          `call graph incremental: ${fullRefresh ? 'suspended backlog' : `${uriStrings.length} files changed`} ` +
+          `call graph incremental: ${fullRefresh ? reason : `${uriStrings.length} files changed`} ` +
           `(${fullRefresh ? 'bounded full-refresh marker' : `>= ${CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD}`}); running one full rebuild instead`,
         );
         try {
-          await this.rebuild();
+          await this.rebuild(undefined, undefined, { force: true });
         } catch (err) {
           if (isIndexingMemoryPressureError(err)) {
             this.pendingFullRefresh = true;

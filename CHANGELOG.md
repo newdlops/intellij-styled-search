@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7160 - 2026-10-08
+
+- Cached immutable token-shape sidecar bytes during usage-count construction, bounded to 32 MiB and 256 entries. Serving queries continue to read the current generation.
+- Woke full graph builds immediately when parsing finishes while retaining the existing progress heartbeat.
+- Indexed external disk changes to open documents without requiring an editor save, and let explicit graph refreshes finish changes left by an automatic update after blur.
+- Coalesced VS Code folder create, rename and delete operations into a graph refresh and a search-index sync so descendant paths stay current without per-file watcher events.
+- Added real filesystem/editor regression checks for external edits and folder operations, plus byte-cache bounds and generation isolation tests.
+
 ## 0.1.7159 - 2026-10-08
 
 - Parallelized full search indexing across files and shards with one bounded worker pool, preserving document order, postings and snapshot validation.
