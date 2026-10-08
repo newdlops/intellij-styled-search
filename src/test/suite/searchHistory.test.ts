@@ -12,6 +12,7 @@ let savedLimit: unknown;
 let windowId: number;
 const historyTasks = new Set<Promise<unknown>>();
 const originalHistoryMethods = new Map<string, (...args: any[]) => unknown>();
+let originalStorageUpdate: (key: string, value: unknown) => Promise<void>;
 const longQuery = 'prefix '.repeat(45) + 'historicalMarker\nsecond line <literal>';
 const entries = ['Recent unrelated query', longQuery, 'Alpha component query', 'alpha service query',
   ...Array.from({ length: 96 }, (_, i) => `older query ${i}`)];
@@ -32,6 +33,7 @@ async function seed(values: string[]) {
   // history. Finish those actual operations before replacing the test fixture.
   while (historyTasks.size > 0) { await Promise.allSettled([...historyTasks]); }
   await control.context.globalState.update(key, values);
+  assert.deepEqual(control.context.globalState.get(key), values, 'stored fixture history is current');
   await control.postSearchHistoryToRenderer();
   await waitForQuery(value => JSON.stringify(value.state.history) === JSON.stringify(values));
 }
@@ -67,6 +69,33 @@ suite('Search history discovery', () => {
     assert.ok(ext);
     api = await ext!.activate();
     control = api.overlay as any;
+    const storage = control.context.globalState;
+    originalStorageUpdate = storage.update;
+    storage.update = async function (storageKey: string, value: unknown) {
+      if (storageKey !== key || JSON.stringify(this.get(key)) === JSON.stringify(value)) {
+        return originalStorageUpdate.call(this, storageKey, value);
+      }
+      // Global Memento updates also return through onDidChangeStorage. Wait for
+      // that real storage echo before a later fixture can replace the value.
+      // https://github.com/microsoft/vscode/blob/main/src/vs/workbench/api/common/extHostMemento.ts
+      assert.equal(typeof this._storage?.onDidChangeStorage, 'function');
+      let acknowledge!: () => void;
+      const acknowledged = new Promise<void>(resolve => { acknowledge = resolve; });
+      const listener = this._storage.onDidChangeStorage((event: any) => {
+        if (event.shared && event.key === this._id
+          && JSON.stringify(event.value[key]) === JSON.stringify(value)) { acknowledge(); }
+      });
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await originalStorageUpdate.call(this, storageKey, value);
+        await Promise.race([acknowledged, new Promise<void>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('history storage echo did not arrive')), 5000);
+        })]);
+      } finally {
+        listener.dispose();
+        if (timeout) { clearTimeout(timeout); }
+      }
+    };
     for (const name of ['recordSearchHistory', 'trimSearchHistoryToLimit', 'postSearchHistoryToRenderer']) {
       const original = control[name];
       originalHistoryMethods.set(name, original);
@@ -88,12 +117,17 @@ suite('Search history discovery', () => {
     await main(`(function(){var win=require('electron').BrowserWindow.fromId(${windowId});win.show();win.focus();win.webContents.setBackgroundThrottling(false);})()`);
   });
   suiteTeardown(async () => {
-    while (historyTasks.size > 0) { await Promise.allSettled([...historyTasks]); }
-    await vscode.workspace.getConfiguration('intellijStyledSearch').update('searchHistoryLimit', savedLimit, vscode.ConfigurationTarget.Workspace);
-    await control.context.globalState.update(key, savedHistory);
-    await control.postSearchHistoryToRenderer();
-    for (const [name, original] of originalHistoryMethods) { control[name] = original; }
-    originalHistoryMethods.clear();
+    try {
+      while (historyTasks.size > 0) { await Promise.allSettled([...historyTasks]); }
+      await vscode.workspace.getConfiguration('intellijStyledSearch').update('searchHistoryLimit', savedLimit, vscode.ConfigurationTarget.Workspace);
+      while (historyTasks.size > 0) { await Promise.allSettled([...historyTasks]); }
+      await control.context.globalState.update(key, savedHistory);
+      await control.postSearchHistoryToRenderer();
+    } finally {
+      if (originalStorageUpdate) { control.context.globalState.update = originalStorageUpdate; }
+      for (const [name, original] of originalHistoryMethods) { control[name] = original; }
+      originalHistoryMethods.clear();
+    }
   });
   setup(async () => {
     await renderer("var menu=panel.querySelector('.ij-find-history-menu');if(menu.classList.contains('open'))panel.querySelector('.ij-find-history').click();return true;");
