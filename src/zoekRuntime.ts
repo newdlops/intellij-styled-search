@@ -1552,7 +1552,8 @@ export class ZoektRuntime implements vscode.Disposable {
     }
     const binary = await this.resolveBinary(false);
     if (!binary) {
-      this.clearPending();
+      this.lastUpdateFailed = true;
+      this.scheduleFlush(UPDATE_FAILURE_RETRY_MS);
       return;
     }
     if (automatic && !this.isWindowFocused()) { return; }
@@ -1573,8 +1574,9 @@ export class ZoektRuntime implements vscode.Disposable {
         this.scheduleFlush(UPDATE_RETRY_WHILE_INDEXING_MS);
         return;
       }
-      this.clearPending();
-      this.log.appendLine('zoek-rs update skipped: index is not ready; run Rebuild Search Index to refresh saved changes');
+      this.lastUpdateFailed = true;
+      this.scheduleFlush(UPDATE_FAILURE_RETRY_MS);
+      this.log.appendLine('zoek-rs update deferred: index is not ready; retained saved changes for retry');
       return;
     }
     if (automatic && !this.isWindowFocused()) { return; }

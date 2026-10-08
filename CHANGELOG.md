@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.7161 - 2026-10-08
+
+- Retained saved changes, deletions and renames when the runtime is temporarily unavailable or the search index is not ready; retry after preparation recovers.
+- Kept search on the live codesearch backend while those known edits remain unindexed, with recovery regression checks for both preparation failures.
+
 ## 0.1.7160 - 2026-10-08
 
 - Cached immutable token-shape sidecar bytes during usage-count construction, bounded to 32 MiB and 256 entries. Serving queries continue to read the current generation.

@@ -1734,6 +1734,68 @@ suite('Activation', () => {
     }
   });
 
+  test('unavailable runtime and unready index retain saved changes until recovery', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const saved = {
+      resolveBinary: runtime.resolveBinary, hasReadyIndex: runtime.hasReadyIndex,
+      invokeJson: runtime.invokeJson, scheduleFlush: runtime.scheduleFlush,
+      changed: runtime.pendingChanged, deleted: runtime.pendingDeleted, renamed: runtime.pendingRenames,
+      sync: runtime.workspaceSyncNeeded, failed: runtime.lastUpdateFailed,
+      indexPromises: runtime.indexPromises, foregroundIndexPromises: runtime.foregroundIndexPromises,
+      lastUpdateFinishedAt: runtime.lastUpdateFinishedAt,
+    };
+    const cancellation = new vscode.CancellationTokenSource();
+    runtime.indexPromises = new Map();
+    runtime.foregroundIndexPromises = new Map();
+    runtime.workspaceSyncNeeded = false;
+    try {
+      for (const unavailable of ['runtime', 'index']) {
+        runtime.pendingChanged = new Set(['modified.ts']);
+        runtime.pendingDeleted = new Set(['removed.ts']);
+        runtime.pendingRenames = [{ oldRelPath: 'previous.ts', newRelPath: 'renamed.ts' }];
+        runtime.lastUpdateFailed = false;
+        let recovered = false;
+        let retryDelay: number | undefined;
+        const invoked: string[][] = [];
+        runtime.resolveBinary = async () => recovered || unavailable !== 'runtime' ? '/tmp/zoek-rs' : null;
+        runtime.hasReadyIndex = async () => recovered || unavailable !== 'index';
+        runtime.scheduleFlush = (delay: number) => { retryDelay = delay; };
+        runtime.invokeJson = async (args: string[]) => {
+          invoked.push(args);
+          return { type: 'update', ok: true, warnings: [] };
+        };
+        assert.strictEqual(await runtime.drainPendingUpdatesBeforeSearch(cancellation.token), false,
+          `${unavailable} preparation must select live search until saved changes can be indexed`);
+        assert.deepStrictEqual([...runtime.pendingChanged], ['modified.ts']);
+        assert.deepStrictEqual([...runtime.pendingDeleted], ['removed.ts']);
+        assert.deepStrictEqual(runtime.pendingRenames, [{ oldRelPath: 'previous.ts', newRelPath: 'renamed.ts' }]);
+        assert.strictEqual(retryDelay, 5_000);
+        assert.strictEqual(invoked.length, 0, 'an unavailable backend cannot process the batch');
+        recovered = true;
+        assert.strictEqual(await runtime.drainPendingUpdatesBeforeSearch(cancellation.token), true);
+        assert.deepStrictEqual(invoked.map(args => args.slice(3)), [
+          ['modified.ts', '--delete', 'removed.ts', '--rename', 'previous.ts', 'renamed.ts'],
+        ]);
+        assert.strictEqual(runtime.hasPendingUpdates(), false, 'recovery drains every retained operation');
+      }
+    } finally {
+      cancellation.dispose();
+      runtime.resolveBinary = saved.resolveBinary;
+      runtime.hasReadyIndex = saved.hasReadyIndex;
+      runtime.invokeJson = saved.invokeJson;
+      runtime.scheduleFlush = saved.scheduleFlush;
+      runtime.pendingChanged = saved.changed;
+      runtime.pendingDeleted = saved.deleted;
+      runtime.pendingRenames = saved.renamed;
+      runtime.workspaceSyncNeeded = saved.sync;
+      runtime.lastUpdateFailed = saved.failed;
+      runtime.indexPromises = saved.indexPromises;
+      runtime.foregroundIndexPromises = saved.foregroundIndexPromises;
+      runtime.lastUpdateFinishedAt = saved.lastUpdateFinishedAt;
+    }
+  });
+
   test('search drains edits arriving during a coalesced native update before using the index', async () => {
     const { overlay } = await getApi();
     const runtime = (overlay as any).zoektRuntime as any;
