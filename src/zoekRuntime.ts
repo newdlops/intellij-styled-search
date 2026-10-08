@@ -80,6 +80,8 @@ const DEFAULT_BACKGROUND_BUILD_DELAY_MS = 0;
 const DEFAULT_BACKGROUND_INDEX_DELAY_MS = 0;
 const UPDATE_RETRY_WHILE_INDEXING_MS = 1_000;
 const MEMORY_PRESSURE_RETRY_MS = 30_000;
+const UPDATE_FAILURE_RETRY_MS = 5_000;
+const UPDATE_MAX_DRAIN_PASSES = 50;
 // A suspended window must retain enough detail for a small incremental update,
 // but a large event burst is cheaper and bounded as one workspace sync.
 const SUSPENDED_UPDATE_PATH_LIMIT = 200;
@@ -507,6 +509,8 @@ export class ZoektRuntime implements vscode.Disposable {
   private readonly indexProgressState = new Map<string, IndexProgressState>();
   private readonly indexProgressListeners = new Map<string, Set<IndexProgressListener>>();
   private updatePromise: Promise<void> = Promise.resolve();
+  private flushPromise: Promise<void> | undefined;
+  private lastUpdateFailed = false;
   private flushTimer: ReturnType<typeof setTimeout> | undefined;
   private pendingChanged = new Set<string>();
   private pendingDeleted = new Set<string>();
@@ -516,6 +520,7 @@ export class ZoektRuntime implements vscode.Disposable {
   private workspaceSyncNeeded = false;
   private readonly lastWorkspaceSyncAt = new Map<string, number>();
   private readonly lastGitState = new Map<string, string>();
+  private readonly workspaceSyncPromises = new Map<string, Promise<void>>();
   private nextChildId = 1;
   private disposed = false;
   private externalSweepPromise: Promise<void> | undefined;
@@ -817,10 +822,9 @@ export class ZoektRuntime implements vscode.Disposable {
       this.syncWorkspaceIndexIfNeeded(workspaceRoot, binary, 'search'),
       new Promise<void>((resolve) => setTimeout(resolve, syncBudgetMs)),
     ]);
-    if (this.hasPendingUpdates()) {
-      await this.flushPendingUpdates();
+    if (!await this.drainPendingUpdatesBeforeSearch(token)) {
+      return { ready: false, reason: 'saved file updates are still pending; verifying with codesearch' };
     }
-    await this.drainPendingUpdatesBeforeSearch(token);
     try {
       const limit = getRequestedResultLimit(options);
       const offset = getRequestedResultOffset(options);
@@ -941,6 +945,8 @@ export class ZoektRuntime implements vscode.Disposable {
       const pendingIndex = [
         ...this.indexPromises.values(),
         ...this.foregroundIndexPromises.values(),
+        ...this.workspaceSyncPromises.values(),
+        ...(this.flushPromise ? [this.flushPromise] : []),
       ];
       const stillFlushing = !!this.flushTimer;
       if (!pendingBuild && pendingIndex.length === 0 && !stillFlushing) {
@@ -1430,23 +1436,45 @@ export class ZoektRuntime implements vscode.Disposable {
     }, delayMs);
   }
 
-  private async drainPendingUpdatesBeforeSearch(token: vscode.CancellationToken): Promise<void> {
-    if (token.isCancellationRequested || this.disposed) { return; }
+  private async drainPendingUpdatesBeforeSearch(token: vscode.CancellationToken): Promise<boolean> {
+    if (token.isCancellationRequested || this.disposed) { return true; }
     await new Promise<void>((resolve) => setImmediate(resolve));
-    if (token.isCancellationRequested || this.disposed) { return; }
+    if (token.isCancellationRequested || this.disposed) { return true; }
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
     }
-    if (this.hasPendingUpdates()) {
-      await this.flushPendingUpdates();
+    for (let pass = 0; pass < UPDATE_MAX_DRAIN_PASSES; pass++) {
+      if (this.flushPromise) {
+        await this.flushPromise;
+      } else if (this.updateInFlight) {
+        await this.updatePromise;
+      } else if (this.hasPendingUpdates()) {
+        await this.flushPendingUpdates();
+      } else {
+        return true;
+      }
+      if (token.isCancellationRequested || this.disposed) { return true; }
+      if (!this.hasPendingUpdates()) { return true; }
+      // A failed/deferred update must not spin or serve known stale results.
+      // The caller falls back to the live search backend, and the queue stays
+      // available for the scheduled retry. Continuous edits are bounded too.
+      if (this.lastUpdateFailed || this.updatePauseDepth > 0 || this.workspaceSyncNeeded) { return false; }
+      const root = this.getWorkspaceRootPath();
+      if (root && (this.indexPromises.has(root) || this.foregroundIndexPromises.has(root))) { return false; }
     }
-    if (this.updateInFlight) {
-      try { await this.updatePromise; } catch {}
-    }
+    return false;
   }
 
-  private async flushPendingUpdates(automatic = false): Promise<void> {
+  private flushPendingUpdates(automatic = false): Promise<void> {
+    if (this.flushPromise) { return this.flushPromise; }
+    this.flushPromise = this.doFlushPendingUpdates(automatic).finally(() => {
+      this.flushPromise = undefined;
+    });
+    return this.flushPromise;
+  }
+
+  private async doFlushPendingUpdates(automatic: boolean): Promise<void> {
     if (this.disposed) {
       this.clearPending();
       return;
@@ -1518,7 +1546,8 @@ export class ZoektRuntime implements vscode.Disposable {
     this.clearPending();
 
     this.updateInFlight = true;
-    let memoryPressureDeferred = false;
+    this.lastUpdateFailed = false;
+    let retryDelayMs: number | undefined;
     this.updatePromise = this.updatePromise
       .then(async () => {
         const args: string[] = [binary, 'update', workspaceRoot];
@@ -1534,22 +1563,22 @@ export class ZoektRuntime implements vscode.Disposable {
         if (args.length <= 3) { return; }
         const response = await this.invokeJson(args, this.lifecycleCts.token);
         if (response.type !== 'update' || !response.ok) {
-          this.log.appendLine(this.describeEngineFailure(response, 'zoek-rs update failed'));
-          return;
+          throw new Error(this.describeEngineFailure(response, 'zoek-rs update failed'));
         }
         this.logUpdateWarnings(response);
         this.maybeStartBaseRefresh(workspaceRoot, binary, response);
       })
       .catch((err) => {
-        if (err instanceof ProcessCancelledError) { return; }
+        this.lastUpdateFailed = true;
+        if (this.disposed) { return; }
+        this.requeueFailedUpdate(workspaceRoot, changed, deleted, renamed);
         if (isIndexingMemoryPressureError(err)) {
-          for (const relPath of changed) { this.pendingChanged.add(relPath); }
-          for (const relPath of deleted) { this.pendingDeleted.add(relPath); }
-          this.pendingRenames.push(...renamed.map(([oldRelPath, newRelPath]) => ({ oldRelPath, newRelPath })));
-          memoryPressureDeferred = true;
+          retryDelayMs = MEMORY_PRESSURE_RETRY_MS;
           this.log.appendLine(`zoek-rs update deferred: ${err.message}`);
           return;
         }
+        retryDelayMs = UPDATE_FAILURE_RETRY_MS;
+        if (err instanceof ProcessCancelledError) { return; }
         this.log.appendLine(`zoek-rs update failed: ${err instanceof Error ? err.message : err}`);
       })
       .finally(() => {
@@ -1563,8 +1592,28 @@ export class ZoektRuntime implements vscode.Disposable {
       this.pendingDeleted.size > 0 ||
       this.pendingRenames.length > 0
     ) {
-      this.scheduleFlush(memoryPressureDeferred ? MEMORY_PRESSURE_RETRY_MS : undefined);
+      this.scheduleFlush(retryDelayMs);
     }
+  }
+
+  private requeueFailedUpdate(
+    workspaceRoot: string,
+    changed: readonly string[],
+    deleted: readonly string[],
+    renamed: readonly (readonly [string, string])[],
+  ): void {
+    const newerRenamePaths = new Set(this.pendingRenames.flatMap((item) => [item.oldRelPath, item.newRelPath]));
+    // Retry invalidated paths against their current disk state. Replaying an
+    // older rename/delete after a newer event could remove a recreated file.
+    for (const relPath of new Set([...changed, ...deleted, ...renamed.flat()])) {
+      if (this.pendingChanged.has(relPath) || this.pendingDeleted.has(relPath) || newerRenamePaths.has(relPath)) { continue; }
+      if (fs.existsSync(path.join(workspaceRoot, relPath))) {
+        this.pendingChanged.add(relPath);
+      } else {
+        this.pendingDeleted.add(relPath);
+      }
+    }
+    this.boundSuspendedPendingUpdates();
   }
 
   private boundSuspendedPendingUpdates(): void {
@@ -1575,7 +1624,24 @@ export class ZoektRuntime implements vscode.Disposable {
     this.workspaceSyncNeeded = true;
   }
 
-  private async syncWorkspaceIndexIfNeeded(
+  private syncWorkspaceIndexIfNeeded(
+    workspaceRoot: string,
+    binary: string,
+    reason: string,
+    automatic = false,
+  ): Promise<void> {
+    const existing = this.workspaceSyncPromises.get(workspaceRoot);
+    if (existing) { return existing; }
+    const promise = this.doSyncWorkspaceIndexIfNeeded(workspaceRoot, binary, reason, automatic).finally(() => {
+      if (this.workspaceSyncPromises.get(workspaceRoot) === promise) {
+        this.workspaceSyncPromises.delete(workspaceRoot);
+      }
+    });
+    this.workspaceSyncPromises.set(workspaceRoot, promise);
+    return promise;
+  }
+
+  private async doSyncWorkspaceIndexIfNeeded(
     workspaceRoot: string,
     binary: string,
     reason: string,
@@ -1606,10 +1672,14 @@ export class ZoektRuntime implements vscode.Disposable {
     const branchChangeNeedsSync = !!gitState && previousGitState !== gitState && !changes;
     const started = Date.now();
     try {
-      if (changes && (changes.changed.length > 0 || changes.deleted.length > 0 || changes.renamed.length > 0)) {
-        await this.invokeJson(this.buildUpdateArgs(binary, workspaceRoot, changes), this.lifecycleCts.token);
-      } else if (this.workspaceSyncNeeded || branchChangeNeedsSync) {
-        await this.invokeJson([binary, 'update', workspaceRoot, '--sync'], this.lifecycleCts.token);
+      let response: ZoektEngineResponse | undefined;
+      if (this.workspaceSyncNeeded || branchChangeNeedsSync) {
+        response = await this.invokeJson([binary, 'update', workspaceRoot, '--sync'], this.lifecycleCts.token);
+      } else if (changes && (changes.changed.length > 0 || changes.deleted.length > 0 || changes.renamed.length > 0)) {
+        response = await this.invokeJson(this.buildUpdateArgs(binary, workspaceRoot, changes), this.lifecycleCts.token);
+      }
+      if (response && (response.type !== 'update' || !response.ok)) {
+        throw new Error(this.describeEngineFailure(response, 'zoek-rs workspace sync failed'));
       }
       this.lastWorkspaceSyncAt.set(workspaceRoot, Date.now());
       if (gitState) {
@@ -1618,12 +1688,14 @@ export class ZoektRuntime implements vscode.Disposable {
       this.workspaceSyncNeeded = false;
       this.log.appendLine(`zoek-rs workspace sync complete: reason=${reason} elapsed=${Date.now() - started}ms`);
     } catch (err) {
+      this.workspaceSyncNeeded = true;
       if (err instanceof ProcessCancelledError) { return; }
       if (isIndexingMemoryPressureError(err)) {
         this.scheduleFlush(MEMORY_PRESSURE_RETRY_MS);
         this.log.appendLine(`zoek-rs workspace sync deferred: ${err.message}`);
         return;
       }
+      this.scheduleFlush(UPDATE_FAILURE_RETRY_MS);
       this.log.appendLine(`zoek-rs workspace sync failed: ${err instanceof Error ? err.message : err}`);
     }
   }

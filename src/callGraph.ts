@@ -821,6 +821,7 @@ const CALL_GRAPH_INCREMENTAL_FULL_REBUILD_THRESHOLD = 200;
 //     flush resumes the remainder.
 const CALL_GRAPH_INCREMENTAL_MAX_DRAIN_ITERATIONS = 50;
 const CALL_GRAPH_MEMORY_PRESSURE_RETRY_MS = 30_000;
+const CALL_GRAPH_INCREMENTAL_FAILURE_RETRY_MS = 5_000;
 // LSM overlay: a save writes a small delta overlay (graph-overlay-update, ~<1s)
 // instead of rewriting the base. After editing goes idle for at least this long, fold the
 // overlay into the base (graph-compact, the heavy ~O(total) job) off the critical
@@ -2732,6 +2733,9 @@ export class CallGraphService implements vscode.Disposable {
             return;
           }
           this.log.appendLine(`call graph batch full rebuild failed: ${err instanceof Error ? err.message : err}`);
+          this.pendingFullRefresh = true;
+          this.armIncrementalFlush(CALL_GRAPH_INCREMENTAL_FAILURE_RETRY_MS);
+          return;
         }
         continue;
       }
@@ -2747,6 +2751,11 @@ export class CallGraphService implements vscode.Disposable {
           return;
         }
         this.log.appendLine(`call graph incremental update failed: ${err instanceof Error ? err.message : err}`);
+        for (const uriString of uriStrings) { this.pendingChangedUris.add(uriString); }
+        if (!this.incrementalReason) { this.incrementalReason = reason; }
+        this.boundSuspendedIncrementalBacklog();
+        this.armIncrementalFlush(CALL_GRAPH_INCREMENTAL_FAILURE_RETRY_MS);
+        return;
       }
     }
     // Editing drained to idle: if overlay-updates accumulated a delta, schedule
@@ -2880,21 +2889,9 @@ export class CallGraphService implements vscode.Disposable {
       .filter((uri) => uri.scheme === 'file' && isSupportedSourceUri(uri) && !hasBinaryFileExtension(uri.fsPath));
     if (uniqueUris.length === 0) { return; }
     const started = Date.now();
-    let updated = false;
-    try {
-      updated = await this.updateRustNativeGraphIndex(folder.uri.fsPath, manifest, uniqueUris, reason);
-    } catch (err) {
-      if (isIndexingMemoryPressureError(err)) {
-        throw err;
-      }
-      this.log.appendLine(`call graph rust-native incremental ${reason} failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    const updated = await this.updateRustNativeGraphIndex(folder.uri.fsPath, manifest, uniqueUris, reason);
     if (!updated) {
-      this.log.appendLine(
-        `call graph rust-native incremental ${reason}: retained previous summaries for ${uniqueUris.length} changed file(s); ` +
-        'run full call graph rebuild if cross-file usage looks stale',
-      );
-      return;
+      throw new Error(`call graph rust-native incremental ${reason}: native update did not publish the changed files`);
     }
     // A delta overlay was written (or a bootstrap full-update ran). Mark it so the
     // drain schedules an idle compaction to fold it into the base.
@@ -2914,7 +2911,13 @@ export class CallGraphService implements vscode.Disposable {
       }
     }
     this.invalidateRustSymbolQueryCache();
+    // Closed files need no inlay metadata. Leave their summaries lazy instead
+    // of launching one native query per file in a branch switch or edit burst.
+    // Every summary was invalidated above, so future opens still read fresh
+    // cross-file counts. Prepare edited open documents before publication.
+    const openUris = new Set(vscode.workspace.textDocuments.map((document) => document.uri.toString()));
     for (const uri of uniqueUris) {
+      if (!openUris.has(uri.toString())) { continue; }
       if (!isSupportedSourceUri(uri) || !fs.existsSync(uri.fsPath)) { continue; }
       try {
         await this.ensureRustNativeDocumentSummary(uri, { force: true });

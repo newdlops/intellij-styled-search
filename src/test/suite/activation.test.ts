@@ -1677,6 +1677,205 @@ suite('Activation', () => {
     }
   });
 
+  test('failed zoekt batches retain invalidated paths without overwriting newer file events', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    assert.ok(workspaceRoot);
+    const saved = {
+      resolveBinary: runtime.resolveBinary, hasReadyIndex: runtime.hasReadyIndex,
+      invokeJson: runtime.invokeJson, scheduleFlush: runtime.scheduleFlush,
+      changed: runtime.pendingChanged, deleted: runtime.pendingDeleted, renamed: runtime.pendingRenames,
+      sync: runtime.workspaceSyncNeeded,
+    };
+    const recreated = path.join(workspaceRoot, 'retry-recreated.txt');
+    const renamed = path.join(workspaceRoot, 'retry-renamed.txt');
+    fs.writeFileSync(recreated, 'fresh');
+    fs.writeFileSync(renamed, 'renamed');
+    runtime.pendingChanged = new Set(['retry-changed.txt']);
+    runtime.pendingDeleted = new Set(['retry-recreated.txt']);
+    runtime.pendingRenames = [{ oldRelPath: 'retry-old.txt', newRelPath: 'retry-renamed.txt' }];
+    runtime.workspaceSyncNeeded = false;
+    runtime.resolveBinary = async () => '/tmp/zoek-rs';
+    runtime.hasReadyIndex = async () => true;
+    let retryDelay: number | undefined;
+    runtime.scheduleFlush = (delay: number) => { retryDelay = delay; };
+    runtime.invokeJson = async () => {
+      // This deletion arrived after the failed batch was captured. Its event
+      // must win over the older change when the batch is restored.
+      runtime.pendingDeleted.add('retry-changed.txt');
+      return { type: 'error', ok: false, message: 'transient write failure' };
+    };
+    try {
+      await runtime.flushPendingUpdates();
+      assert.deepStrictEqual([...runtime.pendingChanged].sort(), ['retry-recreated.txt', 'retry-renamed.txt']);
+      assert.deepStrictEqual([...runtime.pendingDeleted].sort(), ['retry-changed.txt', 'retry-old.txt']);
+      assert.deepStrictEqual(runtime.pendingRenames, [], 'failed renames retry final path state instead of replaying an old operation');
+      assert.strictEqual(retryDelay, 5_000);
+      const invoked: string[][] = [];
+      runtime.invokeJson = async (args: string[]) => {
+        invoked.push(args);
+        return { type: 'update', ok: true, warnings: [] };
+      };
+      await runtime.flushPendingUpdates();
+      assert.ok(invoked[0].includes('retry-recreated.txt') && invoked[0].includes('retry-renamed.txt'));
+      assert.strictEqual(runtime.pendingChanged.size + runtime.pendingDeleted.size, 0);
+    } finally {
+      runtime.resolveBinary = saved.resolveBinary;
+      runtime.hasReadyIndex = saved.hasReadyIndex;
+      runtime.invokeJson = saved.invokeJson;
+      runtime.scheduleFlush = saved.scheduleFlush;
+      runtime.pendingChanged = saved.changed;
+      runtime.pendingDeleted = saved.deleted;
+      runtime.pendingRenames = saved.renamed;
+      runtime.workspaceSyncNeeded = saved.sync;
+      fs.unlinkSync(recreated);
+      fs.unlinkSync(renamed);
+    }
+  });
+
+  test('search drains edits arriving during a coalesced native update before using the index', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const saved = {
+      resolveBinary: runtime.resolveBinary, hasReadyIndex: runtime.hasReadyIndex,
+      invokeJson: runtime.invokeJson, scheduleFlush: runtime.scheduleFlush,
+      changed: runtime.pendingChanged, deleted: runtime.pendingDeleted, renamed: runtime.pendingRenames,
+      sync: runtime.workspaceSyncNeeded, failed: runtime.lastUpdateFailed,
+    };
+    runtime.pendingChanged = new Set(['first-edit.ts']);
+    runtime.pendingDeleted = new Set();
+    runtime.pendingRenames = [];
+    runtime.workspaceSyncNeeded = false;
+    runtime.resolveBinary = async () => { await new Promise<void>((resolve) => setImmediate(resolve)); return '/tmp/zoek-rs'; };
+    runtime.hasReadyIndex = async () => true;
+    runtime.scheduleFlush = () => {};
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let startedFirst!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { startedFirst = resolve; });
+    const invoked: string[][] = [];
+    runtime.invokeJson = async (args: string[]) => {
+      invoked.push(args);
+      if (invoked.length === 1) { startedFirst(); await firstGate; }
+      return { type: 'update', ok: true, warnings: [] };
+    };
+    try {
+      const first = runtime.flushPendingUpdates();
+      const concurrent = runtime.flushPendingUpdates();
+      await firstStarted;
+      assert.strictEqual(invoked.length, 1, 'concurrent preparations must share a single flush');
+      runtime.pendingChanged.add('second-edit.ts');
+      const drain = runtime.drainPendingUpdatesBeforeSearch(new vscode.CancellationTokenSource().token);
+      releaseFirst();
+      await Promise.all([first, concurrent]);
+      assert.strictEqual(await drain, true);
+      assert.deepStrictEqual(invoked.map((args) => args.slice(3)), [['first-edit.ts'], ['second-edit.ts']]);
+      assert.strictEqual(runtime.pendingChanged.size, 0);
+      runtime.pendingChanged.add('failed-edit.ts');
+      runtime.invokeJson = async () => { throw new Error('write failed'); };
+      assert.strictEqual(await runtime.drainPendingUpdatesBeforeSearch(new vscode.CancellationTokenSource().token), false,
+        'a failed drain must select live search instead of accepting stale indexed results');
+      assert.strictEqual(runtime.pendingDeleted.has('failed-edit.ts'), true);
+    } finally {
+      releaseFirst();
+      runtime.resolveBinary = saved.resolveBinary;
+      runtime.hasReadyIndex = saved.hasReadyIndex;
+      runtime.invokeJson = saved.invokeJson;
+      runtime.scheduleFlush = saved.scheduleFlush;
+      runtime.pendingChanged = saved.changed;
+      runtime.pendingDeleted = saved.deleted;
+      runtime.pendingRenames = saved.renamed;
+      runtime.workspaceSyncNeeded = saved.sync;
+      runtime.lastUpdateFailed = saved.failed;
+    }
+  });
+
+  test('failed graph refreshes retain the batch and coalesce changes that arrive during failure', async () => {
+    const { callGraph } = await getApi();
+    const service = callGraph as any;
+    const saved = {
+      processChangedFiles: service.processChangedFiles, armIncrementalFlush: service.armIncrementalFlush,
+      pendingChangedUris: service.pendingChangedUris, pendingFullRefresh: service.pendingFullRefresh,
+      incrementalReason: service.incrementalReason,
+    };
+    const first = vscode.Uri.file('/tmp/retry-first.ts').toString();
+    const second = vscode.Uri.file('/tmp/retry-second.ts').toString();
+    service.pendingChangedUris = new Set([first]);
+    service.pendingFullRefresh = false;
+    let retryDelay: number | undefined;
+    service.armIncrementalFlush = (delay: number) => { retryDelay = delay; };
+    service.processChangedFiles = async () => {
+      service.pendingChangedUris.add(second);
+      throw new Error('transient native update failure');
+    };
+    try {
+      await service.kickIncrementalRefresh(false);
+      assert.deepStrictEqual([...service.pendingChangedUris].sort(), [first, second].sort());
+      assert.strictEqual(retryDelay, 5_000);
+      const batches: string[][] = [];
+      service.processChangedFiles = async (uris: vscode.Uri[]) => { batches.push(uris.map((uri) => uri.toString()).sort()); };
+      await service.kickIncrementalRefresh(false);
+      assert.deepStrictEqual(batches, [[first, second].sort()]);
+      assert.strictEqual(service.pendingChangedUris.size, 0);
+    } finally {
+      service.processChangedFiles = saved.processChangedFiles;
+      service.armIncrementalFlush = saved.armIncrementalFlush;
+      service.pendingChangedUris = saved.pendingChangedUris;
+      service.pendingFullRefresh = saved.pendingFullRefresh;
+      service.incrementalReason = saved.incrementalReason;
+    }
+  });
+
+  test('native graph edit bursts prepare open summaries and leave closed files fresh on demand', async () => {
+    const { callGraph } = await getApi();
+    const service = callGraph as any;
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    assert.ok(workspaceRoot);
+    const directory = fs.mkdtempSync(path.join(workspaceRoot, 'lazy-summary-'));
+    const uris = Array.from({ length: 24 }, (_, i) => vscode.Uri.file(path.join(directory, `${i}.py`)));
+    for (const uri of uris) { fs.writeFileSync(uri.fsPath, 'def calculate():\n    return 1\n'); }
+    await vscode.workspace.openTextDocument(uris[0]);
+    const saved = {
+      cacheManifest: service.cacheManifest, updateRustNativeGraphIndex: service.updateRustNativeGraphIndex,
+      queryRustGraphSymbolIndex: service.queryRustGraphSymbolIndex,
+      emitter: service.onDidChangeSnapshotEmitter,
+      overlayDirty: service.overlayDirty, overlayChangedUris: service.overlayChangedUris,
+    };
+    service.cacheManifest = { workspaceRoot, builtAtUnixMs: 101 };
+    service.overlayChangedUris = new Set();
+    service.onDidChangeSnapshotEmitter = { fire() {} };
+    service.updateRustNativeGraphIndex = async () => true;
+    const queries: string[] = [];
+    service.queryRustGraphSymbolIndex = async (_root: string, input: { uri: string }) => {
+      queries.push(input.uri);
+      return [{ id: input.uri, name: 'calculate', qualifiedName: 'calculate', kind: 'function', language: 'python',
+        uri: input.uri, relPath: path.relative(workspaceRoot, vscode.Uri.parse(input.uri).fsPath),
+        range: { startLine: 0, startColumn: 4, endLine: 0, endColumn: 13 }, usageCount: 7 }];
+    };
+    try {
+      await service.refreshRustNativeChangedFiles(uris, 'test-burst');
+      assert.deepStrictEqual(queries, [uris[0].toString()], 'closed files must not add one subprocess each to the edit drain');
+      assert.strictEqual(service.getCachedDocumentSummaryRecord(uris[0].toString()).symbols[0].usageCount, 7);
+      assert.strictEqual(service.getCachedDocumentSummaryRecord(uris[1].toString()), undefined);
+      await service.ensureRustNativeDocumentSummary(uris[1]);
+      assert.deepStrictEqual(queries, [uris[0].toString(), uris[1].toString()]);
+      assert.strictEqual(service.getCachedDocumentSummaryRecord(uris[1].toString()).symbols[0].usageCount, 7,
+        'opening/requesting a previously closed file must read current counts');
+      service.updateRustNativeGraphIndex = async () => false;
+      await assert.rejects(service.refreshRustNativeChangedFiles(uris, 'failed'), /did not publish/);
+    } finally {
+      service.cacheManifest = saved.cacheManifest;
+      service.updateRustNativeGraphIndex = saved.updateRustNativeGraphIndex;
+      service.queryRustGraphSymbolIndex = saved.queryRustGraphSymbolIndex;
+      service.onDidChangeSnapshotEmitter = saved.emitter;
+      service.overlayDirty = saved.overlayDirty;
+      service.overlayChangedUris = saved.overlayChangedUris;
+      service.clearDocumentSummaryCache();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test('rename crossing ignored zoekt dirs queues only the indexed side', async () => {
     const { overlay } = await getApi();
     const runtime = (overlay as any).zoektRuntime as any;
@@ -1819,6 +2018,84 @@ suite('Activation', () => {
       runtime.lastWorkspaceSyncAt.delete(workspaceRoot);
       runtime.hasReadyIndex = originalHasReadyIndex;
       runtime.invokeJson = originalInvokeJson;
+    }
+  });
+
+  test('workspace catch-up covers non-git edits and retains failed sync requests', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    const saved = {
+      invokeJson: runtime.invokeJson, hasReadyIndex: runtime.hasReadyIndex,
+      readGitState: runtime.readGitState, collectGitBranchChanges: runtime.collectGitBranchChanges,
+      scheduleFlush: runtime.scheduleFlush, sync: runtime.workspaceSyncNeeded,
+      state: runtime.lastGitState.get(workspaceRoot), synced: runtime.lastWorkspaceSyncAt.get(workspaceRoot),
+    };
+    const oldState = 'HEAD ref: refs/heads/main\nREF aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const newState = 'HEAD ref: refs/heads/feature\nREF bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    runtime.workspaceSyncNeeded = true;
+    runtime.lastGitState.set(workspaceRoot, oldState);
+    runtime.hasReadyIndex = async () => true;
+    runtime.readGitState = async () => newState;
+    runtime.collectGitBranchChanges = async () => ({ changed: ['tracked.ts'], deleted: [], renamed: [] });
+    const invoked: string[][] = [];
+    let retryDelay: number | undefined;
+    runtime.scheduleFlush = (delay: number) => { retryDelay = delay; };
+    runtime.invokeJson = async (args: string[]) => {
+      invoked.push(args);
+      return { type: 'error', ok: false, message: 'sync failed' };
+    };
+    try {
+      await runtime.syncWorkspaceIndexIfNeeded(workspaceRoot, '/tmp/zoek-rs', 'catch-up');
+      assert.deepStrictEqual(invoked[0], ['/tmp/zoek-rs', 'update', workspaceRoot, '--sync'],
+        'the bounded catch-up marker includes untracked/external edits beyond the branch diff');
+      assert.strictEqual(runtime.workspaceSyncNeeded, true);
+      assert.strictEqual(runtime.lastGitState.get(workspaceRoot), oldState, 'failed sync cannot accept a new git baseline');
+      assert.strictEqual(retryDelay, 5_000);
+      runtime.invokeJson = async () => ({ type: 'update', ok: true });
+      await runtime.syncWorkspaceIndexIfNeeded(workspaceRoot, '/tmp/zoek-rs', 'retry');
+      assert.strictEqual(runtime.workspaceSyncNeeded, false);
+      assert.strictEqual(runtime.lastGitState.get(workspaceRoot), newState);
+    } finally {
+      runtime.invokeJson = saved.invokeJson;
+      runtime.hasReadyIndex = saved.hasReadyIndex;
+      runtime.readGitState = saved.readGitState;
+      runtime.collectGitBranchChanges = saved.collectGitBranchChanges;
+      runtime.scheduleFlush = saved.scheduleFlush;
+      runtime.workspaceSyncNeeded = saved.sync;
+      if (saved.state === undefined) { runtime.lastGitState.delete(workspaceRoot); } else { runtime.lastGitState.set(workspaceRoot, saved.state); }
+      if (saved.synced === undefined) { runtime.lastWorkspaceSyncAt.delete(workspaceRoot); } else { runtime.lastWorkspaceSyncAt.set(workspaceRoot, saved.synced); }
+    }
+  });
+
+  test('concurrent workspace catch-up requests share one native sync', async () => {
+    const { overlay } = await getApi();
+    const runtime = (overlay as any).zoektRuntime as any;
+    const workspaceRoot = runtime.getWorkspaceRootPath();
+    const saved = { invokeJson: runtime.invokeJson, hasReadyIndex: runtime.hasReadyIndex,
+      readGitState: runtime.readGitState, sync: runtime.workspaceSyncNeeded };
+    runtime.workspaceSyncNeeded = true;
+    runtime.hasReadyIndex = async () => true;
+    runtime.readGitState = async () => null;
+    let invocations = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    runtime.invokeJson = async () => { invocations++; await gate; return { type: 'update', ok: true }; };
+    try {
+      const first = runtime.syncWorkspaceIndexIfNeeded(workspaceRoot, '/tmp/zoek-rs', 'first');
+      const second = runtime.syncWorkspaceIndexIfNeeded(workspaceRoot, '/tmp/zoek-rs', 'second');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.strictEqual(invocations, 1);
+      release();
+      await Promise.all([first, second]);
+      assert.strictEqual(runtime.workspaceSyncPromises.size, 0);
+      assert.strictEqual(runtime.workspaceSyncNeeded, false);
+    } finally {
+      release();
+      runtime.invokeJson = saved.invokeJson;
+      runtime.hasReadyIndex = saved.hasReadyIndex;
+      runtime.readGitState = saved.readGitState;
+      runtime.workspaceSyncNeeded = saved.sync;
     }
   });
 

@@ -600,41 +600,38 @@ where
         return Ok((Vec::new(), CorpusStats::default(), 0, Vec::new()));
     }
 
-    let worker_count = shard_build_worker_count(total_shards);
+    // A small-file workspace may fit in a single shard. Share one bounded
+    // pool between shard writes and document extraction so it can still use
+    // parallel reads/gram extraction without multiplying pools per shard.
+    let total_records = shards.iter().map(|records| records.len()).sum::<usize>();
+    let build_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(shard_build_worker_count(total_records.max(total_shards)))
+        .build()
+        .map_err(io::Error::other)?;
     let mut artifacts = vec![None; total_shards];
     let mut content_snapshots = vec![None; total_shards];
     let mut shard_fingerprints = vec![0u64; total_shards];
     let mut stats = CorpusStats::default();
     let mut completed = 0usize;
 
-    let next_shard = AtomicUsize::new(0);
     let (result_tx, result_rx) = mpsc::channel();
     let mut first_error: Option<io::Error> = None;
     thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let result_tx = result_tx.clone();
-            let next_shard = &next_shard;
-            handles.push(scope.spawn(move || loop {
-                let shard_id = next_shard.fetch_add(1, AtomicOrdering::Relaxed);
-                if shard_id >= total_shards {
-                    break;
-                }
-                let output = build_and_write_base_shard_from_records(
-                    layout,
-                    shard_id as u32,
-                    now,
-                    build_id,
-                    shards[shard_id],
-                    config,
-                );
-                let failed = output.is_err();
-                if result_tx.send((shard_id, output)).is_err() || failed {
-                    break;
-                }
-            }));
-        }
-        drop(result_tx);
+        let handle = scope.spawn(move || {
+            build_pool.install(|| {
+                shards.par_iter().enumerate().try_for_each(|(shard_id, records)| {
+                    let output = build_and_write_base_shard_from_records(
+                        layout, shard_id as u32, now, build_id, records, config,
+                    );
+                    let failed = output.is_err();
+                    if result_tx.send((shard_id, output)).is_err() || failed {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                })
+            })
+        });
 
         for (shard_id, output) in result_rx {
             match output {
@@ -666,13 +663,8 @@ where
             }
         }
 
-        for handle in handles {
-            if handle.join().is_err() && first_error.is_none() {
-                first_error = Some(io::Error::new(
-                    io::ErrorKind::Other,
-                    "base shard builder panicked",
-                ));
-            }
+        if handle.join().is_err() && first_error.is_none() {
+            first_error = Some(io::Error::other("base shard builder panicked"));
         }
     });
     if let Some(err) = first_error {
@@ -765,8 +757,14 @@ fn build_and_write_base_shard_from_records(
     let mut docs = Vec::with_capacity(records.len());
     let mut content_snapshots = Vec::new();
     let mut stats = CorpusStats::default();
-    for record in records {
-        let (outcome, snapshot_hash) = build_indexed_document_from_record(record, config)?;
+    // Indexed parallel collection preserves record order, and therefore doc
+    // ids, posting order and the workspace fingerprint. Each worker releases
+    // its source text before returning its compact document record.
+    let outcomes = records
+        .par_iter()
+        .map(|record| build_indexed_document_from_record(record, config))
+        .collect::<io::Result<Vec<_>>>()?;
+    for (record, (outcome, snapshot_hash)) in records.iter().zip(outcomes) {
         if !record.metadata_reuse_safe {
             content_snapshots.push(ContentSnapshot {
                 rel_path: record.rel_path.clone(),
@@ -2203,6 +2201,67 @@ mod tests {
         let reader = ShardReader::open(&root.join(".zoek-rs/base-shard-0000.zrs"))?;
         assert_eq!(reader.header().doc_count, 1);
 
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_document_extraction_preserves_serial_shard_contents() -> io::Result<()> {
+        let root = temp_dir("parallel-documents");
+        fs::create_dir_all(root.join("src"))?;
+        for i in 0..96 {
+            fs::write(
+                root.join(format!("src/{i:03}.rs")),
+                format!("fn value_{i}() -> usize {{ {i} }}\n"),
+            )?;
+        }
+        fs::write(root.join("src/binary.txt"), [0, 1, 2, 3])?;
+        fs::write(root.join("src/large.txt"), vec![b'x'; 2_048])?;
+        let utf16 = "fn unicode() { /* 한글 */ }\n";
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in utf16.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(root.join("src/unicode.rs"), bytes)?;
+
+        // Compare the actual persisted document/posting bytes with serial
+        // extraction, including skipped records and UTF-16 decoding. Vary the
+        // shard size so nested work cannot reorder ids within or across shards.
+        for max_files in [50_000, 17] {
+            let mut config = EngineConfig::default();
+            config.max_file_size_bytes = 1_024;
+            config.max_files_per_shard = max_files;
+            let layout = StoreLayout::for_workspace(&root, &config);
+            layout.ensure_dirs()?;
+            let (records, scan_stats) =
+                super::collect_index_file_records(&root, &config, &mut |_| {})?;
+            let partitions = super::partition_records(&records, &config);
+            let (shards, build_stats, _, _) = super::write_base_shards_from_records_parallel(
+                &layout, &partitions, &config, 123, 456, &mut |_| {},
+            )?;
+            assert_eq!(build_stats.indexed_files, 97);
+            assert_eq!(build_stats.skipped_binary, 1);
+            assert_eq!(scan_stats.skipped_too_large, 1);
+            for (shard_id, records) in partitions.iter().enumerate() {
+                let mut documents = Vec::new();
+                for record in *records {
+                    if let (super::IndexedRecordOutcome::Indexed { document, .. }, _) =
+                        build_indexed_document_from_record(record, &config)?
+                    {
+                        documents.push(document);
+                    }
+                }
+                let shard = &shards[shard_id];
+                let header = ShardReader::open(&shard.path)?.header().clone();
+                let expected = crate::shard::build_shard_bytes(
+                    shard_id as u32, header.created_unix_secs, header.build_id, &documents,
+                )?;
+                assert!(
+                    fs::read(&shard.path)? == expected.bytes,
+                    "parallel shard {shard_id} differs from serial extraction",
+                );
+            }
+        }
         fs::remove_dir_all(root)?;
         Ok(())
     }

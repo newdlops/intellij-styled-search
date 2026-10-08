@@ -146,6 +146,8 @@ On first activation, the extension attempts to install a platform-specific ripgr
 
 Zoekt indexes are kept fresh with incremental updates for VS Code create/save/delete/rename operations plus external filesystem create/change/delete events. A search drains queued updates before querying the index; unsaved editor buffers are reported as dirty overlay state because they are not yet durable index input. Symbol search also filters deleted/missing-file results before returning them and queues a semantic incremental update when stale symbols are observed.
 
+Full Zoekt builds share a bounded worker pool for file reads, gram extraction and shard writes, including workspaces that fit in one shard. Saved-file updates share one flush and drain edits that arrive during an update before searching. Failed batches retain the affected paths for retry; if known changes cannot be drained, search verifies results with the live codesearch backend. Call graph edit bursts prepare summaries for changed open documents and load closed-file summaries only when requested, while invalidating cross-file usage counts after every successful update.
+
 Search and call graph indexing check host-wide available memory before starting. While an isolated index process runs, sustained memory pressure is sampled and the process is stopped before it can exhaust the machine. Background full builds are deferred to a later trigger, while pending compactions and incremental batches retain their work and retry after pressure subsides; manual rebuilds report the available/required memory totals.
 
 The codesearch trigram engine retains at most 16 MiB or 4,096 entries of clean disk-backed posting data. Evicted postings are read again when needed. Queries use posting sizes from the index metadata to intersect selective terms first and stop reading after the candidate set becomes empty. Reindexing keeps unchanged postings compact, and trigram extraction uses a three-character window. The read-cache limit does not cap mutable build data, query results, or the temporary full index image used during persistence.
@@ -159,10 +161,13 @@ npm install
 npm run compile
 npm test
 npm run bench:zoekt -- --files 10000,50000,100000
+npm run bench:indexing -- --files 4000 --runs 3
 npm run bench:trigram
 ```
 
 `npm run bench:zoekt` saves a timestamped artifact plus `latest.json` under `artifacts/benchmarks/zoekt/`. The artifact includes the raw benchmark response, wall-clock runtime, git commit, Rust toolchain versions, and host metadata so repeated runs stay comparable.
+
+`npm run bench:indexing` measures full builds, clean reuse, single-file and burst updates, duplicate events, renames, deletes, recreation and compaction in an isolated temporary workspace. It verifies text results and cross-file usage counts after each operation. Use `-- --binary /path/to/zoek-rs --output /tmp/indexing.json` to measure an earlier binary with the same workload; reports include binary hashes and individual timing samples. Fixture generation and correctness queries are excluded from timings; CLI startup is included.
 
 `npm run bench:trigram` runs isolated synthetic extraction, selective-query, repeated-query, and unchanged-update workloads without accessing a workspace index. It reports elapsed time, posting reads, and retained heap/array-buffer memory after GC. Use `-- --output=/tmp/trigram.json` to save the report, or `-- --module=/path/to/earlier-bundle.cjs` to compare an earlier build on the same host. These are codesearch measurements, not end-to-end Rust engine timings.
 
