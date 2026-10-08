@@ -162,6 +162,39 @@ test('noninteractive Windows snapshot finishes a child that waits for input EOF'
   }
 });
 
+test('Windows snapshot retries a timed-out child once and rejects other process failures', async () => {
+  const childProcess = require('child_process');
+  const original = childProcess.execFile;
+  const row = { ProcessId: 120, ParentProcessId: 1, ExecutablePath: host.execPath,
+    CommandLine: `"${host.execPath}"` };
+  let attempts = 0;
+  childProcess.execFile = (_binary: string, _args: string[], options: object, callback: Function) => {
+    attempts++;
+    const source = attempts === 1 ? 'setInterval(()=>{},1000)' : `process.stdout.write(${JSON.stringify(JSON.stringify([row]))});`;
+    return original(process.execPath, ['-e', source], { ...options, timeout: attempts === 1 ? 100 : 1_000 }, callback);
+  };
+  try {
+    assert.deepEqual(await windowsElectronMainProcess.readProcessSnapshot(), [proc(120, 1)]);
+    assert.equal(attempts, 2);
+    attempts = 0;
+    childProcess.execFile = (_binary: string, _args: string[], options: object, callback: Function) => {
+      attempts++;
+      return original(process.execPath, ['-e', 'process.stderr.write("access denied");process.exit(2)'], options, callback);
+    };
+    await assert.rejects(windowsElectronMainProcess.readProcessSnapshot(), /access denied/);
+    assert.equal(attempts, 1);
+    attempts = 0;
+    childProcess.execFile = (_binary: string, _args: string[], options: object, callback: Function) => {
+      attempts++;
+      return original(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { ...options, timeout: 100 }, callback);
+    };
+    await assert.rejects(windowsElectronMainProcess.readProcessSnapshot());
+    assert.equal(attempts, 2, 'persistent timeouts are bounded to two reads');
+  } finally {
+    childProcess.execFile = original;
+  }
+});
+
 test('usage binding migration invalidates old overlays while retaining platform URI versions', () => {
   assert.deepEqual(graphStorageVersions('win32'), { cache: 25, native: 17 });
   assert.deepEqual(graphStorageVersions('darwin'), { cache: 24, native: 16 });

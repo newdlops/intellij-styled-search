@@ -80,7 +80,7 @@ export const windowsElectronMainProcess: ElectronMainProcessPlatform = {
   readProcessSnapshot() {
     const powershell = path.win32.join(process.env.SystemRoot || 'C:\\Windows',
       'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-    return new Promise((resolve, reject) => {
+    const readSnapshot = () => new Promise<ElectronProcess[]>((resolve, reject) => {
       const child = execFile(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', PROCESS_SNAPSHOT_SCRIPT], {
         encoding: 'utf8', windowsHide: true, timeout: 15_000, maxBuffer: 8 * 1024 * 1024,
         env: { ...process.env, IJSS_PROCESS_SNAPSHOT_PID: String(process.pid) },
@@ -91,6 +91,15 @@ export const windowsElectronMainProcess: ElectronMainProcessPlatform = {
       // The complete script is in argv; this read-only probe accepts no input.
       // Signal EOF so a redirected PowerShell host cannot wait for more input.
       child.stdin?.end();
+    });
+    // A cold local CIM provider can outlive the first probe. A second bounded
+    // read can use the initialized provider without weakening ownership checks.
+    // Do not repeat permission, executable, parsing or other non-timeout errors.
+    return readSnapshot().catch((error) => {
+      if (error?.code === 'ETIMEDOUT' || (error?.killed && error?.signal === 'SIGTERM')) {
+        return readSnapshot();
+      }
+      throw error;
     });
   },
 };

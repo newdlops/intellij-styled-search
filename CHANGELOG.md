@@ -6,6 +6,7 @@
 - Kept search on the live codesearch backend while those known edits remain unindexed, with recovery regression checks for both preparation failures.
 - Closed unused input for Windows process probes and desktop acceptance commands so redirected shells receive EOF.
 - Restricted Windows process discovery to the extension host's parent chain, retaining installation and Electron-role checks without enumerating unrelated system processes.
+- Retry a Windows process snapshot once after a cold-provider timeout, while keeping non-timeout failures and process ownership checks strict.
 
 ## 0.1.7160 - 2026-10-08
 

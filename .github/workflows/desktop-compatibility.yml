@@ -121,6 +121,8 @@ jobs:
     if: always() && !cancelled()
     runs-on: windows-11-arm
     timeout-minutes: 20
+    env:
+      IJSS_E2E_MIRROR_LOGS: '1'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
