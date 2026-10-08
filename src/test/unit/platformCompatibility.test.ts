@@ -118,9 +118,30 @@ test('Windows file URIs share VS Code drive/UNC identity and encode reserved cha
   assert.equal(windowsFileUri('\\\\?\\UNC\\SERVER\\Share\\a b.ts'), 'file://server/Share/a%20b.ts');
 });
 
-test('native Windows CIM snapshot includes the running Node host', { skip: process.platform !== 'win32' }, async () => {
-  const snapshot = await windowsElectronMainProcess.readProcessSnapshot();
-  assert.equal(snapshot.find((p) => p.pid === process.pid)?.ppid, process.ppid);
+test('native Windows snapshot reads only the running host and its ancestors', {
+  skip: process.platform !== 'win32', timeout: 20_000,
+}, async () => {
+  const unrelated = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'],
+    { stdio: 'ignore', windowsHide: true });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      unrelated.once('spawn', resolve);
+      unrelated.once('error', reject);
+    });
+    const snapshot = await windowsElectronMainProcess.readProcessSnapshot();
+    assert.equal(snapshot.find((p) => p.pid === process.pid)?.ppid, process.ppid);
+    assert.ok(!snapshot.some((p) => p.pid === unrelated.pid), 'descendants are outside the owning parent chain');
+    const byPid = new Map(snapshot.map((p) => [p.pid, p]));
+    const ancestors = new Set<number>();
+    let cursor = process.pid;
+    while (byPid.has(cursor) && !ancestors.has(cursor)) {
+      ancestors.add(cursor);
+      cursor = byPid.get(cursor)!.ppid;
+    }
+    assert.equal(ancestors.size, snapshot.length, 'every returned row must belong to the host ancestry');
+  } finally {
+    unrelated.kill();
+  }
 });
 
 test('noninteractive Windows snapshot finishes a child that waits for input EOF', async () => {

@@ -222,7 +222,11 @@ suite('Desktop compatibility', () => {
             pid = row.ppid;
           }
           diagnostic.ancestors = ancestors;
-        } catch (snapshotError) { diagnostic.snapshotError = String(snapshotError); }
+        } catch (snapshotError) {
+          const details = snapshotError as any;
+          diagnostic.snapshotError = { message: String(snapshotError), code: details?.code,
+            signal: details?.signal, killed: details?.killed };
+        }
         await fs.promises.mkdir(artifactRoot, { recursive: true });
         await fs.promises.writeFile(path.join(artifactRoot, 'attachment-failure.json'), JSON.stringify(diagnostic, null, 2));
         console.error('Windows attachment diagnostics:', JSON.stringify(diagnostic));

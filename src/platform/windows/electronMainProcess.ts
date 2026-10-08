@@ -2,12 +2,25 @@ import { execFile } from 'child_process';
 import * as path from 'path';
 import { validateInspectorPid, type ElectronExtensionHostContext, type ElectronMainProcessPlatform, type ElectronProcess } from '../electronProcessTypes';
 
-// Only fixed script text is sent to PowerShell. Paths and product names are
-// compared in TypeScript, so spaces, quotes and Unicode cannot become code.
+// Only fixed script text is sent to PowerShell. The numeric host PID travels
+// through the environment; paths and product names are compared in TypeScript.
+// Windows never uses global fallback, so unrelated system processes need not
+// be enumerated just to establish this host's owning ancestor.
 const PROCESS_SNAPSHOT_SCRIPT = [
   "$ErrorActionPreference = 'Stop'",
   '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)',
-  '@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine) | ConvertTo-Json -Compress',
+  '$cursor = [uint32]$env:IJSS_PROCESS_SNAPSHOT_PID',
+  'if ($cursor -eq 0) { throw "Missing extension host PID" }',
+  '$seen = New-Object "System.Collections.Generic.HashSet[uint32]"',
+  '$rows = New-Object "System.Collections.Generic.List[object]"',
+  'for ($depth = 0; $cursor -gt 0 -and $depth -lt 64 -and $seen.Add($cursor); $depth++) {'
+    + ' try { $row = Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId = " + $cursor)'
+    + ' -Property ProcessId,ParentProcessId,ExecutablePath,CommandLine }'
+    + ' catch { if ($rows.Count -eq 0) { throw }; break };'
+    + ' if (!$row) { break };'
+    + ' $rows.Add(($row | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine));'
+    + ' $cursor = [uint32]$row.ParentProcessId }',
+  'ConvertTo-Json -InputObject ($rows.ToArray()) -Compress',
 ].join('; ');
 
 export function parseWindowsProcessSnapshot(output: string): ElectronProcess[] {
@@ -70,6 +83,7 @@ export const windowsElectronMainProcess: ElectronMainProcessPlatform = {
     return new Promise((resolve, reject) => {
       const child = execFile(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', PROCESS_SNAPSHOT_SCRIPT], {
         encoding: 'utf8', windowsHide: true, timeout: 15_000, maxBuffer: 8 * 1024 * 1024,
+        env: { ...process.env, IJSS_PROCESS_SNAPSHOT_PID: String(process.pid) },
       }, (error, stdout) => {
         if (error) { reject(error); return; }
         try { resolve(parseWindowsProcessSnapshot(stdout)); } catch (err) { reject(err); }
