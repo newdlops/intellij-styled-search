@@ -925,13 +925,24 @@ suite('Call graph', () => {
     const beforeText = 'from provider import evaluate\n\ndef consume():\n    return evaluate()\n';
     const afterText = 'from provider import evaluate\n\ndef consume():\n    evaluate()\n    return evaluate()\n';
     const priorFocus = service.windowFocusedForTests;
+    let created = false;
     let changes = 0;
+    const createSubscription = service.watcher.onDidCreate((uri: vscode.Uri) => {
+      if (uri.toString() === consumer.toString()) { created = true; }
+    });
     const watcherSubscription = service.watcher.onDidChange((uri: vscode.Uri) => {
       if (uri.toString() === consumer.toString()) { changes++; }
     });
     try {
       fs.writeFileSync(provider.fsPath, 'def evaluate():\n    return 1\n');
       fs.writeFileSync(consumer.fsPath, beforeText);
+      // Establish the real watcher's file lifecycle before testing a change.
+      // A create and immediate edit can otherwise be delivered as one create.
+      const createDeadline = Date.now() + 8_000;
+      while (!created && Date.now() < createDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.ok(created, 'VS Code must observe the fixture file before its external edit');
       await api.callGraph.rebuild(undefined, undefined, { force: true });
       const document = await vscode.workspace.openTextDocument(consumer);
       assert.strictEqual(document.isDirty, false);
@@ -958,6 +969,7 @@ suite('Call graph', () => {
       assert.strictEqual(updated?.usageCount, initialCount + 1,
         'one added call must update cross-file usages without an editor save');
     } finally {
+      createSubscription.dispose();
       watcherSubscription.dispose();
       service.setWindowFocusedForTests(priorFocus);
       fs.rmSync(directory, { recursive: true, force: true });
