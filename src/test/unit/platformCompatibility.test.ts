@@ -7,6 +7,7 @@ import { canPassSearchCandidates } from '../../platform/commandLine';
 import { windowsCommandLineLength, fitsWindowsCommandLine, WINDOWS_COMMAND_LINE_LIMIT } from '../../platform/windows/commandLine';
 import { windowsFileUri } from '../../platform/windows/fileUri';
 import { graphStorageVersions } from '../../platform/graphStorage';
+import { parseWindowsTestIdentity } from '../support/windowsIdentity';
 
 const host = {
   platform: 'win32' as const,
@@ -143,6 +144,21 @@ test('noninteractive Windows snapshot finishes a child that waits for input EOF'
 test('usage binding migration invalidates old overlays while retaining platform URI versions', () => {
   assert.deepEqual(graphStorageVersions('win32'), { cache: 25, native: 17 });
   assert.deepEqual(graphStorageVersions('darwin'), { cache: 24, native: 16 });
+});
+
+test('standard-account acceptance reads SIDs independently of localized group names', () => {
+  const user = '"HOST\\user","S-1-5-21-100-200-300-1001"';
+  const groups = '"모든 사용자","알려진 그룹","S-1-1-0","필수 그룹, 사용됨"\r\n'
+    + '"BUILTIN\\사용자","별칭","S-1-5-32-545","필수 그룹, 사용됨"';
+  const identity = parseWindowsTestIdentity('\uFEFF' + user, groups);
+  assert.equal(identity.user, 'HOST\\user');
+  assert.equal(identity.administrator, false);
+  assert.equal(parseWindowsTestIdentity(user,
+    groups + '\r\n"임의의 이름","별칭","S-1-5-32-544","거부 전용"').administrator, true);
+  for (const [badUser, badGroups] of [['', groups], [user, ''], ['"user","invalid"', groups],
+    [user, 'malformed'], [user, '"name","type","invalid","attributes"']]) {
+    assert.throws(() => parseWindowsTestIdentity(badUser, badGroups));
+  }
 });
 
 test('native Windows inspector activation starts a running child without SIGUSR1', {

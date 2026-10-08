@@ -9,6 +9,7 @@ import { windowsFileUri } from '../../platform/windows/fileUri';
 import { windowsElectronMainProcess } from '../../platform/windows/electronMainProcess';
 import { Uri as WorkerUri } from '../../nodeVscodeShim';
 import { runRgSearch } from '../../rgSearch';
+import { readWindowsTestIdentity } from '../support/windowsIdentity';
 import type { FileMatch } from '../../search';
 
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
@@ -43,9 +44,7 @@ suite('Desktop compatibility', () => {
       assert.ok(relativeExecutable && !relativeExecutable.startsWith('..') && !path.isAbsolute(relativeExecutable),
         'the extension host must belong to the per-user installation, including versioned update layouts');
       assert.strictEqual(path.basename(relativeExecutable), 'code.exe');
-      const host = await invoke('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-        "$id=[Security.Principal.WindowsIdentity]::GetCurrent(); $p=[Security.Principal.WindowsPrincipal]::new($id); " +
-        "@{user=$id.Name;administrator=$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)} | ConvertTo-Json -Compress"]);
+      const host: any = await readWindowsTestIdentity();
       // Query this extension host's kernel directly, avoiding a cold WMI
       // provider query inside the x64-emulated PowerShell process.
       host.os = os.version();
