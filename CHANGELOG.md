@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.7158 - 2026-10-08
+
+- Added terminal-style ↑/↓ history recall directly in the query field, including full multiline queries and restoration of unfinished drafts and their selections.
+- Kept multiline cursor editing, modifier selections and IME composition available. Alt+↑/↓ continues to navigate search results; history recall waits for Enter or Run before searching.
+- Added trusted-key acceptance for history traversal, boundaries, editing and execution, plus rendered query states at three desktop sizes.
+
 ## 0.1.7157 - 2026-10-08
 
 - Added filtering, matching excerpts, result counts and keyboard navigation to search history. Alt+H opens the popup; selecting a query restores its full text without running it automatically.

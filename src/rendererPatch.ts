@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 156;
+export const RENDERER_PATCH_VERSION = 157;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -3401,7 +3401,9 @@ export function getRendererPatchScript(
   var $q = el('textarea', {
     className: 'ij-find-query',
     attrs: {
-      placeholder: 'Search in project... (Shift+Enter for newline)',
+      placeholder: 'Search in project... (↑/↓ history, Shift+Enter newline)',
+      'aria-label': 'Search query',
+      title: '↑/↓ for previous searches (multiline: at start/end). Alt+↑/↓ for results. Shift+Enter for newline.',
       spellcheck: 'false',
       autocomplete: 'off',
       rows: '1',
@@ -5391,8 +5393,57 @@ export function getRendererPatchScript(
     else { openSearchHistory(); }
   }
 
+  var queryHistoryNavigation = null;
+
+  function resetQueryHistoryNavigation() {
+    queryHistoryNavigation = null;
+  }
+
+  function browseQueryHistory(direction) {
+    if (state.searchHistoryLimit <= 0 || !state.searchHistory.length) { return false; }
+    if (queryHistoryNavigation && ($q.value !== queryHistoryNavigation.entries[queryHistoryNavigation.index]
+        || $q.selectionStart !== $q.value.length || $q.selectionEnd !== $q.value.length)) {
+      resetQueryHistoryNavigation();
+    }
+    if (!queryHistoryNavigation) {
+      // Multiline editing keeps its normal cursor movement. Only the outer
+      // boundaries enter history; an active history walk can cross multiline
+      // entries without requiring an extra cursor movement between entries.
+      if (direction > 0) { return false; }
+      if ($q.value.indexOf('\\n') >= 0 && ($q.selectionStart !== 0 || $q.selectionEnd !== 0)) { return false; }
+      var entries = state.searchHistory.filter(function (query) { return query !== $q.value; });
+      if (!entries.length) { return false; }
+      queryHistoryNavigation = {
+        entries: entries,
+        index: -1,
+        draft: $q.value,
+        start: $q.selectionStart,
+        end: $q.selectionEnd,
+        selectionDirection: $q.selectionDirection,
+      };
+    }
+    var navigation = queryHistoryNavigation;
+    var next = Math.max(-1, Math.min(navigation.entries.length - 1, navigation.index - direction));
+    if (next === navigation.index) { return true; }
+    navigation.index = next;
+    $q.value = next < 0 ? navigation.draft : navigation.entries[next];
+    state.staticSessionId = null;
+    $moreUsages.hidden = true;
+    autosizeQuery();
+    if (next < 0) {
+      $q.setSelectionRange(navigation.start, navigation.end, navigation.selectionDirection);
+      resetQueryHistoryNavigation();
+    } else {
+      $q.setSelectionRange($q.value.length, $q.value.length);
+    }
+    markSearchDirty();
+    closeSearchHistory();
+    return true;
+  }
+
   function selectSearchHistory(idx) {
     if (idx >= 0 && state.searchHistory && idx < state.searchHistory.length) {
+      resetQueryHistoryNavigation();
       $q.value = state.searchHistory[idx];
       state.staticSessionId = null;
       $moreUsages.hidden = true;
@@ -6042,6 +6093,7 @@ export function getRendererPatchScript(
   }
 
 	  function triggerSearch(forceRestart, recordHistory) {
+    resetQueryHistoryNavigation();
     state.staticSessionId = null;
 	    var raw = $q.value;
 	    var scopeRaw = $scope.value || '';
@@ -6251,7 +6303,7 @@ export function getRendererPatchScript(
     selectMatch(next);
   }
 
-  on($q, 'input', function () { state.staticSessionId = null; $moreUsages.hidden = true; autosizeQuery(); markSearchDirty(); });
+  on($q, 'input', function () { resetQueryHistoryNavigation(); state.staticSessionId = null; $moreUsages.hidden = true; autosizeQuery(); markSearchDirty(); });
   on($scope, 'input', function () {
     state.filesScopeEdited = true;
     send({ type: 'filesScopeChanged', value: $scope.value || '' });
@@ -6327,14 +6379,19 @@ export function getRendererPatchScript(
     if (e.relatedTarget instanceof Node && !$historyWrap.contains(e.relatedTarget)) { closeSearchHistory(); }
   });
   on($q, 'keydown', function (e) {
+    if (e.isComposing || e.keyCode === 229) { return; }
     if (e.key === 'Enter' && !e.shiftKey) {
       // Shift+Enter: insert literal newline (textarea default) → enables
       // ripgrep multi-line search. Plain Enter: execute the query.
       if (state.debounce) { clearTimeout(state.debounce); }
       e.preventDefault();
       refreshSearch();
-    } else if (e.key === 'ArrowDown' && !e.shiftKey) { e.preventDefault(); moveActive(1); }
-    else if (e.key === 'ArrowUp' && !e.shiftKey) { e.preventDefault(); moveActive(-1); }
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (e.shiftKey || e.ctrlKey || e.metaKey) { return; }
+      var direction = e.key === 'ArrowDown' ? 1 : -1;
+      if (e.altKey) { e.preventDefault(); moveActive(direction); }
+      else if (browseQueryHistory(direction)) { e.preventDefault(); }
+    }
     else if (e.key === 'PageDown') { e.preventDefault(); moveActive(10); }
     else if (e.key === 'PageUp') { e.preventDefault(); moveActive(-10); }
     else if (e.key === 'Escape') { e.preventDefault(); hideSearchPanel(); }
@@ -13694,6 +13751,7 @@ export function getRendererPatchScript(
   // workbench file editor would).
 
 	  function showSearchPanel(initialQuery, showOptions) {
+    resetQueryHistoryNavigation();
     state.staticSessionId = null;
 	    try {
 	      if (Date.now() < (state.recoveryUntil || 0)) { return 'suppressed:recovery'; }
@@ -14480,6 +14538,7 @@ export function getRendererPatchScript(
           return typeof entry === 'string' && entry.length > 0;
         }) : [];
         state.searchHistoryLimit = typeof msg.limit === 'number' ? msg.limit : state.searchHistoryLimit;
+        if (state.searchHistoryLimit <= 0 || !state.searchHistory.length) { resetQueryHistoryNavigation(); }
         renderSearchHistory();
         break;
       case 'preview':

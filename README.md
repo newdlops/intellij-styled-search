@@ -138,6 +138,8 @@ The Files scope field remembers your last edit separately for each workspace, in
 
 Open **History** or press **Alt+H** in the search panel to filter previous queries. Matching is case-insensitive and supports multiple words. Use ↑/↓ and Enter to select a query; Escape closes the history popup. Selecting restores the complete query, including newlines, and waits for Enter or Run before searching. The current Files scope and options stay in effect.
 
+In the query field, press **↑** for older searches and **↓** for newer searches. Moving down past the newest entry restores your unfinished query and its selection. The current query is skipped when it is already in history; editing a recalled query starts a new history walk. For multiline drafts, move to the start before pressing ↑; normal line movement and Shift selections remain available. **Alt+↑/↓** moves through search results. Recalling history does not run a search; press Enter or Run when ready.
+
 ## Runtime Notes
 
 On first activation, the extension attempts to install a platform-specific ripgrep binary into VS Code's extension global storage. If that install fails or the platform is unsupported, it falls back to VS Code's bundled ripgrep when available, and finally to the JavaScript search path.
