@@ -55,32 +55,50 @@ suite('MCP response efficiency', () => {
       ];
       const metrics:any[]=[];
       for(const [name,args] of cases) {
-        const response=await call(name,args);
-        const wire=response.result;
-        assert.equal(wire.isError,false,JSON.stringify(response));
-        assert.equal(wire.structuredContent,undefined,`${name} must avoid default duplication`);
-        const envelope=JSON.parse(wire.content[0].text);
-        assert.equal(envelope.ok,true,name);
-        assert.ok('warnings' in envelope && 'truncated' in envelope && 'next_cursor' in envelope,
-          `${name} must preserve warnings and continuation metadata`);
-        const rich=await call(name,{...args,structured:true});
-        assert.deepEqual(JSON.parse(rich.result.content[0].text),rich.result.structuredContent,
-          `${name} rich JSON must remain fully mirrored for structured clients`);
-        assert.equal(envelope.summary,rich.result.structuredContent.summary,name);
-        // Reconstruct the old default from the exact current envelope, so
-        // changing timings/IDs cannot inflate the measured savings.
-        const old={...response,result:{...wire,structuredContent:envelope}};
-        const before=JSON.stringify(old),after=JSON.stringify(response);
-        assert.ok(Buffer.byteLength(after)<Buffer.byteLength(before)*0.65,`${name} must measurably reduce wire size`);
-        metrics.push({tool:name,beforeBytes:Buffer.byteLength(before),afterBytes:Buffer.byteLength(after),before,after,
-          modelTextBefore:wire.content[0].text+'\n'+JSON.stringify(envelope),modelTextAfter:wire.content[0].text});
-        if(name==='codeidx_read_snippets') {
-          assert.ok(envelope.snippets[0].text.includes('return first + second;'));
-          assert.deepEqual(envelope.snippets.map((s:any)=>s.text),rich.result.structuredContent.snippets.map((s:any)=>s.text));
-        }
+        // Serialization must compare the same live result. Independent
+        // reference queries may refine provenance/evidence between calls.
+        const server=api.mcpServer as any;
+        const findReferences=server.findReferences;
+        const hadOwnReferences=Object.prototype.hasOwnProperty.call(server,'findReferences');
+        let referenceSnapshot: Promise<unknown> | undefined;
         if(name==='codeidx_find_references') {
-          assert.deepEqual(envelope.groups,rich.result.structuredContent.groups);
-          assert.deepEqual(envelope.usage_contract,rich.result.structuredContent.usage_contract);
+          server.findReferences=function(...parameters:unknown[]) {
+            return referenceSnapshot ??= findReferences.apply(this,parameters).then((result:unknown)=>structuredClone(result));
+          };
+        }
+        try {
+          const response=await call(name,args);
+          const wire=response.result;
+          assert.equal(wire.isError,false,JSON.stringify(response));
+          assert.equal(wire.structuredContent,undefined,`${name} must avoid default duplication`);
+          const envelope=JSON.parse(wire.content[0].text);
+          assert.equal(envelope.ok,true,name);
+          assert.ok('warnings' in envelope && 'truncated' in envelope && 'next_cursor' in envelope,
+            `${name} must preserve warnings and continuation metadata`);
+          const rich=await call(name,{...args,structured:true});
+          assert.deepEqual(JSON.parse(rich.result.content[0].text),rich.result.structuredContent,
+            `${name} rich JSON must remain fully mirrored for structured clients`);
+          assert.equal(envelope.summary,rich.result.structuredContent.summary,name);
+          // Reconstruct the old default from the exact current envelope, so
+          // changing timings/IDs cannot inflate the measured savings.
+          const old={...response,result:{...wire,structuredContent:envelope}};
+          const before=JSON.stringify(old),after=JSON.stringify(response);
+          assert.ok(Buffer.byteLength(after)<Buffer.byteLength(before)*0.65,`${name} must measurably reduce wire size`);
+          metrics.push({tool:name,beforeBytes:Buffer.byteLength(before),afterBytes:Buffer.byteLength(after),before,after,
+            modelTextBefore:wire.content[0].text+'\n'+JSON.stringify(envelope),modelTextAfter:wire.content[0].text});
+          if(name==='codeidx_read_snippets') {
+            assert.ok(envelope.snippets[0].text.includes('return first + second;'));
+            assert.deepEqual(envelope.snippets.map((s:any)=>s.text),rich.result.structuredContent.snippets.map((s:any)=>s.text));
+          }
+          if(name==='codeidx_find_references') {
+            assert.deepEqual(envelope.groups,rich.result.structuredContent.groups);
+            assert.deepEqual(envelope.usage_contract,rich.result.structuredContent.usage_contract);
+          }
+        } finally {
+          if(name==='codeidx_find_references') {
+            if(hadOwnReferences) server.findReferences=findReferences;
+            else delete server.findReferences;
+          }
         }
       }
       const output=path.resolve(__dirname,'../../../artifacts/mcp-efficiency');
