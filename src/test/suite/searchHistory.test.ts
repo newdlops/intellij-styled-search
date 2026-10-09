@@ -33,6 +33,7 @@ async function seed(values: string[]) {
   // history. Finish those actual operations before replacing the test fixture.
   while (historyTasks.size > 0) { await Promise.allSettled([...historyTasks]); }
   await control.context.globalState.update(key, values);
+  while (historyTasks.size > 0) { await Promise.allSettled([...historyTasks]); }
   assert.deepEqual(control.context.globalState.get(key), values, 'stored fixture history is current');
   await control.postSearchHistoryToRenderer();
   await waitForQuery(value => JSON.stringify(value.state.history) === JSON.stringify(values));
@@ -71,23 +72,25 @@ suite('Search history discovery', () => {
     control = api.overlay as any;
     const storage = control.context.globalState;
     originalStorageUpdate = storage.update;
-    storage.update = async function (storageKey: string, value: unknown) {
-      if (storageKey !== key || JSON.stringify(this.get(key)) === JSON.stringify(value)) {
-        return originalStorageUpdate.call(this, storageKey, value);
+    storage.update = function (storageKey: string, value: unknown) {
+      if (JSON.stringify(this.get(storageKey)) === JSON.stringify(value)) {
+        return Promise.resolve();
       }
+      const owner = this;
+      const task = (async () => {
       // Global Memento updates also return through onDidChangeStorage. Wait for
       // that real storage echo before a later fixture can replace the value.
       // https://github.com/microsoft/vscode/blob/main/src/vs/workbench/api/common/extHostMemento.ts
-      assert.equal(typeof this._storage?.onDidChangeStorage, 'function');
+      assert.equal(typeof owner._storage?.onDidChangeStorage, 'function');
       let acknowledge!: () => void;
       const acknowledged = new Promise<void>(resolve => { acknowledge = resolve; });
-      const listener = this._storage.onDidChangeStorage((event: any) => {
-        if (event.shared && event.key === this._id
-          && JSON.stringify(event.value[key]) === JSON.stringify(value)) { acknowledge(); }
+      const listener = owner._storage.onDidChangeStorage((event: any) => {
+        if (event.shared && event.key === owner._id
+          && JSON.stringify(event.value[storageKey]) === JSON.stringify(value)) { acknowledge(); }
       });
       let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
-        await originalStorageUpdate.call(this, storageKey, value);
+        await originalStorageUpdate.call(owner, storageKey, value);
         await Promise.race([acknowledged, new Promise<void>((_, reject) => {
           timeout = setTimeout(() => reject(new Error('history storage echo did not arrive')), 5000);
         })]);
@@ -95,6 +98,12 @@ suite('Search history discovery', () => {
         listener.dispose();
         if (timeout) { clearTimeout(timeout); }
       }
+      })();
+      // A Memento echo replaces the complete object, including history. Wait
+      // for other keys' writes too before installing the next fixture.
+      historyTasks.add(task);
+      void task.then(() => historyTasks.delete(task), () => historyTasks.delete(task));
+      return task;
     };
     for (const name of ['recordSearchHistory', 'trimSearchHistoryToLimit', 'postSearchHistoryToRenderer']) {
       const original = control[name];
