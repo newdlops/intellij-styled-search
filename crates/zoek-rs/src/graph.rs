@@ -4853,8 +4853,15 @@ pub fn update_graph_native(
     // same way). Carried exact + carried token-shape refs spill to per-shard
     // partials; only the small aggregates the emit/count logic needs stay in RAM.
     let _t = std::time::Instant::now();
-    let incr_spill_dir =
-        std::env::temp_dir().join(format!("zoek-rs-incr-spill-{}", std::process::id()));
+    // Different workspaces can update concurrently in one library process.
+    // Their per-shard spill names and cleanup must never share a directory.
+    static NEXT_INCREMENTAL_SPILL: AtomicU64 = AtomicU64::new(0);
+    let spill_sequence = NEXT_INCREMENTAL_SPILL.fetch_add(1, Ordering::Relaxed);
+    let incr_spill_dir = std::env::temp_dir().join(format!(
+        "zoek-rs-incr-spill-{}-{}-{spill_sequence}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
+    ));
     let streamed_prior = partition_prior_references_streaming(
         &prior_file_table,
         workspace_root,
