@@ -2507,7 +2507,7 @@ export class ZoektRuntime implements vscode.Disposable {
   }
 
   private isUnstampedCheckoutBuildCandidate(candidate: string): boolean {
-    const relative = path.relative(executablePath(path.join(this.extensionRoot, 'target')), candidate);
+    const relative = path.relative(executablePath(path.join(this.extensionRoot, 'target')), executablePath(candidate));
     return !!relative && !relative.startsWith('..') && !path.isAbsolute(relative);
   }
 

@@ -7,6 +7,7 @@ import { WebSocketServer } from 'ws';
 import { createRustGraphMemoryEnv } from '../../callGraph';
 import type { ExtensionTestApi } from '../../extension';
 import { IndexingMemoryProtection } from '../../internal/indexingMemoryProtection';
+import { executablePath } from '../../platform/executablePath';
 
 const EXTENSION_ID = 'newdlops.intellij-styled-search';
 
@@ -836,7 +837,7 @@ suite('Activation', () => {
 
     try {
       const candidates = runtime.getBinaryCandidatesFor('engine') as string[];
-      assert.strictEqual(candidates[0], path.join(cacheDir, `zoek-rs${exeSuffix}`));
+      assert.strictEqual(candidates[0], executablePath(path.join(cacheDir, `zoek-rs${exeSuffix}`)));
       const cargoTargetDir = runtime.getSharedCargoTargetDir();
       if (runtime.context.extensionMode === vscode.ExtensionMode.Production) {
         assert.strictEqual(
@@ -848,11 +849,11 @@ suite('Activation', () => {
       }
       assert.strictEqual(
         candidates[1],
-        path.join(runtime.extensionRoot, 'resources', 'bin', platformKey, `zoek-rs${exeSuffix}`),
+        executablePath(path.join(runtime.extensionRoot, 'resources', 'bin', platformKey, `zoek-rs${exeSuffix}`)),
       );
       assert.strictEqual(
         candidates[2],
-        path.join(runtime.extensionRoot, 'target', 'release', `zoek-rs${exeSuffix}`),
+        executablePath(path.join(runtime.extensionRoot, 'target', 'release', `zoek-rs${exeSuffix}`)),
       );
     } finally {
       runtime.getRustSourceFingerprint = originalFingerprint;
