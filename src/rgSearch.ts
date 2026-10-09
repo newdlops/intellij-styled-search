@@ -3,6 +3,7 @@ import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import { canPassSearchCandidates } from './platform/commandLine';
 import { bundledRipgrepCandidates } from './platform/bundledRipgrep';
+import { executablePath } from './platform/executablePath';
 import { literalSearchRegexSource } from './literalSearch';
 import * as fs from 'fs';
 import * as https from 'https';
@@ -254,12 +255,13 @@ export function findRipgrepPath(): string | null {
   const envPath = process.env.INTELLIJ_STYLED_SEARCH_RG_PATH;
   if (envPath) {
     try {
-      if (fs.existsSync(envPath)) { cachedRgPath = envPath; return envPath; }
+      if (fs.existsSync(envPath)) { cachedRgPath = executablePath(envPath); return cachedRgPath; }
     } catch {}
   }
   const installed = findInstalledRipgrepPath();
-  if (installed) { cachedRgPath = installed; return installed; }
-  const candidates: string[] = [];
+  if (installed) { cachedRgPath = executablePath(installed); return cachedRgPath; }
+  // appRoot includes the active version directory in Windows update layouts.
+  const candidates = vscode.env.appRoot ? bundledRipgrepCandidates(vscode.env.appRoot) : [];
   // process.execPath points at the Electron binary; rg lives alongside the
   // app's node_modules. Walk up from execPath to find the Resources/app dir.
   const execPath = process.execPath;
@@ -278,7 +280,7 @@ export function findRipgrepPath(): string | null {
   candidates.push(...bundledRipgrepCandidates('/usr/share/code-insiders/resources/app'));
   for (const p of candidates) {
     try {
-      if (fs.existsSync(p)) { cachedRgPath = p; return p; }
+      if (fs.existsSync(p)) { cachedRgPath = executablePath(p); return cachedRgPath; }
     } catch {}
   }
   cachedRgPath = null;
