@@ -7,6 +7,11 @@ import { canPassSearchCandidates } from '../../platform/commandLine';
 import { windowsCommandLineLength, fitsWindowsCommandLine, WINDOWS_COMMAND_LINE_LIMIT } from '../../platform/windows/commandLine';
 import { windowsFileUri } from '../../platform/windows/fileUri';
 import { graphStorageVersions } from '../../platform/graphStorage';
+import { executablePath } from '../../platform/executablePath';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { execFile } from 'node:child_process';
 import { parseWindowsTestIdentity } from '../support/windowsIdentity';
 
 const host = {
@@ -15,6 +20,32 @@ const host = {
   appRoot: "C:\\Portable Tools\\사용자's Workbench\\resources\\app",
   ppid: 220,
 };
+
+test('Windows executable paths retain long drive and UNC locations', () => {
+  assert.equal(executablePath('C:\\cache\\engine.exe', 'win32'), '\\\\?\\C:\\cache\\engine.exe');
+  assert.equal(executablePath('\\\\server\\share\\engine.exe', 'win32'), '\\\\?\\UNC\\server\\share\\engine.exe');
+  assert.equal(executablePath('node', 'win32'), 'node');
+  assert.equal(executablePath('/tmp/engine', 'darwin'), '/tmp/engine');
+});
+
+test('Windows launches an executable from a Unicode path beyond MAX_PATH', { skip: process.platform !== 'win32' }, async () => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'native-launch-'));
+  const nested = path.join(root, ...Array.from({ length: 8 }, (_, i) => `directory-${i}-한글-${'x'.repeat(24)}`));
+  const binary = path.join(nested, 'node.exe');
+  assert.ok(binary.length > 260);
+  try {
+    await fs.promises.mkdir(executablePath(nested), { recursive: true });
+    await fs.promises.copyFile(process.execPath, executablePath(binary));
+    const output = await new Promise<string>((resolve, reject) => {
+      const child = execFile(executablePath(binary), ['-p', '42'], { windowsHide: true, timeout: 10000 },
+        (error, stdout) => error ? reject(error) : resolve(stdout.trim()));
+      child.stdin?.end();
+    });
+    assert.equal(output, '42');
+  } finally {
+    await fs.promises.rm(executablePath(root), { recursive: true, force: true });
+  }
+});
 
 function proc(pid: number, ppid: number, args = '', execPath = host.execPath): ElectronProcess {
   return { pid, ppid, execPath, cmd: `"${execPath}" ${args}`.trim() };

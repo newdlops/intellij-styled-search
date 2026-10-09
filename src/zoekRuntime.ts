@@ -8,6 +8,7 @@ import {
   toRipgrepGlobs,
 } from './pathScope';
 import { findRipgrepPath } from './rgSearch';
+import { executablePath } from './platform/executablePath';
 import {
   IndexingMemoryProtection,
   type IndexingMemoryPressureError,
@@ -2204,7 +2205,7 @@ export class ZoektRuntime implements vscode.Disposable {
       path.join(this.extensionRoot, 'target', 'release', `${baseName}${exeSuffix}`),
       path.join(this.extensionRoot, 'target', 'debug', `${baseName}${exeSuffix}`),
     );
-    return candidates;
+    return candidates.map((candidate) => executablePath(candidate));
   }
 
   private getBinaryPlatformKey(): string {
@@ -2506,7 +2507,7 @@ export class ZoektRuntime implements vscode.Disposable {
   }
 
   private isUnstampedCheckoutBuildCandidate(candidate: string): boolean {
-    const relative = path.relative(path.join(this.extensionRoot, 'target'), candidate);
+    const relative = path.relative(executablePath(path.join(this.extensionRoot, 'target')), candidate);
     return !!relative && !relative.startsWith('..') && !path.isAbsolute(relative);
   }
 

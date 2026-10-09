@@ -72,12 +72,11 @@ suite('Search history discovery', () => {
     control = api.overlay as any;
     const storage = control.context.globalState;
     originalStorageUpdate = storage.update;
+    let storageQueue = Promise.resolve();
     storage.update = function (storageKey: string, value: unknown) {
-      if (JSON.stringify(this.get(storageKey)) === JSON.stringify(value)) {
-        return Promise.resolve();
-      }
       const owner = this;
-      const task = (async () => {
+      const task = storageQueue.then(async () => {
+      if (JSON.stringify(owner.get(storageKey)) === JSON.stringify(value)) { return; }
       // Global Memento updates also return through onDidChangeStorage. Wait for
       // that real storage echo before a later fixture can replace the value.
       // https://github.com/microsoft/vscode/blob/main/src/vs/workbench/api/common/extHostMemento.ts
@@ -98,7 +97,8 @@ suite('Search history discovery', () => {
         listener.dispose();
         if (timeout) { clearTimeout(timeout); }
       }
-      })();
+      });
+      storageQueue = task.catch(() => {});
       // A Memento echo replaces the complete object, including history. Wait
       // for other keys' writes too before installing the next fixture.
       historyTasks.add(task);

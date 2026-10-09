@@ -7,6 +7,7 @@
 - Retained return annotations from unchanged imported providers while resolving edited consumers.
 - Invalidated older graph/count overlays once to rebuild them with the corrected selection rules.
 - Restricted TypeScript compilation to the source directory so generated benchmark trees cannot enter the extension build.
+- Preserved Windows extended-length executable paths for native runtimes cached under long profile directories.
 
 ## 0.1.7161 - 2026-10-09
 
