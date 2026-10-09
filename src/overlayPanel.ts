@@ -33,6 +33,7 @@ import type { ZoektInfoResponse } from './zoekProtocol';
 import { getElectronMainProcessPlatform, findAncestorElectronMainProcess, type ElectronProcess } from './electronMainProcess';
 import { isIndexingMemoryPressureError } from './internal/indexingMemoryProtection';
 import { SearchScopeState } from './internal/searchScopeState';
+import { retainAwaitedCdpExpression } from './internal/retainedCdpExpression';
 
 type RendererEvent =
   | { type: 'search'; options: SearchOptions; recordHistory?: boolean }
@@ -3546,7 +3547,7 @@ export class OverlayPanel {
       })()
     `.trim();
     const resp = await this.send('Runtime.evaluate', {
-        expression: script,
+        expression: retainAwaitedCdpExpression(script, timeoutMs),
         awaitPromise: true,
         returnByValue: true,
         includeCommandLineAPI: true,

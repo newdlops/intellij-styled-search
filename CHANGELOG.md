@@ -9,6 +9,7 @@
 - Restricted TypeScript compilation to the source directory so generated benchmark trees cannot enter the extension build.
 - Preserved Windows extended-length executable paths for native runtimes cached under long profile directories.
 - Isolated incremental spill files per operation so concurrent workspace updates cannot overwrite or remove each other's temporary files.
+- Kept awaited debugger evaluations alive until completion so garbage collection cannot interrupt renderer queries during startup or restart.
 
 ## 0.1.7161 - 2026-10-09
 
