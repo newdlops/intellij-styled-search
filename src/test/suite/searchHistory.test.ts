@@ -9,7 +9,10 @@ let api: ExtensionTestApi;
 let control: any;
 let savedHistory: unknown;
 let savedLimit: unknown;
+let savedScopeHistory: string[];
+let savedScope: string;
 let windowId: number;
+let executedSearches = 0;
 const historyTasks = new Set<Promise<unknown>>();
 const originalHistoryMethods = new Map<string, (...args: any[]) => unknown>();
 let originalStorageUpdate: (key: string, value: unknown) => Promise<void>;
@@ -47,6 +50,16 @@ async function setDraft(value: string, start=value.length, end=start) {
   await renderer(`var input=panel.querySelector('.ij-find-query');input.value=${JSON.stringify(value)};
     input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();input.setSelectionRange(${start},${end});return true;`);
 }
+async function setScope(value: string, start=value.length, end=start) {
+  await renderer(`var input=panel.querySelector('.ij-find-scope');input.value=${JSON.stringify(value)};
+    input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();input.setSelectionRange(${start},${end});return true;`);
+}
+async function seedScopes(values: string[]) {
+  await control.filesScopeHistoryState.trim(0);
+  for (const value of [...values].reverse()) { await control.recordFilesScopeHistory(value); }
+  await control.postSearchHistoryToRenderer();
+  await waitForQuery(value => JSON.stringify(value.state.scopeHistory) === JSON.stringify(values));
+}
 async function pressQueryKey(keyCode: string) {
   await main(`(function(){var win=require('electron').BrowserWindow.fromId(${windowId});win.focus();var wc=win.webContents;
     wc.focus();wc.sendInputEvent({type:'keyDown',keyCode:${JSON.stringify(keyCode)}});
@@ -70,6 +83,8 @@ suite('Search history discovery', () => {
     assert.ok(ext);
     api = await ext!.activate();
     control = api.overlay as any;
+    await api.overlay.rebuildIndex();
+    await api.overlay.waitForIndexReady();
     const storage = control.context.globalState;
     originalStorageUpdate = storage.update;
     let storageQueue = Promise.resolve();
@@ -105,7 +120,7 @@ suite('Search history discovery', () => {
       void task.then(() => historyTasks.delete(task), () => historyTasks.delete(task));
       return task;
     };
-    for (const name of ['recordSearchHistory', 'trimSearchHistoryToLimit', 'postSearchHistoryToRenderer']) {
+    for (const name of ['recordSearchHistory', 'recordFilesScopeHistory', 'trimSearchHistoryToLimit', 'postSearchHistoryToRenderer']) {
       const original = control[name];
       originalHistoryMethods.set(name, original);
       control[name] = function (...args: any[]) {
@@ -116,6 +131,11 @@ suite('Search history discovery', () => {
       };
     }
     savedHistory = control.context.globalState.get(key);
+    const originalRunSearch = control.runSearch;
+    originalHistoryMethods.set('runSearch', originalRunSearch);
+    control.runSearch = function (...args: any[]) { executedSearches++; return originalRunSearch.apply(this, args); };
+    savedScopeHistory = control.filesScopeHistoryState.read(1000);
+    savedScope = control.filesScopeState.initialValue();
     savedLimit = vscode.workspace.getConfiguration('intellijStyledSearch').inspect('searchHistoryLimit')?.workspaceValue;
     await vscode.workspace.getConfiguration('intellijStyledSearch').update('searchHistoryLimit', 100, vscode.ConfigurationTarget.Workspace);
     const folder = vscode.workspace.workspaceFolders?.[0];
@@ -131,6 +151,9 @@ suite('Search history discovery', () => {
       await vscode.workspace.getConfiguration('intellijStyledSearch').update('searchHistoryLimit', savedLimit, vscode.ConfigurationTarget.Workspace);
       while (historyTasks.size > 0) { await Promise.allSettled([...historyTasks]); }
       await control.context.globalState.update(key, savedHistory);
+      await control.filesScopeHistoryState.trim(0);
+      for (const value of [...savedScopeHistory].reverse()) { await control.filesScopeHistoryState.record(value, 1000); }
+      await control.filesScopeState.save(savedScope);
       await control.postSearchHistoryToRenderer();
     } finally {
       if (originalStorageUpdate) { control.context.globalState.update = originalStorageUpdate; }
@@ -140,6 +163,8 @@ suite('Search history discovery', () => {
   });
   setup(async () => {
     await renderer("var menu=panel.querySelector('.ij-find-history-menu');if(menu.classList.contains('open'))panel.querySelector('.ij-find-history').click();return true;");
+    await renderer("var menu=panel.querySelector('.ij-find-scope-history-menu');if(menu.classList.contains('open'))panel.querySelector('.ij-find-scope-history').click();return true;");
+    await control.filesScopeHistoryState.trim(0);
     await seed(entries);
   });
 
@@ -347,6 +372,98 @@ suite('Search history discovery', () => {
       await main(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.sendCommand('Emulation.clearDeviceMetricsOverride')`);
       if(owns) await main(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.detach()`);
     }
+  });
+
+  test('records executed Ant scopes with MRU deduplication and restores only the Files input', async () => {
+    const expression = 'nested/**, !**/*.test.js';
+    const beforeExecutions = executedSearches;
+    await setDraft('function');
+    await setScope(expression);
+    assert.deepEqual((await queryState()).state.scopeHistory, [], 'typing is a draft');
+    await pressQueryKey('Enter');
+    await waitForQuery(value => value.state.scopeHistory[0] === expression);
+    await setScope('**/*.js');
+    await pressQueryKey('Enter');
+    await waitForQuery(value => value.state.scopeHistory[0] === '**/*.js');
+    await setScope(expression);
+    await pressQueryKey('Enter');
+    await waitForQuery(value => JSON.stringify(value.state.scopeHistory) === JSON.stringify([expression, '**/*.js']));
+    assert.equal(executedSearches - beforeExecutions, 3, 'each Enter runs exactly one search');
+    await setDraft('unexecuted query');
+    const before = (await queryState()).state;
+    await renderer("panel.querySelector('.ij-find-scope-history').click();return true;");
+    await main(`require('electron').BrowserWindow.fromId(${windowId}).webContents.insertText('nested')`);
+    await pressQueryKey('Down');
+    await pressQueryKey('Enter');
+    const after = await renderer("return {value:panel.querySelector('.ij-find-scope').value,focused:document.activeElement===panel.querySelector('.ij-find-scope'),state:window.__ijFindGetSearchState()};");
+    assert.equal(after.value, expression);
+    assert.equal(after.focused, true);
+    assert.equal(after.state.inputValue, 'unexecuted query');
+    assert.equal(after.state.searchId, before.searchId);
+    assert.equal(after.state.rgQuery, before.rgQuery, 'selection cannot execute the draft');
+    assert.equal(after.state.rgScope, before.rgScope);
+  });
+
+  test('Ant recall restores the draft selection and respects edits and modifier keys', async () => {
+    await seedScopes(['**/*.{ts,tsx}, !**/*.spec.ts', 'src/**']);
+    await setScope('draft/**', 2, 2);
+    const before = (await queryState()).state;
+    await pressQueryKey('Up');
+    await renderer("return true;");
+    assert.equal(await renderer("return panel.querySelector('.ij-find-scope').value;"), '**/*.{ts,tsx}, !**/*.spec.ts');
+    await pressQueryKey('Up');
+    assert.equal(await renderer("return panel.querySelector('.ij-find-scope').value;"), 'src/**');
+    await pressQueryKey('Down');
+    await pressQueryKey('Down');
+    const draft = await renderer("var input=panel.querySelector('.ij-find-scope');return {value:input.value,start:input.selectionStart,end:input.selectionEnd,state:window.__ijFindGetSearchState()};");
+    assert.deepEqual([draft.value, draft.start, draft.end], ['draft/**', 2, 2]);
+    assert.equal(draft.state.searchId, before.searchId);
+    await setScope('selected/**', 0, 3);
+    await pressQueryKey('Up');
+    assert.equal(await renderer("return panel.querySelector('.ij-find-scope').value;"), 'selected/**');
+    await setScope('edited/**');
+    await pressQueryKey('Up');
+    await setScope('changed/**');
+    await pressQueryKey('Up');
+    await pressQueryKey('Down');
+    assert.equal(await renderer("return panel.querySelector('.ij-find-scope').value;"), 'changed/**');
+  });
+
+  test('renders Ant history with long, filtered, empty and disabled states at three viewport sizes', async function () {
+    this.timeout(30_000);
+    const long = 'src/' + 'nested-segment/'.repeat(30) + '**/*.{ts,tsx}, !**/*.spec.ts';
+    await seedScopes(['src/**', '**/*.py', long]);
+    const output = path.resolve(__dirname, '../../../artifacts/history-ux');
+    await fs.promises.mkdir(output, { recursive: true });
+    const owns = await main(`(function(){var api=require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger;if(api.isAttached())return false;api.attach('1.3');return true;})()`);
+    try {
+      for (const [width, height] of [[1440,900], [768,1024], [390,844]]) {
+        await main(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.sendCommand('Emulation.setDeviceMetricsOverride',{width:${width},height:${height},screenWidth:${width},screenHeight:${height},deviceScaleFactor:1,mobile:false})`);
+        for (const [label, filter] of [['dense',''], ['filtered','nested-segment'], ['empty','unknown-never-found']]) {
+          await renderer(`var menu=panel.querySelector('.ij-find-scope-history-menu');if(!menu.classList.contains('open'))panel.querySelector('.ij-find-scope-history').click();var input=menu.querySelector('.ij-find-history-filter');input.value=${JSON.stringify(filter)};input.dispatchEvent(new Event('input',{bubbles:true}));return true;`);
+          await control.evalInWindow(windowId, "new Promise(function(r){requestAnimationFrame(function(){requestAnimationFrame(function(){r('ready');});});})");
+          const bounds = await renderer("var menu=panel.querySelector('.ij-find-scope-history-menu');var r=menu.getBoundingClientRect();return {left:r.left,top:r.top,right:r.right,bottom:r.bottom,count:menu.querySelectorAll('.ij-find-history-item').length,overflow:menu.scrollWidth>menu.clientWidth};");
+          const data = await main(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.sendCommand('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:{x:0,y:0,width:${width},height:${height},scale:1}}).then(function(v){return v.data;})`);
+          await fs.promises.writeFile(path.join(output, `scope-${label}-${width}x${height}.png`), Buffer.from(data,'base64'));
+          assert.ok(bounds.left >= 0 && bounds.right <= width && bounds.top >= 0 && bounds.bottom <= height, JSON.stringify(bounds));
+          assert.equal(bounds.overflow, false);
+          assert.equal(bounds.count, label === 'dense' ? 3 : label === 'filtered' ? 1 : 0);
+        }
+      }
+    } finally {
+      await main(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.sendCommand('Emulation.clearDeviceMetricsOverride')`);
+      if (owns) { await main(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.detach()`); }
+    }
+    await seedScopes([]);
+    await renderer("var button=panel.querySelector('.ij-find-scope-history');if(panel.querySelector('.ij-find-scope-history-menu').classList.contains('open'))button.click();button.click();return true;");
+    assert.match(await renderer("return panel.querySelector('.ij-find-scope-history-menu .ij-find-history-empty').textContent;"), /No patterns yet/);
+    const cfg = vscode.workspace.getConfiguration('intellijStyledSearch');
+    try {
+      await cfg.update('searchHistoryLimit', 0, vscode.ConfigurationTarget.Workspace);
+      await control.postSearchHistoryToRenderer();
+      const disabled = await renderer("var button=panel.querySelector('.ij-find-scope-history');button.click();return {disabled:button.disabled,title:button.title,open:panel.querySelector('.ij-find-scope-history-menu').classList.contains('open')};");
+      assert.equal(disabled.disabled, true); assert.equal(disabled.open, false); assert.match(disabled.title, /searchHistoryLimit = 0/);
+    } finally { await cfg.update('searchHistoryLimit', 100, vscode.ConfigurationTarget.Workspace); }
   });
 
   test('disabled history explains the setting and cannot open', async () => {

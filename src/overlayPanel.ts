@@ -32,11 +32,11 @@ import { ZoektRuntime, type ZoektFreshnessStatus } from './zoekRuntime';
 import type { ZoektInfoResponse } from './zoekProtocol';
 import { getElectronMainProcessPlatform, findAncestorElectronMainProcess, type ElectronProcess } from './electronMainProcess';
 import { isIndexingMemoryPressureError } from './internal/indexingMemoryProtection';
-import { SearchScopeState } from './internal/searchScopeState';
+import { SearchScopeState, SearchScopeHistoryState } from './internal/searchScopeState';
 import { retainAwaitedCdpExpression } from './internal/retainedCdpExpression';
 
 type RendererEvent =
-  | { type: 'search'; options: SearchOptions; recordHistory?: boolean }
+  | { type: 'search'; options: SearchOptions; recordHistory?: boolean; filesScope?: string }
   | { type: 'filesScopeChanged'; value: string }
   | { type: 'loadMore' }
   | { type: 'cancel' }
@@ -188,7 +188,7 @@ type OverlayMessage =
       refining?: boolean;
     }
   | { type: 'results:error'; searchId: number; message: string }
-  | { type: 'history:update'; entries: string[]; limit: number }
+  | { type: 'history:update'; entries: string[]; scopeEntries: string[]; limit: number }
   | {
       type: 'preview';
       uri: string;
@@ -496,6 +496,8 @@ function buildPreviewPayload(
 
 export class OverlayPanel {
   private readonly filesScopeState: SearchScopeState;
+  private readonly filesScopeHistoryState: SearchScopeHistoryState;
+  private filesScopeHistorySaveWarningShown = false;
   private filesScopeSaveWarningShown = false;
   private static instance: OverlayPanel | undefined;
   private ws: WebSocket | undefined;
@@ -807,6 +809,7 @@ export class OverlayPanel {
   private constructor(private readonly context: vscode.ExtensionContext) {
     this.filesScopeState = new SearchScopeState(context.workspaceState,
       () => vscode.workspace.getConfiguration('intellijStyledSearch').get<unknown>('defaultFilesScope', ''));
+    this.filesScopeHistoryState = new SearchScopeHistoryState(context.workspaceState);
     const rawLog = vscode.window.createOutputChannel('IntelliJ Styled Search');
     const version = (context.extension?.packageJSON?.version as string | undefined) ?? 'unknown';
     this.log = wrapLogWithPrefix(rawLog, version);
@@ -911,7 +914,7 @@ export class OverlayPanel {
     return out;
   }
 
-  private async recordSearchHistory(query: string): Promise<void> {
+  private async recordSearchHistory(query: string, filesScope?: string): Promise<void> {
     const limit = this.getConfiguredSearchHistoryLimit();
     if (limit <= 0 || query.length === 0) {
       await this.postSearchHistoryToRenderer();
@@ -920,13 +923,30 @@ export class OverlayPanel {
     const history = this.readSearchHistory(HARD_SEARCH_HISTORY_LIMIT)
       .filter((item) => item !== query);
     history.unshift(query);
-    await this.context.globalState.update(SEARCH_HISTORY_KEY, history.slice(0, limit));
+    const scopeWrite = typeof filesScope === 'string' && filesScope.trim()
+      ? this.recordFilesScopeHistory(filesScope, false) : Promise.resolve();
+    await Promise.all([this.context.globalState.update(SEARCH_HISTORY_KEY, history.slice(0, limit)), scopeWrite]);
     await this.postSearchHistoryToRenderer();
+  }
+
+  private async recordFilesScopeHistory(value: string, publish = true): Promise<void> {
+    try {
+      await this.filesScopeHistoryState.record(value, this.getConfiguredSearchHistoryLimit());
+      this.filesScopeHistorySaveWarningShown = false;
+    } catch (error) {
+      this.log.appendLine(`Files scope history save failed: ${error instanceof Error ? error.message : error}`);
+      if (!this.filesScopeHistorySaveWarningShown) {
+        this.filesScopeHistorySaveWarningShown = true;
+        void vscode.window.showWarningMessage('Files scope history could not be saved. Recent patterns remain available in this session.');
+      }
+    }
+    if (publish) { await this.postSearchHistoryToRenderer(); }
   }
 
   private async trimSearchHistoryToLimit(): Promise<void> {
     const limit = this.getConfiguredSearchHistoryLimit();
     await this.context.globalState.update(SEARCH_HISTORY_KEY, this.readSearchHistory(limit));
+    await this.filesScopeHistoryState.trim(limit);
   }
 
   private async postSearchHistoryToRenderer(): Promise<void> {
@@ -934,6 +954,7 @@ export class OverlayPanel {
     await this.postToRenderer({
       type: 'history:update',
       entries: this.readSearchHistory(),
+      scopeEntries: this.filesScopeHistoryState.read(this.getConfiguredSearchHistoryLimit()),
       limit: this.getConfiguredSearchHistoryLimit(),
     });
   }
@@ -4537,7 +4558,7 @@ export class OverlayPanel {
           this.activeWindowId = evt.__win;
         }
         if (evt.recordHistory) {
-          void this.recordSearchHistory(evt.options.query).catch((err) => {
+          void this.recordSearchHistory(evt.options.query, evt.filesScope).catch((err) => {
             this.log.appendLine(`record search history failed: ${err instanceof Error ? err.message : err}`);
           });
         }

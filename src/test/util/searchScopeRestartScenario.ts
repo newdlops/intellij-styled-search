@@ -49,6 +49,13 @@ export async function runScopeRestartScenario(): Promise<void> {
     const initial = stage === 'write' ? '**/*.js' : stage === 'isolation-clear' ? '**/*.md'
       : stage === 'restore-empty' ? '' : remembered;
     assert.equal((await rendererState()).scope, initial, 'scope must be restored before the first search');
+    const initialHistory = stage === 'write' || stage === 'isolation-clear' || stage === 'restore-empty' ? [] : [remembered];
+    await control.postSearchHistoryToRenderer();
+    const initialHistoryDeadline = Date.now() + 5000;
+    while (JSON.stringify((await rendererState()).searchState.scopeHistory) !== JSON.stringify(initialHistory)
+        && Date.now() < initialHistoryDeadline) { await new Promise(resolve => setTimeout(resolve, 20)); }
+    assert.deepEqual((await rendererState()).searchState.scopeHistory, initialHistory,
+      'Ant history must survive normal restarts and remain isolated by workspace');
 
     async function editScope(value: string) {
       await inRenderer(`(function(){var input=(${activeRoot}).querySelector('.ij-find-scope');
@@ -100,6 +107,12 @@ export async function runScopeRestartScenario(): Promise<void> {
     }
     assert.deepEqual(actual, expectedFiles, 'the restored scope must constrain a real search: ' + JSON.stringify(await rendererState()));
     assert.equal((await rendererState()).scope, expectedScope);
+    const expectedHistory = expectedScope ? [expectedScope] : [];
+    const historyDeadline = Date.now() + 5000;
+    while (JSON.stringify((await rendererState()).searchState.scopeHistory) !== JSON.stringify(expectedHistory)
+        && Date.now() < historyDeadline) { await new Promise(resolve => setTimeout(resolve, 20)); }
+    assert.deepEqual((await rendererState()).searchState.scopeHistory, expectedHistory);
+    await control.filesScopeHistoryState.whenSaved();
     const output = process.env.IJSS_SCOPE_ARTIFACTS!;
     fs.mkdirSync(output, { recursive: true });
     if (stage === 'restore' || stage === 'restore-empty') {

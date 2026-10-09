@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.7162",
+  "version": "0.1.7163",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -304,7 +304,7 @@
         "intellijStyledSearch.searchHistoryLimit": {
           "type": "number",
           "default": 100,
-          "description": "Maximum number of executed search queries to keep in the search history dropdown. Set to 0 to disable storing search history."
+          "description": "Maximum number of executed search queries and Files scope patterns to keep in each history dropdown. Files scope history is stored per workspace. Set to 0 to disable storing history."
         },
         "intellijStyledSearch.defaultFilesScope": {
           "type": "string",

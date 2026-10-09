@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.7163 - 2026-10-09
+
+- Added workspace-owned History for Files scope Ant patterns, preserving complete folder/file-type and exclusion combinations, with filtering, keyboard recall and draft restoration.
+- Limited declaration-change propagation to matching named imports and conservative namespace/wildcard dependencies; chained edits compare against live overlay declarations.
+- Indexed import impact by provider and binding name, loading binding/type/return evidence only for affected files and reachable providers. Older indexes retain the complete-facts fallback.
+- Updated count contributions and materialized usages for each edit batch while retaining valid overrides from earlier edits, including removed and zero-count usages.
+- Skipped usage candidate keys whose occurrence identities and declaration cardinalities are unchanged.
+- Parallelized full-build usage counting with up to four workers, bounded byte caches and shared immutable file metadata, preserving the query union's deduplication rules.
+
 ## 0.1.7162 - 2026-10-09
 
 - Counted reference occurrence identities directly, grouped live candidates by key and reused the immutable file table for inheritance lookups during usage indexing.

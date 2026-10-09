@@ -92,72 +92,130 @@ pub(super) fn overlay_candidates(
     out
 }
 
-/// Bound peak memory by processing one target shard at a time. This uses the
+/// Bound peak memory by processing one target shard per worker. This uses the
 /// reference implementation of the query union, rather than a second set of
 /// candidate/deduplication rules that can diverge from the panel.
 pub(super) fn build(workspace: &Path, config: &EngineConfig) -> io::Result<()> {
+    build_with_workers(workspace, config, count_worker_count())
+}
+
+fn count_worker_count() -> usize {
+    let requested = std::env::var("ZOEK_COUNT_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(4);
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let memory_workers = std::env::var("ZOEK_MEMORY_CAP_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map_or(4, |bytes| (bytes / (256 * 1024 * 1024)).max(1));
+    requested
+        .min(4)
+        .min(cpus)
+        .min(memory_workers)
+        .min(graph_worker_count(GRAPH_SHARD_COUNT))
+}
+
+fn build_with_workers(workspace: &Path, config: &EngineConfig, workers: usize) -> io::Result<()> {
     let built_at = read_built_at_unix_ms(&graph_manifest_path(workspace, config))?;
     let generation = base_generation(workspace, config, built_at)?;
     let files = read_file_table_binary(&graph_file_table_path(workspace, config))?;
     let empty_overlay = GraphOverlay::new(built_at);
-    let mut member_families = HashMap::default();
     let graph_available = graph_index_available(workspace, config);
-    let mut context = ReferenceCountReadContext {
-        file_table: &files,
-        sharded_references: graph_shard_family_available(
-            workspace, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
-        ),
-        shard_cache: Some(CountShardCache::new(
-            if std::env::var("ZOEK_DISABLE_COUNT_SHARD_CACHE").is_ok() { 0 } else { 32 * 1024 * 1024 },
-        )),
-    };
-    for shard in 0..GRAPH_SHARD_COUNT {
-        let symbol_path = graph_shard_path(workspace, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
-        let symbols = if symbol_path.exists() {
-            read_symbols(&symbol_path, &files)?
-        } else {
-            Vec::new()
-        };
-        let ids: HashSet<String> = symbols.iter().map(|symbol| symbol.id.clone()).collect();
-        let counts = if graph_available {
-            deduped_reference_counts_with_context(
-                workspace, config, &ids, &symbols, &empty_overlay, &mut member_families, &mut context,
-            )?
-        } else {
-            HashMap::default()
-        };
-        bound_member_families(&mut member_families);
-        let mut rows: Vec<(u64, u64)> = symbols
-            .iter()
-            .filter_map(|symbol| {
-                parse_stable_symbol_id_to_u64(&symbol.id).map(|id| {
-                    (
-                        id,
-                        counts
-                            .get(&symbol.id.to_ascii_lowercase())
-                            .copied()
-                            .unwrap_or(0) as u64,
-                    )
-                })
-            })
-            .collect();
-        rows.sort_unstable_by_key(|row| row.0);
-        let mut bytes = Vec::with_capacity(16 + rows.len() * 16);
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&generation.to_le_bytes());
-        for (id, count) in rows {
-            bytes.extend_from_slice(&id.to_le_bytes());
-            bytes.extend_from_slice(&count.to_le_bytes());
+    let sharded_references =
+        graph_shard_family_available(workspace, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX);
+    let next_shard = std::sync::atomic::AtomicUsize::new(0);
+    let stats = std::thread::scope(|scope| -> io::Result<Vec<(usize, usize)>> {
+        let mut handles = Vec::new();
+        for _ in 0..workers.max(1).min(GRAPH_SHARD_COUNT) {
+            let files = &files;
+            let empty_overlay = &empty_overlay;
+            let next_shard = &next_shard;
+            handles.push(scope.spawn(move || -> io::Result<(usize, usize)> {
+                let mut member_families = HashMap::default();
+                let mut context = ReferenceCountReadContext {
+                    file_table: &files,
+                    sharded_references,
+                    shard_cache: Some(CountShardCache::new(
+                        if std::env::var("ZOEK_DISABLE_COUNT_SHARD_CACHE").is_ok() {
+                            0
+                        } else {
+                            32 * 1024 * 1024
+                        },
+                    )),
+                };
+                loop {
+                    let shard = next_shard.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if shard >= GRAPH_SHARD_COUNT {
+                        break;
+                    }
+                    let symbol_path =
+                        graph_shard_path(workspace, config, GRAPH_SYMBOL_ID_SHARD_PREFIX, shard);
+                    let symbols = if symbol_path.exists() {
+                        read_symbols(&symbol_path, &files)?
+                    } else {
+                        Vec::new()
+                    };
+                    let ids: HashSet<String> =
+                        symbols.iter().map(|symbol| symbol.id.clone()).collect();
+                    let counts = if graph_available {
+                        deduped_reference_counts_with_context(
+                            workspace,
+                            config,
+                            &ids,
+                            &symbols,
+                            empty_overlay,
+                            &mut member_families,
+                            &mut context,
+                        )?
+                    } else {
+                        HashMap::default()
+                    };
+                    bound_member_families(&mut member_families);
+                    let mut rows: Vec<(u64, u64)> = symbols
+                        .iter()
+                        .filter_map(|symbol| {
+                            parse_stable_symbol_id_to_u64(&symbol.id).map(|id| {
+                                (
+                                    id,
+                                    counts
+                                        .get(&symbol.id.to_ascii_lowercase())
+                                        .copied()
+                                        .unwrap_or(0) as u64,
+                                )
+                            })
+                        })
+                        .collect();
+                    rows.sort_unstable_by_key(|row| row.0);
+                    let mut bytes = Vec::with_capacity(16 + rows.len() * 16);
+                    bytes.extend_from_slice(MAGIC);
+                    bytes.extend_from_slice(&generation.to_le_bytes());
+                    for (id, count) in rows {
+                        bytes.extend_from_slice(&id.to_le_bytes());
+                        bytes.extend_from_slice(&count.to_le_bytes());
+                    }
+                    write_atomically(
+                        &graph_shard_path(workspace, config, SHARD_PREFIX, shard),
+                        &bytes,
+                    )?;
+                }
+                Ok(context
+                    .shard_cache
+                    .as_ref()
+                    .map_or((0, 0), |cache| (cache.reads, cache.hits)))
+            }));
         }
-        write_atomically(
-            &graph_shard_path(workspace, config, SHARD_PREFIX, shard),
-            &bytes,
-        )?;
-    }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("usage count worker panicked"))
+            .collect()
+    })?;
     if std::env::var("ZOEK_WRITE_PROBE").is_ok() {
-        if let Some(cache) = context.shard_cache.as_ref() {
-            eprintln!("[counts] token-shape shard reads={} cache_hits={}", cache.reads, cache.hits);
-        }
+        let (reads, hits) = stats
+            .into_iter()
+            .fold((0, 0), |(reads, hits), (r, h)| (reads + r, hits + h));
+        eprintln!("[counts] workers={workers} token-shape shard reads={reads} cache_hits={hits}");
     }
     Ok(())
 }
@@ -231,65 +289,140 @@ pub(super) fn update_overlay(
     workspace: &Path,
     config: &EngineConfig,
     compact: &[CompactSym],
+    changed: &HashSet<String>,
+    previous: &BTreeMap<String, crate::graph_overlay::GraphOverlayEntry>,
+    table: &FileTable,
+    contribution_changes: &BTreeMap<u64, [i64; 4]>,
     overlay: &mut GraphOverlay,
 ) -> io::Result<()> {
-    let mut ids: HashSet<String> = overlay
-        .usage_counts
+    let mut ids: HashSet<String> = contribution_changes
         .keys()
         .map(|id| format!("sym:{id:016x}"))
         .collect();
-    ids.extend(
-        overlay
-            .count_deltas
-            .keys()
-            .map(|id| format!("sym:{id:016x}")),
-    );
-    let mut keys: HashSet<(u64, u64, u64)> = overlay
-        .total_token_shape_target_deltas()
-        .keys()
-        .copied()
-        .collect();
-    for entry in overlay.entries.values() {
-        keys.extend(entry.token_shape_candidates.keys().copied());
+    type CandidateKey = (u64, u64, u64);
+    type Signature = (CountSourceOccurrence, u8, bool, u32, u32);
+    let signatures = |candidates: &[OverlayTokenShapeCandidate]| -> HashSet<Signature> {
+        candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    CountSourceOccurrence::from_reference(&candidate.reference),
+                    candidate.access_kind_id,
+                    candidate.is_definition,
+                    candidate.reference.start_line,
+                    candidate.reference.start_column,
+                )
+            })
+            .collect()
+    };
+    let mut keys = HashSet::new();
+    for entry in previous
+        .values()
+        .chain(changed.iter().filter_map(|path| overlay.entries.get(path)))
+    {
         ids.extend(
             entry
                 .refs
                 .iter()
                 .filter_map(|reference| reference.target_symbol_id.as_deref().map(str::to_string)),
         );
+        for symbol in &entry.symbols {
+            ids.insert(symbol.id.clone());
+        }
     }
     // Include removed candidates too: a file may now have no refs at all, or
     // formerly used a key whose eager fanout was too large to emit any rows.
-    let files: HashSet<String> = overlay.entries.keys().cloned().collect();
+    let files: HashSet<String> = changed
+        .iter()
+        .filter(|path| !previous.contains_key(*path))
+        .cloned()
+        .collect();
     let shards: HashSet<usize> = files.iter().map(|file| shard_index_for_key(file)).collect();
-    let table = read_file_table_binary(&graph_file_table_path(workspace, config))?;
     let old_sites =
-        read_ref_sites_excluding_paths(workspace, config, &HashSet::new(), &table, Some(&shards))?;
+        read_ref_sites_excluding_paths(workspace, config, &HashSet::new(), table, Some(&shards))?;
+    let mut base_keys = HashSet::new();
     for site in old_sites
         .iter()
         .filter(|site| files.contains(&*site.rel_path))
     {
-        keys.insert((
+        base_keys.insert((
             stable_hash(&site.language),
             stable_hash(source_scope_key(&site.rel_path)),
             site.name_hash,
         ));
     }
-    for symbol in compact {
-        if keys.contains(&(
-            symbol.lang_hash,
-            stable_hash(source_scope_key(&symbol.rel_path)),
-            symbol.name_hash,
-        )) {
-            ids.insert(format!("sym:{:016x}", symbol.id_u64));
+    let (bare, member) = load_token_shape_tally_for_keys(workspace, config, &base_keys, None)?;
+    let mut old_candidates: HashMap<String, HashMap<CandidateKey, HashSet<Signature>>> =
+        HashMap::new();
+    for (key, candidates) in bare.into_iter().chain(member) {
+        for candidate in candidates {
+            let path = table.get_path(candidate.file_id).unwrap_or("");
+            if files.contains(path) {
+                old_candidates
+                    .entry(path.to_string())
+                    .or_default()
+                    .entry(key)
+                    .or_default()
+                    .insert((
+                        CountSourceOccurrence::Id(candidate.source_ref_id),
+                        candidate.access_kind_id(),
+                        candidate.is_definition(),
+                        candidate.start_line,
+                        candidate.start_column,
+                    ));
+            }
         }
+    }
+    for path in changed {
+        let prior = previous.get(path);
+        let current = overlay.entries.get(path);
+        let mut old: HashMap<_, _> = if let Some(prior) = prior {
+            prior
+                .token_shape_candidates
+                .iter()
+                .map(|(&key, values)| (key, signatures(values)))
+                .collect()
+        } else {
+            old_candidates.remove(path).unwrap_or_default()
+        };
+        if let Some(current) = current {
+            for (&key, values) in &current.token_shape_candidates {
+                if old.remove(&key).unwrap_or_default() != signatures(values) {
+                    keys.insert(key);
+                }
+            }
+        }
+        keys.extend(
+            old.into_iter()
+                .filter(|(_, values)| !values.is_empty())
+                .map(|(key, _)| key),
+        );
+        let mut deltas = prior
+            .map(|entry| entry.token_shape_target_deltas.clone())
+            .unwrap_or_default();
+        if let Some(current) = current {
+            for (&key, &value) in &current.token_shape_target_deltas {
+                if deltas.remove(&key).unwrap_or_default() != value {
+                    keys.insert(key);
+                }
+            }
+        }
+        keys.extend(
+            deltas
+                .into_iter()
+                .filter(|(_, value)| *value != (0, 0))
+                .map(|(key, _)| key),
+        );
+    }
+    for symbol in compact {
+        ids.insert(format!("sym:{:016x}", symbol.id_u64));
     }
     let mut symbols = read_symbols_for_symbol_ids_indexed(workspace, config, &ids)?;
     let superseded = overlay.symbol_superseded();
     // The compact slice contains only edited files. A declaration addition can
     // invalidate the former unique target in another file with this key.
     let name_hashes: AHashSet<u64> = keys.iter().map(|key| key.2).collect();
-    for symbol in load_resolve_candidates(workspace, config, &table, &name_hashes)? {
+    for symbol in load_resolve_candidates(workspace, config, table, &name_hashes)? {
         let key = (
             stable_hash(&symbol.language),
             stable_hash(source_scope_key(&symbol.rel_path)),
@@ -315,17 +448,27 @@ pub(super) fn update_overlay(
     let mut seen = HashSet::new();
     symbols.retain(|symbol| seen.insert(symbol.id.clone()));
     let counts = deduped_reference_counts_from_index(workspace, config, &ids, &symbols, overlay)?;
-    overlay.usage_counts = ids
-        .into_iter()
-        .filter_map(|id| {
+    if std::env::var("ZOEK_FLOW_PROBE").is_ok() {
+        eprintln!(
+            "[overlay] refresh_usage targets={} keys={} changed_files={} retained_counts={}",
+            ids.len(),
+            keys.len(),
+            changed.len(),
+            overlay.usage_counts.len()
+        );
+    }
+    // Preserve absolute overrides from earlier edits. Removed references still
+    // refresh their former targets, including a zero-count override.
+    overlay
+        .usage_counts
+        .extend(ids.into_iter().filter_map(|id| {
             parse_stable_symbol_id_to_u64(&id).map(|value| {
                 (
                     value,
                     counts.get(&id.to_ascii_lowercase()).copied().unwrap_or(0),
                 )
             })
-        })
-        .collect();
+        }));
     Ok(())
 }
 
@@ -513,6 +656,110 @@ mod tests {
     }
 
     #[test]
+    fn parallel_count_shards_match_serial_query_union() {
+        let ws = Workspace::new();
+        let config = EngineConfig::default();
+        ws.consumer(512);
+        fs::write(ws.0.join("pkg/types.ts"),
+            "interface Task { run(): void; }\nclass Left implements Task { run() {} }\nclass Right implements Task { run() {} }\nfunction invoke(task: Task) { task.run(); }\n").unwrap();
+        rebuild_graph_native(&ws.0, 920, &config, 1, &mut |_| {}).unwrap();
+        build_with_workers(&ws.0, &config, 1).unwrap();
+        let serial: Vec<_> = (0..GRAPH_SHARD_COUNT).map(|shard|
+            fs::read(graph_shard_path(&ws.0, &config, SHARD_PREFIX, shard)).unwrap()).collect();
+        build_with_workers(&ws.0, &config, 4).unwrap();
+        for (shard, bytes) in serial.iter().enumerate() {
+            assert_eq!(*bytes, fs::read(graph_shard_path(&ws.0, &config, SHARD_PREFIX, shard)).unwrap());
+        }
+        for symbol in query_graph_symbols(&ws.0, "", 1000, &config).unwrap().unwrap().symbols {
+            assert_eq!(symbol.usage_count, Some(query_graph(&ws.0, &symbol.id, usize::MAX, &config).unwrap().unwrap().total_references));
+        }
+    }
+
+    #[test]
+    fn stale_import_index_falls_back_to_current_base_bindings() {
+        let ws = Workspace::new();
+        let config = EngineConfig::default();
+        rebuild_graph_native(&ws.0, 930, &config, 1, &mut |_| {}).unwrap();
+        let generation_path = config.index_root(&ws.0).join(edit_facts::GENERATION_FILE);
+        let old_generation = fs::read(&generation_path).unwrap();
+        let old_shards: Vec<_> = (0..GRAPH_SHARD_COUNT).map(|shard|
+            fs::read(graph_shard_path(&ws.0, &config, edit_facts::PREFIX, shard)).unwrap()).collect();
+        fs::write(ws.0.join("pkg/consumer.py"), "import pkg.provider as source\nsource.future()\n").unwrap();
+        rebuild_graph_native(&ws.0, 931, &config, 1, &mut |_| {}).unwrap();
+        // A previous runtime can rebuild the base without knowing this newer
+        // additive index. Its old rows must not hide a newly indexed importer.
+        fs::write(&generation_path, old_generation).unwrap();
+        for (shard, bytes) in old_shards.iter().enumerate() {
+            fs::write(graph_shard_path(&ws.0, &config, edit_facts::PREFIX, shard), bytes).unwrap();
+        }
+        let provider = ws.0.join("pkg/provider.py");
+        fs::write(&provider, "def future():\n    return 1\n").unwrap();
+        overlay_update_graph_native(&ws.0, &[provider], &[], 931, &config, 1).unwrap();
+        let target = query_graph_symbols(&ws.0, "future", 10, &config).unwrap().unwrap().symbols.remove(0);
+        assert_eq!(target.usage_count, Some(1));
+        assert_eq!(target.usage_must_count, Some(1));
+        assert_eq!(query_graph(&ws.0, &target.id, 100, &config).unwrap().unwrap().total_references, 1);
+    }
+
+    #[test]
+    fn unrelated_declaration_edits_do_not_refresh_named_importers() {
+        let ws = Workspace::new();
+        let config = EngineConfig::default();
+        let provider = ws.0.join("pkg/provider.py");
+        fs::write(&provider, "def kept():\n    return 1\n").unwrap();
+        fs::write(ws.0.join("pkg/consumer.py"),
+            "from pkg.provider import kept\ndef consume():\n    return kept()\n").unwrap();
+        fs::write(ws.0.join("pkg/outer.py"),
+            "from pkg.consumer import consume\nconsume()\n").unwrap();
+        rebuild_graph_native(&ws.0, 900, &config, 1, &mut |_| {}).unwrap();
+        for calls in [1, 2] {
+            fs::write(&provider, format!(
+                "def kept():\n    return 1\ndef added():\n    return 2\n{}", "added()\n".repeat(calls))).unwrap();
+            overlay_update_graph_native(&ws.0, &[provider.clone()], &[], 900, &config, 1).unwrap();
+            let overlay = GraphOverlay::load_valid(&ws.0, &config, 900);
+            assert_eq!(overlay.entries.keys().map(String::as_str).collect::<Vec<_>>(), ["pkg/provider.py"],
+                "an unrelated export cannot change named import bindings");
+            let added = query_graph_symbols(&ws.0, "added", 10, &config).unwrap().unwrap().symbols.remove(0);
+            assert_eq!(added.usage_count, Some(calls));
+            assert_eq!(query_graph(&ws.0, &added.id, 100, &config).unwrap().unwrap().total_references, calls);
+        }
+        fs::write(&provider, "def kept():\n    return 1\n").unwrap();
+        overlay_update_graph_native(&ws.0, &[provider], &[], 900, &config, 1).unwrap();
+        assert!(query_graph_symbols(&ws.0, "added", 10, &config).unwrap().unwrap().symbols.is_empty());
+        let live = query_graph_symbols(&ws.0, "", 1000, &config).unwrap().unwrap().symbols;
+        rebuild_graph_native(&ws.0, 901, &config, 1, &mut |_| {}).unwrap();
+        let fresh = query_graph_symbols(&ws.0, "", 1000, &config).unwrap().unwrap().symbols;
+        let counts = |symbols: Vec<GraphSymbol>| symbols.into_iter().map(|s| (s.id, s.usage_count)).collect::<BTreeMap<_, _>>();
+        assert_eq!(counts(live), counts(fresh));
+    }
+
+    #[test]
+    fn declaration_addition_refreshes_namespace_wildcard_and_transitive_importers() {
+        let ws = Workspace::new();
+        let config = EngineConfig::default();
+        let provider = ws.0.join("pkg/provider.py");
+        fs::write(&provider, "def kept():\n    return 1\n").unwrap();
+        fs::write(ws.0.join("pkg/namespace.py"),
+            "import pkg.provider as source\ndef consume():\n    return source.added()\n").unwrap();
+        fs::write(ws.0.join("pkg/wildcard.py"),
+            "from pkg.provider import *\ndef consume():\n    return added()\n").unwrap();
+        fs::write(ws.0.join("pkg/outer.py"),
+            "from pkg.namespace import consume\nconsume()\n").unwrap();
+        rebuild_graph_native(&ws.0, 910, &config, 1, &mut |_| {}).unwrap();
+        fs::write(&provider, "def kept():\n    return 1\ndef added():\n    return 2\n").unwrap();
+        overlay_update_graph_native(&ws.0, &[provider], &[], 910, &config, 1).unwrap();
+        let overlay = GraphOverlay::load_valid(&ws.0, &config, 910);
+        for path in ["pkg/namespace.py", "pkg/wildcard.py", "pkg/outer.py"] {
+            assert!(overlay.entries.contains_key(path), "dependent must refresh: {path}");
+        }
+        let live = query_graph_symbols(&ws.0, "", 1000, &config).unwrap().unwrap().symbols;
+        rebuild_graph_native(&ws.0, 911, &config, 1, &mut |_| {}).unwrap();
+        let fresh = query_graph_symbols(&ws.0, "", 1000, &config).unwrap().unwrap().symbols;
+        let counts = |symbols: Vec<GraphSymbol>| symbols.into_iter().map(|s| (s.id, s.usage_count)).collect::<BTreeMap<_, _>>();
+        assert_eq!(counts(live), counts(fresh));
+    }
+
+    #[test]
     fn member_declaration_fallback_excludes_same_name_bare_calls() {
         let ws = Workspace::new();
         let config = EngineConfig::default();
@@ -603,10 +850,15 @@ mod tests {
         };
         rebuild_graph_native(&ws.0, 860, &config, 1, &mut |_| {}).unwrap();
         check();
-        fs::write(&seed, "def anchor():\n    pass\ndef added():\n    pass\n").unwrap();
-        overlay_update_graph_native(&ws.0, &[seed], &[], 860, &config, 1).unwrap();
+        fs::write(&seed, "def added():\n    pass\n").unwrap();
+        overlay_update_graph_native(&ws.0, &[seed.clone()], &[], 860, &config, 1).unwrap();
+        assert!(GraphOverlay::load_valid(&ws.0, &config, 860).entries.contains_key("pkg/use.py"));
         check();
         compact_graph_overlay(&ws.0, 861, &config, 1).unwrap();
+        check();
+        fs::remove_file(graph_shard_path(&ws.0, &config, edit_facts::PREFIX, 0)).unwrap();
+        fs::write(&seed, "def anchor():\n    pass\ndef added():\n    pass\n").unwrap();
+        overlay_update_graph_native(&ws.0, &[seed], &[], 860, &config, 1).unwrap();
         check();
     }
 

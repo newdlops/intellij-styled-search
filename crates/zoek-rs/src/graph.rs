@@ -270,6 +270,9 @@ const GRAPH_OUTGOING_TALLY_BY_FILE_SHARD_PREFIX: &str = "callgraph-outgoing-tall
 #[path = "graph_usage_counts.rs"]
 mod usage_counts;
 
+#[path = "graph_edit_facts.rs"]
+mod edit_facts;
+
 #[path = "graph_python_bindings.rs"]
 mod python_bindings;
 #[path = "graph_python_strings.rs"]
@@ -5402,8 +5405,8 @@ fn parse_overlay_file(
 
 /// FAST incremental edit path (LSM overlay). Parses + lazy-resolves ONLY the
 /// changed + affected files (O(edit)), then writes a small delta overlay
-/// (`graph_overlay`) instead of rewriting the canonical base index — which
-/// `update_graph_native` does and costs O(total index size) (~54s on captain).
+/// (`graph_overlay`) instead of rewriting the canonical base index, whose
+/// update cost grows with the total index size.
 ///
 /// The base shards and the base `callgraph-manifest.json` (incl. its
 /// `builtAtUnixMs`) are left UNTOUCHED, so the extension's `--built-at` guard
@@ -5507,8 +5510,14 @@ pub fn overlay_update_graph_native(
     let mut changed_full_symbols: Vec<GraphSymbol> = Vec::new();
     let mut changed_ref_sites: Vec<RefSite> = Vec::new();
     let t = std::time::Instant::now();
-    let (mut import_facts, mut type_facts, mut function_return_facts, prior_changed_imports) =
-        read_facts_for_edit(workspace_root, config, &exclude_paths, &prior_file_table, true)?;
+    let prior_overlay = GraphOverlay::load_valid(workspace_root, config, base_built_at);
+    let indexed_facts = edit_facts::available(workspace_root, config);
+    let (mut import_facts, mut type_facts, mut function_return_facts, prior_changed_imports) = if indexed_facts {
+        let prior = edit_facts::read_paths(workspace_root, config, &prior_file_table, &prior_overlay, &exclude_paths)?;
+        (Vec::new(), Vec::new(), Vec::new(), prior.imports)
+    } else {
+        read_facts_for_edit(workspace_root, config, &exclude_paths, &prior_file_table, true)?
+    };
     if probe { eprintln!("[overlay] read_facts={}ms", t.elapsed().as_millis()); }
     for path in changed_paths {
         if let Some(graph) = parse_overlay_file(workspace_root, path, config)? {
@@ -5551,12 +5560,16 @@ pub fn overlay_update_graph_native(
     // missed. Overlay-path only — the full compaction path is untouched.
     let prior_compact =
         read_compact_syms_for_paths(workspace_root, config, &prior_file_table, &exclude_paths)?;
+    let superseded_symbols = prior_overlay.symbol_superseded();
     let mut old_ids_by_name: HashMap<String, HashSet<u64>> = HashMap::new();
-    for cs in &prior_compact {
+    for cs in prior_compact.iter().filter(|symbol| !superseded_symbols.contains(&*symbol.rel_path)) {
         old_ids_by_name
             .entry(cs.name.to_string())
             .or_default()
             .insert(cs.id_u64);
+    }
+    for symbol in prior_overlay.live_symbols().filter(|symbol| exclude_paths.contains(&symbol.rel_path)) {
+        old_ids_by_name.entry(symbol.name.clone()).or_default().insert(symbol.id_u64);
     }
     let mut new_ids_by_name: HashMap<String, HashSet<u64>> = HashMap::new();
     for sym in &changed_full_symbols {
@@ -5577,8 +5590,16 @@ pub fn overlay_update_graph_native(
         }
     }
     let mut affected_paths: HashSet<String> = exclude_paths.clone();
-    for fact in &import_facts {
-        if !changed_names.contains(&fact.imported_name)
+    if indexed_facts {
+        let mut reader = edit_facts::Reader::new(workspace_root, config, &prior_file_table,
+            &prior_overlay, &exclude_paths, &import_facts);
+        affected_paths.extend(reader.direct_importers(&changed_names)?);
+    } else { for fact in &import_facts {
+        // Namespace and wildcard imports expose the provider's export surface.
+        // A named import of an unchanged declaration does not depend on an
+        // unrelated declaration newly added to the same module.
+        if (!changed_names.contains(&fact.imported_name)
+            && !(fact.imported_name == "*" && !changed_names.is_empty()))
             || exclude_paths.contains(&fact.rel_path)
         {
             continue;
@@ -5592,13 +5613,21 @@ pub fn overlay_update_graph_native(
             continue; // import definitely resolves to a non-changed module
         }
         affected_paths.insert(fact.rel_path.clone());
-    }
+    } }
     let mut dependency_seeds = changed_import_binding_paths(&prior_changed_imports, &import_facts, &exclude_paths);
-    if !changed_names.is_empty() { dependency_seeds.extend(exclude_paths.iter().cloned()); }
+    // Binding edits can affect any re-export downstream. Declaration edits
+    // propagate from their matching direct importers, rather than every
+    // importer of the edited module.
     dependency_seeds.extend(affected_paths.iter().filter(|path| !exclude_paths.contains(*path)).cloned());
     extend_global_binding_dependents(workspace_root, config, &prior_file_table, &prior_changed_imports,
         &import_facts, &dependency_seeds, &mut affected_paths)?;
-    extend_import_dependents(&import_facts, &dependency_seeds, &mut affected_paths);
+    if indexed_facts {
+        let mut reader = edit_facts::Reader::new(workspace_root, config, &prior_file_table,
+            &prior_overlay, &exclude_paths, &import_facts);
+        reader.extend_dependents(&dependency_seeds, &mut affected_paths)?;
+    } else {
+        extend_import_dependents(&import_facts, &dependency_seeds, &mut affected_paths);
+    }
     if probe {
         eprintln!(
             "[overlay] changed_names={} (prior_names={} fresh_names={})",
@@ -5645,12 +5674,28 @@ pub fn overlay_update_graph_native(
         );
     }
 
+    // Load only reachable provider bindings and return annotations after the
+    // affected-file set is known. Older bases without the additive import
+    // index retain the complete-facts fallback.
+    if indexed_facts {
+        let fresh = crate::graph_overlay::BindingFacts {
+            imports: import_facts, types: type_facts, returns: function_return_facts,
+        };
+        let mut reader = edit_facts::Reader::new(workspace_root, config, &prior_file_table,
+            &prior_overlay, &exclude_paths, &fresh.imports);
+        let facts = reader.resolution_facts(&affected_paths, &ref_sites, &fresh)?;
+        import_facts = facts.imports;
+        type_facts = facts.types;
+        function_return_facts = facts.returns;
+        if probe { eprintln!("[overlay] indexed_facts imports={} types={} returns={}", import_facts.len(), type_facts.len(), function_return_facts.len()); }
+    }
+
     // ---- lazy-resolve ONLY the affected sites (reuse v3) ----
     // The resolver builds its fact-based maps (import_targets / types_by_name /
     // return-of) over EVERY fact handed in. An affected site only ever consults
     // its OWN file's facts, so filter to the affected files first — `read_facts`
-    // loaded all 137K files' facts for the `affected_paths` computation above,
-    // and feeding that whole set to the resolver is a fixed O(total-facts)
+    // may load a complete older base for dependency discovery above, and
+    // feeding that whole set to the resolver is a fixed O(total-facts)
     // map-build that dominates the floor of a low-fanout edit. (This is an
     // overlay-path-only narrowing; the full `update_graph_native` is unchanged.)
     let aff_import_facts = import_facts_for_resolution(&import_facts, &affected_paths, &ref_sites);
@@ -5826,7 +5871,19 @@ pub fn overlay_update_graph_native(
         m
     };
 
-    let mut overlay = GraphOverlay::load_valid(workspace_root, config, base_built_at);
+    let mut overlay = prior_overlay;
+    let previous_entries: BTreeMap<_, _> = affected_paths.iter()
+        .filter_map(|path| overlay.entries.get(path).map(|entry| (path.clone(), entry.clone())))
+        .collect();
+    let newly_superseded: HashSet<_> = affected_paths.iter()
+        .filter(|path| !previous_entries.contains_key(*path)).cloned().collect();
+    let mut previous_contrib = load_outgoing_tally_for_files(workspace_root, config, &newly_superseded)?;
+    for entry in previous_entries.values() {
+        for (&target, counts) in &entry.contrib {
+            let total = previous_contrib.entry(target).or_default();
+            for (value, count) in total.iter_mut().zip(counts) { *value += *count as i64; }
+        }
+    }
     let mut facts_by_file: HashMap<String, crate::graph_overlay::BindingFacts> = HashMap::new();
     for fact in &import_facts { if affected_paths.contains(&fact.rel_path) { facts_by_file.entry(fact.rel_path.clone()).or_default().imports.push(fact.clone()); } }
     for fact in &type_facts { if affected_paths.contains(&fact.rel_path) { facts_by_file.entry(fact.rel_path.clone()).or_default().types.push(fact.clone()); } }
@@ -5893,29 +5950,24 @@ pub fn overlay_update_graph_native(
         );
     }
 
-    // Recompute per-target count deltas = current overlay contribution − base
-    // tally over the overlay's files (recomputed from ALL entries each edit so
-    // chained edits stay correct). Empty when the tally sidecar is absent
-    // (graceful degrade → base counts until the next compaction builds it).
-    let overlay_files: HashSet<String> = overlay.entries.keys().cloned().collect();
-    let base_contrib = load_outgoing_tally_for_files(workspace_root, config, &overlay_files)?;
-    let current = overlay.total_contrib();
-    let mut count_deltas: std::collections::BTreeMap<u64, [i64; 4]> =
-        std::collections::BTreeMap::new();
-    for (&t, &n) in &current {
-        let o = base_contrib.get(&t).copied().unwrap_or_default();
-        let d = std::array::from_fn(|i| n[i] - o[i]);
-        if d != [0; 4] {
-            count_deltas.insert(t, d);
+    // Apply this batch's old-to-new contribution delta. Prior overlay entries
+    // already replaced their base rows; only newly superseded files read the
+    // base tally, so accumulated edits do not widen the refresh scope.
+    let mut contribution_changes: BTreeMap<u64, [i64; 4]> = previous_contrib.into_iter()
+        .map(|(target, counts)| (target, counts.map(|count| -count))).collect();
+    for entry in affected_paths.iter().filter_map(|path| overlay.entries.get(path)) {
+        for (&target, counts) in &entry.contrib {
+            let total = contribution_changes.entry(target).or_default();
+            for (value, count) in total.iter_mut().zip(counts) { *value += *count as i64; }
         }
     }
-    for (&t, &o) in &base_contrib {
-        if !current.contains_key(&t) && o != [0; 4] {
-            count_deltas.insert(t, o.map(|value| -value));
-        }
+    for (&target, changes) in &contribution_changes {
+        let total = overlay.count_deltas.entry(target).or_default();
+        for (value, change) in total.iter_mut().zip(changes) { *value += change; }
+        if *total == [0; 4] { overlay.count_deltas.remove(&target); }
     }
-    overlay.count_deltas = count_deltas;
-    usage_counts::update_overlay(workspace_root, config, &prior_compact, &mut overlay)?;
+    usage_counts::update_overlay(workspace_root, config, &prior_compact, &affected_paths,
+        &previous_entries, &prior_file_table, &contribution_changes, &mut overlay)?;
     overlay.updated_unix_secs = unix_secs_now();
     overlay.revision = overlay.revision.saturating_add(1);
     overlay.save(workspace_root, config)?;
@@ -13629,6 +13681,7 @@ fn write_store(
         &graph_manifest_path(workspace_root, config),
         manifest.as_bytes(),
     )?;
+    write_atomically(&layout_root.join(edit_facts::GENERATION_FILE), &query_generation.to_le_bytes())?;
     Ok(GraphIndexSummary {
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         index_path: relation_path.to_string_lossy().into_owned(),
@@ -13725,6 +13778,7 @@ fn is_graph_shard_file_name(name: &str) -> bool {
             GRAPH_SYMBOL_URI_SHARD_PREFIX,
             GRAPH_COUNT_ID_SHARD_PREFIX,
             usage_counts::SHARD_PREFIX,
+            edit_facts::PREFIX,
             GRAPH_HIERARCHY_PARENT_SHARD_PREFIX,
             GRAPH_METHOD_CONTAINER_SHARD_PREFIX,
             GRAPH_REF_SITES_BY_FILE_SHARD_PREFIX,
@@ -14476,7 +14530,7 @@ fn write_graph_shards(
                 function_return_facts,
                 file_table,
                 incremental,
-            );
+            ).and_then(|bytes| edit_facts::write(workspace_root, config, import_facts, file_table).map(|index_bytes| bytes + index_bytes));
             (t.elapsed(), r)
         });
         let count_id_h = s.spawn(|| {

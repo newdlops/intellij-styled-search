@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 157;
+export const RENDERER_PATCH_VERSION = 158;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -2625,7 +2625,7 @@ export function getRendererPatchScript(
     '  transform: translateX(-50%);',
     '  width: 760px; max-width: calc(100vw - 40px);',
     '  height: 640px; max-height: calc(100vh - 100px);',
-    '  min-width: 420px; min-height: 320px;',
+    '  min-width: min(420px, calc(100vw - 20px)); min-height: 320px;',
     '  background: var(--vscode-editorWidget-background, #252526);',
     '  color: var(--vscode-foreground, #cccccc);',
     '  border: 1px solid var(--vscode-widget-border, var(--vscode-contrastBorder, #454545));',
@@ -2749,7 +2749,7 @@ export function getRendererPatchScript(
     '  border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-widget-border));',
     '}',
     '.ij-find-search-row { display: flex; gap: 6px; align-items: flex-start; }',
-    '.ij-find-scope-row { margin-top: 6px; }',
+    '.ij-find-scope-row { display: flex; align-items: flex-start; gap: 6px; margin-top: 6px; }',
     '.ij-find-query-group {',
     '  flex: 1; display: flex; gap: 4px; align-items: flex-start;',
     '  min-width: 0;',
@@ -2843,7 +2843,7 @@ export function getRendererPatchScript(
     '.ij-find-history-item:focus-visible { background: var(--vscode-list-focusBackground, #04395e); color: var(--vscode-list-focusForeground, #ffffff); outline: 1px solid var(--vscode-focusBorder, #007acc); outline-offset: -1px; }',
     '.ij-find-history-item mark { background: var(--vscode-list-filterMatchBackground, rgba(234,92,0,0.25)); color: inherit; }',
     '.ij-find-scope {',
-    '  width: 100%; padding: 5px 8px;',
+    '  flex: 1 1 auto; min-width: 0; width: 100%; padding: 5px 8px;',
     '  font-family: var(--vscode-editor-font-family, monospace);',
     '  font-size: 12px;',
     '  line-height: 1.4;',
@@ -3416,33 +3416,35 @@ export function getRendererPatchScript(
     var h = Math.min(160, Math.max(26, $q.scrollHeight));
     $q.style.height = h + 'px';
   }
-  var $history = el('button', {
-    className: 'ij-find-history',
-    text: 'History',
-    attrs: {
-      type: 'button',
-      title: 'Search history (Alt+H)',
-      'aria-label': 'Search history',
-      'aria-haspopup': 'dialog',
-      'aria-expanded': 'false',
-      disabled: 'true',
-    },
-  });
-  var historyListId = 'ij-history-' + Math.random().toString(36).slice(2);
-  var $historyCount = el('span', { attrs: { 'aria-live': 'polite' } });
-  var $historyFilter = el('input', { className: 'ij-find-history-filter', attrs: {
-    type: 'text', name: 'historyFilter', placeholder: 'Filter previous searches…', 'aria-label': 'Filter search history',
-    'aria-controls': historyListId, autocomplete: 'off', spellcheck: 'false',
-  } });
-  var $historyList = el('div', { className: 'ij-find-history-list', attrs: { id: historyListId, role: 'listbox', 'aria-label': 'Previous searches' } });
-  var $historyMenu = el('div', {
-    className: 'ij-find-history-menu',
-    attrs: { id: historyListId + '-popup', role: 'dialog', 'aria-label': 'Search history' },
-    children: [el('div', { className: 'ij-find-history-heading', children: [el('span', { text: 'Recent searches' }), $historyCount] }),
-      $historyFilter, $historyList, el('div', { className: 'ij-find-history-hint', text: '↑ ↓ to browse · Enter to select · Esc to close' })],
-  });
-  $history.setAttribute('aria-controls', historyListId + '-popup');
-  var $historyWrap = el('div', { className: 'ij-find-history-wrap', children: [$history, $historyMenu] });
+  function createHistoryView(scope) {
+    var label = scope ? 'Files scope history' : 'Search history';
+    var button = el('button', { className: 'ij-find-history' + (scope ? ' ij-find-scope-history' : ''), text: 'History', attrs: {
+      type: 'button', title: label + ' (Alt+H)', 'aria-label': label,
+      'aria-haspopup': 'dialog', 'aria-expanded': 'false', disabled: 'true',
+    } });
+    var listId = 'ij-history-' + Math.random().toString(36).slice(2);
+    var count = el('span', { attrs: { 'aria-live': 'polite' } });
+    var filter = el('input', { className: 'ij-find-history-filter' + (scope ? ' ij-find-scope-history-filter' : ''), attrs: {
+      type: 'text', name: scope ? 'scopeHistoryFilter' : 'historyFilter',
+      placeholder: scope ? 'Filter previous patterns…' : 'Filter previous searches…',
+      'aria-label': scope ? 'Filter Files scope history' : 'Filter search history',
+      'aria-controls': listId, autocomplete: 'off', spellcheck: 'false',
+    } });
+    var list = el('div', { className: 'ij-find-history-list', attrs: {
+      id: listId, role: 'listbox', 'aria-label': scope ? 'Previous Files scopes' : 'Previous searches',
+    } });
+    var menu = el('div', { className: 'ij-find-history-menu' + (scope ? ' ij-find-scope-history-menu' : ''), attrs: {
+      id: listId + '-popup', role: 'dialog', 'aria-label': label,
+    }, children: [el('div', { className: 'ij-find-history-heading', children: [
+      el('span', { text: scope ? 'Recent Files scopes' : 'Recent searches' }), count,
+    ] }), filter, list, el('div', { className: 'ij-find-history-hint', text: '↑ ↓ to browse · Enter to select · Esc to close' })] });
+    button.setAttribute('aria-controls', listId + '-popup');
+    var wrap = el('div', { className: 'ij-find-history-wrap' + (scope ? ' ij-find-scope-history-wrap' : ''), children: [button, menu] });
+    return { scope: scope, label: label, button: button, count: count, filter: filter, list: list, menu: menu, wrap: wrap };
+  }
+  var searchHistoryView = createHistoryView(false);
+  var $history = searchHistoryView.button;
+  var $historyWrap = searchHistoryView.wrap;
   var $optCase = el('button', { className: 'ij-find-opt', title: 'Case Sensitive (Alt+C)', text: 'aA', attrs: { 'data-opt': 'caseSensitive', 'aria-pressed': 'false' } });
   var $optWord = el('button', { className: 'ij-find-opt', title: 'Whole Word (Alt+W)', text: 'W', attrs: { 'data-opt': 'wholeWord', 'aria-pressed': 'false' } });
   var $optRegex = el('button', { className: 'ij-find-opt', title: 'Regex (Alt+R)', text: '.*', attrs: { 'data-opt': 'useRegex', 'aria-pressed': 'false' } });
@@ -3459,12 +3461,15 @@ export function getRendererPatchScript(
     attrs: {
       placeholder: 'Files scope (Ant patterns: src/**, **/*.ts, !**/*.test.ts)',
       'aria-label': 'Files scope',
+      name: 'filesScope',
+      title: '↑/↓ for previous Files scopes. Enter to run. Alt+H for history.',
       spellcheck: 'false',
       autocomplete: 'off',
       type: 'text',
     },
   });
-  var $scopeRow = el('div', { className: 'ij-find-scope-row', children: [$scope] });
+  var scopeHistoryView = createHistoryView(true);
+  var $scopeRow = el('div', { className: 'ij-find-scope-row', children: [$scope, scopeHistoryView.wrap] });
 
   var $status = el('span', { className: 'ij-find-status', text: 'Type a query', attrs: { role: 'status', 'aria-live': 'polite' } });
   var $spinner = el('span', { className: 'ij-find-spinner hidden' });
@@ -3697,6 +3702,7 @@ export function getRendererPatchScript(
     resultsInfoText: '',
     rgScope: '',
 	    searchHistory: [],
+        filesScopeHistory: [],
 	    searchHistoryLimit: 100,
 		  matchCount: 0,
 		  recoveryUntil: 0,
@@ -5323,11 +5329,13 @@ export function getRendererPatchScript(
     return { includePatterns: includePatterns, excludePatterns: excludePatterns };
   }
 
-  function renderSearchHistory() {
+  function renderSearchHistory(view) {
+    view = view || searchHistoryView;
+    var $history = view.button, $historyMenu = view.menu, $historyList = view.list, $historyFilter = view.filter, $historyCount = view.count;
     var focused = document.activeElement;
     var focusedQuery = focused && $historyList.contains(focused) ? focused.title : null;
     clearChildren($historyList);
-    var items = state.searchHistory || [];
+    var items = (view.scope ? state.filesScopeHistory : state.searchHistory) || [];
     var filter = String($historyFilter.value || '').trim().toLowerCase();
     var terms = filter ? filter.split(/\\s+/) : [];
     var matched = 0;
@@ -5358,7 +5366,7 @@ export function getRendererPatchScript(
       if (focusedQuery === item.title) { try { item.focus(); } catch (eFocus) {} }
     }
     $historyCount.textContent = filter ? matched + ' of ' + items.length : String(items.length);
-    if (!matched) { $historyList.appendChild(el('div', { className: 'ij-find-history-empty', text: filter ? 'No matching searches. Try another phrase.' : 'No searches yet. Press Enter or Run to save a search.' })); }
+    if (!matched) { $historyList.appendChild(el('div', { className: 'ij-find-history-empty', text: filter ? (view.scope ? 'No matching patterns. Try another phrase.' : 'No matching searches. Try another phrase.') : (view.scope ? 'No patterns yet. Run a search with a Files scope to save it.' : 'No searches yet. Press Enter or Run to save a search.') })); }
     if (focusedQuery && document.activeElement !== focused) {
       var replacement = $historyList.querySelector('.ij-find-history-item:focus');
       if (!replacement) { try { $historyFilter.focus(); } catch (eFocus2) {} }
@@ -5366,34 +5374,68 @@ export function getRendererPatchScript(
     if (state.searchHistoryLimit > 0) { $history.removeAttribute('disabled'); }
     else {
       $history.setAttribute('disabled', 'true');
-      $history.title = 'Search history is disabled (searchHistoryLimit = 0)';
-      closeSearchHistory();
+      $history.title = view.label + ' is disabled (searchHistoryLimit = 0)';
+      closeSearchHistory(view);
     }
-    if (state.searchHistoryLimit > 0) { $history.title = 'Search history (Alt+H)'; }
+    if (state.searchHistoryLimit > 0) { $history.title = view.label + ' (Alt+H)'; }
   }
 
-  function closeSearchHistory() {
-    $historyMenu.classList.remove('open');
-    $history.setAttribute('aria-expanded', 'false');
+  function closeSearchHistory(view) {
+    view = view || searchHistoryView;
+    view.menu.classList.remove('open');
+    view.button.setAttribute('aria-expanded', 'false');
   }
 
-  function openSearchHistory() {
+  function openSearchHistory(view) {
+    view = view || searchHistoryView;
     if (state.searchHistoryLimit <= 0) { return; }
-    $historyFilter.value = '';
-    renderSearchHistory();
-    var available = Math.min(innerHeight, panel.getBoundingClientRect().bottom) - $history.getBoundingClientRect().bottom - 16;
-    $historyList.style.maxHeight = Math.max(64, Math.min(220, available - 100)) + 'px';
-    $historyMenu.classList.add('open');
-    $history.setAttribute('aria-expanded', 'true');
-    try { $historyFilter.focus(); } catch (eFocus) {}
+    closeSearchHistory(view.scope ? searchHistoryView : scopeHistoryView);
+    view.filter.value = '';
+    renderSearchHistory(view);
+    var available = Math.min(innerHeight, panel.getBoundingClientRect().bottom) - view.button.getBoundingClientRect().bottom - 16;
+    view.list.style.maxHeight = Math.max(64, Math.min(220, available - 100)) + 'px';
+    view.menu.classList.add('open');
+    view.button.setAttribute('aria-expanded', 'true');
+    try { view.filter.focus(); } catch (eFocus) {}
   }
 
-  function toggleSearchHistory() {
-    if ($historyMenu.classList.contains('open')) { closeSearchHistory(); }
-    else { openSearchHistory(); }
+  function toggleSearchHistory(view) {
+    view = view || searchHistoryView;
+    if (view.menu.classList.contains('open')) { closeSearchHistory(view); }
+    else { openSearchHistory(view); }
   }
 
   var queryHistoryNavigation = null;
+  var scopeHistoryNavigation = null;
+
+  function browseScopeHistory(direction) {
+    if (state.searchHistoryLimit <= 0 || !state.filesScopeHistory.length) { return false; }
+    if (scopeHistoryNavigation && ($scope.value !== scopeHistoryNavigation.entries[scopeHistoryNavigation.index]
+        || $scope.selectionStart !== $scope.value.length || $scope.selectionEnd !== $scope.value.length)) {
+      scopeHistoryNavigation = null;
+    }
+    if (!scopeHistoryNavigation) {
+      if (direction > 0 || $scope.selectionStart !== $scope.selectionEnd) { return false; }
+      var entries = state.filesScopeHistory.filter(function (value) { return value !== $scope.value; });
+      if (!entries.length) { return false; }
+      scopeHistoryNavigation = { entries: entries, index: -1, draft: $scope.value,
+        start: $scope.selectionStart, end: $scope.selectionEnd, selectionDirection: $scope.selectionDirection };
+    }
+    var navigation = scopeHistoryNavigation;
+    var next = Math.max(-1, Math.min(navigation.entries.length - 1, navigation.index - direction));
+    if (next === navigation.index) { return true; }
+    navigation.index = next;
+    $scope.value = next < 0 ? navigation.draft : navigation.entries[next];
+    if (next < 0) {
+      $scope.setSelectionRange(navigation.start, navigation.end, navigation.selectionDirection);
+      scopeHistoryNavigation = null;
+    } else { $scope.setSelectionRange($scope.value.length, $scope.value.length); }
+    state.filesScopeEdited = true;
+    send({ type: 'filesScopeChanged', value: $scope.value });
+    markSearchDirty();
+    closeSearchHistory(scopeHistoryView);
+    return true;
+  }
 
   function resetQueryHistoryNavigation() {
     queryHistoryNavigation = null;
@@ -5441,7 +5483,18 @@ export function getRendererPatchScript(
     return true;
   }
 
-  function selectSearchHistory(idx) {
+  function selectSearchHistory(idx, view) {
+    if (view && view.scope) {
+      if (idx < 0 || idx >= state.filesScopeHistory.length) { return; }
+      scopeHistoryNavigation = null;
+      $scope.value = state.filesScopeHistory[idx];
+      state.filesScopeEdited = true;
+      send({ type: 'filesScopeChanged', value: $scope.value });
+      markSearchDirty();
+      closeSearchHistory(view);
+      try { $scope.focus(); $scope.setSelectionRange($scope.value.length, $scope.value.length); } catch (eScopeFocus) {}
+      return;
+    }
     if (idx >= 0 && state.searchHistory && idx < state.searchHistory.length) {
       resetQueryHistoryNavigation();
       $q.value = state.searchHistory[idx];
@@ -6094,6 +6147,7 @@ export function getRendererPatchScript(
 
 	  function triggerSearch(forceRestart, recordHistory) {
     resetQueryHistoryNavigation();
+    scopeHistoryNavigation = null;
     state.staticSessionId = null;
 	    var raw = $q.value;
 	    var scopeRaw = $scope.value || '';
@@ -6189,6 +6243,7 @@ export function getRendererPatchScript(
     send({
       type: 'search',
       recordHistory: !!recordHistory,
+      filesScope: scopeRaw,
       options: {
         query: q,
         caseSensitive: state.options.caseSensitive,
@@ -6269,7 +6324,7 @@ export function getRendererPatchScript(
     if (withModifier && optionShortcutMatches(e, 'KeyH', 'h')) {
       if (!(e.target instanceof Node) || !panel.contains(e.target)) { return false; }
       e.preventDefault();
-      toggleSearchHistory();
+      toggleSearchHistory(document.activeElement === $scope || scopeHistoryView.wrap.contains(e.target) ? scopeHistoryView : searchHistoryView);
       return true;
     }
     if (optionShortcutMatches(e, 'KeyC', 'c')) {
@@ -6305,35 +6360,49 @@ export function getRendererPatchScript(
 
   on($q, 'input', function () { resetQueryHistoryNavigation(); state.staticSessionId = null; $moreUsages.hidden = true; autosizeQuery(); markSearchDirty(); });
   on($scope, 'input', function () {
+    scopeHistoryNavigation = null;
     state.filesScopeEdited = true;
     send({ type: 'filesScopeChanged', value: $scope.value || '' });
     scheduleSearch();
   });
+  on($scope, 'keydown', function (e) {
+    if (e.isComposing || e.keyCode === 229) { return; }
+    if (e.key === 'Enter' && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault(); e.stopPropagation(); refreshSearch();
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (e.shiftKey || e.ctrlKey || e.metaKey) { return; }
+      var direction = e.key === 'ArrowDown' ? 1 : -1;
+      if (e.altKey) { e.preventDefault(); moveActive(direction); }
+      else if (browseScopeHistory(direction)) { e.preventDefault(); }
+    } else if (e.key === 'Escape') { e.preventDefault(); hideSearchPanel(); }
+  });
+  function bindHistoryView(view) {
+    var $history = view.button, $historyMenu = view.menu, $historyFilter = view.filter, $historyList = view.list, $historyWrap = view.wrap;
   on($history, 'click', function (e) {
     e.preventDefault();
-    toggleSearchHistory();
+    toggleSearchHistory(view);
   });
   on($history, 'keydown', function (e) {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
-      toggleSearchHistory();
+      toggleSearchHistory(view);
     } else if (e.key === 'ArrowDown') {
       e.preventDefault();
-      openSearchHistory();
+      openSearchHistory(view);
       var first = $historyMenu.querySelector('.ij-find-history-item');
       if (first) { try { first.focus(); } catch (eFocus) {} }
     } else if (e.key === 'Escape') {
       e.preventDefault();
-      closeSearchHistory();
+      closeSearchHistory(view);
     }
   });
   on($historyMenu, 'click', function (e) {
     var item = e.target instanceof HTMLElement ? e.target.closest('.ij-find-history-item') : null;
     if (!item) { return; }
     e.preventDefault();
-    selectSearchHistory(parseInt(item.getAttribute('data-history-index') || '-1', 10));
+    selectSearchHistory(parseInt(item.getAttribute('data-history-index') || '-1', 10), view);
   });
-  on($historyFilter, 'input', function () { renderSearchHistory(); $historyList.scrollTop = 0; });
+  on($historyFilter, 'input', function () { renderSearchHistory(view); $historyList.scrollTop = 0; });
   on($historyList, 'focusin', function (e) {
     var items = $historyList.querySelectorAll('.ij-find-history-item');
     for (var i = 0; i < items.length; i++) { items[i].setAttribute('aria-selected', String(items[i] === e.target)); }
@@ -6342,8 +6411,7 @@ export function getRendererPatchScript(
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      e.stopPropagation();
-      closeSearchHistory();
+      closeSearchHistory(view);
       try { $history.focus(); } catch (eFocus) {}
       return;
     }
@@ -6353,7 +6421,7 @@ export function getRendererPatchScript(
       if (active) {
         e.preventDefault();
         e.stopPropagation();
-        selectSearchHistory(parseInt(active.getAttribute('data-history-index') || '-1', 10));
+        selectSearchHistory(parseInt(active.getAttribute('data-history-index') || '-1', 10), view);
       }
       return;
     }
@@ -6373,11 +6441,14 @@ export function getRendererPatchScript(
   on(document, 'mousedown', function (e) {
     if (!$historyMenu.classList.contains('open')) { return; }
     if (e.target instanceof Node && $historyWrap.contains(e.target)) { return; }
-    closeSearchHistory();
+    closeSearchHistory(view);
   });
   on($historyWrap, 'focusout', function (e) {
-    if (e.relatedTarget instanceof Node && !$historyWrap.contains(e.relatedTarget)) { closeSearchHistory(); }
+    if (e.relatedTarget instanceof Node && !$historyWrap.contains(e.relatedTarget)) { closeSearchHistory(view); }
   });
+  }
+  bindHistoryView(searchHistoryView);
+  bindHistoryView(scopeHistoryView);
   on($q, 'keydown', function (e) {
     if (e.isComposing || e.keyCode === 229) { return; }
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -6394,15 +6465,6 @@ export function getRendererPatchScript(
     }
     else if (e.key === 'PageDown') { e.preventDefault(); moveActive(10); }
     else if (e.key === 'PageUp') { e.preventDefault(); moveActive(-10); }
-    else if (e.key === 'Escape') { e.preventDefault(); hideSearchPanel(); }
-  });
-  on($scope, 'keydown', function (e) {
-    if (e.key === 'Enter') {
-      if (state.debounce) { clearTimeout(state.debounce); }
-      e.preventDefault();
-      refreshSearch();
-    } else if (e.key === 'ArrowDown') { e.preventDefault(); moveActive(1); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); moveActive(-1); }
     else if (e.key === 'Escape') { e.preventDefault(); hideSearchPanel(); }
   });
   on($optCase, 'click', function () { toggleOpt('caseSensitive', $optCase); });
@@ -13978,6 +14040,8 @@ export function getRendererPatchScript(
     } catch (e) { return 'show-err: ' + (e && e.message); }
   }
 	  function hideSearchPanel() {
+    closeSearchHistory();
+    closeSearchHistory(scopeHistoryView);
 	    var wasVisible = panel.classList.contains('visible');
     cancelStandaloneNativePromotion();
     trace('hide:start', { wasVisible: !!wasVisible });
@@ -14247,6 +14311,7 @@ export function getRendererPatchScript(
         filterQuery: state.filterQuery || '',
         historyCount: state.searchHistory ? state.searchHistory.length : 0,
         history: state.searchHistory || [],
+        scopeHistory: state.filesScopeHistory || [],
         options: {
           caseSensitive: !!state.options.caseSensitive,
           wholeWord: !!state.options.wholeWord,
@@ -14537,9 +14602,14 @@ export function getRendererPatchScript(
         state.searchHistory = Array.isArray(msg.entries) ? msg.entries.filter(function (entry) {
           return typeof entry === 'string' && entry.length > 0;
         }) : [];
+        state.filesScopeHistory = Array.isArray(msg.scopeEntries) ? msg.scopeEntries.filter(function (entry) {
+          return typeof entry === 'string' && entry.trim().length > 0;
+        }) : [];
         state.searchHistoryLimit = typeof msg.limit === 'number' ? msg.limit : state.searchHistoryLimit;
         if (state.searchHistoryLimit <= 0 || !state.searchHistory.length) { resetQueryHistoryNavigation(); }
         renderSearchHistory();
+        renderSearchHistory(scopeHistoryView);
+        if (state.searchHistoryLimit <= 0 || !state.filesScopeHistory.length) { scopeHistoryNavigation = null; }
         break;
       case 'preview':
         panelDiagMark('preview:message', {
