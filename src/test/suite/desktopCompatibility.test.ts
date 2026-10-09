@@ -8,7 +8,7 @@ import type { ExtensionTestApi } from '../../extension';
 import { windowsFileUri } from '../../platform/windows/fileUri';
 import { windowsElectronMainProcess } from '../../platform/windows/electronMainProcess';
 import { Uri as WorkerUri } from '../../nodeVscodeShim';
-import { runRgSearch } from '../../rgSearch';
+import { findRipgrepPath, runRgSearch } from '../../rgSearch';
 import { readWindowsTestIdentity } from '../support/windowsIdentity';
 import type { FileMatch } from '../../search';
 
@@ -33,6 +33,19 @@ async function invoke(binary: string, args: string[]): Promise<any> {
 }
 
 suite('Desktop compatibility', () => {
+  test('VS Code bundled ripgrep resolves and executes without a download', async function () {
+    await getApi();
+    const binary = findRipgrepPath();
+    assert.ok(binary, 'expected the running VS Code installation to provide ripgrep');
+    assert.match(binary, /@vscode[\\/](?:ripgrep-universal|ripgrep)[\\/]bin/);
+    const version = await new Promise<string>((resolve, reject) => {
+      execFile(binary, ['--version'], { windowsHide: true, timeout: 5000 }, (error, stdout) => {
+        if (error) { reject(error); } else { resolve(stdout); }
+      });
+    });
+    assert.match(version, /^ripgrep \d+\./);
+  });
+
   test('extension search uses the packaged zoekt engine without fallback after a real rebuild', async function () {
     this.timeout(60_000);
     const { overlay } = await getApi();

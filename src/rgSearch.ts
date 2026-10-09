@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import { canPassSearchCandidates } from './platform/commandLine';
+import { bundledRipgrepCandidates } from './platform/bundledRipgrep';
 import { literalSearchRegexSource } from './literalSearch';
 import * as fs from 'fs';
 import * as https from 'https';
@@ -264,17 +265,17 @@ export function findRipgrepPath(): string | null {
   const execPath = process.execPath;
   let cur = path.dirname(execPath);
   for (let i = 0; i < 6; i++) {
-    candidates.push(path.join(cur, 'app', 'node_modules', '@vscode', 'ripgrep', 'bin', process.platform === 'win32' ? 'rg.exe' : 'rg'));
-    candidates.push(path.join(cur, 'node_modules', '@vscode', 'ripgrep', 'bin', process.platform === 'win32' ? 'rg.exe' : 'rg'));
-    candidates.push(path.join(cur, 'Resources', 'app', 'node_modules', '@vscode', 'ripgrep', 'bin', process.platform === 'win32' ? 'rg.exe' : 'rg'));
+    for (const appRoot of [path.join(cur, 'app'), cur, path.join(cur, 'Resources', 'app'), path.join(cur, 'resources', 'app')]) {
+      candidates.push(...bundledRipgrepCandidates(appRoot));
+    }
     cur = path.dirname(cur);
   }
   // macOS default install
-  candidates.push('/Applications/Visual Studio Code.app/Contents/Resources/app/node_modules/@vscode/ripgrep/bin/rg');
-  candidates.push('/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/node_modules/@vscode/ripgrep/bin/rg');
+  candidates.push(...bundledRipgrepCandidates('/Applications/Visual Studio Code.app/Contents/Resources/app'));
+  candidates.push(...bundledRipgrepCandidates('/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app'));
   // Linux Snap / deb
-  candidates.push('/usr/share/code/resources/app/node_modules/@vscode/ripgrep/bin/rg');
-  candidates.push('/usr/share/code-insiders/resources/app/node_modules/@vscode/ripgrep/bin/rg');
+  candidates.push(...bundledRipgrepCandidates('/usr/share/code/resources/app'));
+  candidates.push(...bundledRipgrepCandidates('/usr/share/code-insiders/resources/app'));
   for (const p of candidates) {
     try {
       if (fs.existsSync(p)) { cachedRgPath = p; return p; }

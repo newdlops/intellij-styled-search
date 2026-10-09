@@ -2091,6 +2091,10 @@ suite('Call graph', () => {
         'export const mcpLargeGeneratedPadding = "' + 'x'.repeat(1_100_000) + '";',
         '',
       ].join('\n'), 'utf8'));
+      // These protocol assertions require a prepared text index. The later
+      // file edit remains deliberately after this baseline for overlay checks.
+      await api.overlay.rebuildIndex();
+      await api.overlay.waitForIndexReady();
       const init = await postJson(url, {
         jsonrpc: '2.0',
         id: 1,
@@ -2284,7 +2288,7 @@ suite('Call graph', () => {
           },
         },
       });
-      assert.strictEqual(autoRegexSearch.result?.isError, false);
+      assert.strictEqual(autoRegexSearch.result?.isError, false, JSON.stringify(autoRegexSearch.result));
       assert.strictEqual(autoRegexSearch.result?.structuredContent?.query_diagnostics?.effective_query_kind, 'regex');
       assert.strictEqual(autoRegexSearch.result?.structuredContent?.output_mode, 'rg_like');
       assert.strictEqual(autoRegexSearch.result?.structuredContent?.results, undefined);
