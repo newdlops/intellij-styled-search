@@ -196,8 +196,8 @@ test('Windows snapshot retries a timed-out child once and rejects other process 
 });
 
 test('usage binding migration invalidates old overlays while retaining platform URI versions', () => {
-  assert.deepEqual(graphStorageVersions('win32'), { cache: 25, native: 17 });
-  assert.deepEqual(graphStorageVersions('darwin'), { cache: 24, native: 16 });
+  assert.deepEqual(graphStorageVersions('win32'), { cache: 26, native: 18 });
+  assert.deepEqual(graphStorageVersions('darwin'), { cache: 25, native: 17 });
 });
 
 test('standard-account acceptance reads SIDs independently of localized group names', () => {

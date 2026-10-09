@@ -30,9 +30,30 @@ pub(super) fn base_generation(
     Ok(json_u64_field(&manifest, "queryGeneration").unwrap_or(built_at))
 }
 
-pub(super) fn overlay_candidates(sites: &[RefSite]) -> HashMap<String, CandidateMap> {
+pub(super) fn candidate_mask(
+    site_count: usize,
+    bare: &HashMap<(u64, u64, u64), Vec<u32>>,
+    member: &HashMap<(u64, u64, u64), Vec<u32>>,
+) -> Vec<bool> {
+    // Use the full resolver's candidate selection, including lexical and
+    // resolved-import exclusions. An edited file must not reintroduce proven
+    // local bindings as candidates for unrelated same-name declarations.
+    let mut eligible = vec![false; site_count];
+    for index in bare.values().chain(member.values()).flatten() {
+        eligible[*index as usize] = true;
+    }
+    eligible
+}
+
+pub(super) fn overlay_candidates(
+    sites: &[RefSite],
+    bare: &HashMap<(u64, u64, u64), Vec<u32>>,
+    member: &HashMap<(u64, u64, u64), Vec<u32>>,
+) -> HashMap<String, CandidateMap> {
+    let eligible = candidate_mask(sites.len(), bare, member);
     let mut out: HashMap<String, CandidateMap> = HashMap::new();
-    for site in sites {
+    for (index, site) in sites.iter().enumerate() {
+        if !eligible[index] { continue; }
         let access = compute_access_kind_id(&site.access_kind);
         if !matches!(access, ACCESS_KIND_BARE | ACCESS_KIND_MEMBER) {
             continue;
@@ -489,6 +510,104 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn member_declaration_fallback_excludes_same_name_bare_calls() {
+        let ws = Workspace::new();
+        let config = EngineConfig::default();
+        let provider = ws.0.join("pkg/provider.js");
+        let write = |calls: usize| fs::write(&provider,
+            format!("export function adapt() {{}}\nexport class Left {{\n  adapt() {{}}\n}}\nexport class Right {{\n  adapt() {{}}\n}}\n{}",
+                "adapt();\n".repeat(calls))).unwrap();
+        let check = || {
+            let symbols = query_graph_symbols(&ws.0, "adapt", 100, &config).unwrap().unwrap().symbols;
+            let methods: Vec<_> = symbols.iter().filter(|s| s.kind == "method" && s.rel_path == "pkg/provider.js").collect();
+            assert_eq!(methods.len(), 2);
+            for target in methods {
+                let page = query_graph(&ws.0, &target.id, usize::MAX, &config).unwrap().unwrap();
+                assert_eq!(target.usage_count, Some(page.total_references));
+                assert_eq!(page.total_references, 0, "unrelated methods cannot receive same-name bare function calls");
+            }
+        };
+        write(512);
+        rebuild_graph_native(&ws.0, 800, &config, 1, &mut |_| {}).unwrap();
+        check();
+        write(1);
+        overlay_update_graph_native(&ws.0, &[provider], &[], 800, &config, 1).unwrap();
+        check();
+        compact_graph_overlay(&ws.0, 801, &config, 1).unwrap();
+        check();
+    }
+
+    #[test]
+    fn live_candidate_union_keeps_multiple_files_through_chained_edits_and_deletion() {
+        let ws = Workspace::new();
+        let config = EngineConfig::default();
+        let paths: Vec<_> = (0..3).map(|i| ws.0.join(format!("pkg/consumer{i}.py"))).collect();
+        let write = |path: &Path, calls: usize| fs::write(path,
+            format!("def consume(client):\n{}", "    client.run()\n".repeat(calls))).unwrap();
+        for path in &paths { write(path, 2); }
+        let check = |expected: &[usize]| {
+            let target = ws.target(&config);
+            let page = query_graph(&ws.0, &target.id, usize::MAX, &config).unwrap().unwrap();
+            assert_eq!(target.usage_count, Some(expected.iter().sum()));
+            assert_eq!(page.total_references, expected.iter().sum::<usize>());
+            for (i, count) in expected.iter().enumerate() {
+                let path = format!("pkg/consumer{i}.py");
+                assert_eq!(page.references.iter().filter(|r| r.rel_path.as_ref() == path).count(), *count);
+            }
+        };
+        rebuild_graph_native(&ws.0, 850, &config, 1, &mut |_| {}).unwrap();
+        check(&[2, 2, 2]);
+        write(&paths[0], 3);
+        write(&paths[1], 4);
+        overlay_update_graph_native(&ws.0, &paths[..2], &[], 850, &config, 1).unwrap();
+        check(&[3, 4, 2]);
+        write(&paths[0], 1);
+        fs::remove_file(&paths[2]).unwrap();
+        overlay_update_graph_native(&ws.0, &[paths[0].clone()], &[paths[2].clone()], 850, &config, 1).unwrap();
+        check(&[1, 4, 0]);
+        compact_graph_overlay(&ws.0, 851, &config, 1).unwrap();
+        check(&[1, 4, 0]);
+        rebuild_graph_native(&ws.0, 852, &config, 1, &mut |_| {}).unwrap();
+        check(&[1, 4, 0]);
+    }
+
+    #[test]
+    fn dependency_refresh_preserves_lexical_bindings_and_imported_return_types() {
+        let ws = Workspace::new();
+        let config = EngineConfig::default();
+        let seed = ws.0.join("pkg/seed.py");
+        fs::write(&seed, "def anchor():\n    pass\n").unwrap();
+        fs::write(ws.0.join("pkg/model.py"),
+            "class Record:\n    valid: bool\nclass Other:\n    valid: bool\n").unwrap();
+        fs::write(ws.0.join("pkg/producer.py"),
+            "from pkg.model import Record\ndef produce() -> Record:\n    return Record()\n").unwrap();
+        fs::write(ws.0.join("pkg/unrelated.py"), "def payload():\n    pass\n").unwrap();
+        fs::write(ws.0.join("pkg/use.py"),
+            "from pkg.seed import anchor\nfrom pkg.producer import produce\ndef consume(value):\n    payload = value\n    result = produce()\n    return result.valid, payload\n").unwrap();
+        let check = || {
+            let field = query_graph_symbols(&ws.0, "Record.valid", 10, &config).unwrap().unwrap()
+                .symbols.into_iter().find(|s| s.qualified_name == "Record.valid").unwrap();
+            let page = query_graph(&ws.0, &field.id, usize::MAX, &config).unwrap().unwrap();
+            assert_eq!(field.usage_count, Some(1));
+            assert_eq!(page.total_references, 1);
+            assert_eq!(page.references[0].provenance.as_ref(), "type-fact");
+            let unrelated = query_graph_symbols(&ws.0, "payload", 100, &config).unwrap().unwrap()
+                .symbols.into_iter().find(|s| s.rel_path == "pkg/unrelated.py").unwrap();
+            let page = query_graph(&ws.0, &unrelated.id, usize::MAX, &config).unwrap().unwrap();
+            assert_eq!(unrelated.usage_count, Some(1), "references: {:?}", page.references);
+            assert_eq!(page.total_references, 1, "only the conservative declaration candidate remains");
+            assert_eq!(page.references[0].start_line, 3, "local reads cannot be bound to an unrelated callable");
+        };
+        rebuild_graph_native(&ws.0, 860, &config, 1, &mut |_| {}).unwrap();
+        check();
+        fs::write(&seed, "def anchor():\n    pass\ndef added():\n    pass\n").unwrap();
+        overlay_update_graph_native(&ws.0, &[seed], &[], 860, &config, 1).unwrap();
+        check();
+        compact_graph_overlay(&ws.0, 861, &config, 1).unwrap();
+        check();
     }
 
     #[test]

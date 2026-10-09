@@ -1,6 +1,6 @@
 use std::path::Path;
 
-pub(crate) const GRAPH_STORAGE_VERSION: u32 = 16;
+pub(crate) const GRAPH_STORAGE_VERSION: u32 = 17;
 
 pub(crate) fn metadata_change_identity(
     _path: &Path,

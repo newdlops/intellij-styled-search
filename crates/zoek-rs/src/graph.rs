@@ -1423,6 +1423,7 @@ fn token_shape_entries_for_keys(
 fn token_shape_member_family_covers_key(
     workspace_root: &Path,
     config: &EngineConfig,
+    file_table: &FileTable,
     symbol: &GraphSymbol,
     target_count: u32,
     families: &mut HashMap<String, Option<MemberImplementationFamily>>,
@@ -1434,7 +1435,7 @@ fn token_shape_member_family_covers_key(
         return Ok(false);
     };
     if !families.contains_key(container_id) {
-        let family = load_member_implementation_family(workspace_root, config, container_id)?;
+        let family = load_member_implementation_family(workspace_root, config, file_table, container_id)?;
         families.insert(container_id.to_string(), family);
     }
     let Some(family) = families.get(container_id).and_then(Option::as_ref) else {
@@ -1477,13 +1478,15 @@ struct MemberImplementationFamily {
 fn load_member_implementation_family(
     workspace_root: &Path,
     config: &EngineConfig,
+    file_table: &FileTable,
     container_id: &str,
 ) -> io::Result<Option<MemberImplementationFamily>> {
     let container_ids: HashSet<String> = [container_id.to_string()].into_iter().collect();
-    let Some(container) = read_symbols_for_symbol_ids_indexed(
+    let Some(container) = read_symbols_for_symbol_ids_with_table(
         workspace_root,
         config,
         &container_ids,
+        file_table,
     )?
     .into_iter()
     .find(|candidate| candidate.id == container_id)
@@ -1495,11 +1498,12 @@ fn load_member_implementation_family(
     if descendant_ids.is_empty() || descendant_names.is_empty() {
         return Ok(None);
     }
-    let methods = read_method_candidates_for_container_names_indexed(
+    let method_ids = read_method_candidate_ids_for_container_names_indexed(
         workspace_root,
         config,
         &descendant_names,
     )?;
+    let methods = read_symbols_for_symbol_ids_with_table(workspace_root, config, &method_ids, file_table)?;
     Ok(Some(MemberImplementationFamily {
         descendant_ids,
         descendant_names,
@@ -1536,10 +1540,111 @@ fn append_lazy_token_shape_references_with_overlay_and_families(
     references: &mut Vec<GraphReference>,
     overlay: &crate::graph_overlay::GraphOverlay,
     member_families: &mut HashMap<String, Option<MemberImplementationFamily>>,
-    mut cache: Option<&mut CountShardCache>,
+    cache: Option<&mut CountShardCache>,
 ) -> io::Result<()> {
     if symbols.is_empty() {
         return Ok(());
+    }
+    let context = load_lazy_token_shape_reference_context(
+        workspace_root,
+        config,
+        symbols,
+        file_table,
+        overlay,
+        member_families,
+        cache,
+    )?;
+    references.retain(|reference| context.accepts_reference(reference));
+    visit_lazy_token_shape_references(
+        symbols,
+        file_table,
+        overlay,
+        &context,
+        &mut |symbol, candidate| references.push(candidate.materialize(symbol)),
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct LazyTokenShapeReferenceContext<'a> {
+    bare: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
+    bare_definitions: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
+    member: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>>,
+    target_counts: HashMap<(u64, u64, u64), TokenShapeTargetCount>,
+    assignable_targets: HashSet<String>,
+    overlay_candidates: HashMap<
+        (u64, u64, u64),
+        Vec<(
+            &'a str,
+            &'a crate::graph_overlay::OverlayTokenShapeCandidate,
+        )>,
+    >,
+}
+
+impl LazyTokenShapeReferenceContext<'_> {
+    fn accepts_reference(&self, reference: &GraphReference) -> bool {
+        !matches!(reference.provenance.as_ref(), "token-shape" | "unique-name")
+            || reference
+                .target_symbol_id
+                .as_deref()
+                .is_some_and(|target| self.assignable_targets.contains(target))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LazyTokenShapeReference<'a> {
+    Base {
+        candidate: &'a TokenShapeCandidate,
+        rel_path: &'a str,
+    },
+    Overlay(&'a GraphReference),
+}
+
+impl LazyTokenShapeReference<'_> {
+    fn materialize(self, symbol: &GraphSymbol) -> GraphReference {
+        match self {
+            Self::Overlay(candidate) => {
+                let mut reference = candidate.clone();
+                reference.target_symbol_id = Some(symbol.id.as_str().into());
+                reference
+            }
+            Self::Base {
+                candidate,
+                rel_path,
+            } => GraphReference {
+                source_ref_id: format!("ref:{:016x}", candidate.source_ref_id).into(),
+                target_symbol_id: Some(symbol.id.as_str().into()),
+                edge_kind: edge_kind_str_from_id(candidate.edge_kind_id)
+                    .unwrap_or("usage")
+                    .into(),
+                name: symbol.name.as_str().into(),
+                raw_text: symbol.name.as_str().into(),
+                uri: Box::from(""),
+                rel_path: rel_path.into(),
+                start_line: candidate.start_line,
+                start_column: candidate.start_column,
+                end_line: candidate.end_line,
+                end_column: candidate.end_column,
+                enclosing_symbol_id: enclosing_id_to_string(candidate.enclosing_id).map(Into::into),
+                bound_mask: BOUND_MAY,
+                confidence: "possible".into(),
+                provenance: "token-shape".into(),
+            },
+        }
+    }
+}
+
+fn load_lazy_token_shape_reference_context<'a>(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbols: &[GraphSymbol],
+    file_table: &FileTable,
+    overlay: &'a crate::graph_overlay::GraphOverlay,
+    member_families: &mut HashMap<String, Option<MemberImplementationFamily>>,
+    mut cache: Option<&mut CountShardCache>,
+) -> io::Result<LazyTokenShapeReferenceContext<'a>> {
+    if symbols.is_empty() {
+        return Ok(LazyTokenShapeReferenceContext::default());
     }
     let keys: HashSet<(u64, u64, u64)> = symbols
         .iter()
@@ -1551,10 +1656,18 @@ fn append_lazy_token_shape_references_with_overlay_and_families(
             )
         })
         .collect();
-    let shards: HashSet<usize> = keys.iter().map(|key| token_shape_shard_for_key(*key)).collect();
-    let (bare, member) = load_token_shape_tally_for_keys(workspace_root, config, &keys, cache.as_deref_mut())?;
-    let mut target_counts =
-        load_token_shape_target_counts_cached(workspace_root, config, Some(&shards), cache.as_deref_mut())?;
+    let shards: HashSet<usize> = keys
+        .iter()
+        .map(|key| token_shape_shard_for_key(*key))
+        .collect();
+    let (bare, member) =
+        load_token_shape_tally_for_keys(workspace_root, config, &keys, cache.as_deref_mut())?;
+    let mut target_counts = load_token_shape_target_counts_cached(
+        workspace_root,
+        config,
+        Some(&shards),
+        cache.as_deref_mut(),
+    )?;
     for (key, (bare_delta, member_delta)) in overlay.total_token_shape_target_deltas() {
         if !shards.contains(&token_shape_shard_for_key(key)) {
             continue;
@@ -1562,10 +1675,8 @@ fn append_lazy_token_shape_references_with_overlay_and_families(
         let count = target_counts.entry(key).or_default();
         // Edited/deleted candidates are replaced below, so both positive and
         // negative declaration deltas are safe before compaction.
-        count.bare = (count.bare as i64 + bare_delta)
-            .clamp(0, u32::MAX as i64) as u32;
-        count.member = (count.member as i64 + member_delta)
-            .clamp(0, u32::MAX as i64) as u32;
+        count.bare = (count.bare as i64 + bare_delta).clamp(0, u32::MAX as i64) as u32;
+        count.member = (count.member as i64 + member_delta).clamp(0, u32::MAX as i64) as u32;
     }
 
     // Eager token-shape and unique-name rows were written against the base
@@ -1573,9 +1684,11 @@ fn append_lazy_token_shape_references_with_overlay_and_families(
     // compaction, so discard any now-ambiguous provisional rows as well as
     // suppressing lazy ones. Import/type/lexical rows are independent of this
     // cardinality and remain untouched.
-    let mut assignable_targets: HashSet<&str> = HashSet::default();
+    let mut assignable_targets: HashSet<String> = HashSet::default();
     for symbol in symbols {
-        if symbol.is_local_binding { continue; }
+        if symbol.is_local_binding {
+            continue;
+        }
         let key = (
             stable_hash(&symbol.language),
             stable_hash(source_scope_key(&symbol.rel_path)),
@@ -1586,6 +1699,7 @@ fn append_lazy_token_shape_references_with_overlay_and_families(
             token_shape_member_family_covers_key(
                 workspace_root,
                 config,
+                file_table,
                 symbol,
                 count.member,
                 member_families,
@@ -1594,102 +1708,166 @@ fn append_lazy_token_shape_references_with_overlay_and_families(
             count.bare == 1
         };
         if assignable {
-            assignable_targets.insert(symbol.id.as_str());
+            assignable_targets.insert(symbol.id.clone());
         }
     }
-    references.retain(|reference| {
-        !matches!(reference.provenance.as_ref(), "token-shape" | "unique-name")
-            || reference
-                .target_symbol_id
-                .as_deref()
-                .is_some_and(|target| assignable_targets.contains(target))
-    });
-
+    // A member can conservatively include same-key bare declarations. Keep
+    // those declaration rows in stored order once, rather than scanning all
+    // bare calls/reads again for every member with that key.
+    let mut bare_definitions = HashMap::default();
     for symbol in symbols {
-        if symbol.is_local_binding { continue; }
+        if symbol.is_local_binding || !uses_member_token_shape_for_likely_count(symbol) {
+            continue;
+        }
         let key = (
             stable_hash(&symbol.language),
             stable_hash(source_scope_key(&symbol.rel_path)),
             symbol.name_hash,
         );
-        let member_symbol = uses_member_token_shape_for_likely_count(symbol);
-        let target_count = target_counts.get(&key).copied().unwrap_or_default();
-        let primary = assignable_targets
-            .contains(symbol.id.as_str())
-            .then(|| if member_symbol { member.get(&key) } else { bare.get(&key) })
-            .flatten();
-        let declaration_fallback = (member_symbol && target_count.bare == 1)
-            .then(|| bare.get(&key))
-            .flatten();
-        references.reserve(
-            primary.map(Vec::len).unwrap_or(0)
-                + declaration_fallback.map(Vec::len).unwrap_or(0),
-        );
-        let candidates = primary
-            .into_iter()
-            .flatten()
-            .chain(
-                declaration_fallback
+        if target_counts.get(&key).is_some_and(|count| count.bare == 1)
+            && !bare_definitions.contains_key(&key)
+        {
+            bare_definitions.insert(
+                key,
+                bare.get(&key)
                     .into_iter()
                     .flatten()
-                    .filter(|candidate| candidate.is_definition()),
+                    .filter(|candidate| candidate.is_definition())
+                    .copied()
+                    .collect(),
             );
-        for candidate in candidates {
-            let rel_path = file_table.get_path(candidate.file_id).unwrap_or("");
-            if overlay.entries.contains_key(rel_path) {
-                continue;
-            }
-            // Find-usages excludes the requested declaration itself. Other
-            // declaration occurrences remain conservative candidates: in
-            // structural type systems an interface member, class member and
-            // contextually typed object property may denote the same member.
-            if rel_path == symbol.rel_path
-                && candidate.start_line == symbol.start_line
-                && candidate.start_column == symbol.start_column
-            {
-                continue;
-            }
-            let edge_kind =
-                edge_kind_str_from_id(candidate.edge_kind_id).unwrap_or("usage");
-            references.push(GraphReference {
-                source_ref_id: format!("ref:{:016x}", candidate.source_ref_id).into(),
-                target_symbol_id: Some(symbol.id.as_str().into()),
-                edge_kind: edge_kind.into(),
-                name: symbol.name.as_str().into(),
-                raw_text: symbol.name.as_str().into(),
-                uri: Box::from(""),
-                rel_path: rel_path.into(),
-                start_line: candidate.start_line,
-                start_column: candidate.start_column,
-                end_line: candidate.end_line,
-                end_column: candidate.end_column,
-                enclosing_symbol_id: enclosing_id_to_string(candidate.enclosing_id)
-                    .map(Into::into),
-                bound_mask: BOUND_MAY,
-                confidence: "possible".into(),
-                provenance: "token-shape".into(),
-            });
         }
-        for (rel_path, entry) in &overlay.entries {
-            for candidate in entry.token_shape_candidates.get(&key).into_iter().flatten() {
-                let primary = assignable_targets.contains(symbol.id.as_str())
-                    && candidate.access_kind_id == if member_symbol { ACCESS_KIND_MEMBER } else { ACCESS_KIND_BARE };
-                let declaration = member_symbol && target_count.bare == 1
-                    && candidate.access_kind_id == ACCESS_KIND_BARE && candidate.is_definition;
-                if !(primary || declaration)
-                    || (rel_path == &symbol.rel_path
-                        && candidate.reference.start_line == symbol.start_line
-                        && candidate.reference.start_column == symbol.start_column)
-                {
-                    continue;
+    }
+    // Invert the overlay's file-major storage once. Visiting every changed
+    // file for every requested symbol turns a broad dependency refresh into
+    // symbols × changed files work, even when most keys are absent.
+    let mut overlay_candidates: HashMap<_, Vec<_>> = HashMap::default();
+    for (path, entry) in &overlay.entries {
+        // A single-symbol query should still perform one indexed lookup per
+        // edited file, rather than scanning every key in a broad overlay.
+        if keys.len() < entry.token_shape_candidates.len() {
+            for key in &keys {
+                if let Some(candidates) = entry.token_shape_candidates.get(key) {
+                    overlay_candidates.entry(*key).or_default().extend(
+                        candidates.iter().map(|candidate| (path.as_str(), candidate)),
+                    );
                 }
-                let mut reference = candidate.reference.clone();
-                reference.target_symbol_id = Some(symbol.id.as_str().into());
-                references.push(reference);
+            }
+            continue;
+        }
+        for (key, candidates) in &entry.token_shape_candidates {
+            if keys.contains(key) {
+                overlay_candidates.entry(*key).or_default().extend(
+                    candidates
+                        .iter()
+                        .map(|candidate| (path.as_str(), candidate)),
+                );
             }
         }
     }
-    Ok(())
+    Ok(LazyTokenShapeReferenceContext {
+        bare,
+        bare_definitions,
+        member,
+        target_counts,
+        assignable_targets,
+        overlay_candidates,
+    })
+}
+
+fn visit_lazy_token_shape_references<'a>(
+    symbols: impl IntoIterator<Item = &'a GraphSymbol>,
+    file_table: &FileTable,
+    overlay: &crate::graph_overlay::GraphOverlay,
+    context: &LazyTokenShapeReferenceContext<'_>,
+    visitor: &mut impl FnMut(&GraphSymbol, LazyTokenShapeReference<'_>),
+) {
+    for symbol in symbols {
+        visit_lazy_token_shape_references_for_symbol(
+            symbol,
+            file_table,
+            overlay,
+            context,
+            &mut |candidate| visitor(symbol, candidate),
+        );
+    }
+}
+
+fn visit_lazy_token_shape_references_for_symbol(
+    symbol: &GraphSymbol,
+    file_table: &FileTable,
+    overlay: &crate::graph_overlay::GraphOverlay,
+    context: &LazyTokenShapeReferenceContext<'_>,
+    visitor: &mut impl FnMut(LazyTokenShapeReference<'_>),
+) {
+    if symbol.is_local_binding {
+        return;
+    }
+    let key = (
+        stable_hash(&symbol.language),
+        stable_hash(source_scope_key(&symbol.rel_path)),
+        symbol.name_hash,
+    );
+    let member_symbol = uses_member_token_shape_for_likely_count(symbol);
+    let target_count = context.target_counts.get(&key).copied().unwrap_or_default();
+    let assignable = context.assignable_targets.contains(symbol.id.as_str());
+    let primary = assignable
+        .then(|| {
+            if member_symbol {
+                context.member.get(&key)
+            } else {
+                context.bare.get(&key)
+            }
+        })
+        .flatten();
+    let declaration_fallback = (member_symbol && target_count.bare == 1)
+        .then(|| context.bare_definitions.get(&key))
+        .flatten();
+    let candidates = primary
+        .into_iter()
+        .flatten()
+        .chain(declaration_fallback.into_iter().flatten());
+    for candidate in candidates {
+        let rel_path = file_table.get_path(candidate.file_id).unwrap_or("");
+        if overlay.entries.contains_key(rel_path) {
+            continue;
+        }
+        // Find-usages excludes the requested declaration itself. Other
+        // declaration occurrences remain conservative candidates: in
+        // structural type systems an interface member, class member and
+        // contextually typed object property may denote the same member.
+        if rel_path == symbol.rel_path
+            && candidate.start_line == symbol.start_line
+            && candidate.start_column == symbol.start_column
+        {
+            continue;
+        }
+        visitor(LazyTokenShapeReference::Base {
+            candidate,
+            rel_path,
+        });
+    }
+    for &(rel_path, candidate) in context.overlay_candidates.get(&key).into_iter().flatten() {
+        let primary = assignable
+            && candidate.access_kind_id
+                == if member_symbol {
+                    ACCESS_KIND_MEMBER
+                } else {
+                    ACCESS_KIND_BARE
+                };
+        let declaration = member_symbol
+            && target_count.bare == 1
+            && candidate.access_kind_id == ACCESS_KIND_BARE
+            && candidate.is_definition;
+        if !(primary || declaration)
+            || (rel_path == symbol.rel_path
+                && candidate.reference.start_line == symbol.start_line
+                && candidate.reference.start_column == symbol.start_column)
+        {
+            continue;
+        }
+        visitor(LazyTokenShapeReference::Overlay(&candidate.reference));
+    }
 }
 
 /// A2 Stage B: rebuild the GLOBAL token-shape references from the persisted
@@ -4748,10 +4926,9 @@ pub fn update_graph_native(
         );
     }
     // A2 Stage B: load the persisted token-shape tally (all shards for v1) and
-    // delta only the CHANGED files (token-shape is purely syntactic, so
-    // importers — which the exact graph re-resolves — contribute nothing here).
-    // Remove every candidate whose file is changed, then re-add candidates from
-    // the freshly parsed changed sites (same key/sort/cap as Stage A's write).
+    // Refresh affected files as well: lexical/import binding evidence decides
+    // whether a syntactic occurrence remains an eligible fallback candidate.
+    // Use phase C's selection just as a full build does.
     let _t = std::time::Instant::now();
     let (mut bare_tally, mut member_tally) = load_token_shape_tally(workspace_root, config, None)?;
     if probe { eprintln!("[flow] load_tally={}ms bare_keys={} member_keys={}", _t.elapsed().as_millis(), bare_tally.len(), member_tally.len()); }
@@ -4772,7 +4949,7 @@ pub fn update_graph_native(
         t
     };
     let _t = std::time::Instant::now();
-    let changed_file_ids: HashSet<u32> = exclude_paths
+    let affected_file_ids: HashSet<u32> = affected_paths
         .iter()
         .filter_map(|p| prior_file_table.get_id(p))
         .collect();
@@ -4781,22 +4958,22 @@ pub fn update_graph_native(
     // (already sorted+capped) order and the whole-tally scan stays cheap.
     let mut bare_touched: AHashSet<(u64, u64, u64)> = AHashSet::default();
     let mut member_touched: AHashSet<(u64, u64, u64)> = AHashSet::default();
-    if !changed_file_ids.is_empty() {
+    if !affected_file_ids.is_empty() {
         for (map, touched) in [
             (&mut bare_tally, &mut bare_touched),
             (&mut member_tally, &mut member_touched),
         ] {
             for (key, cands) in map.iter_mut() {
                 let before = cands.len();
-                cands.retain(|c| !changed_file_ids.contains(&c.file_id));
+                cands.retain(|c| !affected_file_ids.contains(&c.file_id));
                 if cands.len() != before {
                     touched.insert(*key);
                 }
             }
         }
     }
-    // Add candidates from the re-parsed changed/new files' sites. Mirrors
-    // phase_c: every bare/member occurrence is persisted once, including
+    // Add candidates from the re-resolved affected files' sites. Mirrors
+    // phase_c: eligible bare/member occurrences are persisted once, including
     // declarations used by the lazy structural fallback; only non-definitions
     // contribute to eager usage counts. Key = (lang_hash, scope_hash,
     // name_hash) with scope = top-level dir. file_id comes from the
@@ -4805,8 +4982,13 @@ pub fn update_graph_native(
     // skipped) with an id the next update can resolve.
     let mut bare_added: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>> = HashMap::default();
     let mut member_added: HashMap<(u64, u64, u64), Vec<TokenShapeCandidate>> = HashMap::default();
-    for site in &ref_sites {
-        if !exclude_paths.contains(&*site.rel_path) {
+    let eligible_candidates = usage_counts::candidate_mask(
+        ref_sites.len(),
+        &intermediate.bare_likely_sites_by_scope_and_name,
+        &intermediate.member_likely_sites_by_scope_and_name,
+    );
+    for (index, site) in ref_sites.iter().enumerate() {
+        if !affected_paths.contains(&*site.rel_path) || !eligible_candidates[index] {
             continue;
         }
         let access = site.access_kind_id;
@@ -5465,6 +5647,11 @@ pub fn overlay_update_graph_native(
     // map-build that dominates the floor of a low-fanout edit. (This is an
     // overlay-path-only narrowing; the full `update_graph_native` is unchanged.)
     let aff_import_facts = import_facts_for_resolution(&import_facts, &affected_paths, &ref_sites);
+    // Imported calls also need their provider's return annotation, even when
+    // that provider did not change and is outside the affected-file set.
+    let return_provider_paths: HashSet<&str> = aff_import_facts.iter()
+        .flat_map(|fact| fact.module_candidates.iter().map(String::as_str))
+        .collect();
     let aff_type_facts: Vec<TypeFact> = type_facts
         .iter()
         .filter(|f| affected_paths.contains(&f.rel_path))
@@ -5472,7 +5659,7 @@ pub fn overlay_update_graph_native(
         .collect();
     let aff_return_facts: Vec<FunctionReturnFact> = function_return_facts
         .iter()
-        .filter(|f| affected_paths.contains(&f.rel_path))
+        .filter(|f| affected_paths.contains(&f.rel_path) || return_provider_paths.contains(f.rel_path.as_str()))
         .cloned()
         .collect();
     let t = std::time::Instant::now();
@@ -5641,7 +5828,11 @@ pub fn overlay_update_graph_native(
         if deleted_rel.contains(path) { overlay.binding_facts.remove(path); }
         else { overlay.binding_facts.insert(path.clone(), facts_by_file.remove(path).unwrap_or_default()); }
     }
-    let mut candidates_by_file = usage_counts::overlay_candidates(&ref_sites);
+    let mut candidates_by_file = usage_counts::overlay_candidates(
+        &ref_sites,
+        &intermediate.bare_likely_sites_by_scope_and_name,
+        &intermediate.member_likely_sites_by_scope_and_name,
+    );
     // Changed (non-deleted) files: supersede base refs + symbols.
     for rel in exclude_paths.iter().filter(|r| !deleted_rel.contains(*r)) {
         let refs = refs_by_file.remove(rel).unwrap_or_default();
@@ -17434,8 +17625,11 @@ fn build_resolve_candidate_symbols(
         name_hashes.insert(stable_hash(&fact.local_name));
         seed_type_name_hashes(&fact.type_name, &mut name_hashes);
     }
+    let return_provider_paths: HashSet<&str> = import_facts.iter()
+        .flat_map(|fact| fact.module_candidates.iter().map(String::as_str))
+        .collect();
     for fact in function_return_facts {
-        if !affected_paths.contains(&fact.rel_path) {
+        if !affected_paths.contains(&fact.rel_path) && !return_provider_paths.contains(fact.rel_path.as_str()) {
             continue;
         }
         name_hashes.insert(stable_hash(&fact.function_name));
@@ -17569,12 +17763,27 @@ fn read_symbols_for_symbol_ids_indexed(
     } else {
         FileTable::default()
     };
+    read_symbols_for_symbol_ids_with_table(workspace_root, config, symbol_ids, &file_table)
+}
+
+// A count operation already owns the file table for its immutable base. Keep
+// hierarchy/container lookups on that same table instead of decoding every
+// workspace path again for each container.
+fn read_symbols_for_symbol_ids_with_table(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    symbol_ids: &HashSet<String>,
+    file_table: &FileTable,
+) -> io::Result<Vec<GraphSymbol>> {
+    if symbol_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     if !graph_shard_family_available(workspace_root, config, GRAPH_SYMBOL_ID_SHARD_PREFIX) {
         let symbol_path = graph_symbol_index_path(workspace_root, config);
         if !symbol_path.exists() {
             return Ok(Vec::new());
         }
-        return read_symbols_matching(&symbol_path, &file_table, |s| {
+        return read_symbols_matching(&symbol_path, file_table, |s| {
             symbol_ids.contains(&s.id)
         });
     }
@@ -17601,11 +17810,11 @@ fn read_symbols_for_symbol_ids_indexed(
             }
             return read_symbols_matching(
                 &symbol_path,
-                &file_table,
+                file_table,
                 |s| symbol_ids.contains(&s.id),
             );
         }
-        symbols.extend(read_symbols_with_ids(&shard_path, &file_table, &shard_symbol_ids)?);
+        symbols.extend(read_symbols_with_ids(&shard_path, file_table, &shard_symbol_ids)?);
     }
     Ok(symbols)
 }
@@ -17676,15 +17885,18 @@ fn read_method_candidates_for_container_names_indexed(
     config: &EngineConfig,
     container_names: &HashSet<String>,
 ) -> io::Result<Vec<GraphSymbol>> {
+    let ids = read_method_candidate_ids_for_container_names_indexed(workspace_root, config, container_names)?;
+    read_symbols_for_symbol_ids_indexed(workspace_root, config, &ids)
+}
+
+fn read_method_candidate_ids_for_container_names_indexed(
+    workspace_root: &Path,
+    config: &EngineConfig,
+    container_names: &HashSet<String>,
+) -> io::Result<HashSet<String>> {
     if container_names.is_empty() {
-        return Ok(Vec::new());
+        return Ok(HashSet::new());
     }
-    let file_table_path = graph_file_table_path(workspace_root, config);
-    let file_table = if file_table_path.exists() {
-        read_file_table_binary(&file_table_path).unwrap_or_default()
-    } else {
-        FileTable::default()
-    };
     let mut by_shard: BTreeMap<usize, HashSet<String>> = BTreeMap::new();
     for container_name in container_names {
         for lookup_key in graph_name_lookup_keys(container_name) {
@@ -17714,11 +17926,7 @@ fn read_method_candidates_for_container_names_indexed(
             }
         }
     }
-    drop(file_table);
-    if candidate_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    read_symbols_for_symbol_ids_indexed(workspace_root, config, &candidate_ids)
+    Ok(candidate_ids)
 }
 
 fn read_hierarchy_children_for_parent_keys_indexed(
@@ -18146,6 +18354,104 @@ struct ReferenceCountReadContext<'a> {
     shard_cache: Option<CountShardCache>,
 }
 
+// Counts need only the query union's occurrence identity. Keep the original
+// target spelling until the final aggregation, just as the list deduper does.
+// Canonical numeric source ids avoid a formatted string for each lazy row;
+// opaque ids and location fallbacks retain their exact existing semantics.
+#[derive(Hash, PartialEq, Eq)]
+enum CountSourceOccurrence {
+    Id(u64),
+    OpaqueId(Box<str>),
+    Position(Box<str>, u32, u32),
+}
+
+impl CountSourceOccurrence {
+    fn from_reference(reference: &GraphReference) -> Self {
+        let id = reference.source_ref_id.as_ref();
+        if let Some(hex) = id.strip_prefix("ref:") {
+            if hex.len() == 16
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                if let Ok(value) = u64::from_str_radix(hex, 16) {
+                    return Self::Id(value);
+                }
+            }
+        }
+        if !id.is_empty() {
+            return Self::OpaqueId(id.into());
+        }
+        Self::Position(
+            reference.rel_path.clone(),
+            reference.start_line,
+            reference.start_column,
+        )
+    }
+}
+
+#[derive(Default)]
+struct ReferenceOccurrenceCounts {
+    occurrences: AHashMap<String, TargetReferenceOccurrences>,
+}
+
+#[derive(Default)]
+struct TargetReferenceOccurrences {
+    // Almost every persisted occurrence has a canonical numeric id. Do not
+    // pay for the larger opaque-id/location enum in every numeric hash slot.
+    numeric: AHashSet<u64>,
+    other: AHashSet<CountSourceOccurrence>,
+}
+
+impl TargetReferenceOccurrences {
+    fn insert(&mut self, occurrence: CountSourceOccurrence) {
+        match occurrence {
+            CountSourceOccurrence::Id(value) => {
+                self.numeric.insert(value);
+            }
+            other => {
+                self.other.insert(other);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.numeric.len() + self.other.len()
+    }
+}
+
+impl ReferenceOccurrenceCounts {
+    fn target(&mut self, target: &str) -> &mut TargetReferenceOccurrences {
+        self.occurrences.entry(target.to_string()).or_default()
+    }
+
+    fn insert(&mut self, target: &str, occurrence: CountSourceOccurrence) {
+        if let Some(occurrences) = self.occurrences.get_mut(target) {
+            occurrences.insert(occurrence);
+        } else {
+            let mut occurrences = TargetReferenceOccurrences::default();
+            occurrences.insert(occurrence);
+            self.occurrences.insert(target.to_string(), occurrences);
+        }
+    }
+
+    fn insert_reference(&mut self, reference: &GraphReference) {
+        if let Some(target) = reference.target_symbol_id.as_deref() {
+            self.insert(target, CountSourceOccurrence::from_reference(reference));
+        }
+    }
+
+    fn into_counts(self) -> HashMap<String, usize> {
+        let mut counts = HashMap::default();
+        for (target, occurrences) in self.occurrences {
+            if occurrences.len() != 0 {
+                *counts.entry(target.to_ascii_lowercase()).or_default() += occurrences.len();
+            }
+        }
+        counts
+    }
+}
+
 fn deduped_reference_counts_with_context(
     workspace_root: &Path,
     config: &EngineConfig,
@@ -18155,9 +18461,23 @@ fn deduped_reference_counts_with_context(
     member_families: &mut HashMap<String, Option<MemberImplementationFamily>>,
     context: &mut ReferenceCountReadContext<'_>,
 ) -> io::Result<HashMap<String, usize>> {
-    if symbol_ids.is_empty() { return Ok(HashMap::new()); }
-    let ids_lower: HashSet<String> = symbol_ids.iter().map(|id| id.to_ascii_lowercase()).collect();
-    let mut references: Vec<GraphReference> = Vec::new();
+    if symbol_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids_lower: HashSet<String> = symbol_ids
+        .iter()
+        .map(|id| id.to_ascii_lowercase())
+        .collect();
+    let lazy = load_lazy_token_shape_reference_context(
+        workspace_root,
+        config,
+        symbols,
+        context.file_table,
+        overlay,
+        member_families,
+        context.shard_cache.as_mut(),
+    )?;
+    let mut occurrences = ReferenceOccurrenceCounts::default();
     if context.sharded_references {
         let mut shards: BTreeMap<usize, Vec<String>> = BTreeMap::new();
         for id in &ids_lower {
@@ -18167,8 +18487,12 @@ fn deduped_reference_counts_with_context(
                 .push(id.clone());
         }
         for (shard, shard_ids) in shards {
-            let path =
-                graph_shard_path(workspace_root, config, GRAPH_REFERENCE_TARGET_SHARD_PREFIX, shard);
+            let path = graph_shard_path(
+                workspace_root,
+                config,
+                GRAPH_REFERENCE_TARGET_SHARD_PREFIX,
+                shard,
+            );
             if !path.exists() {
                 continue;
             }
@@ -18178,7 +18502,8 @@ fn deduped_reference_counts_with_context(
             let shard_id_values: HashSet<u64> = shard_set
                 .iter()
                 .filter_map(|id| {
-                    parse_stable_symbol_id_to_u64(id).filter(|value| format!("sym:{value:016x}") == *id)
+                    parse_stable_symbol_id_to_u64(id)
+                        .filter(|value| format!("sym:{value:016x}") == *id)
                 })
                 .collect();
             let matches = |r: &GraphReference| {
@@ -18197,9 +18522,13 @@ fn deduped_reference_counts_with_context(
                     ReferenceTargetField::Inline(_) => true,
                 };
                 if candidate {
-                    let reference = parse_reference_binary(&bytes, &mut cursor, context.file_table)?;
-                    if matches(&reference) {
-                        references.push(reference);
+                    let reference =
+                        parse_reference_binary(&bytes, &mut cursor, context.file_table)?;
+                    if matches(&reference)
+                        && !overlay.entries.contains_key(&*reference.rel_path)
+                        && (symbols.is_empty() || lazy.accepts_reference(&reference))
+                    {
+                        occurrences.insert_reference(&reference);
                     }
                 }
                 cursor = end;
@@ -18208,34 +18537,51 @@ fn deduped_reference_counts_with_context(
     } else {
         let relation_path = graph_index_path(workspace_root, config);
         if relation_path.exists() {
-            references.extend(read_references_matching(&relation_path, |fields, offset| {
+            let references = read_references_matching(&relation_path, |fields, offset| {
                 Ok(ids_lower.contains(&fields[1 + offset].to_ascii_lowercase()))
-            })?);
-        }
-    }
-    references.retain(|r| !overlay.entries.contains_key(&*r.rel_path));
-    references.extend(overlay.live_refs().filter(|r| r.target_symbol_id.as_deref()
-        .is_some_and(|target| ids_lower.contains(&target.to_ascii_lowercase()))).cloned());
-    append_lazy_token_shape_references_with_overlay_and_families(
-        workspace_root,
-        config,
-        symbols,
-        context.file_table,
-        &mut references,
-        overlay,
-        member_families,
-        context.shard_cache.as_mut(),
-    )?;
-    let mut counts: HashMap<String, usize> = HashMap::default();
-    for reference in dedupe_graph_references_by_source_occurrence(references) {
-        if let Some(target) = reference.target_symbol_id.as_deref() {
-            let key = target.to_ascii_lowercase();
-            if ids_lower.contains(&key) {
-                *counts.entry(key).or_default() += 1;
+            })?;
+            for reference in references {
+                if !overlay.entries.contains_key(&*reference.rel_path)
+                    && (symbols.is_empty() || lazy.accepts_reference(&reference))
+                {
+                    occurrences.insert_reference(&reference);
+                }
             }
         }
     }
-    Ok(counts)
+    for reference in overlay.live_refs().filter(|r| {
+        r.target_symbol_id
+            .as_deref()
+            .is_some_and(|target| ids_lower.contains(&target.to_ascii_lowercase()))
+    }) {
+        if symbols.is_empty() || lazy.accepts_reference(reference) {
+            occurrences.insert_reference(reference);
+        }
+    }
+    for symbol in symbols
+        .iter()
+        .filter(|symbol| ids_lower.contains(&symbol.id.to_ascii_lowercase()))
+    {
+        let target_occurrences = occurrences.target(&symbol.id);
+        visit_lazy_token_shape_references_for_symbol(
+            symbol,
+            context.file_table,
+            overlay,
+            &lazy,
+            &mut |candidate| {
+                let occurrence = match candidate {
+                    LazyTokenShapeReference::Base { candidate, .. } => {
+                        CountSourceOccurrence::Id(candidate.source_ref_id)
+                    }
+                    LazyTokenShapeReference::Overlay(reference) => {
+                        CountSourceOccurrence::from_reference(reference)
+                    }
+                };
+                target_occurrences.insert(occurrence);
+            },
+        );
+    }
+    Ok(occurrences.into_counts())
 }
 
 fn apply_count_options(
@@ -20084,6 +20430,50 @@ mod tests {
         assert_eq!(deduped.len(), 1);
         assert_eq!(&*deduped[0].confidence, "exact");
         assert_eq!(&*deduped[0].edge_kind, "call");
+    }
+
+    #[test]
+    fn streamed_count_identity_matches_list_union_for_ids_and_locations() {
+        let base = test_graph_reference("possible", "token-shape", "usage");
+        let mut references = vec![base.clone(), test_graph_reference("exact", "semantic", "call")];
+        for source in ["ref:000000000000000a", "ref:000000000000000A", "opaque-source"] {
+            let mut reference = base.clone();
+            reference.source_ref_id = source.into();
+            references.push(reference.clone());
+            reference.confidence = "exact".into();
+            references.push(reference);
+        }
+        let mut position = base.clone();
+        position.source_ref_id = "".into();
+        references.push(position.clone());
+        let mut same_position = position.clone();
+        same_position.uri = "file:///another-spelling/source.py".into();
+        same_position.end_column += 1;
+        references.push(same_position);
+        position.start_column += 1;
+        references.push(position.clone());
+        position.rel_path = "another.py".into();
+        references.push(position);
+        let mut other_target = base.clone();
+        other_target.target_symbol_id = Some("sym:0000000000000009".into());
+        references.push(other_target);
+        let mut differently_spelled_target = base.clone();
+        differently_spelled_target.target_symbol_id = Some("SYM:0000000000000002".into());
+        references.push(differently_spelled_target);
+        let mut unbound = base;
+        unbound.target_symbol_id = None;
+        references.push(unbound);
+        let mut streamed = ReferenceOccurrenceCounts::default();
+        for reference in &references { streamed.insert_reference(reference); }
+        let mut listed = HashMap::default();
+        for reference in dedupe_graph_references_by_source_occurrence(references) {
+            if let Some(target) = reference.target_symbol_id {
+                *listed.entry(target.to_ascii_lowercase()).or_insert(0usize) += 1;
+            }
+        }
+        assert_eq!(listed.get("sym:0000000000000002"), Some(&8));
+        assert_eq!(listed.get("sym:0000000000000009"), Some(&1));
+        assert_eq!(streamed.into_counts(), listed);
     }
 
     // A2 Stage B verification gate (ignored — needs the external captain2 corpus

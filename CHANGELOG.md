@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7162 - 2026-10-09
+
+- Counted reference occurrence identities directly, grouped live candidates by key and reused the immutable file table for inheritance lookups during usage indexing.
+- Shared full-build candidate selection with incremental updates and compaction so proven local/import bindings do not become unrelated same-name usages.
+- Retained return annotations from unchanged imported providers while resolving edited consumers.
+- Invalidated older graph/count overlays once to rebuild them with the corrected selection rules.
+- Restricted TypeScript compilation to the source directory so generated benchmark trees cannot enter the extension build.
+
 ## 0.1.7161 - 2026-10-09
 
 - Retained saved changes, deletions and renames when the runtime is temporarily unavailable or the search index is not ready; retry after preparation recovers.
