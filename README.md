@@ -6,7 +6,7 @@ Open **IntelliJ Search: Search**, enter a query, and press **Enter** or **Run**.
 
 ## See it in use
 
-Watch the short demos below. Each has an MP4 link with playback controls and a still image for a motion-free view.
+Watch the short demos below, download an MP4 to pause and replay, or open a still image for a motion-free view.
 
 ### 1. Find a match and read its context
 
@@ -14,7 +14,7 @@ Search for `scheduleTask`, then select a result to see the surrounding file in t
 
 ![Search demo: enter scheduleTask, run the search, and select its declaration to read the surrounding code.](resources/marketplace/01-search.gif)
 
-8-second demo · [Play MP4](resources/marketplace/01-search.mp4?raw=true) · [View still](resources/marketplace/01-search.png)
+8-second demo · [Download MP4](resources/marketplace/01-search.mp4?raw=true) · [View still](resources/marketplace/01-search.png)
 
 ### 2. Focus on the files that matter
 
@@ -34,7 +34,7 @@ Edit the selected file in the preview, then click **Save** or press **Cmd/Ctrl+S
 
 ![Edit demo: change the preview's default delay from 1000 to 1500, then save and clear the modified indicator.](resources/marketplace/04-edit.gif)
 
-7-second demo · [Play MP4](resources/marketplace/04-edit.mp4?raw=true) · [View still](resources/marketplace/04-edit.png)
+7-second demo · [Download MP4](resources/marketplace/04-edit.mp4?raw=true) · [View still](resources/marketplace/04-edit.png)
 
 ### 5. Follow a symbol's usages
 
@@ -42,7 +42,7 @@ After building the graph index, click an inline **usages** link beside a symbol 
 
 ![Usages demo: click scheduleTask's usages link, then select a resolved reference to preview its caller.](resources/marketplace/05-usages.gif)
 
-7-second demo · [Play MP4](resources/marketplace/05-usages.mp4?raw=true) · [View still](resources/marketplace/05-usages.png)
+7-second demo · [Download MP4](resources/marketplace/05-usages.mp4?raw=true) · [View still](resources/marketplace/05-usages.png)
 
 These captures show the running extension in a small TypeScript example project, with idle pauses shortened. Result counts and available language features vary with your workspace.
 

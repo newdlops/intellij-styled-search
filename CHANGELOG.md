@@ -2,7 +2,7 @@
 
 ## 0.1.7165 - 2026-10-15
 
-- Added short recordings of workspace search, preview editing and saving, and usage navigation to the Marketplace overview, with inline GIFs, MP4 playback links, and still-image alternatives.
+- Added short recordings of workspace search, preview editing and saving, and usage navigation to the Marketplace overview, with inline GIFs, MP4 downloads, and still-image alternatives.
 - Documented the real-window capture and file-only encoding workflow.
 
 ## 0.1.7164 - 2026-10-15

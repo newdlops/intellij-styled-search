@@ -10,7 +10,7 @@ Show a developer evaluating one task at a time: search, scope, recall, edit, the
 - Use a consistent panel crop that includes the query, Files scope, result list, preview path, and editor. The current exports are normalized to 2010 × 1288 PNGs; prefer a 2× display for crisp text.
 - Wait for search and language-feature warmup to finish. Clear unrelated notifications. Keep the selected match and useful code context visible.
 - Keep meaningful image alt text and relative image paths in the overview. Verify the assets are included by `vsce ls --no-dependencies`.
-- Put animated GIFs inline, with separate MP4 playback and still-image links. Keep the animations short and silent; the stills provide a motion-free alternative.
+- Put animated GIFs inline, with separate MP4 download and still-image links. Keep the animations short and silent; the stills provide a motion-free alternative.
 - Separately exercise search execution, regex/scope filtering, keyboard history recall, editing/saving, and a usage-link click. A screenshot alone does not verify these behaviors.
 
 ## Prepare an isolated workspace
