@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.7165 - 2026-10-15
+
+- Added short recordings of workspace search, preview editing and saving, and usage navigation to the Marketplace overview, with inline GIFs, MP4 playback links, and still-image alternatives.
+- Documented the real-window capture and file-only encoding workflow.
+
 ## 0.1.7164 - 2026-10-15
 
 - Replaced the Marketplace overview's old screenshot with five current usage stills covering search, Files scope, history, preview editing, and usage navigation. Updated command names and setup behavior, with detailed MCP and contributor guides linked separately.

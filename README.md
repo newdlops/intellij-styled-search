@@ -6,13 +6,15 @@ Open **IntelliJ Search: Search**, enter a query, and press **Enter** or **Run**.
 
 ## See it in use
 
-Click a still to view it at full size.
+Watch the short demos below. Each has an MP4 link with playback controls and a still image for a motion-free view.
 
 ### 1. Find a match and read its context
 
 Search for `scheduleTask`, then select a result to see the surrounding file in the embedded editor. Drag the title bar to move the panel, resize it from the corner, or adjust the results/preview split.
 
-[![Workspace search for scheduleTask with matching lines and a syntax-highlighted source preview.](resources/marketplace/01-search.png)](resources/marketplace/01-search.png)
+![Search demo: enter scheduleTask, run the search, and select its declaration to read the surrounding code.](resources/marketplace/01-search.gif)
+
+8-second demo · [Play MP4](resources/marketplace/01-search.mp4?raw=true) · [View still](resources/marketplace/01-search.png)
 
 ### 2. Focus on the files that matter
 
@@ -30,15 +32,19 @@ Open **History** or press **Alt+H** to filter executed queries and recall one wi
 
 Edit the selected file in the preview, then click **Save** or press **Cmd/Ctrl+S**. The modified indicator and enabled Save button show pending changes. Language features such as hover, completion, and navigation use the providers available in your VS Code installation.
 
-[![Editable source preview with a modified scheduling delay, a pending-change indicator, and an enabled Save button.](resources/marketplace/04-edit.png)](resources/marketplace/04-edit.png)
+![Edit demo: change the preview's default delay from 1000 to 1500, then save and clear the modified indicator.](resources/marketplace/04-edit.gif)
+
+7-second demo · [Play MP4](resources/marketplace/04-edit.mp4?raw=true) · [View still](resources/marketplace/04-edit.png)
 
 ### 5. Follow a symbol's usages
 
-After building the graph index, click an inline **usages** link beside a symbol to open its references in the same panel. Results show confidence labels. When candidate references are available, **Cand** toggles their visibility; **More** loads the next page when needed.
+After building the graph index, click an inline **usages** link beside a symbol to open its references in a usage-results panel. Select a result to preview its calling code. Results show confidence labels. When candidate references are available, **Cand** toggles their visibility; **More** loads the next page when needed.
 
-[![Find Usages for scheduleTask with resolved reference labels and the selected caller shown in the preview.](resources/marketplace/05-usages.png)](resources/marketplace/05-usages.png)
+![Usages demo: click scheduleTask's usages link, then select a resolved reference to preview its caller.](resources/marketplace/05-usages.gif)
 
-These stills come from the running extension in a small TypeScript example project. Result counts and available language features vary with your workspace.
+7-second demo · [Play MP4](resources/marketplace/05-usages.mp4?raw=true) · [View still](resources/marketplace/05-usages.png)
+
+These captures show the running extension in a small TypeScript example project, with idle pauses shortened. Result counts and available language features vary with your workspace.
 
 ## Get started
 
@@ -106,7 +112,7 @@ See the [MCP setup and tool guide](docs/mcp.md) for client configuration, health
 
 ## Development
 
-See the [runtime and development guide](docs/development.md), [release instructions](DEPLOY.md), and [Marketplace screenshot guide](docs/marketplace-captures.md).
+See the [runtime and development guide](docs/development.md), [release instructions](DEPLOY.md), and [Marketplace capture guide](docs/marketplace-captures.md).
 
 ```bash
 npm install
