@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.7164 - 2026-10-15
+
+- Replaced the Marketplace overview's old screenshot with five current usage stills covering search, Files scope, history, preview editing, and usage navigation. Updated command names and setup behavior, with detailed MCP and contributor guides linked separately.
+- Allowed preview saves when the submitted edits are already present in VS Code's shared native document model, while still rejecting different concurrent changes.
+
 ## 0.1.7163 - 2026-10-09
 
 - Added workspace-owned History for Files scope Ant patterns, preserving complete folder/file-type and exclusion combinations, with filtering, keyboard recall and draft restoration.

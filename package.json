@@ -1,8 +1,8 @@
 {
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
-  "description": "IntelliJ IDEA style project search — peek-like movable panel with workspace file results",
-  "version": "0.1.7163",
+  "description": "IntelliJ-style workspace search with scoped results, editable previews, search history, and usage navigation.",
+  "version": "0.1.7164",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",

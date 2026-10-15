@@ -1,213 +1,115 @@
 # IntelliJ Styled Search
 
-IntelliJ Styled Search adds an IntelliJ IDEA-like project search panel to VS Code. It opens as a movable overlay, streams workspace results, and shows an editable Monaco preview for the selected match.
+Search your workspace in a movable IntelliJ IDEA-style panel for VS Code. Narrow the results, read and edit the matching code in place, and follow symbol usages without losing your working context.
 
-![IntelliJ Styled Search preview](intellijfind.png)
+Open **IntelliJ Search: Search**, enter a query, and press **Enter** or **Run**. See [keyboard shortcuts](#get-started).
+
+## See it in use
+
+Click a still to view it at full size.
+
+### 1. Find a match and read its context
+
+Search for `scheduleTask`, then select a result to see the surrounding file in the embedded editor. Drag the title bar to move the panel, resize it from the corner, or adjust the results/preview split.
+
+[![Workspace search for scheduleTask with matching lines and a syntax-highlighted source preview.](resources/marketplace/01-search.png)](resources/marketplace/01-search.png)
+
+### 2. Focus on the files that matter
+
+Set **Files scope** to `src/**, !**/*.test.ts` to search source files while excluding tests. Combine scope with case-sensitive, whole-word, regex, or multiline search. Each workspace remembers its last scope, including an empty scope.
+
+[![Regex search for schedule(Task|Batch), limited to src/** with test files excluded.](resources/marketplace/02-scope.png)](resources/marketplace/02-scope.png)
+
+### 3. Bring back a previous search
+
+Open **History** or press **Alt+H** to filter executed queries and recall one with the keyboard. Files scope has its own workspace history. Selecting a history entry restores it; press **Enter** or **Run** when ready.
+
+[![Search history filtered by schedule, showing previous queries above the current results.](resources/marketplace/03-history.png)](resources/marketplace/03-history.png)
+
+### 4. Make a small edit right in the preview
+
+Edit the selected file in the preview, then click **Save** or press **Cmd/Ctrl+S**. The modified indicator and enabled Save button show pending changes. Language features such as hover, completion, and navigation use the providers available in your VS Code installation.
+
+[![Editable source preview with a modified scheduling delay, a pending-change indicator, and an enabled Save button.](resources/marketplace/04-edit.png)](resources/marketplace/04-edit.png)
+
+### 5. Follow a symbol's usages
+
+After building the graph index, click an inline **usages** link beside a symbol to open its references in the same panel. Results show confidence labels. When candidate references are available, **Cand** toggles their visibility; **More** loads the next page when needed.
+
+[![Find Usages for scheduleTask with resolved reference labels and the selected caller shown in the preview.](resources/marketplace/05-usages.png)](resources/marketplace/05-usages.png)
+
+These stills come from the running extension in a small TypeScript example project. Result counts and available language features vary with your workspace.
+
+## Get started
+
+Open a project folder, then run **IntelliJ Search: Search** from the Command Palette or **IntelliJ Search → Search** in the editor context menu. Selected text, or the word at the cursor, prefills the query. Opening the panel does not run the prefilled query by default; press **Enter** or **Run** when ready.
+
+- **macOS:** `Cmd+Shift+Alt+F` searches from the editor; `Cmd+Shift+Alt+P` opens search anywhere.
+- **Windows / Linux:** `Ctrl+Shift+Alt+F` searches from the editor; `Ctrl+Shift+Alt+P` opens search anywhere.
 
 ## Features
 
-- Find in project from a movable IntelliJ-style overlay.
-- Search the selected text directly from the editor context menu or keybinding.
-- Preview matches in an embedded Monaco editor with installed VS Code TextMate grammars, immediate lexical hover, and VS Code semantic hover, completions, navigation, diagnostics, and semantic highlighting relayed into the bundled editor.
-- Narrow large searches with a local trigram index, then verify results with ripgrep.
-- Support literal, regex, case-sensitive, whole-word, and multi-line searches.
-- Keep results responsive by streaming matches and showing candidate files while ripgrep is still running.
+- Movable, resizable search panel with streamed results and an editable Monaco preview.
+- Literal, case-sensitive, whole-word, regex, and multiline search; **Shift+Enter** adds a query line. **ML** enables regex dotAll when regex is on.
+- Ant-style include/exclude patterns and workspace-specific Files scope persistence.
+- Filterable query and scope histories, with **↑/↓** recall and draft restoration. **Alt+↑/↓** navigates results.
+- Local Rust search index (`zoekt`), with a `codesearch`/ripgrep fallback while the native runtime or index is unavailable. Saved file changes update the index incrementally.
+- Graph-backed usage navigation and optional local Codeidx MCP access for coding agents.
+
+## Index setup
+
+Run **IntelliJ Search: Force Rebuild Search + Graph Index** to prepare or refresh both indexes. Initial searches can use fallback while the native index is unavailable; startup does not build it automatically with the default settings. Use **IntelliJ Search: Show Index Health** to inspect readiness and pending updates.
+
+This extension targets desktop VS Code. The universal release bundles Windows x64 and Apple Silicon macOS native runtimes. Other platforms need a matching runtime or Cargo for a local build; text search can fall back to `codesearch`. Preview language features depend on installed language extensions.
 
 ## Commands
 
-| Command | Description |
+The Command Palette exposes these commands under **IntelliJ Search**:
+
+| Command | What it does |
 | --- | --- |
-| `IntelliJ Search: Find in Path (IntelliJ Style)` | Open the search panel. |
-| `IntelliJ Search: Find Selection in Project` | Search the current selection. |
-| `IntelliJ Search: Reinject Renderer Patch (Recovery)` | Reinstall the renderer overlay if VS Code's renderer state changes. |
-| `IntelliJ Search: Rebuild Search Index` | Rebuild the trigram search index. |
-| `IntelliJ Search: Switch Search Engine` | Switch between `zoekt` and `codesearch`, then rebuild the selected engine. |
-| `IntelliJ Search: Show Zoekt Diagnostics` | Print shard, overlay, journal, and process stats for the Rust engine. |
-| `IntelliJ Search: Explain Query With Zoekt` | Print the Rust engine's candidate plan for a query. |
-| `IntelliJ Search: Diagnose Active File in Search Index` | Inspect why the active file may not be in the index. |
-| `IntelliJ Search: Start Codeidx MCP Server` | Start the local Codeidx MCP endpoint for Codex, Claude, and other MCP clients. |
-| `IntelliJ Search: Stop Codeidx MCP Server` | Stop the local Codeidx MCP endpoint. |
+| `Search` | Open the panel with the selection or word at the cursor. |
+| `Show Candidate Usages` | Show candidate references for the current usage query or symbol. |
+| `Toggle Candidate Usages` | Toggle candidate references for the last usage query. |
+| `Force Rebuild Search + Graph Index` | Rebuild search, then force a graph rebuild. |
+| `Show Index Health` | Write index, freshness, and MCP status to the output log. |
+| `Select Search Mode` | Choose an indexed, fallback, symbol, or reference search preset. |
+| `Benchmark Against rg` | Compare a query against ripgrep and report timings. |
+| `Diagnose Preview Intellisense (probe Pylance for last previewed URI)` | Inspect language-provider behavior for the last previewed file. |
+| `Start Codeidx MCP Server` | Start the workspace's local MCP endpoint. |
+| `Stop Codeidx MCP Server` | Stop the local endpoint. |
+| `Restart Codeidx MCP Server` | Restart the local endpoint. |
 
-## MCP Usage
+## Common settings
 
-This repository includes project MCP config files:
+All names below start with `intellijStyledSearch.`.
 
-- `.mcp.json` for Claude Code project-scoped MCP discovery.
-- `.codex/config.toml` for Codex project-scoped MCP configuration when supported by the installed Codex CLI.
-
-The MCP clients spawn a stdio proxy, but the proxy still needs the VS Code extension's localhost endpoint. In trusted workspaces the extension auto-starts that endpoint by default. Each VS Code window binds an OS-assigned free port and writes the actual URL to `.codeidx/mcp-server.json`, so multiple projects can run at the same time without sharing a fixed port. The extension also writes `.codeidx/codeidx-mcp-stdio.js`, which lets project MCP configs launch the proxy through `node` without depending on a global `codeidx-mcp` binary. Auto-setup writes only project-local MCP config files such as `.mcp.json` and `.codex/config.toml`; it does not write `~/.codex/config.toml` or any other user/global MCP config.
-
-Manual stdio proxy command:
-
-```bash
-codeidx-mcp stdio --workspace .
-```
-
-From a workspace where the extension has started, use the generated project launcher:
-
-```bash
-node .codeidx/codeidx-mcp-stdio.js stdio --workspace .
-```
-
-The proxy discovers the VS Code endpoint from `.codeidx/mcp-server.json` and verifies that the endpoint reports the same workspace ID. A stale `CODEIDX_MCP_URL` from another VS Code window is ignored instead of pinning the proxy to the wrong project. If you disable `intellijStyledSearch.mcpAutoStart`, the extension still publishes a workspace-local control API in `.codeidx/mcp-control.json`; agents can call `mcp_start` from the stopped stdio fallback to ask that VS Code window to start the workspace MCP endpoint. You can also pass the URL explicitly:
-
-```bash
-codeidx-mcp stdio --url http://127.0.0.1:<port>/mcp
-```
-
-Codex should use the generated project-scoped `.codex/config.toml` when your Codex CLI supports it. Avoid `codex mcp add` for this launcher when it writes to `~/.codex/config.toml`, because user/global MCP config can pin `codeidx` to one workspace. If a global entry is necessary, use a cwd-based command rather than a project-specific `.codeidx/codeidx-mcp-stdio.js` absolute path.
-
-Claude Code example:
-
-```bash
-claude mcp add --transport stdio codeidx -- node .codeidx/codeidx-mcp-stdio.js stdio --workspace .
-```
-
-Claude Code also auto-detects the checked-in `.mcp.json` after you approve the project-scoped MCP server.
-
-Useful MCP self-check tools:
-
-- `mcp_health`: verifies the MCP connection and reports endpoint, discovery file, capabilities, index status, and the agent startup policy.
-- `mcp_start`: when `mcp_health` reports `health.mcp_connection == "stopped"` and `control.available == true`, asks the VS Code extension control API to start this workspace's MCP endpoint.
-
-Agents should initialize codeidx with `mcp_health({ "include_agent_policy": true, "include_discovery": true })`, then follow the policy returned in `agent_policy`. If health reports `health.mcp_connection == "stopped"` and the stopped stdio fallback advertises `mcp_start`, call `mcp_start` once, rediscover, then call `mcp_health` again before using search, symbol, reference, or graph tools. Unless higher-priority user or project policy such as `AGENTS.md`, `CLAUDE.md`, or direct user instructions says otherwise, agents should automatically use codeidx before broad grep or whole-file reads: use `codeidx_probe`/`codeidx_exists` for cardinality, `codeidx_search_code` with `output_mode: "minimal"` for path:line candidates, and only then expand selected ranges with `codeidx_read_snippets` or `codeidx_symbol_slice`. MCP intentionally does not expose index refresh/rebuild tools; if the index is not ready, a full scan is required, or final audit ordering matters, fall back to `rg` or ask the user to prepare the index.
-
-Native OR search is available through `queries`; the engine unions per-term index candidates before verification, so this avoids broad regex alternation for simple keyword sets:
-
-```json
-{
-  "queries": ["AlphaService", "BetaService", "GammaService"],
-  "query_kind": "literal",
-  "query_operator": "any"
-}
-```
-
-By default, `codeidx_search_code` protects common dependency/generated/sensitive paths such as `node_modules/**`, `out/**`, `dist/**`, `graphql-codegen/**`, and `.env*`. To deliberately search a normally excluded path, pass a narrow include plus an exclude policy override:
-
-```json
-{
-  "query": "SomeGeneratedSymbol",
-  "include_globs": ["out/**/*.js"],
-  "exclude_policy": "custom_only"
-}
-```
-
-Use `exclude_policy: "none"` only when you intentionally want to ignore both default excludes and `exclude_globs`.
-Both override modes bypass `intellijStyledSearch.excludeGlobs` for that MCP request; keep `include_globs` narrow when searching dependency or generated trees.
-For generated/codegen searches, `include_generated: true` disables generated excludes and uses a bounded full scan with a larger MCP file-size cap so large generated files are not silently missed.
-If a generated/full-scan request explicitly forbids fallback, MCP returns `fallback_policy_requires_full_scan` instead of pretending the indexed search found zero results.
-
-`codeidx_search_code` defaults to token-first `output_mode: "minimal"` and returns only `path:line` rows. Use `output_mode: "rg_like"` when you need line previews, and `codeidx_read_snippets` for selected ranges instead of paying snippet cost in the broad search response.
-Compact search diagnostics are opt-in for compact text calls: pass `"include_diagnostics": true` when you need engine/fallback/scope/timing metadata in `structuredContent`. Pass `"structured": true` or `"output_mode": "structured"` only for full JSON-rich search results.
-Pass `"diagnostic_level": "full"` only when you need full query terms and verbose ranking metadata.
-
-Envelope tools such as symbols, references, snippets, counts and health send a single JSON text copy by default. Read it from `content[0].text`; pass `"structured": true` if your client consumes `structuredContent`. Rich mode retains the full schema and its JSON text mirror. Warnings, confidence, IDs and continuation cursors remain available in both modes.
-Scope presets are explicit: `source` means production plus tests while excluding migrations/generated/dependencies/local editor context, `production` excludes tests too, `tests` keeps only tests, and `all` disables those preset filters.
-For architectural inventories, `codeidx_top_files` supports `group_by: "directory"` plus `directory_depth`; this is useful for summarizing where notification implementations, senders, or callers are concentrated before reading files.
-
-Example prompt for Codex or Claude:
-
-```text
-Use the codeidx MCP mcp_health tool, then search for "UserService" with codeidx_search_symbols first and codeidx_search_code if text locations are needed.
-```
-
-## Keybindings
-
-| Platform | Search Selection | Open Search |
+| Setting | Default | Purpose |
 | --- | --- | --- |
-| macOS | `Cmd+Shift+Alt+F` | `Cmd+Shift+Alt+P` |
-| Windows/Linux | `Ctrl+Shift+Alt+F` | `Ctrl+Shift+Alt+P` |
+| `engine` | `zoekt` | Choose the native index or the `codesearch` path. |
+| `searchOnOpen` | `false` | Run a prefilled query as soon as the panel opens. |
+| `defaultFilesScope` | `""` | Initial Ant patterns when a workspace has no remembered scope. |
+| `excludeGlobs` | `[]` | Add patterns to exclude from text search. |
+| `searchHistoryLimit` | `100` | Entries retained in each history; `0` disables storage. |
+| `maxResults` | `2000` | Match lines per batch; scrolling loads more. |
+| `previewLanguageFeatures` | `true` | Relay installed language providers into the preview. |
+| `callGraphInlayHints` | `true` | Show inline graph navigation links beside symbols. |
+| `mcpAutoStart` | `true` | Start the local MCP endpoint in trusted workspaces. |
 
-## Settings
+See the [search controls and settings guide](docs/search-guide.md) for history shortcuts, scope persistence, and preview configuration.
 
-| Setting | Default | Description |
-| --- | --- | --- |
-| `intellijStyledSearch.engine` | `zoekt` | Search engine selection. `zoekt` uses the Rust local shard/mmap engine and falls back to `codesearch` while the runtime is unavailable or still preparing its index. `codesearch` is the current TypeScript codesearch planner plus ripgrep verifier. |
-| `intellijStyledSearch.excludeGlobs` | `[]` | User-controlled glob patterns excluded from full searches. |
-| `intellijStyledSearch.callGraphExcludeGlobs` | common dependency/build/cache folders | Glob patterns excluded only from call graph rebuilds; set to `[]` to include those folders intentionally. |
-| `intellijStyledSearch.callGraphMemoryBudgetMb` | `8192` | Total memory ceiling for full call graph rebuilds. It caps the JavaScript worker heap and the Rust process/spill buffers. |
-| `intellijStyledSearch.disableMonacoCapture` | `false` | Disable probing VS Code's private Monaco services. The bundled Monaco preview and its VS Code language-provider bridge remain available. |
-| `intellijStyledSearch.allowTransientPreviewCaptureEditor` | `true` | Allow a short-lived background editor when passive capture cannot upgrade the bundled preview to VS Code's native editor. Disable it to guarantee Search never changes editor tabs. |
-| `intellijStyledSearch.previewLanguageFeatures` | `true` | Enable bundled TextMate/lexical hover and relay semantic hover, completions, navigation, diagnostics, and semantic tokens from VS Code language providers. |
-| `intellijStyledSearch.maxFileSize` | `1048576` | Maximum file size in bytes to search. |
-| `intellijStyledSearch.maxResults` | `2000` | Match lines to load per batch. Scrolling near the bottom loads the next batch. Values at or below `0` use the built-in default. |
-| `intellijStyledSearch.searchHistoryLimit` | `100` | Entries to keep in each query and Files scope History dropdown. Files scope history is stored per workspace. Set to `0` to disable storing history. |
-| `intellijStyledSearch.defaultFilesScope` | `""` | Initial Files scope for a workspace with no remembered value. Accepts comma-separated Ant patterns, such as `**/*.vue,**/*.ts`. |
+## Codeidx MCP for coding agents
 
-The Files scope field remembers your last edit separately for each workspace, including after VS Code restarts. A remembered scope takes precedence over `defaultFilesScope`. Clearing the field remembers an unrestricted search, even when a default is configured. You can set the default in User or Workspace settings.
+The extension can expose local text search, symbols, references, and snippets to MCP clients. In trusted workspaces the endpoint starts automatically by default and publishes workspace-local discovery and launcher files under `.codeidx/`. Each VS Code window uses its own port and workspace identity.
 
-Open **History** or press **Alt+H** in the search panel to filter previous queries. Matching is case-insensitive and supports multiple words. Use ↑/↓ and Enter to select a query; Escape closes the history popup. Selecting restores the complete query, including newlines, and waits for Enter or Run before searching. The current Files scope and options stay in effect.
-
-In the query field, press **↑** for older searches and **↓** for newer searches. Moving down past the newest entry restores your unfinished query and its selection. The current query is skipped when it is already in history; editing a recalled query starts a new history walk. For multiline drafts, move to the start before pressing ↑; normal line movement and Shift selections remain available. **Alt+↑/↓** moves through search results. Recalling history does not run a search; press Enter or Run when ready.
-
-The **History** button beside **Files scope** keeps the complete Ant expressions used in executed searches, including folder patterns (`src/**`), file types (`**/*.ts`) and combined exclusions (`src/**, !**/*.test.ts`). Patterns are stored separately for each workspace. Filter the list or press **↑/↓** in Files scope to recall a pattern; moving down past the newest entry restores your draft. **Alt+H** opens the history of the focused input. Selecting a pattern restores only Files scope and waits for **Enter** or **Run** before searching. Empty scopes and typing drafts are not added to history.
-
-## Runtime Notes
-
-On first activation, the extension attempts to install a platform-specific ripgrep binary into VS Code's extension global storage. If that install fails or the platform is unsupported, it falls back to VS Code's bundled ripgrep when available, and finally to the JavaScript search path.
-
-Zoekt indexes are kept fresh with incremental updates for VS Code create/save/delete/rename operations plus external filesystem create/change/delete events. A search drains queued updates before querying the index; unsaved editor buffers are reported as dirty overlay state because they are not yet durable index input. Symbol search also filters deleted/missing-file results before returning them and queues a semantic incremental update when stale symbols are observed.
-
-Full Zoekt builds share a bounded worker pool for file reads, gram extraction and shard writes, including workspaces that fit in one shard. Saved-file updates share one flush and drain edits that arrive during an update before searching. Failed batches and temporary runtime/index preparation failures retain the affected paths for retry; if known changes cannot be drained, search verifies results with the live codesearch backend. Call graph full builds and compaction reuse the immutable file table and reference-shard metadata across count shards. Call graph edit bursts prepare summaries for changed open documents and load closed-file summaries only when requested, while invalidating cross-file usage counts after every successful update.
-
-Usage-count construction also retains at most 32 MiB and 256 entries of immutable token-shape sidecar bytes for that build; evicted and oversized shards are read again. The cache ends with the build and is not shared across serving generations. External saved-file changes refresh usages even when the document is open. VS Code folder operations queue one graph refresh and one search-index sync; search sync reuses unchanged files. Explicit graph refreshes also drain changes retained by a background update after the window loses focus.
-
-Search and call graph indexing check host-wide available memory before starting. While an isolated index process runs, sustained memory pressure is sampled and the process is stopped before it can exhaust the machine. Background full builds are deferred to a later trigger, while pending compactions and incremental batches retain their work and retry after pressure subsides; manual rebuilds report the available/required memory totals.
-
-The codesearch trigram engine retains at most 16 MiB or 4,096 entries of clean disk-backed posting data. Evicted postings are read again when needed. Queries use posting sizes from the index metadata to intersect selective terms first and stop reading after the candidate set becomes empty. Reindexing keeps unchanged postings compact, and trigram extraction uses a three-character window. The read-cache limit does not cap mutable build data, query results, or the temporary full index image used during persistence.
-
-The tab-free bundled preview is the guaranteed path. It uses real file URIs, lazily reads the installed extensions' `contributes.languages`/`contributes.grammars` assets without activating those extensions, and relays VS Code language providers without opening an editor tab. TextMate grammar failures or safety-budget overruns fall back to Monaco's bundled tokenizer. When passive renderer capture is available, the preview may upgrade to VS Code's native editor services. Workspace language requests use the saved VS Code document snapshot, so a bundled preview pauses them while it has unsaved edits and resumes them after a successful save instead of showing stale ranges. If the overlay or preview fails to mount after a VS Code update, run `IntelliJ Search: Reinject Renderer Patch (Recovery)`.
+See the [MCP setup and tool guide](docs/mcp.md) for client configuration, health checks, and query examples.
 
 ## Development
+
+See the [runtime and development guide](docs/development.md), [release instructions](DEPLOY.md), and [Marketplace screenshot guide](docs/marketplace-captures.md).
 
 ```bash
 npm install
 npm run compile
 npm test
-npm run bench:zoekt -- --files 10000,50000,100000
-npm run bench:indexing -- --files 4000 --runs 3
-npm run bench:trigram
-```
-
-`npm run bench:zoekt` saves a timestamped artifact plus `latest.json` under `artifacts/benchmarks/zoekt/`. The artifact includes the raw benchmark response, wall-clock runtime, git commit, Rust toolchain versions, and host metadata so repeated runs stay comparable.
-
-`npm run bench:indexing` measures full builds, clean reuse, single-file and burst updates, duplicate events, renames, deletes, recreation and compaction in an isolated temporary workspace. It verifies text results and cross-file usage counts after each operation. Use `-- --binary /path/to/zoek-rs --output /tmp/indexing.json` to measure an earlier binary with the same workload; reports include binary hashes and individual timing samples. Fixture generation and correctness queries are excluded from timings; CLI startup is included.
-
-`npm run bench:trigram` runs isolated synthetic extraction, selective-query, repeated-query, and unchanged-update workloads without accessing a workspace index. It reports elapsed time, posting reads, and retained heap/array-buffer memory after GC. Use `-- --output=/tmp/trigram.json` to save the report, or `-- --module=/path/to/earlier-bundle.cjs` to compare an earlier build on the same host. These are codesearch measurements, not end-to-end Rust engine timings.
-
-## Desktop platform compatibility
-
-The search overlay uses separate desktop adapters. Windows process discovery and inspector activation live in `src/platform/windows/`; macOS bundle discovery lives in `src/platform/darwin/`, with POSIX process operations in `src/platform/posix/`. The overlay only calls their shared interface. Windows discovery follows the local extension host's ancestors and checks the installation path, so portable installations and paths containing spaces or Unicode are supported without selecting another running editor.
-
-Windows opens the Electron main inspector through Node's native debug hook. It does not require a Unix signal or a manually configured startup flag. Search commands account for the Windows command-line limit, and both the Rust graph and JavaScript graph worker serialize drive and UNC file paths with VS Code's URI identity. OS-specific Rust URI code lives under `crates/zoek-rs/src/platform/`.
-
-Run `npm run compile`, `npm run test:unit`, and `cargo test --locked -p zoek-rs` for structural regression checks. After `npm run build:zoek-runtime`, `npm test` runs the actual desktop extension. The [desktop compatibility workflow](.github/workflows/desktop-compatibility.yml) checks current macOS/Windows builds plus VS Code 1.114.0 on Windows, requires renderer attachment, exercises on-demand inspector activation, and saves rendered workbench screenshots at Chromium viewports of 1440×900, 1024×768, and 800×600 under `artifacts/desktop-compatibility/`.
-
-After compiling, `npm run test:scope` launches and fully exits normal VS Code five times using one generated profile and two temporary workspaces. It verifies configured defaults, the remembered `**/*.vue,**/*.ts` scope, an explicitly cleared scope, project isolation, and actual filtered search results. Reports and rendered screenshots are saved under `artifacts/scope-persistence/`. This harness deliberately omits `--extensionTestsPath`, because VS Code uses in-memory storage in extension-test mode. CI runs it on macOS and both Windows versions, including the Windows standard-account UserSetup installations.
-
-Full renderer functional checks remain required on shared CI runners. Hardware timing measurements, unchanged budgets, and any overruns are shown in the job summary and desktop artifact. Local renderer tests enforce those budgets by default. The workflow's `enforce_timings` input supports strict manual runs once the workflow is registered on the default branch. See [performance verification](DEPLOY.md#local-verification) for the strict and report modes and current branch prerequisites.
-
-Its Windows 11 job installs x64 UserSetup 1.114.0 and stable as a standard
-account and verifies that the extension host actually runs without administrator
-privileges. The host is ARM64, so these x64 application checks use Windows
-emulation; they do not certify native ARM64 VS Code or native x64 Windows 11
-hardware.
-
-CI gates native tests, desktop acceptance, extension functional regressions, and the complete renderer suite, including save/recovery, repeated clicks and the existing hardware timing budgets. Timing samples are recorded in the CI log. Windows graph caches created before the URI correction require one rebuild; macOS graph cache versions are unchanged.
-
-## Deployment
-
-Deployment and release steps now live in [DEPLOY.md](DEPLOY.md).
-
-Short version:
-
-- `vsce package` includes any staged `resources/bin/<platform-arch>/` tuples in a universal VSIX; a fresh checkout without tuples produces a lightweight package.
-- Without a `resources/bin/<platform-arch>/` tuple it relies on the global Cargo cache and a one-time local Rust build per Rust-source revision.
-- Run `npm run build:zoek-runtime` before packaging a self-contained host-platform VSIX; use the explicit target options in `DEPLOY.md` for cross-platform artifacts.
-- The current universal desktop release bundles Windows x64 and Apple Silicon macOS runtimes in one Marketplace package.
-
-Quick local package:
-
-```bash
-vsce package
 ```

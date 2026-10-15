@@ -238,8 +238,8 @@ development-only and are excluded from the VSIX.
 
 Recommended smoke checks:
 
-- Open `IntelliJ Search: Find in Path (IntelliJ Style)`.
-- Run `IntelliJ Search: Rebuild Search Index`.
+- Open `IntelliJ Search: Search`.
+- Run `IntelliJ Search: Force Rebuild Search + Graph Index`.
 - Confirm `zoekt` searches return results without falling back unexpectedly.
 - Confirm the preview panel and renderer patch recover correctly after window reload.
 

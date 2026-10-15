@@ -4850,18 +4850,22 @@ export class OverlayPanel {
       // intentionally avoided: they can desynchronize an open
       // TextDocument and can silently change its encoding/BOM.
       const doc = await vscode.workspace.openTextDocument(uri);
-      if (expectedContentHash && stableSearchHash(doc.getText()) !== expectedContentHash) {
+      const currentContent = doc.getText();
+      // Native previews share VS Code's document model, so their edits may
+      // already be present in the document before the save request arrives.
+      // An identical submitted value is safe to save; different concurrent
+      // edits must still fail the snapshot check.
+      if (expectedContentHash && stableSearchHash(currentContent) !== expectedContentHash && currentContent !== content) {
         throw new Error('The file changed after this preview was loaded; reopen the preview before saving');
       }
-      const fullRange = new vscode.Range(
-        doc.positionAt(0),
-        doc.positionAt(doc.getText().length),
-      );
-      const edit = new vscode.WorkspaceEdit();
-      edit.replace(uri, fullRange, content);
-      const ok = await vscode.workspace.applyEdit(edit);
-      if (!ok) {
-        throw new Error('VS Code declined to apply the preview edit');
+      if (currentContent !== content) {
+        const fullRange = new vscode.Range(doc.positionAt(0), doc.positionAt(currentContent.length));
+        const edit = new vscode.WorkspaceEdit();
+        edit.replace(uri, fullRange, content);
+        const ok = await vscode.workspace.applyEdit(edit);
+        if (!ok) {
+          throw new Error('VS Code declined to apply the preview edit');
+        }
       }
       const refreshed = await vscode.workspace.openTextDocument(uri);
       const saved = await refreshed.save();
