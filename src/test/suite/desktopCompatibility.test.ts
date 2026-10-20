@@ -343,6 +343,17 @@ suite('Desktop compatibility', () => {
         assert.strictEqual(png.readUInt32BE(20), height, 'the PNG must capture the emulated viewport height');
         await fs.promises.writeFile(path.join(artifactRoot, `${width}x${height}.png`), png);
       }
+      // A viewport constraint must not replace the user's preferred size.
+      await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.sendCommand(
+        'Emulation.setDeviceMetricsOverride', { width: 1440, height: 900,
+          screenWidth: 1440, screenHeight: 900, deviceScaleFactor: 1, mobile: false })`);
+      const restored = await overlay.evalInActiveWindowForTests(`new Promise(function (resolve) {
+        requestAnimationFrame(function () { requestAnimationFrame(function () {
+          var root = window.__ijFindInstances[window.__ijssDesktopTestSrc].panel;
+          resolve(String(root.getBoundingClientRect().width));
+        }); });
+      })`);
+      assert.ok(Number(restored) >= 860, 'growing the viewport restores the resized panel width: ' + restored);
       await fs.promises.writeFile(path.join(artifactRoot, 'layout.json'), JSON.stringify(reports, null, 2));
     } finally {
       await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.sendCommand('Emulation.clearDeviceMetricsOverride')`);

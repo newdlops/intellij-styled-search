@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 159;
+export const RENDERER_PATCH_VERSION = 160;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -5045,12 +5045,13 @@ export function getRendererPatchScript(
     if (width < rect.width || height < rect.height) {
       var css = getComputedStyle(panel);
       // Bounds include the border; inline width/height may describe only the
-      // content box. Retain the existing box model when shrinking the panel.
+      // content box. Constrain the maximum instead of overwriting the user's
+      // preferred dimensions, so growing the viewport restores their size.
       if (width < rect.width) {
-        panel.style.width = Math.max(0, width - Math.max(0, rect.width - parseFloat(css.width))) + 'px';
+        panel.style.maxWidth = 'calc(100vw - ' + (margin * 2 + Math.max(0, rect.width - parseFloat(css.width))) + 'px)';
       }
       if (height < rect.height) {
-        panel.style.height = Math.max(0, height - Math.max(0, rect.height - parseFloat(css.height))) + 'px';
+        panel.style.maxHeight = 'calc(100vh - ' + (margin * 2 + Math.max(0, rect.height - parseFloat(css.height))) + 'px)';
       }
     }
     var left = Math.max(margin, Math.min(window.innerWidth - margin - width, rect.left));
