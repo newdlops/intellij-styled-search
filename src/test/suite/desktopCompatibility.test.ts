@@ -282,6 +282,15 @@ suite('Desktop compatibility', () => {
       if (debuggerApi.isAttached()) { return false; }
       debuggerApi.attach('1.3'); return true;
     })()`);
+    const priorBackgroundThrottling = await evaluateMain(`(function () {
+      var window = require('electron').BrowserWindow.fromId(${windowId});
+      var before = window.webContents.getBackgroundThrottling();
+      require('electron').app.focus({ steal: true });
+      if (window.isMinimized()) { window.restore(); }
+      window.show(); window.focus();
+      window.webContents.setBackgroundThrottling(false);
+      return before;
+    })()`);
     await fs.promises.mkdir(artifactRoot, { recursive: true });
     const reports: any[] = [];
     try {
@@ -291,9 +300,26 @@ suite('Desktop compatibility', () => {
         await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.sendCommand(
           'Emulation.setDeviceMetricsOverride', { width: ${width}, height: ${height},
             screenWidth: ${width}, screenHeight: ${height}, deviceScaleFactor: 1, mobile: false })`);
-        await overlay.evalInActiveWindowForTests(`new Promise(function (resolve) {
+        if (width === 1440) {
+          // Use the real resize handle before shrinking the workbench. A
+          // custom panel size must obey the same bounds as the default size.
+          await overlay.evalInActiveWindowForTests(`(function () {
+            var root = window.__ijFindInstances[window.__ijssDesktopTestSrc].panel;
+            var handle = root.querySelector('.ij-find-resizer');
+            var rect = root.getBoundingClientRect();
+            handle.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true,
+              clientX: rect.right - 4, clientY: rect.bottom - 4 }));
+            document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true,
+              clientX: rect.right - 4 + 860 - rect.width,
+              clientY: rect.bottom - 4 + 720 - rect.height }));
+            document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+            return 'resized';
+          })()`);
+        }
+        const painted = await overlay.evalInActiveWindowForTests(`new Promise(function (resolve) {
           requestAnimationFrame(function () { requestAnimationFrame(function () { resolve('stable'); }); });
-        })()`);
+        })`);
+        assert.strictEqual(painted, 'stable', 'await actual workbench animation frames');
         const layout = JSON.parse(await overlay.evalInActiveWindowForTests(`(function () {
           var root = Array.from(document.querySelectorAll('.ij-find-overlay.visible')).find(function (node) {
             return node.getAttribute('data-ij-find-src') === window.__ijssDesktopTestSrc;
@@ -320,6 +346,7 @@ suite('Desktop compatibility', () => {
       await fs.promises.writeFile(path.join(artifactRoot, 'layout.json'), JSON.stringify(reports, null, 2));
     } finally {
       await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.sendCommand('Emulation.clearDeviceMetricsOverride')`);
+      await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).webContents.setBackgroundThrottling(${priorBackgroundThrottling})`);
       if (ownsDebugger) {
         await evaluateMain(`require('electron').BrowserWindow.fromId(${windowId}).webContents.debugger.detach()`);
       }

@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 158;
+export const RENDERER_PATCH_VERSION = 159;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -2625,7 +2625,7 @@ export function getRendererPatchScript(
     '  transform: translateX(-50%);',
     '  width: 760px; max-width: calc(100vw - 40px);',
     '  height: 640px; max-height: calc(100vh - 100px);',
-    '  min-width: min(420px, calc(100vw - 20px)); min-height: 320px;',
+    '  min-width: min(420px, calc(100vw - 20px)); min-height: min(320px, calc(100vh - 20px));',
     '  background: var(--vscode-editorWidget-background, #252526);',
     '  color: var(--vscode-foreground, #cccccc);',
     '  border: 1px solid var(--vscode-widget-border, var(--vscode-contrastBorder, #454545));',
@@ -4896,6 +4896,7 @@ export function getRendererPatchScript(
     state.minimizedLayout = null;
     panel.classList.remove('ij-find-minimized');
     restorePanelInlineLayout(layout);
+    fitPanelToViewport();
     setPreviewOverflowHidden(false);
     installPreviewHoverTransitGuard(state.previewMonacoEditor || state.monacoEditor);
     syncMinimizeButton();
@@ -5034,6 +5035,36 @@ export function getRendererPatchScript(
     panel.style.maxHeight = 'none';
     panel.style.transform = 'none';
   }
+
+  function fitPanelToViewport() {
+    if (!panel.classList.contains('visible') || !panel.isConnected) { return; }
+    var rect = panel.getBoundingClientRect();
+    var margin = 8;
+    var width = Math.min(rect.width, Math.max(0, window.innerWidth - margin * 2));
+    var height = Math.min(rect.height, Math.max(0, window.innerHeight - margin * 2));
+    if (width < rect.width || height < rect.height) {
+      var css = getComputedStyle(panel);
+      // Bounds include the border; inline width/height may describe only the
+      // content box. Retain the existing box model when shrinking the panel.
+      if (width < rect.width) {
+        panel.style.width = Math.max(0, width - Math.max(0, rect.width - parseFloat(css.width))) + 'px';
+      }
+      if (height < rect.height) {
+        panel.style.height = Math.max(0, height - Math.max(0, rect.height - parseFloat(css.height))) + 'px';
+      }
+    }
+    var left = Math.max(margin, Math.min(window.innerWidth - margin - width, rect.left));
+    var top = Math.max(margin, Math.min(window.innerHeight - margin - height, rect.top));
+    if (left !== rect.left || top !== rect.top) {
+      panel.style.left = left + 'px';
+      panel.style.top = top + 'px';
+      panel.style.transform = 'none';
+    }
+  }
+
+  // Resized/spawned panels have fixed inline dimensions. CSS viewport maxima
+  // alone cannot keep their bottom/right edge reachable after a window shrink.
+  on(window, 'resize', fitPanelToViewport);
 
   function applyPreviewHeavyLayout(panelHeight) {
     try {
@@ -6162,8 +6193,8 @@ export function getRendererPatchScript(
       recordHistory: !!recordHistory,
     });
 	    var scopePatterns = parseScopeInput(scopeRaw);
-    clearPreview();
     if (!q) {
+      clearPreview();
       setShellMode(true);
       state.files = []; state.flat = []; state.activeIndex = -1; state.searching = false;
       state.rgQuery = ''; state.filterQuery = ''; state.rgScope = '';
@@ -6204,6 +6235,9 @@ export function getRendererPatchScript(
     if (!forceRestart && !optsChanged && oldQ && q === oldQ) {
       return;
     }
+    // A no-op must preserve the rendered preview as well as the backend
+    // request. Clearing before the guard stranded the selected row empty.
+    clearPreview();
     var isExtension = !forceRestart && oldQ && q.length > oldQ.length && q.indexOf(oldQ) === 0 &&
       !optsChanged && !involvesMultiline;
     if (isExtension) {
@@ -13875,6 +13909,7 @@ export function getRendererPatchScript(
       panel.style.setProperty('position', 'fixed', 'important');
 	      var mountT0 = perfNow();
 	      var searchUiMountRoot = ensureSearchUiMounted(panel);
+      fitPanelToViewport();
       reportPerfPhase('show:mount', mountT0, {
         shouldShell: shouldShell,
         parentTag: panel.parentElement && panel.parentElement.tagName ? String(panel.parentElement.tagName).toLowerCase() : '',

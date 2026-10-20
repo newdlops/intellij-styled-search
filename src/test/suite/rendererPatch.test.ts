@@ -3,6 +3,36 @@ import * as vm from 'vm';
 import { getRendererPatchScript, RENDERER_PATCH_VERSION } from '../../rendererPatch';
 
 suite('Renderer patch source', () => {
+  test('a duplicate search preserves its preview while a restarted search clears it', () => {
+    const script = getRendererPatchScript();
+    const start = script.indexOf('function triggerSearch(');
+    const end = script.indexOf('function scheduleSearch()', start);
+    assert.ok(start >= 0 && end > start);
+    const options = { caseSensitive: false, wholeWord: false, useRegex: false, regexMultiline: false };
+    let clears = 0;
+    const messages: any[] = [];
+    const context = {
+      $q: { value: 'a repeated query' },
+      $scope: { value: '*.ts' },
+      state: { options, rgOptions: { ...options }, rgQuery: 'a repeated query', rgScope: '*.ts' },
+      resetQueryHistoryNavigation() {},
+      trace() {},
+      parseScopeInput: () => ({ includePatterns: ['*.ts'], excludePatterns: [] }),
+      effectiveRegexMultilineValue: (value: typeof options) => value.regexMultiline,
+      clearPreview: () => { clears++; },
+      setShellMode() {},
+      send: (message: any) => { messages.push(message); },
+    };
+    vm.createContext(context);
+    vm.runInContext(script.slice(start, end), context);
+    vm.runInContext('triggerSearch(false)', context);
+    assert.strictEqual(clears, 0, 'deduplication must leave the selected preview and decorations intact');
+    assert.strictEqual(messages.length, 0, 'a duplicate must not restart the backend');
+    vm.runInContext('triggerSearch(true)', context);
+    assert.strictEqual(clears, 1, 'an explicit restart must invalidate the old preview');
+    assert.strictEqual(messages.filter((message) => message.type === 'search').length, 1);
+  });
+
   test('emits syntactically valid JavaScript for bundled and captured preview modes', () => {
     const variants = [
       getRendererPatchScript(false, false, true, true, true, false, true),
