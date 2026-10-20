@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 160;
+export const RENDERER_PATCH_VERSION = 161;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -13910,7 +13910,9 @@ export function getRendererPatchScript(
       panel.style.setProperty('position', 'fixed', 'important');
 	      var mountT0 = perfNow();
 	      var searchUiMountRoot = ensureSearchUiMounted(panel);
-      fitPanelToViewport();
+      // A visible panel is already constrained by its resize listener. Avoid
+      // forcing pending Monaco/style layout on every warm show request.
+      if (!wasVisible) { fitPanelToViewport(); }
       reportPerfPhase('show:mount', mountT0, {
         shouldShell: shouldShell,
         parentTag: panel.parentElement && panel.parentElement.tagName ? String(panel.parentElement.tagName).toLowerCase() : '',
