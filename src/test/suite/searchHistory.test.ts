@@ -377,16 +377,25 @@ suite('Search history discovery', () => {
   test('records executed Ant scopes with MRU deduplication and restores only the Files input', async () => {
     const expression = 'nested/**, !**/*.test.js';
     const beforeExecutions = executedSearches;
+    const runScopeSearch = async (scope: string) => {
+      const previousId = (await queryState()).state.searchId;
+      await pressQueryKey('Enter');
+      // History is published before results:start. Wait for this request to
+      // complete so its delayed start cannot look like a History selection
+      // executed the later draft.
+      await waitForQuery(value => value.state.searchId > previousId &&
+        !value.state.searching && value.state.rgScope === scope);
+    };
     await setDraft('function');
     await setScope(expression);
     assert.deepEqual((await queryState()).state.scopeHistory, [], 'typing is a draft');
-    await pressQueryKey('Enter');
+    await runScopeSearch(expression);
     await waitForQuery(value => value.state.scopeHistory[0] === expression);
     await setScope('**/*.js');
-    await pressQueryKey('Enter');
+    await runScopeSearch('**/*.js');
     await waitForQuery(value => value.state.scopeHistory[0] === '**/*.js');
     await setScope(expression);
-    await pressQueryKey('Enter');
+    await runScopeSearch(expression);
     await waitForQuery(value => JSON.stringify(value.state.scopeHistory) === JSON.stringify([expression, '**/*.js']));
     assert.equal(executedSearches - beforeExecutions, 3, 'each Enter runs exactly one search');
     await setDraft('unexecuted query');
