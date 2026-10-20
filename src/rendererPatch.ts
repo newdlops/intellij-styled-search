@@ -1,4 +1,4 @@
-export const RENDERER_PATCH_VERSION = 161;
+export const RENDERER_PATCH_VERSION = 162;
 
 export function getRendererPatchScript(
   enableMonacoPreviewCapture = false,
@@ -5038,6 +5038,12 @@ export function getRendererPatchScript(
 
   function fitPanelToViewport() {
     if (!panel.classList.contains('visible') || !panel.isConnected) { return; }
+    // The default CSS maxima already fit the viewport above its 320px minimum
+    // height plus 100px vertical allowance. Probe only custom geometry or a
+    // viewport too small for those defaults; cold shows avoid a forced layout.
+    if (window.innerWidth >= 40 && window.innerHeight >= 420 &&
+        !panel.style.left && !panel.style.top && !panel.style.width && !panel.style.height &&
+        !panel.style.maxWidth && !panel.style.maxHeight && !panel.style.transform) { return; }
     var rect = panel.getBoundingClientRect();
     var margin = 8;
     var width = Math.min(rect.width, Math.max(0, window.innerWidth - margin * 2));

@@ -4568,17 +4568,21 @@ function runChildJson(command: string, args: string[], cwd: string, env: NodeJS.
       try { child.kill('SIGKILL'); } catch {}
       reject(new Error(`timed out waiting for child JSON output; stderr=${stderr}`));
     }, 5_000);
-    child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
     });
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
     });
     child.once('error', (err) => {
       clearTimeout(timer);
       reject(err);
     });
-    child.once('exit', (code, signal) => {
+    // exit may precede the final stdout/stderr data, especially on Windows.
+    // close guarantees the piped output has drained before parsing its JSON.
+    child.once('close', (code, signal) => {
       clearTimeout(timer);
       if (code !== 0) {
         reject(new Error(`child exited with code=${code} signal=${signal}; stderr=${stderr}`));

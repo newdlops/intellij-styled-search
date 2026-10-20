@@ -5,13 +5,23 @@ import { test } from 'node:test';
 import WebSocket from 'ws';
 import { retainAwaitedCdpExpression } from '../../internal/retainedCdpExpression';
 
-test('awaited CDP promises survive GC and release their roots after settlement', { timeout: 15000 }, async () => {
+test('awaited CDP promises survive GC and release their roots after settlement', { timeout: 15000 }, async (t) => {
   // Use an external inspector connection: sending a local Session callback
   // while V8 is collecting a promise can itself crash Node during GC.
-  const child = spawn(process.execPath, ['--expose-gc', '--inspect=127.0.0.1:0', '-e', 'setInterval(function(){},30000)']);
+  const child = spawn(process.execPath, ['--expose-gc', '--inspect=127.0.0.1:0', '-e', 'setInterval(function(){},30000)'], { signal: t.signal });
   let socket: WebSocket | undefined;
   const pending = new Map<number, (response: any) => void>();
   let nextId = 0;
+  const cleanup = async () => {
+    socket?.terminate();
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill();
+      await once(child, 'exit');
+    }
+  };
+  // A node:test timeout does not unwind a callback awaiting inspector I/O.
+  // The hook still runs and prevents the inspector child keeping CI alive.
+  t.after(cleanup);
   try {
     const url = await new Promise<string>((resolve, reject) => {
       let stderr = '';
@@ -43,14 +53,24 @@ test('awaited CDP promises survive GC and release their roots after settlement',
     const collect = async () => {
       for (let i = 0; i < 4; i++) { await evaluate('global.gc()'); }
     };
+    const assertSettledOrCollected = (response: any, expected: string) => {
+      if (response.error) { assert.match(response.error.message, /Promise was collected/); }
+      else { assert.equal(response.result.result.value, expected); }
+    };
+    // Collection timing is not guaranteed, even after explicit GC. Settle a
+    // still-live fixture so native inspector retention cannot hang the test.
+    // https://github.com/tc39/proposal-weakrefs/blob/master/reference.md
     const unrooted = evaluate(fixture('__unrootedProbe'), true);
     await collect();
-    assert.match((await unrooted).error.message, /Promise was collected/);
+    await evaluate('globalThis.__unrootedProbe.deref()?.finish("unrooted")');
+    assertSettledOrCollected(await unrooted, 'unrooted');
 
     const first = evaluate(retainAwaitedCdpExpression(fixture('__retainedProbeA'), 10000), true);
     const second = evaluate(retainAwaitedCdpExpression(fixture('__retainedProbeB'), 10000), true);
     await collect();
     assert.equal((await evaluate('globalThis.__ijssPendingCdpEvaluations.size')).result.result.value, 2);
+    assert.equal((await evaluate('globalThis.__ijssPendingCdpEvaluations.has(globalThis.__retainedProbeA.deref())')).result.result.value, true);
+    assert.equal((await evaluate('globalThis.__ijssPendingCdpEvaluations.has(globalThis.__retainedProbeB.deref())')).result.result.value, true);
     await evaluate('globalThis.__retainedProbeA.deref().finish("first")');
     assert.equal((await first).result.result.value, 'first');
     assert.equal((await evaluate('globalThis.__ijssPendingCdpEvaluations.size')).result.result.value, 1);
@@ -73,10 +93,9 @@ test('awaited CDP promises survive GC and release their roots after settlement',
     }
     assert.equal(roots, 0, 'an abandoned evaluation must release its root after the caller deadline');
     await collect();
-    assert.match((await expiring).error.message, /Promise was collected/);
+    await evaluate('globalThis.__expiringProbe.deref()?.finish("expired")');
+    assertSettledOrCollected(await expiring, 'expired');
   } finally {
-    socket?.terminate();
-    child.kill();
-    if (child.exitCode === null && child.signalCode === null) { await once(child, 'exit'); }
+    await cleanup();
   }
 });

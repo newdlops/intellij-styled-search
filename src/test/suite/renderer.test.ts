@@ -5727,6 +5727,10 @@ suite('Renderer — overlay UI probes', () => {
       suppressSearch: true,
     });
     await probeRendererSearchState(overlay);
+    const primed = await overlay.evalInActiveWindowForTests(`new Promise(function (resolve) {
+      requestAnimationFrame(function () { requestAnimationFrame(function () { resolve('painted'); }); });
+    })`);
+    assert.strictEqual(primed, 'painted', 'the priming panel must paint before measuring warm requests');
 
     const tabsBefore = snapshotTabCounts();
     const timings: number[] = [];

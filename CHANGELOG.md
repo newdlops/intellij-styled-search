@@ -6,7 +6,7 @@
 - Reused lazy path filters across base shards, overlays, fallback searches and diagnostics while preserving include/exclude order and invalid-pattern behavior.
 - Removed repeated text-prefix scans for match positions and bounded preview truncation work, preserving existing Unicode ranges, LF/CRLF matching, result order, OR deduplication and pagination.
 - Added regression coverage for match boundaries, candidate ranking and path scopes, plus isolated before/after search benchmarks that compare complete responses and streamed results.
-- Preserved the selected preview on duplicate search requests and kept resized search panels inside the workbench when its viewport shrinks, without redundant layout reads on repeated show requests.
+- Preserved the selected preview on duplicate search requests and kept resized search panels inside the workbench when its viewport shrinks, without redundant layout reads for default or repeated show requests.
 
 ## 0.1.7165 - 2026-10-15
 
