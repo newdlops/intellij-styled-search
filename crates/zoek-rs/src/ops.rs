@@ -9,7 +9,7 @@ use crate::protocol::{
 };
 use crate::searcher::search_workspace;
 use crate::shard::{open_validated_base_shard, read_base_shard_set, ShardDocument, ShardReader};
-use crate::verifier::matches_path_filters;
+use crate::verifier::PreparedPathFilters;
 use crate::watcher::build_change_batch;
 use std::collections::BTreeSet;
 use std::fs;
@@ -168,6 +168,7 @@ pub fn diagnose_query(
     let layout = StoreLayout::for_workspace(workspace_root, config);
     let _read_lock = acquire_index_read_lock(&layout).map_err(|err| err.to_string())?;
     let plan = build_query_plan(request);
+    let path_filters = PreparedPathFilters::new(&plan.include, &plan.exclude);
 
     let overlay = load_overlay_with_recovery(&layout).map_err(|err| err.to_string())?;
     let latest_overlay = overlay.manifest.latest_entries();
@@ -223,7 +224,7 @@ pub fn diagnose_query(
                     if latest_overlay.contains_key(&doc.rel_path) {
                         continue;
                     }
-                    if !matches_path_filters(&doc.rel_path, &plan.include, &plan.exclude) {
+                    if !path_filters.is_match(&doc.rel_path) {
                         continue;
                     }
                     final_candidates.insert(doc.rel_path.clone());
@@ -250,7 +251,7 @@ pub fn diagnose_query(
             final_candidates.remove(&overlay_entry.rel_path);
             continue;
         }
-        if !matches_path_filters(&overlay_entry.rel_path, &plan.include, &plan.exclude) {
+        if !path_filters.is_match(&overlay_entry.rel_path) {
             continue;
         }
         if !overlay_matches_plan(overlay_entry, &plan) {

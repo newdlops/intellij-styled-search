@@ -5,7 +5,7 @@ use regex::{Regex, RegexBuilder};
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 const MAX_PREVIEW_CHARS: usize = 240;
@@ -24,40 +24,7 @@ pub fn verify_literal(
     whole_word: bool,
     limit: usize,
 ) -> Vec<SearchMatch> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-
-    // Editor selections use logical line breaks; the same literal snippet
-    // must match files saved with either LF or CRLF on any operating system.
-    let pattern = if query.contains('\n') {
-        query.replace("\r\n", "\n").split('\n')
-            .map(regex::escape).collect::<Vec<_>>().join(r"\r?\n")
-    } else {
-        regex::escape(query)
-    };
-    let regex = match RegexBuilder::new(&pattern)
-        .case_insensitive(!case_sensitive)
-        .multi_line(true)
-        .build()
-    {
-        Ok(regex) => regex,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut matches = Vec::new();
-    for found in regex.find_iter(text) {
-        let start = found.start();
-        let end = found.end();
-        if !whole_word || is_word_boundary(text, start, end) {
-            matches.push(build_match(text, start, end));
-            if matches.len() >= limit {
-                break;
-            }
-        }
-    }
-
-    matches
+    PreparedVerifier::literal(query, case_sensitive, whole_word).verify(text, limit)
 }
 
 pub fn verify_regex(
@@ -67,52 +34,103 @@ pub fn verify_regex(
     regex_multiline: bool,
     limit: usize,
 ) -> Result<Vec<SearchMatch>, regex::Error> {
-    if pattern.is_empty() {
-        return Ok(Vec::new());
+    Ok(PreparedVerifier::regex(pattern, case_sensitive, regex_multiline)?.verify(text, limit))
+}
+
+/// Query-scoped compiled state. Clone once per worker so each worker can reuse
+/// its regex search cache without competing for another worker's cache.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedVerifier {
+    regex: Option<Regex>,
+    whole_word: bool,
+    line_by_line: bool,
+}
+
+impl PreparedVerifier {
+    pub(crate) fn literal(query: &str, case_sensitive: bool, whole_word: bool) -> Self {
+        // Editor selections use logical line breaks; accept LF and CRLF files.
+        let regex = if query.is_empty() {
+            None
+        } else {
+            let pattern = if query.contains('\n') {
+                query
+                    .replace("\r\n", "\n")
+                    .split('\n')
+                    .map(regex::escape)
+                    .collect::<Vec<_>>()
+                    .join(r"\r?\n")
+            } else {
+                regex::escape(query)
+            };
+            // Keep the existing literal API's behavior on regex size limits.
+            RegexBuilder::new(&pattern)
+                .case_insensitive(!case_sensitive)
+                .multi_line(true)
+                .build()
+                .ok()
+        };
+        Self {
+            regex,
+            whole_word,
+            line_by_line: false,
+        }
     }
-    let regex = RegexBuilder::new(pattern)
-        .case_insensitive(!case_sensitive)
-        .multi_line(regex_multiline)
-        .dot_matches_new_line(regex_multiline)
-        .build()?;
-    let mut matches = Vec::new();
-    if regex_multiline {
-        for found in regex.find_iter(text) {
-            matches.push(build_match(text, found.start(), found.end()));
-            if matches.len() >= limit {
-                break;
+
+    pub(crate) fn regex(
+        pattern: &str,
+        case_sensitive: bool,
+        regex_multiline: bool,
+    ) -> Result<Self, regex::Error> {
+        let regex = if pattern.is_empty() {
+            None
+        } else {
+            Some(
+                RegexBuilder::new(pattern)
+                    .case_insensitive(!case_sensitive)
+                    .multi_line(regex_multiline)
+                    .dot_matches_new_line(regex_multiline)
+                    .build()?,
+            )
+        };
+        Ok(Self {
+            regex,
+            whole_word: false,
+            line_by_line: !regex_multiline,
+        })
+    }
+
+    pub(crate) fn verify(&self, text: &str, limit: usize) -> Vec<SearchMatch> {
+        let Some(regex) = &self.regex else {
+            return Vec::new();
+        };
+        let mut matches = Vec::new();
+        let mut builder = MatchBuilder::new(text);
+        if !self.line_by_line {
+            for found in regex.find_iter(text) {
+                if !self.whole_word || is_word_boundary(text, found.start(), found.end()) {
+                    matches.push(builder.build(found.start(), found.end()));
+                    if matches.len() >= limit {
+                        break;
+                    }
+                }
             }
+            return matches;
         }
-        return Ok(matches);
-    }
-    let bytes = text.as_bytes();
-    let mut line_start = 0usize;
-    while line_start <= text.len() {
-        let line_end_raw = text[line_start..]
-            .find('\n')
-            .map(|offset| line_start + offset)
-            .unwrap_or(text.len());
-        let mut line_end = line_end_raw;
-        if line_end > line_start && bytes.get(line_end - 1) == Some(&b'\r') {
-            line_end -= 1;
-        }
-        let line = &text[line_start..line_end];
-        for found in regex.find_iter(line) {
-            matches.push(build_match(
-                text,
-                line_start + found.start(),
-                line_start + found.end(),
-            ));
-            if matches.len() >= limit {
-                return Ok(matches);
+        let mut line_start = 0usize;
+        // split preserves empty and trailing lines and borrows each slice. Keep
+        // the raw length for byte offsets while removing one CR for matching.
+        for raw_line in text.split('\n') {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            for found in regex.find_iter(line) {
+                matches.push(builder.build(line_start + found.start(), line_start + found.end()));
+                if matches.len() >= limit {
+                    return matches;
+                }
             }
+            line_start += raw_line.len() + 1;
         }
-        if line_end_raw >= text.len() {
-            break;
-        }
-        line_start = line_end_raw + 1;
+        matches
     }
-    Ok(matches)
 }
 
 pub fn load_current_text(path: &Path, config: &EngineConfig) -> io::Result<Option<LoadedTextFile>> {
@@ -180,46 +198,120 @@ pub fn matches_path_filters(rel_path: &str, include: &[String], exclude: &[Strin
     matches_include_filters(rel_path, include) && matches_exclude_filters(rel_path, exclude)
 }
 
-fn build_match(text: &str, start: usize, end: usize) -> SearchMatch {
-    let (line, start_column) = line_and_column(text, start);
-    let (end_line_value, end_column) = line_and_column(text, end);
-    let end_line = if end_line_value == line {
-        None
-    } else {
-        Some(end_line_value)
-    };
-    SearchMatch {
-        line,
-        start_column,
-        end_line,
-        end_column,
-        preview: build_preview(text, start, end),
+/// Request-local glob matchers. Preserve pattern order and short-circuiting,
+/// initializing only the patterns reached by a candidate path. Each matcher
+/// reuses its regex search cache instead of cloning one for every file.
+pub(crate) struct PreparedPathFilters<'a> {
+    include: Vec<PreparedGlob<'a>>,
+    exclude: Vec<PreparedGlob<'a>>,
+}
+
+impl<'a> PreparedPathFilters<'a> {
+    pub(crate) fn new(include: &'a [String], exclude: &'a [String]) -> Self {
+        let prepare = |patterns: &'a [String]| {
+            patterns
+                .iter()
+                .map(|pattern| PreparedGlob {
+                    pattern,
+                    regex: OnceLock::new(),
+                })
+                .collect()
+        };
+        Self {
+            include: prepare(include),
+            exclude: prepare(exclude),
+        }
+    }
+
+    pub(crate) fn is_match(&self, rel_path: &str) -> bool {
+        (self.include.is_empty() || self.include.iter().any(|glob| glob.is_match(rel_path)))
+            && !self.exclude.iter().any(|glob| glob.is_match(rel_path))
     }
 }
 
-fn build_preview(text: &str, start: usize, end: usize) -> String {
-    let line_start = text[..start].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
-    let line_end = text[end..]
-        .find('\n')
-        .map(|idx| end + idx)
-        .unwrap_or(text.len());
-    let excerpt = &text[line_start..line_end];
-    if excerpt.chars().count() <= MAX_PREVIEW_CHARS {
-        excerpt.to_string()
-    } else {
-        excerpt.chars().take(MAX_PREVIEW_CHARS).collect()
+struct PreparedGlob<'a> {
+    pattern: &'a str,
+    regex: OnceLock<Option<Regex>>,
+}
+
+impl PreparedGlob<'_> {
+    fn is_match(&self, path: &str) -> bool {
+        self.regex
+            .get_or_init(|| get_or_compile_glob(self.pattern))
+            .as_ref()
+            .is_some_and(|regex| regex.is_match(path))
     }
 }
 
-fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
-    let bounded = offset.min(text.len());
-    let line = text[..bounded]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count();
-    let line_start = text[..bounded].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
-    let column = text[line_start..bounded].chars().count();
-    (line, column)
+/// find_iter yields non-overlapping, ordered byte ranges. Advance through the
+/// text once instead of rescanning its prefix for every match's two positions.
+/// State is constant-sized even for files containing millions of empty lines.
+struct MatchBuilder<'a> {
+    text: &'a str,
+    offset: usize,
+    line: usize,
+    column: usize,
+    line_start: usize,
+    preview_line_end: Option<usize>,
+}
+
+impl<'a> MatchBuilder<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            offset: 0,
+            line: 0,
+            column: 0,
+            line_start: 0,
+            preview_line_end: None,
+        }
+    }
+
+    fn advance_to(&mut self, offset: usize) {
+        debug_assert!(offset >= self.offset);
+        let segment = &self.text[self.offset..offset];
+        if let Some(newline) = segment.rfind('\n') {
+            self.line += segment.bytes().filter(|byte| *byte == b'\n').count();
+            self.column = segment[newline + 1..].chars().count();
+            self.line_start = self.offset + newline + 1;
+        } else {
+            self.column += segment.chars().count();
+        }
+        self.offset = offset;
+    }
+
+    fn build(&mut self, start: usize, end: usize) -> SearchMatch {
+        self.advance_to(start);
+        let line = self.line;
+        let start_column = self.column;
+        let line_start = self.line_start;
+        self.advance_to(end);
+        let line_end = match self.preview_line_end {
+            Some(cached) if end <= cached => cached,
+            _ => {
+                let line_end = self.text[end..]
+                    .find('\n')
+                    .map(|idx| end + idx)
+                    .unwrap_or(self.text.len());
+                self.preview_line_end = Some(line_end);
+                line_end
+            }
+        };
+        // Locate at most 241 characters, then allocate the exact byte length.
+        // Short Unicode previews need no intermediate growing String either.
+        let excerpt = &self.text[line_start..line_end];
+        let preview_end = excerpt
+            .char_indices()
+            .nth(MAX_PREVIEW_CHARS)
+            .map_or(excerpt.len(), |(idx, _)| idx);
+        SearchMatch {
+            line,
+            start_column,
+            end_line: (self.line != line).then_some(self.line),
+            end_column: self.column,
+            preview: excerpt[..preview_end].to_string(),
+        }
+    }
 }
 
 fn is_word_boundary(text: &str, start: usize, end: usize) -> bool {
@@ -382,7 +474,239 @@ fn glob_to_regex_source(pattern: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches_include_filters, verify_literal, verify_regex};
+    use super::{
+        matches_include_filters, matches_path_filters, verify_literal, verify_regex, MatchBuilder,
+        PreparedPathFilters, PreparedVerifier,
+    };
+    use crate::protocol::SearchMatch;
+
+    #[test]
+    fn prepared_path_filters_preserve_scope_combinations_and_invalid_patterns() {
+        let paths = [
+            "",
+            "unit.rs",
+            "unit.ts",
+            "src/unit.rs",
+            "src/deep/unit.rs",
+            "src/한글😀.rs",
+            "src/generated/unit.rs",
+            "tests/a1.rs",
+            "tests/a2.rs",
+            ".hidden/a.rs",
+            "a+b/file(1).rs",
+            "sub/README.md",
+            "sub/a\nb.rs",
+        ];
+        let scopes: &[&[&str]] = &[
+            &[],
+            &["**/*.rs"],
+            &["src/*.rs", "tests/a[12].rs"],
+            &["**/*.ts", "src/**"],
+            &["**/generated/**"],
+            &["a+b/file(1).rs"],
+            &["[z-a]"],
+            &["[z-a]", "src/**"],
+            &["*"],
+            &["**"],
+            &["src/**/unit.?s"],
+            &["tests/a[!2].rs"],
+            &["["],
+            &[""],
+        ];
+        let scopes = scopes
+            .iter()
+            .map(|patterns| {
+                patterns
+                    .iter()
+                    .map(|pattern| pattern.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for include in &scopes {
+            for exclude in &scopes {
+                let prepared = PreparedPathFilters::new(include, exclude);
+                for path in paths {
+                    assert_eq!(
+                        prepared.is_match(path),
+                        matches_path_filters(path, include, exclude),
+                        "path={path:?}, include={include:?}, exclude={exclude:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_globs_initialize_only_reached_patterns_and_retain_failed_compilations() {
+        let include = vec!["src/**".to_string(), "[z-a]".to_string()];
+        let exclude = vec!["**/generated/**".to_string(), "[z-a]".to_string()];
+        let prepared = PreparedPathFilters::new(&include, &exclude);
+        assert!(prepared
+            .include
+            .iter()
+            .chain(&prepared.exclude)
+            .all(|glob| glob.regex.get().is_none()));
+        assert!(!prepared.is_match("src/generated/unit.rs"));
+        assert!(prepared.include[0].regex.get().is_some());
+        assert!(prepared.include[1].regex.get().is_none());
+        assert!(prepared.exclude[0].regex.get().is_some());
+        assert!(prepared.exclude[1].regex.get().is_none());
+        assert!(!prepared.is_match("other/unit.rs"));
+        assert!(matches!(prepared.include[1].regex.get(), Some(None)));
+        assert!(!prepared.is_match("other/second.rs"));
+        assert!(matches!(prepared.include[1].regex.get(), Some(None)));
+        assert!(prepared.exclude[1].regex.get().is_none());
+        assert!(prepared.is_match("src/unit.rs"));
+        assert!(matches!(prepared.exclude[1].regex.get(), Some(None)));
+    }
+
+    fn reference_match(text: &str, start: usize, end: usize) -> SearchMatch {
+        // Deliberately rescan each prefix as the original verifier did. This
+        // oracle does not depend on the optimized cursor or its preview cache.
+        let position = |offset| {
+            let lines = text[..offset].split('\n').collect::<Vec<_>>();
+            (lines.len() - 1, lines.last().unwrap().chars().count())
+        };
+        let (line, start_column) = position(start);
+        let (end_line, end_column) = position(end);
+        let line_start = text[..start].rfind('\n').map_or(0, |idx| idx + 1);
+        let line_end = text[end..].find('\n').map_or(text.len(), |idx| end + idx);
+        SearchMatch {
+            line,
+            start_column,
+            end_line: (end_line != line).then_some(end_line),
+            end_column,
+            preview: text[line_start..line_end].chars().take(240).collect(),
+        }
+    }
+
+    #[test]
+    fn match_positions_and_previews_preserve_all_unicode_and_line_boundaries() {
+        for text in [
+            "".to_string(),
+            "\r\n\n가😀e\u{301} x\r\ny\nz\n".to_string(),
+            format!("{}\r\n{}", "é😀a ".repeat(65), "b한 ".repeat(90)),
+        ] {
+            let mut boundaries = text
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>();
+            boundaries.push(text.len());
+            // Exhaust short texts; sample the long lines around preview limits.
+            if boundaries.len() > 100 {
+                boundaries = boundaries.into_iter().step_by(7).collect();
+                boundaries.push(text.len());
+                boundaries.dedup();
+            }
+            for (idx, &start) in boundaries.iter().enumerate() {
+                for &end in &boundaries[idx..] {
+                    let mut builder = MatchBuilder::new(&text);
+                    assert_eq!(
+                        builder.build(start, end).to_json(),
+                        reference_match(&text, start, end).to_json()
+                    );
+                    // Continue from a previous match, including an empty match
+                    // at its end and a match crossing later cached line ends.
+                    assert_eq!(
+                        builder.build(end, end).to_json(),
+                        reference_match(&text, end, end).to_json()
+                    );
+                    assert_eq!(
+                        builder.build(end, text.len()).to_json(),
+                        reference_match(&text, end, text.len()).to_json()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_verifiers_reset_positions_and_limits_for_each_file_and_clone() {
+        let verifier = PreparedVerifier::literal("item", false, true);
+        for verifier in [&verifier, &verifier.clone()] {
+            let text = "가😀 item item\r\n\né item\nITEM itemSuffix";
+            let matches = verifier.verify(text, 10);
+            assert_eq!(
+                matches
+                    .iter()
+                    .map(|found| (found.line, found.start_column, found.end_column))
+                    .collect::<Vec<_>>(),
+                vec![(0, 3, 7), (0, 8, 12), (2, 2, 6), (3, 0, 4)]
+            );
+            assert_eq!(matches[0].preview, "가😀 item item\r");
+            assert_eq!(
+                verifier
+                    .verify(text, 2)
+                    .iter()
+                    .map(SearchMatch::to_json)
+                    .collect::<Vec<_>>(),
+                matches[..2]
+                    .iter()
+                    .map(SearchMatch::to_json)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                verifier.verify("item", 10)[0].to_json(),
+                reference_match("item", 0, 4).to_json()
+            );
+            assert!(verifier.verify("no matches", 10).is_empty());
+        }
+    }
+
+    #[test]
+    fn singleline_empty_regex_matches_keep_crlf_and_trailing_empty_line_positions() {
+        let text = "😀\r\n\n가\n";
+        let matches = verify_regex(text, "^|$", true, false, 20).unwrap();
+        assert_eq!(
+            matches
+                .iter()
+                .map(|found| (found.line, found.start_column, found.end_column))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 0, 0),
+                (0, 1, 1),
+                (1, 0, 0),
+                (2, 0, 0),
+                (2, 1, 1),
+                (3, 0, 0)
+            ]
+        );
+        assert_eq!(
+            matches
+                .iter()
+                .map(|found| found.preview.as_str())
+                .collect::<Vec<_>>(),
+            vec!["😀\r", "😀\r", "", "가", "가", ""]
+        );
+    }
+
+    #[test]
+    fn consecutive_multiline_matches_keep_unicode_ranges_and_full_line_previews() {
+        let matches = verify_literal("한 item\r\n😀 item\n😀", "item\n😀", true, false, 10);
+        let expected = vec![
+            SearchMatch {
+                line: 0,
+                start_column: 2,
+                end_line: Some(1),
+                end_column: 1,
+                preview: "한 item\r\n😀 item".to_string(),
+            },
+            SearchMatch {
+                line: 1,
+                start_column: 2,
+                end_line: Some(2),
+                end_column: 1,
+                preview: "😀 item\n😀".to_string(),
+            },
+        ];
+        assert_eq!(
+            matches.iter().map(SearchMatch::to_json).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(SearchMatch::to_json)
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn verifies_case_insensitive_whole_word_matches() {

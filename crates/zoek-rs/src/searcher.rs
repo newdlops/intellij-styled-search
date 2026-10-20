@@ -7,9 +7,9 @@ use crate::protocol::{SearchFileResult, SearchMatch, SearchRequest, SearchRespon
 use crate::scorer::score_file;
 use crate::shard::{open_validated_base_shard, read_base_shard_set, ShardDocument, ShardReader};
 use crate::verifier::{
-    build_file_result, load_current_text, matches_path_filters, verify_literal, verify_regex,
+    build_file_result, load_current_text, PreparedPathFilters, PreparedVerifier,
 };
-use regex::{Regex, RegexBuilder};
+use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,36 +63,48 @@ where
         .map(Regex::new)
         .transpose()
         .map_err(|err| format!("invalid path regex: {err}"))?;
-    // Validate the content regex up front so an invalid or unsupported pattern
-    // (bad syntax, backreference, look-around) surfaces a clear error even when
-    // the trigram pre-filter selects zero candidate files. Otherwise verify_regex
-    // only compiles per candidate, so a zero-candidate query silently returns
-    // "no matches" and hides the real cause from the user.
-    if matches!(plan.mode, QueryMode::Regex) {
-        for term in &plan.terms {
-            RegexBuilder::new(&term.effective_query)
-                .case_insensitive(!request.case_sensitive)
-                .multi_line(request.regex_multiline)
-                .dot_matches_new_line(request.regex_multiline)
-                .build()
-                .map_err(|err| err.to_string())?;
-        }
-    }
+    // Compile once per query, preserving up-front regex errors even when the
+    // index selects no candidates. All verification paths reuse this state.
+    let verifiers = plan
+        .terms
+        .iter()
+        .map(|term| match plan.mode {
+            QueryMode::Literal => Ok(PreparedVerifier::literal(
+                &term.query,
+                request.case_sensitive,
+                request.whole_word,
+            )),
+            QueryMode::Regex => PreparedVerifier::regex(
+                &term.effective_query,
+                request.case_sensitive,
+                request.regex_multiline,
+            ),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
     let workspace_root = Path::new(&request.workspace_root);
     let layout = StoreLayout::for_workspace(workspace_root, config);
     let mut warnings = Vec::new();
+    let path_filters = PreparedPathFilters::new(&plan.include, &plan.exclude);
 
     let indexed_candidates = {
         let _read_lock = acquire_index_read_lock(&layout).map_err(|err| err.to_string())?;
-        collect_index_candidates(workspace_root, &layout, &plan, config, &mut warnings)
+        collect_index_candidates(
+            workspace_root,
+            &layout,
+            &plan,
+            config,
+            &path_filters,
+            &mut warnings,
+        )
     };
     let candidates = match indexed_candidates {
         Ok(Some(candidates)) => candidates,
-        Ok(None) => fallback_candidates(workspace_root, request, &mut warnings)
+        Ok(None) => fallback_candidates(workspace_root, request, &path_filters, &mut warnings)
             .map_err(|err| err.to_string())?,
         Err(err) => {
             warnings.push(format!("index query fallback: {err}"));
-            fallback_candidates(workspace_root, request, &mut warnings)
+            fallback_candidates(workspace_root, request, &path_filters, &mut warnings)
                 .map_err(|fallback| fallback.to_string())?
         }
     };
@@ -119,8 +131,7 @@ where
     if !stream_files && ordered_candidates.len() >= PARALLEL_VERIFY_THRESHOLD {
         let (files, scanned, matches, term_coverage) = verify_candidates_parallel(
             &ordered_candidates,
-            &plan,
-            request,
+            &verifiers,
             config,
             path_regex.clone(),
             target_matches,
@@ -147,13 +158,8 @@ where
                 continue;
             };
             let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
-            let (matches, term_coverage) = verify_plan_terms_with_coverage(
-                &current.text,
-                &plan,
-                request,
-                remaining_match_budget,
-            )
-            .map_err(|err| err.to_string())?;
+            let (matches, term_coverage) =
+                verify_plan_terms_with_coverage(&current.text, &verifiers, remaining_match_budget);
             if matches.is_empty() {
                 continue;
             }
@@ -189,8 +195,13 @@ where
             let latest_overlay = load_overlay_with_recovery(&layout)
                 .map(|result| result.manifest.latest_entries())
                 .unwrap_or_default();
-            let fallback = fallback_candidates(workspace_root, &fallback_request, &mut warnings)
-                .map_err(|err| err.to_string())?;
+            let fallback = fallback_candidates(
+                workspace_root,
+                &fallback_request,
+                &path_filters,
+                &mut warnings,
+            )
+            .map_err(|err| err.to_string())?;
             for (rel_path, candidate) in fallback {
                 if candidates.contains_key(&rel_path) {
                     continue;
@@ -220,11 +231,9 @@ where
                 let remaining_match_budget = target_matches.saturating_sub(total_matches).max(1);
                 let (matches, term_coverage) = verify_plan_terms_with_coverage(
                     &current.text,
-                    &plan,
-                    request,
+                    &verifiers,
                     remaining_match_budget,
-                )
-                .map_err(|err| err.to_string())?;
+                );
                 if matches.is_empty() {
                     continue;
                 }
@@ -351,6 +360,7 @@ fn collect_index_candidates(
     layout: &StoreLayout,
     plan: &crate::planner::QueryPlan,
     config: &EngineConfig,
+    path_filters: &PreparedPathFilters<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<Option<BTreeMap<String, CandidateDocument>>, String> {
     let base_shards = match read_base_shard_set(layout) {
@@ -397,7 +407,7 @@ fn collect_index_candidates(
             if latest_overlay.contains_key(&doc.rel_path) {
                 continue;
             }
-            if !matches_path_filters(&doc.rel_path, &plan.include, &plan.exclude) {
+            if !path_filters.is_match(&doc.rel_path) {
                 continue;
             }
             if let Some(regex) = &path_regex {
@@ -423,7 +433,7 @@ fn collect_index_candidates(
         if overlay_entry.tombstone {
             continue;
         }
-        if !matches_path_filters(&overlay_entry.rel_path, &plan.include, &plan.exclude) {
+        if !path_filters.is_match(&overlay_entry.rel_path) {
             continue;
         }
         if let Some(regex) = &path_regex {
@@ -468,7 +478,7 @@ fn candidate_doc_ranks(
 
     let mut selected_ids = BTreeMap::<u32, u16>::new();
     for term in &plan.terms {
-        let mut term_ids: Option<BTreeSet<u32>> = None;
+        let mut term_ids: Option<Vec<u32>> = None;
         let mut incomplete_sets = Vec::new();
         let mut incomplete_hit_counts = BTreeMap::<u32, u16>::new();
         let has_literal_special_gram = term
@@ -477,9 +487,11 @@ fn candidate_doc_ranks(
             .any(|gram| gram.contains("://") || gram.contains(':'));
         for gram in &term.required_grams {
             let posting = reader.find_posting(gram)?;
-            let ids = posting
-                .map(|posting| posting.doc_ids.into_iter().collect::<BTreeSet<_>>())
-                .unwrap_or_default();
+            // Delta-decoded shard postings are already nondecreasing. Keep
+            // them compact, but preserve the previous set semantics when a
+            // gram occurs more than once in a document's posting list.
+            let mut ids = posting.map(|posting| posting.doc_ids).unwrap_or_default();
+            ids.dedup();
             let allow_incomplete_backfill =
                 !has_literal_special_gram || gram.contains("://") || gram.contains(':');
             if allow_incomplete_backfill
@@ -487,9 +499,10 @@ fn candidate_doc_ranks(
                 && ids.len() <= INCOMPLETE_GRAM_BACKFILL_DOC_LIMIT
             {
                 let incomplete_docs = ids
-                    .intersection(&incomplete_ids)
+                    .iter()
+                    .filter(|doc_id| incomplete_ids.contains(doc_id))
                     .copied()
-                    .collect::<BTreeSet<_>>();
+                    .collect::<Vec<_>>();
                 if !incomplete_docs.is_empty() {
                     for doc_id in &incomplete_docs {
                         *incomplete_hit_counts.entry(*doc_id).or_default() += 1;
@@ -497,11 +510,11 @@ fn candidate_doc_ranks(
                     incomplete_sets.push(incomplete_docs);
                 }
             }
-            term_ids = Some(match term_ids {
-                Some(existing) => existing.intersection(&ids).copied().collect(),
-                None => ids,
-            });
-            if term_ids.as_ref().is_some_and(BTreeSet::is_empty) {
+            match &mut term_ids {
+                Some(existing) => intersect_sorted_doc_ids(existing, &ids),
+                None => term_ids = Some(ids),
+            }
+            if term_ids.as_ref().is_some_and(Vec::is_empty) {
                 break;
             }
         }
@@ -520,7 +533,7 @@ fn candidate_doc_ranks(
             continue;
         }
         if !incomplete_sets.is_empty() {
-            incomplete_sets.sort_by_key(BTreeSet::len);
+            incomplete_sets.sort_by_key(Vec::len);
             for docs in incomplete_sets
                 .into_iter()
                 .take(INCOMPLETE_GRAM_BACKFILL_LIMIT)
@@ -538,6 +551,22 @@ fn candidate_doc_ranks(
     Ok(selected_ids)
 }
 
+/// Both inputs are sorted and unique. Retain the intersection in the existing
+/// allocation instead of building a tree and another intersection per gram.
+fn intersect_sorted_doc_ids(existing: &mut Vec<u32>, ids: &[u32]) {
+    if ids.is_empty() {
+        existing.clear();
+        return;
+    }
+    let mut right = 0;
+    existing.retain(|id| {
+        while right < ids.len() && ids[right] < *id {
+            right += 1;
+        }
+        ids.get(right) == Some(id)
+    });
+}
+
 fn should_verify_all_incomplete_docs(mode: QueryMode, term: &QueryTermPlan) -> bool {
     mode == QueryMode::Literal
         && (term.query.contains('\n') || term.query.len() >= LONG_LITERAL_INCOMPLETE_BACKFILL_CHARS)
@@ -545,14 +574,10 @@ fn should_verify_all_incomplete_docs(mode: QueryMode, term: &QueryTermPlan) -> b
 
 fn docs_for_ranked_ids<'a>(
     docs: &'a [ShardDocument],
-    ids: &BTreeMap<u32, u16>,
-) -> Vec<(&'a ShardDocument, u16)> {
-    if ids.is_empty() {
-        return Vec::new();
-    }
+    ids: &'a BTreeMap<u32, u16>,
+) -> impl Iterator<Item = (&'a ShardDocument, u16)> + 'a {
     ids.iter()
-        .filter_map(|(doc_id, rank)| docs.get(*doc_id as usize).map(|doc| (doc, *rank)))
-        .collect()
+        .filter_map(move |(doc_id, rank)| docs.get(*doc_id as usize).map(|doc| (doc, *rank)))
 }
 
 fn overlay_matches_plan(
@@ -587,29 +612,13 @@ fn overlay_matches_plan(
 
 fn verify_plan_terms_with_coverage(
     text: &str,
-    plan: &crate::planner::QueryPlan,
-    request: &SearchRequest,
+    verifiers: &[PreparedVerifier],
     limit: usize,
-) -> Result<(Vec<SearchMatch>, Vec<bool>), regex::Error> {
+) -> (Vec<SearchMatch>, Vec<bool>) {
     let mut matches = Vec::new();
-    let mut matched_terms = vec![false; plan.terms.len()];
-    for (term_idx, term) in plan.terms.iter().enumerate() {
-        let term_matches = match plan.mode {
-            QueryMode::Literal => verify_literal(
-                text,
-                &term.query,
-                request.case_sensitive,
-                request.whole_word,
-                limit,
-            ),
-            QueryMode::Regex => verify_regex(
-                text,
-                &term.effective_query,
-                request.case_sensitive,
-                request.regex_multiline,
-                limit,
-            )?,
-        };
+    let mut matched_terms = vec![false; verifiers.len()];
+    for (term_idx, verifier) in verifiers.iter().enumerate() {
+        let term_matches = verifier.verify(text, limit);
         if !term_matches.is_empty() {
             matched_terms[term_idx] = true;
             matches.extend(term_matches);
@@ -632,7 +641,7 @@ fn verify_plan_terms_with_coverage(
     if matches.len() > limit {
         matches.truncate(limit);
     }
-    Ok((matches, matched_terms))
+    (matches, matched_terms)
 }
 
 fn merge_term_coverage(target: &mut [bool], source: &[bool]) {
@@ -676,8 +685,7 @@ fn literal_fallback_request_for_missing_terms(
 
 fn verify_candidates_parallel(
     candidates: &[&CandidateDocument],
-    plan: &crate::planner::QueryPlan,
-    request: &SearchRequest,
+    verifiers: &[PreparedVerifier],
     config: &EngineConfig,
     path_regex: Option<Regex>,
     per_file_limit: usize,
@@ -695,8 +703,7 @@ fn verify_candidates_parallel(
             .iter()
             .map(|candidate| (*candidate).clone())
             .collect::<Vec<_>>();
-        let plan = plan.clone();
-        let request = request.clone();
+        let verifiers = verifiers.to_vec();
         let config = config.clone();
         let path_regex = path_regex.clone();
         handles.push(thread::spawn(
@@ -704,7 +711,7 @@ fn verify_candidates_parallel(
                 let mut files = Vec::new();
                 let mut scanned = 0usize;
                 let mut total_matches = 0usize;
-                let mut matched_terms = vec![false; plan.terms.len()];
+                let mut matched_terms = vec![false; verifiers.len()];
                 for candidate in chunk {
                     if let Some(regex) = &path_regex {
                         if !regex.is_match(&candidate.rel_path) {
@@ -717,13 +724,8 @@ fn verify_candidates_parallel(
                     else {
                         continue;
                     };
-                    let (matches, term_coverage) = verify_plan_terms_with_coverage(
-                        &current.text,
-                        &plan,
-                        &request,
-                        per_file_limit,
-                    )
-                    .map_err(|err| err.to_string())?;
+                    let (matches, term_coverage) =
+                        verify_plan_terms_with_coverage(&current.text, &verifiers, per_file_limit);
                     if matches.is_empty() {
                         continue;
                     }
@@ -746,7 +748,7 @@ fn verify_candidates_parallel(
     let mut files = Vec::new();
     let mut scanned = 0usize;
     let mut total_matches = 0usize;
-    let mut matched_terms = vec![false; plan.terms.len()];
+    let mut matched_terms = vec![false; verifiers.len()];
     for handle in handles {
         let (chunk_files, chunk_scanned, chunk_matches, chunk_term_coverage) = handle
             .join()
@@ -762,6 +764,7 @@ fn verify_candidates_parallel(
 fn fallback_candidates(
     workspace_root: &Path,
     request: &SearchRequest,
+    path_filters: &PreparedPathFilters<'_>,
     warnings: &mut Vec<String>,
 ) -> std::io::Result<BTreeMap<String, CandidateDocument>> {
     if let Some(rel_path) = request
@@ -769,7 +772,7 @@ fn fallback_candidates(
         .as_deref()
         .and_then(exact_path_from_regex)
     {
-        if !matches_path_filters(&rel_path, &request.include, &request.exclude) {
+        if !path_filters.is_match(&rel_path) {
             return Ok(BTreeMap::new());
         }
         let absolute_path = workspace_root.join(&rel_path);
@@ -787,7 +790,9 @@ fn fallback_candidates(
             },
         )]));
     }
-    if let Some(candidates) = rg_literal_fallback_candidates(workspace_root, request, warnings)? {
+    if let Some(candidates) =
+        rg_literal_fallback_candidates(workspace_root, request, path_filters, warnings)?
+    {
         return Ok(candidates);
     }
     let (entries, _) = discover_text_files(workspace_root, &EngineConfig::default())?;
@@ -800,7 +805,7 @@ fn fallback_candidates(
         .map_err(std::io::Error::other)?;
     Ok(entries
         .into_iter()
-        .filter(|entry| matches_path_filters(&entry.rel_path, &request.include, &request.exclude))
+        .filter(|entry| path_filters.is_match(&entry.rel_path))
         .filter(|entry| {
             path_regex
                 .as_ref()
@@ -825,6 +830,7 @@ fn fallback_candidates(
 fn rg_literal_fallback_candidates(
     workspace_root: &Path,
     request: &SearchRequest,
+    path_filters: &PreparedPathFilters<'_>,
     warnings: &mut Vec<String>,
 ) -> std::io::Result<Option<BTreeMap<String, CandidateDocument>>> {
     let literal_terms = request.all_query_terms();
@@ -887,9 +893,7 @@ fn rg_literal_fallback_candidates(
             .strip_prefix("./")
             .unwrap_or_else(|| line.trim())
             .replace('\\', "/");
-        if rel_path.is_empty()
-            || !matches_path_filters(&rel_path, &request.include, &request.exclude)
-        {
+        if rel_path.is_empty() || !path_filters.is_match(&rel_path) {
             continue;
         }
         if path_regex
@@ -940,19 +944,395 @@ fn exact_path_from_regex(pattern: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exact_path_from_regex, search_workspace};
+    use super::{
+        candidate_doc_ranks, exact_path_from_regex, intersect_sorted_doc_ids, search_workspace,
+        search_workspace_streaming,
+    };
     use crate::config::{ripgrep_executable, EngineConfig};
     use crate::indexer::index_directory;
     use crate::mmap_store::StoreLayout;
     use crate::overlay::{apply_change_batch, OverlayEntry, OverlayManifest};
     use crate::protocol::{json_string, SearchRequest};
-    use crate::shard::{build_shard_bytes, IndexedDocument};
+    use crate::shard::{build_shard_bytes, IndexedDocument, ShardReader};
     use crate::watcher::build_change_batch;
     use std::fs;
     use std::io;
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn prepared_scopes_keep_base_overlay_and_fallback_results_in_sync() -> io::Result<()> {
+        use crate::verifier::matches_path_filters;
+        use std::collections::BTreeSet;
+
+        let root = temp_dir("prepared-path-scopes");
+        let indexed = root.join("indexed");
+        let fallback = root.join("fallback");
+        let paths = [
+            "src/direct.rs",
+            "src/nested/unit.rs",
+            "src/generated/unit.rs",
+            "src/unit.test.rs",
+            "tests/a1.rs",
+            "tests/a2.rs",
+            "notes.txt",
+            "한글/😀.rs",
+        ];
+        for workspace in [&indexed, &fallback] {
+            for rel_path in paths {
+                let path = workspace.join(rel_path);
+                fs::create_dir_all(path.parent().unwrap())?;
+                fs::write(path, "shared_marker\n")?;
+            }
+        }
+        let config = EngineConfig::default();
+        index_directory(&indexed, &config)?;
+        for workspace in [&indexed, &fallback] {
+            fs::remove_file(workspace.join("src/nested/unit.rs"))?;
+            for rel_path in ["src/direct.rs", "src/new.rs", "src/generated/new.rs"] {
+                fs::write(workspace.join(rel_path), "shared_marker updated\n")?;
+            }
+        }
+        let layout = StoreLayout::for_workspace(&indexed, &config);
+        apply_change_batch(
+            &indexed,
+            &layout,
+            &config,
+            &build_change_batch(
+                0,
+                &[
+                    "src/direct.rs".into(),
+                    "src/new.rs".into(),
+                    "src/generated/new.rs".into(),
+                ],
+                &["src/nested/unit.rs".into()],
+                &[],
+            ),
+        )?;
+        let mut current_paths = paths
+            .into_iter()
+            .filter(|path| *path != "src/nested/unit.rs")
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        current_paths.extend(["src/new.rs".to_string(), "src/generated/new.rs".to_string()]);
+        let scopes: &[(&[&str], &[&str])] = &[
+            (&[], &["**/generated/**", "**/*.test.rs"]),
+            (&["src/*.rs"], &[]),
+            (&["tests/a[!2].rs"], &[]),
+            (&["[z-a]"], &[]),
+            (&["src/**", "**/*.txt"], &["**/*.test.rs", "[z-a]"]),
+            (&[], &["**"]),
+        ];
+        for workspace in [&indexed, &fallback] {
+            for &(include, exclude) in scopes {
+                // No base index exercises both rg literal fallback and full
+                // corpus regex fallback; exact scopes use the targeted path.
+                for (use_regex, exact) in [(false, false), (true, false), (false, true)] {
+                    let request = SearchRequest {
+                        workspace_root: workspace.to_string_lossy().into_owned(),
+                        query: "shared_marker".to_string(),
+                        query_terms: vec![],
+                        case_sensitive: true,
+                        whole_word: false,
+                        use_regex,
+                        regex_multiline: false,
+                        include: include.iter().map(|value| value.to_string()).collect(),
+                        exclude: exclude.iter().map(|value| value.to_string()).collect(),
+                        path_regex: exact.then(|| r"^src/direct\.rs$".to_string()),
+                        limit: 100,
+                        offset: 0,
+                    };
+                    let expected = current_paths
+                        .iter()
+                        .filter(|path| {
+                            matches_path_filters(path, &request.include, &request.exclude)
+                                && (!exact || path.as_str() == "src/direct.rs")
+                        })
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    let response = search_workspace(&request, &config).map_err(io::Error::other)?;
+                    assert_eq!(
+                        response
+                            .files
+                            .iter()
+                            .map(|file| file.rel_path.clone())
+                            .collect::<BTreeSet<_>>(),
+                        expected
+                    );
+                    assert_eq!(response.total_matches, expected.len());
+                    if workspace == &indexed && !exact {
+                        let diagnostic = crate::ops::diagnose_query(&request, &config)
+                            .map_err(io::Error::other)?;
+                        assert_eq!(diagnostic.final_candidate_count, expected.len());
+                        assert_eq!(
+                            diagnostic
+                                .candidate_sample
+                                .into_iter()
+                                .collect::<BTreeSet<_>>(),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_posting_intersections_match_set_membership_for_sparse_and_boundary_ids() {
+        let universe = [0, 1, 3, 9, 255, 65535, u32::MAX - 1, u32::MAX];
+        let subset = |mask: usize| {
+            universe
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, id)| ((mask & (1 << idx)) != 0).then_some(*id))
+                .collect::<Vec<_>>()
+        };
+        for left in 0..256 {
+            for right in 0..256 {
+                let mut actual = subset(left);
+                let ids = subset(right);
+                let expected = actual
+                    .iter()
+                    .copied()
+                    .filter(|id| ids.contains(id))
+                    .collect::<Vec<_>>();
+                intersect_sorted_doc_ids(&mut actual, &ids);
+                assert_eq!(actual, expected, "left={left}, right={right}");
+            }
+        }
+    }
+
+    #[test]
+    fn compact_postings_preserve_or_ranks_and_incomplete_backfill_rules() -> io::Result<()> {
+        use crate::gram::hash_gram_value;
+        use crate::planner::{QueryMode, QueryPlan, QueryTermPlan};
+        use std::collections::BTreeMap;
+
+        let root = temp_dir("compact-posting-ranks");
+        fs::create_dir_all(&root)?;
+        let input: &[(&[&str], bool)] = &[
+            (&["a", "a", "b", "c"], false),
+            (&["a", "a", "b"], true),
+            (&["a"], true),
+            (&["b", "c"], false),
+            (&["c"], true),
+            (&["x:y"], true),
+            (&[], false),
+        ];
+        let documents = input
+            .iter()
+            .enumerate()
+            .map(|(idx, (grams, incomplete))| IndexedDocument {
+                rel_path: format!("unit-{idx}.txt"),
+                byte_len: 0,
+                modified_unix_secs: 1,
+                content_hash: 1,
+                grams: grams.iter().map(|gram| hash_gram_value(gram)).collect(),
+                gram_incomplete: *incomplete,
+            })
+            .collect::<Vec<_>>();
+        let shard_path = root.join("shard.zrs");
+        fs::write(&shard_path, build_shard_bytes(0, 1, 1, &documents)?.bytes)?;
+        let reader = ShardReader::open(&shard_path)?;
+        let docs = reader.documents()?;
+        let term = |query: &str, grams: &[&str]| QueryTermPlan {
+            query: query.to_string(),
+            effective_query: query.to_string(),
+            required_literals: vec![],
+            required_grams: grams.iter().map(|gram| gram.to_string()).collect(),
+        };
+        let ranks = |terms| {
+            candidate_doc_ranks(
+                &reader,
+                &docs,
+                &QueryPlan {
+                    mode: QueryMode::Literal,
+                    effective_query: String::new(),
+                    terms,
+                    case_sensitive: true,
+                    whole_word: false,
+                    include: vec![],
+                    exclude: vec![],
+                    path_regex: None,
+                    required_literals: vec![],
+                    required_grams: vec![],
+                },
+            )
+        };
+
+        // OR keeps the strongest rank and de-duplicates repeated posting IDs.
+        assert_eq!(
+            ranks(vec![term("ab", &["a", "b"]), term("c", &["c"])])?,
+            BTreeMap::from([(0, 1002), (1, 1002), (3, 1001), (4, 1001)])
+        );
+        // Stop at the same empty intersection; later grams must not alter the
+        // incomplete hit counts or the stable choice between equal-sized sets.
+        assert_eq!(
+            ranks(vec![term("missing", &["a", "missing", "b"])])?,
+            BTreeMap::from([(1, 1), (2, 1)])
+        );
+        assert_eq!(
+            ranks(vec![term("bc", &["b", "c"])])?,
+            BTreeMap::from([(0, 1002), (1, 1), (3, 1002)])
+        );
+        // A specialized literal gram restricts which incomplete postings can
+        // supply backfill; missing specialized grams cannot borrow other hits.
+        assert_eq!(
+            ranks(vec![term("a x:y", &["a", "x:y"])])?,
+            BTreeMap::from([(5, 1)])
+        );
+        assert!(ranks(vec![term("a z:w", &["a", "z:w"])])?.is_empty());
+        for query in ["a\nmissing".to_string(), "a".repeat(512)] {
+            assert_eq!(
+                ranks(vec![term(&query, &["a", "missing"])])?,
+                BTreeMap::from([(1, 0), (2, 0), (4, 0), (5, 0)])
+            );
+        }
+        let all_docs = (0..7).map(|id| (id, 0)).collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            ranks(vec![term("a", &["a"]), term("short", &[])])?,
+            all_docs
+        );
+        assert_eq!(ranks(vec![])?, all_docs);
+        drop(reader);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reused_verifiers_preserve_or_results_pagination_and_streamed_ranges() -> io::Result<()> {
+        let root = temp_dir("prepared-query");
+        for (directory, count) in [("serial", 3), ("parallel", 160)] {
+            fs::create_dir_all(root.join(directory))?;
+            for idx in 0..count {
+                fs::write(
+                    root.join(directory).join(format!("unit-{idx}.txt")),
+                    "pré😀 item\r\nITEM other\r\n",
+                )?;
+            }
+        }
+        let config = EngineConfig::default();
+        index_directory(&root, &config)?;
+        for (directory, count) in [("serial", 3), ("parallel", 160)] {
+            for (use_regex, regex_multiline) in [(false, false), (true, false), (true, true)] {
+                let mut request = SearchRequest {
+                    workspace_root: root.to_string_lossy().into_owned(),
+                    query: "item".to_string(),
+                    query_terms: vec![if use_regex { "item|other" } else { "other" }.to_string()],
+                    case_sensitive: false,
+                    whole_word: true,
+                    use_regex,
+                    regex_multiline,
+                    include: vec![format!("{directory}/**")],
+                    exclude: vec![],
+                    path_regex: None,
+                    limit: 1000,
+                    offset: 0,
+                };
+                let response = search_workspace(&request, &config).map_err(io::Error::other)?;
+                assert_eq!(response.total_matches, count * 3);
+                assert_eq!(response.files.len(), count);
+                assert!(response.warnings.is_empty());
+                for file in &response.files {
+                    assert_eq!(
+                        file.matches
+                            .iter()
+                            .map(|found| (found.line, found.start_column, found.end_column))
+                            .collect::<Vec<_>>(),
+                        vec![(0, 5, 9), (1, 0, 4), (1, 5, 10)]
+                    );
+                    assert_eq!(file.matches[0].preview, "pré😀 item\r");
+                    assert!(file.matches.iter().all(|found| found.end_line.is_none()));
+                }
+                let mut events = Vec::new();
+                let streamed = search_workspace_streaming(&request, &config, |file| {
+                    events.push(file.to_json());
+                    Ok(())
+                })
+                .map_err(io::Error::other)?;
+                assert_eq!(streamed.to_json(), response.to_json());
+                assert_eq!(
+                    events,
+                    response
+                        .files
+                        .iter()
+                        .map(|file| file.to_json())
+                        .collect::<Vec<_>>()
+                );
+
+                request.offset = 2;
+                request.limit = 4;
+                let page = search_workspace(&request, &config).map_err(io::Error::other)?;
+                events.clear();
+                let streamed_page = search_workspace_streaming(&request, &config, |file| {
+                    events.push(file.to_json());
+                    Ok(())
+                })
+                .map_err(io::Error::other)?;
+                assert_eq!(
+                    page.files
+                        .iter()
+                        .map(|file| file.matches.len())
+                        .sum::<usize>(),
+                    4
+                );
+                assert!(page.truncated);
+                assert_eq!(
+                    streamed_page
+                        .files
+                        .iter()
+                        .map(|file| file.to_json())
+                        .collect::<Vec<_>>(),
+                    page.files
+                        .iter()
+                        .map(|file| file.to_json())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    events,
+                    page.files
+                        .iter()
+                        .map(|file| file.to_json())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_regex_still_errors_when_no_file_can_match() -> io::Result<()> {
+        let root = temp_dir("prepared-query-invalid");
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("unit.txt"), "unrelated text\n")?;
+        let config = EngineConfig::default();
+        index_directory(&root, &config)?;
+        let mut request = SearchRequest {
+            workspace_root: root.to_string_lossy().into_owned(),
+            query: String::new(),
+            query_terms: vec![],
+            case_sensitive: true,
+            whole_word: false,
+            use_regex: true,
+            regex_multiline: false,
+            include: vec!["missing/**".to_string()],
+            exclude: vec![],
+            path_regex: None,
+            limit: 10,
+            offset: 0,
+        };
+        for pattern in ["[", r"(a)\1", "(?=x)"] {
+            request.query = pattern.to_string();
+            assert!(search_workspace(&request, &config).is_err());
+            assert!(search_workspace_streaming(&request, &config, |_| Ok(())).is_err());
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn search_workspace_uses_shards_for_literal_queries() -> io::Result<()> {

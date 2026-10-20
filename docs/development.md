@@ -14,6 +14,12 @@ Search and call graph indexing check host-wide available memory before starting.
 
 The codesearch trigram engine retains at most 16 MiB or 4,096 entries of clean disk-backed posting data. Evicted postings are read again when needed. Queries use posting sizes from the index metadata to intersect selective terms first and stop reading after the candidate set becomes empty. Reindexing keeps unchanged postings compact, and trigram extraction uses a three-character window. The read-cache limit does not cap mutable build data, query results, or the temporary full index image used during persistence.
 
+Rust text search compiles each query term once and reuses it for indexed candidates, fallback candidates and streamed results. Parallel workers clone the compiled verifier once per worker to keep regex search caches independent. Match positions advance through each file using constant-sized state. Preview truncation examines at most 241 characters, preserves the existing 240-character output limit, and allocates the exact output byte length. These changes preserve Unicode columns, LF/CRLF matching, whole-word behavior, OR deduplication and pagination without retaining a global query cache.
+
+Candidate selection keeps delta-decoded posting IDs as sorted arrays, removes duplicate IDs and intersects in place. It visits query grams in their original order so early termination, incomplete-index backfill and ranking stay unchanged. Selected documents are iterated directly from the rank map without allocating another document list.
+
+Search requests share lazy path-glob matchers across base shards, overlays and fallback paths; query diagnostics use the same matcher preparation. A pattern is initialized only when reached by the existing include/exclude short-circuit order, and its regex search cache is reused for subsequent paths. Invalid patterns remain non-matching and are remembered only for that request. The bounded compiled-glob cache and the existing glob syntax are unchanged.
+
 The tab-free bundled preview is the guaranteed path. It uses real file URIs, lazily reads the installed extensions' `contributes.languages`/`contributes.grammars` assets without activating those extensions, and relays VS Code language providers without opening an editor tab. TextMate grammar failures or safety-budget overruns fall back to Monaco's bundled tokenizer. When passive renderer capture is available, the preview may upgrade to VS Code's native editor services. Workspace language requests use the saved VS Code document snapshot, so a bundled preview pauses them while it has unsaved edits and resumes them after a successful save instead of showing stale ranges. If the overlay or preview fails after a VS Code update, reload the VS Code window and reopen `IntelliJ Search: Search`.
 
 ## Development
@@ -25,6 +31,7 @@ npm test
 npm run bench:zoekt -- --files 10000,50000,100000
 npm run bench:indexing -- --files 4000 --runs 3
 npm run bench:trigram
+npm run bench:verification -- --before /path/to/before/zoek-rs --after /path/to/after/zoek-rs --runs 5
 ```
 
 `npm run bench:zoekt` saves a timestamped artifact plus `latest.json` under `artifacts/benchmarks/zoekt/`. The artifact includes the raw benchmark response, wall-clock runtime, git commit, Rust toolchain versions, and host metadata so repeated runs stay comparable.
@@ -32,6 +39,8 @@ npm run bench:trigram
 `npm run bench:indexing` measures full builds, clean reuse, single-file and burst updates, duplicate events, renames, deletes, recreation and compaction in an isolated temporary workspace. It verifies text results and cross-file usage counts after each operation. Use `-- --binary /path/to/zoek-rs --output /tmp/indexing.json` to measure an earlier binary with the same workload; reports include binary hashes and individual timing samples. Fixture generation and correctness queries are excluded from timings; CLI startup is included.
 
 `npm run bench:trigram` runs isolated synthetic extraction, selective-query, repeated-query, and unchanged-update workloads without accessing a workspace index. It reports elapsed time, posting reads, and retained heap/array-buffer memory after GC. Use `-- --output=/tmp/trigram.json` to save the report, or `-- --module=/path/to/earlier-bundle.cjs` to compare an earlier build on the same host. These are codesearch measurements, not end-to-end Rust engine timings.
+
+`npm run bench:verification` compares text-search binaries in one isolated temporary workspace. It covers serial, parallel and streamed queries, include/exclude scopes and invalid globs, dense matches, long lines, multiline CRLF literals, late matches and no-match verification. Every run checks the complete response and streamed file events against the first binary, including ranges, previews, order and counts. Build both binaries with the same Cargo profile; paired runs alternate their execution order. Reports include individual wall-time samples and binary hashes. On macOS, `/usr/bin/time` also measures child wall time, CPU time and peak RSS; its times have 10 ms precision, and child wall time excludes starting the measurement wrapper itself. Other platforms report outer wall time only. The default report is `artifacts/benchmarks/search-verification.json`; use `--output /tmp/verification.json` to choose another path. CLI startup, file loading and JSON serialization are included; fixture creation and index construction are excluded. Run without other builds or tests for comparable timings.
 
 ## Desktop platform compatibility
 

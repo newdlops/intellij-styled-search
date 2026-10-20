@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.7166 - 2026-10-20
+
+- Reduced native search CPU and allocation overhead by reusing query matchers across files and verification workers, intersecting sorted candidate postings in place, and iterating selected documents without an intermediate list.
+- Reused lazy path filters across base shards, overlays, fallback searches and diagnostics while preserving include/exclude order and invalid-pattern behavior.
+- Removed repeated text-prefix scans for match positions and bounded preview truncation work, preserving existing Unicode ranges, LF/CRLF matching, result order, OR deduplication and pagination.
+- Added regression coverage for match boundaries, candidate ranking and path scopes, plus isolated before/after search benchmarks that compare complete responses and streamed results.
+
 ## 0.1.7165 - 2026-10-15
 
 - Added short recordings of workspace search, preview editing and saving, and usage navigation to the Marketplace overview, with inline GIFs, MP4 downloads, and still-image alternatives.
