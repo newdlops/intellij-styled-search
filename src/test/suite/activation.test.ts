@@ -76,9 +76,12 @@ suite('Activation', () => {
     const { overlay } = await getApi();
     const control = overlay as any;
     const saved = { ws: control.ws, pending: control.pending, injectPromise: control.injectPromise,
+      mainInspectorTarget: control.mainInspectorTarget, mainInspectorHost: control.mainInspectorHost,
       findMainPid: control.findMainPid, findInspectorWebSocketForPid: control.findInspectorWebSocketForPid,
       probeRetainedRendererPatch: control.probeRetainedRendererPatch, markRendererInlayClickHookReady: control.markRendererInlayClickHookReady };
-    const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    const host = process.env.IJSS_TEST_LOOPBACK_HOST ||
+      vscode.workspace.getConfiguration('intellijStyledSearch').get<string>('mcpHost', '127.0.0.1');
+    const server = new WebSocketServer({ port: 0, host });
     await new Promise<void>((resolve) => server.once('listening', resolve));
     const address = server.address();
     assert.ok(address && typeof address !== 'string');
@@ -90,8 +93,12 @@ suite('Activation', () => {
     let second: any;
     try {
       control.pending = new Map();
-      control.findMainPid = async () => 1;
-      control.findInspectorWebSocketForPid = async () => ({ wsUrl: `ws://127.0.0.1:${address.port}`, port: address.port, attempts: 1 });
+      // Discovery is stubbed ready, so no OS lookup or activation is permitted. PID 1 is
+      // deliberately rejected by the production coordinator and cannot represent an owner.
+      control.findMainPid = async () => process.pid + 1;
+      control.findInspectorWebSocketForPid = async () => ({
+        wsUrl: `ws://${host.includes(':') ? `[${host}]` : host}:${address.port}`, port: address.port, attempts: 1,
+      });
       control.probeRetainedRendererPatch = async () => 'ok:1:already patched:retained';
       control.markRendererInlayClickHookReady = () => {};
       await control.inject();
