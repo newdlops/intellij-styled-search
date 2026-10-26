@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.7168 - 2026-10-26
+
+- Allow up to 10 seconds for cold Windows process creation-time verification, while keeping listener probes at 3 seconds and never repeating debugger activation.
+- Cover slow metadata subprocess startup, cached reconnects and the single-activation invariant with an actual delayed child-process regression.
+
 ## 0.1.7167 - 2026-10-26
 
 - Coordinate main-inspector activation with IntelliSense Recursion across extension hosts, without repeated startup signals.

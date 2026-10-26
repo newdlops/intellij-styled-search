@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ-style workspace search with scoped results, editable previews, search history, and usage navigation.",
-  "version": "0.1.7167",
+  "version": "0.1.7168",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
