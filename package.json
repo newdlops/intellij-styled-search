@@ -2,7 +2,7 @@
   "name": "intellij-styled-search",
   "displayName": "IntelliJ Styled Search",
   "description": "IntelliJ-style workspace search with scoped results, editable previews, search history, and usage navigation.",
-  "version": "0.1.7166",
+  "version": "0.1.7167",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -324,8 +324,9 @@
         },
         "intellijStyledSearch.closeMainInspectorAfterSearch": {
           "type": "boolean",
-          "default": true,
-          "description": "Close VS Code's shared main-process inspector after Search UI work. Enabled by default to keep the VS Code renderer responsive after CDP-based UI injection."
+          "default": false,
+          "description": "Legacy compatibility option. Cleanup releases this extension’s client sockets while keeping the shared main inspector active.",
+          "deprecationMessage": "The shared main inspector stays active so other extensions and windows remain connected. This option no longer shuts it down."
         },
         "intellijStyledSearch.rendererPerfDiagnostics": {
           "type": "boolean",
@@ -368,6 +369,11 @@
           "type": "boolean",
           "default": true,
           "description": "Temporarily stop and suppress IntelliSense Recursion renderer capture while the Search UI is visible. This avoids overlapping renderer prototype hooks from slowing VS Code."
+        },
+        "intellijStyledSearch.mcpHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Explicit loopback address for both MCP and its control endpoint. Set your dedicated loopback when using Port Manager; only 127.x.x.x and ::1 are accepted. Restart the extension host after changing this address."
         },
         "intellijStyledSearch.mcpPort": {
           "type": "number",

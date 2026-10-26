@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.7167 - 2026-10-26
+
+- Coordinate main-inspector activation with IntelliSense Recursion across extension hosts, without repeated startup signals.
+- Preserve shared debugger connections during search cleanup, recovery and reinjection; never stop another process’s inspector.
+- Release only this extension host’s window bridges, preserving other windows and Recursion clients.
+- Discover the owning main process’s actual loopback listeners and reuse that address for the event bridge, including dedicated loopbacks and arbitrary ports.
+- Retain warm renderer patches, preview behavior, search/indexing optimizations and cached endpoint reconnection. The legacy close-main-inspector setting is retained as an inactive compatibility option.
+- Add lifecycle, cross-process coordination, peer-window cleanup and dedicated-loopback regression coverage.
+- Add a validated MCP loopback address setting for both the MCP and control endpoints, preserving discovery and browser-origin restrictions.
+
 ## 0.1.7166 - 2026-10-20
 
 - Reduced native search CPU and allocation overhead by reusing query matchers across files and verification workers, intersecting sorted candidate postings in place, and iterating selected documents without an intermediate list.

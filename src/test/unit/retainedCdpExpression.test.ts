@@ -8,7 +8,9 @@ import { retainAwaitedCdpExpression } from '../../internal/retainedCdpExpression
 test('awaited CDP promises survive GC and release their roots after settlement', { timeout: 15000 }, async (t) => {
   // Use an external inspector connection: sending a local Session callback
   // while V8 is collecting a promise can itself crash Node during GC.
-  const child = spawn(process.execPath, ['--expose-gc', '--inspect=127.0.0.1:0', '-e', 'setInterval(function(){},30000)'], { signal: t.signal });
+  const host = process.env.IJSS_TEST_LOOPBACK_HOST || '127.0.0.1';
+  const address = host.includes(':') ? `[${host}]` : host;
+  const child = spawn(process.execPath, ['--expose-gc', `--inspect=${address}:0`, '-e', 'setInterval(function(){},30000)'], { signal: t.signal });
   let socket: WebSocket | undefined;
   const pending = new Map<number, (response: any) => void>();
   let nextId = 0;
@@ -27,7 +29,7 @@ test('awaited CDP promises survive GC and release their roots after settlement',
       let stderr = '';
       child.stderr.on('data', chunk => {
         stderr += chunk.toString();
-        const match = stderr.match(/ws:\/\/127\.0\.0\.1:\d+\/[^\s]+/);
+        const match = stderr.match(/ws:\/\/[^\s]+/);
         if (match) { resolve(match[0]); }
       });
       child.once('error', reject);

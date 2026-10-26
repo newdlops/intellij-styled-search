@@ -236,7 +236,8 @@ export function activate(context: vscode.ExtensionContext): ExtensionTestApi {
   );
   overlay.setPreviewCallGraphInlayProvider((uri, document, range) =>
     buildPreviewCallGraphInlays(callGraph, callGraphLog, uri, document, range));
-  const mcpServer = new CallGraphMcpServer(callGraph, callGraphLog, overlay);
+  const mcpHost = vscode.workspace.getConfiguration('intellijStyledSearch').get<string>('mcpHost', '127.0.0.1');
+  const mcpServer = new CallGraphMcpServer(callGraph, callGraphLog, overlay, mcpHost);
   context.subscriptions.push(
     callGraph,
     callGraphInlayHintsProvider,

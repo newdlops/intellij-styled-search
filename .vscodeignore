@@ -24,6 +24,7 @@ node_modules/**
 out/test/**
 tests/**
 .vscode-test.mjs
+AGENTS.md
 vscode_monacoeditor_monkeypatch.md
 target/**
 reports

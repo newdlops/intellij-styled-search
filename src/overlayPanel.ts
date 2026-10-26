@@ -34,6 +34,7 @@ import { getElectronMainProcessPlatform, findAncestorElectronMainProcess, type E
 import { isIndexingMemoryPressureError } from './internal/indexingMemoryProtection';
 import { SearchScopeState, SearchScopeHistoryState } from './internal/searchScopeState';
 import { retainAwaitedCdpExpression } from './internal/retainedCdpExpression';
+import { acquireMainInspector, readMainInspectorEndpoints, mainInspectorHttpOrigin, mainInspectorWebSocketMatches } from './main-inspector-lifecycle';
 
 type RendererEvent =
   | { type: 'search'; options: SearchOptions; recordHistory?: boolean; filesScope?: string }
@@ -564,6 +565,9 @@ export class OverlayPanel {
   private rendererPostChain: Promise<void> = Promise.resolve();
   private localBridgeServer: http.Server | undefined;
   private localBridgePort: number | undefined;
+  private localBridgeHost: string | undefined;
+  private mainInspectorHost: string | undefined;
+  private mainInspectorTarget: { pid: number; url: string } | undefined;
   private localBridgePromise: Promise<void> | undefined;
   private readonly localBridgeToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
   private showSeq = 0;
@@ -1170,11 +1174,6 @@ export class OverlayPanel {
     return undefined;
   }
 
-  private shouldCloseMainInspector(): boolean {
-    return vscode.workspace.getConfiguration('intellijStyledSearch')
-      .get<boolean>('closeMainInspectorAfterSearch', true);
-  }
-
   private isRendererPerfDiagnosticsEnabled(): boolean {
     return vscode.workspace.getConfiguration('intellijStyledSearch')
       .get<boolean>('rendererPerfDiagnostics', false);
@@ -1222,17 +1221,6 @@ export class OverlayPanel {
       .get<number>('rendererBridgeSingletonIdleMs', 30_000);
     if (!Number.isFinite(raw)) { return 30_000; }
     return Math.max(1_000, Math.min(300_000, Math.floor(raw)));
-  }
-
-  private shouldCloseInspectorForReason(reason: string): boolean {
-    if (!this.shouldCloseMainInspector()) { return false; }
-    // Closing Node's shared inspector from inside an active Runtime.evaluate
-    // drops the CDP socket before the response can arrive. Doing that while
-    // the Search UI is still visible made blank-panel typing fragile because
-    // each search result could race a forced inspector shutdown. Keep
-    // search/show idle cleanup to the client WebSocket only; panelHidden and
-    // explicit recovery still own full bridge/inspector teardown.
-    return /panel hidden|overlay disposed|renderer UI recovery|stop monaco capture|force reinject/i.test(reason);
   }
 
   private logMonacoCaptureDisabled(reason: string): void {
@@ -2200,17 +2188,19 @@ export class OverlayPanel {
     }
   }
 
-  private async ensureLocalBridgeServer(): Promise<{ port: number; token: string }> {
-    if (this.localBridgeServer && this.localBridgePort !== undefined) {
-      return { port: this.localBridgePort, token: this.localBridgeToken };
+  private async ensureLocalBridgeServer(): Promise<{ host: string; port: number; token: string }> {
+    if (this.localBridgeServer && this.localBridgePort !== undefined && this.localBridgeHost) {
+      return { host: this.localBridgeHost, port: this.localBridgePort, token: this.localBridgeToken };
     }
+    const host = this.mainInspectorHost;
+    if (!host) { throw new Error('Cannot start renderer bridge before verifying its main-process loopback'); }
     if (!this.localBridgePromise) {
       this.localBridgePromise = new Promise<void>((resolve, reject) => {
         const server = http.createServer((req, res) => {
           void this.handleLocalBridgeRequest(req, res);
         });
         server.once('error', reject);
-        server.listen(0, '127.0.0.1', () => {
+        server.listen(0, host, () => {
           const addr = server.address();
           if (!addr || typeof addr === 'string') {
             try { server.close(); } catch {}
@@ -2220,7 +2210,8 @@ export class OverlayPanel {
           server.removeListener('error', reject);
           this.localBridgeServer = server;
           this.localBridgePort = addr.port;
-          this.log.appendLine(`Renderer event bridge listening on 127.0.0.1:${addr.port}`);
+          this.localBridgeHost = addr.address;
+          this.log.appendLine(`Renderer event bridge listening on ${addr.address}:${addr.port}`);
           resolve();
         });
       }).finally(() => {
@@ -2228,10 +2219,10 @@ export class OverlayPanel {
       });
     }
     await this.localBridgePromise;
-    if (!this.localBridgeServer || this.localBridgePort === undefined) {
+    if (!this.localBridgeServer || this.localBridgePort === undefined || !this.localBridgeHost) {
       throw new Error('local renderer bridge failed to start');
     }
-    return { port: this.localBridgePort, token: this.localBridgeToken };
+    return { host: this.localBridgeHost, port: this.localBridgePort, token: this.localBridgeToken };
   }
 
   private async handleLocalBridgeRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -2258,6 +2249,7 @@ export class OverlayPanel {
     try { this.localBridgeServer.close(); } catch {}
     this.localBridgeServer = undefined;
     this.localBridgePort = undefined;
+    this.localBridgeHost = undefined;
     this.log.appendLine(`Renderer event bridge closed (${reason})`);
   }
 
@@ -3798,45 +3790,31 @@ export class OverlayPanel {
   }
 
   private async closeCdpAndInspectorSoon(reason: string): Promise<void> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      this.closeCdpWebSocket(reason);
-      return;
-    }
-    if (!this.shouldCloseInspectorForReason(reason)) {
-      this.log.appendLine(`CDP WebSocket closing without inspector.close (${reason}); inspector kept until panel hidden.`);
-      this.closeCdpWebSocket(reason);
-      return;
-    }
-    try {
-      const resp = await this.send('Runtime.evaluate', {
-        expression: `try { require('inspector').close(); 'inspector=closed'; } catch (e) { 'inspector-close-err:' + (e && e.message); }`,
-        returnByValue: true,
-        includeCommandLineAPI: true,
-      }, 500);
-      this.log.appendLine(`Inspector close result (${reason}): ${String(resp?.result?.value ?? '(no result)')}`);
-    } catch (err) {
-      this.log.appendLine(`Inspector close scheduling failed (${reason}): ${err instanceof Error ? err.message : err}`);
-    } finally {
-      this.closeCdpWebSocket(reason);
-    }
+    // The main inspector belongs to the VS Code process, including other extensions/windows.
+    // Idle cleanup releases this client's socket; it never stops the shared server.
+    this.closeCdpWebSocket(reason);
   }
 
   private async releaseRendererBridge(reason: string, sourceWindowId?: number, timeoutMs = 2000): Promise<string> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) { return 'no-active-bridge'; }
     const keepConsoleBridgeForInlay = this.shouldEnableRendererInlayClickHook() &&
       /panel hidden/i.test(reason);
-    const closeMainInspector = this.shouldCloseMainInspector() && !keepConsoleBridgeForInlay;
     const script = `
       (function () {
         var BW = require('electron').BrowserWindow;
-        var closeMainInspector = ${JSON.stringify(closeMainInspector)};
         var keepConsoleBridgeForInlay = ${JSON.stringify(keepConsoleBridgeForInlay)};
+        var ownerPort = ${JSON.stringify(this.localBridgePort)};
+        var ownerToken = ${JSON.stringify(this.localBridgeToken)};
+        var ownerWindow = ${sourceWindowId === undefined ? 'undefined' : JSON.stringify(sourceWindowId)};
         var wins = BW.getAllWindows();
         var removed = 0;
         var detached = 0;
         for (var i = 0; i < wins.length; i++) {
           var w = wins[i];
           try {
+            var owner = global.__ijFindConsoleBridgeTargets && global.__ijFindConsoleBridgeTargets.get(w.id);
+            if (!owner || owner.port !== ownerPort || owner.token !== ownerToken ||
+                (typeof ownerWindow === 'number' && ownerWindow !== w.id)) { continue; }
             var consoleBridge = global.__ijFindConsoleBridgeListeners && global.__ijFindConsoleBridgeListeners.get(w.id);
             if (consoleBridge) {
               if (!keepConsoleBridgeForInlay) {
@@ -3859,7 +3837,10 @@ export class OverlayPanel {
             var attachedByUs = global.__ijFindAttachedWindows && global.__ijFindAttachedWindows.has(w.id);
             var ownedByIjFind = !!(attachedByUs || bridge || reload || consoleBridge);
             var hasKnownOtherBridge = !!(global.__irGoToTypeBridgeListeners && global.__irGoToTypeBridgeListeners.has(w.id));
-            if (ownedByIjFind && !hasKnownOtherBridge) {
+            var debuggerChannel = w.webContents.debugger;
+            var hasOtherListeners = !debuggerChannel || typeof debuggerChannel.listenerCount !== 'function' ||
+              debuggerChannel.listenerCount('message') > 0;
+            if (attachedByUs && !hasKnownOtherBridge && !hasOtherListeners) {
               try {
                 if (w.webContents.debugger && w.webContents.debugger.isAttached()) {
                   w.webContents.debugger.detach();
@@ -3872,18 +3853,8 @@ export class OverlayPanel {
             }
           } catch (e) {}
         }
-        try {
-          if (global.__ijFindMainHttpBridge && global.__ijFindMainHttpBridge.server) {
-            try { global.__ijFindMainHttpBridge.server.close(); } catch (eMainHttpClose) {}
-            try { delete global.__ijFindMainHttpBridge; } catch (eMainHttpDelete) {}
-          }
-        } catch (eMainHttp) {}
-        if (closeMainInspector) {
-          try {
-            require('inspector').close();
-          } catch (eCloseInspector) {}
-        }
-        return 'removed=' + removed + ' detached=' + detached + ' inspector=' + (closeMainInspector ? 'closed' : 'kept');
+        // Other extension hosts and legacy bridge instances retain their own servers.
+        return 'removed=' + removed + ' detached=' + detached + ' inspector=kept';
       })()
     `.trim();
     try {
@@ -3946,6 +3917,7 @@ export class OverlayPanel {
         var markerDeadline = Date.now() + 1500;
         var expectedLocalBridgePort = ${JSON.stringify(this.localBridgePort)};
         var expectedLocalBridgeToken = ${JSON.stringify(this.localBridgeToken)};
+        var expectedLocalBridgeHost = ${JSON.stringify(this.localBridgeHost)};
         function isWorkbench(win) {
           try { return !!win && /workbench\\.(?:esm\\.)?html/.test(win.webContents.getURL() || ''); }
           catch (e) { return false; }
@@ -3992,7 +3964,8 @@ export class OverlayPanel {
         var bridge = global.__ijFindConsoleBridgeListeners && global.__ijFindConsoleBridgeListeners.get(target.id);
         var bridgeTarget = global.__ijFindConsoleBridgeTargets && global.__ijFindConsoleBridgeTargets.get(target.id);
         var bridgeReady = !!bridge && !!bridgeTarget &&
-          bridgeTarget.port === expectedLocalBridgePort && bridgeTarget.token === expectedLocalBridgeToken;
+          bridgeTarget.port === expectedLocalBridgePort && bridgeTarget.token === expectedLocalBridgeToken &&
+          bridgeTarget.host === expectedLocalBridgeHost;
         if (!bridgeReady) { return 'missing:stale-console-bridge:' + target.id; }
         var status = await target.webContents.executeJavaScript(${JSON.stringify(rendererReadyExpr)}, true);
         return status === 'ready'
@@ -4018,31 +3991,21 @@ export class OverlayPanel {
     const mainPid = await this.findMainPid();
     if (!mainPid) { throw new Error('Could not locate VSCode main (Electron) process'); }
     const tStart = Date.now();
-    // If VS Code's main inspector is already open, reuse it without sending
-    // SIGUSR1 again. Re-signalling the main process on every Search UI open
-    // keeps the shared inspector hot and has shown up as renderer jank.
-    let inspector = await this.findInspectorWebSocketForPid(mainPid, { rounds: 1, fetchTimeoutMs: 50, probeTimeoutMs: 120 });
-    let wsUrl = inspector.wsUrl;
-    if (!wsUrl) {
-      await this.closeStaleIjFindInspectorBlockingTarget(mainPid);
-      this.log.appendLine(`Main PID ${mainPid}: requesting inspector activation`);
-      try { getElectronMainProcessPlatform().requestInspector(mainPid); } catch (e) {
-        throw new Error(`Inspector activation for pid ${mainPid} failed: ${e instanceof Error ? e.message : e}`);
-      }
-      inspector = await this.findInspectorWebSocketForPid(mainPid);
-      wsUrl = inspector.wsUrl;
-      if (!wsUrl && await this.closeStaleIjFindInspectorBlockingTarget(mainPid)) {
-        this.log.appendLine(`Main PID ${mainPid}: retrying inspector activation after closing stale inspector`);
-        try { getElectronMainProcessPlatform().requestInspector(mainPid); } catch (e) {
-          throw new Error(`Inspector activation retry for pid ${mainPid} failed: ${e instanceof Error ? e.message : e}`);
+    const inspector = await acquireMainInspector(mainPid, {
+      discover: async () => {
+        const cached = this.mainInspectorTarget;
+        if (cached?.pid === mainPid && (await this.probeInspectorInfo(cached.url, 150)).pid === mainPid) {
+          return { wsUrl: cached.url, port: Number(new URL(cached.url).port), attempts: 1 };
         }
-        inspector = await this.findInspectorWebSocketForPid(mainPid);
-        wsUrl = inspector.wsUrl;
-      }
-    } else {
-      this.log.appendLine(`Main PID ${mainPid}: reusing existing inspector`);
-    }
-    if (!wsUrl) { throw new Error(`CDP inspector for VSCode main pid ${mainPid} did not come up`); }
+        const result = await this.findInspectorWebSocketForPid(mainPid, { rounds: 1, fetchTimeoutMs: 100, probeTimeoutMs: 150 });
+        return result.wsUrl ? result : undefined;
+      },
+      request: () => getElectronMainProcessPlatform().requestInspector(mainPid),
+      log: message => this.log.appendLine(message),
+    });
+    const wsUrl = inspector.wsUrl!;
+    this.mainInspectorTarget = { pid: mainPid, url: wsUrl };
+    this.mainInspectorHost = new URL(wsUrl).hostname.replace(/^\[|\]$/g, '');
     const tInspector = Date.now();
     this.log.appendLine(
       `Inspector for pid ${mainPid} up on port ${inspector.port ?? '?'} after ${tInspector - tStart}ms ` +
@@ -4100,7 +4063,7 @@ export class OverlayPanel {
           var chains = global.__ijFindMainHttpBridgeChains;
           var post = function(){return new Promise(function(resolve){
             try {
-              var request = require('http').request({hostname:'127.0.0.1',port:target.port,
+              var request = require('http').request({hostname:target.host || defaultTarget.host,port:target.port,
                 path:'/ijss-bridge',method:'POST',headers:{'content-type':'application/json','x-ijss-token':target.token}},
                 function(response){response.resume();response.on('end',resolve);response.on('error',resolve)});
               request.on('error',resolve);
@@ -4203,7 +4166,8 @@ export class OverlayPanel {
         var mainBridgeBindingName = ${JSON.stringify(BRIDGE_BINDING)};
         var localBridgePort = ${JSON.stringify(localBridge.port)};
         var localBridgeToken = ${JSON.stringify(localBridge.token)};
-        var closeMainInspector = ${JSON.stringify(this.shouldCloseMainInspector())};
+        var localBridgeHost = ${JSON.stringify(localBridge.host)};
+        var localBridgeOrigin = ${JSON.stringify(mainInspectorHttpOrigin(localBridge))};
         var keepConsoleBridgeForInlay = ${JSON.stringify(this.shouldEnableRendererInlayClickHook())};
         var forcePatchInstall = ${JSON.stringify(!!(options.additionalInstance || options.forceInstall))};
         var targetWindowId = ${targetWindowId === undefined ? 'undefined' : JSON.stringify(targetWindowId)};
@@ -4311,13 +4275,7 @@ export class OverlayPanel {
                     }
                   } catch (eConsoleSelfDel) {}
                   try {
-                    var hasConsoleBridges = !!(global.__ijFindConsoleBridgeListeners && global.__ijFindConsoleBridgeListeners.size);
-                    var hasDebuggerBridges = !!(global.__ijFindBridgeListeners && global.__ijFindBridgeListeners.size);
-                    var hasReloadBridges = !!(global.__ijFindReloadPatchListeners && global.__ijFindReloadPatchListeners.size);
-                    if (closeMainInspector && !hasConsoleBridges && !hasDebuggerBridges && !hasReloadBridges) {
-                      try { if (typeof process._debugEnd === 'function') { process._debugEnd(); } } catch (eDebugEnd) {}
-                      try { require('inspector').close(); } catch (eInspectorClose) {}
-                    }
+                    // Preserve the process-wide inspector and every other extension's CDP client.
                   } catch (eMaybeClose) {}
                 }, 0);
               } catch (eReleaseSelf) {}
@@ -4353,7 +4311,7 @@ export class OverlayPanel {
                   }, 2000) : null;
                   var request;
                   try {
-                    request = fetch('http://127.0.0.1:' + localBridgePort + '/ijss-bridge', {
+                    request = fetch(localBridgeOrigin + '/ijss-bridge', {
                       method: 'POST',
                       headers: {
                         'content-type': 'application/json',
@@ -4396,6 +4354,7 @@ export class OverlayPanel {
           w.webContents.on('console-message', bridge);
           global.__ijFindConsoleBridgeListeners.set(w.id, bridge);
           global.__ijFindConsoleBridgeTargets.set(w.id, {
+            host: localBridgeHost,
             port: localBridgePort,
             token: localBridgeToken,
           });
@@ -6286,29 +6245,27 @@ export class OverlayPanel {
     pid: number,
     options: { rounds?: number; fetchTimeoutMs?: number; probeTimeoutMs?: number } = {},
   ): Promise<{ wsUrl?: string; port?: number; attempts: number }> {
-    const ports: number[] = [];
-    for (let port = 9229; port <= 9249; port++) { ports.push(port); }
     const knownWrongTargets = new Set<string>();
     let attempts = 0;
     const rounds = Math.max(1, Math.min(80, options.rounds ?? 80));
     const fetchTimeoutMs = Math.max(25, Math.min(500, options.fetchTimeoutMs ?? 150));
     const probeTimeoutMs = Math.max(50, Math.min(1000, options.probeTimeoutMs ?? 350));
     for (let round = 0; round < rounds; round++) {
-      for (const port of ports) {
+      for (const endpoint of await readMainInspectorEndpoints(pid)) {
         let targets: any;
         try {
           attempts++;
-          targets = await fetchJson(`http://127.0.0.1:${port}/json/list`, fetchTimeoutMs);
+          targets = await fetchJson(`${mainInspectorHttpOrigin(endpoint)}/json/list`, fetchTimeoutMs);
         } catch {
           continue;
         }
         if (!Array.isArray(targets)) { continue; }
         for (const target of targets) {
           const wsUrl = String(target?.webSocketDebuggerUrl || '');
-          if (!wsUrl || knownWrongTargets.has(wsUrl)) { continue; }
+          if (!mainInspectorWebSocketMatches(wsUrl, endpoint) || knownWrongTargets.has(wsUrl)) { continue; }
           const inspectorPid = (await this.probeInspectorInfo(wsUrl, probeTimeoutMs)).pid;
           if (inspectorPid === pid) {
-            return { wsUrl, port, attempts };
+            return { wsUrl, port: endpoint.port, attempts };
           }
           if (inspectorPid !== undefined) {
             knownWrongTargets.add(wsUrl);
@@ -6318,119 +6275,6 @@ export class OverlayPanel {
       await delay(25);
     }
     return { attempts };
-  }
-
-  private async closeStaleIjFindInspectorBlockingTarget(targetPid: number): Promise<boolean> {
-    // The default Node inspector port is 9229. The developer's own VS Code
-    // typically owns that port for THEIR extension host. Probing it from
-    // inside the test VS Code (which runs on a different port — we pass
-    // --inspect=9239 in .vscode-test.mjs) would target the dev VS Code's
-    // bridge listeners and start detaching them; the dev workbench loses
-    // its IJSS state or crashes outright. Refuse to run during tests.
-    const inTest = process.env.VSCODE_TEST === '1' || !!process.env.IJSS_E2E_WORKSPACE;
-    if (inTest) {
-      this.log.appendLine(`closeStaleIjFindInspector: skipping in test mode to protect dev VS Code`);
-      return false;
-    }
-    let targets: any;
-    try {
-      targets = await fetchJson('http://127.0.0.1:9229/json/list', 150);
-    } catch {
-      return false;
-    }
-    if (!Array.isArray(targets)) { return false; }
-    for (const target of targets) {
-      const wsUrl = String(target?.webSocketDebuggerUrl || '');
-      if (!wsUrl) { continue; }
-      const info = await this.probeInspectorInfo(wsUrl, 350);
-      if (!info.pid || info.pid === targetPid || !info.ownedByIjFind) { continue; }
-      const report = await this.evaluateInspectorExpression(wsUrl, `
-        (function () {
-          var removed = 0;
-          var detached = 0;
-          try {
-            var BW = require('electron').BrowserWindow;
-            if (global.__ijFindConsoleBridgeListeners) {
-              try {
-                global.__ijFindConsoleBridgeListeners.forEach(function (listener, id) {
-                  try {
-                    var w = BW.fromId(Number(id));
-                    if (w && w.webContents) {
-                      w.webContents.removeListener('console-message', listener);
-                      removed++;
-                    }
-                  } catch (eConsoleRemoveOne) {}
-                });
-              } catch (eConsoleRemoveEach) {}
-              try { global.__ijFindConsoleBridgeListeners.clear(); } catch (eConsoleClear) {}
-              try { if (global.__ijFindConsoleBridgeTargets) { global.__ijFindConsoleBridgeTargets.clear(); } } catch (eConsoleTargetsClear) {}
-            }
-            if (global.__ijFindBridgeListeners) {
-              try {
-                global.__ijFindBridgeListeners.forEach(function (listener, id) {
-                  try {
-                    var w = BW.fromId(Number(id));
-                    if (w && w.webContents) {
-                      w.webContents.debugger.removeListener('message', listener);
-                      removed++;
-                    }
-                  } catch (eRemoveOne) {}
-                });
-              } catch (eRemoveEach) {}
-              try { global.__ijFindBridgeListeners.clear(); } catch (eClear) {}
-            }
-            if (global.__ijFindReloadPatchListeners) {
-              try {
-                global.__ijFindReloadPatchListeners.forEach(function (listener, id) {
-                  try {
-                    var w = BW.fromId(Number(id));
-                    if (w && w.webContents) {
-                      w.webContents.removeListener('did-finish-load', listener);
-                      w.webContents.removeListener('dom-ready', listener);
-                    }
-                  } catch (eReloadOne) {}
-                });
-              } catch (eReloadEach) {}
-              try { global.__ijFindReloadPatchListeners.clear(); } catch (eReloadClear) {}
-            }
-            if (global.__ijFindAttachedWindows) {
-              try {
-                global.__ijFindAttachedWindows.forEach(function (id) {
-                  try {
-                    var w = BW.fromId(Number(id));
-                    if (w && w.webContents && w.webContents.debugger && w.webContents.debugger.isAttached()) {
-                      w.webContents.debugger.detach();
-                      detached++;
-                    }
-                  } catch (eDetachOne) {}
-                });
-              } catch (eDetachEach) {}
-              try { global.__ijFindAttachedWindows.clear(); } catch (eAttachedClear) {}
-            }
-          } catch (eCleanup) {}
-          try { delete global[${JSON.stringify(BRIDGE_BINDING)}]; } catch (eDeleteBridge) {}
-          try {
-            setTimeout(function () {
-              try {
-                if (typeof process._debugEnd === 'function') { process._debugEnd(); }
-              } catch (eDebugEnd) {}
-              try { require('inspector').close(); } catch (eCloseInspector) {}
-            }, 0);
-          } catch (eScheduleClose) {}
-          return 'pid=' + process.pid + ' removed=' + removed + ' detached=' + detached + ' inspector=closing';
-        })()
-      `.trim(), 700);
-      const targetId = String(target?.id || '');
-      if (targetId) {
-        try { await fetchText(`http://127.0.0.1:9229/json/close/${encodeURIComponent(targetId)}`, 150); } catch {}
-      }
-      this.log.appendLine(
-        `Closed stale IJSS inspector blocking pid ${targetPid}: stalePid=${info.pid} report=${String(report)}`,
-      );
-      await delay(350);
-      return true;
-    }
-    return false;
   }
 
   private async probeInspectorInfo(
@@ -6586,22 +6430,7 @@ export class OverlayPanel {
         return this.rememberAncestorMainPid(ancestor.pid, 'ancestor');
       }
 
-      // When running under @vscode/test-electron, never fall back to a
-      // global VS Code main scan — the developer's own VS Code is usually
-      // running too and a fallback hit would SIGUSR1 that process (waking
-      // up its inspector, hijacking its CDP). Tests must stay inside their
-      // own ancestor chain.
-      const inTest = process.env.VSCODE_TEST === '1' || !!process.env.IJSS_E2E_WORKSPACE;
-      if (!inTest && getElectronMainProcessPlatform().allowGlobalFallback) {
-        for (const proc of processes) {
-          if (this.isElectronMainProcess(proc)) {
-            this.log.appendLine(`findMainPid: fallback global main pid=${proc.pid}`);
-            return proc.pid;
-          }
-        }
-      } else {
-        this.log.appendLine('findMainPid: skipping global fallback; no owning ancestor found');
-      }
+      this.log.appendLine('findMainPid: no owning ancestor; refusing global process fallback');
     } catch (e) {
       this.log.appendLine(`findMainPid process snapshot error: ${e instanceof Error ? e.message : e}`);
     }

@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { isMatchingLoopbackOrigin, loopbackHttpOrigin, normalizeLoopbackHost } from './loopbackAddress';
 import {
   CallGraphService,
   callGraphUsageConfidenceBucket,
@@ -419,9 +420,11 @@ const EMPTY_USER_EDIT_DIRECTORY_PRIORITY: UserEditDirectoryPriority = {
 export class CallGraphMcpServer implements vscode.Disposable {
   private server: http.Server | undefined;
   private port: number | undefined;
+  private host: string | undefined;
   private startPromise: Promise<string> | undefined;
   private controlServer: http.Server | undefined;
   private controlPort: number | undefined;
+  private controlHost: string | undefined;
   private controlStartPromise: Promise<string> | undefined;
   private controlToken: string | undefined;
   private readonly searchGate = new AsyncSemaphore(MCP_SEARCH_CONCURRENCY);
@@ -436,6 +439,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
     private readonly callGraph: CallGraphService,
     private readonly log: vscode.OutputChannel,
     private readonly searchBackend?: CodeidxSearchBackend,
+    private readonly configuredHost = '127.0.0.1',
   ) {}
 
   dispose(): void {
@@ -448,11 +452,11 @@ export class CallGraphMcpServer implements vscode.Disposable {
   }
 
   getAddress(): string | undefined {
-    return this.port === undefined ? undefined : `http://127.0.0.1:${this.port}/mcp`;
+    return this.port === undefined ? undefined : `${loopbackHttpOrigin(this.host!, this.port)}/mcp`;
   }
 
   getControlAddress(): string | undefined {
-    return this.controlPort === undefined ? undefined : `http://127.0.0.1:${this.controlPort}`;
+    return this.controlPort === undefined ? undefined : loopbackHttpOrigin(this.controlHost!, this.controlPort);
   }
 
   async startControlServer(): Promise<string> {
@@ -462,6 +466,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
       return url;
     }
     if (this.controlStartPromise) { return this.controlStartPromise; }
+    this.controlHost = normalizeLoopbackHost(this.configuredHost);
     this.controlToken ??= crypto.randomBytes(24).toString('hex');
     this.controlServer = http.createServer((req, res) => {
       void this.handleControlRequest(req, res).catch((err) => {
@@ -502,7 +507,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
       };
       server.once('error', onError);
       server.once('listening', onListening);
-      server.listen(0, '127.0.0.1', 64);
+      server.listen(0, this.controlHost, 64);
     });
     return this.controlStartPromise;
   }
@@ -521,6 +526,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
   }
 
   private async startListening(port: number): Promise<string> {
+    this.host = normalizeLoopbackHost(this.configuredHost);
     const boundedPort = Number.isFinite(port) && port >= 0 ? Math.floor(port) : 0;
     this.server = http.createServer((req, res) => {
       void this.handleRequest(req, res).catch((err) => {
@@ -551,7 +557,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
         };
         server.once('error', onError);
         server.once('listening', onListening);
-        server.listen(boundedPort, '127.0.0.1', 1024);
+        server.listen(boundedPort, this.host, 1024);
       });
     } catch (err) {
       this.server = undefined;
@@ -606,7 +612,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
   }
 
   private async handleControlRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    if (!isAllowedOrigin(req.headers.origin)) {
+    if (!isAllowedOrigin(req.headers.origin, this.controlHost!)) {
       this.writeJson(res, 403, { ok: false, error: 'origin not allowed' });
       return;
     }
@@ -666,7 +672,7 @@ export class CallGraphMcpServer implements vscode.Disposable {
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     try {
-      if (!isAllowedOrigin(req.headers.origin)) {
+      if (!isAllowedOrigin(req.headers.origin, this.host!)) {
         this.writeJson(res, 403, { error: 'origin not allowed' });
         return;
       }
@@ -6501,13 +6507,12 @@ function getExtensionVersion(): string {
   return (extension?.packageJSON?.version as string | undefined) ?? 'unknown';
 }
 
-function isAllowedOrigin(origin: string | undefined): boolean {
+function isAllowedOrigin(origin: string | undefined, host: string): boolean {
   if (!origin) { return true; }
   try {
     const parsed = new URL(origin);
     if (parsed.protocol === 'vscode-webview:') { return true; }
-    return (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') &&
-      (parsed.protocol === 'http:' || parsed.protocol === 'https:');
+    return isMatchingLoopbackOrigin(origin, host);
   } catch {
     return false;
   }
