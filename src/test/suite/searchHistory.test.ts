@@ -16,6 +16,9 @@ let executedSearches = 0;
 const historyTasks = new Set<Promise<unknown>>();
 const originalHistoryMethods = new Map<string, (...args: any[]) => unknown>();
 let originalStorageUpdate: (key: string, value: unknown) => Promise<void>;
+const storageBarrierKey = 'intellijStyledSearch.__historyTestWriteBarrier';
+let savedStorageBarrier: unknown;
+let storageWriteSequence = 0;
 const longQuery = 'prefix '.repeat(45) + 'historicalMarker\nsecond line <literal>';
 const entries = ['Recent unrelated query', longQuery, 'Alpha component query', 'alpha service query',
   ...Array.from({ length: 96 }, (_, i) => `older query ${i}`)];
@@ -87,11 +90,15 @@ suite('Search history discovery', () => {
     await api.overlay.waitForIndexReady();
     const storage = control.context.globalState;
     originalStorageUpdate = storage.update;
+    savedStorageBarrier = storage.get(storageBarrierKey);
     let storageQueue = Promise.resolve();
     storage.update = function (storageKey: string, value: unknown) {
       const owner = this;
+      // Match Memento.update's immediate snapshot even while this fixture serializes writes.
+      const serialized = JSON.stringify(value);
+      const snapshot = serialized === undefined ? undefined : JSON.parse(serialized);
       const task = storageQueue.then(async () => {
-      if (JSON.stringify(owner.get(storageKey)) === JSON.stringify(value)) { return; }
+      const barrier = `${process.pid}:${Date.now()}:${++storageWriteSequence}`;
       // Global Memento updates also return through onDidChangeStorage. Wait for
       // that real storage echo before a later fixture can replace the value.
       // https://github.com/microsoft/vscode/blob/main/src/vs/workbench/api/common/extHostMemento.ts
@@ -100,11 +107,17 @@ suite('Search history discovery', () => {
       const acknowledged = new Promise<void>(resolve => { acknowledge = resolve; });
       const listener = owner._storage.onDidChangeStorage((event: any) => {
         if (event.shared && event.key === owner._id
-          && JSON.stringify(event.value[storageKey]) === JSON.stringify(value)) { acknowledge(); }
+          && event.value[storageBarrierKey] === barrier
+          && JSON.stringify(event.value[storageKey]) === serialized) { acknowledge(); }
       });
       let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
-        await originalStorageUpdate.call(owner, storageKey, value);
+        // A no-op backend write does not emit an echo. Batch a unique fixture token
+        // in the same real Memento scheduler flush so every awaited echo is observable.
+        await Promise.all([
+          originalStorageUpdate.call(owner, storageKey, snapshot),
+          originalStorageUpdate.call(owner, storageBarrierKey, barrier),
+        ]);
         await Promise.race([acknowledged, new Promise<void>((_, reject) => {
           timeout = setTimeout(() => reject(new Error('history storage echo did not arrive')), 5000);
         })]);
@@ -155,6 +168,7 @@ suite('Search history discovery', () => {
       for (const value of [...savedScopeHistory].reverse()) { await control.filesScopeHistoryState.record(value, 1000); }
       await control.filesScopeState.save(savedScope);
       await control.postSearchHistoryToRenderer();
+      await originalStorageUpdate.call(control.context.globalState, storageBarrierKey, savedStorageBarrier);
     } finally {
       if (originalStorageUpdate) { control.context.globalState.update = originalStorageUpdate; }
       for (const [name, original] of originalHistoryMethods) { control[name] = original; }
