@@ -1744,7 +1744,15 @@ suite('Activation', () => {
 
   test('unavailable runtime and unready index retain saved changes until recovery', async () => {
     const { overlay } = await getApi();
-    const runtime = (overlay as any).zoektRuntime as any;
+    // The singleton's watcher must keep receiving real workspace events. Exercise this
+    // controlled queue on an unregistered instance view, so delayed events from earlier
+    // fixtures cannot join the batch or be discarded by this test's state restoration.
+    const runtime = Object.create((overlay as any).zoektRuntime) as any;
+    Object.assign(runtime, {
+      pendingChanged: new Set<string>(), pendingDeleted: new Set<string>(), pendingRenames: [],
+      workspaceSyncNeeded: false, updateInFlight: false, updatePauseDepth: 0,
+      flushPromise: undefined, updatePromise: Promise.resolve(), lastUpdateFinishedAt: 0,
+    });
     const saved = {
       resolveBinary: runtime.resolveBinary, hasReadyIndex: runtime.hasReadyIndex,
       invokeJson: runtime.invokeJson, scheduleFlush: runtime.scheduleFlush,
